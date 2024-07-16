@@ -193,6 +193,7 @@ impl UploadRequest {
     }
 
     /// Split the body from the request by taking it and replacing it with the default.
+    #[allow(dead_code)]   // FIXME(aws-sdk-rust#1159) - remove when consumed internally by other modules
     pub(crate) fn take_body(&mut self) -> InputStream {
         mem::take(&mut self.body)
     }

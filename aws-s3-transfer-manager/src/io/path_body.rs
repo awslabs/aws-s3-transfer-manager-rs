@@ -19,7 +19,7 @@ pub(super) struct PathBody {
     pub(super) offset: u64,
 }
 
-/// Builder for creating [`InputStream`](InputStream) from a file/path.
+/// Builder for creating [`InputStream`] from a file/path.
 ///
 /// ```no_run
 /// # {
@@ -145,7 +145,7 @@ mod test {
 
     #[test]
     fn test_explicit_content_length() {
-        let mut tmp = NamedTempFile::new().unwrap();
+        let tmp = NamedTempFile::new().unwrap();
 
         let stream = PathBodyBuilder::new()
             .path(tmp.path())
