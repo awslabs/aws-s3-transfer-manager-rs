@@ -103,7 +103,7 @@ jobs:
         # Workaround for rust-lang/cargo#7732
         run: |
           if ! cargo fmt --check; then
-            printf "Please run \`cargo fmt` to fix rustfmt errors.\nSee CONTRIBUTING.md for more details.\n" >&2
+            printf "Please run \`cargo fmt` to fix rustfmt errors.\nSee CONTRIBUTING.md for more details.\n" >&2"
             exit 1
           fi
 
