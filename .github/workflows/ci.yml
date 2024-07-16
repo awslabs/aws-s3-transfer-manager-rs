@@ -42,7 +42,6 @@ jobs:
       - check-deny
       - sanitizers
       - features
-      - cross-check
     steps:
       - run: exit 0
 
