@@ -30,3 +30,6 @@ clap = { version = "4.5.7", default-features = false, features = ["derive", "std
 console-subscriber = "0.3.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tempfile = "3.10.1"
+
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+jemallocator = "0.5.4"

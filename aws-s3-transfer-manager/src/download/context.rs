@@ -7,5 +7,5 @@
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadContext {
     pub(crate) client: aws_sdk_s3::Client,
-    pub(crate) target_part_size: u64,
+    pub(crate) target_part_size_bytes: u64,
 }

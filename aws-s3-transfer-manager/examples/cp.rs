@@ -25,6 +25,13 @@ type BoxError = Box<dyn Error + Send + Sync>;
 
 const ONE_MEGABYTE: u64 = 1000 * 1000;
 
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[derive(Debug, Clone, clap::Parser)]
 #[command(name = "cp")]
 #[command(about = "Copies a local file or S3 object to another location locally or in S3.")]
@@ -44,6 +51,10 @@ pub struct Args {
     /// Part size to use
     #[arg(long, default_value_t = 8388608)]
     part_size: u64,
+
+    /// Enable tokio console (requires RUSTFLAGS="--cfg tokio_unstable")
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    tokio_console: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -105,14 +116,14 @@ fn invalid_arg(message: &str) -> ! {
         .exit()
 }
 
-async fn do_download(args: Args) -> Result<(), Box<dyn Error>> {
+async fn do_download(args: Args) -> Result<(), BoxError> {
     let config = aws_config::from_env().load().await;
     warmup(&config).await?;
 
     let tm = Downloader::builder()
         .sdk_config(config)
-        .concurrency(args.concurrency)
-        .target_part_size(args.part_size)
+        .concurrency(ConcurrencySetting::Explicit(args.concurrency))
+        .target_part_size(TargetPartSize::Explicit(args.part_size))
         .build();
 
     let (bucket, key) = args.source.expect_s3().parts();
@@ -146,7 +157,7 @@ async fn do_download(args: Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn do_upload(args: Args) -> Result<(), Box<dyn Error>> {
+async fn do_upload(args: Args) -> Result<(), BoxError> {
     let config = aws_config::from_env().load().await;
     warmup(&config).await?;
 
@@ -188,14 +199,16 @@ async fn do_upload(args: Args) -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_thread_ids(true)
-        .init();
-    // FIXME - requires --cfg tokio_unstable flag, make opt-in via cmdline
-    // console_subscriber::init();
+async fn main() -> Result<(), BoxError> {
     let args = dbg!(Args::parse());
+    if args.tokio_console {
+        console_subscriber::init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_thread_ids(true)
+            .init();
+    }
 
     use TransferUri::*;
     match (&args.source, &args.dest) {
@@ -208,7 +221,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), Box<dyn Error>> {
+async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk.unwrap();
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
@@ -223,7 +236,7 @@ async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-async fn warmup(config: &SdkConfig) -> Result<(), Box<dyn Error>> {
+async fn warmup(config: &SdkConfig) -> Result<(), BoxError> {
     println!("warming up client...");
     let s3 = aws_sdk_s3::Client::new(config);
     s3.list_buckets().send().await?;

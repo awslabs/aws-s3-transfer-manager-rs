@@ -17,6 +17,7 @@ use crate::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::download::handle::DownloadHandle;
 use crate::download::worker::{distribute_work, download_chunks, ChunkResponse};
 use crate::error::TransferError;
+use crate::types::{ConcurrencySetting, TargetPartSize};
 use crate::MEBIBYTE;
 use aws_sdk_s3::operation::get_object::builders::{GetObjectFluentBuilder, GetObjectInputBuilder};
 use aws_types::SdkConfig;
@@ -50,29 +51,23 @@ impl From<GetObjectInputBuilder> for DownloadRequest {
 }
 
 /// Fluent style builder for [Downloader]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Builder {
-    target_part_size_bytes: u64,
-    // TODO(design): should we instead consider an enum here allows for not only explicit but also
-    // an "Auto" mode that allows us to control the concurrency actually used based on overall transfer and part size?
-    concurrency: usize,
+    target_part_size_bytes: TargetPartSize,
+    concurrency: ConcurrencySetting,
     sdk_config: Option<SdkConfig>,
 }
 
 impl Builder {
-    fn new() -> Self {
-        Self {
-            target_part_size_bytes: 8 * MEBIBYTE,
-            concurrency: 8,
-            sdk_config: None,
-        }
+    fn new() -> Builder {
+        Builder::default()
     }
 
     /// Size of parts the object will be downloaded in, in bytes.
     ///
-    /// Defaults is 8 MiB.
-    pub fn target_part_size(mut self, size_bytes: u64) -> Self {
-        self.target_part_size_bytes = size_bytes;
+    /// Defaults is [TargetPartSize::Auto].
+    pub fn target_part_size(mut self, target_size: TargetPartSize) -> Self {
+        self.target_part_size_bytes = target_size;
         self
     }
 
@@ -85,8 +80,8 @@ impl Builder {
     /// Set the concurrency level this component is allowed to use.
     ///
     /// This sets the maximum number of concurrent in-flight requests.
-    /// Default is 8.
-    pub fn concurrency(mut self, concurrency: usize) -> Self {
+    /// Default is [ConcurrencySetting::Auto].
+    pub fn concurrency(mut self, concurrency: ConcurrencySetting) -> Self {
         self.concurrency = concurrency;
         self
     }
@@ -104,7 +99,7 @@ impl From<Builder> for Downloader {
             .unwrap_or_else(|| SdkConfig::builder().build());
         let client = aws_sdk_s3::Client::new(&sdk_config);
         Self {
-            target_part_size_bytes: value.target_part_size_bytes,
+            target_part_size: value.target_part_size_bytes,
             concurrency: value.concurrency,
             client,
         }
@@ -115,8 +110,8 @@ impl From<Builder> for Downloader {
 /// concurrent requests (e.g. using ranged GET or part number).
 #[derive(Debug, Clone)]
 pub struct Downloader {
-    target_part_size_bytes: u64,
-    concurrency: usize,
+    target_part_size: TargetPartSize,
+    concurrency: ConcurrencySetting,
     client: aws_sdk_s3::client::Client,
 }
 
@@ -155,14 +150,17 @@ impl Downloader {
             todo!("single part download not implemented")
         }
 
+        let target_part_size_bytes = self.target_part_size();
         let ctx = DownloadContext {
             client: self.client.clone(),
-            target_part_size: self.target_part_size_bytes,
+            target_part_size_bytes,
         };
+
+        let concurrency = self.concurrency();
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &req).await?;
-        let (comp_tx, comp_rx) = mpsc::channel(self.concurrency);
+        let (comp_tx, comp_rx) = mpsc::channel(concurrency);
         let start_seq = handle_discovery_chunk(&mut discovery, &comp_tx).await;
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
@@ -170,9 +168,8 @@ impl Downloader {
 
         if !discovery.remaining.is_empty() {
             // start assigning work
-            let (work_tx, work_rx) = async_channel::bounded(self.concurrency);
+            let (work_tx, work_rx) = async_channel::bounded(concurrency);
             let input = req.input.clone();
-            let part_size = self.target_part_size_bytes;
             let rem = discovery.remaining.clone();
 
             // TODO(aws-sdk-rust#1159) - test semaphore based approach where we create all futures at once,
@@ -180,9 +177,15 @@ impl Downloader {
             //        quite a few futures created. If more performant could be enabled for
             //        objects less than some size.
 
-            tasks.spawn(distribute_work(rem, input, part_size, start_seq, work_tx));
+            tasks.spawn(distribute_work(
+                rem,
+                input,
+                target_part_size_bytes,
+                start_seq,
+                work_tx,
+            ));
 
-            for i in 0..self.concurrency {
+            for i in 0..concurrency {
                 let worker = download_chunks(ctx.clone(), work_rx.clone(), comp_tx.clone())
                     .instrument(tracing::debug_span!("chunk-downloader", worker = i));
                 tasks.spawn(worker);
@@ -201,6 +204,22 @@ impl Downloader {
         };
 
         Ok(handle)
+    }
+
+    /// Get the concrete concurrency setting
+    fn concurrency(&self) -> usize {
+        match self.concurrency {
+            ConcurrencySetting::Auto => 8,
+            ConcurrencySetting::Explicit(explicit) => explicit,
+        }
+    }
+
+    // Get the concrete part size to use in bytes
+    fn target_part_size(&self) -> u64 {
+        match self.target_part_size {
+            TargetPartSize::Auto => 8 * MEBIBYTE,
+            TargetPartSize::Explicit(explicit) => explicit,
+        }
     }
 }
 

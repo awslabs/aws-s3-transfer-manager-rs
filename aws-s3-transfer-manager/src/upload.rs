@@ -103,7 +103,8 @@ impl Builder {
     }
 
     /// Set an explicit client to use. This takes precedence over setting `sdk_config`.
-    #[allow(unused)]  /// FIXME - this is currently only used for tests...
+    #[allow(unused)]
+    /// FIXME - this is currently only used for tests...
     pub(crate) fn client(mut self, client: aws_sdk_s3::Client) -> Self {
         self.client = Some(client);
         self

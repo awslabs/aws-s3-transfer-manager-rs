@@ -76,8 +76,7 @@ impl UploadHandle {
             FailedMultipartUploadPolicy::AbortUpload => abort_upload(self).await,
             FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
         }
-
-   }
+    }
 }
 
 /// Describes the result of aborting an in-progress upload.
@@ -130,10 +129,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadResponse, Upl
         todo!("non mpu upload not implemented yet")
     }
 
-    tracing::trace!(
-        "joining upload_id={:?}",
-        handle.ctx.upload_id
-    );
+    tracing::trace!("joining upload_id={:?}", handle.ctx.upload_id);
 
     let mut all_parts = Vec::new();
 
