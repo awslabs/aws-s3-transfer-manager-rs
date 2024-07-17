@@ -18,7 +18,7 @@ use crate::download::handle::DownloadHandle;
 use crate::download::worker::{distribute_work, download_chunks, ChunkResponse};
 use crate::error::TransferError;
 use crate::types::{ConcurrencySetting, TargetPartSize};
-use crate::MEBIBYTE;
+use crate::{DEFAULT_CONCURRENCY, MEBIBYTE};
 use aws_sdk_s3::operation::get_object::builders::{GetObjectFluentBuilder, GetObjectInputBuilder};
 use aws_types::SdkConfig;
 use context::DownloadContext;
@@ -209,7 +209,7 @@ impl Downloader {
     /// Get the concrete concurrency setting
     fn concurrency(&self) -> usize {
         match self.concurrency {
-            ConcurrencySetting::Auto => 8,
+            ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
             ConcurrencySetting::Explicit(explicit) => explicit,
         }
     }
