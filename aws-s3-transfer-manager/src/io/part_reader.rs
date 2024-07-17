@@ -73,7 +73,7 @@ impl ReadPart for PartReader {
 
 /// Data for a single part
 pub(crate) struct PartData {
-    // 1-indexed 
+    // 1-indexed
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
 }
@@ -258,7 +258,7 @@ mod test {
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
-    use crate::io::part_reader::{PartData, Builder, ReadPart};
+    use crate::io::part_reader::{Builder, PartData, ReadPart};
     use crate::io::InputStream;
 
     async fn collect_parts(reader: impl ReadPart) -> Vec<PartData> {
@@ -304,10 +304,7 @@ mod test {
         let expected = data.chunks(part_size).collect::<Vec<_>>();
 
         let stream = builder.build().unwrap();
-        let reader = Builder::new()
-            .part_size(part_size)
-            .stream(stream)
-            .build();
+        let reader = Builder::new().part_size(part_size).stream(stream).build();
 
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();

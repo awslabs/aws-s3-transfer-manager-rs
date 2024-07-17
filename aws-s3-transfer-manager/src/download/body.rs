@@ -213,7 +213,7 @@ mod tests {
             received.push(data);
         }
 
-        let expected: Vec<String> = vec![0, 1, 2].iter().map(|i| format!("chunk {i}")).collect();
+        let expected: Vec<String> = [0, 1, 2].iter().map(|i| format!("chunk {i}")).collect();
         assert_eq!(expected, received);
     }
 

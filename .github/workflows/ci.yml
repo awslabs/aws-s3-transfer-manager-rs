@@ -1,0 +1,270 @@
+on:
+  pull_request:
+
+name: CI
+
+# Allow one instance of this workflow per pull request, and cancel older runs when new changes are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+  # Change to specific Rust release to pin
+  rust_stable: stable
+  rust_nightly: nightly-2024-07-07
+  rust_clippy: '1.77'
+  # When updating this, also update relevant docs
+  rust_min: '1.76'
+
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  # depends on all actions required for a "successful" CI run
+  ci-required-checks:
+    name: Required checks pass
+    runs-on: ubuntu-24.04
+    needs:
+      - test-hll
+      - fmt
+      - clippy
+      - docs
+      - minrust
+      - check-external-types
+      - check-deny
+      - sanitizers
+      - features
+    steps:
+      - run: exit 0
+
+ # Basic actions that must pass before we kick off more expensive tests.
+  basics:
+    name: basic checks
+    runs-on: ubuntu-24.04
+    needs:
+      - fmt
+      - clippy
+      - docs
+      - minrust
+    steps:
+      - run: exit 0 
+
+  test-hll:
+    name: Test S3 transfer manager HLL
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2022
+          - macos-14
+    needs: basics
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+            toolchain: ${{ env.rust_stable }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test s3-transfer-manager HLL
+        run: |
+          cargo nextest run --workspace --all-features
+          cargo test --doc --workspace --all-features
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # Check fmt
+      - name: "cargo fmt --check"
+        # Workaround for rust-lang/cargo#7732
+        run: |
+          if ! cargo fmt --check; then
+            printf "Please run \`cargo fmt\` to fix rustfmt errors.\nSee CONTRIBUTING.md for more details.\n" >&2
+            exit 1
+          fi
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_clippy }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_clippy }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: "clippy --all"
+        run: cargo clippy --all --tests --all-features --no-deps
+
+  docs:
+    name: docs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+      - uses: Swatinem/rust-cache@v2
+      - name: "doc --lib --all-features"
+        run: |
+          cargo doc --lib --no-deps --all-features --document-private-items
+        env:
+          RUSTFLAGS: --cfg docsrs 
+          RUSTDOCFLAGS: --cfg docsrs
+
+  minrust:
+    name: minrust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+      - uses: Swatinem/rust-cache@v2
+      - name: "check --workspace --all-features"
+        run: cargo check --workspace --all-features
+        env:
+          RUSTFLAGS: "" # remove -Dwarnings
+
+  check-external-types:
+    name: check-external-types (${{ matrix.os }})
+    needs: basics
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          # FIXME - can't generate docs on windows due to typenum (see https://github.com/paholg/typenum/issues/158)
+          # - windows-2022
+          - ubuntu-24.04
+        rust:
+          # `check-external-types` requires a specific Rust nightly version. See
+          # the README for details: https://github.com/awslabs/cargo-check-external-types
+          - nightly-2024-05-01
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-check-external-types
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-check-external-types@0.1.12
+      - name: check-external-types
+        run: cargo check-external-types --all-features --config external-types.toml
+        working-directory: aws-s3-transfer-manager
+
+  check-deny:
+    name: check deps with cargo-deny
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny
+        run: cargo deny --all-features check --hide-inclusion-graph --config .cargo-deny-config.toml licenses bans sources
+
+  sanitizers:
+    name: saniters
+    needs: basics
+    runs-on: ubuntu-24.04
+    # TODO - add additional sanitizers like leak via matrix or other jobs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install llvm
+        # Required to resolve symbols in sanitizer output
+        run: sudo apt-get install -y llvm
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+      - uses: Swatinem/rust-cache@v2
+      - name: asan
+        run: cargo test --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- --test-threads 1 --nocapture
+        env:
+          RUSTFLAGS: -Z sanitizer=address
+          # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
+          TRYBUILD: overwrite
+
+  semver:
+    name: semver
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          rust-toolchain: ${{ env.rust_stable }}
+          release-type: minor
+
+  features:
+    name: features
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - name: check --feature-powerset 
+        run: cargo hack check --all --feature-powerset
+
+  # TODO - get cross check working
+  # cross-check:
+  #   name: cross-check
+  #   needs: basics
+  #   runs-on: ubuntu-24.04
+  #   strategy:
+  #     matrix:
+  #       target:
+  #         - powerpc-unknown-linux-gnu
+  #         - powerpc64-unknown-linux-gnu
+  #         - arm-linux-androideabi
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install Rust ${{ env.rust_stable }}
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         toolchain: ${{ env.rust_stable }}
+  #         target: ${{ matrix.target }}
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo check --workspace --all-features --target ${{ matrix.target }}
