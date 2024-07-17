@@ -1,3 +1,7 @@
 [build]
 # Share one `target` directory at the project root for all Cargo projects and workspaces in aws-s3-transfer-manager-rs
 target-dir = "target"
+
+[profile.profiling]
+inherits = "release"
+debug = true

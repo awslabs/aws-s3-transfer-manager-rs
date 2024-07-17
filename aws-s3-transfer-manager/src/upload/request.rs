@@ -184,6 +184,9 @@ pub struct UploadRequest {
     pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
     pub expected_bucket_owner: Option<String>,
+
+    /// The policy that describes how to handle a failed multipart upload.
+    pub failed_multipart_upload_policy: Option<FailedMultipartUploadPolicy>,
 }
 
 impl UploadRequest {
@@ -193,7 +196,6 @@ impl UploadRequest {
     }
 
     /// Split the body from the request by taking it and replacing it with the default.
-    #[allow(dead_code)] // FIXME(aws-sdk-rust#1159) - remove when consumed internally by other modules
     pub(crate) fn take_body(&mut self) -> InputStream {
         mem::take(&mut self.body)
     }
@@ -448,6 +450,11 @@ impl UploadRequest {
     pub fn expected_bucket_owner(&self) -> Option<&str> {
         self.expected_bucket_owner.as_deref()
     }
+
+    /// The policy that describes how to handle a failed multipart upload.
+    pub fn failed_multipart_upload_policy(&self) -> Option<&FailedMultipartUploadPolicy> {
+        self.failed_multipart_upload_policy.as_ref()
+    }
 }
 
 impl Debug for UploadRequest {
@@ -502,6 +509,10 @@ impl Debug for UploadRequest {
             &self.object_lock_legal_hold_status(),
         );
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
+        formatter.field(
+            "failed_multipart_upload_policy",
+            &self.failed_multipart_upload_policy,
+        );
         formatter.finish()
     }
 }
@@ -547,6 +558,7 @@ pub struct UploadRequestBuilder {
     pub(crate) object_lock_retain_until_date: Option<::aws_smithy_types::DateTime>,
     pub(crate) object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
     pub(crate) expected_bucket_owner: Option<String>,
+    pub(crate) failed_multipart_upload_policy: Option<FailedMultipartUploadPolicy>,
 }
 
 impl UploadRequestBuilder {
@@ -1405,6 +1417,26 @@ impl UploadRequestBuilder {
         &self.expected_bucket_owner
     }
 
+    /// The policy that describes how to handle a failed multipart upload.
+    pub fn failed_multipart_upload_policy(mut self, input: FailedMultipartUploadPolicy) -> Self {
+        self.failed_multipart_upload_policy = Some(input);
+        self
+    }
+
+    /// The policy that describes how to handle a failed multipart upload.
+    pub fn set_failed_multipart_upload_policy(
+        mut self,
+        input: Option<FailedMultipartUploadPolicy>,
+    ) -> Self {
+        self.failed_multipart_upload_policy = input;
+        self
+    }
+
+    /// The policy that describes how to handle a failed multipart upload.
+    pub fn get_failed_multipart_upload_policy(&self) -> &Option<FailedMultipartUploadPolicy> {
+        &self.failed_multipart_upload_policy
+    }
+
     /// Consumes the builder and constructs a [`UploadRequest`]
     // FIXME(aws-sdk-rust#1159): replace BuildError with our own type?
     pub fn build(self) -> Result<UploadRequest, ::aws_smithy_types::error::operation::BuildError> {
@@ -1446,6 +1478,7 @@ impl UploadRequestBuilder {
             object_lock_retain_until_date: self.object_lock_retain_until_date,
             object_lock_legal_hold_status: self.object_lock_legal_hold_status,
             expected_bucket_owner: self.expected_bucket_owner,
+            failed_multipart_upload_policy: self.failed_multipart_upload_policy,
         })
     }
 }
@@ -1499,6 +1532,22 @@ impl Debug for UploadRequestBuilder {
             &self.object_lock_legal_hold_status,
         );
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
+        formatter.field(
+            "failed_multipart_upload_policy",
+            &self.failed_multipart_upload_policy,
+        );
         formatter.finish()
     }
+}
+
+/// Policy for how to handle a failed multipart upload
+///
+/// Default is to abort the upload.
+#[derive(Debug, Clone, Default)]
+pub enum FailedMultipartUploadPolicy {
+    /// Abort the upload on any individual part failure
+    #[default]
+    AbortUpload,
+    /// Retain any uploaded parts. The upload ID will be available in the response.
+    Retain,
 }
