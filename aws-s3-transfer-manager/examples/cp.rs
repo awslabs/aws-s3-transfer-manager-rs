@@ -225,7 +225,7 @@ async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), Box<dyn Er
 
 async fn warmup(config: &SdkConfig) -> Result<(), Box<dyn Error>> {
     println!("warming up client...");
-    let s3 = aws_sdk_s3::Client::new(&config);
+    let s3 = aws_sdk_s3::Client::new(config);
     s3.list_buckets().send().await?;
     println!("warming up complete");
     Ok(())

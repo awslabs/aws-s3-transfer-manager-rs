@@ -103,6 +103,7 @@ impl Builder {
     }
 
     /// Set an explicit client to use. This takes precedence over setting `sdk_config`.
+    #[allow(unused)]  /// FIXME - this is currently only used for tests...
     pub(crate) fn client(mut self, client: aws_sdk_s3::Client) -> Self {
         self.client = Some(client);
         self
@@ -325,7 +326,7 @@ async fn upload_parts(
         };
 
         let part_number = part_data.part_number as i32;
-        tracing::trace!("worker recv'd part number {}", part_number);
+        tracing::trace!("recv'd part number {}", part_number);
 
         let content_length = part_data.data.remaining();
         let body = ByteStream::from(part_data.data);
@@ -349,6 +350,7 @@ async fn upload_parts(
             .send()
             .await?;
 
+        tracing::trace!("completed upload of part number {}", part_number);
         let completed = CompletedPart::builder()
             .part_number(part_number)
             .set_e_tag(resp.e_tag.clone())
