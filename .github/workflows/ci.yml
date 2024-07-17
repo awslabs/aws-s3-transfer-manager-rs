@@ -28,10 +28,10 @@ permissions:
   contents: read
 
 jobs:
-  # depens on all actions required for a "successful" CI run
+  # depends on all actions required for a "successful" CI run
   ci-required-checks:
     name: Required checks pass
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - test-hll
       - fmt
@@ -48,7 +48,7 @@ jobs:
  # Basic actions that must pass before we kick off more expensive tests.
   basics:
     name: basic checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - fmt
       - clippy
@@ -63,9 +63,9 @@ jobs:
     strategy:
       matrix:
         os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+          - ubuntu-24.04
+          - windows-2022
+          - macos-14
     needs: basics
     steps:
       - uses: actions/checkout@v4
@@ -82,13 +82,12 @@ jobs:
 
       - name: test s3-transfer-manager HLL
         run: |
-          set -euxo pipefail
           cargo nextest run --workspace --all-features
           cargo test --doc --workspace --all-features
 
   fmt:
     name: fmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -108,7 +107,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_clippy }}
@@ -122,7 +121,7 @@ jobs:
 
   docs:
     name: docs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -139,7 +138,7 @@ jobs:
 
   minrust:
     name: minrust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_min }}
@@ -159,8 +158,9 @@ jobs:
     strategy:
       matrix:
         os:
-          - windows-latest
-          - ubuntu-latest
+          # FIXME - can't generate docs on windows due to typenum (see https://github.com/paholg/typenum/issues/158)
+          # - windows-2022
+          - ubuntu-24.04
         rust:
           # `check-external-types` requires a specific Rust nightly version. See
           # the README for details: https://github.com/awslabs/cargo-check-external-types
@@ -183,7 +183,7 @@ jobs:
   check-deny:
     name: check deps with cargo-deny
     needs: basics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -201,7 +201,7 @@ jobs:
   sanitizers:
     name: saniters
     needs: basics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # TODO - add additional sanitizers like leak via matrix or other jobs
     steps:
       - uses: actions/checkout@v4
@@ -223,7 +223,7 @@ jobs:
   semver:
     name: semver
     needs: basics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Check semver
@@ -235,7 +235,7 @@ jobs:
   features:
     name: features
     needs: basics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -252,7 +252,7 @@ jobs:
   # cross-check:
   #   name: cross-check
   #   needs: basics
-  #   runs-on: ubuntu-latest
+  #   runs-on: ubuntu-24.04
   #   strategy:
   #     matrix:
   #       target:
