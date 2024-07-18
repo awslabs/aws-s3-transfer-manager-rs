@@ -56,15 +56,15 @@ impl Builder {
     ///
     /// The minimum part size is 5 MiB, any part size less than that will be rounded up.
     /// Default is [PartSize::Auto]
-    pub fn multipart_threshold_part_size(self, multipart_threshold_part_size: PartSize) -> Self {
-        let threshold = match multipart_threshold_part_size {
+    pub fn multipart_threshold(self, threshold: PartSize) -> Self {
+        let threshold = match threshold {
             PartSize::Target(part_size) => {
                 PartSize::Target(cmp::max(part_size, MIN_PART_SIZE_BYTES))
             }
             tps => tps,
         };
 
-        self.set_multipart_threshold_part_size(threshold)
+        self.set_multipart_threshold(threshold)
     }
 
     /// The target size of each part when using a multipart upload to complete the request.
@@ -79,7 +79,7 @@ impl Builder {
     ///
     /// [`multipart_threshold_part_size`]: method@Self::multipart_threshold_part_size
     /// [`PutObject`]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
-    pub fn target_part_size(self, part_size: PartSize) -> Self {
+    pub fn part_size(self, part_size: PartSize) -> Self {
         let threshold = match part_size {
             PartSize::Target(part_size) => {
                 PartSize::Target(cmp::max(part_size, MIN_PART_SIZE_BYTES))
@@ -93,7 +93,7 @@ impl Builder {
     /// Minimum object size that should trigger a multipart upload.
     ///
     /// NOTE: This does not validate the setting and is meant for internal use only.
-    pub(crate) fn set_multipart_threshold_part_size(mut self, threshold: PartSize) -> Self {
+    pub(crate) fn set_multipart_threshold(mut self, threshold: PartSize) -> Self {
         self.multipart_threshold_part_size = threshold;
         self
     }
@@ -464,7 +464,7 @@ mod test {
 
         let uploader = Uploader::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
-            .set_multipart_threshold_part_size(PartSize::Target(10))
+            .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(30))
             .client(client)
             .build();

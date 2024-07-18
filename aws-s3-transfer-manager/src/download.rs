@@ -53,7 +53,7 @@ impl From<GetObjectInputBuilder> for DownloadRequest {
 /// Fluent style builder for [Downloader]
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
-    target_part_size_bytes: PartSize,
+    part_size: PartSize,
     concurrency: ConcurrencySetting,
     sdk_config: Option<SdkConfig>,
 }
@@ -66,8 +66,8 @@ impl Builder {
     /// Size of parts the object will be downloaded in, in bytes.
     ///
     /// Defaults is [PartSize::Auto].
-    pub fn target_part_size(mut self, target_size: PartSize) -> Self {
-        self.target_part_size_bytes = target_size;
+    pub fn part_size(mut self, target_size: PartSize) -> Self {
+        self.part_size = target_size;
         self
     }
 
@@ -99,7 +99,7 @@ impl From<Builder> for Downloader {
             .unwrap_or_else(|| SdkConfig::builder().build());
         let client = aws_sdk_s3::Client::new(&sdk_config);
         Self {
-            target_part_size: value.target_part_size_bytes,
+            part_size: value.part_size,
             concurrency: value.concurrency,
             client,
         }
@@ -110,7 +110,7 @@ impl From<Builder> for Downloader {
 /// concurrent requests (e.g. using ranged GET or part number).
 #[derive(Debug, Clone)]
 pub struct Downloader {
-    target_part_size: PartSize,
+    part_size: PartSize,
     concurrency: ConcurrencySetting,
     client: aws_sdk_s3::client::Client,
 }
@@ -150,7 +150,7 @@ impl Downloader {
             todo!("single part download not implemented")
         }
 
-        let target_part_size_bytes = self.target_part_size();
+        let target_part_size_bytes = self.part_size();
         let ctx = DownloadContext {
             client: self.client.clone(),
             target_part_size_bytes,
@@ -215,8 +215,8 @@ impl Downloader {
     }
 
     // Get the concrete part size to use in bytes
-    fn target_part_size(&self) -> u64 {
-        match self.target_part_size {
+    fn part_size(&self) -> u64 {
+        match self.part_size {
             PartSize::Auto => 8 * MEBIBYTE,
             PartSize::Target(explicit) => explicit,
         }

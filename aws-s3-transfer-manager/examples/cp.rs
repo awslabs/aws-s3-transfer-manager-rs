@@ -123,7 +123,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let tm = Downloader::builder()
         .sdk_config(config)
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
-        .target_part_size(PartSize::Target(args.part_size))
+        .part_size(PartSize::Target(args.part_size))
         .build();
 
     let (bucket, key) = args.source.expect_s3().parts();
@@ -164,7 +164,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let tm = Uploader::builder()
         .sdk_config(config)
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
-        .target_part_size(PartSize::Target(args.part_size))
+        .part_size(PartSize::Target(args.part_size))
         .build();
 
     let path = args.source.expect_local();
