@@ -82,9 +82,9 @@ pub(super) async fn discover_obj(
             let byte_range = match range.as_ref() {
                 Some(r) => ByteRange::Inclusive(
                     *r.start(),
-                    cmp::min(*r.start() + ctx.target_part_size - 1, *r.end()),
+                    cmp::min(*r.start() + ctx.target_part_size_bytes - 1, *r.end()),
                 ),
-                None => ByteRange::Inclusive(0, ctx.target_part_size - 1),
+                None => ByteRange::Inclusive(0, ctx.target_part_size_bytes - 1),
             };
             let r = request
                 .input
@@ -216,7 +216,7 @@ mod tests {
 
         let ctx = DownloadContext {
             client,
-            target_part_size: 5 * MEBIBYTE,
+            target_part_size_bytes: 5 * MEBIBYTE,
         };
         let request = GetObjectInput::builder()
             .bucket("test-bucket")
@@ -266,7 +266,7 @@ mod tests {
 
         let ctx = DownloadContext {
             client,
-            target_part_size,
+            target_part_size_bytes: target_part_size,
         };
 
         let request = GetObjectInput::builder()
@@ -300,7 +300,7 @@ mod tests {
 
         let ctx = DownloadContext {
             client,
-            target_part_size,
+            target_part_size_bytes: target_part_size,
         };
 
         let request = GetObjectInput::builder()

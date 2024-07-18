@@ -179,7 +179,7 @@ mod test {
 
     #[test]
     fn test_explicit_content_length_and_offset() {
-        let mut tmp = NamedTempFile::new().unwrap();
+        let tmp = NamedTempFile::new().unwrap();
 
         let stream = PathBodyBuilder::new()
             .path(tmp.path())
@@ -200,7 +200,7 @@ mod test {
         let content = "hello path body";
         tmp.write_all(content.as_bytes()).unwrap();
 
-        let stream = PathBodyBuilder::new()
+        let _stream = PathBodyBuilder::new()
             .path(tmp.path())
             .offset(22)
             .build()
