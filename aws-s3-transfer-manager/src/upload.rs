@@ -72,9 +72,8 @@ impl Builder {
 
     /// The target size of each part when using a multipart upload to complete the request.
     ///
-    /// If the content length of a request is less than the configured
-    /// [`multipart_threshold_part_size`] then this setting will have no effect on a request and
-    /// instead will be completed with a single [`PutObject`] request.
+    /// When a request's content length is les than [`multipart_threshold_part_size`],
+    /// this setting is ignored and a single [`PutObject`] request will be made instead.
     ///
     /// NOTE: The actual part size used may be larger than the configured part size if
     /// the current value would result in more than 10,000 parts for an upload request.
@@ -131,8 +130,7 @@ impl Builder {
     }
 
     /// Set an explicit client to use. This takes precedence over setting `sdk_config`.
-    #[allow(unused)]
-    /// FIXME - this is currently only used for tests...
+    #[cfg(test)]
     pub(crate) fn client(mut self, client: aws_sdk_s3::Client) -> Self {
         self.client = Some(client);
         self
