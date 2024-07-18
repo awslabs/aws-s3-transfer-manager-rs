@@ -216,9 +216,10 @@ impl Uploader {
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
         if content_length < min_mpu_threshold {
-            tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            // let resp = req.input.send_with(&self.client)?;
-            todo!("adapt body to ByteStream and send request as is for non mpu upload")
+            // TODO - adapt body to ByteStream and send request using `PutObject` for non mpu upload
+            // tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
+            self.try_start_mpu_upload(&mut handle, stream, content_length)
+                .await?
         } else {
             self.try_start_mpu_upload(&mut handle, stream, content_length)
                 .await?
