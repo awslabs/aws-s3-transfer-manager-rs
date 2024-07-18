@@ -17,7 +17,7 @@ use crate::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::download::handle::DownloadHandle;
 use crate::download::worker::{distribute_work, download_chunks, ChunkResponse};
 use crate::error::TransferError;
-use crate::types::{ConcurrencySetting, TargetPartSize};
+use crate::types::{ConcurrencySetting, PartSize};
 use crate::{DEFAULT_CONCURRENCY, MEBIBYTE};
 use aws_sdk_s3::operation::get_object::builders::{GetObjectFluentBuilder, GetObjectInputBuilder};
 use aws_types::SdkConfig;
@@ -53,7 +53,7 @@ impl From<GetObjectInputBuilder> for DownloadRequest {
 /// Fluent style builder for [Downloader]
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
-    target_part_size_bytes: TargetPartSize,
+    target_part_size_bytes: PartSize,
     concurrency: ConcurrencySetting,
     sdk_config: Option<SdkConfig>,
 }
@@ -65,8 +65,8 @@ impl Builder {
 
     /// Size of parts the object will be downloaded in, in bytes.
     ///
-    /// Defaults is [TargetPartSize::Auto].
-    pub fn target_part_size(mut self, target_size: TargetPartSize) -> Self {
+    /// Defaults is [PartSize::Auto].
+    pub fn target_part_size(mut self, target_size: PartSize) -> Self {
         self.target_part_size_bytes = target_size;
         self
     }
@@ -110,7 +110,7 @@ impl From<Builder> for Downloader {
 /// concurrent requests (e.g. using ranged GET or part number).
 #[derive(Debug, Clone)]
 pub struct Downloader {
-    target_part_size: TargetPartSize,
+    target_part_size: PartSize,
     concurrency: ConcurrencySetting,
     client: aws_sdk_s3::client::Client,
 }
@@ -217,8 +217,8 @@ impl Downloader {
     // Get the concrete part size to use in bytes
     fn target_part_size(&self) -> u64 {
         match self.target_part_size {
-            TargetPartSize::Auto => 8 * MEBIBYTE,
-            TargetPartSize::Explicit(explicit) => explicit,
+            PartSize::Auto => 8 * MEBIBYTE,
+            PartSize::Target(explicit) => explicit,
         }
     }
 }

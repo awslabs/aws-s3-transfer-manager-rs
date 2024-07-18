@@ -5,13 +5,16 @@
 
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
-pub enum TargetPartSize {
+pub enum PartSize {
     /// Automatically configure an optimal target part size based on the execution environment.
     #[default]
     Auto,
 
-    /// Explicitly configured part size.
-    Explicit(u64),
+    /// Target part size explicitly given.
+    ///
+    /// NOTE: This is a suggestion and will be used if possible but may be adjusted for an individual request
+    /// as required by the underlying API.
+    Target(u64),
 }
 
 /// The concurrency settings to use for a single upload or download request.

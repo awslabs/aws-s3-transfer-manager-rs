@@ -9,7 +9,7 @@ pub use crate::upload::response::UploadResponse;
 use crate::error::UploadError;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
 use crate::io::InputStream;
-use crate::types::{ConcurrencySetting, TargetPartSize};
+use crate::types::{ConcurrencySetting, PartSize};
 use crate::upload::context::UploadContext;
 use crate::upload::handle::UploadHandle;
 use crate::upload::response::UploadResponseBuilder;
@@ -40,8 +40,8 @@ const MAX_PARTS: u64 = 10_000;
 /// Fluent style builder for [Uploader]
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
-    multipart_threshold_part_size: TargetPartSize,
-    target_part_size: TargetPartSize,
+    multipart_threshold_part_size: PartSize,
+    target_part_size: PartSize,
     concurrency: ConcurrencySetting,
     sdk_config: Option<SdkConfig>,
     client: Option<aws_sdk_s3::Client>,
@@ -55,14 +55,11 @@ impl Builder {
     /// Minimum object size that should trigger a multipart upload.
     ///
     /// The minimum part size is 5 MiB, any part size less than that will be rounded up.
-    /// Default is [TargetPartSize::Auto]
-    pub fn multipart_threshold_part_size(
-        self,
-        multipart_threshold_part_size: TargetPartSize,
-    ) -> Self {
+    /// Default is [PartSize::Auto]
+    pub fn multipart_threshold_part_size(self, multipart_threshold_part_size: PartSize) -> Self {
         let threshold = match multipart_threshold_part_size {
-            TargetPartSize::Explicit(part_size) => {
-                TargetPartSize::Explicit(cmp::max(part_size, MIN_PART_SIZE_BYTES))
+            PartSize::Target(part_size) => {
+                PartSize::Target(cmp::max(part_size, MIN_PART_SIZE_BYTES))
             }
             tps => tps,
         };
@@ -78,14 +75,14 @@ impl Builder {
     /// NOTE: The actual part size used may be larger than the configured part size if
     /// the current value would result in more than 10,000 parts for an upload request.
     ///
-    /// Default is [TargetPartSize::Auto]
+    /// Default is [PartSize::Auto]
     ///
     /// [`multipart_threshold_part_size`]: method@Self::multipart_threshold_part_size
     /// [`PutObject`]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
-    pub fn target_part_size(self, part_size: TargetPartSize) -> Self {
+    pub fn target_part_size(self, part_size: PartSize) -> Self {
         let threshold = match part_size {
-            TargetPartSize::Explicit(part_size) => {
-                TargetPartSize::Explicit(cmp::max(part_size, MIN_PART_SIZE_BYTES))
+            PartSize::Target(part_size) => {
+                PartSize::Target(cmp::max(part_size, MIN_PART_SIZE_BYTES))
             }
             tps => tps,
         };
@@ -96,7 +93,7 @@ impl Builder {
     /// Minimum object size that should trigger a multipart upload.
     ///
     /// NOTE: This does not validate the setting and is meant for internal use only.
-    pub(crate) fn set_multipart_threshold_part_size(mut self, threshold: TargetPartSize) -> Self {
+    pub(crate) fn set_multipart_threshold_part_size(mut self, threshold: PartSize) -> Self {
         self.multipart_threshold_part_size = threshold;
         self
     }
@@ -104,7 +101,7 @@ impl Builder {
     /// Target part size for a multipart upload.
     ///
     /// NOTE: This does not validate the setting and is meant for internal use only.
-    pub(crate) fn set_target_part_size(mut self, threshold: TargetPartSize) -> Self {
+    pub(crate) fn set_target_part_size(mut self, threshold: PartSize) -> Self {
         self.target_part_size = threshold;
         self
     }
@@ -159,8 +156,8 @@ impl From<Builder> for Uploader {
 /// concurrent requests (e.g. using multi-part uploads).
 #[derive(Debug, Clone)]
 pub struct Uploader {
-    multipart_threshold_part_size: TargetPartSize,
-    target_part_size: TargetPartSize,
+    multipart_threshold_part_size: PartSize,
+    target_part_size: PartSize,
     concurrency: ConcurrencySetting,
     client: aws_sdk_s3::client::Client,
 }
@@ -291,15 +288,15 @@ impl Uploader {
     fn mpu_threshold_bytes(&self) -> u64 {
         match self.multipart_threshold_part_size {
             // TODO(aws-sdk-rust#1159): add logic for determining this
-            TargetPartSize::Auto => 16 * MEBIBYTE,
-            TargetPartSize::Explicit(explicit) => explicit,
+            PartSize::Auto => 16 * MEBIBYTE,
+            PartSize::Target(explicit) => explicit,
         }
     }
 
     fn part_size_bytes(&self) -> u64 {
         match self.target_part_size {
-            TargetPartSize::Auto => 8 * MEBIBYTE,
-            TargetPartSize::Explicit(explicit) => explicit,
+            PartSize::Auto => 8 * MEBIBYTE,
+            PartSize::Target(explicit) => explicit,
         }
     }
 }
@@ -407,7 +404,7 @@ async fn upload_parts(
 #[cfg(test)]
 mod test {
     use crate::io::InputStream;
-    use crate::types::{ConcurrencySetting, TargetPartSize};
+    use crate::types::{ConcurrencySetting, PartSize};
     use crate::upload::{UploadRequest, Uploader};
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -467,8 +464,8 @@ mod test {
 
         let uploader = Uploader::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
-            .set_multipart_threshold_part_size(TargetPartSize::Explicit(10))
-            .set_target_part_size(TargetPartSize::Explicit(30))
+            .set_multipart_threshold_part_size(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(30))
             .client(client)
             .build();
 
