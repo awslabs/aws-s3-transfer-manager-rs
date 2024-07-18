@@ -267,7 +267,7 @@ impl Uploader {
         let part_reader = Arc::new(
             PartReaderBuilder::new()
                 .stream(stream)
-                .part_size(part_size as usize)
+                .part_size(part_size.try_into().expect("valid part size"))
                 .build(),
         );
 
