@@ -164,7 +164,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let tm = Uploader::builder()
         .sdk_config(config)
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
-        .multipart_threshold_part_size(TargetPartSize::Explicit(args.part_size))
+        .target_part_size(TargetPartSize::Explicit(args.part_size))
         .build();
 
     let path = args.source.expect_local();
