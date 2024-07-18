@@ -76,17 +76,14 @@ impl Builder {
     /// [`multipart_threshold_part_size`] then this setting will have no effect on a request and
     /// instead will be completed with a single [`PutObject`] request.
     ///
-    /// NOTE: The actual part size used may be larger than the configured part size if 
+    /// NOTE: The actual part size used may be larger than the configured part size if
     /// the current value would result in more than 10,000 parts for an upload request.
     ///
     /// Default is [TargetPartSize::Auto]
     ///
     /// [`multipart_threshold_part_size`]: method@Self::multipart_threshold_part_size
     /// [`PutObject`]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
-    pub fn target_part_size(
-        self,
-        part_size: TargetPartSize,
-    ) -> Self {
+    pub fn target_part_size(self, part_size: TargetPartSize) -> Self {
         let threshold = match part_size {
             TargetPartSize::Explicit(part_size) => {
                 TargetPartSize::Explicit(cmp::max(part_size, MIN_PART_SIZE_BYTES))
@@ -303,7 +300,7 @@ impl Uploader {
     fn part_size_bytes(&self) -> u64 {
         match self.target_part_size {
             TargetPartSize::Auto => 8 * MEBIBYTE,
-            TargetPartSize::Explicit(explicit) => explicit
+            TargetPartSize::Explicit(explicit) => explicit,
         }
     }
 }
