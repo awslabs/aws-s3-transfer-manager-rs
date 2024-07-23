@@ -7,7 +7,7 @@ use crate::operation::upload::UploadInput;
 use std::ops::Deref;
 use std::sync::Arc;
 
-/// Internal context used to drive a single Upload request
+/// Internal context used to drive a single Upload operation
 #[derive(Debug, Clone)]
 pub(crate) struct UploadContext {
     /// client used for SDK operations

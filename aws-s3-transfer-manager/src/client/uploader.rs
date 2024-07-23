@@ -2,8 +2,8 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::client::uploader::context::UploadContext;
-use crate::client::uploader::handle::UploadHandle;
+use crate::operation::upload::context::UploadContext;
+use crate::operation::upload::handle::UploadHandle;
 use crate::error::UploadError;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
 use crate::io::InputStream;
@@ -18,9 +18,6 @@ use std::cmp;
 use std::sync::Arc;
 use tracing::Instrument;
 
-mod handle;
-
-mod context;
 
 /// Minimum upload part size in bytes
 const MIN_PART_SIZE_BYTES: u64 = 5 * MEBIBYTE;

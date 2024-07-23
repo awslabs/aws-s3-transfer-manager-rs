@@ -39,3 +39,27 @@ pub enum FailedMultipartUploadPolicy {
     /// Retain any uploaded parts. The upload ID will be available in the response.
     Retain,
 }
+
+/// Describes the result of aborting an in-progress upload.
+#[derive(Debug, Default)]
+pub struct AbortedUpload {
+    pub(crate) upload_id: Option<String>,
+    pub(crate) request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+}
+
+impl AbortedUpload {
+    /// Get the multipart upload ID that was cancelled
+    ///
+    /// Not present for uploads that did not utilize a multipart upload
+    pub fn upload_id(&self) -> &Option<String> {
+        &self.upload_id
+    }
+
+    /// If present, indicates that the requester was successfully charged for the request.
+    ///
+    /// This functionality is not supported for directory buckets and is
+    /// not present for uploads that did not utilize a multipart upload
+    pub fn request_charged(&self) -> &Option<aws_sdk_s3::types::RequestCharged> {
+        &self.request_charged
+    }
+}
