@@ -2,17 +2,13 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
-pub use crate::upload::request::UploadRequest;
-pub use crate::upload::response::UploadResponse;
-
+use crate::client::uploader::context::UploadContext;
+use crate::client::uploader::handle::UploadHandle;
 use crate::error::UploadError;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
 use crate::io::InputStream;
+use crate::operation::upload::{UploadInput, UploadOutputBuilder};
 use crate::types::{ConcurrencySetting, PartSize};
-use crate::upload::context::UploadContext;
-use crate::upload::handle::UploadHandle;
-use crate::upload::response::UploadResponseBuilder;
 use crate::{DEFAULT_CONCURRENCY, MEBIBYTE};
 use aws_sdk_s3::types::CompletedPart;
 use aws_smithy_types::byte_stream::ByteStream;
@@ -24,12 +20,7 @@ use tracing::Instrument;
 
 mod handle;
 
-/// Request types for uploads to Amazon S3
-pub mod request;
-
 mod context;
-/// Response types for uploads to Amazon S3
-pub mod response;
 
 /// Minimum upload part size in bytes
 const MIN_PART_SIZE_BYTES: u64 = 5 * MEBIBYTE;
@@ -179,11 +170,12 @@ impl Uploader {
     /// use std::error::Error;
     /// use std::path::Path;
     /// use aws_s3_transfer_manager::io::InputStream;
-    /// use aws_s3_transfer_manager::upload::{Uploader, UploadRequest};
+    /// use aws_s3_transfer_manager::client::Uploader;
+    /// use aws_s3_transfer_manager::operation::upload::UploadInput;
     ///
     /// async fn upload_file(client: Uploader, path: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
     ///     let stream = InputStream::from_path(path)?;
-    ///     let request = UploadRequest::builder()
+    ///     let request = UploadInput::builder()
     ///         .bucket("my-bucket")
     ///         .key("my-key")
     ///         .body(stream)
@@ -199,7 +191,7 @@ impl Uploader {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn upload(&self, mut req: UploadRequest) -> Result<UploadHandle, UploadError> {
+    pub async fn upload(&self, mut req: UploadInput) -> Result<UploadHandle, UploadError> {
         let min_mpu_threshold = self.mpu_threshold_bytes();
 
         let stream = req.take_body();
@@ -225,7 +217,7 @@ impl Uploader {
         Ok(handle)
     }
 
-    fn new_context(&self, req: UploadRequest) -> UploadContext {
+    fn new_context(&self, req: UploadInput) -> UploadContext {
         UploadContext {
             client: self.client.clone(),
             request: Arc::new(req),
@@ -302,7 +294,7 @@ impl Uploader {
 }
 
 /// start a new multipart upload by invoking `CreateMultipartUpload`
-async fn start_mpu(handle: &UploadHandle) -> Result<UploadResponseBuilder, UploadError> {
+async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, UploadError> {
     let req = handle.ctx.request();
     let client = handle.ctx.client();
 
@@ -403,9 +395,9 @@ async fn upload_parts(
 
 #[cfg(test)]
 mod test {
+    use crate::client::uploader::{UploadInput, Uploader};
     use crate::io::InputStream;
     use crate::types::{ConcurrencySetting, PartSize};
-    use crate::upload::{UploadRequest, Uploader};
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -469,7 +461,7 @@ mod test {
             .client(client)
             .build();
 
-        let request = UploadRequest::builder()
+        let request = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .body(stream)

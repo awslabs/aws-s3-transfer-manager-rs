@@ -25,9 +25,6 @@ pub(crate) const MEBIBYTE: u64 = 1024 * 1024;
 
 pub(crate) const DEFAULT_CONCURRENCY: usize = 8;
 
-/// Abstractions for downloading objects from S3
-pub mod download;
-
 /// Error types emitted by `aws-s3-transfer-manager`
 pub mod error;
 
@@ -37,5 +34,8 @@ pub mod types;
 /// Types and helpers for I/O
 pub mod io;
 
-/// Abstractions for downloading objects from Amazon S3
-pub mod upload;
+/// Transfer manager client
+pub mod client;
+
+/// Transfer manager operations
+pub mod operation;

@@ -27,3 +27,15 @@ pub enum ConcurrencySetting {
     /// Explicitly configured concurrency setting.
     Explicit(usize),
 }
+
+/// Policy for how to handle a failed multipart upload
+///
+/// Default is to abort the upload.
+#[derive(Debug, Clone, Default)]
+pub enum FailedMultipartUploadPolicy {
+    /// Abort the upload on any individual part failure
+    #[default]
+    AbortUpload,
+    /// Retain any uploaded parts. The upload ID will be available in the response.
+    Retain,
+}

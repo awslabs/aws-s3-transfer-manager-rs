@@ -12,14 +12,14 @@ mod header;
 mod object_meta;
 mod worker;
 
-use crate::download::body::Body;
-use crate::download::discovery::{discover_obj, ObjectDiscovery};
-use crate::download::handle::DownloadHandle;
-use crate::download::worker::{distribute_work, download_chunks, ChunkResponse};
+use crate::client::downloader::body::Body;
+use crate::client::downloader::discovery::{discover_obj, ObjectDiscovery};
+use crate::client::downloader::handle::DownloadHandle;
+use crate::client::downloader::worker::{distribute_work, download_chunks, ChunkResponse};
 use crate::error::TransferError;
+use crate::operation::download::DownloadInput;
 use crate::types::{ConcurrencySetting, PartSize};
 use crate::{DEFAULT_CONCURRENCY, MEBIBYTE};
-use aws_sdk_s3::operation::get_object::builders::{GetObjectFluentBuilder, GetObjectInputBuilder};
 use aws_types::SdkConfig;
 use context::DownloadContext;
 use tokio::sync::mpsc;
@@ -27,28 +27,6 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 // TODO(aws-sdk-rust#1159) - need to set User-Agent header value for SEP, e.g. `ft/hll#s3-transfer`
-
-/// Request type for downloading a single object
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct DownloadRequest {
-    pub(crate) input: GetObjectInputBuilder,
-}
-
-// FIXME - should probably be TryFrom since checksums may conflict?
-impl From<GetObjectFluentBuilder> for DownloadRequest {
-    fn from(value: GetObjectFluentBuilder) -> Self {
-        Self {
-            input: value.as_input().clone(),
-        }
-    }
-}
-
-impl From<GetObjectInputBuilder> for DownloadRequest {
-    fn from(value: GetObjectInputBuilder) -> Self {
-        Self { input: value }
-    }
-}
 
 /// Fluent style builder for [Downloader]
 #[derive(Debug, Clone, Default)]
@@ -131,7 +109,8 @@ impl Downloader {
     /// ```no_run
     /// use std::error::Error;
     /// use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
-    /// use aws_s3_transfer_manager::download::{Downloader, DownloadRequest};
+    /// use aws_s3_transfer_manager::client::Downloader;
+    /// use aws_s3_transfer_manager::operation::download::DownloadInput;
     ///
     /// async fn get_object(client: Downloader) -> Result<(), Box<dyn Error>> {
     ///     let request = GetObjectInputBuilder::default()
@@ -144,7 +123,7 @@ impl Downloader {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn download(&self, req: DownloadRequest) -> Result<DownloadHandle, TransferError> {
+    pub async fn download(&self, req: DownloadInput) -> Result<DownloadHandle, TransferError> {
         // if there is a part number then just send the default request
         if req.input.get_part_number().is_some() {
             todo!("single part download not implemented")

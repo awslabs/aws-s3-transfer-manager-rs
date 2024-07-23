@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::upload::UploadRequest;
+use crate::operation::upload::UploadInput;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ pub(crate) struct UploadContext {
     /// the multipart upload ID
     pub(crate) upload_id: Option<String>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
-    pub(crate) request: Arc<UploadRequest>,
+    pub(crate) request: Arc<UploadInput>,
 }
 
 impl UploadContext {
@@ -25,7 +25,7 @@ impl UploadContext {
     }
 
     /// The original request (sans the body as it will have been taken for processing)
-    pub(crate) fn request(&self) -> &UploadRequest {
+    pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()
     }
 

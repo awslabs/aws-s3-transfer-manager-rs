@@ -3,11 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::client::uploader::context::UploadContext;
 use crate::error::UploadError;
-use crate::upload::context::UploadContext;
-use crate::upload::request::FailedMultipartUploadPolicy;
-use crate::upload::response::UploadResponseBuilder;
-use crate::upload::UploadResponse;
+use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
+use crate::types::FailedMultipartUploadPolicy;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::task;
 
@@ -20,7 +19,7 @@ pub struct UploadHandle {
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
-    response: Option<UploadResponseBuilder>,
+    response: Option<UploadOutputBuilder>,
 }
 
 impl UploadHandle {
@@ -37,7 +36,7 @@ impl UploadHandle {
     ///
     /// This is usually after `CreateMultipartUpload` is initiated (or
     /// `PutObject` is invoked for uploads less than the required MPU threshold).
-    pub(crate) fn set_response(&mut self, builder: UploadResponseBuilder) {
+    pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
         if builder.upload_id.is_some() {
             let upload_id = builder.upload_id.clone().expect("upload ID present");
             self.ctx.set_upload_id(upload_id);
@@ -47,7 +46,7 @@ impl UploadHandle {
     }
 
     /// Consume the handle and wait for upload to complete
-    pub async fn join(self) -> Result<UploadResponse, UploadError> {
+    pub async fn join(self) -> Result<UploadOutput, UploadError> {
         complete_upload(self).await
     }
 
@@ -124,7 +123,7 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, UploadErro
     Ok(aborted_upload)
 }
 
-async fn complete_upload(mut handle: UploadHandle) -> Result<UploadResponse, UploadError> {
+async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, UploadError> {
     if !handle.ctx.is_multipart_upload() {
         todo!("non mpu upload not implemented yet")
     }

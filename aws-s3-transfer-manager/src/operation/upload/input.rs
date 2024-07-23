@@ -4,12 +4,14 @@
  */
 
 use crate::io::InputStream;
+use crate::types::FailedMultipartUploadPolicy;
+
 use std::fmt::Debug;
 use std::mem;
 
 /// Request type for uploading a single object
 #[non_exhaustive]
-pub struct UploadRequest {
+pub struct UploadInput {
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p>When adding a new object, you can use headers to grant ACL-based permissions to individual Amazon Web Services accounts or to predefined groups defined by Amazon S3. These permissions are then added to the ACL on the object. By default, all objects are private. Only the owner has full access control. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html">Access Control List (ACL) Overview</a> and <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-using-rest-api.html">Managing ACLs Using the REST API</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p>If the bucket that you're uploading objects to uses the bucket owner enforced setting for S3 Object Ownership, ACLs are disabled and no longer affect permissions. Buckets that use this setting only accept PUT requests that don't specify an ACL or PUT requests that specify bucket owner full control ACLs, such as the <code>bucket-owner-full-control</code> canned ACL or an equivalent form of this ACL expressed in the XML format. PUT requests that contain other ACLs (for example, custom grants to certain Amazon Web Services accounts) fail and return a <code>400</code> error with the error code <code>AccessControlListNotSupported</code>. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html"> Controlling ownership of objects and disabling ACLs</a> in the <i>Amazon S3 User Guide</i>.</p><note>
@@ -189,10 +191,10 @@ pub struct UploadRequest {
     pub failed_multipart_upload_policy: Option<FailedMultipartUploadPolicy>,
 }
 
-impl UploadRequest {
-    /// Create a new builder for `UploadRequest`
-    pub fn builder() -> UploadRequestBuilder {
-        UploadRequestBuilder::default()
+impl UploadInput {
+    /// Create a new builder for `UploadInput`
+    pub fn builder() -> UploadInputBuilder {
+        UploadInputBuilder::default()
     }
 
     /// Split the body from the request by taking it and replacing it with the default.
@@ -457,9 +459,9 @@ impl UploadRequest {
     }
 }
 
-impl Debug for UploadRequest {
+impl Debug for UploadInput {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        let mut formatter = f.debug_struct("UploadRequest");
+        let mut formatter = f.debug_struct("UploadInput");
         formatter.field("acl", &self.acl);
         formatter.field("body", &self.body);
         formatter.field("bucket", &self.bucket);
@@ -517,10 +519,10 @@ impl Debug for UploadRequest {
     }
 }
 
-/// A builder for [`UploadRequest`].
+/// A builder for [`UploadInput`].
 #[non_exhaustive]
 #[derive(Default)]
-pub struct UploadRequestBuilder {
+pub struct UploadInputBuilder {
     pub(crate) acl: Option<aws_sdk_s3::types::ObjectCannedAcl>,
     pub(crate) body: Option<crate::io::InputStream>,
     pub(crate) bucket: Option<String>,
@@ -561,7 +563,7 @@ pub struct UploadRequestBuilder {
     pub(crate) failed_multipart_upload_policy: Option<FailedMultipartUploadPolicy>,
 }
 
-impl UploadRequestBuilder {
+impl UploadInputBuilder {
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p>When adding a new object, you can use headers to grant ACL-based permissions to individual Amazon Web Services accounts or to predefined groups defined by Amazon S3. These permissions are then added to the ACL on the object. By default, all objects are private. Only the owner has full access control. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html">Access Control List (ACL) Overview</a> and <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-using-rest-api.html">Managing ACLs Using the REST API</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p>If the bucket that you're uploading objects to uses the bucket owner enforced setting for S3 Object Ownership, ACLs are disabled and no longer affect permissions. Buckets that use this setting only accept PUT requests that don't specify an ACL or PUT requests that specify bucket owner full control ACLs, such as the <code>bucket-owner-full-control</code> canned ACL or an equivalent form of this ACL expressed in the XML format. PUT requests that contain other ACLs (for example, custom grants to certain Amazon Web Services accounts) fail and return a <code>400</code> error with the error code <code>AccessControlListNotSupported</code>. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html"> Controlling ownership of objects and disabling ACLs</a> in the <i>Amazon S3 User Guide</i>.</p><note>
@@ -1437,10 +1439,10 @@ impl UploadRequestBuilder {
         &self.failed_multipart_upload_policy
     }
 
-    /// Consumes the builder and constructs a [`UploadRequest`]
+    /// Consumes the builder and constructs a [`UploadInput`]
     // FIXME(aws-sdk-rust#1159): replace BuildError with our own type?
-    pub fn build(self) -> Result<UploadRequest, ::aws_smithy_types::error::operation::BuildError> {
-        Ok(UploadRequest {
+    pub fn build(self) -> Result<UploadInput, ::aws_smithy_types::error::operation::BuildError> {
+        Ok(UploadInput {
             body: self.body.unwrap_or_default(),
             acl: self.acl,
             bucket: self.bucket,
@@ -1483,9 +1485,9 @@ impl UploadRequestBuilder {
     }
 }
 
-impl Debug for UploadRequestBuilder {
+impl Debug for UploadInputBuilder {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        let mut formatter = f.debug_struct("UploadRequestBuilder");
+        let mut formatter = f.debug_struct("UploadInputBuilder");
         formatter.field("acl", &self.acl);
         formatter.field("body", &self.body);
         formatter.field("bucket", &self.bucket);
@@ -1538,16 +1540,4 @@ impl Debug for UploadRequestBuilder {
         );
         formatter.finish()
     }
-}
-
-/// Policy for how to handle a failed multipart upload
-///
-/// Default is to abort the upload.
-#[derive(Debug, Clone, Default)]
-pub enum FailedMultipartUploadPolicy {
-    /// Abort the upload on any individual part failure
-    #[default]
-    AbortUpload,
-    /// Retain any uploaded parts. The upload ID will be available in the response.
-    Retain,
 }

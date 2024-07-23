@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::{mem, time};
 
-use aws_s3_transfer_manager::download::Downloader;
-
-use aws_s3_transfer_manager::download::body::Body;
+use aws_s3_transfer_manager::client::downloader::body::Body;
+use aws_s3_transfer_manager::client::Downloader;
+use aws_s3_transfer_manager::client::Uploader;
 use aws_s3_transfer_manager::io::InputStream;
+use aws_s3_transfer_manager::operation::upload::UploadInput;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
-use aws_s3_transfer_manager::upload::{UploadRequest, Uploader};
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_types::SdkConfig;
 use bytes::Buf;
@@ -173,7 +173,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let stream = InputStream::from_path(path)?;
     let (bucket, key) = args.dest.expect_s3().parts();
 
-    let request = UploadRequest::builder()
+    let request = UploadInput::builder()
         .bucket(bucket)
         .key(key)
         .body(stream)
