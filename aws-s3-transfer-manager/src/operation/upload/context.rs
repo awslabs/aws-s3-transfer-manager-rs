@@ -3,29 +3,29 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::upload::UploadRequest;
+use crate::operation::upload::UploadInput;
 use std::ops::Deref;
 use std::sync::Arc;
 
-/// Internal context used to drive a single Upload request
+/// Internal context used to drive a single Upload operation
 #[derive(Debug, Clone)]
 pub(crate) struct UploadContext {
     /// client used for SDK operations
-    pub(crate) client: aws_sdk_s3::Client,
+    pub(crate) handle: Arc<crate::client::Handle>,
     /// the multipart upload ID
     pub(crate) upload_id: Option<String>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
-    pub(crate) request: Arc<UploadRequest>,
+    pub(crate) request: Arc<UploadInput>,
 }
 
 impl UploadContext {
     /// The S3 client to use for SDK operations
     pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
-        &self.client
+        self.handle.config.client()
     }
 
     /// The original request (sans the body as it will have been taken for processing)
-    pub(crate) fn request(&self) -> &UploadRequest {
+    pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()
     }
 

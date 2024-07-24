@@ -16,8 +16,8 @@ use crate::error;
 
 use super::header::{self, ByteRange};
 use super::object_meta::ObjectMetadata;
-use super::DownloadRequest;
-use crate::download::context::DownloadContext;
+use super::DownloadInput;
+use crate::client::downloader::context::DownloadContext;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -44,7 +44,7 @@ pub(super) struct ObjectDiscovery {
 
 impl ObjectDiscoveryStrategy {
     fn from_request(
-        request: &DownloadRequest,
+        request: &DownloadInput,
     ) -> Result<ObjectDiscoveryStrategy, error::TransferError> {
         let strategy = match request.input.get_range() {
             Some(h) => {
@@ -71,7 +71,7 @@ impl ObjectDiscoveryStrategy {
 /// to be fetched, and _(if available)_ the first chunk of data.
 pub(super) async fn discover_obj(
     ctx: &DownloadContext,
-    request: &DownloadRequest,
+    request: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::TransferError> {
     let strategy = ObjectDiscoveryStrategy::from_request(request)?;
     match strategy {
@@ -99,7 +99,7 @@ pub(super) async fn discover_obj(
 
 async fn discover_obj_with_head(
     ctx: &DownloadContext,
-    request: &DownloadRequest,
+    request: &DownloadInput,
     byte_range: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, error::TransferError> {
     let meta: ObjectMetadata = ctx
@@ -166,11 +166,11 @@ async fn discover_obj_with_get(
 
 #[cfg(test)]
 mod tests {
-    use crate::download::context::DownloadContext;
-    use crate::download::discovery::{
+    use crate::client::downloader::context::DownloadContext;
+    use crate::client::downloader::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
-    use crate::download::header::ByteRange;
+    use crate::client::downloader::header::ByteRange;
     use crate::MEBIBYTE;
     use aws_sdk_s3::operation::get_object::{GetObjectInput, GetObjectOutput};
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;

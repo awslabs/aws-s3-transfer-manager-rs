@@ -2,8 +2,8 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::download::context::DownloadContext;
-use crate::download::header;
+use crate::client::downloader::context::DownloadContext;
+use crate::client::downloader::header;
 use crate::error;
 use crate::error::TransferError;
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
@@ -137,8 +137,8 @@ fn next_chunk(
 
 #[cfg(test)]
 mod tests {
-    use crate::download::header;
-    use crate::download::worker::distribute_work;
+    use crate::client::downloader::header;
+    use crate::client::downloader::worker::distribute_work;
     use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
     use std::ops::RangeInclusive;
 

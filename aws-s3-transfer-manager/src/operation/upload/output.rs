@@ -9,7 +9,7 @@ use std::fmt::{Debug, Formatter};
 /// Common response fields for uploading an object to Amazon S3
 #[non_exhaustive]
 #[derive(Clone, PartialEq)]
-pub struct UploadResponse {
+pub struct UploadOutput {
     /// <p>If the expiration is configured for the object (see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html">PutBucketLifecycleConfiguration</a>) in the <i>Amazon S3 User Guide</i>, the response includes this header. It includes the <code>expiry-date</code> and <code>rule-id</code> key-value pairs that provide information about object expiration. The value of the <code>rule-id</code> is URL-encoded.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -78,7 +78,7 @@ pub struct UploadResponse {
     pub upload_id: Option<String>,
 }
 
-impl UploadResponse {
+impl UploadOutput {
     /// <p>If the expiration is configured for the object (see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html">PutBucketLifecycleConfiguration</a>) in the <i>Amazon S3 User Guide</i>, the response includes this header. It includes the <code>expiry-date</code> and <code>rule-id</code> key-value pairs that provide information about object expiration. The value of the <code>rule-id</code> is URL-encoded.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -164,9 +164,9 @@ impl UploadResponse {
     }
 }
 
-impl Debug for UploadResponse {
+impl Debug for UploadOutput {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut formatter = f.debug_struct("UploadResponse");
+        let mut formatter = f.debug_struct("UploadOutput");
         formatter.field("expiration", &self.expiration);
         formatter.field("e_tag", &self.e_tag);
         formatter.field("checksum_crc32", &self.checksum_crc32);
@@ -189,10 +189,10 @@ impl Debug for UploadResponse {
     }
 }
 
-/// A builder for [`UploadResponse`].
+/// A builder for [`UploadOutput`].
 #[non_exhaustive]
 #[derive(Default)]
-pub struct UploadResponseBuilder {
+pub struct UploadOutputBuilder {
     pub(crate) expiration: Option<String>,
     pub(crate) e_tag: Option<String>,
     pub(crate) checksum_crc32: Option<String>,
@@ -210,7 +210,7 @@ pub struct UploadResponseBuilder {
     pub(crate) upload_id: Option<String>,
 }
 
-impl UploadResponseBuilder {
+impl UploadOutputBuilder {
     /// <p>If the expiration is configured for the object (see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html">PutBucketLifecycleConfiguration</a>) in the <i>Amazon S3 User Guide</i>, the response includes this header. It includes the <code>expiry-date</code> and <code>rule-id</code> key-value pairs that provide information about object expiration. The value of the <code>rule-id</code> is URL-encoded.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -492,10 +492,10 @@ impl UploadResponseBuilder {
         &self.upload_id
     }
 
-    /// Consumes the builder and constructs a [`UploadResponse`]
+    /// Consumes the builder and constructs a [`UploadOutput`]
     // FIXME(aws-sdk-rust#1159): replace BuildError with our own type?
-    pub fn build(self) -> Result<UploadResponse, ::aws_smithy_types::error::operation::BuildError> {
-        Ok(UploadResponse {
+    pub fn build(self) -> Result<UploadOutput, ::aws_smithy_types::error::operation::BuildError> {
+        Ok(UploadOutput {
             expiration: self.expiration,
             e_tag: self.e_tag,
             checksum_crc32: self.checksum_crc32,
@@ -515,9 +515,9 @@ impl UploadResponseBuilder {
     }
 }
 
-impl Debug for UploadResponseBuilder {
+impl Debug for UploadOutputBuilder {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        let mut formatter = f.debug_struct("UploadResponseBuilder");
+        let mut formatter = f.debug_struct("UploadOutputBuilder");
         formatter.field("expiration", &self.expiration);
         formatter.field("e_tag", &self.e_tag);
         formatter.field("checksum_crc32", &self.checksum_crc32);
@@ -540,9 +540,9 @@ impl Debug for UploadResponseBuilder {
     }
 }
 
-impl From<CreateMultipartUploadOutput> for UploadResponseBuilder {
+impl From<CreateMultipartUploadOutput> for UploadOutputBuilder {
     fn from(value: CreateMultipartUploadOutput) -> Self {
-        UploadResponseBuilder {
+        UploadOutputBuilder {
             upload_id: value.upload_id,
             server_side_encryption: value.server_side_encryption,
             sse_customer_algorithm: value.sse_customer_algorithm,
