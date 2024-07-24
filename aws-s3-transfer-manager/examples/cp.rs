@@ -10,7 +10,6 @@ use std::{mem, time};
 use aws_s3_transfer_manager::client::downloader::body::Body;
 use aws_s3_transfer_manager::client::Downloader;
 use aws_s3_transfer_manager::io::InputStream;
-use aws_s3_transfer_manager::operation::upload::UploadInput;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_types::SdkConfig;
@@ -176,12 +175,17 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let stream = InputStream::from_path(path)?;
     let (bucket, key) = args.dest.expect_s3().parts();
 
-    let request = UploadInput::builder().bucket(bucket).key(key).body(stream);
-
     println!("starting upload");
     let start = time::Instant::now();
 
-    let handle = request.send_with(&tm).await?;
+    let handle = tm
+        .upload()
+        .bucket(bucket)
+        .key(key)
+        .body(stream)
+        .send()
+        .await?;
+
     let _resp = handle.join().await?;
     let elapsed = start.elapsed();
 

@@ -62,8 +62,42 @@ impl Client {
         Client { handle }
     }
 
+    /// Returns the client's configuration
+    pub fn config(&self) -> &Config {
+        &self.handle.config
+    }
+
     /// Constructs a fluent builder for the
     /// [`Upload`](crate::operation::upload::builders::UploadFluentBuilder) operation.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::error::Error;
+    /// use std::path::Path;
+    /// use aws_s3_transfer_manager::io::InputStream;
+    ///
+    /// async fn upload_file(
+    ///     client: &aws_s3_transfer_manager::Client,
+    ///     path: impl AsRef<Path>
+    /// ) -> Result<(), Box<dyn Error>> {
+    ///     let stream = InputStream::from_path(path)?;
+    ///     let handle = client.upload()
+    ///         .bucket("my-bucket")
+    ///         .key("my_key")
+    ///         .body(stream)
+    ///         .send()
+    ///         .await?;
+    ///     
+    ///     // send() will return potentially before the transfer is complete.
+    ///     // The handle given must be joined to drive the request to completion.
+    ///     // It can also be used to get progress, pause, or cancel the transfer, etc.
+    ///     let response = handle.join().await?;
+    ///     // ... do something with response
+    ///     Ok(())
+    /// }
+    ///
+    /// ```
     pub fn upload(&self) -> crate::operation::upload::builders::UploadFluentBuilder {
         crate::operation::upload::builders::UploadFluentBuilder::new(self.handle.clone())
     }
