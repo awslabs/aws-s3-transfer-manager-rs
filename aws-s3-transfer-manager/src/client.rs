@@ -89,9 +89,9 @@ impl Client {
     ///         .send()
     ///         .await?;
     ///     
-    ///     // send() will return potentially before the transfer is complete.
-    ///     // The handle given must be joined to drive the request to completion.
-    ///     // It can also be used to get progress, pause, or cancel the transfer, etc.
+    ///     // send() may return before the transfer is complete.
+    ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
+    ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
     ///     let response = handle.join().await?;
     ///     // ... do something with response
     ///     Ok(())

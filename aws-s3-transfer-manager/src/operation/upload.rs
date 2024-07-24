@@ -11,18 +11,18 @@ mod output;
 pub(crate) mod context;
 pub(crate) mod handle;
 
-use self::context::UploadContext;
-pub use self::handle::UploadHandle;
-/// Request type for uploads to Amazon S3
-pub use self::input::{UploadInput, UploadInputBuilder};
-/// Response type for uploads to Amazon S3
-pub use self::output::{UploadOutput, UploadOutputBuilder};
 use crate::error::UploadError;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
 use crate::io::InputStream;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedPart;
 use bytes::Buf;
+use context::UploadContext;
+pub use handle::UploadHandle;
+/// Request type for uploads to Amazon S3
+pub use input::{UploadInput, UploadInputBuilder};
+/// Response type for uploads to Amazon S3
+pub use output::{UploadOutput, UploadOutputBuilder};
 use std::cmp;
 use std::sync::Arc;
 use tracing::Instrument;
