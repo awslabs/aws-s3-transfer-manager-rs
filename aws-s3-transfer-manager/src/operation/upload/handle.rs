@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::operation::upload::context::UploadContext;
 use crate::error::UploadError;
+use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -78,11 +78,10 @@ impl UploadHandle {
     }
 }
 
-
 async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, UploadError> {
     let abort_mpu_resp = handle
         .ctx
-        .client
+        .client()
         .abort_multipart_upload()
         .set_bucket(handle.ctx.request.bucket.clone())
         .set_key(handle.ctx.request.key.clone())
@@ -137,7 +136,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, Uploa
     // complete the multipart upload
     let complete_mpu_resp = handle
         .ctx
-        .client
+        .client()
         .complete_multipart_upload()
         .set_bucket(handle.ctx.request.bucket.clone())
         .set_key(handle.ctx.request.key.clone())

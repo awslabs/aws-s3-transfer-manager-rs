@@ -16,11 +16,12 @@ pub struct UploadFluentBuilder {
     inner: UploadInputBuilder,
 }
 
-
 impl UploadFluentBuilder {
-
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> Self {
-        Self { handle, inner: ::std::default::Default::default() }
+        Self {
+            handle,
+            inner: ::std::default::Default::default(),
+        }
     }
 
     /// Initiate an upload transfer for a single object
@@ -30,6 +31,14 @@ impl UploadFluentBuilder {
         crate::operation::upload::Upload::orchestrate(self.handle, input).await
     }
 
-    // TODO - all the builder setters and getters
+    // TODO - all the builder setters and getters, for now use send_with()
 }
 
+impl crate::operation::upload::input::UploadInputBuilder {
+    /// Initiate an upload transfer for a single object with this input using the given client.
+    pub async fn send_with(self, client: &crate::Client) -> Result<UploadHandle, UploadError> {
+        let mut fluent_builder = client.upload();
+        fluent_builder.inner = self;
+        fluent_builder.send().await
+    }
+}

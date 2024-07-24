@@ -43,4 +43,5 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+pub use self::client::Client;
 pub use self::config::Config;

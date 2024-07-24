@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::cmp;
+use crate::types::{ConcurrencySetting, PartSize};
 use crate::MEBIBYTE;
-use crate::types::{PartSize, ConcurrencySetting };
+use std::cmp;
 
 /// Minimum upload part size in bytes
 const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * MEBIBYTE;
@@ -20,6 +20,11 @@ pub struct Config {
 }
 
 impl Config {
+    /// Create a new `Config` builder
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
+
     /// Returns a reference to the multipart upload threshold part size
     pub fn multipart_threshold(&self) -> &PartSize {
         &self.multipart_threshold
@@ -57,7 +62,6 @@ pub struct Builder {
 }
 
 impl Builder {
-
     /// Minimum object size that should trigger a multipart upload.
     ///
     /// The minimum part size is 5 MiB, any part size less than that will be rounded up.
@@ -127,14 +131,13 @@ impl Builder {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
-            client: self.client.expect("client set")
+            client: self.client.expect("client set"),
         }
     }
 
-    /// Set an explicit S3 client to use. 
+    /// Set an explicit S3 client to use.
     pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
         self.client = Some(client);
         self
     }
 }
-

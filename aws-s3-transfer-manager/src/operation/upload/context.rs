@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub(crate) struct UploadContext {
     /// client used for SDK operations
-    pub(crate) client: aws_sdk_s3::Client,
+    pub(crate) handle: Arc<crate::client::Handle>,
     /// the multipart upload ID
     pub(crate) upload_id: Option<String>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
@@ -21,7 +21,7 @@ pub(crate) struct UploadContext {
 impl UploadContext {
     /// The S3 client to use for SDK operations
     pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
-        &self.client
+        self.handle.config.client()
     }
 
     /// The original request (sans the body as it will have been taken for processing)
