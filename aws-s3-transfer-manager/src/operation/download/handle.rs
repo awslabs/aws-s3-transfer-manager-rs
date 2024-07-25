@@ -2,8 +2,8 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::client::downloader::body::Body;
-use crate::client::downloader::object_meta::ObjectMetadata;
+use crate::operation::download::body::Body;
+use crate::operation::download::object_meta::ObjectMetadata;
 use tokio::task;
 
 /// Response type for a single download object request.

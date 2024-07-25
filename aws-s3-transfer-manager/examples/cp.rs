@@ -7,11 +7,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::{mem, time};
 
-use aws_s3_transfer_manager::client::downloader::body::Body;
-use aws_s3_transfer_manager::client::Downloader;
 use aws_s3_transfer_manager::io::InputStream;
+use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_types::SdkConfig;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -118,14 +116,17 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let config = aws_config::from_env().load().await;
     warmup(&config).await?;
 
-    let tm = Downloader::builder()
-        .sdk_config(config)
+    let s3_client = aws_sdk_s3::Client::new(&config);
+
+    let tm_config = aws_s3_transfer_manager::Config::builder()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
+        .client(s3_client)
         .build();
 
+    let tm = aws_s3_transfer_manager::Client::new(tm_config);
+
     let (bucket, key) = args.source.expect_s3().parts();
-    let input = GetObjectInputBuilder::default().bucket(bucket).key(key);
 
     let dest = fs::File::create(args.dest.expect_local()).await?;
     println!("dest file opened, starting download");
@@ -135,7 +136,8 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     // TODO(aws-sdk-rust#1159) - rewrite this less naively,
     //      likely abstract this into performant utils for single file download. Higher level
     //      TM will handle it's own thread pool for filesystem work
-    let mut handle = tm.download(input.into()).await?;
+    let mut handle = tm.download().bucket(bucket).key(key).send().await?;
+
     let body = mem::replace(&mut handle.body, Body::empty());
 
     write_body(body, dest)
