@@ -7,23 +7,6 @@ use std::fmt;
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 
-// FIXME - replace with our own types like upload
-
-// FIXME - should probably be TryFrom since checksums may conflict?
-// impl From<GetObjectFluentBuilder> for DownloadInput {
-//     fn from(value: GetObjectFluentBuilder) -> Self {
-//         Self {
-//             input: value.as_input().clone(),
-//         }
-//     }
-// }
-//
-// impl From<GetObjectInputBuilder> for DownloadInput {
-//     fn from(value: GetObjectInputBuilder) -> Self {
-//         Self { input: value }
-//     }
-// }
-
 /// Input type for downloading a single object
 #[allow(missing_docs)] // documentation missing in model
 #[non_exhaustive]
@@ -931,3 +914,5 @@ impl From<DownloadInput> for GetObjectInputBuilder {
             .set_checksum_mode(value.checksum_mode)
     }
 }
+
+// TODO - implement TryFrom<GetObjectInput> and TryFrom<GetObjectInputBuilder> for DownloadInput and DownloadInputBuilder respectively (TryFrom due to checksums)

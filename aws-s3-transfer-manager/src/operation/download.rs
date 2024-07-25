@@ -10,8 +10,6 @@ use std::sync::Arc;
 /// Request type for uploads to Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
-mod output;
-
 /// Abstractions for response bodies and consuming data streams.
 pub mod body;
 /// Operation builders
