@@ -2,10 +2,10 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::client::downloader::context::DownloadContext;
-use crate::client::downloader::header;
 use crate::error;
 use crate::error::TransferError;
+use crate::operation::download::context::DownloadContext;
+use crate::operation::download::header;
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
@@ -71,7 +71,7 @@ async fn download_chunk(
 ) -> Result<ChunkResponse, TransferError> {
     let mut resp = request
         .input
-        .send_with(&ctx.client)
+        .send_with(ctx.client())
         .await
         .map_err(error::chunk_failed)?;
 
@@ -137,8 +137,8 @@ fn next_chunk(
 
 #[cfg(test)]
 mod tests {
-    use crate::client::downloader::header;
-    use crate::client::downloader::worker::distribute_work;
+    use crate::operation::download::header;
+    use crate::operation::download::worker::distribute_work;
     use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
     use std::ops::RangeInclusive;
 

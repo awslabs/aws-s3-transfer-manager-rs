@@ -3,10 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/// Abstractions for downloading objects from S3
-pub mod downloader;
-pub use downloader::Downloader;
-
 use crate::Config;
 use crate::{
     types::{ConcurrencySetting, PartSize},
@@ -17,7 +13,7 @@ use std::sync::Arc;
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
 pub struct Client {
-    handle: Arc<Handle>,
+    pub(crate) handle: Arc<Handle>,
 }
 
 /// Whatever is needed to carry out operations, e.g. scheduler, budgets, config, env details, etc
@@ -52,6 +48,14 @@ impl Handle {
             PartSize::Target(explicit) => *explicit,
         }
     }
+
+    /// Get the concrete target part size to use for downloads
+    pub(crate) fn download_part_size_bytes(&self) -> u64 {
+        match self.config.part_size() {
+            PartSize::Auto => 5 * MEBIBYTE,
+            PartSize::Target(explicit) => *explicit,
+        }
+    }
 }
 
 impl Client {
@@ -67,6 +71,8 @@ impl Client {
         &self.handle.config
     }
 
+    /// Upload a single object from S3.
+    ///
     /// Constructs a fluent builder for the
     /// [`Upload`](crate::operation::upload::builders::UploadFluentBuilder) operation.
     ///
@@ -84,7 +90,7 @@ impl Client {
     ///     let stream = InputStream::from_path(path)?;
     ///     let handle = client.upload()
     ///         .bucket("my-bucket")
-    ///         .key("my_key")
+    ///         .key("my-key")
     ///         .body(stream)
     ///         .send()
     ///         .await?;
@@ -100,5 +106,37 @@ impl Client {
     /// ```
     pub fn upload(&self) -> crate::operation::upload::builders::UploadFluentBuilder {
         crate::operation::upload::builders::UploadFluentBuilder::new(self.handle.clone())
+    }
+
+    /// Download a single object from S3.
+    ///
+    /// A single logical request may be split into many concurrent ranged `GetObject` requests
+    /// to improve throughput.
+    ///
+    /// Constructs a fluent builder for the
+    /// [`Download`](crate::operation::download::builders::DownloadFluentBuilder) operation.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::error::Error;
+    ///
+    /// async fn get_object(client: &aws_s3_transfer_manager::Client) -> Result<(), Box<dyn Error>> {
+    ///
+    ///     let handle = client
+    ///         .download()
+    ///         .bucket("my-bucket")
+    ///         .key("my-key")
+    ///         .send()
+    ///         .await?;
+    ///
+    ///     // process data off handle...
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn download(&self) -> crate::operation::download::builders::DownloadFluentBuilder {
+        crate::operation::download::builders::DownloadFluentBuilder::new(self.handle.clone())
     }
 }

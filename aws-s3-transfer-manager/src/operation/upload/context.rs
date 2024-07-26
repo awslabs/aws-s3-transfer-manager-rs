@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Internal context used to drive a single Upload operation
 #[derive(Debug, Clone)]
 pub(crate) struct UploadContext {
-    /// client used for SDK operations
+    /// reference to client handle used to do actual work
     pub(crate) handle: Arc<crate::client::Handle>,
     /// the multipart upload ID
     pub(crate) upload_id: Option<String>,

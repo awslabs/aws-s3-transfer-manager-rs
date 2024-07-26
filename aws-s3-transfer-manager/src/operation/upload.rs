@@ -8,8 +8,8 @@ pub mod builders;
 mod input;
 mod output;
 
-pub(crate) mod context;
-pub(crate) mod handle;
+mod context;
+mod handle;
 
 use crate::error::UploadError;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
