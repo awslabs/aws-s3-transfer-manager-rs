@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use crate::error::DownloadError;
+
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -94,5 +96,28 @@ where
         DownloadFilter {
             predicate: Arc::new(value),
         }
+    }
+}
+
+/// Detailed information about a failed object download transfer
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct FailedDownloadTransfer {
+    /// The input for the download object operation that failed
+    pub(crate) input: crate::operation::download::DownloadInput,
+
+    /// The error encountered downloading the object
+    pub(crate) error: DownloadError,
+}
+
+impl FailedDownloadTransfer {
+    /// The input for the download object operation that failed
+    pub fn input(&self) -> &crate::operation::download::DownloadInput {
+        &self.input
+    }
+
+    /// The error encountered downloading the object
+    pub fn error(&self) -> &DownloadError {
+        &self.error
     }
 }

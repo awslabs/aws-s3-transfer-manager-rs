@@ -3,13 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::{
-    error::TransferError,
-    types::{DownloadFilter, FailedTransferPolicy},
-};
+use crate::types::{DownloadFilter, FailedTransferPolicy};
 use std::{path::PathBuf, sync::Arc};
 
-use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
+use super::{DownloadObjectsError, DownloadObjectsHandle, DownloadObjectsInputBuilder};
 
 /// Fluent builder for constructing a multiple object download transfer
 #[derive(Debug)]
@@ -26,9 +23,9 @@ impl DownloadObjectsFluentBuilder {
         }
     }
 
-    /// Initiate an upload transfer for a single object
-    pub async fn send(self) -> Result<DownloadObjectsHandle, TransferError> {
-        // FIXME - need DownloadError to support this conversion to remove expect() in favor of ?
+    /// Initiate au download transfer for multiple objects
+    pub async fn send(self) -> Result<DownloadObjectsHandle, DownloadObjectsError> {
+        // FIXME - need DownloadObjectsError to support this conversion to remove expect() in favor of ?
         let input = self.inner.build().expect("valid input");
         crate::operation::download_objects::DownloadObjects::orchestrate(self.handle, input).await
     }
@@ -135,7 +132,7 @@ impl crate::operation::download_objects::input::DownloadObjectsInputBuilder {
     pub async fn send_with(
         self,
         client: &crate::Client,
-    ) -> Result<DownloadObjectsHandle, TransferError> {
+    ) -> Result<DownloadObjectsHandle, DownloadObjectsError> {
         let mut fluent_builder = client.download_objects();
         fluent_builder.inner = self;
         fluent_builder.send().await
