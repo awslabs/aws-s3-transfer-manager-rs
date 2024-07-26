@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::sync::Arc;
+
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -61,5 +63,36 @@ impl AbortedUpload {
     /// not present for uploads that did not utilize a multipart upload
     pub fn request_charged(&self) -> &Option<aws_sdk_s3::types::RequestCharged> {
         &self.request_charged
+    }
+}
+
+/// Policy for how to handle a failure of any indiviudal object in a transfer
+/// involving multiple objects.
+///
+/// Default is to abort the transfer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum FailedTransferPolicy {
+    /// Abort the transfer on any individual failure to upload or download an object
+    #[default]
+    Abort,
+    /// Continue the transfer. Any failure will be logged and the details of all failed
+    /// objects will be available in the response after the transfer completes.
+    Continue,
+}
+
+/// A filter for downloading objects from S3
+#[derive(Clone)]
+pub struct DownloadFilter {
+    pub(crate) predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool>,
+}
+
+impl<F> From<F> for DownloadFilter
+where
+    F: Fn(&aws_sdk_s3::types::Object) -> bool + 'static,
+{
+    fn from(value: F) -> Self {
+        DownloadFilter {
+            predicate: Arc::new(value),
+        }
     }
 }

@@ -139,4 +139,12 @@ impl Client {
     pub fn download(&self) -> crate::operation::download::builders::DownloadFluentBuilder {
         crate::operation::download::builders::DownloadFluentBuilder::new(self.handle.clone())
     }
+
+    pub fn download_objects(
+        &self,
+    ) -> crate::operation::download_objects::builders::DownloadObjectsFluentBuilder {
+        crate::operation::download_objects::builders::DownloadObjectsFluentBuilder::new(
+            self.handle.clone(),
+        )
+    }
 }

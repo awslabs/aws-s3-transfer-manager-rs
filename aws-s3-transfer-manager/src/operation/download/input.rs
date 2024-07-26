@@ -310,7 +310,7 @@ impl DownloadInput {
     }
 }
 
-/// A builder for [`DownloadInput`](crate::operation::get_object::DownloadInput).
+/// A builder for [`DownloadInput`](crate::operation::download::DownloadInput).
 #[derive(Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct DownloadInputBuilder {
