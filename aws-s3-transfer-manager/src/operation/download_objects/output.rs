@@ -12,9 +12,6 @@ pub struct DownloadObjectsOutput {
     /// The number of objects that were successfully downloaded
     pub objects_downloaded: u64,
 
-    /// The number of objects that failed to be downloaded
-    pub objects_failed: u64,
-
     /// A list of failed object transfers
     pub failed_transfers: Option<Vec<FailedDownloadTransfer>>,
 }
@@ -28,11 +25,6 @@ impl DownloadObjectsOutput {
     /// The number of objects that were successfully downloaded
     pub fn objects_downloaded(&self) -> u64 {
         self.objects_downloaded
-    }
-
-    /// The number of objects that failed to be downloaded
-    pub fn objects_failed(&self) -> u64 {
-        self.objects_failed
     }
 
     /// A slice of failed object transfers
@@ -49,7 +41,6 @@ impl DownloadObjectsOutput {
 #[derive(Debug, Default)]
 pub struct DownloadObjectsOutputBuilder {
     pub(crate) objects_downloaded: u64,
-    pub(crate) objects_failed: u64,
     pub(crate) failed_transfers: Option<Vec<FailedDownloadTransfer>>,
 }
 
@@ -63,17 +54,6 @@ impl DownloadObjectsOutputBuilder {
     /// The number of objects that were successfully downloaded
     pub fn get_objects_download(&self) -> u64 {
         self.objects_downloaded
-    }
-
-    /// The number of objects that failed to be downloaded
-    pub fn objects_failed(mut self, input: u64) -> Self {
-        self.objects_failed = input;
-        self
-    }
-
-    /// The number of objects that failed to be downloaded
-    pub fn get_objects_failed(&self) -> u64 {
-        self.objects_failed
     }
 
     /// Append a failed transfer.
