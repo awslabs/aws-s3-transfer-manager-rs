@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use core::fmt;
 use std::sync::Arc;
 
 use crate::error::DownloadError;
@@ -78,14 +79,22 @@ pub enum FailedTransferPolicy {
     #[default]
     Abort,
     /// Continue the transfer. Any failure will be logged and the details of all failed
-    /// objects will be available in the response after the transfer completes.
+    /// objects will be available in the output after the transfer completes.
     Continue,
 }
 
 /// A filter for downloading objects from S3
 #[derive(Clone)]
 pub struct DownloadFilter {
-    pub(crate) predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool>,
+    pub(crate) _predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool>,
+}
+
+impl fmt::Debug for DownloadFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut formatter = f.debug_struct("DownloadFilter");
+        formatter.field("predicate", &"<closure>");
+        formatter.finish()
+    }
 }
 
 impl<F> From<F> for DownloadFilter
@@ -94,7 +103,7 @@ where
 {
     fn from(value: F) -> Self {
         DownloadFilter {
-            predicate: Arc::new(value),
+            _predicate: Arc::new(value),
         }
     }
 }

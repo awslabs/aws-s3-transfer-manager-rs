@@ -23,7 +23,7 @@ impl DownloadObjectsFluentBuilder {
         }
     }
 
-    /// Initiate au download transfer for multiple objects
+    /// Initiate a download transfer for multiple objects
     pub async fn send(self) -> Result<DownloadObjectsHandle, DownloadObjectsError> {
         // FIXME - need DownloadObjectsError to support this conversion to remove expect() in favor of ?
         let input = self.inner.build().expect("valid input");
