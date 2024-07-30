@@ -3,6 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use core::fmt;
+use std::sync::Arc;
+
+use crate::error::DownloadError;
+
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -61,5 +66,67 @@ impl AbortedUpload {
     /// not present for uploads that did not utilize a multipart upload
     pub fn request_charged(&self) -> &Option<aws_sdk_s3::types::RequestCharged> {
         &self.request_charged
+    }
+}
+
+/// Policy for how to handle a failure of any indiviudal object in a transfer
+/// involving multiple objects.
+///
+/// Default is to abort the transfer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum FailedTransferPolicy {
+    /// Abort the transfer on any individual failure to upload or download an object
+    #[default]
+    Abort,
+    /// Continue the transfer. Any failure will be logged and the details of all failed
+    /// objects will be available in the output after the transfer completes.
+    Continue,
+}
+
+/// A filter for downloading objects from S3
+#[derive(Clone)]
+pub struct DownloadFilter {
+    pub(crate) _predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool>,
+}
+
+impl fmt::Debug for DownloadFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut formatter = f.debug_struct("DownloadFilter");
+        formatter.field("predicate", &"<closure>");
+        formatter.finish()
+    }
+}
+
+impl<F> From<F> for DownloadFilter
+where
+    F: Fn(&aws_sdk_s3::types::Object) -> bool + 'static,
+{
+    fn from(value: F) -> Self {
+        DownloadFilter {
+            _predicate: Arc::new(value),
+        }
+    }
+}
+
+/// Detailed information about a failed object download transfer
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct FailedDownloadTransfer {
+    /// The input for the download object operation that failed
+    pub(crate) input: crate::operation::download::DownloadInput,
+
+    /// The error encountered downloading the object
+    pub(crate) error: DownloadError,
+}
+
+impl FailedDownloadTransfer {
+    /// The input for the download object operation that failed
+    pub fn input(&self) -> &crate::operation::download::DownloadInput {
+        &self.input
+    }
+
+    /// The error encountered downloading the object
+    pub fn error(&self) -> &DownloadError {
+        &self.error
     }
 }

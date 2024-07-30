@@ -310,7 +310,7 @@ impl DownloadInput {
     }
 }
 
-/// A builder for [`DownloadInput`](crate::operation::get_object::DownloadInput).
+/// A builder for [`DownloadInput`].
 #[derive(Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct DownloadInputBuilder {
@@ -829,7 +829,7 @@ impl DownloadInputBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         &self.checksum_mode
     }
-    /// Consumes the builder and constructs a [`DownloadInput`](crate::operation::download::DownloadInput).
+    /// Consumes the builder and constructs a [`DownloadInput`].
     pub fn build(self) -> Result<DownloadInput, ::aws_smithy_types::error::operation::BuildError> {
         Result::Ok(DownloadInput {
             bucket: self.bucket,

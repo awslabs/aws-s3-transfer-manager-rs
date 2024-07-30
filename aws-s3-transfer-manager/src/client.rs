@@ -139,4 +139,41 @@ impl Client {
     pub fn download(&self) -> crate::operation::download::builders::DownloadFluentBuilder {
         crate::operation::download::builders::DownloadFluentBuilder::new(self.handle.clone())
     }
+
+    /// Download multiple objects from an Amazon S3 bucket to a local directory
+    ///
+    /// Constructs a fluent builder for the
+    /// [`DownloadObjects`](crate::operation::download_objects::builders::DownloadObjectsFluentBuilder) operation.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use std::path::PathBuf;
+    /// use aws_s3_transfer_manager::operation::download_objects::DownloadObjectsError;
+    ///
+    /// async fn download_bucket(
+    ///     client: &aws_s3_transfer_manager::Client,
+    ///     dest: PathBuf
+    /// ) -> Result<(), DownloadObjectsError> {
+    ///
+    ///     let handle = client
+    ///         .download_objects()
+    ///         .bucket("my-bucket")
+    ///         .destination(dest)
+    ///         .send()
+    ///         .await?;
+    ///
+    ///     // wait for transfer to complete
+    ///     handle.join().await?;
+    ///
+    ///     Ok(())
+    /// }
+    ///
+    /// ```
+    pub fn download_objects(
+        &self,
+    ) -> crate::operation::download_objects::builders::DownloadObjectsFluentBuilder {
+        crate::operation::download_objects::builders::DownloadObjectsFluentBuilder::new(
+            self.handle.clone(),
+        )
+    }
 }

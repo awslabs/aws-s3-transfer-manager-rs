@@ -8,3 +8,6 @@ pub mod upload;
 
 /// Types for single object download operation
 pub mod download;
+
+/// Types for multiple object download operation
+pub mod download_objects;

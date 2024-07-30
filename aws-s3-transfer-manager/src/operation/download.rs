@@ -5,9 +5,7 @@
 
 mod input;
 
-use std::sync::Arc;
-
-/// Request type for uploads to Amazon S3
+/// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
 /// Abstractions for response bodies and consuming data streams.
@@ -29,6 +27,7 @@ use crate::error::TransferError;
 use body::Body;
 use context::DownloadContext;
 use discovery::{discover_obj, ObjectDiscovery};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::Instrument;

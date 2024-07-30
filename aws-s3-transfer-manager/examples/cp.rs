@@ -51,6 +51,10 @@ pub struct Args {
     /// Enable tokio console (requires RUSTFLAGS="--cfg tokio_unstable")
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     tokio_console: bool,
+
+    /// Command is performed on all files or objects under the specified directory or prefix
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    recursive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +132,10 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
     let (bucket, key) = args.source.expect_s3().parts();
 
+    if args.recursive {
+        todo!("implement recursive download")
+    }
+
     let dest = fs::File::create(args.dest.expect_local()).await?;
     println!("dest file opened, starting download");
 
@@ -158,6 +166,10 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 }
 
 async fn do_upload(args: Args) -> Result<(), BoxError> {
+    if args.recursive {
+        unimplemented!("recursive upload not supported yet")
+    }
+
     let config = aws_config::from_env().load().await;
     warmup(&config).await?;
 
