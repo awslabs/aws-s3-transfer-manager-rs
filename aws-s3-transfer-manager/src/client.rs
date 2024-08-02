@@ -184,7 +184,7 @@ impl Client {
     ///
     /// Examples
     /// ```no_run
-    /// use std::Path::Path;
+    /// use std::path::Path;
     /// use aws_s3_transfer_manager::operation::upload_objects::UploadObjectsError;
     ///
     /// async fn upload_directory(
