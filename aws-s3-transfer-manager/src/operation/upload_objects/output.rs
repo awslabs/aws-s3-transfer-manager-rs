@@ -62,7 +62,7 @@ impl UploadObjectsOutputBuilder {
         self
     }
 
-    /// The list of failed uploads
+    /// The list of any failed uploads
     pub fn set_failed_transfers(mut self, input: Vec<FailedUploadTransfer>) -> Self {
         self.failed_transfers = input;
         self

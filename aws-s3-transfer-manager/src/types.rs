@@ -108,8 +108,7 @@ where
     }
 }
 
-/// A filter for uploading objects to S3.
-/// Return true if the file should be uploaded.
+/// A filter for choosing which objects to upload to S3.
 #[derive(Clone)]
 pub struct UploadFilter {
     pub(crate) _predicate: Arc<dyn Fn(&UploadFilterItem) -> bool>,
@@ -139,6 +138,10 @@ where
 #[derive(Debug)]
 pub struct UploadFilterItem {
     path: std::path::PathBuf,
+
+    // TODO - Should we be passing std::fs::Metadata? It avoids additional syscalls
+    // from naive calls to path.is_dir(), path.is_symlink(), etc. Should
+    // we pass our own custom type so we're not tied to std::fs::Metadata?
     metadata: std::fs::Metadata,
 }
 
@@ -150,7 +153,7 @@ impl UploadFilterItem {
 
     /// Metadata for the file.
     /// Use this Metadata for queries like `is_dir()` and `is_symlink()`.
-    /// It is more efficient than `Path.is_dir()`, which looks up the metadata again under the hood.
+    /// This is more efficient than `Path.is_dir()`, which looks up the metadata again with each call.
     pub fn metadata(&self) -> &std::fs::Metadata {
         &self.metadata
     }

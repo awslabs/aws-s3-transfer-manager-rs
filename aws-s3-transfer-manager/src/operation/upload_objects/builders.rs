@@ -106,18 +106,17 @@ impl UploadObjectsFluentBuilder {
 
     // TODO - download version of filter() takes Fn instead of Into
 
-    // TODO - IS it a good idea to filter directories too?
-    // or just do files for simplicity? or because DownloadFilter can't do directories
+    // TODO - should we filter directories too? not just files?
+    // only-files is simpler, and matches what DownloadFilter can do.
+    // but filtering out a directory in 1 call is more efficient than filtering out N files within it.
+    // we could add it later, via new property `dir_filter: UploadFilter`
+    // or new bool `filter_dirs: bool`
 
     // TODO - We COULD just let the user handle recursion and symlinks themselves
     // via the filter, instead of via bools, ... but that's probably a footgun.
 
     // TODO - TransferManager should prevent infinite recursion from symlinks.
     // Should it skip ALL symbolic links that point elsewhere within the upload dir?
-
-    // TODO - Should we be passing std::fs::Metadata? It avoids additional syscalls
-    // from naive calls to path.is_dir(), path.is_symlink(), etc. Should
-    // we pass our own custom type so we're not tied to std::fs::Metadata?
 
     /// The filter for choosing which files to upload.
     pub fn set_filter(mut self, input: Option<UploadFilter>) -> Self {

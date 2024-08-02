@@ -184,6 +184,27 @@ impl Client {
     ///
     /// Examples
     /// ```no_run
+    /// use std::Path::Path;
+    /// use aws_s3_transfer_manager::operation::upload_objects::UploadObjectsError;
+    ///
+    /// async fn upload_directory(
+    ///     client: &aws_s3_transfer_manager::Client,
+    ///     source: &Path,
+    /// ) -> Result<(), UploadObjectsError> {
+    ///
+    ///     let handle = client
+    ///         .upload_objects()
+    ///         .source(source)
+    ///         .bucket("my-bucket")
+    ///         .recursive(true)
+    ///         .send()
+    ///         .await?;
+    ///
+    ///     // wait for transfer to complete
+    ///     handle.join().await?;
+    ///
+    ///     Ok(())
+    /// }
     ///
     /// ```
     pub fn upload_objects(

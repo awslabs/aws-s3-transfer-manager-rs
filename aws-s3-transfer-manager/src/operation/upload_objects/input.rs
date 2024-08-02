@@ -11,8 +11,6 @@ use crate::types::{FailedTransferPolicy, UploadFilter};
 
 // TODO - should required stuff in the Input struct (i.e. bucket) be Optional?
 
-// TODO - should stuff with fallback values (i.e. s3_delimiter) be Optional?
-
 // TODO - should stuff like s3_delimiter (which defaults to "/") be an String or Option<String>,
 
 // TODO - docs and examples on the interaction of prefix & delimiter
