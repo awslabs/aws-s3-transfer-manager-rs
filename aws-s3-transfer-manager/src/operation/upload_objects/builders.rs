@@ -19,9 +19,6 @@ pub struct UploadObjectsFluentBuilder {
 // TODO - should Builder getters be nice like the Input getters?
 // e.g. Option<&str> instead of &Option<String>
 
-// TODO - can we reduce the copy-pastastravaganza? only have 1 builder type?
-// macromagic? point to canonical documentation on client.upload_objects()?
-
 impl UploadObjectsFluentBuilder {
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> Self {
         Self {
