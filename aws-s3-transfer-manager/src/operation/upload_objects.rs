@@ -15,9 +15,9 @@ mod handle;
 pub use handle::UploadObjectsHandle;
 
 mod output;
-pub use output::UploadObjectsOutput;
+pub use output::{UploadObjectsOutput, UploadObjectsOutputBuilder};
 
-/// Operation struct for uploading multiple objects from Amazon S3
+/// Operation struct for uploading multiple objects to Amazon S3
 #[derive(Clone, Default, Debug)]
 pub(crate) struct UploadObjects;
 

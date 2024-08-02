@@ -4,9 +4,9 @@
  */
 
 use core::fmt;
-use std::{fs::Metadata, path::Path, sync::Arc};
+use std::sync::Arc;
 
-use crate::error::DownloadError;
+use crate::error::{DownloadError, UploadError};
 
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
@@ -109,10 +109,10 @@ where
 }
 
 /// A filter for uploading objects to S3.
-/// Given a Path and its Metadata, return true if it should be uploaded.
+/// Return true if the file should be uploaded.
 #[derive(Clone)]
 pub struct UploadFilter {
-    pub(crate) _predicate: Arc<dyn Fn(&Path, &Metadata) -> bool>,
+    pub(crate) _predicate: Arc<dyn Fn(&UploadFilterItem) -> bool>,
 }
 
 impl fmt::Debug for UploadFilter {
@@ -125,12 +125,34 @@ impl fmt::Debug for UploadFilter {
 
 impl<F> From<F> for UploadFilter
 where
-    F: Fn(&Path, &Metadata) -> bool + 'static,
+    F: Fn(&UploadFilterItem) -> bool + 'static,
 {
     fn from(value: F) -> Self {
         UploadFilter {
             _predicate: Arc::new(value),
         }
+    }
+}
+
+/// An item passed to [`UploadFilter`] for evaluation
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct UploadFilterItem {
+    path: std::path::PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+impl UploadFilterItem {
+    /// Full path to the file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Metadata for the file.
+    /// Use this Metadata for queries like `is_dir()` and `is_symlink()`.
+    /// It is more efficient than `Path.is_dir()`, which looks up the metadata again under the hood.
+    pub fn metadata(&self) -> &std::fs::Metadata {
+        &self.metadata
     }
 }
 
@@ -153,6 +175,40 @@ impl FailedDownloadTransfer {
 
     /// The error encountered downloading the object
     pub fn error(&self) -> &DownloadError {
+        &self.error
+    }
+}
+
+/// Detailed information about a failed upload
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct FailedUploadTransfer {
+    // TODO - should we include path? should we wrap UploadInput in an Option?
+    // there could be an error with the file before we even assemble an UploadInput
+
+    // TODO - what about an error caused by a directory?
+    // like, user doesn't have permission to read subdirectory,
+    // but they're using FailedTransferPolicy::Continue, so
+    // it probably shouldn't be fatal, but they'd probably
+    // want the failure list to indicate that it wasn't a perfect run
+
+    // TODO - Does "FailedUploadTransfer" violate the Consistent Word Order rule?
+    // Should it start with "Upload" or be like "UploadObjectsFailure"?
+
+    // TODO - Omit "Transfer" from struct name?
+    // "Transfer" is generic for "upload or download" but this already has "Upload" in the name
+    pub(crate) input: crate::operation::upload::UploadInput,
+    pub(crate) error: UploadError,
+}
+
+impl FailedUploadTransfer {
+    /// The input for the failed object upload
+    pub fn input(&self) -> &crate::operation::upload::UploadInput {
+        &self.input
+    }
+
+    /// The error encountered uploading the object
+    pub fn error(&self) -> &UploadError {
         &self.error
     }
 }

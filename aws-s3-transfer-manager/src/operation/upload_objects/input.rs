@@ -7,19 +7,20 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{FailedTransferPolicy, UploadFilter};
 
+// TODO - consistent naming for "s3_delimiter" and "s3_prefix" between upload_objects and download_objects
+
+// TODO - should required stuff in the Input struct (i.e. bucket) be Optional?
+
+// TODO - should stuff with fallback values (i.e. s3_delimiter) be Optional?
+
+// TODO - should stuff like s3_delimiter (which defaults to "/") be an String or Option<String>,
+
+// TODO - docs and examples on the interaction of prefix & delimiter
+
 /// Input type for uploading multiple objects
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct UploadObjectsInput {
-    // TODO - consistent naming for "s3_delimiter" and "s3_prefix" between upload_objects and download_objects
-
-    // TODO - should required stuff (i.e. bucket) be Optional?
-
-    // TODO - should stuff with fallback values (i.e. s3_delimiter) be Optional?
-
-    // TODO - should stuff like s3_delimiter (which defaults to "/") be an String or Option<String>,
-
-    // TODO - docs and examples on the interaction of prefix & delimiter
     /// The S3 bucket name that objects will upload to.
     pub bucket: Option<String>,
 
@@ -30,7 +31,7 @@ pub struct UploadObjectsInput {
     pub recursive: bool,
 
     /// Whether to follow symbolic links when traversing the local file tree.
-    pub follow_symbolic_links: bool,
+    pub follow_symlinks: bool,
 
     /// The filter for choosing which files to upload.
     pub filter: Option<UploadFilter>,
@@ -62,8 +63,8 @@ impl UploadObjectsInput {
     }
 
     /// Whether to follow symbolic links when traversing the local file tree.
-    pub fn follow_symbolic_links(&self) -> bool {
-        self.follow_symbolic_links
+    pub fn follow_symlinks(&self) -> bool {
+        self.follow_symlinks
     }
 
     /// The filter for choosing which files to upload.
@@ -94,7 +95,7 @@ pub struct UploadObjectsInputBuilder {
     pub(crate) bucket: Option<String>,
     pub(crate) source: Option<PathBuf>,
     pub(crate) recursive: bool,
-    pub(crate) follow_symbolic_links: bool,
+    pub(crate) follow_symlinks: bool,
     pub(crate) filter: Option<UploadFilter>,
     pub(crate) s3_prefix: Option<String>,
     pub(crate) s3_delimiter: Option<String>,
@@ -102,8 +103,6 @@ pub struct UploadObjectsInputBuilder {
 }
 
 impl UploadObjectsInputBuilder {
-    // TODO - setters/getters
-
     /// Consumes the builder and constructs an [`UploadObjectsInput`]
     pub fn build(
         self,
@@ -114,107 +113,129 @@ impl UploadObjectsInputBuilder {
             bucket: self.bucket,
             source: self.source,
             recursive: self.recursive,
-            follow_symbolic_links: self.follow_symbolic_links,
+            follow_symlinks: self.follow_symlinks,
             filter: self.filter,
             s3_prefix: self.s3_prefix,
             s3_delimiter: self.s3_delimiter.or(Some("/".into())),
             failure_policy: self.failure_policy,
         })
     }
+
+    /// The S3 bucket name that objects will upload to.
+    pub fn bucket(mut self, input: impl Into<String>) -> Self {
+        self.bucket = Some(input.into());
+        self
+    }
+
+    /// The S3 bucket name that objects will upload to.
+    pub fn set_bucket(mut self, input: Option<String>) -> Self {
+        self.bucket = input;
+        self
+    }
+
+    /// The S3 bucket name that objects will upload to.
+    pub fn get_bucket(&self) -> &Option<String> {
+        &self.bucket
+    }
+
+    /// The local directory to upload from.
+    pub fn source(mut self, input: impl Into<PathBuf>) -> Self {
+        self.source = Some(input.into());
+        self
+    }
+
+    /// The local directory to upload from.
+    pub fn set_source(mut self, input: Option<PathBuf>) -> Self {
+        self.source = input;
+        self
+    }
+
+    /// The local directory to upload from.
+    pub fn get_source(&self) -> &Option<PathBuf> {
+        &self.source
+    }
+
+    /// Whether to recurse into subdirectories when traversing local file tree.
+    pub fn recursive(mut self, input: bool) -> Self {
+        self.recursive = input;
+        self
+    }
+
+    /// Whether to recurse into subdirectories when traversing local file tree.
+    pub fn get_recursive(&self) -> bool {
+        self.recursive
+    }
+
+    /// Whether to follow symbolic links when traversing the local file tree.
+    pub fn follow_symlinks(mut self, input: bool) -> Self {
+        self.follow_symlinks = input;
+        self
+    }
+
+    /// Whether to follow symbolic links when traversing the local file tree.
+    pub fn get_follow_symlinks(&self) -> bool {
+        self.follow_symlinks
+    }
+
+    /// The filter for choosing which files to upload.
+    pub fn filter(mut self, input: impl Into<UploadFilter>) -> Self {
+        self.filter = Some(input.into());
+        self
+    }
+
+    /// The filter for choosing which files to upload.
+    pub fn set_filter(mut self, input: Option<UploadFilter>) -> Self {
+        self.filter = input;
+        self
+    }
+
+    /// The filter for choosing which files to upload.
+    pub fn get_filter(&self) -> &Option<UploadFilter> {
+        &self.filter
+    }
+
+    /// The S3 key prefix to use for each object.
+    pub fn s3_prefix(mut self, input: impl Into<String>) -> Self {
+        self.s3_prefix = Some(input.into());
+        self
+    }
+
+    /// The S3 key prefix to use for each object.
+    pub fn set_s3_prefix(mut self, input: Option<String>) -> Self {
+        self.s3_prefix = input;
+        self
+    }
+
+    /// The S3 key prefix to use for each object.
+    pub fn get_s3_prefix(&self) -> &Option<String> {
+        &self.s3_prefix
+    }
+
+    /// The S3 delimiter.
+    pub fn s3_delimiter(mut self, input: impl Into<String>) -> Self {
+        self.s3_delimiter = Some(input.into());
+        self
+    }
+
+    /// The S3 delimiter.
+    pub fn set_s3_delimiter(mut self, input: Option<String>) -> Self {
+        self.s3_delimiter = input;
+        self
+    }
+
+    /// The S3 delimiter.
+    pub fn get_s3_delimiter(&self) -> &Option<String> {
+        &self.s3_delimiter
+    }
+
+    /// The failure policy to use when any individual object upload fails.
+    pub fn failure_policy(mut self, input: FailedTransferPolicy) -> Self {
+        self.failure_policy = input;
+        self
+    }
+
+    /// The failure policy to use when any individual object upload fails.
+    pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
+        &self.failure_policy
+    }
 }
-
-// impl UploadObjectsInputBuilder {
-//     pub fn bucket(mut self, input: impl Into<String>) -> Self {
-//         self.set_bucket(Some(input.into()))
-//     }
-
-//     pub fn set_bucket(mut self, input: Option<String>) -> Self {
-//         self.model.bucket = input;
-//         self
-//     }
-
-//     pub fn get_bucket(&self) -> Option<&str> {
-//         self.model.bucket()
-//     }
-
-//     pub fn source(mut self, input: impl Into<PathBuf>) -> Self {
-//         self.set_source(Some(input.into()))
-//     }
-
-//     pub fn set_source(mut self, input: Option<PathBuf>) -> Self {
-//         self.model.source = input;
-//         self
-//     }
-
-//     pub fn get_source(&self) -> Option<&Path> {
-//         self.model.source()
-//     }
-
-//     pub fn follow_symbolic_links(mut self, input: bool) -> Self {
-//         self.model.follow_symbolic_links = input;
-//         self
-//     }
-
-//     pub fn get_follow_symbolic_links(&self) -> bool {
-//         self.model.follow_symbolic_links
-//     }
-
-//     pub fn recursive(mut self, input: bool) -> Self {
-//         self.model.recursive = input;
-//         self
-//     }
-
-//     pub fn get_recursive(&self) -> bool {
-//         self.model.recursive
-//     }
-
-//     pub fn s3_prefix(mut self, input: impl Into<String>) -> Self {
-//         self.set_s3_prefix(Some(input.into()))
-//     }
-
-//     pub fn set_s3_prefix(mut self, input: Option<String>) -> Self {
-//         self.model.s3_prefix = input;
-//         self
-//     }
-
-//     pub fn get_s3_prefix(&self) -> &Option<String> {
-//         &self.model.s3_prefix
-//     }
-
-//     pub fn s3_delimiter(mut self, input: impl Into<String>) -> Self {
-//         self.set_s3_delimiter(Some(input.into()))
-//     }
-
-//     pub fn set_s3_delimiter(mut self, input: Option<String>) -> Self {
-//         self.model.s3_delimiter = input;
-//         self
-//     }
-
-//     pub fn get_s3_delimiter(&self) -> &Option<String> {
-//         &self.model.s3_delimiter
-//     }
-
-//     // TODO: download version of this takes Fn instead of Into
-
-//     pub fn filter(mut self, input: impl Into<UploadFilter>) -> Self {
-//         self.set_filter(Some(input.into()))
-//     }
-
-//     pub fn set_filter(mut self, input: Option<UploadFilter>) -> Self {
-//         self.model.filter = input;
-//         self
-//     }
-
-//     pub fn get_filter(&self) -> &Option<UploadFilter> {
-//         &self.model.filter
-//     }
-
-//     pub fn failure_policy(mut self, input: FailedTransferPolicy) -> Self {
-//         self.model.failure_policy = input;
-//         self
-//     }
-
-//     pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
-//         self.model.failure_policy
-//     }
-// }
