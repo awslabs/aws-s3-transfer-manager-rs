@@ -4,7 +4,7 @@
  */
 
 use core::fmt;
-use std::sync::Arc;
+use std::{fs::Metadata, path::Path, sync::Arc};
 
 use crate::error::DownloadError;
 
@@ -103,6 +103,32 @@ where
 {
     fn from(value: F) -> Self {
         DownloadFilter {
+            _predicate: Arc::new(value),
+        }
+    }
+}
+
+/// A filter for uploading objects to S3.
+/// Given a Path and its Metadata, return true if it should be uploaded.
+#[derive(Clone)]
+pub struct UploadFilter {
+    pub(crate) _predicate: Arc<dyn Fn(&Path, &Metadata) -> bool>,
+}
+
+impl fmt::Debug for UploadFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut formatter = f.debug_struct("UploadFilter");
+        formatter.field("predicate", &"<closure>");
+        formatter.finish()
+    }
+}
+
+impl<F> From<F> for UploadFilter
+where
+    F: Fn(&Path, &Metadata) -> bool + 'static,
+{
+    fn from(value: F) -> Self {
+        UploadFilter {
             _predicate: Arc::new(value),
         }
     }

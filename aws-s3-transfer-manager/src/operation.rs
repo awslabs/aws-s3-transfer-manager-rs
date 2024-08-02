@@ -11,3 +11,6 @@ pub mod download;
 
 /// Types for multiple object download operation
 pub mod download_objects;
+
+/// Types for multiple object upload operation
+pub mod upload_objects;

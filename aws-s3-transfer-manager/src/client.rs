@@ -94,7 +94,7 @@ impl Client {
     ///         .body(stream)
     ///         .send()
     ///         .await?;
-    ///     
+    ///
     ///     // send() may return before the transfer is complete.
     ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
     ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
@@ -173,6 +173,23 @@ impl Client {
         &self,
     ) -> crate::operation::download_objects::builders::DownloadObjectsFluentBuilder {
         crate::operation::download_objects::builders::DownloadObjectsFluentBuilder::new(
+            self.handle.clone(),
+        )
+    }
+
+    /// Upload multiple objects from a local directory to an Amazon S3 bucket
+    ///
+    /// Constructs a fluent builder for the
+    /// [`UploadObjects`](crate::operation::upload_objects::builders::UploadObjectsFluentBuilder) operation.
+    ///
+    /// Examples
+    /// ```no_run
+    ///
+    /// ```
+    pub fn upload_objects(
+        &self,
+    ) -> crate::operation::upload_objects::builders::UploadObjectsFluentBuilder {
+        crate::operation::upload_objects::builders::UploadObjectsFluentBuilder::new(
             self.handle.clone(),
         )
     }
