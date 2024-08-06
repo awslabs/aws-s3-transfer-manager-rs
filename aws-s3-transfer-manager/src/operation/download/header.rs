@@ -38,7 +38,7 @@ impl From<Range> for String {
 }
 
 impl FromStr for Range {
-    type Err = error::TransferError;
+    type Err = error::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut iter = s.splitn(2, '=');
@@ -46,18 +46,18 @@ impl FromStr for Range {
             (Some("bytes"), Some(range)) => {
                 if range.contains(',') {
                     // TODO(aws-sdk-rust#1159) - error S3 doesn't support multiple byte ranges
-                    Err(error::invalid_meta_request(format!(
+                    Err(error::invalid_input(format!(
                         "multiple byte ranges not supported for range header {}",
                         s
                     )))
                 } else {
                     let spec = ByteRange::from_str(range).map_err(|_| {
-                        error::invalid_meta_request(format!("invalid range header {}", s))
+                        error::invalid_input(format!("invalid range header {}", s))
                     })?;
                     Ok(Range(spec))
                 }
             }
-            _ => Err(error::invalid_meta_request(format!(
+            _ => Err(error::invalid_input(format!(
                 "unsupported byte range header format `{s}`; see https://www.rfc-editor.org/rfc/rfc9110.html#name-range for valid formats"
             ))),
         }
@@ -107,7 +107,8 @@ impl FromStr for ByteRange {
 #[cfg(test)]
 mod tests {
     use super::{ByteRange, Range};
-    use crate::error::TransferError;
+    use crate::error;
+    use aws_smithy_types::error::display::DisplayErrorContext;
     use std::str::FromStr;
 
     #[test]
@@ -126,10 +127,11 @@ mod tests {
         );
     }
 
-    fn assert_err_contains(r: Result<Range, TransferError>, msg: &str) {
+    fn assert_err_contains(r: Result<Range, error::Error>, msg: &str) {
         let err = r.unwrap_err();
-        match err {
-            TransferError::InvalidMetaRequest(m) => {
+        match err.kind() {
+            error::ErrorKind::InputInvalid => {
+                let m = DisplayErrorContext(err).to_string();
                 assert!(m.contains(msg), "'{}' does not contain '{}'", m, msg);
             }
             _ => panic!("unexpected error type"),

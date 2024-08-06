@@ -11,7 +11,7 @@ mod output;
 mod context;
 mod handle;
 
-use crate::error::UploadError;
+use crate::error;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
 use crate::io::InputStream;
 use aws_sdk_s3::primitives::ByteStream;
@@ -39,7 +39,7 @@ impl Upload {
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
-    ) -> Result<UploadHandle, UploadError> {
+    ) -> Result<UploadHandle, error::Error> {
         let min_mpu_threshold = handle.mpu_threshold_bytes();
 
         let stream = input.take_body();
@@ -75,7 +75,7 @@ async fn try_start_mpu_upload(
     handle: &mut UploadHandle,
     stream: InputStream,
     content_length: u64,
-) -> Result<(), UploadError> {
+) -> Result<(), crate::error::Error> {
     let part_size = cmp::max(
         handle.ctx.handle.upload_part_size_bytes(),
         content_length / MAX_PARTS,
@@ -116,7 +116,7 @@ fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadCo
 }
 
 /// start a new multipart upload by invoking `CreateMultipartUpload`
-async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, UploadError> {
+async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::error::Error> {
     let req = handle.ctx.request();
     let client = handle.ctx.client();
 
@@ -164,7 +164,7 @@ async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, UploadE
 async fn upload_parts(
     ctx: UploadContext,
     reader: Arc<impl ReadPart>,
-) -> Result<Vec<CompletedPart>, UploadError> {
+) -> Result<Vec<CompletedPart>, error::Error> {
     let mut completed_parts = Vec::new();
     loop {
         let part_result = reader.next_part().await?;

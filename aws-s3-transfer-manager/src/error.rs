@@ -3,127 +3,165 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_smithy_types::byte_stream;
-use std::io;
+use std::fmt;
 
-// TODO(design): revisit errors
+/// A boxed error that is `Send` and `Sync`.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Failed transfer result
-#[derive(thiserror::Error, Debug)]
-pub enum TransferError {
-    /// The request was invalid
-    #[error("invalid meta request: {0}")]
-    InvalidMetaRequest(String),
+use aws_sdk_s3::error::ProvideErrorMetadata;
 
-    /// A download failed
-    #[error("download failed")]
-    DownloadFailed(#[from] DownloadError),
-
-    /// A upload failed
-    #[error("upload failed")]
-    UploadFailed(#[from] UploadError),
+/// Errors returned by this library
+///
+/// NOTE: Use [`aws_smithy_types::error::display::DisplayErrorContext`] or similar to display
+/// the entire error cause/source chain.
+#[derive(Debug)]
+pub struct Error {
+    kind: ErrorKind,
+    source: BoxError,
 }
 
-pub(crate) type GetObjectSdkError = ::aws_smithy_runtime_api::client::result::SdkError<
-    aws_sdk_s3::operation::get_object::GetObjectError,
-    ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
->;
-pub(crate) type HeadObjectSdkError = ::aws_smithy_runtime_api::client::result::SdkError<
-    aws_sdk_s3::operation::head_object::HeadObjectError,
-    ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
->;
+/// General categories of transfer errors.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Operation input validation issues
+    InputInvalid,
 
-/// An error related to downloading an object
-#[derive(thiserror::Error, Debug)]
-pub enum DownloadError {
-    /// Discovery of object metadata failed
-    #[error(transparent)]
-    DiscoverFailed(SdkOperationError),
+    /// I/O errors
+    IOError,
 
-    /// A failure occurred fetching a single chunk of the overall object data
-    #[error("download chunk failed")]
-    ChunkFailed {
-        /// The underlying SDK error
-        source: SdkOperationError,
-    },
+    /// Some kind of internal runtime issue (e.g. task failure, poisoned mutex, etc)
+    RuntimeError,
+
+    /// Object discovery failed
+    ObjectNotDiscoverable,
+
+    /// Failed to upload or download a chunk of an object
+    ChunkFailed,
+
+    /// Resource not found (e.g. bucket, key, multipart upload ID not found)
+    NotFound,
+
+    /// child operation failed (e.g. download of a single object as part of downloading all objects from a bucket)
+    ChildOperationFailed,
+
+    /// A custom error that does not fall under any other error kind
+    Other,
 }
 
-pub(crate) type CreateMultipartUploadSdkError = ::aws_smithy_runtime_api::client::result::SdkError<
-    aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError,
-    ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
->;
+impl Error {
+    /// Creates a new transfer [`Error`] from a known kind of error as well as an arbitrary error
+    /// source.
+    pub fn new<E>(kind: ErrorKind, err: E) -> Error
+    where
+        E: Into<BoxError>,
+    {
+        Error {
+            kind,
+            source: err.into(),
+        }
+    }
 
-pub(crate) type UploadPartSdkError = ::aws_smithy_runtime_api::client::result::SdkError<
-    aws_sdk_s3::operation::upload_part::UploadPartError,
-    ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
->;
+    /// Creates a new transfer [`Error`] from an arbitrary payload.
+    ///
+    /// This function is a shortcut for [`Error::new`] with [`ErrorKind::Other`]
+    pub fn other<E>(err: E) -> Error
+    where
+        E: Into<BoxError>,
+    {
+        Error::new(ErrorKind::Other, err)
+    }
 
-pub(crate) type CompleteMultipartUploadSdkError =
-    ::aws_smithy_runtime_api::client::result::SdkError<
-        aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError,
-        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
-    >;
-
-pub(crate) type AbortMultipartUploadSdkError = ::aws_smithy_runtime_api::client::result::SdkError<
-    aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError,
-    ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
->;
-
-/// An error related to upload an object
-#[derive(thiserror::Error, Debug)]
-pub enum UploadError {
-    /// An error occurred invoking [aws_sdk_s3::Client::CreateMultipartUpload]
-    #[error(transparent)]
-    CreateMultipartUpload(#[from] CreateMultipartUploadSdkError),
-
-    /// An error occurred invoking [aws_sdk_s3::Client::CreateMultipartUpload]
-    #[error(transparent)]
-    CompleteMultipartUpload(#[from] CompleteMultipartUploadSdkError),
-
-    /// An error occurred invoking [aws_sdk_s3::Client::UploadPart]
-    #[error(transparent)]
-    UploadPart(#[from] UploadPartSdkError),
-
-    /// An error occurred invoking [aws_sdk_s3::Client::AbortMultipartUpload]
-    #[error(transparent)]
-    AbortMultipartUpload(#[from] AbortMultipartUploadSdkError),
-
-    /// An I/O error occurred
-    #[error(transparent)]
-    IOError(#[from] crate::io::error::Error),
+    /// Returns the corresponding [`ErrorKind`] for this error.
+    pub fn kind(&self) -> ErrorKind {
+        self.kind.clone()
+    }
 }
 
-/// An underlying S3 SDK error
-#[derive(thiserror::Error, Debug)]
-pub enum SdkOperationError {
-    /// An error occurred invoking [aws_sdk_s3::Client::head_object]
-    #[error(transparent)]
-    HeadObject(#[from] HeadObjectSdkError),
-
-    /// An error occurred invoking [aws_sdk_s3::Client::get_object]
-    #[error(transparent)]
-    GetObject(#[from] GetObjectSdkError),
-
-    /// An error occurred reading the underlying data
-    #[error(transparent)]
-    ReadError(#[from] byte_stream::error::Error),
-
-    /// An unknown IO error occurred carrying out the request
-    #[error(transparent)]
-    IoError(#[from] io::Error),
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            ErrorKind::InputInvalid => write!(f, "invalid input"),
+            ErrorKind::IOError => write!(f, "I/O error"),
+            ErrorKind::RuntimeError => write!(f, "runtime error"),
+            ErrorKind::ObjectNotDiscoverable => write!(f, "object discovery failed"),
+            ErrorKind::ChunkFailed => write!(f, "failed to process chunk"),
+            ErrorKind::NotFound => write!(f, "resource not found"),
+            ErrorKind::ChildOperationFailed => write!(f, "child operation failed"),
+            ErrorKind::Other => write!(f, "unknown error"),
+        }
+    }
 }
 
-// convenience to construct a TransferError from a chunk failure
-pub(crate) fn chunk_failed<E: Into<SdkOperationError>>(e: E) -> TransferError {
-    DownloadError::ChunkFailed { source: e.into() }.into()
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
-pub(crate) fn invalid_meta_request(message: String) -> TransferError {
-    TransferError::InvalidMetaRequest(message)
+impl From<crate::io::error::Error> for Error {
+    fn from(value: crate::io::error::Error) -> Self {
+        Self::new(ErrorKind::IOError, value)
+    }
 }
 
-impl From<CreateMultipartUploadSdkError> for TransferError {
-    fn from(value: CreateMultipartUploadSdkError) -> Self {
-        TransferError::UploadFailed(value.into())
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::new(ErrorKind::IOError, value)
+    }
+}
+
+impl From<tokio::task::JoinError> for Error {
+    fn from(value: tokio::task::JoinError) -> Self {
+        Self::new(ErrorKind::RuntimeError, value)
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for Error
+where
+    T: Send + Sync + 'static,
+{
+    fn from(value: std::sync::PoisonError<T>) -> Self {
+        Self::new(ErrorKind::RuntimeError, value)
+    }
+}
+
+pub(crate) fn invalid_input<E>(err: E) -> Error
+where
+    E: Into<BoxError>,
+{
+    Error::new(ErrorKind::InputInvalid, err)
+}
+
+pub(crate) fn discovery_failed<E>(err: E) -> Error
+where
+    E: Into<BoxError>,
+{
+    Error::new(ErrorKind::ObjectNotDiscoverable, err)
+}
+
+pub(crate) fn from_kind<E>(kind: ErrorKind) -> impl FnOnce(E) -> Error
+where
+    E: Into<BoxError>,
+{
+    |err| Error::new(kind, err)
+}
+
+impl<E, R> From<aws_sdk_s3::error::SdkError<E, R>> for Error
+where
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+    R: Send + Sync + fmt::Debug + 'static,
+{
+    fn from(value: aws_sdk_s3::error::SdkError<E, R>) -> Self {
+        // TODO - extract request id/metadata
+        let kind = match value.code() {
+            Some("NotFound") | Some("NoSuchKey") | Some("NoSuchUpload") | Some("NoSuchBucket") => {
+                ErrorKind::NotFound
+            }
+            // TODO - is this the rigth error kind? do we need something else?
+            _ => ErrorKind::ChildOperationFailed,
+        };
+
+        Error::new(kind, value)
     }
 }

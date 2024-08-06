@@ -6,8 +6,6 @@
 use core::fmt;
 use std::sync::Arc;
 
-use crate::error::DownloadError;
-
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -116,7 +114,7 @@ pub struct FailedDownloadTransfer {
     pub(crate) input: crate::operation::download::DownloadInput,
 
     /// The error encountered downloading the object
-    pub(crate) error: DownloadError,
+    pub(crate) error: crate::error::Error,
 }
 
 impl FailedDownloadTransfer {
@@ -126,7 +124,7 @@ impl FailedDownloadTransfer {
     }
 
     /// The error encountered downloading the object
-    pub fn error(&self) -> &DownloadError {
+    pub fn error(&self) -> &crate::error::Error {
         &self.error
     }
 }
