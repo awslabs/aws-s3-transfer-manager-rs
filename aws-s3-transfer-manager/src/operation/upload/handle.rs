@@ -104,10 +104,8 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
         todo!("non mpu upload not implemented yet")
     }
 
-    let span = tracing::debug_span!("completing upload", upload_id = handle.ctx.upload_id);
+    let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
     let _enter = span.enter();
-
-    // tracing::trace!("joining upload_id={:?}", handle.ctx.upload_id);
 
     let mut all_parts = Vec::new();
 
@@ -130,10 +128,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
         }
     }
 
-    tracing::trace!(
-        "completing multipart upload: upload_id={:?}",
-        handle.ctx.upload_id
-    );
+    tracing::trace!("completing multipart upload");
 
     // parts must be sorted
     all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
@@ -173,10 +168,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
         .set_expiration(complete_mpu_resp.expiration.clone())
         .set_version_id(complete_mpu_resp.version_id.clone());
 
-    tracing::trace!(
-        "upload completed successfully: upload_id={:?}",
-        handle.ctx.upload_id
-    );
+    tracing::trace!("upload completed successfully");
 
     Ok(resp.build().expect("valid response"))
 }
