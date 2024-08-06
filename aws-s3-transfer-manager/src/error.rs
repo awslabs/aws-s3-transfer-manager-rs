@@ -126,6 +126,12 @@ where
     }
 }
 
+impl From<aws_smithy_types::error::operation::BuildError> for Error {
+    fn from(value: aws_smithy_types::error::operation::BuildError) -> Self {
+        Self::new(ErrorKind::InputInvalid, value)
+    }
+}
+
 pub(crate) fn invalid_input<E>(err: E) -> Error
 where
     E: Into<BoxError>,

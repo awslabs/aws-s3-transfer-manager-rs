@@ -25,8 +25,7 @@ impl DownloadObjectsFluentBuilder {
 
     /// Initiate a download transfer for multiple objects
     pub async fn send(self) -> Result<DownloadObjectsHandle, crate::error::Error> {
-        // FIXME - need DownloadObjectsError to support this conversion to remove expect() in favor of ?
-        let input = self.inner.build().expect("valid input");
+        let input = self.inner.build()?;
         crate::operation::download_objects::DownloadObjects::orchestrate(self.handle, input).await
     }
 

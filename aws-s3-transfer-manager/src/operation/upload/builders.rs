@@ -26,8 +26,7 @@ impl UploadFluentBuilder {
 
     /// Initiate an upload transfer for a single object
     pub async fn send(self) -> Result<UploadHandle, crate::error::Error> {
-        // FIXME - need UploadError to support this conversion to remove expect() in favor of ?
-        let input = self.inner.build().expect("valid input");
+        let input = self.inner.build()?;
         crate::operation::upload::Upload::orchestrate(self.handle, input).await
     }
 

@@ -69,11 +69,6 @@ impl Download {
             let input = input.clone();
             let rem = discovery.remaining.clone();
 
-            // TODO(aws-sdk-rust#1159) - test semaphore based approach where we create all futures at once,
-            //        the downside is controlling memory usage as a large download may result in
-            //        quite a few futures created. If more performant could be enabled for
-            //        objects less than some size.
-
             tasks.spawn(distribute_work(
                 rem,
                 input.into(),

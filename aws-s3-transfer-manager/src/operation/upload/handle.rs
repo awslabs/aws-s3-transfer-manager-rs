@@ -6,6 +6,7 @@
 use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::task;
 
@@ -103,7 +104,10 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
         todo!("non mpu upload not implemented yet")
     }
 
-    tracing::trace!("joining upload_id={:?}", handle.ctx.upload_id);
+    let span = tracing::debug_span!("completing upload", upload_id = handle.ctx.upload_id);
+    let _enter = span.enter();
+
+    // tracing::trace!("joining upload_id={:?}", handle.ctx.upload_id);
 
     let mut all_parts = Vec::new();
 
@@ -118,7 +122,9 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
             Err(err) => {
                 tracing::error!("multipart upload failed, aborting");
                 // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                handle.abort().await?;
+                if let Err(err) = handle.abort().await {
+                    tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
+                };
                 return Err(err);
             }
         }

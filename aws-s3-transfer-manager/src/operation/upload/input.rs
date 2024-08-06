@@ -1440,7 +1440,6 @@ impl UploadInputBuilder {
     }
 
     /// Consumes the builder and constructs a [`UploadInput`]
-    // FIXME(aws-sdk-rust#1159): replace BuildError with our own type?
     pub fn build(self) -> Result<UploadInput, ::aws_smithy_types::error::operation::BuildError> {
         Ok(UploadInput {
             body: self.body.unwrap_or_default(),
