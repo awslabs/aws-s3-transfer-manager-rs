@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::{error::UploadError, types::FailedMultipartUploadPolicy};
+use crate::types::FailedMultipartUploadPolicy;
 
 use super::{UploadHandle, UploadInputBuilder};
 
@@ -25,9 +25,8 @@ impl UploadFluentBuilder {
     }
 
     /// Initiate an upload transfer for a single object
-    pub async fn send(self) -> Result<UploadHandle, UploadError> {
-        // FIXME - need UploadError to support this conversion to remove expect() in favor of ?
-        let input = self.inner.build().expect("valid input");
+    pub async fn send(self) -> Result<UploadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
         crate::operation::upload::Upload::orchestrate(self.handle, input).await
     }
 
@@ -907,7 +906,10 @@ impl UploadFluentBuilder {
 
 impl crate::operation::upload::input::UploadInputBuilder {
     /// Initiate an upload transfer for a single object with this input using the given client.
-    pub async fn send_with(self, client: &crate::Client) -> Result<UploadHandle, UploadError> {
+    pub async fn send_with(
+        self,
+        client: &crate::Client,
+    ) -> Result<UploadHandle, crate::error::Error> {
         let mut fluent_builder = client.upload();
         fluent_builder.inner = self;
         fluent_builder.send().await

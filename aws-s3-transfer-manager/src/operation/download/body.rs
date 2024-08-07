@@ -2,7 +2,6 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::error::TransferError;
 use crate::operation::download::worker::ChunkResponse;
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use std::cmp;
@@ -20,7 +19,7 @@ pub struct Body {
     sequencer: Sequencer,
 }
 
-type BodyChannel = mpsc::Receiver<Result<ChunkResponse, TransferError>>;
+type BodyChannel = mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>;
 
 impl Body {
     /// Create a new empty Body
@@ -51,7 +50,7 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
-    pub async fn next(&mut self) -> Option<Result<AggregatedBytes, TransferError>> {
+    pub async fn next(&mut self) -> Option<Result<AggregatedBytes, crate::error::Error>> {
         // TODO(aws-sdk-rust#1159, design) - do we want ChunkResponse (or similar) rather than AggregatedBytes? Would
         //  make additional retries of an individual chunk/part more feasible (though theoretically already exhausted retries)
         loop {
@@ -146,7 +145,7 @@ impl PartialEq for SequencedChunk {
 /// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
 pub(crate) struct UnorderedBody {
-    chunks: Option<mpsc::Receiver<Result<ChunkResponse, TransferError>>>,
+    chunks: Option<mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>>,
 }
 
 impl UnorderedBody {
@@ -160,7 +159,7 @@ impl UnorderedBody {
     /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
-    pub(crate) async fn next(&mut self) -> Option<Result<ChunkResponse, TransferError>> {
+    pub(crate) async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
         match self.chunks.as_mut() {
             None => None,
             Some(ch) => ch.recv().await,
@@ -170,8 +169,7 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::TransferError;
-    use crate::operation::download::worker::ChunkResponse;
+    use crate::{error, operation::download::worker::ChunkResponse};
     use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
     use bytes::Bytes;
     use tokio::sync::mpsc;
@@ -226,7 +224,7 @@ mod tests {
             let aggregated = ByteStream::from(data).collect().await.unwrap();
             let chunk = chunk_resp(0, Some(aggregated));
             tx.send(Ok(chunk)).await.unwrap();
-            let err = TransferError::InvalidMetaRequest("test errors".to_string());
+            let err = error::Error::new(error::ErrorKind::InputInvalid, "test errors".to_string());
             tx.send(Err(err)).await.unwrap();
         });
 

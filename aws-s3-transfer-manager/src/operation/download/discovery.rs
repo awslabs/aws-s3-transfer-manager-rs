@@ -10,9 +10,9 @@ use std::{cmp, mem};
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
-use bytes::Buf;
 
 use crate::error;
+use bytes::Buf;
 
 use super::header::{self, ByteRange};
 use super::object_meta::ObjectMetadata;
@@ -43,9 +43,7 @@ pub(super) struct ObjectDiscovery {
 }
 
 impl ObjectDiscoveryStrategy {
-    fn from_request(
-        input: &DownloadInput,
-    ) -> Result<ObjectDiscoveryStrategy, error::TransferError> {
+    fn from_request(input: &DownloadInput) -> Result<ObjectDiscoveryStrategy, crate::error::Error> {
         let strategy = match input.range() {
             Some(h) => {
                 let byte_range = header::Range::from_str(h)?.0;
@@ -72,7 +70,7 @@ impl ObjectDiscoveryStrategy {
 pub(super) async fn discover_obj(
     ctx: &DownloadContext,
     input: &DownloadInput,
-) -> Result<ObjectDiscovery, error::TransferError> {
+) -> Result<ObjectDiscovery, crate::error::Error> {
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     match strategy {
         ObjectDiscoveryStrategy::HeadObject(byte_range) => {
@@ -100,7 +98,7 @@ async fn discover_obj_with_head(
     ctx: &DownloadContext,
     input: &DownloadInput,
     byte_range: Option<ByteRange>,
-) -> Result<ObjectDiscovery, error::TransferError> {
+) -> Result<ObjectDiscovery, crate::error::Error> {
     let meta: ObjectMetadata = ctx
         .client()
         .head_object()
@@ -108,7 +106,7 @@ async fn discover_obj_with_head(
         .set_key(input.key().map(str::to_string))
         .send()
         .await
-        .map_err(|e| error::DownloadError::DiscoverFailed(e.into()))?
+        .map_err(error::discovery_failed)?
         .into();
 
     let remaining = match byte_range {
@@ -131,23 +129,20 @@ async fn discover_obj_with_get(
     ctx: &DownloadContext,
     input: GetObjectInputBuilder,
     range: Option<RangeInclusive<u64>>,
-) -> Result<ObjectDiscovery, error::TransferError> {
+) -> Result<ObjectDiscovery, error::Error> {
     let resp = input.send_with(ctx.client()).await;
 
     if resp.is_err() {
         // TODO(aws-sdk-rust#1159) - deal with empty file errors, see https://github.com/awslabs/aws-c-s3/blob/v0.5.7/source/s3_auto_ranged_get.c#L147-L153
     }
 
-    let mut resp = resp.map_err(|e| error::DownloadError::DiscoverFailed(e.into()))?;
+    let mut resp = resp.map_err(error::discovery_failed)?;
 
     // take the body so we can convert the metadata
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
 
-    let data = body
-        .collect()
-        .await
-        .map_err(|e| error::DownloadError::DiscoverFailed(e.into()))?;
+    let data = body.collect().await.map_err(error::discovery_failed)?;
 
     let meta: ObjectMetadata = resp.into();
 

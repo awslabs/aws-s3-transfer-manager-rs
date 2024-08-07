@@ -23,7 +23,6 @@ mod header;
 mod object_meta;
 mod worker;
 
-use crate::error::TransferError;
 use body::Body;
 use context::DownloadContext;
 use discovery::{discover_obj, ObjectDiscovery};
@@ -42,7 +41,7 @@ impl Download {
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
-    ) -> Result<DownloadHandle, TransferError> {
+    ) -> Result<DownloadHandle, crate::error::Error> {
         // if there is a part number then just send the default request
         if input.part_number().is_some() {
             todo!("single part download not implemented")
@@ -69,11 +68,6 @@ impl Download {
             let (work_tx, work_rx) = async_channel::bounded(concurrency);
             let input = input.clone();
             let rem = discovery.remaining.clone();
-
-            // TODO(aws-sdk-rust#1159) - test semaphore based approach where we create all futures at once,
-            //        the downside is controlling memory usage as a large download may result in
-            //        quite a few futures created. If more performant could be enabled for
-            //        objects less than some size.
 
             tasks.spawn(distribute_work(
                 rem,
@@ -109,7 +103,7 @@ impl Download {
 /// the starting sequence number to use for remaining chunks.
 async fn handle_discovery_chunk(
     discovery: &mut ObjectDiscovery,
-    completed: &mpsc::Sender<Result<ChunkResponse, TransferError>>,
+    completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
 ) -> u64 {
     let mut start_seq = 0;
     if let Some(initial_data) = discovery.initial_chunk.take() {

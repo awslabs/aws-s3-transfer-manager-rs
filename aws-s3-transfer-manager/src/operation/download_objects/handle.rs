@@ -5,7 +5,7 @@
 
 use tokio::task;
 
-use super::{DownloadObjectsError, DownloadObjectsOutput};
+use super::DownloadObjectsOutput;
 
 /// Handle for `DownloadObjects` transfer operation
 #[derive(Debug)]
@@ -17,7 +17,7 @@ pub struct DownloadObjectsHandle {
 
 impl DownloadObjectsHandle {
     /// Consume the handle and wait for download transfer to complete
-    pub async fn join(self) -> Result<DownloadObjectsOutput, DownloadObjectsError> {
+    pub async fn join(self) -> Result<DownloadObjectsOutput, crate::error::Error> {
         unimplemented!()
     }
 }
