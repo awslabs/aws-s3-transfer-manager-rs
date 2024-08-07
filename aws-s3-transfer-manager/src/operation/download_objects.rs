@@ -27,12 +27,7 @@ impl DownloadObjects {
     pub(crate) async fn orchestrate(
         _handle: Arc<crate::client::Handle>,
         _input: crate::operation::download_objects::DownloadObjectsInput,
-    ) -> Result<DownloadObjectsHandle, DownloadObjectsError> {
+    ) -> Result<DownloadObjectsHandle, crate::error::Error> {
         unimplemented!()
     }
 }
-
-/// Error type for `DownloadObjects` operation
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum DownloadObjectsError {}

@@ -220,17 +220,18 @@ jobs:
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
-  semver:
-    name: semver
-    needs: basics
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check semver
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          rust-toolchain: ${{ env.rust_stable }}
-          release-type: minor
+  # TODO - re-enable semver check once released
+  # semver:
+  #   name: semver
+  #   needs: basics
+  #   runs-on: ubuntu-24.04
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Check semver
+  #       uses: obi1kenobi/cargo-semver-checks-action@v2
+  #       with:
+  #         rust-toolchain: ${{ env.rust_stable }}
+  #         release-type: minor
 
   features:
     name: features

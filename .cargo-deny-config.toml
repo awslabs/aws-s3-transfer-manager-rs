@@ -4,10 +4,7 @@
 # More documentation for the licenses section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
 [licenses]
-default = "deny"
-unlicensed = "deny"
-copyleft = "deny"
-allow-osi-fsf-free = "neither"
+version = 2
 allow = [
     # See https://spdx.org/licenses/ for list of possible licenses
     # [possible values: any SPDX 3.11 short identifier (+ optional exception)].

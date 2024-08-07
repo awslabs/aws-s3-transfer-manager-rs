@@ -4,8 +4,6 @@
  */
 use std::sync::Arc;
 
-use crate::error::TransferError;
-
 use super::{DownloadHandle, DownloadInputBuilder};
 
 /// Fluent builder for constructing a single object upload transfer
@@ -24,9 +22,8 @@ impl DownloadFluentBuilder {
     }
 
     /// Initiate a download transfer for a single object
-    pub async fn send(self) -> Result<DownloadHandle, TransferError> {
-        // FIXME - need DownloadError to support this conversion to remove expect() in favor of ?
-        let input = self.inner.build().expect("valid input");
+    pub async fn send(self) -> Result<DownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input).await
     }
 
@@ -523,7 +520,10 @@ impl DownloadFluentBuilder {
 
 impl crate::operation::download::input::DownloadInputBuilder {
     /// Initiate a download transfer for a single object with this input using the given client.
-    pub async fn send_with(self, client: &crate::Client) -> Result<DownloadHandle, TransferError> {
+    pub async fn send_with(
+        self,
+        client: &crate::Client,
+    ) -> Result<DownloadHandle, crate::error::Error> {
         let mut fluent_builder = client.download();
         fluent_builder.inner = self;
         fluent_builder.send().await

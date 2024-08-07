@@ -148,12 +148,12 @@ impl Client {
     /// # Examples
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use aws_s3_transfer_manager::operation::download_objects::DownloadObjectsError;
+    /// use aws_s3_transfer_manager::error::Error;
     ///
     /// async fn download_bucket(
     ///     client: &aws_s3_transfer_manager::Client,
     ///     dest: PathBuf
-    /// ) -> Result<(), DownloadObjectsError> {
+    /// ) -> Result<(), Error> {
     ///
     ///     let handle = client
     ///         .download_objects()

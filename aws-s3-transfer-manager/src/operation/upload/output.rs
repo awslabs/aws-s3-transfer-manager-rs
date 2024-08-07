@@ -493,7 +493,6 @@ impl UploadOutputBuilder {
     }
 
     /// Consumes the builder and constructs a [`UploadOutput`]
-    // FIXME(aws-sdk-rust#1159): replace BuildError with our own type?
     pub fn build(self) -> Result<UploadOutput, ::aws_smithy_types::error::operation::BuildError> {
         Ok(UploadOutput {
             expiration: self.expiration,

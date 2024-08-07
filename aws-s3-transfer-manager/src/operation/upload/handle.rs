@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::error::UploadError;
 use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::task;
 
@@ -15,7 +15,7 @@ use tokio::task;
 #[non_exhaustive]
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
-    pub(crate) tasks: task::JoinSet<Result<Vec<CompletedPart>, UploadError>>,
+    pub(crate) tasks: task::JoinSet<Result<Vec<CompletedPart>, crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -46,12 +46,12 @@ impl UploadHandle {
     }
 
     /// Consume the handle and wait for upload to complete
-    pub async fn join(self) -> Result<UploadOutput, UploadError> {
+    pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
         complete_upload(self).await
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
-    pub async fn abort(&mut self) -> Result<AbortedUpload, UploadError> {
+    pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
         // cancel in-progress uploads
@@ -78,7 +78,7 @@ impl UploadHandle {
     }
 }
 
-async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, UploadError> {
+async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::error::Error> {
     let abort_mpu_resp = handle
         .ctx
         .client()
@@ -99,12 +99,13 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, UploadErro
     Ok(aborted_upload)
 }
 
-async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, UploadError> {
+async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
     if !handle.ctx.is_multipart_upload() {
         todo!("non mpu upload not implemented yet")
     }
 
-    tracing::trace!("joining upload_id={:?}", handle.ctx.upload_id);
+    let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
+    let _enter = span.enter();
 
     let mut all_parts = Vec::new();
 
@@ -119,16 +120,15 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, Uploa
             Err(err) => {
                 tracing::error!("multipart upload failed, aborting");
                 // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                handle.abort().await?;
+                if let Err(err) = handle.abort().await {
+                    tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
+                };
                 return Err(err);
             }
         }
     }
 
-    tracing::trace!(
-        "completing multipart upload: upload_id={:?}",
-        handle.ctx.upload_id
-    );
+    tracing::trace!("completing multipart upload");
 
     // parts must be sorted
     all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
@@ -168,10 +168,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, Uploa
         .set_expiration(complete_mpu_resp.expiration.clone())
         .set_version_id(complete_mpu_resp.version_id.clone());
 
-    tracing::trace!(
-        "upload completed successfully: upload_id={:?}",
-        handle.ctx.upload_id
-    );
+    tracing::trace!("upload completed successfully");
 
     Ok(resp.build().expect("valid response"))
 }

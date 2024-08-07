@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
-use crate::error::TransferError;
 use crate::operation::download::context::DownloadContext;
 use crate::operation::download::header;
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
@@ -45,7 +44,7 @@ pub(crate) struct ChunkResponse {
 pub(super) async fn download_chunks(
     ctx: DownloadContext,
     requests: async_channel::Receiver<ChunkRequest>,
-    completed: mpsc::Sender<Result<ChunkResponse, TransferError>>,
+    completed: mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
 ) {
     while let Ok(request) = requests.recv().await {
         let seq = request.seq;
@@ -68,12 +67,12 @@ pub(super) async fn download_chunks(
 async fn download_chunk(
     ctx: &DownloadContext,
     request: ChunkRequest,
-) -> Result<ChunkResponse, TransferError> {
+) -> Result<ChunkResponse, error::Error> {
     let mut resp = request
         .input
         .send_with(ctx.client())
         .await
-        .map_err(error::chunk_failed)?;
+        .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
 
@@ -81,7 +80,7 @@ async fn download_chunk(
         .collect()
         .instrument(tracing::debug_span!("collect-body", seq = request.seq))
         .await
-        .map_err(error::chunk_failed)?;
+        .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
     Ok(ChunkResponse {
         seq: request.seq,
