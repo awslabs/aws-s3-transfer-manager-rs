@@ -44,9 +44,6 @@ pub enum ErrorKind {
 
     /// child operation failed (e.g. download of a single object as part of downloading all objects from a bucket)
     ChildOperationFailed,
-
-    /// A custom error that does not fall under any other error kind
-    Other,
 }
 
 impl Error {
@@ -60,16 +57,6 @@ impl Error {
             kind,
             source: err.into(),
         }
-    }
-
-    /// Creates a new transfer [`Error`] from an arbitrary payload.
-    ///
-    /// This function is a shortcut for [`Error::new`] with [`ErrorKind::Other`]
-    pub fn other<E>(err: E) -> Error
-    where
-        E: Into<BoxError>,
-    {
-        Error::new(ErrorKind::Other, err)
     }
 
     /// Returns the corresponding [`ErrorKind`] for this error.
@@ -88,7 +75,6 @@ impl fmt::Display for Error {
             ErrorKind::ChunkFailed => write!(f, "failed to process chunk"),
             ErrorKind::NotFound => write!(f, "resource not found"),
             ErrorKind::ChildOperationFailed => write!(f, "child operation failed"),
-            ErrorKind::Other => write!(f, "unknown error"),
         }
     }
 }
