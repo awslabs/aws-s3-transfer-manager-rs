@@ -73,8 +73,8 @@ impl Error {
     }
 
     /// Returns the corresponding [`ErrorKind`] for this error.
-    pub fn kind(&self) -> ErrorKind {
-        self.kind.clone()
+    pub fn kind(&self) -> &ErrorKind {
+        &self.kind
     }
 }
 
@@ -161,9 +161,7 @@ where
     fn from(value: aws_sdk_s3::error::SdkError<E, R>) -> Self {
         // TODO - extract request id/metadata
         let kind = match value.code() {
-            Some("NotFound") | Some("NoSuchKey") | Some("NoSuchUpload") | Some("NoSuchBucket") => {
-                ErrorKind::NotFound
-            }
+            Some("NotFound" | "NoSuchKey" | "NoSuchUpload" | "NoSuchBucket") => ErrorKind::NotFound,
             // TODO - is this the rigth error kind? do we need something else?
             _ => ErrorKind::ChildOperationFailed,
         };
