@@ -134,27 +134,6 @@ async fn download_single_obj(
     unimplemented!()
 }
 
-// fn relative_path(
-//     dest_dir: &Path,
-//     key: &str,
-//     prefix: Option<&str>,
-//     delimiter: Option<&str>
-// ) -> Result<PathBuf, error::Error> {
-//     let normal_key = prefix
-//         .and_then(|p| key.strip_prefix(p))
-//         .unwrap_or(key);
-//
-//     let rpath = delimiter
-//         .map(|d| key.replace(d, std::path::MAIN_SEPARATOR_STR))
-//         .unwrap_or_else(|| normal_key.to_string());
-//
-//     // FIXME - can't call canonicalize
-//     // std::path::absolute(path)
-//     // let key_path = dest_dir.join(rpath);
-//
-//     todo!()
-// }
-
 const DEFAULT_DELIMITER: &str = "/";
 
 /// If the prefix is not empty AND the key contains the delimiter, strip the prefix from the key.
@@ -201,6 +180,7 @@ fn replace_delim<'a>(key: &'a str, delimiter: Option<&str>, path_separator: &str
     }
 }
 
+/// Derive the local path for a given S3 key
 fn local_key_path(
     root_dir: &Path,
     key: &str,
@@ -210,14 +190,7 @@ fn local_key_path(
     let stripped = strip_key_prefix(key, prefix, delimiter);
     let relative_path = replace_delim(stripped, delimiter, std::path::MAIN_SEPARATOR_STR);
 
-    // // strip leading path separator because PathBuf::join behaves oddly compared to other
-    // // stdlib implementations when given an absolute path
-    // let normal_key = normal_key.strip_prefix(std::path::MAIN_SEPARATOR_STR).unwrap_or(&normal_key);
-    // let local_path = root_dir.join(normal_key).clean();
-
     let local_path = root_dir.join(relative_path.as_ref()).clean();
-    println!("stripped: {stripped:?}, relative path: {relative_path:?}, local_path: {local_path:?}, root_dir: {root_dir:?}");
-
     validate_path(root_dir, &local_path, key)?;
 
     Ok(local_path)

@@ -15,14 +15,15 @@ pub use output::{DownloadObjectsOutput, DownloadObjectsOutputBuilder};
 
 mod handle;
 pub use handle::DownloadObjectsHandle;
-use tracing::Instrument;
 
+mod list_objects;
 mod worker;
 
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tokio::{fs, task::JoinSet};
+use tracing::Instrument;
 
 use crate::{error, types::FailedDownloadTransfer};
 
