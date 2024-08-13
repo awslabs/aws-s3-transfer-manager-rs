@@ -84,7 +84,7 @@ pub enum FailedTransferPolicy {
 /// A filter for downloading objects from S3
 #[derive(Clone)]
 pub struct DownloadFilter {
-    pub(crate) _predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool>,
+    pub(crate) predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static>,
 }
 
 impl fmt::Debug for DownloadFilter {
@@ -97,13 +97,26 @@ impl fmt::Debug for DownloadFilter {
 
 impl<F> From<F> for DownloadFilter
 where
-    F: Fn(&aws_sdk_s3::types::Object) -> bool + 'static,
+    F: Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static,
 {
     fn from(value: F) -> Self {
         DownloadFilter {
-            _predicate: Arc::new(value),
+            predicate: Arc::new(value),
         }
     }
+}
+
+impl Default for DownloadFilter {
+    fn default() -> Self {
+        Self {
+            predicate: Arc::new(all_objects_filter),
+        }
+    }
+}
+
+fn all_objects_filter(obj: &aws_sdk_s3::types::Object) -> bool {
+    todo!("implement filtering of folder objects");
+    true
 }
 
 /// Detailed information about a failed object download transfer

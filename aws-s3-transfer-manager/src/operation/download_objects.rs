@@ -15,8 +15,18 @@ pub use output::{DownloadObjectsOutput, DownloadObjectsOutputBuilder};
 
 mod handle;
 pub use handle::DownloadObjectsHandle;
+use tracing::Instrument;
 
-use std::sync::Arc;
+mod worker;
+
+use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+use tokio::{fs, task::JoinSet};
+
+use crate::{error, types::FailedDownloadTransfer};
+
+use super::TransferContext;
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -25,9 +35,64 @@ pub(crate) struct DownloadObjects;
 impl DownloadObjects {
     /// Execute a single `DownloadObjects` transfer operation
     pub(crate) async fn orchestrate(
-        _handle: Arc<crate::client::Handle>,
-        _input: crate::operation::download_objects::DownloadObjectsInput,
+        handle: Arc<crate::client::Handle>,
+        input: crate::operation::download_objects::DownloadObjectsInput,
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
-        unimplemented!()
+        //  validate existence of source directory and return error if it's not a directory
+        let destination = input.destination().expect("destination set");
+        validate_destination(destination).await?;
+
+        let concurrency = handle.num_workers();
+        let ctx = DownloadObjectsContext::new(handle.clone(), input);
+
+        // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
+        let mut tasks = JoinSet::new();
+        let (work_tx, work_rx) = async_channel::bounded(concurrency);
+
+        // spawn worker to discover/distribute work
+        tasks.spawn(worker::discover_objects(ctx.clone(), work_tx));
+
+        for i in 0..concurrency {
+            let worker = worker::download_objects(ctx.clone(), work_rx.clone())
+                .instrument(tracing::debug_span!("object-downloader", worker = i));
+            tasks.spawn(worker);
+        }
+
+        let handle = DownloadObjectsHandle { tasks };
+        Ok(handle)
+    }
+}
+
+async fn validate_destination(path: &Path) -> Result<(), error::Error> {
+    let file = fs::File::open(path).await?;
+    let meta = file.metadata().await?;
+
+    if !meta.is_dir() {
+        return Err(error::invalid_input(format!(
+            "destination is not a directory: {path:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// DownloadObjects operation specific state
+#[derive(Debug, Clone)]
+struct DownloadObjectsState {
+    input: DownloadObjectsInput,
+    failed_downloads: Arc<Mutex<Option<Vec<FailedDownloadTransfer>>>>,
+    successful_downloads: Arc<AtomicU64>,
+}
+
+type DownloadObjectsContext = TransferContext<DownloadObjectsState>;
+
+impl DownloadObjectsContext {
+    fn new(handle: Arc<crate::client::Handle>, input: DownloadObjectsInput) -> Self {
+        let state = DownloadObjectsState {
+            input,
+            failed_downloads: Arc::new(Mutex::new(None)),
+            successful_downloads: Arc::new(AtomicU64::default()),
+        };
+        TransferContext { handle, state }
     }
 }

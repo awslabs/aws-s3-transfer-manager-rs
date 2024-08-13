@@ -12,7 +12,7 @@ use super::DownloadObjectsOutput;
 #[non_exhaustive]
 pub struct DownloadObjectsHandle {
     /// All child tasks spawned for this download
-    pub(crate) _tasks: task::JoinSet<()>,
+    pub(crate) tasks: task::JoinSet<Result<(), crate::error::Error>>,
 }
 
 impl DownloadObjectsHandle {

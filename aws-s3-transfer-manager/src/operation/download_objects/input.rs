@@ -4,6 +4,8 @@
  */
 
 use crate::types::{DownloadFilter, FailedTransferPolicy};
+use aws_smithy_types::error::operation::BuildError;
+
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -175,7 +177,10 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// Filter unwanted S3 objects from being downloaded as part of the transfer.
-    pub fn filter(mut self, input: impl Fn(&aws_sdk_s3::types::Object) -> bool + 'static) -> Self {
+    pub fn filter(
+        mut self,
+        input: impl Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static,
+    ) -> Self {
         self.filter = Some(DownloadFilter::from(input));
         self
     }
@@ -192,9 +197,18 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// Consumes the builder and constructs a [`DownloadObjectsInput`](crate::operation::download_objects::DownloadObjectsInput).
-    pub fn build(
-        self,
-    ) -> Result<DownloadObjectsInput, ::aws_smithy_types::error::operation::BuildError> {
+    pub fn build(self) -> Result<DownloadObjectsInput, BuildError> {
+        if self.bucket.is_none() {
+            return Err(BuildError::missing_field("bucket", "A bucket is required"));
+        }
+
+        if self.destination.is_none() {
+            return Err(BuildError::missing_field(
+                "destination",
+                "Destination directory is required",
+            ));
+        }
+
         Result::Ok(DownloadObjectsInput {
             bucket: self.bucket,
             destination: self.destination,
