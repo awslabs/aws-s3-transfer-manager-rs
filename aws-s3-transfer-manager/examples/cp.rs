@@ -10,6 +10,7 @@ use std::{mem, time};
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
+use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_types::SdkConfig;
 use bytes::Buf;
@@ -122,6 +123,7 @@ async fn do_recursive_download(
     let dest = args.dest.expect_local();
     fs::create_dir_all(dest).await?;
 
+    let start = time::Instant::now();
     let handle = tm
         .download_objects()
         .bucket(bucket)
@@ -132,11 +134,25 @@ async fn do_recursive_download(
 
     let output = handle.join().await?;
     tracing::info!("download output: {output:?}");
+
+    let elapsed = start.elapsed();
+    let transfer_size_bytes = output.total_bytes_transferred();
+    let transfer_size_megabytes = transfer_size_bytes as f64 / ONE_MEGABYTE as f64;
+    let transfer_size_megabits = transfer_size_megabytes * 8f64;
+
+    println!(
+        "downloaded {} objects totalling {transfer_size_bytes} bytes ({transfer_size_megabytes} MB) in {elapsed:?}; Mb/s: {}",
+        output.objects_downloaded(),
+        transfer_size_megabits / elapsed.as_secs_f64(),
+    );
     Ok(())
 }
 
 async fn do_download(args: Args) -> Result<(), BoxError> {
-    let config = aws_config::from_env().load().await;
+    let config = aws_config::from_env()
+        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+        .load()
+        .await;
     warmup(&config).await?;
 
     let s3_client = aws_sdk_s3::Client::new(&config);

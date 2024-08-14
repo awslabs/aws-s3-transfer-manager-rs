@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use async_channel::{Receiver, Sender};
-use bytes::Buf;
 use path_clean::PathClean;
 use std::borrow::Cow;
 use std::mem;
@@ -80,6 +79,18 @@ pub(super) async fn download_objects(
                 ctx.state
                     .successful_downloads
                     .fetch_add(1, Ordering::SeqCst);
+
+                let bytes_transferred: u64 = job
+                    .object
+                    .size()
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap_or_default();
+
+                ctx.state
+                    .total_bytes_transferred
+                    .fetch_add(bytes_transferred, Ordering::SeqCst);
+
                 tracing::debug!("worker finished downloading key {:?}", job.object.key);
             }
             Err(err) => {

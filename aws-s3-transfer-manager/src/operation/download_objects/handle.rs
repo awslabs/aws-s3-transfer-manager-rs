@@ -29,10 +29,16 @@ impl DownloadObjectsHandle {
 
         let failed_downloads = self.ctx.state.failed_downloads.lock().unwrap().take();
         let successful_downloads = self.ctx.state.successful_downloads.load(Ordering::SeqCst);
+        let total_bytes_transferred = self
+            .ctx
+            .state
+            .total_bytes_transferred
+            .load(Ordering::SeqCst);
 
         let output = DownloadObjectsOutput::builder()
             .objects_downloaded(successful_downloads)
             .set_failed_transfers(failed_downloads)
+            .total_bytes_transferred(total_bytes_transferred)
             .build();
 
         Ok(output)

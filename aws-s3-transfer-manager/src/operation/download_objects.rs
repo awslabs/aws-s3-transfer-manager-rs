@@ -83,6 +83,7 @@ pub(crate) struct DownloadObjectsState {
     input: DownloadObjectsInput,
     failed_downloads: Arc<Mutex<Option<Vec<FailedDownloadTransfer>>>>,
     successful_downloads: Arc<AtomicU64>,
+    total_bytes_transferred: Arc<AtomicU64>,
 }
 
 type DownloadObjectsContext = TransferContext<DownloadObjectsState>;
@@ -93,6 +94,7 @@ impl DownloadObjectsContext {
             input,
             failed_downloads: Arc::new(Mutex::new(None)),
             successful_downloads: Arc::new(AtomicU64::default()),
+            total_bytes_transferred: Arc::new(AtomicU64::default()),
         };
         TransferContext { handle, state }
     }

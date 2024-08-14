@@ -31,6 +31,7 @@ impl DownloadHandle {
         &self.body
     }
 
+    /// Consume the handle and wait for download transfer to complete
     pub async fn join(mut self) -> Result<(), crate::error::Error> {
         while let Some(join_result) = self.tasks.join_next().await {
             join_result?;
