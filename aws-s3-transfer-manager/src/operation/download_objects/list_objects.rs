@@ -10,6 +10,7 @@ use aws_sdk_s3::{
     operation::list_objects_v2::{ListObjectsV2Error, ListObjectsV2Input, ListObjectsV2Output},
 };
 use aws_smithy_runtime_api::http::Response;
+use std::mem;
 
 use super::DownloadObjectsContext;
 
@@ -87,10 +88,8 @@ impl State {
     }
 }
 
-// TODO - implement iterator over objects (aka "items"), probably rename this one
-
 impl ListObjectsPaginator {
-    pub(crate) fn new(context: DownloadObjectsContext) -> Self {
+    fn new(context: DownloadObjectsContext) -> Self {
         let prefix = context.state.input.key_prefix.to_owned();
         Self {
             context,
@@ -106,7 +105,7 @@ impl ListObjectsPaginator {
         self.state.as_ref().expect("valid state")
     }
 
-    pub(crate) async fn next_page(
+    async fn next_page(
         &mut self,
     ) -> Option<Result<ListObjectsV2Output, SdkError<ListObjectsV2Error, Response>>> {
         let input = &self.context.state.input;
@@ -136,6 +135,60 @@ impl ListObjectsPaginator {
     }
 }
 
+/// Custom paginator for `ListObjectsV2` operation that handles
+/// recursing over `CommonPrefixes` when a delimiter is set.
+pub(crate) struct ListObjectsStream {
+    paginator: ListObjectsPaginator,
+    current_page: Option<std::vec::IntoIter<aws_sdk_s3::types::Object>>,
+}
+
+impl ListObjectsStream {
+    pub(crate) fn new(context: DownloadObjectsContext) -> Self {
+        Self {
+            paginator: ListObjectsPaginator::new(context),
+            current_page: None,
+        }
+    }
+
+    pub(crate) async fn next(
+        &mut self,
+    ) -> Option<Result<aws_sdk_s3::types::Object, SdkError<ListObjectsV2Error, Response>>> {
+        if let Err(err) = self.ensure_page().await {
+            return Some(Err(err));
+        }
+
+        match &mut self.current_page {
+            Some(ref mut page) => page.next().map(Ok),
+            None => None,
+        }
+    }
+
+    async fn set_next_page(&mut self) -> Result<(), SdkError<ListObjectsV2Error, Response>> {
+        self.current_page.take();
+        let next_page = self.paginator.next_page().await;
+        if next_page.is_none() {
+            return Ok(());
+        }
+
+        let mut next_page = next_page.unwrap()?;
+        let mut contents = next_page.contents.take().map(|v| v.into_iter());
+        mem::swap(&mut self.current_page, &mut contents);
+        Ok(())
+    }
+
+    async fn ensure_page(&mut self) -> Result<(), SdkError<ListObjectsV2Error, Response>> {
+        let remaining = match &mut self.current_page {
+            Some(ref mut page) => page.size_hint().1.expect("known upper bound"),
+            None => 0,
+        };
+
+        if remaining == 0 {
+            self.set_next_page().await?
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -144,8 +197,11 @@ mod tests {
         operation::list_objects_v2::ListObjectsV2Output,
         types::{CommonPrefix, Object},
     };
+    use aws_smithy_mocks_experimental::{mock, mock_client};
 
-    use super::State;
+    use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};
+
+    use super::{ListObjectsStream, State};
 
     /*
      *              initial-prefix
@@ -245,5 +301,51 @@ mod tests {
             .set_common_prefixes(common_prefixes)
             .set_contents(Some(contents))
             .build()
+    }
+
+    #[tokio::test]
+    async fn test_object_stream() {
+        let resp1 = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            list_resp(
+                Some("token1"),
+                "initial-prefix",
+                Some(vec!["pre1", "pre2"]),
+                vec!["k1", "k2"],
+            )
+        });
+        let resp2 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| list_resp(None, "initial-prefix", None, vec!["k3", "k4"]));
+        let resp3 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| list_resp(Some("token2"), "pre1", None, vec!["pre1/k5", "pre1/k6"]));
+        let resp4 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| list_resp(None, "pre1", None, vec!["pre1/k7", "pre1/k8"]));
+        let resp5 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| list_resp(None, "pre2", None, vec!["pre2/k9", "pre2/k10"]));
+        let client = mock_client!(aws_sdk_s3, &[&resp1, &resp2, &resp3, &resp4, &resp5]);
+
+        let config = crate::Config::builder().client(client).build();
+        let client = crate::Client::new(config);
+        let input = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .build()
+            .unwrap();
+
+        let ctx = DownloadObjectsContext::new(client.handle.clone(), input);
+        let mut stream = ListObjectsStream::new(ctx);
+
+        let mut keys = Vec::new();
+        while let Some(res) = stream.next().await {
+            let obj = res.unwrap();
+            keys.push(obj.key.unwrap());
+        }
+
+        assert_eq!(
+            keys,
+            vec![
+                "k1", "k2", "k3", "k4", "pre1/k5", "pre1/k6", "pre1/k7", "pre1/k8", "pre2/k9",
+                "pre2/k10"
+            ]
+        );
     }
 }
