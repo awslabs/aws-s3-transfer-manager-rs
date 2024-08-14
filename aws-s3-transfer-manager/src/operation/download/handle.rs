@@ -17,7 +17,7 @@ pub struct DownloadHandle {
     pub body: Body,
 
     /// All child tasks spawned for this download
-    pub(crate) _tasks: task::JoinSet<()>,
+    pub(crate) tasks: task::JoinSet<()>,
 }
 
 impl DownloadHandle {
@@ -29,5 +29,12 @@ impl DownloadHandle {
     /// Object content
     pub fn body(&self) -> &Body {
         &self.body
+    }
+
+    pub async fn join(mut self) -> Result<(), crate::error::Error> {
+        while let Some(join_result) = self.tasks.join_next().await {
+            join_result?;
+        }
+        Ok(())
     }
 }

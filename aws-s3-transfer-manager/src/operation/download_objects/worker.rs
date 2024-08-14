@@ -3,17 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use async_channel::{Receiver, Sender};
+use bytes::Buf;
 use path_clean::PathClean;
 use std::borrow::Cow;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::error;
 use crate::operation::download::body::Body;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
 use crate::types::{DownloadFilter, FailedDownloadTransfer, FailedTransferPolicy};
 
+use super::list_objects::ListObjectsStream;
 use super::DownloadObjectsContext;
 
 #[derive(Debug)]
@@ -38,34 +42,21 @@ pub(super) async fn discover_objects(
     work_tx: Sender<DownloadObjectJob>,
 ) -> Result<(), error::Error> {
     // TODO - directory buckets don't guarantee order like regular buckets do...do we care? Was a major CLI issue for sync
-    let mut stream = ctx
-        .client()
-        .list_objects_v2()
-        .set_bucket(ctx.state.input.bucket.to_owned())
-        .set_prefix(ctx.state.input.key_prefix.to_owned())
-        .set_delimiter(ctx.state.input.delimiter.to_owned())
-        .into_paginator()
-        .send();
 
-    // FIXME - need to implement support for common prefixes
-    // See https://github.com/aws/aws-sdk-java-v2/blob/master/services-custom/s3-transfer-manager/src/main/java/software/amazon/awssdk/transfer/s3/internal/ListObjectsHelper.java
+    let mut stream = ListObjectsStream::new(ctx.clone());
 
     let default_filter = &DownloadFilter::default();
     let filter = ctx.state.input.filter().unwrap_or(default_filter);
-    while let Some(page_result) = stream.next().await {
-        let page = page_result.map_err(error::from_kind(error::ErrorKind::ChildOperationFailed))?;
-        let iter = page.contents().iter();
 
-        for obj in iter {
-            if !(filter.predicate)(obj) {
-                tracing::debug!("skipping object due to filter: {:?}", obj);
-                continue;
-            }
-
-            let object = obj.to_owned();
-            let job = DownloadObjectJob { object };
-            work_tx.send(job).await.expect("channel valid");
+    while let Some(obj_result) = stream.next().await {
+        let object = obj_result?;
+        if !(filter.predicate)(&object) {
+            tracing::debug!("skipping object due to filter: {:?}", object);
+            continue;
         }
+
+        let job = DownloadObjectJob { object };
+        work_tx.send(job).await.expect("channel valid");
     }
 
     Ok(())
@@ -77,7 +68,11 @@ pub(super) async fn download_objects(
     work_rx: Receiver<DownloadObjectJob>,
 ) -> Result<(), error::Error> {
     while let Ok(job) = work_rx.recv().await {
-        tracing::trace!("worker recv'd request for key {:?}", job.object.key);
+        tracing::debug!(
+            "worker recv'd request for key {:?} ({:?} bytes)",
+            job.object.key,
+            job.object.size()
+        );
 
         let dl_result = download_single_obj(&ctx, &job).await;
         match dl_result {
@@ -85,23 +80,31 @@ pub(super) async fn download_objects(
                 ctx.state
                     .successful_downloads
                     .fetch_add(1, Ordering::SeqCst);
+                tracing::debug!("worker finished downloading key {:?}", job.object.key);
             }
-            Err(err) => match ctx.state.input.failure_policy() {
-                FailedTransferPolicy::Abort => return Err(err),
-                FailedTransferPolicy::Continue => {
-                    let mut guard = ctx.state.failed_downloads.lock().unwrap();
-                    let mut failures = mem::take(&mut *guard).unwrap_or_default();
+            Err(err) => {
+                tracing::debug!(
+                    "worker failed to download key {:?}: {}",
+                    job.object.key,
+                    err
+                );
+                match ctx.state.input.failure_policy() {
+                    FailedTransferPolicy::Abort => return Err(err),
+                    FailedTransferPolicy::Continue => {
+                        let mut guard = ctx.state.failed_downloads.lock().unwrap();
+                        let mut failures = mem::take(&mut *guard).unwrap_or_default();
 
-                    let failed_transfer = FailedDownloadTransfer {
-                        input: job.input(&ctx),
-                        error: err,
-                    };
+                        let failed_transfer = FailedDownloadTransfer {
+                            input: job.input(&ctx),
+                            error: err,
+                        };
 
-                    failures.push(failed_transfer);
+                        failures.push(failed_transfer);
 
-                    let _ = mem::replace(&mut *guard, Some(failures));
+                        let _ = mem::replace(&mut *guard, Some(failures));
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -114,24 +117,30 @@ async fn download_single_obj(
     job: &DownloadObjectJob,
 ) -> Result<(), error::Error> {
     let input = job.input(ctx);
+    let root_dir = ctx.state.input.destination().expect("destination set");
+    let key = input.key.as_ref().expect("key set");
+    let prefix = ctx.state.input.key_prefix();
+    let delim = ctx.state.input.delimiter();
+
+    let key_path = local_key_path(root_dir, key.as_str(), prefix, delim)?;
     let mut handle =
         crate::operation::download::Download::orchestrate(ctx.handle.clone(), input).await?;
-    let body = mem::replace(&mut handle.body, Body::empty());
+    let mut body = mem::replace(&mut handle.body, Body::empty());
 
-    // TODO - spawn blocking?
-    // while let Some(chunk) = body.next().await {
-    //     let chunk = chunk?;
-    //     tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
-    //     let mut segment_cnt = 1;
-    //     for segment in chunk.into_segments() {
-    //         dest.write_all(segment.as_ref()).await?;
-    //         tracing::trace!("wrote segment size: {}", segment.remaining());
-    //         segment_cnt += 1;
-    //     }
-    //     tracing::trace!("chunk had {segment_cnt} segments");
-    // }
+    let parent_dir = key_path.parent().expect("valid parent dir for key");
+    fs::create_dir_all(parent_dir).await?;
+    let mut dest = fs::File::create(key_path).await?;
 
-    unimplemented!()
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        for segment in chunk.into_segments() {
+            dest.write_all(segment.as_ref()).await?;
+        }
+    }
+
+    handle.join().await?;
+
+    Ok(())
 }
 
 const DEFAULT_DELIMITER: &str = "/";

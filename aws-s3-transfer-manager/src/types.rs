@@ -114,9 +114,12 @@ impl Default for DownloadFilter {
     }
 }
 
+/// Filter that returns all non-folder objects. A folder is a 0-byte object created
+/// when a customer uses S3 console to create a folder, and it always ends with '/'.
 fn all_objects_filter(obj: &aws_sdk_s3::types::Object) -> bool {
-    todo!("implement filtering of folder objects");
-    true
+    let key = obj.key().unwrap_or("");
+    let is_folder = key.ends_with('/') && obj.size().is_some() && obj.size().unwrap() == 0;
+    !is_folder
 }
 
 /// Detailed information about a failed object download transfer

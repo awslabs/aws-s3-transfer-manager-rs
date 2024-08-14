@@ -77,4 +77,12 @@ impl DownloadObjectsOutputBuilder {
     pub fn get_failed_transfers(&self) -> &Option<Vec<FailedDownloadTransfer>> {
         &self.failed_transfers
     }
+
+    /// Consume the builder and return the output
+    pub fn build(self) -> DownloadObjectsOutput {
+        DownloadObjectsOutput {
+            objects_downloaded: self.objects_downloaded,
+            failed_transfers: self.failed_transfers,
+        }
+    }
 }

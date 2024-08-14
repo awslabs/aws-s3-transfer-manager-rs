@@ -59,7 +59,7 @@ impl DownloadObjects {
             tasks.spawn(worker);
         }
 
-        let handle = DownloadObjectsHandle { tasks };
+        let handle = DownloadObjectsHandle { tasks, ctx };
         Ok(handle)
     }
 }
@@ -79,7 +79,7 @@ async fn validate_destination(path: &Path) -> Result<(), error::Error> {
 
 /// DownloadObjects operation specific state
 #[derive(Debug, Clone)]
-struct DownloadObjectsState {
+pub(crate) struct DownloadObjectsState {
     input: DownloadObjectsInput,
     failed_downloads: Arc<Mutex<Option<Vec<FailedDownloadTransfer>>>>,
     successful_downloads: Arc<AtomicU64>,
