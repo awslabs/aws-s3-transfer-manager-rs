@@ -78,24 +78,24 @@ async fn validate_destination(path: &Path) -> Result<(), error::Error> {
 }
 
 /// DownloadObjects operation specific state
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct DownloadObjectsState {
     input: DownloadObjectsInput,
-    failed_downloads: Arc<Mutex<Option<Vec<FailedDownloadTransfer>>>>,
-    successful_downloads: Arc<AtomicU64>,
-    total_bytes_transferred: Arc<AtomicU64>,
+    failed_downloads: Mutex<Option<Vec<FailedDownloadTransfer>>>,
+    successful_downloads: AtomicU64,
+    total_bytes_transferred: AtomicU64,
 }
 
 type DownloadObjectsContext = TransferContext<DownloadObjectsState>;
 
 impl DownloadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: DownloadObjectsInput) -> Self {
-        let state = DownloadObjectsState {
+        let state = Arc::new(DownloadObjectsState {
             input,
-            failed_downloads: Arc::new(Mutex::new(None)),
-            successful_downloads: Arc::new(AtomicU64::default()),
-            total_bytes_transferred: Arc::new(AtomicU64::default()),
-        };
+            failed_downloads: Mutex::new(None),
+            successful_downloads: AtomicU64::default(),
+            total_bytes_transferred: AtomicU64::default(),
+        });
         TransferContext { handle, state }
     }
 }

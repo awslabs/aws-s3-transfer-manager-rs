@@ -111,6 +111,7 @@ pub(super) async fn distribute_work(
             chunk_req
         );
         let chunk_size = chunk_req.size();
+        // FIXME - restructure like download_objects for tasks to yield errors that can be propagated on join()
         tx.send(chunk_req).await.expect("channel open");
 
         seq += 1;
