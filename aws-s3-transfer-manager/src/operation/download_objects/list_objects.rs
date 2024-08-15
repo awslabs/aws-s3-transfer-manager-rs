@@ -25,8 +25,11 @@ struct ListObjectsPaginator {
 #[derive(Debug, PartialEq)]
 enum State {
     Paginating {
+        // next continuation token to use
         next_token: Option<String>,
+        // next prefix to use
         prefix: Option<String>,
+        // accumulated set of common prefixes to recurse
         common_prefixes: VecDeque<String>,
     },
     Done,
@@ -203,6 +206,33 @@ mod tests {
 
     use super::{ListObjectsStream, State};
 
+    /// Create a `ListObjectsV2` output
+    fn list_resp(
+        next_token: Option<&'static str>,
+        prefix: &'static str,
+        common_prefixes: Option<Vec<&'static str>>,
+        keys: Vec<&'static str>,
+    ) -> ListObjectsV2Output {
+        let common_prefixes = common_prefixes.map(|p| {
+            p.iter()
+                .map(|v| CommonPrefix::builder().prefix(*v).build())
+                .collect()
+        });
+
+        let contents = keys
+            .iter()
+            .map(|k| Object::builder().key(*k).build())
+            .collect();
+
+        ListObjectsV2Output::builder()
+            .is_truncated(next_token.is_some())
+            .set_next_continuation_token(next_token.map(str::to_owned))
+            .prefix(prefix.to_owned())
+            .set_common_prefixes(common_prefixes)
+            .set_contents(Some(contents))
+            .build()
+    }
+
     /*
      *              initial-prefix
      * /   /  |  |     \              \
@@ -277,30 +307,6 @@ mod tests {
 
         let state6 = state5.next_state(&output5);
         assert_eq!(state6, State::Done);
-    }
-
-    fn list_resp(
-        next_token: Option<&'static str>,
-        prefix: &'static str,
-        common_prefixes: Option<Vec<&'static str>>,
-        keys: Vec<&'static str>,
-    ) -> ListObjectsV2Output {
-        let common_prefixes = common_prefixes.map(|p| {
-            p.iter()
-                .map(|v| CommonPrefix::builder().prefix(*v).build())
-                .collect()
-        });
-        let contents = keys
-            .iter()
-            .map(|k| Object::builder().key(*k).build())
-            .collect();
-        ListObjectsV2Output::builder()
-            .is_truncated(next_token.is_some())
-            .set_next_continuation_token(next_token.map(str::to_owned))
-            .prefix(prefix.to_owned())
-            .set_common_prefixes(common_prefixes)
-            .set_contents(Some(contents))
-            .build()
     }
 
     #[tokio::test]

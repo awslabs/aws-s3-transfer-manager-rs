@@ -40,8 +40,6 @@ pub(super) async fn discover_objects(
     ctx: DownloadObjectsContext,
     work_tx: Sender<DownloadObjectJob>,
 ) -> Result<(), error::Error> {
-    // TODO - directory buckets don't guarantee order like regular buckets do...do we care? Was a major CLI issue for sync
-
     let mut stream = ListObjectsStream::new(ctx.clone());
 
     let default_filter = &DownloadFilter::default();
@@ -228,6 +226,13 @@ fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), er
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+    use aws_smithy_mocks_experimental::{mock, mock_client};
+
+    use crate::operation::download_objects::{
+        worker::discover_objects, DownloadObjectsContext, DownloadObjectsInput,
+    };
+
     use super::strip_key_prefix;
 
     struct ObjectKeyPathTest {
@@ -404,5 +409,56 @@ mod tests {
         let actual = local_key_path(&root_dir, test.key, test.prefix, test.delimiter).unwrap();
         let actual_str = actual.to_str().expect("valid utf-8 path");
         assert_eq!(*test.expected.as_ref().unwrap(), actual_str);
+    }
+
+    #[tokio::test]
+    async fn test_skip_folder_objects() {
+        let list_objects_rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("key1")
+                        .size(10)
+                        .build(),
+                )
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("key2")
+                        .size(0)
+                        .build(),
+                )
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("folder/")
+                        .size(0)
+                        .build(),
+                )
+                .build()
+        });
+
+        let s3_client = mock_client!(aws_sdk_s3, &[&list_objects_rule]);
+        let config = crate::Config::builder().client(s3_client).build();
+        let client = crate::Client::new(config);
+        let input = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .build()
+            .unwrap();
+
+        let ctx = DownloadObjectsContext::new(client.handle.clone(), input);
+
+        let (work_tx, work_rx) = async_channel::unbounded();
+
+        let join_handle = tokio::spawn(discover_objects(ctx, work_tx));
+
+        let mut keys = Vec::new();
+
+        while let Ok(job) = work_rx.recv().await {
+            keys.push(job.object.key.unwrap());
+        }
+
+        join_handle.await.unwrap().unwrap();
+
+        assert_eq!(keys, vec!["key1", "key2"]);
     }
 }

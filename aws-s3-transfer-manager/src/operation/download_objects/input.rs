@@ -232,3 +232,30 @@ impl fmt::Debug for DownloadObjectsInputBuilder {
         formatter.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DownloadObjectsInput;
+
+    #[test]
+    fn test_no_destination_error() {
+        let err = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .build()
+            .unwrap_err();
+
+        let err_string = err.to_string();
+        assert!(err_string.contains("Destination directory is required"));
+    }
+
+    #[test]
+    fn test_no_bucket_error() {
+        let err = DownloadObjectsInput::builder()
+            .destination("/tmp/test")
+            .build()
+            .unwrap_err();
+
+        let err_string = err.to_string();
+        assert!(err_string.contains("A bucket is required"));
+    }
+}
