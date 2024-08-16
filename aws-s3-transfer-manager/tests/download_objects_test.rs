@@ -122,21 +122,19 @@ struct MockBucketBuilder {
 }
 
 impl MockBucketBuilder {
-    fn key(mut self, key: impl Into<String>, data: impl Into<Bytes>) -> Self {
-        self.objects.push(MockObject::new(key, data));
-        self
-    }
-
+    /// Create a new key with the given content size using random data
     fn key_with_size(mut self, key: impl Into<String>, size: usize) -> Self {
         self.objects.push(MockObject::new_random(key, size));
         self
     }
 
+    /// Create a new key that returns an error when `get_object` API operation is invoked
     fn key_with_error(mut self, key: impl Into<String>) -> Self {
         self.objects.push(MockObject::new_with_error(key));
         self
     }
 
+    /// Consume the builder and build a `MockBucket`
     fn build(self) -> MockBucket {
         MockBucket {
             objects: self.objects,
@@ -144,7 +142,8 @@ impl MockBucketBuilder {
     }
 }
 
-/// Walk the directory rooted at `dir` and gather all of the relative path filenames
+/// Walk the directory rooted at `dir` and gather all of the relative path filenames (sans
+/// directory names)
 fn relative_path_names(dir: &Path) -> Result<Vec<String>, io::Error> {
     let mut paths: Vec<String> = WalkDir::new(dir)
         .into_iter()
