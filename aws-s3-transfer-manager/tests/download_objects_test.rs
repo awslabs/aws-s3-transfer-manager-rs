@@ -2,6 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+#![cfg(target_family = "unix")]
 
 use aws_s3_transfer_manager::types::FailedTransferPolicy;
 use aws_sdk_s3::{
