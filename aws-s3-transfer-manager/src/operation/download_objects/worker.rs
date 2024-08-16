@@ -226,6 +226,7 @@ fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), er
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::error::DisplayErrorContext;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
     use aws_smithy_mocks_experimental::{mock, mock_client};
 
@@ -233,7 +234,8 @@ mod tests {
         worker::discover_objects, DownloadObjectsContext, DownloadObjectsInput,
     };
 
-    use super::strip_key_prefix;
+    use super::{local_key_path, strip_key_prefix};
+    use std::path::PathBuf;
 
     struct ObjectKeyPathTest {
         key: &'static str,
@@ -339,12 +341,6 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn test_local_key_path_linux() {
-        use std::path::PathBuf;
-
-        use aws_sdk_s3::error::DisplayErrorContext;
-
-        use super::local_key_path;
-
         let tests = &[
             success_path_test("2023/Jan/1.png", None, None, "test/2023/Jan/1.png"),
             success_path_test("2023/Jan/1.png", Some("2023/Jan/"), None, "test/1.png"),
