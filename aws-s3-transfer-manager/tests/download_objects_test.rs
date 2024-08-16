@@ -5,6 +5,7 @@
 
 use aws_s3_transfer_manager::types::FailedTransferPolicy;
 use aws_sdk_s3::{
+    error::DisplayErrorContext,
     operation::{get_object::GetObjectOutput, list_objects_v2::ListObjectsV2Output},
     primitives::ByteStream,
 };
@@ -375,4 +376,30 @@ async fn test_delimiter() {
 
     expected_paths.sort();
     assert_eq!(expected_paths, paths);
+}
+
+/// Fail when destination is not a directory
+#[tokio::test]
+async fn test_destination_dir_not_valid() {
+    let bucket = MockBucket::builder().key_with_size("image.png", 12).build();
+
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_s3_transfer_manager::Client::new(config);
+
+    let dest = tempfile::NamedTempFile::new().unwrap();
+
+    let err = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .send()
+        .await
+        .unwrap_err();
+
+    let err_str = format!("{}", DisplayErrorContext(err));
+    assert!(err_str.contains("destination is not a directory"));
 }
