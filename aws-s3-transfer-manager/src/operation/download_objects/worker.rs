@@ -461,4 +461,62 @@ mod tests {
 
         assert_eq!(keys, vec!["key1", "key2"]);
     }
+
+    #[tokio::test]
+    async fn test_user_filter() {
+        let list_objects_rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("key1")
+                        .size(10)
+                        .build(),
+                )
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("key2")
+                        .size(0)
+                        .build(),
+                )
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("key3")
+                        .size(7)
+                        .build(),
+                )
+                .contents(
+                    aws_sdk_s3::types::Object::builder()
+                        .key("foobar")
+                        .size(12)
+                        .build(),
+                )
+                .build()
+        });
+
+        let s3_client = mock_client!(aws_sdk_s3, &[&list_objects_rule]);
+        let config = crate::Config::builder().client(s3_client).build();
+        let client = crate::Client::new(config);
+        let input = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .filter(|obj| obj.size().unwrap_or_default() > 0 && obj.key().unwrap().contains("key"))
+            .build()
+            .unwrap();
+
+        let ctx = DownloadObjectsContext::new(client.handle.clone(), input);
+
+        let (work_tx, work_rx) = async_channel::unbounded();
+
+        let join_handle = tokio::spawn(discover_objects(ctx, work_tx));
+
+        let mut keys = Vec::new();
+
+        while let Ok(job) = work_rx.recv().await {
+            keys.push(job.object.key.unwrap());
+        }
+
+        join_handle.await.unwrap().unwrap();
+
+        assert_eq!(keys, vec!["key1", "key3"]);
+    }
 }
