@@ -103,7 +103,7 @@ async fn upload_object(ctx: UploadContext, body: ByteStream, content_length: i64
 /// * `stream` - The content to upload
 /// * `content_length` - The upper bound on the content length
 async fn try_start_mpu_upload(
-    ctx: UploadContext,
+    mut ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
 ) -> Result<UploadHandle, crate::error::Error> {
@@ -118,6 +118,7 @@ async fn try_start_mpu_upload(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
+    ctx.upload_id = mpu.upload_id.clone();
 
 
     let part_reader = Arc::new(
