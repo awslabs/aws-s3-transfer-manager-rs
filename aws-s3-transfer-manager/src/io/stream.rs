@@ -80,7 +80,7 @@ impl InputStream {
 
     pub async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
        match self.inner {
-            RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path).await.map_err(error::from_kind(error::ErrorKind::ChunkFailed)),
+            RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path).await.map_err(error::from_kind(error::ErrorKind::InputInvalid)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
         }
     }

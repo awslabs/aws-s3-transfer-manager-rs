@@ -53,10 +53,8 @@ impl Upload {
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
         if content_length < min_mpu_threshold {
-            // TODO - adapt body to ByteStream and send request using `PutObject` for non mpu upload
-            // tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            // try_start_mpu_upload(&mut handle, stream, content_length).await?
-            try_start_upload(&mut handle, stream, content_length).await?
+            tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
+            try_start_upload_object(&mut handle, stream, content_length).await?
         } else {
             try_start_mpu_upload(&mut handle, stream, content_length).await?
         }
@@ -65,15 +63,16 @@ impl Upload {
     }
 }
 
-async fn try_start_upload(
+async fn try_start_upload_object(
     handle: &mut UploadHandle,
     stream: InputStream,
     content_length: u64,
 ) -> Result<(), crate::error::Error> {
+
     let ctx = handle.ctx.clone();
     let byte_stream = stream.into_byte_stream().await?;
-    let task = upload_object(ctx, byte_stream, content_length as i64);
-    handle.task = Some(tokio::spawn(task));
+    let content_length: i64 = content_length.try_into().map_err(|_| { error::invalid_input(format!("content_length:{} is invalid.", content_length))})?;
+    handle.task = Some(tokio::spawn(upload_object(ctx, byte_stream, content_length)));
     Ok(())
 }
 
@@ -84,7 +83,6 @@ async fn upload_object(ctx: UploadContext, body: ByteStream, content_length: i64
         .put_object()
         .set_bucket(ctx.request.bucket.clone())
         .set_key(ctx.request.key.clone())
-        // TODO: fix
         .content_length(content_length)
         .body(body)
         .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())

@@ -16,7 +16,8 @@ use tokio::task;
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
     pub(crate) tasks: task::JoinSet<Result<Vec<CompletedPart>, crate::error::Error>>,
-    pub(crate) task: Option<task::JoinHandle<Result<UploadOutput, crate::error::Error>>>,
+    // TODO: what is the best way in Rust to represent this?
+    pub(crate) put_object_task: Option<task::JoinHandle<Result<UploadOutput, crate::error::Error>>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -28,7 +29,7 @@ impl UploadHandle {
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
             tasks: task::JoinSet::new(),
-            task: None,
+            put_object_task: None,
             ctx,
             response: None,
         }
@@ -53,7 +54,8 @@ impl UploadHandle {
             complete_upload(self).await
         } else {
             // TODO: fix unwrap
-            let join_handle = self.task.unwrap();
+            // TODO: What about abort? 
+            let join_handle = self.put_object_task.unwrap();
             join_handle.await?
         }
     }
@@ -61,6 +63,7 @@ impl UploadHandle {
     /// Abort the upload and cancel any in-progress part uploads.
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
+        // TODO - handle put_object upload
 
         // cancel in-progress uploads
         self.tasks.abort_all();
