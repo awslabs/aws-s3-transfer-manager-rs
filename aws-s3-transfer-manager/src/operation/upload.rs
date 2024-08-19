@@ -118,7 +118,7 @@ async fn try_start_mpu_upload(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
-    ctx.upload_id = mpu.upload_id.clone();
+    ctx.upload_id.clone_from(&mpu.upload_id);
 
 
     let part_reader = Arc::new(
@@ -136,10 +136,7 @@ async fn try_start_mpu_upload(
         tasks.spawn(worker);
     }
 
-    // TODO: Fix?
-    let mut handle = UploadHandle::new_multipart(ctx, tasks);
-    handle.set_response(mpu);
-    Ok(handle)
+    Ok(UploadHandle::new_multipart(ctx, tasks, mpu))
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {

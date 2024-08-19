@@ -37,11 +37,12 @@ impl UploadHandle {
     pub(crate) fn new_multipart(
         ctx: UploadContext,
         tasks: task::JoinSet<Result<Vec<CompletedPart>, crate::error::Error>>,
+        response: UploadOutputBuilder,
     ) -> Self {
         Self {
             tasks: UploadTasks::Multipart(tasks),
             ctx,
-            response: None,
+            response: Some(response),
         }
     }
 
@@ -61,14 +62,14 @@ impl UploadHandle {
     ///
     /// This is usually after `CreateMultipartUpload` is initiated (or
     /// `PutObject` is invoked for uploads less than the required MPU threshold).
-    pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
-        if builder.upload_id.is_some() {
-            let upload_id = builder.upload_id.clone().expect("upload ID present");
-            self.ctx.set_upload_id(upload_id);
-        }
-
-        self.response = Some(builder);
-    }
+//    pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
+//        if builder.upload_id.is_some() {
+//            let upload_id = builder.upload_id.clone().expect("upload ID present");
+//            self.ctx.set_upload_id(upload_id);
+//        }
+//
+//        self.response = Some(builder);
+//    }
 
     /// Consume the handle and wait for upload to complete
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
