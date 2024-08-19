@@ -23,6 +23,7 @@ pub use handle::UploadHandle;
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
+use tokio::task;
 use std::cmp;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -44,7 +45,6 @@ impl Upload {
 
         let stream = input.take_body();
         let ctx = new_context(handle, input);
-        let mut handle = UploadHandle::new(ctx);
 
         // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
         let content_length = stream
@@ -52,28 +52,27 @@ impl Upload {
             .upper()
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
-        if content_length < min_mpu_threshold {
+        let handle = if content_length < min_mpu_threshold {
             tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            try_start_upload_object(&mut handle, stream, content_length).await?
+            try_start_upload_object(ctx, stream, content_length).await?
         } else {
-            try_start_mpu_upload(&mut handle, stream, content_length).await?
-        }
+            try_start_mpu_upload(ctx, stream, content_length).await?
+        };
 
         Ok(handle)
     }
 }
 
 async fn try_start_upload_object(
-    handle: &mut UploadHandle,
+    ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<(), crate::error::Error> {
+) -> Result<UploadHandle, crate::error::Error> {
 
-    let ctx = handle.ctx.clone();
     let byte_stream = stream.into_byte_stream().await?;
     let content_length: i64 = content_length.try_into().map_err(|_| { error::invalid_input(format!("content_length:{} is invalid.", content_length))})?;
-    handle.task = Some(tokio::spawn(upload_object(ctx, byte_stream, content_length)));
-    Ok(())
+    let task = tokio::spawn(upload_object(ctx.clone(), byte_stream, content_length));
+    Ok(UploadHandle::new_single_put(ctx, task))
 }
 
 async fn upload_object(ctx: UploadContext, body: ByteStream, content_length: i64) -> Result<UploadOutput, error::Error> {
@@ -104,23 +103,22 @@ async fn upload_object(ctx: UploadContext, body: ByteStream, content_length: i64
 /// * `stream` - The content to upload
 /// * `content_length` - The upper bound on the content length
 async fn try_start_mpu_upload(
-    handle: &mut UploadHandle,
+    ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<(), crate::error::Error> {
+) -> Result<UploadHandle, crate::error::Error> {
     let part_size = cmp::max(
-        handle.ctx.handle.upload_part_size_bytes(),
+        ctx.handle.upload_part_size_bytes(),
         content_length / MAX_PARTS,
     );
     tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
 
-    let mpu = start_mpu(handle).await?;
+    let mpu = start_mpu(ctx.clone()).await?;
     tracing::trace!(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
 
-    handle.set_response(mpu);
 
     let part_reader = Arc::new(
         PartReaderBuilder::new()
@@ -129,14 +127,18 @@ async fn try_start_mpu_upload(
             .build(),
     );
 
-    let n_workers = handle.ctx.handle.num_workers();
+    let n_workers = ctx.handle.num_workers();
+    let mut tasks = task::JoinSet::new();
     for i in 0..n_workers {
-        let worker = upload_parts(handle.ctx.clone(), part_reader.clone())
+        let worker = upload_parts(ctx.clone(), part_reader.clone())
             .instrument(tracing::debug_span!("upload-part", worker = i));
-        handle.tasks.spawn(worker);
+        tasks.spawn(worker);
     }
 
-    Ok(())
+    // TODO: Fix?
+    let mut handle = UploadHandle::new_multipart(ctx, tasks);
+    handle.set_response(mpu);
+    Ok(handle)
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
@@ -148,9 +150,9 @@ fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadCo
 }
 
 /// start a new multipart upload by invoking `CreateMultipartUpload`
-async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::error::Error> {
-    let req = handle.ctx.request();
-    let client = handle.ctx.client();
+async fn start_mpu(ctx: UploadContext) -> Result<UploadOutputBuilder, crate::error::Error> {
+    let req = ctx.request();
+    let client = ctx.client();
 
     let resp = client
         .create_multipart_upload()
