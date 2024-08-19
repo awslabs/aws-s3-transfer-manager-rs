@@ -16,6 +16,7 @@ use tokio::task;
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
     pub(crate) tasks: task::JoinSet<Result<Vec<CompletedPart>, crate::error::Error>>,
+    pub(crate) task: Option<task::JoinHandle<Result<UploadOutput, crate::error::Error>>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -27,6 +28,7 @@ impl UploadHandle {
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
             tasks: task::JoinSet::new(),
+            task: None,
             ctx,
             response: None,
         }
@@ -47,7 +49,13 @@ impl UploadHandle {
 
     /// Consume the handle and wait for upload to complete
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
-        complete_upload(self).await
+        if self.ctx.is_multipart_upload() {
+            complete_upload(self).await
+        } else {
+            // TODO: fix unwrap
+            let join_handle = self.task.unwrap();
+            join_handle.await?
+        }
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
