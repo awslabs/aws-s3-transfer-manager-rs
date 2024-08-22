@@ -36,6 +36,14 @@ enum State {
 }
 
 impl State {
+    fn paginating(prefix: Option<String>) -> Self {
+        State::Paginating {
+            next_token: None,
+            prefix,
+            common_prefixes: VecDeque::new(),
+        }
+    }
+
     fn next_state(self, output: &ListObjectsV2Output) -> State {
         let prev_state = self;
         let is_truncated =
@@ -55,9 +63,9 @@ impl State {
         match prev_state {
             // more results with this prefix
             State::Paginating {
-                next_token: _,
                 prefix,
                 mut common_prefixes,
+                ..
             } if is_truncated => {
                 // add new prefixes and keep going with same prefix
                 common_prefixes.append(&mut output_common_prefixes);
@@ -70,9 +78,8 @@ impl State {
 
             // try next common prefix (if any)
             State::Paginating {
-                next_token: _,
-                prefix: _,
                 mut common_prefixes,
+                ..
             } => {
                 common_prefixes.append(&mut output_common_prefixes);
                 let prefix = common_prefixes.pop_front();
@@ -96,11 +103,7 @@ impl ListObjectsPaginator {
         let prefix = context.state.input.key_prefix.to_owned();
         Self {
             context,
-            state: Some(State::Paginating {
-                next_token: None,
-                prefix,
-                common_prefixes: VecDeque::new(),
-            }),
+            state: Some(State::paginating(prefix)),
         }
     }
 
@@ -115,9 +118,7 @@ impl ListObjectsPaginator {
         let request = match self.state() {
             State::Done => return None,
             State::Paginating {
-                next_token,
-                prefix,
-                common_prefixes: _,
+                next_token, prefix, ..
             } => ListObjectsV2Input::builder()
                 .set_bucket(input.bucket.to_owned())
                 .set_prefix(prefix.clone())

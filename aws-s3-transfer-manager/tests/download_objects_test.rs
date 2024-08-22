@@ -67,7 +67,7 @@ fn get_object_error_http_resp() -> HttpResponse {
     HttpResponse::new(StatusCode::try_from(500).unwrap(), Bytes::new().into())
 }
 
-/// Get the mock rule for this object when `get_object` is API is invoked for the corresponding key
+/// Get the mock rule for this object when `get_object` API is invoked for the corresponding key
 fn get_object_rule(mobj: &MockObject) -> Rule {
     let share1 = Arc::new(mobj.clone());
     let share2 = share1.clone();

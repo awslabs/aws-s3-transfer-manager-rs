@@ -35,6 +35,9 @@ impl DownloadObjectJob {
     }
 }
 
+// TODO(optimization) - we already will have the object metadata/size for when we goto download it
+// which could be used to seed/skip object discovery.
+
 // worker to enumerate objects from a bucket
 pub(super) async fn discover_objects(
     ctx: DownloadObjectsContext,
@@ -48,6 +51,9 @@ pub(super) async fn discover_objects(
     while let Some(obj_result) = stream.next().await {
         let object = obj_result?;
         if !(filter.predicate)(&object) {
+            // TODO(SEP) - The S3 Transfer Manager MAY add validation to handle the case for the objects whose
+            // keys differ only by case in case-insensitive filesystems such as Windows. For example, throw
+            // validation exception if a user attempts to download a bucket that contains "foobar" and "FOOBAR" in Windows.
             tracing::debug!("skipping object due to filter: {:?}", object);
             continue;
         }
@@ -98,6 +104,10 @@ pub(super) async fn download_objects(
                     err
                 );
                 match ctx.state.input.failure_policy() {
+                    // TODO - this will abort this worker, the rest of the workers will be aborted
+                    // when the handle is joined and the error is propagated and the task set is
+                    // dropped. This _may_ be later/too passive and we might consider aborting all
+                    // the tasks on error rather than relying on join and then drop.
                     FailedTransferPolicy::Abort => return Err(err),
                     FailedTransferPolicy::Continue => {
                         let mut guard = ctx.state.failed_downloads.lock().unwrap();
@@ -156,7 +166,7 @@ const DEFAULT_DELIMITER: &str = "/";
 
 /// If the prefix is not empty AND the key contains the delimiter, strip the prefix from the key.
 ///
-/// If delimiter is null, uses "/" by default.
+/// If delimiter is `None`, uses "/" by default.
 ///
 ///
 /// # Examples
@@ -165,7 +175,7 @@ const DEFAULT_DELIMITER: &str = "/";
 /// let actual = strip_key_prefix("notes/2021/1.txt", Some("notes/2021/"), None);
 /// assert_eq!("1.txt", actual);
 ///
-/// // If the prefix is not the full name of the folder, the folder name will ber truncated.
+/// // If the prefix is not the full name of the folder, the folder name will be truncated.
 /// let actual = strip_key_prefix("top-level/sub-folder/1.txt", Some("top-"), Some("/"));
 /// assert_eq!("level/sub-folder/1.txt", actual);
 /// ```

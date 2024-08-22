@@ -39,7 +39,7 @@ impl DownloadObjects {
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download_objects::DownloadObjectsInput,
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
-        //  validate existence of source directory and return error if it's not a directory
+        //  validate existence of destination and return error if it's not a directory
         let destination = input.destination().expect("destination set");
         validate_destination(destination).await?;
 
@@ -65,8 +65,7 @@ impl DownloadObjects {
 }
 
 async fn validate_destination(path: &Path) -> Result<(), error::Error> {
-    let file = fs::File::open(path).await?;
-    let meta = file.metadata().await?;
+    let meta = fs::metadata(path).await?;
 
     if !meta.is_dir() {
         return Err(error::invalid_input(format!(

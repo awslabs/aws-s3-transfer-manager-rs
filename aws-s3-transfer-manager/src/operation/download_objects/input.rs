@@ -98,12 +98,16 @@ pub struct DownloadObjectsInputBuilder {
 
 impl DownloadObjectsInputBuilder {
     /// Set the bucket name containing the object(s) to download.
+    ///
+    /// NOTE: A bucket name is required.
     pub fn bucket(mut self, input: impl Into<String>) -> Self {
         self.bucket = Some(input.into());
         self
     }
 
     /// Set the bucket name containing the object(s) to download.
+    ///
+    /// NOTE: A bucket name is required.
     pub fn set_bucket(mut self, input: Option<String>) -> Self {
         self.bucket = input;
         self
@@ -115,12 +119,16 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// Set the destination directory to which files should be downloaded
+    ///
+    /// NOTE: A destination directory is required.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.destination = Some(input.into());
         self
     }
 
     /// Set the destination directory to which files should be downloaded
+    ///
+    /// NOTE: A destination directory is required.
     pub fn set_destination(mut self, input: Option<PathBuf>) -> Self {
         self.destination = input;
         self
