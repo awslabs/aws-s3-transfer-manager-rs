@@ -360,6 +360,12 @@ mod tests {
             success_path_test("2023/Jan/1.png", Some("2023/Jan"), None, "test/1.png"),
             success_path_test("2023-Jan-1.png", None, Some("-"), "test/2023/Jan/1.png"),
             success_path_test("2023-Jan-.png", None, Some("-"), "test/2023/Jan/.png"),
+            success_path_test(
+                "many////delims-in-a-row",
+                None,
+                Some("/"),
+                "test/many/delims-in-a-row",
+            ),
             // FIXME - figure out if this test case is valid, Java v2 TM fails with exception stating it's outside the target directory
             // success_path_test("2023/Jan-1.png",	Some("2023"),	Some("-"),	"test/Jan/1.png"),
 
