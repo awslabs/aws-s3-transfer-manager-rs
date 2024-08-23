@@ -109,7 +109,7 @@ where
 /// A filter for choosing which objects to upload to S3.
 #[derive(Clone)]
 pub struct UploadFilter {
-    pub(crate) predicate: Arc<dyn Fn(&UploadFilterItem) -> bool + Send + Sync + 'static>,
+    pub(crate) _predicate: Arc<dyn Fn(&UploadFilterItem) -> bool + Send + Sync + 'static>,
 }
 
 impl fmt::Debug for UploadFilter {
@@ -126,7 +126,7 @@ where
 {
     fn from(value: F) -> Self {
         UploadFilter {
-            predicate: Arc::new(value),
+            _predicate: Arc::new(value),
         }
     }
 }
