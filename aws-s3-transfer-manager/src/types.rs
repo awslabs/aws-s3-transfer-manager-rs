@@ -106,6 +106,57 @@ where
     }
 }
 
+/// A filter for choosing which objects to upload to S3.
+#[derive(Clone)]
+pub struct UploadFilter {
+    pub(crate) _predicate: Arc<dyn Fn(&UploadFilterItem) -> bool + Send + Sync + 'static>,
+}
+
+impl fmt::Debug for UploadFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut formatter = f.debug_struct("UploadFilter");
+        formatter.field("predicate", &"<closure>");
+        formatter.finish()
+    }
+}
+
+impl<F> From<F> for UploadFilter
+where
+    F: Fn(&UploadFilterItem) -> bool + Send + Sync + 'static,
+{
+    fn from(value: F) -> Self {
+        UploadFilter {
+            _predicate: Arc::new(value),
+        }
+    }
+}
+
+/// An item passed to [`UploadFilter`] for evaluation
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct UploadFilterItem {
+    path: std::path::PathBuf,
+
+    // TODO - Should we be passing std::fs::Metadata? It avoids additional syscalls
+    // from naive calls to path.is_dir(), path.is_symlink(), etc. Should
+    // we pass our own custom type so we're not tied to std::fs::Metadata?
+    metadata: std::fs::Metadata,
+}
+
+impl UploadFilterItem {
+    /// Full path to the file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Metadata for the file.
+    /// Use this Metadata for queries like `is_dir()` and `is_symlink()`.
+    /// This is more efficient than `Path.is_dir()`, which looks up the metadata again with each call.
+    pub fn metadata(&self) -> &std::fs::Metadata {
+        &self.metadata
+    }
+}
+
 /// Detailed information about a failed object download transfer
 #[non_exhaustive]
 #[derive(Debug)]
@@ -124,6 +175,36 @@ impl FailedDownloadTransfer {
     }
 
     /// The error encountered downloading the object
+    pub fn error(&self) -> &crate::error::Error {
+        &self.error
+    }
+}
+
+/// Detailed information about a failed upload
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct FailedUploadTransfer {
+    // TODO - should we include path? should we wrap UploadInput in an Option?
+    // there could be an error with the file before we even assemble an UploadInput
+
+    // TODO - what about an error caused by a directory?
+    // like, user doesn't have permission to read subdirectory,
+    // but they're using FailedTransferPolicy::Continue, so
+    // it probably shouldn't be fatal, but they'd probably
+    // want the failure list to indicate that it wasn't a perfect run
+    pub(crate) input: crate::operation::upload::UploadInput,
+    pub(crate) error: crate::error::Error,
+}
+
+// TODO - Omit "Transfer" from struct name?
+// "Transfer" is generic for "upload or download" but this already has "Upload" in the name
+impl FailedUploadTransfer {
+    /// The input for the failed object upload
+    pub fn input(&self) -> &crate::operation::upload::UploadInput {
+        &self.input
+    }
+
+    /// The error encountered uploading the object
     pub fn error(&self) -> &crate::error::Error {
         &self.error
     }
