@@ -109,7 +109,7 @@ where
 /// A filter for choosing which objects to upload to S3.
 #[derive(Clone)]
 pub struct UploadFilter {
-    pub(crate) _predicate: Arc<dyn Fn(&UploadFilterItem) -> bool>,
+    pub(crate) predicate: Arc<dyn Fn(&UploadFilterItem) -> bool + Send + Sync + 'static>,
 }
 
 impl fmt::Debug for UploadFilter {
@@ -122,11 +122,11 @@ impl fmt::Debug for UploadFilter {
 
 impl<F> From<F> for UploadFilter
 where
-    F: Fn(&UploadFilterItem) -> bool + 'static,
+    F: Fn(&UploadFilterItem) -> bool + Send + Sync + 'static,
 {
     fn from(value: F) -> Self {
         UploadFilter {
-            _predicate: Arc::new(value),
+            predicate: Arc::new(value),
         }
     }
 }
@@ -192,16 +192,12 @@ pub struct FailedUploadTransfer {
     // but they're using FailedTransferPolicy::Continue, so
     // it probably shouldn't be fatal, but they'd probably
     // want the failure list to indicate that it wasn't a perfect run
-
-    // TODO - Does "FailedUploadTransfer" violate the Consistent Word Order rule?
-    // Should it start with "Upload" or be like "UploadObjectsFailure"?
-
-    // TODO - Omit "Transfer" from struct name?
-    // "Transfer" is generic for "upload or download" but this already has "Upload" in the name
     pub(crate) input: crate::operation::upload::UploadInput,
     pub(crate) error: crate::error::Error,
 }
 
+// TODO - Omit "Transfer" from struct name?
+// "Transfer" is generic for "upload or download" but this already has "Upload" in the name
 impl FailedUploadTransfer {
     /// The input for the failed object upload
     pub fn input(&self) -> &crate::operation::upload::UploadInput {

@@ -7,13 +7,10 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{FailedTransferPolicy, UploadFilter};
 
-// TODO - consistent naming for "s3_delimiter" and "s3_prefix" between upload_objects and download_objects
+// TODO - docs and examples on the interaction of key_prefix & delimiter
 
-// TODO - should required stuff in the Input struct (i.e. bucket) be Optional?
-
-// TODO - should stuff like s3_delimiter (which defaults to "/") be an String or Option<String>,
-
-// TODO - docs and examples on the interaction of prefix & delimiter
+// TODO - upload_objects has recursive option (defaulting to false, per SEP)
+// but download_objects currently has no such option. Be consistent.
 
 /// Input type for uploading multiple objects
 #[non_exhaustive]
@@ -35,10 +32,10 @@ pub struct UploadObjectsInput {
     pub filter: Option<UploadFilter>,
 
     /// The S3 key prefix to use for each object.
-    pub s3_prefix: Option<String>,
+    pub key_prefix: Option<String>,
 
-    /// The S3 delimiter.
-    pub s3_delimiter: Option<String>,
+    /// Character used to group keys.
+    pub delimiter: Option<String>,
 
     /// The failure policy to use when any individual object upload fails.
     pub failure_policy: FailedTransferPolicy,
@@ -71,13 +68,13 @@ impl UploadObjectsInput {
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn s3_prefix(&self) -> Option<&str> {
-        self.s3_prefix.as_deref()
+    pub fn key_prefix(&self) -> Option<&str> {
+        self.key_prefix.as_deref()
     }
 
-    /// The S3 delimiter.
-    pub fn s3_delimiter(&self) -> Option<&str> {
-        self.s3_delimiter.as_deref()
+    /// Character used to group keys.
+    pub fn delimiter(&self) -> Option<&str> {
+        self.delimiter.as_deref()
     }
 
     /// The failure policy to use when any individual object upload fails.
@@ -95,8 +92,8 @@ pub struct UploadObjectsInputBuilder {
     pub(crate) recursive: bool,
     pub(crate) follow_symlinks: bool,
     pub(crate) filter: Option<UploadFilter>,
-    pub(crate) s3_prefix: Option<String>,
-    pub(crate) s3_delimiter: Option<String>,
+    pub(crate) key_prefix: Option<String>,
+    pub(crate) delimiter: Option<String>,
     pub(crate) failure_policy: FailedTransferPolicy,
 }
 
@@ -113,8 +110,8 @@ impl UploadObjectsInputBuilder {
             recursive: self.recursive,
             follow_symlinks: self.follow_symlinks,
             filter: self.filter,
-            s3_prefix: self.s3_prefix,
-            s3_delimiter: self.s3_delimiter.or(Some("/".into())),
+            key_prefix: self.key_prefix,
+            delimiter: self.delimiter.or(Some("/".into())),
             failure_policy: self.failure_policy,
         })
     }
@@ -193,37 +190,37 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn s3_prefix(mut self, input: impl Into<String>) -> Self {
-        self.s3_prefix = Some(input.into());
+    pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
+        self.key_prefix = Some(input.into());
         self
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn set_s3_prefix(mut self, input: Option<String>) -> Self {
-        self.s3_prefix = input;
+    pub fn set_key_prefix(mut self, input: Option<String>) -> Self {
+        self.key_prefix = input;
         self
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn get_s3_prefix(&self) -> &Option<String> {
-        &self.s3_prefix
+    pub fn get_key_prefix(&self) -> &Option<String> {
+        &self.key_prefix
     }
 
-    /// The S3 delimiter.
-    pub fn s3_delimiter(mut self, input: impl Into<String>) -> Self {
-        self.s3_delimiter = Some(input.into());
+    /// Character used to group keys.
+    pub fn delimiter(mut self, input: impl Into<String>) -> Self {
+        self.delimiter = Some(input.into());
         self
     }
 
-    /// The S3 delimiter.
-    pub fn set_s3_delimiter(mut self, input: Option<String>) -> Self {
-        self.s3_delimiter = input;
+    /// Character used to group keys.
+    pub fn set_delimiter(mut self, input: Option<String>) -> Self {
+        self.delimiter = input;
         self
     }
 
-    /// The S3 delimiter.
-    pub fn get_s3_delimiter(&self) -> &Option<String> {
-        &self.s3_delimiter
+    /// Character used to group keys.
+    pub fn get_delimiter(&self) -> &Option<String> {
+        &self.delimiter
     }
 
     /// The failure policy to use when any individual object upload fails.

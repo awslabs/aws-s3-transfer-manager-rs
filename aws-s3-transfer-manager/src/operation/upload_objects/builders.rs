@@ -101,16 +101,13 @@ impl UploadObjectsFluentBuilder {
         self
     }
 
-    // TODO - download version of filter() takes Fn instead of Into
+    // TODO - download version of filter() takes Fn instead of Into. Be consistent
 
     // TODO - should we filter directories too? not just files?
     // only-files is simpler, and matches what DownloadFilter can do.
     // but filtering out a directory in 1 call is more efficient than filtering out N files within it.
     // we could add it later, via new property `dir_filter: UploadFilter`
     // or new bool `filter_dirs: bool`
-
-    // TODO - We COULD just let the user handle recursion and symlinks themselves
-    // via the filter, instead of via bools, ... but that's probably a footgun.
 
     // TODO - TransferManager should prevent infinite recursion from symlinks.
     // Should it skip ALL symbolic links that point elsewhere within the upload dir?
@@ -128,38 +125,38 @@ impl UploadObjectsFluentBuilder {
 
     /// The S3 key prefix to use for each object.
     /// If not provided, files will be uploaded to the root of the bucket.
-    pub fn s3_prefix(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.s3_prefix(input);
+    pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
+        self.inner = self.inner.key_prefix(input);
         self
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn set_s3_prefix(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_s3_prefix(input);
+    pub fn set_key_prefix(mut self, input: Option<String>) -> Self {
+        self.inner = self.inner.set_key_prefix(input);
         self
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn get_s3_prefix(&self) -> &Option<String> {
-        self.inner.get_s3_prefix()
+    pub fn get_key_prefix(&self) -> &Option<String> {
+        self.inner.get_key_prefix()
     }
 
-    /// The S3 delimiter.
+    /// Character used to group keys.
     /// If not provided, the slash "/" character is used.
-    pub fn s3_delimiter(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.s3_delimiter(input);
+    pub fn delimiter(mut self, input: impl Into<String>) -> Self {
+        self.inner = self.inner.delimiter(input);
         self
     }
 
-    /// The S3 delimiter.
-    pub fn set_s3_delimiter(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_s3_delimiter(input);
+    /// Character used to group keys.
+    pub fn set_delimiter(mut self, input: Option<String>) -> Self {
+        self.inner = self.inner.set_delimiter(input);
         self
     }
 
-    /// The S3 delimiter.
-    pub fn get_s3_delimiter(&self) -> &Option<String> {
-        self.inner.get_s3_delimiter()
+    /// Character used to group keys.
+    pub fn get_delimiter(&self) -> &Option<String> {
+        self.inner.get_delimiter()
     }
 
     /// The failure policy to use when any individual object upload fails.

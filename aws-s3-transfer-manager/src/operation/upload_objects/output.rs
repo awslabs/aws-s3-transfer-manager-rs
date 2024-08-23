@@ -14,7 +14,7 @@ pub struct UploadObjectsOutput {
 
     /// The list of failed uploads
     pub failed_transfers: Vec<FailedUploadTransfer>,
-    // TODO - DownloadObjectsOutput did Option<Vec<>> instead of just Vec<>
+    // TODO - DownloadObjectsOutput did Option<Vec<>> instead of just Vec<>. Be consistent
 }
 
 impl UploadObjectsOutput {
