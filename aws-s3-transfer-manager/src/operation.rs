@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::sync::Arc;
+
 /// Types for single object upload operation
 pub mod upload;
 
@@ -14,3 +16,28 @@ pub mod download_objects;
 
 /// Types for multiple object upload operation
 pub mod upload_objects;
+
+/// Container for maintaining context required to carry out a single operation/transfer.
+///
+/// `State` is whatever additional operation specific state is required for the operation.
+#[derive(Debug)]
+pub(crate) struct TransferContext<State> {
+    handle: Arc<crate::client::Handle>,
+    state: Arc<State>,
+}
+
+impl<State> TransferContext<State> {
+    /// The S3 client to use for SDK operations
+    pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
+        self.handle.config.client()
+    }
+}
+
+impl<State> Clone for TransferContext<State> {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            state: self.state.clone(),
+        }
+    }
+}

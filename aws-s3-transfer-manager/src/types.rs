@@ -84,7 +84,7 @@ pub enum FailedTransferPolicy {
 /// A filter for downloading objects from S3
 #[derive(Clone)]
 pub struct DownloadFilter {
-    pub(crate) _predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool>,
+    pub(crate) predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static>,
 }
 
 impl fmt::Debug for DownloadFilter {
@@ -97,12 +97,51 @@ impl fmt::Debug for DownloadFilter {
 
 impl<F> From<F> for DownloadFilter
 where
-    F: Fn(&aws_sdk_s3::types::Object) -> bool + 'static,
+    F: Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static,
 {
     fn from(value: F) -> Self {
         DownloadFilter {
-            _predicate: Arc::new(value),
+            predicate: Arc::new(value),
         }
+    }
+}
+
+impl Default for DownloadFilter {
+    fn default() -> Self {
+        Self {
+            predicate: Arc::new(all_objects_filter),
+        }
+    }
+}
+
+/// Filter that returns all non-folder objects. A folder is a 0-byte object created
+/// when a customer uses S3 console to create a folder, and it always ends with '/'.
+fn all_objects_filter(obj: &aws_sdk_s3::types::Object) -> bool {
+    let key = obj.key().unwrap_or("");
+    let is_folder = key.ends_with('/') && obj.size().is_some() && obj.size().unwrap() == 0;
+    !is_folder
+}
+
+/// Detailed information about a failed object download transfer
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct FailedDownloadTransfer {
+    /// The input for the download object operation that failed
+    pub(crate) input: crate::operation::download::DownloadInput,
+
+    /// The error encountered downloading the object
+    pub(crate) error: crate::error::Error,
+}
+
+impl FailedDownloadTransfer {
+    /// The input for the download object operation that failed
+    pub fn input(&self) -> &crate::operation::download::DownloadInput {
+        &self.input
+    }
+
+    /// The error encountered downloading the object
+    pub fn error(&self) -> &crate::error::Error {
+        &self.error
     }
 }
 
@@ -154,29 +193,6 @@ impl UploadFilterItem {
     /// This is more efficient than `Path.is_dir()`, which looks up the metadata again with each call.
     pub fn metadata(&self) -> &std::fs::Metadata {
         &self.metadata
-    }
-}
-
-/// Detailed information about a failed object download transfer
-#[non_exhaustive]
-#[derive(Debug)]
-pub struct FailedDownloadTransfer {
-    /// The input for the download object operation that failed
-    pub(crate) input: crate::operation::download::DownloadInput,
-
-    /// The error encountered downloading the object
-    pub(crate) error: crate::error::Error,
-}
-
-impl FailedDownloadTransfer {
-    /// The input for the download object operation that failed
-    pub fn input(&self) -> &crate::operation::download::DownloadInput {
-        &self.input
-    }
-
-    /// The error encountered downloading the object
-    pub fn error(&self) -> &crate::error::Error {
-        &self.error
     }
 }
 

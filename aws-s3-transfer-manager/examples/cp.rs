@@ -10,6 +10,8 @@ use std::{mem, time};
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
+use aws_sdk_s3::config::StalledStreamProtectionConfig;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_types::SdkConfig;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -102,11 +104,8 @@ struct S3Uri(String);
 impl S3Uri {
     /// Split the URI into it's component parts '(bucket, key)'
     fn parts(&self) -> (&str, &str) {
-        self.0
-            .strip_prefix("s3://")
-            .expect("valid s3 uri prefix")
-            .split_once('/')
-            .expect("invalid s3 uri, missing '/' between bucket and key")
+        let bucket = self.0.strip_prefix("s3://").expect("valid s3 uri prefix");
+        bucket.split_once('/').unwrap_or((bucket, ""))
     }
 }
 
@@ -116,8 +115,44 @@ fn invalid_arg(message: &str) -> ! {
         .exit()
 }
 
+async fn do_recursive_download(
+    args: Args,
+    tm: aws_s3_transfer_manager::Client,
+) -> Result<(), BoxError> {
+    let (bucket, key_prefix) = args.source.expect_s3().parts();
+    let dest = args.dest.expect_local();
+    fs::create_dir_all(dest).await?;
+
+    let start = time::Instant::now();
+    let handle = tm
+        .download_objects()
+        .bucket(bucket)
+        .key_prefix(key_prefix)
+        .destination(dest)
+        .send()
+        .await?;
+
+    let output = handle.join().await?;
+    tracing::info!("download output: {output:?}");
+
+    let elapsed = start.elapsed();
+    let transfer_size_bytes = output.total_bytes_transferred();
+    let transfer_size_megabytes = transfer_size_bytes as f64 / ONE_MEGABYTE as f64;
+    let transfer_size_megabits = transfer_size_megabytes * 8f64;
+
+    println!(
+        "downloaded {} objects totalling {transfer_size_bytes} bytes ({transfer_size_megabytes} MB) in {elapsed:?}; Mb/s: {}",
+        output.objects_downloaded(),
+        transfer_size_megabits / elapsed.as_secs_f64(),
+    );
+    Ok(())
+}
+
 async fn do_download(args: Args) -> Result<(), BoxError> {
-    let config = aws_config::from_env().load().await;
+    let config = aws_config::from_env()
+        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+        .load()
+        .await;
     warmup(&config).await?;
 
     let s3_client = aws_sdk_s3::Client::new(&config);
@@ -130,12 +165,11 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
     let tm = aws_s3_transfer_manager::Client::new(tm_config);
 
-    let (bucket, key) = args.source.expect_s3().parts();
-
     if args.recursive {
-        todo!("implement recursive download")
+        return do_recursive_download(args, tm).await;
     }
 
+    let (bucket, key) = args.source.expect_s3().parts();
     let dest = fs::File::create(args.dest.expect_local()).await?;
     println!("dest file opened, starting download");
 
@@ -228,11 +262,15 @@ async fn main() -> Result<(), BoxError> {
     }
 
     use TransferUri::*;
-    match (&args.source, &args.dest) {
-        (Local(_), S3(_)) => do_upload(args).await?,
+    let result = match (&args.source, &args.dest) {
+        (Local(_), S3(_)) => do_upload(args).await,
         (Local(_), Local(_)) => invalid_arg("local to local transfer not supported"),
-        (S3(_), Local(_)) => do_download(args).await?,
+        (S3(_), Local(_)) => do_download(args).await,
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
+    };
+
+    if let Err(ref err) = result {
+        tracing::error!("transfer failed: {}", DisplayErrorContext(err.as_ref()));
     }
 
     Ok(())

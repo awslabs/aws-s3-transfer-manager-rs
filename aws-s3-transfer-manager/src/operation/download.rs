@@ -92,7 +92,7 @@ impl Download {
             //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
             object_meta: discovery.meta,
             body: Body::new(comp_rx),
-            _tasks: tasks,
+            tasks,
         };
 
         Ok(handle)

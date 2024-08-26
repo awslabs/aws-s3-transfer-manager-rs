@@ -109,7 +109,10 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Filter unwanted S3 objects from being downloaded as part of the transfer.
-    pub fn filter(mut self, input: impl Fn(&aws_sdk_s3::types::Object) -> bool + 'static) -> Self {
+    pub fn filter(
+        mut self,
+        input: impl Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static,
+    ) -> Self {
         self.inner = self.inner.filter(input);
         self
     }
