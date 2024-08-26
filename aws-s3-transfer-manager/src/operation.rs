@@ -14,6 +14,9 @@ pub mod download;
 /// Types for multiple object download operation
 pub mod download_objects;
 
+/// Types for multiple object upload operation
+pub mod upload_objects;
+
 /// Container for maintaining context required to carry out a single operation/transfer.
 ///
 /// `State` is whatever additional operation specific state is required for the operation.
