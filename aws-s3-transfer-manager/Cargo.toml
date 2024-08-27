@@ -21,6 +21,7 @@ bytes = "1"
 hyper = { version = "0.14.29", features = ["client"] }
 path-clean = "1.0.1"
 tokio = { version = "1.38.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
+tower = { version = "0.5.0", features = ["buffer", "hedge", "limit", "util"] }
 tracing = "0.1"
 
 [dev-dependencies]
