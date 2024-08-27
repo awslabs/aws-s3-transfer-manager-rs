@@ -77,9 +77,11 @@ impl InputStream {
     pub fn from_path(path: impl AsRef<Path>) -> Result<InputStream, IOError> {
         Self::read_from().path(path).build()
     }
-
+    
+    /// TODO: doc
     pub async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
        match self.inner {
+            // TODO: will this read the whole file into memory?
             RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path).await.map_err(error::from_kind(error::ErrorKind::InputInvalid)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
         }

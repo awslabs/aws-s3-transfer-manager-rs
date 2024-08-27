@@ -62,14 +62,14 @@ impl UploadHandle {
     ///
     /// This is usually after `CreateMultipartUpload` is initiated (or
     /// `PutObject` is invoked for uploads less than the required MPU threshold).
-//    pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
-//        if builder.upload_id.is_some() {
-//            let upload_id = builder.upload_id.clone().expect("upload ID present");
-//            self.ctx.set_upload_id(upload_id);
-//        }
-//
-//        self.response = Some(builder);
-//    }
+    //    pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
+    //        if builder.upload_id.is_some() {
+    //            let upload_id = builder.upload_id.clone().expect("upload ID present");
+    //            self.ctx.set_upload_id(upload_id);
+    //        }
+    //
+    //        self.response = Some(builder);
+    //    }
 
     /// Consume the handle and wait for upload to complete
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
@@ -79,33 +79,35 @@ impl UploadHandle {
     /// Abort the upload and cancel any in-progress part uploads.
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
-        // TODO - handle put_object upload
-
         // cancel in-progress uploads
-        if let UploadTasks::Multipart(tasks) = &mut self.tasks {
-            tasks.abort_all();
+        match &mut self.tasks {
+            UploadTasks::SinglePut(task) => {
+                task.abort();
+                // TODO: what's the right way to cancel a task?
+                let _ = task.await?;
 
-            // join all tasks
-            while (tasks.join_next().await).is_some() {}
-
-            if !self.ctx.is_multipart_upload() {
-                return Ok(AbortedUpload::default());
+                Ok(AbortedUpload::default())
             }
+            UploadTasks::Multipart(tasks) => {
+                tasks.abort_all();
 
-            let abort_policy = self
-                .ctx
-                .request
-                .failed_multipart_upload_policy
-                .clone()
-                .unwrap_or_default();
+                // join all tasks
+                while (tasks.join_next().await).is_some() {}
 
-            match abort_policy {
-                FailedMultipartUploadPolicy::AbortUpload => abort_upload(self).await,
-                FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+                let abort_policy = self
+                    .ctx
+                    .request
+                    .failed_multipart_upload_policy
+                    .clone()
+                    .unwrap_or_default();
+
+                match abort_policy {
+                    FailedMultipartUploadPolicy::AbortUpload => abort_upload(self).await,
+                    FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+                }
             }
-        } else {
-            todo!("handle completed uploads")
         }
+        // cancel in-progress uploads
     }
 }
 
