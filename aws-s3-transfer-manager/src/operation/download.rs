@@ -26,17 +26,16 @@ mod service;
 use body::Body;
 use context::DownloadContext;
 use discovery::{discover_obj, ObjectDiscovery};
+use service::{distribute_work, ChunkResponse};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use service::{distribute_work, ChunkResponse};
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
 
 impl Download {
-
     /// Execute a single `Download` transfer operation
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,

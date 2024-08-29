@@ -5,18 +5,15 @@
 use crate::error;
 use crate::operation::download::context::DownloadContext;
 use crate::operation::download::header;
-use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::byte_stream::{ByteStream, AggregatedBytes};
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
-use tower::hedge::Hedge;
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
+use std::cmp;
+use std::mem;
+use std::ops::RangeInclusive;
+use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
-use tokio::sync::mpsc;
-use std::mem;
-use std::sync::Arc;
-use std::time::Duration;
-use std::ops::RangeInclusive;
-use std::cmp;
 
 use super::DownloadHandle;
 
@@ -53,61 +50,18 @@ async fn download_chunk_handler(
     })
 }
 
-/// Minimum number of data points for hedging decision
-const HEDGE_MIN_DATA_POINTS: u64 = 3;
-
-/// Any request that takes longer than this latency percentile will be pre-emptively retried
-const HEDGE_LATENCY_PERCENTILE: f32 = 0.90;
-
-/// Period for calculating percentiles
-const HEDGE_PERIOD_SECS: u64 = 5;
-
-#[derive(Debug, Clone, Default)]
-struct HedgePolicy;
-
-impl tower::hedge::Policy<DownloadChunkRequest> for HedgePolicy {
-    fn clone_request(&self, req: &DownloadChunkRequest) -> Option<DownloadChunkRequest> {
-        Some(req.clone())
-    }
-
-    fn can_retry(&self, _req: &DownloadChunkRequest) -> bool {
-        true
-    }
-}
-
 /// Create a new tower::Service for downloading individual chunks of an object from S3
 pub(super) fn chunk_service(
     ctx: &DownloadContext,
 ) -> impl Service<DownloadChunkRequest, Response = ChunkResponse, Error = error::Error, Future: Send>
        + Clone
-       + Send 
-{
+       + Send {
     let svc = service_fn(download_chunk_handler);
-    // let svc = Hedge::new(
-    //     svc,
-    //     HedgePolicy,
-    //     HEDGE_MIN_DATA_POINTS,
-    //     HEDGE_LATENCY_PERCENTILE,
-    //     Duration::from_secs(HEDGE_PERIOD_SECS),
-    // );
 
-    // TODO - todo use Buffer::pair() to not spawn directly onto tokio and spawn onto the JoinSet
-    let svc = ServiceBuilder::new()
+    ServiceBuilder::new()
         .concurrency_limit(ctx.handle.num_workers())
-        .service(svc);
-
-    // restore our error type
-    // let svc = svc.map_err(|err| {
-    //     let e = err
-    //         .downcast::<error::Error>()
-    //         .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
-    //     *e
-    // });
-
-    svc
+        .service(svc)
 }
-
-
 
 // FIXME - should probably be enum ChunkRequest { Range(..), Part(..) } or have an inner field like such
 #[derive(Debug, Clone)]
@@ -202,8 +156,5 @@ fn next_chunk(
     ChunkRequest { seq, range, input }
 }
 
-
-
 #[cfg(test)]
-mod tests {
-}
+mod tests {}
