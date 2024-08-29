@@ -156,5 +156,28 @@ fn next_chunk(
     ChunkRequest { seq, range, input }
 }
 
-#[cfg(test)]
-mod tests {}
+// #[cfg(test)]
+// mod tests {
+//     use aws_sdk_s3::operation::get_object::GetObjectOutput;
+//     use aws_smithy_mocks_experimental::mock_client;
+//     use aws_smithy_mocks_experimental::mock;
+//     use aws_smithy_mocks_experimental::RuleMode;
+//
+//
+//     #[tokio::test]
+//     async fn test_distribute_work() {
+//         let get_object_rule = mock!(aws_sdk_s3::Client::get_object)
+//             .then_output(|| {
+//                 GetObjectOutput::builder()
+//                     .build()
+//             });
+//
+//         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_object_rule]);
+//         let config = crate::Config::builder().client(s3_client).build();
+//         let client = crate::Client::new(config);
+//         // distribute_work(handle, remaining, input, start_seq, comp_tx)
+//
+//     }
+//
+//
+// }
