@@ -2,7 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::worker::ChunkResponse;
+use crate::operation::download::service::ChunkResponse;
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use std::cmp;
 use std::cmp::Ordering;
@@ -169,7 +169,7 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::worker::ChunkResponse};
+    use crate::{error, operation::download::service::ChunkResponse};
     use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
     use bytes::Bytes;
     use tokio::sync::mpsc;

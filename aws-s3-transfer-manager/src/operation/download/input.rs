@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_sdk_s3::operation::get_object::builders::{GetObjectFluentBuilder, GetObjectInputBuilder};
 
 /// Input type for downloading a single object
 #[allow(missing_docs)] // documentation missing in model
