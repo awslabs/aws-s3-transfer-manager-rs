@@ -17,6 +17,7 @@ use tracing::Instrument;
 
 use super::DownloadHandle;
 
+/// Request/input type for our "chunk" service.
 #[derive(Debug, Clone)]
 pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
@@ -89,6 +90,15 @@ pub(crate) struct ChunkResponse {
     pub(crate) data: Option<AggregatedBytes>,
 }
 
+/// Spawn tasks to download the remaining chunks of object data
+///
+/// # Arguments
+///
+/// * handle - the handle for this download
+/// * remaining - the remaining content range that needs to be downloaded
+/// * input - the base transfer request input used to build chunk requests from
+/// * start_seq - the starting sequence number to use for chunks
+/// * comp_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
     handle: &mut DownloadHandle,
     remaining: RangeInclusive<u64>,
@@ -127,9 +137,8 @@ pub(super) fn distribute_work(
 
         let task = async move {
             let resp = svc.oneshot(req).await;
-            // FIXME - error should propagate to handle.join()
             if let Err(err) = comp_tx.send(resp).await {
-                tracing::error!(error = ?err, "chunk send failed");
+                tracing::debug!(error = ?err, "chunk send failed, channel closed");
             }
         }
         .instrument(tracing::debug_span!("download-chunk", seq = seq));
