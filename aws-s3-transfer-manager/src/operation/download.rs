@@ -76,7 +76,7 @@ impl Download {
 
         if !discovery.remaining.is_empty() {
             let remaining = discovery.remaining.clone();
-            distribute_work(&mut handle, remaining, input.into(), start_seq, comp_tx)
+            distribute_work(&mut handle, remaining, input, start_seq, comp_tx)
         }
 
         Ok(handle)

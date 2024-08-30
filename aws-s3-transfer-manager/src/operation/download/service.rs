@@ -5,7 +5,6 @@
 use crate::error;
 use crate::operation::download::context::DownloadContext;
 use crate::operation::download::header;
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
 use std::cmp;
@@ -15,7 +14,7 @@ use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::DownloadHandle;
+use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
 #[derive(Debug, Clone)]
@@ -31,9 +30,10 @@ async fn download_chunk_handler(
     let ctx = request.ctx;
     let request = request.request;
 
-    let mut resp = request
-        .input
-        .send_with(ctx.client())
+    let op = request.input.into_sdk_operation(ctx.client());
+
+    let mut resp = op
+        .send()
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
@@ -69,7 +69,7 @@ pub(super) fn chunk_service(
 pub(super) struct ChunkRequest {
     // byte range to download
     pub(super) range: RangeInclusive<u64>,
-    pub(super) input: GetObjectInputBuilder,
+    pub(super) input: DownloadInputBuilder,
     // sequence number
     pub(super) seq: u64,
 }
@@ -102,7 +102,7 @@ pub(crate) struct ChunkResponse {
 pub(super) fn distribute_work(
     handle: &mut DownloadHandle,
     remaining: RangeInclusive<u64>,
-    input: GetObjectInputBuilder,
+    input: DownloadInput,
     start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
 ) {
@@ -114,6 +114,7 @@ pub(super) fn distribute_work(
     let svc = chunk_service(&handle.ctx);
 
     let part_size = handle.ctx.target_part_size_bytes;
+    let input: DownloadInputBuilder = input.into();
 
     while remaining > 0 {
         let start = pos;
@@ -158,35 +159,9 @@ fn next_chunk(
     start: u64,
     end_inclusive: u64,
     seq: u64,
-    input: GetObjectInputBuilder,
+    input: DownloadInputBuilder,
 ) -> ChunkRequest {
     let range = start..=end_inclusive;
     let input = input.range(header::Range::bytes_inclusive(start, end_inclusive));
     ChunkRequest { seq, range, input }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use aws_sdk_s3::operation::get_object::GetObjectOutput;
-//     use aws_smithy_mocks_experimental::mock_client;
-//     use aws_smithy_mocks_experimental::mock;
-//     use aws_smithy_mocks_experimental::RuleMode;
-//
-//
-//     #[tokio::test]
-//     async fn test_distribute_work() {
-//         let get_object_rule = mock!(aws_sdk_s3::Client::get_object)
-//             .then_output(|| {
-//                 GetObjectOutput::builder()
-//                     .build()
-//             });
-//
-//         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_object_rule]);
-//         let config = crate::Config::builder().client(s3_client).build();
-//         let client = crate::Client::new(config);
-//         // distribute_work(handle, remaining, input, start_seq, comp_tx)
-//
-//     }
-//
-//
-// }
