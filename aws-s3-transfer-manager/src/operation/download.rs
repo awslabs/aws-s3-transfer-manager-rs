@@ -13,7 +13,6 @@ pub mod body;
 /// Operation builders
 pub mod builders;
 
-mod context;
 mod discovery;
 
 mod handle;
@@ -24,12 +23,13 @@ mod object_meta;
 mod service;
 
 use body::Body;
-use context::DownloadContext;
 use discovery::{discover_obj, ObjectDiscovery};
 use service::{distribute_work, ChunkResponse};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+
+use super::TransferContext;
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -46,13 +46,8 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let target_part_size_bytes = handle.download_part_size_bytes();
         let concurrency = handle.num_workers();
-
-        let ctx = DownloadContext {
-            handle,
-            target_part_size_bytes,
-        };
+        let ctx = DownloadContext::new(handle);
 
         // FIXME - discovery network requests should go through hedging, as well as scheduler to
         // prevent hurting throughput by not coordinating the work
@@ -99,4 +94,22 @@ async fn handle_discovery_chunk(
         start_seq = 1;
     }
     start_seq
+}
+
+/// Download operation specific state
+#[derive(Debug)]
+pub(crate) struct DownloadState {}
+
+type DownloadContext = TransferContext<DownloadState>;
+
+impl DownloadContext {
+    fn new(handle: Arc<crate::client::Handle>) -> Self {
+        let state = Arc::new(DownloadState {});
+        TransferContext { handle, state }
+    }
+
+    /// The target part size to use for this download
+    fn target_part_size_bytes(&self) -> u64 {
+        self.handle.download_part_size_bytes()
+    }
 }

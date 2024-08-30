@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
-use crate::operation::download::context::DownloadContext;
 use crate::operation::download::header;
+use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
 use std::cmp;
@@ -113,7 +113,7 @@ pub(super) fn distribute_work(
 
     let svc = chunk_service(&handle.ctx);
 
-    let part_size = handle.ctx.target_part_size_bytes;
+    let part_size = handle.ctx.target_part_size_bytes();
     let input: DownloadInputBuilder = input.into();
 
     while remaining > 0 {

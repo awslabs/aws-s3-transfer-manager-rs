@@ -6,7 +6,7 @@ use crate::operation::download::body::Body;
 use crate::operation::download::object_meta::ObjectMetadata;
 use tokio::task;
 
-use super::context::DownloadContext;
+use super::DownloadContext;
 
 /// Response type for a single download object request.
 #[derive(Debug)]
