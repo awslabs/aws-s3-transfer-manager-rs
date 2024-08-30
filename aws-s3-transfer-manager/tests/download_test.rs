@@ -3,14 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{iter, mem};
-
 use aws_config::Region;
 use aws_s3_transfer_manager::{
     error::BoxError,
-    operation::download::{body::Body, DownloadHandle},
+    operation::download::DownloadHandle,
     types::{ConcurrencySetting, PartSize},
 };
+use std::iter;
 
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
@@ -30,6 +29,9 @@ fn rand_data(size: usize) -> Bytes {
         .into()
 }
 
+/// create a dummy placeholder request for StaticReplayClient. This is used when we don't
+/// want to use `assert_requests()` and make our own assertions about the actually captured
+/// requests. Useful when you don't want to mock up the entire http request that is expected.
 fn dummy_expected_request() -> http_02x::Request<SdkBody> {
     http_02x::Request::builder()
         .uri("https://not-used")
@@ -37,9 +39,9 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
         .unwrap()
 }
 
+/// drain/consume the body
 async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
-    let mut body = mem::replace(&mut handle.body, Body::empty());
-
+    let body = handle.body_mut();
     let mut data = BytesMut::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk?.into_bytes();
@@ -49,48 +51,45 @@ async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
     Ok(data.into())
 }
 
-/// Test the object ranges are expected and we get all the data
-#[tokio::test]
-async fn test_download_ranges() {
-    tracing_subscriber::fmt::init();
+/// Create a static replay client (http connector) for an object of the given size.
+///
+/// Assumptions:
+///     1. Expected requests are not created. A dummy placeholder is used. Callers need to make
+///        assertions directly on the captured requests.
+///     2. Object discovery goes through ranged get which will fetch the first part.
+///     3. Concurrency of 1 is used since responses for a static replay client are just returned in
+///        the order given.
+fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient {
+    let events = data
+        .chunks(part_size)
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let start = idx * part_size;
+            let end = part_size * (idx + 1) - 1;
+            ReplayEvent::new(
+                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
+                // make our own assertions against the captured requests.
+                dummy_expected_request(),
+                http_02x::Response::builder()
+                    .status(200)
+                    .header(
+                        "Content-Range",
+                        format!("bytes {start}-{end}/{}", data.len()),
+                    )
+                    .body(SdkBody::from(chunk))
+                    .unwrap(),
+            )
+        })
+        .collect();
 
-    let object_data = rand_data(12 * MEBIBYTE);
-    let part_size = 5 * MEBIBYTE;
+    StaticReplayClient::new(events)
+}
 
-    // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
-    // make our own assertions against the captured requests.
-    let http_client = StaticReplayClient::new(vec![
-        // discovery w/first chunk
-        ReplayEvent::new(
-            dummy_expected_request(),
-            http_02x::Response::builder()
-                .status(200)
-                .header(
-                    "Content-Range",
-                    format!("bytes {}/{}", 5 * MEBIBYTE, object_data.len()),
-                )
-                .body(SdkBody::from(object_data.slice(0..=part_size - 1)))
-                .unwrap(),
-        ),
-        // chunk seq 1
-        ReplayEvent::new(
-            dummy_expected_request(),
-            http_02x::Response::builder()
-                .status(200)
-                .body(SdkBody::from(
-                    object_data.slice(part_size..=part_size * 2 - 1),
-                ))
-                .unwrap(),
-        ),
-        // chunk seq 2
-        ReplayEvent::new(
-            dummy_expected_request(),
-            http_02x::Response::builder()
-                .status(200)
-                .body(SdkBody::from(object_data.slice(part_size * 2..)))
-                .unwrap(),
-        ),
-    ]);
+fn simple_test_tm(
+    data: &Bytes,
+    part_size: usize,
+) -> (aws_s3_transfer_manager::Client, StaticReplayClient) {
+    let http_client = simple_object_connector(data, part_size);
 
     let s3_client = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Config::builder()
@@ -108,6 +107,17 @@ async fn test_download_ranges() {
 
     let tm = aws_s3_transfer_manager::Client::new(config);
 
+    (tm, http_client)
+}
+
+/// Test the object ranges are expected and we get all the data
+#[tokio::test]
+async fn test_download_ranges() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 5 * MEBIBYTE;
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
     let mut handle = tm
         .download()
         .bucket("test-bucket")
@@ -116,11 +126,9 @@ async fn test_download_ranges() {
         .await
         .unwrap();
 
-    // FIXME - without draining the body handle.join() will wait forever (e.g. due to channel being full)
-    // we need to define the semantics we want here w.r.t the response body.
     let body = drain(&mut handle).await.unwrap();
 
-    assert_eq!(object_data.len(), body.len());
+    assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(3, requests.len());
 
@@ -133,6 +141,25 @@ async fn test_download_ranges() {
         requests[2].headers().get("Range"),
         Some("bytes=10485760-12582911")
     );
+
+    handle.join().await.unwrap();
+}
+
+/// Test body not consumed which should not prevent the handle from being joined
+#[tokio::test]
+async fn test_body_not_consumed() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 5 * MEBIBYTE;
+
+    let (tm, _) = simple_test_tm(&data, part_size);
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .send()
+        .await
+        .unwrap();
 
     handle.join().await.unwrap();
 }

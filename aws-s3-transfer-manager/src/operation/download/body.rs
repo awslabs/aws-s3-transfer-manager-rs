@@ -77,6 +77,11 @@ impl Body {
 
         chunk
     }
+
+    /// Close the body, no more data will flow from it and all publishers will be notified.
+    pub(crate) fn close(&mut self) {
+        self.inner.close()
+    }
 }
 
 #[derive(Debug)]
@@ -163,6 +168,13 @@ impl UnorderedBody {
         match self.chunks.as_mut() {
             None => None,
             Some(ch) => ch.recv().await,
+        }
+    }
+
+    /// Close the body
+    pub(crate) fn close(&mut self) {
+        if let Some(ch) = &mut self.chunks {
+            ch.close();
         }
     }
 }

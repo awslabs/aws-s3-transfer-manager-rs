@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{mem, time};
+use std::time;
 
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::operation::download::body::Body;
@@ -181,9 +181,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     //      TM will handle it's own thread pool for filesystem work
     let mut handle = tm.download().bucket(bucket).key(key).send().await?;
 
-    let body = mem::replace(&mut handle.body, Body::empty());
-
-    write_body(body, dest)
+    write_body(handle.body_mut(), dest)
         .instrument(debug_span!("write-output"))
         .await?;
 
@@ -278,7 +276,7 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), BoxError> {
+async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk.unwrap();
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
