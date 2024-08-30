@@ -15,9 +15,9 @@ env:
   # Change to specific Rust release to pin
   rust_stable: stable
   rust_nightly: nightly-2024-07-07
-  rust_clippy: '1.78'
+  rust_clippy: '1.79'
   # When updating this, also update relevant docs
-  rust_min: '1.78'
+  rust_min: '1.79'
 
 
 defaults:
