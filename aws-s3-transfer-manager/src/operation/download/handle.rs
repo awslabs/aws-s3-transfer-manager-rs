@@ -6,6 +6,8 @@ use crate::operation::download::body::Body;
 use crate::operation::download::object_meta::ObjectMetadata;
 use tokio::task;
 
+use super::DownloadContext;
+
 /// Response type for a single download object request.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -14,10 +16,13 @@ pub struct DownloadHandle {
     pub object_meta: ObjectMetadata,
 
     /// The object content
-    pub body: Body,
+    pub(crate) body: Body,
 
     /// All child tasks spawned for this download
     pub(crate) tasks: task::JoinSet<()>,
+
+    /// The context used to drive an upload to completion
+    pub(crate) ctx: DownloadContext,
 }
 
 impl DownloadHandle {
@@ -31,8 +36,14 @@ impl DownloadHandle {
         &self.body
     }
 
+    /// Mutable reference to the body
+    pub fn body_mut(&mut self) -> &mut Body {
+        &mut self.body
+    }
+
     /// Consume the handle and wait for download transfer to complete
     pub async fn join(mut self) -> Result<(), crate::error::Error> {
+        self.body.close();
         while let Some(join_result) = self.tasks.join_next().await {
             join_result?;
         }

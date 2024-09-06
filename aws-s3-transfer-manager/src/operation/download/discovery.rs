@@ -16,8 +16,8 @@ use bytes::Buf;
 
 use super::header::{self, ByteRange};
 use super::object_meta::ObjectMetadata;
+use super::DownloadContext;
 use super::DownloadInput;
-use crate::operation::download::context::DownloadContext;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -80,9 +80,9 @@ pub(super) async fn discover_obj(
             let byte_range = match range.as_ref() {
                 Some(r) => ByteRange::Inclusive(
                     *r.start(),
-                    cmp::min(*r.start() + ctx.target_part_size_bytes - 1, *r.end()),
+                    cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
                 ),
-                None => ByteRange::Inclusive(0, ctx.target_part_size_bytes - 1),
+                None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
             };
             let builder: GetObjectInputBuilder = input.clone().into();
             let r = builder
@@ -162,12 +162,13 @@ async fn discover_obj_with_get(
 mod tests {
     use std::sync::Arc;
 
-    use crate::operation::download::context::DownloadContext;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
     use crate::operation::download::header::ByteRange;
+    use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
+    use crate::types::PartSize;
     use crate::MEBIBYTE;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -187,8 +188,14 @@ mod tests {
         ObjectDiscoveryStrategy::from_request(&input).unwrap()
     }
 
-    fn test_handle(client: aws_sdk_s3::Client) -> Arc<crate::client::Handle> {
-        let tm_config = crate::Config::builder().client(client).build();
+    fn test_handle(
+        client: aws_sdk_s3::Client,
+        target_part_size: u64,
+    ) -> Arc<crate::client::Handle> {
+        let tm_config = crate::Config::builder()
+            .client(client)
+            .set_target_part_size(PartSize::Target(target_part_size))
+            .build();
         let tm = crate::Client::new(tm_config);
         tm.handle.clone()
     }
@@ -219,10 +226,7 @@ mod tests {
             .then_output(|| HeadObjectOutput::builder().content_length(500).build());
         let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext {
-            handle: test_handle(client),
-            target_part_size_bytes: 5 * MEBIBYTE,
-        };
+        let ctx = DownloadContext::new(test_handle(client, 5 * MEBIBYTE));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -271,10 +275,7 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext {
-            handle: test_handle(client),
-            target_part_size_bytes: target_part_size,
-        };
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
@@ -306,10 +307,7 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext {
-            handle: test_handle(client),
-            target_part_size_bytes: target_part_size,
-        };
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")

@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{mem, time};
+use std::time;
 
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::operation::download::body::Body;
@@ -153,7 +153,8 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
         .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
         .load()
         .await;
-    warmup(&config).await?;
+    let (bucket, _) = args.source.expect_s3().parts();
+    warmup(&config, bucket).await?;
 
     let s3_client = aws_sdk_s3::Client::new(&config);
 
@@ -180,9 +181,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     //      TM will handle it's own thread pool for filesystem work
     let mut handle = tm.download().bucket(bucket).key(key).send().await?;
 
-    let body = mem::replace(&mut handle.body, Body::empty());
-
-    write_body(body, dest)
+    write_body(handle.body_mut(), dest)
         .instrument(debug_span!("write-output"))
         .await?;
 
@@ -205,7 +204,9 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     }
 
     let config = aws_config::from_env().load().await;
-    warmup(&config).await?;
+    let (bucket, key) = args.dest.expect_s3().parts();
+
+    warmup(&config, bucket).await?;
 
     let s3_client = aws_sdk_s3::Client::new(&config);
 
@@ -221,7 +222,6 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let file_meta = fs::metadata(path).await.expect("file metadata");
 
     let stream = InputStream::from_path(path)?;
-    let (bucket, key) = args.dest.expect_s3().parts();
 
     println!("starting upload");
     let start = time::Instant::now();
@@ -276,7 +276,7 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), BoxError> {
+async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk.unwrap();
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
@@ -291,10 +291,23 @@ async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), BoxError> 
     Ok(())
 }
 
-async fn warmup(config: &SdkConfig) -> Result<(), BoxError> {
+async fn warmup(config: &SdkConfig, bucket: &str) -> Result<(), BoxError> {
     println!("warming up client...");
     let s3 = aws_sdk_s3::Client::new(config);
-    s3.list_buckets().send().await?;
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let s3 = s3.clone();
+        let bucket = bucket.to_owned();
+        let warmup_task = async move { s3.head_bucket().bucket(bucket).send().await };
+        let handle = tokio::spawn(warmup_task);
+        handles.push(handle);
+    }
+
+    for h in handles {
+        let _ = h.await?;
+    }
+
     println!("warming up complete");
     Ok(())
 }

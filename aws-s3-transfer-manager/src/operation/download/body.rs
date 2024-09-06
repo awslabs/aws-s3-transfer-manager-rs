@@ -2,7 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::worker::ChunkResponse;
+use crate::operation::download::service::ChunkResponse;
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use std::cmp;
 use std::cmp::Ordering;
@@ -76,6 +76,11 @@ impl Body {
         }
 
         chunk
+    }
+
+    /// Close the body, no more data will flow from it and all publishers will be notified.
+    pub(crate) fn close(&mut self) {
+        self.inner.close()
     }
 }
 
@@ -165,11 +170,18 @@ impl UnorderedBody {
             Some(ch) => ch.recv().await,
         }
     }
+
+    /// Close the body
+    pub(crate) fn close(&mut self) {
+        if let Some(ch) = &mut self.chunks {
+            ch.close();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::worker::ChunkResponse};
+    use crate::{error, operation::download::service::ChunkResponse};
     use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
     use bytes::Bytes;
     use tokio::sync::mpsc;

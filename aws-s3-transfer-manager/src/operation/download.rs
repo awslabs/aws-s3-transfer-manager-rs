@@ -13,7 +13,6 @@ pub mod body;
 /// Operation builders
 pub mod builders;
 
-mod context;
 mod discovery;
 
 mod handle;
@@ -21,16 +20,16 @@ pub use handle::DownloadHandle;
 
 mod header;
 mod object_meta;
-mod worker;
+mod service;
 
 use body::Body;
-use context::DownloadContext;
 use discovery::{discover_obj, ObjectDiscovery};
+use service::{distribute_work, ChunkResponse};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::Instrument;
-use worker::{distribute_work, download_chunks, ChunkResponse};
+
+use super::TransferContext;
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -47,13 +46,11 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let target_part_size_bytes = handle.download_part_size_bytes();
         let concurrency = handle.num_workers();
+        let ctx = DownloadContext::new(handle);
 
-        let ctx = DownloadContext {
-            handle,
-            target_part_size_bytes,
-        };
+        // FIXME - discovery network requests should go through hedging, as well as scheduler to
+        // prevent hurting throughput by not coordinating the work
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &input).await?;
@@ -61,39 +58,21 @@ impl Download {
         let start_seq = handle_discovery_chunk(&mut discovery, &comp_tx).await;
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
-        let mut tasks = JoinSet::new();
+        let tasks = JoinSet::new();
 
-        if !discovery.remaining.is_empty() {
-            // start assigning work
-            let (work_tx, work_rx) = async_channel::bounded(concurrency);
-            let input = input.clone();
-            let rem = discovery.remaining.clone();
-
-            tasks.spawn(distribute_work(
-                rem,
-                input.into(),
-                target_part_size_bytes,
-                start_seq,
-                work_tx,
-            ));
-
-            for i in 0..concurrency {
-                let worker = download_chunks(ctx.clone(), work_rx.clone(), comp_tx.clone())
-                    .instrument(tracing::debug_span!("chunk-downloader", worker = i));
-                tasks.spawn(worker);
-            }
-        }
-
-        // Drop our half of the completion channel. When all workers drop theirs, the channel is closed.
-        drop(comp_tx);
-
-        let handle = DownloadHandle {
+        let mut handle = DownloadHandle {
             // FIXME(aws-sdk-rust#1159) - initial object discovery for a range/first-part will not
             //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
             object_meta: discovery.meta,
             body: Body::new(comp_rx),
             tasks,
+            ctx,
         };
+
+        if !discovery.remaining.is_empty() {
+            let remaining = discovery.remaining.clone();
+            distribute_work(&mut handle, remaining, input, start_seq, comp_tx)
+        }
 
         Ok(handle)
     }
@@ -115,4 +94,22 @@ async fn handle_discovery_chunk(
         start_seq = 1;
     }
     start_seq
+}
+
+/// Download operation specific state
+#[derive(Debug)]
+pub(crate) struct DownloadState {}
+
+type DownloadContext = TransferContext<DownloadState>;
+
+impl DownloadContext {
+    fn new(handle: Arc<crate::client::Handle>) -> Self {
+        let state = Arc::new(DownloadState {});
+        TransferContext { handle, state }
+    }
+
+    /// The target part size to use for this download
+    fn target_part_size_bytes(&self) -> u64 {
+        self.handle.download_part_size_bytes()
+    }
 }
