@@ -43,5 +43,8 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// Tower related middleware and components
+pub(crate) mod middleware;
+
 pub use self::client::Client;
 pub use self::config::Config;

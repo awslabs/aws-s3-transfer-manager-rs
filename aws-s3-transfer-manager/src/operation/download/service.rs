@@ -3,25 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
+use crate::middleware::retry;
 use crate::operation::download::header;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
-use futures_util::future;
 use std::cmp;
-use std::error::Error;
 use std::mem;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tower::retry::backoff::Backoff;
-use tower::retry::backoff::ExponentialBackoff;
-use tower::retry::backoff::ExponentialBackoffMaker;
-use tower::retry::backoff::MakeBackoff;
-use tower::retry::{self, budget::Budget};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
-use tracing::trace_span;
 use tracing::Instrument;
 
 use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
@@ -61,59 +52,6 @@ async fn download_chunk_handler(
     })
 }
 
-#[derive(Debug, Clone)]
-struct RetryChunkPolicy {
-    budget: Arc<retry::budget::TpsBudget>,
-    backoff_maker: ExponentialBackoffMaker,
-    backoff: Option<ExponentialBackoff>,
-    remaining_attempts: usize,
-}
-
-impl Default for RetryChunkPolicy {
-    fn default() -> Self {
-        Self {
-            budget: Default::default(),
-            backoff_maker: Default::default(),
-            backoff: None,
-            remaining_attempts: 2,
-        }
-    }
-}
-
-impl<Req, Res, E> tower::retry::Policy<Req, Res, E> for RetryChunkPolicy
-where
-    Req: Clone,
-    E: Error,
-{
-    type Future = tokio::time::Sleep;
-
-    fn retry(&mut self, _req: &mut Req, result: &mut Result<Res, E>) -> Option<Self::Future> {
-        match result {
-            Ok(_) => {
-                self.budget.deposit();
-                None
-            }
-            Err(_) => {
-                if self.remaining_attempts == 0 || !self.budget.withdraw() {
-                    return None;
-                }
-                let mut backoff = self
-                    .backoff
-                    .take()
-                    .unwrap_or_else(|| self.backoff_maker.make_backoff());
-                let delay = backoff.next_backoff();
-                self.backoff = Some(backoff);
-                self.remaining_attempts = cmp::min(0, self.remaining_attempts - 1);
-                Some(delay)
-            }
-        }
-    }
-
-    fn clone_request(&mut self, req: &Req) -> Option<Req> {
-        Some(req.clone())
-    }
-}
-
 /// Create a new tower::Service for downloading individual chunks of an object from S3
 pub(super) fn chunk_service(
     ctx: &DownloadContext,
@@ -124,7 +62,7 @@ pub(super) fn chunk_service(
 
     ServiceBuilder::new()
         .concurrency_limit(ctx.handle.num_workers())
-        .retry(RetryChunkPolicy::default())
+        .retry(retry::RetryPolicy::default())
         .service(svc)
 }
 
