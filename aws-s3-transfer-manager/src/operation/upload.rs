@@ -13,11 +13,8 @@ mod handle;
 mod service;
 
 use crate::error;
-use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
 use crate::io::InputStream;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::CompletedPart;
-use bytes::Buf;
+use crate::io::part_reader::Builder as PartReaderBuilder;
 use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3
@@ -159,64 +156,6 @@ async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::
         .await?;
 
     Ok(resp.into())
-}
-
-/// Worker function that pulls part data off the `reader` and uploads each part until the reader
-/// is exhausted. If any part fails the worker will return the error and stop processing. If
-/// the worker finishes successfully the completed parts uploaded by this worker are returned.
-#[allow(dead_code)]
-async fn upload_parts(
-    ctx: UploadContext,
-    reader: Arc<impl ReadPart>,
-) -> Result<Vec<CompletedPart>, error::Error> {
-    let mut completed_parts = Vec::new();
-    loop {
-        let part_result = reader.next_part().await?;
-        let part_data = match part_result {
-            Some(part_data) => part_data,
-            None => break,
-        };
-
-        let part_number = part_data.part_number as i32;
-        tracing::trace!("recv'd part number {}", part_number);
-
-        let content_length = part_data.data.remaining();
-        let body = ByteStream::from(part_data.data);
-
-        // TODO(aws-sdk-rust#1159): disable payload signing
-        // TODO(aws-sdk-rust#1159): set checksum fields if applicable
-        let resp = ctx
-            .client()
-            .upload_part()
-            .set_bucket(ctx.request.bucket.clone())
-            .set_key(ctx.request.key.clone())
-            .set_upload_id(ctx.upload_id.clone())
-            .part_number(part_number)
-            .content_length(content_length as i64)
-            .body(body)
-            .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())
-            .set_sse_customer_key(ctx.request.sse_customer_key.clone())
-            .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
-            .set_request_payer(ctx.request.request_payer.clone())
-            .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
-            .send()
-            .await?;
-
-        tracing::trace!("completed upload of part number {}", part_number);
-        let completed = CompletedPart::builder()
-            .part_number(part_number)
-            .set_e_tag(resp.e_tag.clone())
-            .set_checksum_crc32(resp.checksum_crc32.clone())
-            .set_checksum_crc32_c(resp.checksum_crc32_c.clone())
-            .set_checksum_sha1(resp.checksum_sha1.clone())
-            .set_checksum_sha256(resp.checksum_sha256.clone())
-            .build();
-
-        completed_parts.push(completed);
-    }
-
-    tracing::trace!("no more parts, worker finished");
-    Ok(completed_parts)
 }
 
 #[cfg(test)]

@@ -66,6 +66,9 @@ pub(super) fn upload_part_service(
        .service(svc)
 }
 
+/// Worker function that pulls part data off the `reader` and uploads each part until the reader
+/// is exhausted. If any part fails the worker will return the error and stop processing. If
+/// the worker finishes successfully the completed parts uploaded by this worker are returned.
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
     reader: Arc<impl ReadPart>,
@@ -91,10 +94,7 @@ pub(super) async fn distribute_work(
 
         let svc = svc.clone();
         let task = async move {
-            // TODO: remove vector here
-            let result = vec![svc.oneshot(req).await];
-            let output: Result<Vec<CompletedPart>, error::Error> = result.into_iter().collect();
-            output
+            svc.oneshot(req).await
         };
 
         handle.tasks.spawn(task);

@@ -15,7 +15,7 @@ use tokio::task;
 #[non_exhaustive]
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
-    pub(crate) tasks: task::JoinSet<Result<Vec<CompletedPart>, crate::error::Error>>,
+    pub(crate) tasks: task::JoinSet<Result<CompletedPart, crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -113,8 +113,8 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     while let Some(join_result) = handle.tasks.join_next().await {
         let result = join_result.expect("task completed");
         match result {
-            Ok(mut completed_parts) => {
-                all_parts.append(&mut completed_parts);
+            Ok(completed_part) => {
+                all_parts.push(completed_part);
             }
             // TODO(aws-sdk-rust#1159, design) - do we want to return first error or collect all errors?
             Err(err) => {
