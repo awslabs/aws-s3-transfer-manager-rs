@@ -24,9 +24,10 @@ pub use handle::UploadHandle;
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
+use service::distribute_work;
+
 use std::cmp;
 use std::sync::Arc;
-use tracing::Instrument;
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
@@ -98,12 +99,13 @@ async fn try_start_mpu_upload(
             .build(),
     );
 
-    let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
-        let worker = upload_parts(handle.ctx.clone(), part_reader.clone())
-            .instrument(tracing::debug_span!("upload-part", worker = i));
-        handle.tasks.spawn(worker);
-    }
+//    let n_workers = handle.ctx.handle.num_workers();
+//    for i in 0..n_workers {
+//        let worker = upload_parts(handle.ctx.clone(), part_reader.clone())
+//            .instrument(tracing::debug_span!("upload-part", worker = i));
+//        handle.tasks.spawn(worker);
+//    }
+    distribute_work(handle, part_reader).await?;
 
     Ok(())
 }
@@ -162,6 +164,7 @@ async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::
 /// Worker function that pulls part data off the `reader` and uploads each part until the reader
 /// is exhausted. If any part fails the worker will return the error and stop processing. If
 /// the worker finishes successfully the completed parts uploaded by this worker are returned.
+#[allow(dead_code)]
 async fn upload_parts(
     ctx: UploadContext,
     reader: Arc<impl ReadPart>,

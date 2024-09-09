@@ -72,6 +72,7 @@ impl ReadPart for PartReader {
 }
 
 /// Data for a single part
+#[derive(Debug, Clone)]
 pub(crate) struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
