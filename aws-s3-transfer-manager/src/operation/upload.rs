@@ -13,8 +13,8 @@ mod handle;
 mod service;
 
 use crate::error;
-use crate::io::InputStream;
 use crate::io::part_reader::Builder as PartReaderBuilder;
+use crate::io::InputStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3
@@ -96,15 +96,7 @@ async fn try_start_mpu_upload(
             .build(),
     );
 
-//    let n_workers = handle.ctx.handle.num_workers();
-//    for i in 0..n_workers {
-//        let worker = upload_parts(handle.ctx.clone(), part_reader.clone())
-//            .instrument(tracing::debug_span!("upload-part", worker = i));
-//        handle.tasks.spawn(worker);
-//    }
-    distribute_work(handle, part_reader).await?;
-
-    Ok(())
+    distribute_work(handle, part_reader).await
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
