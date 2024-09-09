@@ -10,6 +10,7 @@ mod output;
 
 mod context;
 mod handle;
+mod service;
 
 use crate::error;
 use crate::io::part_reader::{Builder as PartReaderBuilder, ReadPart};
