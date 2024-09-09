@@ -10,7 +10,7 @@ use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 // TODO(aws-sdk-rust#1159,docs): Document fields
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObjectMetadata {
     pub delete_marker: Option<bool>,
     pub accept_ranges: Option<String>,

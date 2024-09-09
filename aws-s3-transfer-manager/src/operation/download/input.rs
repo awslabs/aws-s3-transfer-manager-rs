@@ -915,4 +915,65 @@ impl From<DownloadInput> for GetObjectInputBuilder {
     }
 }
 
+impl From<DownloadInput> for DownloadInputBuilder {
+    fn from(value: DownloadInput) -> Self {
+        DownloadInputBuilder {
+            bucket: value.bucket,
+            if_match: value.if_match,
+            if_modified_since: value.if_modified_since,
+            if_none_match: value.if_none_match,
+            if_unmodified_since: value.if_unmodified_since,
+            key: value.key,
+            range: value.range,
+            response_cache_control: value.response_cache_control,
+            response_content_disposition: value.response_content_disposition,
+            response_content_encoding: value.response_content_encoding,
+            response_content_language: value.response_content_language,
+            response_content_type: value.response_content_type,
+            response_expires: value.response_expires,
+            version_id: value.version_id,
+            sse_customer_algorithm: value.sse_customer_algorithm,
+            sse_customer_key: value.sse_customer_key,
+            sse_customer_key_md5: value.sse_customer_key_md5,
+            request_payer: value.request_payer,
+            part_number: value.part_number,
+            expected_bucket_owner: value.expected_bucket_owner,
+            checksum_mode: value.checksum_mode,
+        }
+    }
+}
+
+impl DownloadInputBuilder {
+    /// Create an operation fluent builder for the rust SDK S3 client from this transfer manager
+    /// download input and the given client
+    pub(crate) fn into_sdk_operation(
+        self,
+        client: &aws_sdk_s3::Client,
+    ) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
+        client
+            .get_object()
+            .set_bucket(self.bucket)
+            .set_if_match(self.if_match)
+            .set_if_modified_since(self.if_modified_since)
+            .set_if_none_match(self.if_none_match)
+            .set_if_unmodified_since(self.if_unmodified_since)
+            .set_key(self.key)
+            .set_range(self.range)
+            .set_response_cache_control(self.response_cache_control)
+            .set_response_content_disposition(self.response_content_disposition)
+            .set_response_content_encoding(self.response_content_encoding)
+            .set_response_content_language(self.response_content_language)
+            .set_response_content_type(self.response_content_type)
+            .set_response_expires(self.response_expires)
+            .set_version_id(self.version_id)
+            .set_sse_customer_algorithm(self.sse_customer_algorithm)
+            .set_sse_customer_key(self.sse_customer_key)
+            .set_sse_customer_key_md5(self.sse_customer_key_md5)
+            .set_request_payer(self.request_payer)
+            .set_part_number(self.part_number)
+            .set_expected_bucket_owner(self.expected_bucket_owner)
+            .set_checksum_mode(self.checksum_mode)
+    }
+}
+
 // TODO - implement TryFrom<GetObjectInput> and TryFrom<GetObjectInputBuilder> for DownloadInput and DownloadInputBuilder respectively (TryFrom due to checksums)

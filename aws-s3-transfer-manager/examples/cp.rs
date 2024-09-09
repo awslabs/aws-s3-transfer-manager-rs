@@ -5,11 +5,13 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{mem, time};
+use std::time;
 
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
+use aws_sdk_s3::config::StalledStreamProtectionConfig;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_types::SdkConfig;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -102,11 +104,8 @@ struct S3Uri(String);
 impl S3Uri {
     /// Split the URI into it's component parts '(bucket, key)'
     fn parts(&self) -> (&str, &str) {
-        self.0
-            .strip_prefix("s3://")
-            .expect("valid s3 uri prefix")
-            .split_once('/')
-            .expect("invalid s3 uri, missing '/' between bucket and key")
+        let bucket = self.0.strip_prefix("s3://").expect("valid s3 uri prefix");
+        bucket.split_once('/').unwrap_or((bucket, ""))
     }
 }
 
@@ -116,9 +115,46 @@ fn invalid_arg(message: &str) -> ! {
         .exit()
 }
 
+async fn do_recursive_download(
+    args: Args,
+    tm: aws_s3_transfer_manager::Client,
+) -> Result<(), BoxError> {
+    let (bucket, key_prefix) = args.source.expect_s3().parts();
+    let dest = args.dest.expect_local();
+    fs::create_dir_all(dest).await?;
+
+    let start = time::Instant::now();
+    let handle = tm
+        .download_objects()
+        .bucket(bucket)
+        .key_prefix(key_prefix)
+        .destination(dest)
+        .send()
+        .await?;
+
+    let output = handle.join().await?;
+    tracing::info!("download output: {output:?}");
+
+    let elapsed = start.elapsed();
+    let transfer_size_bytes = output.total_bytes_transferred();
+    let transfer_size_megabytes = transfer_size_bytes as f64 / ONE_MEGABYTE as f64;
+    let transfer_size_megabits = transfer_size_megabytes * 8f64;
+
+    println!(
+        "downloaded {} objects totalling {transfer_size_bytes} bytes ({transfer_size_megabytes} MB) in {elapsed:?}; Mb/s: {}",
+        output.objects_downloaded(),
+        transfer_size_megabits / elapsed.as_secs_f64(),
+    );
+    Ok(())
+}
+
 async fn do_download(args: Args) -> Result<(), BoxError> {
-    let config = aws_config::from_env().load().await;
-    warmup(&config).await?;
+    let config = aws_config::from_env()
+        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+        .load()
+        .await;
+    let (bucket, _) = args.source.expect_s3().parts();
+    warmup(&config, bucket).await?;
 
     let s3_client = aws_sdk_s3::Client::new(&config);
 
@@ -130,12 +166,11 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
     let tm = aws_s3_transfer_manager::Client::new(tm_config);
 
-    let (bucket, key) = args.source.expect_s3().parts();
-
     if args.recursive {
-        todo!("implement recursive download")
+        return do_recursive_download(args, tm).await;
     }
 
+    let (bucket, key) = args.source.expect_s3().parts();
     let dest = fs::File::create(args.dest.expect_local()).await?;
     println!("dest file opened, starting download");
 
@@ -146,9 +181,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     //      TM will handle it's own thread pool for filesystem work
     let mut handle = tm.download().bucket(bucket).key(key).send().await?;
 
-    let body = mem::replace(&mut handle.body, Body::empty());
-
-    write_body(body, dest)
+    write_body(handle.body_mut(), dest)
         .instrument(debug_span!("write-output"))
         .await?;
 
@@ -171,7 +204,9 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     }
 
     let config = aws_config::from_env().load().await;
-    warmup(&config).await?;
+    let (bucket, key) = args.dest.expect_s3().parts();
+
+    warmup(&config, bucket).await?;
 
     let s3_client = aws_sdk_s3::Client::new(&config);
 
@@ -187,7 +222,6 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let file_meta = fs::metadata(path).await.expect("file metadata");
 
     let stream = InputStream::from_path(path)?;
-    let (bucket, key) = args.dest.expect_s3().parts();
 
     println!("starting upload");
     let start = time::Instant::now();
@@ -228,17 +262,21 @@ async fn main() -> Result<(), BoxError> {
     }
 
     use TransferUri::*;
-    match (&args.source, &args.dest) {
-        (Local(_), S3(_)) => do_upload(args).await?,
+    let result = match (&args.source, &args.dest) {
+        (Local(_), S3(_)) => do_upload(args).await,
         (Local(_), Local(_)) => invalid_arg("local to local transfer not supported"),
-        (S3(_), Local(_)) => do_download(args).await?,
+        (S3(_), Local(_)) => do_download(args).await,
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
+    };
+
+    if let Err(ref err) = result {
+        tracing::error!("transfer failed: {}", DisplayErrorContext(err.as_ref()));
     }
 
     Ok(())
 }
 
-async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), BoxError> {
+async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk.unwrap();
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
@@ -253,10 +291,23 @@ async fn write_body(mut body: Body, mut dest: fs::File) -> Result<(), BoxError> 
     Ok(())
 }
 
-async fn warmup(config: &SdkConfig) -> Result<(), BoxError> {
+async fn warmup(config: &SdkConfig, bucket: &str) -> Result<(), BoxError> {
     println!("warming up client...");
     let s3 = aws_sdk_s3::Client::new(config);
-    s3.list_buckets().send().await?;
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let s3 = s3.clone();
+        let bucket = bucket.to_owned();
+        let warmup_task = async move { s3.head_bucket().bucket(bucket).send().await };
+        let handle = tokio::spawn(warmup_task);
+        handles.push(handle);
+    }
+
+    for h in handles {
+        let _ = h.await?;
+    }
+
     println!("warming up complete");
     Ok(())
 }

@@ -14,6 +14,10 @@ pub struct DownloadObjectsOutput {
 
     /// A list of failed object transfers
     pub failed_transfers: Option<Vec<FailedDownloadTransfer>>,
+
+    // FIXME - likely remove when progress is implemented?
+    /// Total number of bytes transferred
+    pub total_bytes_transferred: u64,
 }
 
 impl DownloadObjectsOutput {
@@ -34,6 +38,11 @@ impl DownloadObjectsOutput {
     pub fn failed_transfers(&self) -> &[FailedDownloadTransfer] {
         self.failed_transfers.as_deref().unwrap_or_default()
     }
+
+    /// The number of bytes successfully transferred (downloaded)
+    pub fn total_bytes_transferred(&self) -> u64 {
+        self.total_bytes_transferred
+    }
 }
 
 /// A builder for [`DownloadObjectsOutput`](crate::operation::download_objects::DownloadObjectsOutput).
@@ -42,6 +51,7 @@ impl DownloadObjectsOutput {
 pub struct DownloadObjectsOutputBuilder {
     pub(crate) objects_downloaded: u64,
     pub(crate) failed_transfers: Option<Vec<FailedDownloadTransfer>>,
+    pub(crate) total_bytes_transferred: u64,
 }
 
 impl DownloadObjectsOutputBuilder {
@@ -76,5 +86,25 @@ impl DownloadObjectsOutputBuilder {
     /// A list of failed object transfers
     pub fn get_failed_transfers(&self) -> &Option<Vec<FailedDownloadTransfer>> {
         &self.failed_transfers
+    }
+
+    /// The number of bytes successfully transferred (downloaded)
+    pub fn total_bytes_transferred(mut self, input: u64) -> Self {
+        self.total_bytes_transferred = input;
+        self
+    }
+
+    /// The number of bytes successfully transferred (downloaded)
+    pub fn get_total_bytes_transferred(&self) -> u64 {
+        self.total_bytes_transferred
+    }
+
+    /// Consume the builder and return the output
+    pub fn build(self) -> DownloadObjectsOutput {
+        DownloadObjectsOutput {
+            objects_downloaded: self.objects_downloaded,
+            failed_transfers: self.failed_transfers,
+            total_bytes_transferred: self.total_bytes_transferred,
+        }
     }
 }
