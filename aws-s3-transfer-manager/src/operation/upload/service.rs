@@ -23,8 +23,6 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let ctx = request.ctx;
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
-    let content_length = part_data.data.remaining();
-    let body = ByteStream::from(part_data.data);
 
     // TODO(aws-sdk-rust#1159): disable payload signing
     // TODO(aws-sdk-rust#1159): set checksum fields if applicable
@@ -35,8 +33,8 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_key(ctx.request.key.clone())
         .set_upload_id(ctx.upload_id.clone())
         .part_number(part_number)
-        .content_length(content_length as i64)
-        .body(body)
+        .content_length(part_data.data.remaining() as i64)
+        .body(ByteStream::from(part_data.data))
         .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())
         .set_sse_customer_key(ctx.request.sse_customer_key.clone())
         .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
