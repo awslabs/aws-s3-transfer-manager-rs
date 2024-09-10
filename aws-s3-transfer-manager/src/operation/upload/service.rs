@@ -68,7 +68,7 @@ pub(super) fn upload_part_service(
 /// # Arguments
 ///
 /// * handle - the handle for this upload
-/// * reader - the reader to read the body for upload
+/// * body_rx - the channel to receive the body for upload
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
     mut body_rx: mpsc::Receiver<PartData>,
