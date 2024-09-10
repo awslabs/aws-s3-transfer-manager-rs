@@ -23,10 +23,10 @@ pub use input::{UploadInput, UploadInputBuilder};
 pub use output::{UploadOutput, UploadOutputBuilder};
 use service::distribute_work;
 use tokio::sync::mpsc;
-use tracing::Instrument;
 
 use std::cmp;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
