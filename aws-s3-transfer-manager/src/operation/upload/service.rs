@@ -71,10 +71,10 @@ pub(super) fn upload_part_service(
 /// * reader - the reader to read the body for upload
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
-    mut data: mpsc::Receiver<PartData>,
+    mut body_rx: mpsc::Receiver<PartData>,
 ) -> Result<(), error::Error> {
     let svc = upload_part_service(&handle.ctx);
-    while let Some(part_data) = data.recv().await {
+    while let Some(part_data) = body_rx.recv().await {
         let part_number = part_data.part_number as i32;
         tracing::trace!("recv'd part number {}", part_number);
 
@@ -85,7 +85,7 @@ pub(super) async fn distribute_work(
 
         let svc = svc.clone();
         let task = async move { svc.oneshot(req).await };
-        handle.tasks.spawn(task);
+        handle.upload_tasks.spawn(task);
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())

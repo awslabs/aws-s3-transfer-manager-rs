@@ -98,20 +98,20 @@ async fn try_start_mpu_upload(
             .build(),
     );
 
-    let (sender, data) = mpsc::channel(handle.ctx.handle.num_workers());
+    let (body_tx, body_rx) = mpsc::channel(handle.ctx.handle.num_workers());
     let n_workers = handle.ctx.handle.num_workers();
     for i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), sender.clone())
+        let worker = read_body(part_reader.clone(), body_tx.clone())
             .instrument(tracing::debug_span!("read_body", worker = i));
-        handle.read_body_tasks.spawn(worker);
+        handle.read_tasks.spawn(worker);
     }
-    drop(sender);
-    distribute_work(handle, data).await
+    drop(body_tx);
+    distribute_work(handle, body_rx).await
 }
 
 async fn read_body(
     part_reader: Arc<impl ReadPart>,
-    sender: mpsc::Sender<PartData>,
+    body_tx: mpsc::Sender<PartData>,
 ) -> Result<(), error::Error> {
     loop {
         let part_data = part_reader.next_part().await?;
@@ -121,7 +121,7 @@ async fn read_body(
         };
 
         // TODO: is unwrap the right thing to do?
-        sender.send(part_data).await.unwrap();
+        body_tx.send(part_data).await.unwrap();
     }
     Ok(())
 }
