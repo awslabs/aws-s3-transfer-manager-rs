@@ -11,12 +11,14 @@ use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 
 use super::UploadHandle;
 
+/// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
 }
 
+/// handler (service fn) for a single part
 async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart, error::Error> {
     let ctx = request.ctx;
     let part_data = request.part_data;
@@ -56,6 +58,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     Ok(completed)
 }
 
+/// Create a new tower::Service for uploading individual parts of an object to S3
 pub(super) fn upload_part_service(
     ctx: &UploadContext,
 ) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
@@ -67,16 +70,18 @@ pub(super) fn upload_part_service(
         .service(svc)
 }
 
-/// Worker function that pulls part data off the `reader` and uploads each part until the reader
-/// is exhausted. If any part fails the worker will return the error and stop processing. If
-/// the worker finishes successfully the completed parts uploaded by this worker are returned.
+/// Spawn tasks to upload the remaining parts of object
+///
+/// # Arguments
+///
+/// * handle - the handle for this upload
+/// * reader - the reader to read the body for upload 
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
     reader: Arc<impl ReadPart>,
 ) -> Result<(), error::Error> {
     let svc = upload_part_service(&handle.ctx);
     loop {
-        // TODO: can I move this to a service as well?
         let part_result = reader.next_part().await?;
         let part_data = match part_result {
             Some(part_data) => part_data,
@@ -86,7 +91,6 @@ pub(super) async fn distribute_work(
         let part_number = part_data.part_number as i32;
         tracing::trace!("recv'd part number {}", part_number);
 
-        // send the request
         let req = UploadPartRequest {
             ctx: handle.ctx.clone(),
             part_data,
@@ -94,8 +98,9 @@ pub(super) async fn distribute_work(
 
         let svc = svc.clone();
         let task = async move { svc.oneshot(req).await };
-
         handle.tasks.spawn(task);
     }
+    tracing::trace!("work distributed for uploading parts");
     Ok(())
 }
+
