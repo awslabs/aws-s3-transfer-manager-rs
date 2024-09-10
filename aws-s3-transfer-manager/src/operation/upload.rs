@@ -105,6 +105,7 @@ async fn try_start_mpu_upload(
             .instrument(tracing::debug_span!("read_body", worker = i));
         handle.read_tasks.spawn(worker);
     }
+    // explicitly drop body_tx to ensure the channel is closed once all senders are done.
     drop(body_tx);
     distribute_work(handle, body_rx).await
 }
