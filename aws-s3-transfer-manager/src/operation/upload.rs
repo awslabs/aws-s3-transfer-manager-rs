@@ -13,7 +13,7 @@ mod handle;
 mod service;
 
 use crate::error;
-use crate::io::part_reader::Builder as PartReaderBuilder;
+use crate::io::part_reader::{Builder as PartReaderBuilder, PartData, ReadPart};
 use crate::io::InputStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
@@ -22,6 +22,8 @@ pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
 use service::distribute_work;
+use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use std::cmp;
 use std::sync::Arc;
@@ -96,7 +98,32 @@ async fn try_start_mpu_upload(
             .build(),
     );
 
-    distribute_work(handle, part_reader).await
+    let (sender, data) = mpsc::channel(handle.ctx.handle.num_workers());
+    let n_workers = handle.ctx.handle.num_workers();
+    for i in 0..n_workers {
+        let worker = read_body(part_reader.clone(), sender.clone())
+            .instrument(tracing::debug_span!("read_body", worker = i));
+        handle.read_body_tasks.spawn(worker);
+    }
+    drop(sender);
+    distribute_work(handle, data).await
+}
+
+async fn read_body(
+    part_reader: Arc<impl ReadPart>,
+    sender: mpsc::Sender<PartData>,
+) -> Result<(), error::Error> {
+    loop {
+        let part_data = part_reader.next_part().await?;
+        let part_data = match part_data {
+            None => break,
+            Some(part_data) => part_data,
+        };
+
+        // TODO: is unwrap the right thing to do?
+        sender.send(part_data).await.unwrap();
+    }
+    Ok(())
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {

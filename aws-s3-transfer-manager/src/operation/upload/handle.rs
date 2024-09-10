@@ -16,6 +16,7 @@ use tokio::task;
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
     pub(crate) tasks: task::JoinSet<Result<CompletedPart, crate::error::Error>>,
+    pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -27,6 +28,7 @@ impl UploadHandle {
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
             tasks: task::JoinSet::new(),
+            read_body_tasks: task::JoinSet::new(),
             ctx,
             response: None,
         }
@@ -55,9 +57,11 @@ impl UploadHandle {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
         // cancel in-progress uploads
+        self.read_body_tasks.abort_all();
         self.tasks.abort_all();
 
         // join all tasks
+        while (self.read_body_tasks.join_next().await).is_some() {}
         while (self.tasks.join_next().await).is_some() {}
 
         if !self.ctx.is_multipart_upload() {
@@ -108,6 +112,18 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     let _enter = span.enter();
 
     let mut all_parts = Vec::new();
+
+    while let Some(join_result) = handle.read_body_tasks.join_next().await {
+        let result = join_result.expect("task completed");
+        if let Err(error) = result {
+            // TODO: common error handling for both sets
+                tracing::error!("multipart upload failed, aborting");
+                if let Err(err) = handle.abort().await {
+                    tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
+                };
+                return Err(error);
+        }
+    }
 
     // join all the upload tasks
     while let Some(join_result) = handle.tasks.join_next().await {

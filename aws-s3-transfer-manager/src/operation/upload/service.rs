@@ -1,12 +1,11 @@
-use std::sync::Arc;
-
 use crate::{
     error,
-    io::part_reader::{PartData, ReadPart},
+    io::part_reader::PartData,
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
+use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 
 use super::UploadHandle;
@@ -76,17 +75,10 @@ pub(super) fn upload_part_service(
 /// * reader - the reader to read the body for upload
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
-    reader: Arc<impl ReadPart>,
+    mut data: mpsc::Receiver<PartData>,
 ) -> Result<(), error::Error> {
     let svc = upload_part_service(&handle.ctx);
-    loop {
-        // TODO: read parts using multiple threads.
-        let part_result = reader.next_part().await?;
-        let part_data = match part_result {
-            Some(part_data) => part_data,
-            None => break,
-        };
-
+    while let Some(part_data) = data.recv().await {
         let part_number = part_data.part_number as i32;
         tracing::trace!("recv'd part number {}", part_number);
 
