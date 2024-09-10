@@ -73,13 +73,14 @@ pub(super) fn upload_part_service(
 /// # Arguments
 ///
 /// * handle - the handle for this upload
-/// * reader - the reader to read the body for upload 
+/// * reader - the reader to read the body for upload
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
     reader: Arc<impl ReadPart>,
 ) -> Result<(), error::Error> {
     let svc = upload_part_service(&handle.ctx);
     loop {
+        // TODO: read parts using multiple threads.
         let part_result = reader.next_part().await?;
         let part_data = match part_result {
             Some(part_data) => part_data,
@@ -101,4 +102,3 @@ pub(super) async fn distribute_work(
     tracing::trace!("work distributed for uploading parts");
     Ok(())
 }
-
