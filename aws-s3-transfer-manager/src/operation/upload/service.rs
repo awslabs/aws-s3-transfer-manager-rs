@@ -1,8 +1,4 @@
-use crate::{
-    error,
-    io::part_reader::PartData,
-    operation::upload::UploadContext,
-};
+use crate::{error, io::part_reader::PartData, operation::upload::UploadContext};
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::sync::mpsc;
