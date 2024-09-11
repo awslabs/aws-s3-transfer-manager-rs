@@ -46,5 +46,8 @@ pub mod config;
 /// Tower related middleware and components
 pub(crate) mod middleware;
 
+/// Metrics
+pub mod metrics;
+
 pub use self::client::Client;
 pub use self::config::Config;
