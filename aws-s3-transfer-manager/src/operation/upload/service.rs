@@ -12,6 +12,7 @@ use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
+use tracing::Instrument;
 
 use super::UploadHandle;
 
@@ -71,12 +72,13 @@ pub(super) fn upload_part_service(
         .service(svc)
 }
 
-/// Spawn tasks to upload the remaining parts of object
+/// Spawn tasks to read the body and upload the remaining parts of object
 ///
 /// # Arguments
 ///
 /// * handle - the handle for this upload
-/// * body_rx - the channel to receive the body for upload
+/// * stream - the body input stream
+/// * part_size - the part_size for each part
 pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
     stream: InputStream,
@@ -90,20 +92,22 @@ pub(super) async fn distribute_work(
     );
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
-    for _i in 0..n_workers {
+    for i in 0..n_workers {
         let worker = read_body(
             part_reader.clone(),
             handle.ctx.clone(),
             svc.clone(),
             handle.upload_tasks.clone(),
-        );
-        //.instrument
+        )
+        .instrument(tracing::debug_span!("read_body", worker = i));
         handle.read_tasks.spawn(worker);
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())
 }
 
+/// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader
+/// is exhausted. If any part fails, the worker will return the error and stop processing.
 pub(super) async fn read_body(
     part_reader: Arc<impl ReadPart>,
     ctx: UploadContext,
@@ -119,15 +123,15 @@ pub(super) async fn read_body(
             None => break,
             Some(part_data) => part_data,
         };
-
+        let part_number = part_data.part_number;
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
         };
         let svc = svc.clone();
-        let task = async move { svc.oneshot(req).await };
-        let mut upload_tasks = upload_tasks.lock().await;
-        upload_tasks.spawn(task);
+        let task = async move { svc.oneshot(req).await }
+            .instrument(tracing::trace_span!("upload_part", worker = part_number));
+        upload_tasks.lock().await.spawn(task);
     }
     Ok(())
 }
