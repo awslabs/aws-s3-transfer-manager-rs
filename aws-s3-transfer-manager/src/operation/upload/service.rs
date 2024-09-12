@@ -16,7 +16,7 @@ pub(super) struct UploadPartRequest {
 }
 
 /// handler (service fn) for a single part
-async fn upload_part_handler(request: UploadPartRequest) -> Result<Option<CompletedPart>, error::Error> {
+async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart, error::Error> {
     let ctx = request.ctx;
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
@@ -50,13 +50,13 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<Option<Comple
         .set_checksum_sha256(resp.checksum_sha256.clone())
         .build();
 
-    Ok(Some(completed))
+    Ok(completed)
 }
 
 /// Create a new tower::Service for uploading individual parts of an object to S3
 pub(super) fn upload_part_service(
     ctx: &UploadContext,
-) -> impl Service<UploadPartRequest, Response = Option<CompletedPart>, Error = error::Error, Future: Send>
+) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
        + Clone
        + Send {
     let svc = service_fn(upload_part_handler);
@@ -84,10 +84,9 @@ pub(super) async fn distribute_work(
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
     for _i in 0..n_workers {
-        let mut tasks = handle.tasks.lock().await;
         let worker = read_body(part_reader.clone(), handle.ctx.clone(), svc.clone(), handle.tasks.clone());
         //.instrument
-        tasks.spawn(worker);
+        handle.read_tasks.spawn(worker);
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())
@@ -96,12 +95,12 @@ pub(super) async fn distribute_work(
 pub(super) async fn read_body(
     part_reader: Arc<impl ReadPart>,
     ctx: UploadContext,
-    svc: impl Service<UploadPartRequest, Response = Option<CompletedPart>, Error = error::Error, Future: Send>
+    svc: impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
        + Clone
        + Send
        + 'static,
-    tasks: Arc<Mutex<task::JoinSet<Result<Option<CompletedPart>, crate::error::Error>>>>,
-) -> Result<Option<CompletedPart>, error::Error> {
+    tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+) -> Result<(), error::Error> {
     loop {
         let part_data = part_reader.next_part().await?;
         let part_data = match part_data {
@@ -118,5 +117,5 @@ pub(super) async fn read_body(
         let mut tasks = tasks.lock().await;
         tasks.spawn(task);
     }
-    Ok(None)
+    Ok(())
 }

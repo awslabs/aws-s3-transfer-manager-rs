@@ -18,7 +18,8 @@ use tokio::task;
 #[non_exhaustive]
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
-    pub(crate) tasks: Arc<Mutex<task::JoinSet<Result<Option<CompletedPart>, crate::error::Error>>>>,
+    pub(crate) tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    pub(crate) read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -30,6 +31,7 @@ impl UploadHandle {
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
             tasks: Arc::new(Mutex::new(task::JoinSet::new())),
+            read_tasks: task::JoinSet::new(),
             ctx,
             response: None,
         }
@@ -58,6 +60,9 @@ impl UploadHandle {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
         // cancel in-progress uploads
+        self.read_tasks.abort_all();
+        while (self.read_tasks.join_next().await).is_some() {}
+
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
 
@@ -111,17 +116,25 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
     let _enter = span.enter();
 
+    while let Some(join_result) = handle.read_tasks.join_next().await {
+        if let Err(err) =  join_result.expect("task completed") {
+            //TODO: code duplication? one JoinSet?
+                tracing::error!("multipart upload failed, aborting");
+                // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
+                if let Err(err) = handle.abort().await {
+                    tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
+                };
+                return Err(err);
+        }
+    }
+
     let mut all_parts = Vec::new();
     // join all the upload tasks
     let mut tasks = handle.tasks.lock().await;
     while let Some(join_result) = tasks.join_next().await {
         let result = join_result.expect("task completed");
         match result {
-            Ok(completed_part) => { match completed_part {
-                None => continue,
-                Some(completed_part) => all_parts.push(completed_part),
-            }
-            }
+            Ok(completed_part) => all_parts.push(completed_part),
             // TODO(aws-sdk-rust#1159, design) - do we want to return first error or collect all errors?
             Err(err) => {
                 tracing::error!("multipart upload failed, aborting");
