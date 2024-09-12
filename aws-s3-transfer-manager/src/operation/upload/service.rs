@@ -1,6 +1,13 @@
 use std::sync::Arc;
 
-use crate::{error, io::{part_reader::{Builder as PartReaderBuilder, PartData, ReadPart}, InputStream}, operation::upload::UploadContext};
+use crate::{
+    error,
+    io::{
+        part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
+        InputStream,
+    },
+    operation::upload::UploadContext,
+};
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
@@ -9,7 +16,6 @@ use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use super::UploadHandle;
 
 /// Request/input type for our "upload_part" service.
-#[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
@@ -76,14 +82,21 @@ pub(super) async fn distribute_work(
     stream: InputStream,
     part_size: u64,
 ) -> Result<(), error::Error> {
-    let part_reader = Arc::new(PartReaderBuilder::new()
+    let part_reader = Arc::new(
+        PartReaderBuilder::new()
             .stream(stream)
             .part_size(part_size.try_into().expect("valid part size"))
-            .build());
+            .build(),
+    );
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
     for _i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), handle.ctx.clone(), svc.clone(), handle.upload_tasks.clone());
+        let worker = read_body(
+            part_reader.clone(),
+            handle.ctx.clone(),
+            svc.clone(),
+            handle.upload_tasks.clone(),
+        );
         //.instrument
         handle.read_tasks.spawn(worker);
     }
@@ -95,9 +108,9 @@ pub(super) async fn read_body(
     part_reader: Arc<impl ReadPart>,
     ctx: UploadContext,
     svc: impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
-       + Clone
-       + Send
-       + 'static,
+        + Clone
+        + Send
+        + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
 ) -> Result<(), error::Error> {
     loop {

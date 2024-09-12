@@ -117,14 +117,14 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     let _enter = span.enter();
 
     while let Some(join_result) = handle.read_tasks.join_next().await {
-        if let Err(err) =  join_result.expect("task completed") {
+        if let Err(err) = join_result.expect("task completed") {
             //TODO: code duplication? one JoinSet?
-                tracing::error!("multipart upload failed, aborting");
-                // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                if let Err(err) = handle.abort().await {
-                    tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
-                };
-                return Err(err);
+            tracing::error!("multipart upload failed, aborting");
+            // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
+            if let Err(err) = handle.abort().await {
+                tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
+            };
+            return Err(err);
         }
     }
 

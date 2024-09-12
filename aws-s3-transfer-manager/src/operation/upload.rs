@@ -91,7 +91,6 @@ async fn try_start_mpu_upload(
     Ok(())
 }
 
-
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
     UploadContext {
         handle,
