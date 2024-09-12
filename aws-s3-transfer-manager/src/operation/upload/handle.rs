@@ -19,7 +19,6 @@ use tokio::task;
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
     pub(crate) tasks: Arc<Mutex<task::JoinSet<Result<Option<CompletedPart>, crate::error::Error>>>>,
-    pub(crate) tasks2: task::JoinSet<Result<Option<CompletedPart>, crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -31,7 +30,6 @@ impl UploadHandle {
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
             tasks: Arc::new(Mutex::new(task::JoinSet::new())),
-            tasks2: task::JoinSet::new(),
             ctx,
             response: None,
         }

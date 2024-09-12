@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::{error, io::{part_reader::{Builder as PartReaderBuilder, PartData, ReadPart}, InputStream}, operation::upload::UploadContext};
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
+use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 
 use super::UploadHandle;
@@ -70,21 +71,7 @@ pub(super) fn upload_part_service(
 ///
 /// * handle - the handle for this upload
 /// * body_rx - the channel to receive the body for upload
-#[allow(dead_code)]
-pub(super) async fn distribute_work_bad(
-    handle: &mut UploadHandle,
-    part_reader: Arc<impl ReadPart>,
-) -> Result<(), error::Error> {
-    let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), handle.ctx.clone());
-        handle.tasks2.spawn(worker);
-    }
-    tracing::trace!("work distributed for uploading parts");
-    Ok(())
-}
-    
-pub(super) async fn distribute_work_good(
+pub(super) async fn distribute_work(
     handle: &mut UploadHandle,
     stream: InputStream,
     part_size: u64,
@@ -94,10 +81,13 @@ pub(super) async fn distribute_work_good(
             .stream(stream)
             .part_size(part_size.try_into().expect("valid part size"))
             .build());
+    let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), handle.ctx.clone());
-        handle.tasks2.spawn(worker);
+    for _i in 0..n_workers {
+        let mut tasks = handle.tasks.lock().await;
+        let worker = read_body(part_reader.clone(), handle.ctx.clone(), svc.clone(), handle.tasks.clone());
+        //.instrument
+        tasks.spawn(worker);
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())
@@ -105,23 +95,28 @@ pub(super) async fn distribute_work_good(
 
 pub(super) async fn read_body(
     part_reader: Arc<impl ReadPart>,
-    _ctx: UploadContext,
+    ctx: UploadContext,
+    svc: impl Service<UploadPartRequest, Response = Option<CompletedPart>, Error = error::Error, Future: Send>
+       + Clone
+       + Send
+       + 'static,
+    tasks: Arc<Mutex<task::JoinSet<Result<Option<CompletedPart>, crate::error::Error>>>>,
 ) -> Result<Option<CompletedPart>, error::Error> {
     loop {
         let part_data = part_reader.next_part().await?;
-        let _part_data = match part_data {
+        let part_data = match part_data {
             None => break,
             Some(part_data) => part_data,
         };
-//
-//        let req = UploadPartRequest {
-//            ctx: ctx.clone(),
-//            part_data,
-//        };
-//        let svc = svc.clone();
-//        let task = async move { svc.oneshot(req).await };
-//        let mut tasks = tasks.lock().await;
-//        tasks.spawn(task);
+
+        let req = UploadPartRequest {
+            ctx: ctx.clone(),
+            part_data,
+        };
+        let svc = svc.clone();
+        let task = async move { svc.oneshot(req).await };
+        let mut tasks = tasks.lock().await;
+        tasks.spawn(task);
     }
     Ok(None)
 }

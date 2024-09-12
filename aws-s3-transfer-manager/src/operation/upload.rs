@@ -13,21 +13,17 @@ mod handle;
 mod service;
 
 use crate::error;
-use crate::io::part_reader::{Builder as PartReaderBuilder, PartData, ReadPart};
 use crate::io::InputStream;
-use aws_sdk_s3::types::CompletedPart;
 use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
-use service::{distribute_work, read_body};
-use tokio::sync::mpsc;
+use service::distribute_work;
 
 use std::cmp;
 use std::sync::Arc;
-use tracing::Instrument;
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
@@ -91,19 +87,7 @@ async fn try_start_mpu_upload(
     );
 
     handle.set_response(mpu);
-
-    let part_reader = Arc::new(PartReaderBuilder::new()
-            .stream(stream)
-            .part_size(part_size.try_into().expect("valid part size"))
-            .build());
-
-    //distribute_work(handle, part_reader).await
-    let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), handle.ctx.clone());
-        handle.tasks2.spawn(worker);
-    };
-
+    distribute_work(handle, stream, part_size).await?;
     Ok(())
 }
 
