@@ -18,7 +18,7 @@ use tokio::task;
 #[non_exhaustive]
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
-    pub(crate) tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    pub(crate) upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
     pub(crate) read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
@@ -30,7 +30,7 @@ impl UploadHandle {
     /// Create a new upload handle with the given request context
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(task::JoinSet::new())),
+            upload_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
             read_tasks: task::JoinSet::new(),
             ctx,
             response: None,
@@ -63,7 +63,7 @@ impl UploadHandle {
         self.read_tasks.abort_all();
         while (self.read_tasks.join_next().await).is_some() {}
 
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.upload_tasks.lock().await;
         tasks.abort_all();
 
         // join all tasks
@@ -130,7 +130,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
 
     let mut all_parts = Vec::new();
     // join all the upload tasks
-    let mut tasks = handle.tasks.lock().await;
+    let mut tasks = handle.upload_tasks.lock().await;
     while let Some(join_result) = tasks.join_next().await {
         let result = join_result.expect("task completed");
         match result {

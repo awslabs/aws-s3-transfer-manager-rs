@@ -76,7 +76,6 @@ pub(super) async fn distribute_work(
     stream: InputStream,
     part_size: u64,
 ) -> Result<(), error::Error> {
-    
     let part_reader = Arc::new(PartReaderBuilder::new()
             .stream(stream)
             .part_size(part_size.try_into().expect("valid part size"))
@@ -84,7 +83,7 @@ pub(super) async fn distribute_work(
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
     for _i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), handle.ctx.clone(), svc.clone(), handle.tasks.clone());
+        let worker = read_body(part_reader.clone(), handle.ctx.clone(), svc.clone(), handle.upload_tasks.clone());
         //.instrument
         handle.read_tasks.spawn(worker);
     }
@@ -99,7 +98,7 @@ pub(super) async fn read_body(
        + Clone
        + Send
        + 'static,
-    tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
 ) -> Result<(), error::Error> {
     loop {
         let part_data = part_reader.next_part().await?;
@@ -114,8 +113,8 @@ pub(super) async fn read_body(
         };
         let svc = svc.clone();
         let task = async move { svc.oneshot(req).await };
-        let mut tasks = tasks.lock().await;
-        tasks.spawn(task);
+        let mut upload_tasks = upload_tasks.lock().await;
+        upload_tasks.spawn(task);
     }
     Ok(())
 }
