@@ -1,7 +1,8 @@
-use crate::{error, io::part_reader::PartData, operation::upload::UploadContext};
+use std::sync::Arc;
+
+use crate::{error, io::{part_reader::{Builder as PartReaderBuilder, PartData, ReadPart}, InputStream}, operation::upload::UploadContext};
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
-use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 
 use super::UploadHandle;
@@ -14,7 +15,7 @@ pub(super) struct UploadPartRequest {
 }
 
 /// handler (service fn) for a single part
-async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart, error::Error> {
+async fn upload_part_handler(request: UploadPartRequest) -> Result<Option<CompletedPart>, error::Error> {
     let ctx = request.ctx;
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
@@ -48,13 +49,13 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_checksum_sha256(resp.checksum_sha256.clone())
         .build();
 
-    Ok(completed)
+    Ok(Some(completed))
 }
 
 /// Create a new tower::Service for uploading individual parts of an object to S3
 pub(super) fn upload_part_service(
     ctx: &UploadContext,
-) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
+) -> impl Service<UploadPartRequest, Response = Option<CompletedPart>, Error = error::Error, Future: Send>
        + Clone
        + Send {
     let svc = service_fn(upload_part_handler);
@@ -69,24 +70,58 @@ pub(super) fn upload_part_service(
 ///
 /// * handle - the handle for this upload
 /// * body_rx - the channel to receive the body for upload
-pub(super) async fn distribute_work(
+#[allow(dead_code)]
+pub(super) async fn distribute_work_bad(
     handle: &mut UploadHandle,
-    mut body_rx: mpsc::Receiver<PartData>,
+    part_reader: Arc<impl ReadPart>,
 ) -> Result<(), error::Error> {
-    let svc = upload_part_service(&handle.ctx);
-    while let Some(part_data) = body_rx.recv().await {
-        let part_number = part_data.part_number as i32;
-        tracing::trace!("recv'd part number {}", part_number);
-
-        let req = UploadPartRequest {
-            ctx: handle.ctx.clone(),
-            part_data,
-        };
-
-        let svc = svc.clone();
-        let task = async move { svc.oneshot(req).await };
-        handle.upload_tasks.spawn(task);
+    let n_workers = handle.ctx.handle.num_workers();
+    for i in 0..n_workers {
+        let worker = read_body(part_reader.clone(), handle.ctx.clone());
+        handle.tasks2.spawn(worker);
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())
+}
+    
+pub(super) async fn distribute_work_good(
+    handle: &mut UploadHandle,
+    stream: InputStream,
+    part_size: u64,
+) -> Result<(), error::Error> {
+    
+    let part_reader = Arc::new(PartReaderBuilder::new()
+            .stream(stream)
+            .part_size(part_size.try_into().expect("valid part size"))
+            .build());
+    let n_workers = handle.ctx.handle.num_workers();
+    for i in 0..n_workers {
+        let worker = read_body(part_reader.clone(), handle.ctx.clone());
+        handle.tasks2.spawn(worker);
+    }
+    tracing::trace!("work distributed for uploading parts");
+    Ok(())
+}
+
+pub(super) async fn read_body(
+    part_reader: Arc<impl ReadPart>,
+    _ctx: UploadContext,
+) -> Result<Option<CompletedPart>, error::Error> {
+    loop {
+        let part_data = part_reader.next_part().await?;
+        let _part_data = match part_data {
+            None => break,
+            Some(part_data) => part_data,
+        };
+//
+//        let req = UploadPartRequest {
+//            ctx: ctx.clone(),
+//            part_data,
+//        };
+//        let svc = svc.clone();
+//        let task = async move { svc.oneshot(req).await };
+//        let mut tasks = tasks.lock().await;
+//        tasks.spawn(task);
+    }
+    Ok(None)
 }

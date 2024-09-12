@@ -81,7 +81,7 @@ pub(crate) struct PartData {
 
 /// The `ReadPart` trait allows for reading data from an `InputStream` and packaging the raw
 /// data into `PartData` which carries additional metadata needed for uploading a part.
-pub(crate) trait ReadPart {
+pub(crate) trait ReadPart: Send {
     /// Request the next "part" of data.
     ///
     /// When there is no more data readers should return `Ok(None)`.

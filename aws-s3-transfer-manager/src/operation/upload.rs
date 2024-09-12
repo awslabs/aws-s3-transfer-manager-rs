@@ -15,13 +15,14 @@ mod service;
 use crate::error;
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartData, ReadPart};
 use crate::io::InputStream;
+use aws_sdk_s3::types::CompletedPart;
 use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
-use service::distribute_work;
+use service::{distribute_work, read_body};
 use tokio::sync::mpsc;
 
 use std::cmp;
@@ -91,41 +92,21 @@ async fn try_start_mpu_upload(
 
     handle.set_response(mpu);
 
-    let part_reader = Arc::new(
-        PartReaderBuilder::new()
+    let part_reader = Arc::new(PartReaderBuilder::new()
             .stream(stream)
             .part_size(part_size.try_into().expect("valid part size"))
-            .build(),
-    );
+            .build());
 
-    let (body_tx, body_rx) = mpsc::channel(handle.ctx.handle.num_workers());
+    //distribute_work(handle, part_reader).await
     let n_workers = handle.ctx.handle.num_workers();
     for i in 0..n_workers {
-        let worker = read_body(part_reader.clone(), body_tx.clone())
-            .instrument(tracing::debug_span!("read_body", worker = i));
-        handle.read_tasks.spawn(worker);
-    }
-    // explicitly drop body_tx to ensure the channel is closed once all senders are done.
-    drop(body_tx);
-    distribute_work(handle, body_rx).await
-}
+        let worker = read_body(part_reader.clone(), handle.ctx.clone());
+        handle.tasks2.spawn(worker);
+    };
 
-async fn read_body(
-    part_reader: Arc<impl ReadPart>,
-    body_tx: mpsc::Sender<PartData>,
-) -> Result<(), error::Error> {
-    loop {
-        let part_data = part_reader.next_part().await?;
-        let part_data = match part_data {
-            None => break,
-            Some(part_data) => part_data,
-        };
-
-        // TODO: is unwrap the right thing to do?
-        body_tx.send(part_data).await.unwrap();
-    }
     Ok(())
 }
+
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
     UploadContext {
