@@ -10,7 +10,11 @@ use aws_s3_transfer_manager::{
     types::{ConcurrencySetting, PartSize},
 };
 use pin_project_lite::pin_project;
-use std::{cmp, iter, task::Poll};
+use std::{
+    cmp,
+    iter::{self, repeat_with},
+    task::Poll,
+};
 
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
@@ -91,10 +95,14 @@ fn simple_test_tm(
     part_size: usize,
 ) -> (aws_s3_transfer_manager::Client, StaticReplayClient) {
     let http_client = simple_object_connector(data, part_size);
+    let tm = test_tm(http_client.clone(), part_size);
+    (tm, http_client)
+}
 
+fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer_manager::Client {
     let s3_client = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Config::builder()
-            .http_client(http_client.clone())
+            .http_client(http_client)
             .region(Region::from_static("us-west-2"))
             .with_test_defaults()
             .build(),
@@ -106,9 +114,7 @@ fn simple_test_tm(
         .concurrency(ConcurrencySetting::Explicit(1))
         .build();
 
-    let tm = aws_s3_transfer_manager::Client::new(config);
-
-    (tm, http_client)
+    aws_s3_transfer_manager::Client::new(config)
 }
 
 /// Test the object ranges are expected and we get all the data
@@ -195,7 +201,6 @@ impl http_body_1x::Body for FailingBody {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
-        println!("poll_frame: idx: {}", this.idx);
         let result = if this.idx >= this.fail_after_byte {
             // fail forevermore
             Err(BoxError::from("simulated body read failure"))
@@ -247,6 +252,7 @@ async fn test_retry_failed_chunk() {
                 )))
                 .unwrap(),
         ),
+        // request for second chunk should be retried
         ReplayEvent::new(
             dummy_expected_request(),
             http_02x::Response::builder()
@@ -260,21 +266,7 @@ async fn test_retry_failed_chunk() {
         ),
     ]);
 
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client.clone())
-            .region(Region::from_static("us-west-2"))
-            .with_test_defaults()
-            .build(),
-    );
-
-    let config = aws_s3_transfer_manager::Config::builder()
-        .client(s3_client)
-        .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencySetting::Explicit(1))
-        .build();
-
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = test_tm(http_client.clone(), part_size);
 
     let mut handle = tm
         .download()
@@ -290,4 +282,117 @@ async fn test_retry_failed_chunk() {
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(3, requests.len());
     handle.join().await.unwrap();
+}
+
+const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <Error>
+            <Code>ExpiredToken</Code>
+            <Message>The provided token has expired</Message>
+            <RequestId>K2H6N7ZGQT6WHCEG</RequestId>
+            <HostId>WWoZlnK4pTjKCYn6eNV7GgOurabfqLkjbSyqTvDMGBaI9uwzyNhSaDhOCPs8paFGye7S6b/AB3A=</HostId>
+        </Error>
+"#;
+
+/// Test non retryable SdkError
+#[tokio::test]
+async fn test_non_retryable_error() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 8 * MEBIBYTE;
+
+    let http_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http_02x::Response::builder()
+                .status(200)
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+        // fail chunk with non-retryable error
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http_02x::Response::builder()
+                .status(400)
+                .body(SdkBody::from(ERROR_RESPONSE))
+                .unwrap(),
+        ),
+    ]);
+
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .send()
+        .await
+        .unwrap();
+
+    let _ = drain(&mut handle).await.unwrap_err();
+
+    handle.join().await.unwrap();
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(2, requests.len());
+}
+
+/// Test max attempts exhausted reading a stream
+#[tokio::test]
+async fn test_retry_max_attempts() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 8 * MEBIBYTE;
+    let frame_size = 16 * 1024;
+    let fail_after_byte = frame_size * 4;
+
+    let mut failures = repeat_with(|| {
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http_02x::Response::builder()
+                .status(200)
+                .header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
+                )
+                .body(SdkBody::from_body_1_x(FailingBody::new(
+                    data.slice(part_size..),
+                    fail_after_byte,
+                    frame_size,
+                )))
+                .unwrap(),
+        )
+    })
+    .take(3)
+    .collect::<Vec<_>>();
+
+    let mut events = vec![ReplayEvent::new(
+        dummy_expected_request(),
+        http_02x::Response::builder()
+            .status(200)
+            .header(
+                "Content-Range",
+                format!("bytes 0-{}/{}", part_size - 1, data.len()),
+            )
+            .body(SdkBody::from(data.slice(0..part_size)))
+            .unwrap(),
+    )];
+
+    events.append(&mut failures);
+
+    let http_client = StaticReplayClient::new(events);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .send()
+        .await
+        .unwrap();
+
+    let err = drain(&mut handle).await.unwrap_err();
+    handle.join().await.unwrap();
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(4, requests.len());
 }
