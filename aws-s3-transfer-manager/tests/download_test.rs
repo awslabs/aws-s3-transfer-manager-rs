@@ -391,7 +391,7 @@ async fn test_retry_max_attempts() {
         .await
         .unwrap();
 
-    let err = drain(&mut handle).await.unwrap_err();
+    let _ = drain(&mut handle).await.unwrap_err();
     handle.join().await.unwrap();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(4, requests.len());
