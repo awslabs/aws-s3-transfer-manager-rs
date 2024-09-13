@@ -10,7 +10,7 @@ use crate::{
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
-use tokio::{sync::Mutex, task};
+use tokio::{sync::Mutex, task, time::Instant};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
@@ -30,6 +30,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
 
     // TODO(aws-sdk-rust#1159): disable payload signing
     // TODO(aws-sdk-rust#1159): set checksum fields if applicable
+    let instant = Instant::now();
     let resp = ctx
         .client()
         .upload_part()
@@ -46,6 +47,8 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .send()
         .await?;
+    let elasped = instant.elapsed();
+    eprint!("{0},", elasped.as_nanos());
 
     tracing::trace!("completed upload of part number {}", part_number);
     let completed = CompletedPart::builder()
