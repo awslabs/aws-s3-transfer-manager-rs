@@ -19,6 +19,7 @@ use tokio::task;
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
     pub(crate) upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    /// All child read body tasks spawned for this upload
     pub(crate) read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
@@ -59,10 +60,11 @@ impl UploadHandle {
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
-        // cancel in-progress uploads
+        // cancel in-progress read_body tasks
         self.read_tasks.abort_all();
         while (self.read_tasks.join_next().await).is_some() {}
 
+        // cancel in-progress upload tasks
         let mut tasks = self.upload_tasks.lock().await;
         tasks.abort_all();
 
