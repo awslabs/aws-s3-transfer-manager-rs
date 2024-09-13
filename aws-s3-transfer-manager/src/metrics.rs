@@ -106,9 +106,18 @@ impl Throughput {
         }
     }
 
+    pub(crate) fn new_bytes_per_sec(bytes_transferred: u64) -> Throughput {
+        Self::new(bytes_transferred, Duration::from_secs(1))
+    }
+
     /// Convert this throughput into a specific unit per second
     pub fn as_unit_per_sec(&self, unit: unit::Bytes) -> f64 {
         (self.bytes_transferred as f64 / unit.as_bytes_u64() as f64) / self.elapsed.as_secs_f64()
+    }
+
+    /// Convert this throughput into bytes / sec
+    pub fn as_bytes_per_sec(&self) -> f64 {
+        self.as_unit_per_sec(unit::Bytes::Byte)
     }
 
     /// Returns a type that can be used to format/display this throughput in a particular unit
@@ -117,6 +126,19 @@ impl Throughput {
             throughput: self,
             unit,
         }
+    }
+}
+
+impl PartialEq for Throughput {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes_per_sec() == other.as_bytes_per_sec()
+    }
+}
+
+impl PartialOrd for Throughput {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.as_bytes_per_sec()
+            .partial_cmp(&other.as_bytes_per_sec())
     }
 }
 

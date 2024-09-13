@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::types::{ConcurrencySetting, PartSize};
-use crate::MEBIBYTE;
+use crate::metrics::{self, Throughput};
+use crate::types::{ConcurrencySetting, PartSize, TargetThroughput};
 use std::cmp;
+use std::time::Duration;
 
 /// Minimum upload part size in bytes
-const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * MEBIBYTE;
+const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * metrics::unit::Bytes::Mebibyte.as_bytes_u64();
 
 /// Configuration for a [`Client`](crate::client::Client)
 #[derive(Debug, Clone)]
@@ -17,6 +18,7 @@ pub struct Config {
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
     client: aws_sdk_s3::client::Client,
+    target_throughput: TargetThroughput,
 }
 
 impl Config {
@@ -50,6 +52,11 @@ impl Config {
     pub fn client(&self) -> &aws_sdk_s3::Client {
         &self.client
     }
+
+    /// The throughput target the client should try to reach
+    pub fn target_throughput(&self) -> &TargetThroughput {
+        &self.target_throughput
+    }
 }
 
 /// Fluent style builder for [Config]
@@ -59,6 +66,7 @@ pub struct Builder {
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
     client: Option<aws_sdk_s3::Client>,
+    target_throughput: TargetThroughput,
 }
 
 impl Builder {
@@ -125,6 +133,20 @@ impl Builder {
         self
     }
 
+    /// Set an explicit S3 client to use.
+    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Set the target throughput this client should try to reach.
+    ///
+    /// Default is [TargetThroughput::Auto]
+    pub fn target_throughput(mut self, target_throughput: TargetThroughput) -> Self {
+        self.target_throughput = target_throughput;
+        self
+    }
+
     /// Consumes the builder and constructs a [`Config`](crate::config::Config)
     pub fn build(self) -> Config {
         Config {
@@ -132,12 +154,7 @@ impl Builder {
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
             client: self.client.expect("client set"),
+            target_throughput: self.target_throughput,
         }
-    }
-
-    /// Set an explicit S3 client to use.
-    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
-        self.client = Some(client);
-        self
     }
 }
