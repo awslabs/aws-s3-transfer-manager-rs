@@ -101,8 +101,9 @@ impl State {
             Poll::Ready(())
         } else {
             tracing::trace!(
-                "estimated in-flight throughput {} exceeds target, throttling",
-                in_flight_estimate
+                "estimated in-flight throughput {} exceeds target, throttling ({} current in-flight requests)",
+                in_flight_estimate,
+                self.in_flight,
             );
             self.waiters.push_back(cx.waker().clone());
             Poll::Pending
@@ -121,8 +122,9 @@ impl State {
         if in_flight_estimate < self.target_throughput {
             if let Some(waker) = self.waiters.pop_front() {
                 tracing::trace!(
-                    "estimated in-flight throughput {} below target, waking pending request",
-                    in_flight_estimate
+                    "estimated in-flight throughput {} below target, waking pending request ({} current in-flight requests)",
+                    in_flight_estimate,
+                    self.in_flight,
                 );
                 waker.wake();
             }
