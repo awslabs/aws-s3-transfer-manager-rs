@@ -3,4 +3,4 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-pub(crate) mod concurrency;
+pub(crate) mod estimated_throughput;

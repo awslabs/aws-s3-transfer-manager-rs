@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
-use crate::middleware::limit::concurrency::estimated_throughput::EstimatedThroughputConcurrencyLimitLayer;
-use crate::middleware::limit::concurrency::estimated_throughput::ProvidePayloadSize;
+use crate::middleware::limit::estimated_throughput::{
+    EstimatedThroughputConcurrencyLimitLayer, ProvidePayloadSize,
+};
 use crate::middleware::retry;
 use crate::operation::download::header;
 use crate::operation::download::DownloadContext;

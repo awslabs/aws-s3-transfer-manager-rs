@@ -13,7 +13,7 @@ use std::{
 
 use crate::metrics::{self, Throughput};
 use futures_util::ready;
-use tower::{Layer, Service};
+use tower::Service;
 
 /// Enforces a limit on the number of concurrent requests the underlying service
 /// can handle based on a configured target throughput objective and estimated in-flight
@@ -28,12 +28,6 @@ pub(crate) struct EstimatedThroughputConcurrencyLimit<T> {
     inner: T,
 }
 
-/// Estimated P50 latency for S3
-const S3_P50_REQUEST_LATENCY_MS: usize = 30;
-
-/// Estimated per/request max throughput S3 is capable of
-const S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC: u64 = 90;
-
 impl<T> EstimatedThroughputConcurrencyLimit<T> {
     pub(crate) fn new(
         inner: T,
@@ -47,17 +41,6 @@ impl<T> EstimatedThroughputConcurrencyLimit<T> {
             state: Arc::new(Mutex::new(State::new(target_throughput))),
             inner,
         }
-    }
-
-    /// Create a new estimated throughput limiter using S3 service defaults for
-    /// estimated p50 latency and estimated max request throughput
-    pub(crate) fn s3_defaults(inner: T, target_throughput: metrics::Throughput) -> Self {
-        Self::new(
-            inner,
-            S3_P50_REQUEST_LATENCY_MS,
-            Throughput::new_bytes_per_sec(S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC),
-            target_throughput,
-        )
     }
 }
 
@@ -212,42 +195,6 @@ fn estimated_throughput(
     cmp::min_by(estimated_max_request_throughput, req_estimate, |x, y| {
         x.partial_cmp(y).expect("valid order")
     })
-}
-
-/// Enforces a limit on the number of concurrent requests the underlying service
-/// can handle based on a configured target throughput objective and estimated in-flight
-/// throughput using heuristics.
-#[derive(Debug, Clone)]
-pub(crate) struct EstimatedThroughputConcurrencyLimitLayer {
-    estimated_p50_latency_ms: usize,
-    estimated_max_request_throughput: metrics::Throughput,
-    target_throughput: metrics::Throughput,
-}
-
-impl EstimatedThroughputConcurrencyLimitLayer {
-    /// Create a new estimated throughput limit layer using S3 service defaults for
-    /// estimated p50 latency and estimated max request throughput
-    pub(crate) fn s3_defaults(target_throughput: metrics::Throughput) -> Self {
-        Self {
-            estimated_p50_latency_ms: S3_P50_REQUEST_LATENCY_MS,
-            estimated_max_request_throughput: Throughput::new_bytes_per_sec(
-                S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC,
-            ),
-            target_throughput,
-        }
-    }
-}
-
-impl<S> Layer<S> for EstimatedThroughputConcurrencyLimitLayer {
-    type Service = EstimatedThroughputConcurrencyLimit<S>;
-    fn layer(&self, service: S) -> Self::Service {
-        EstimatedThroughputConcurrencyLimit::new(
-            service,
-            self.estimated_p50_latency_ms,
-            self.estimated_max_request_throughput,
-            self.target_throughput,
-        )
-    }
 }
 
 #[cfg(test)]
