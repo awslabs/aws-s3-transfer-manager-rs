@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::Config;
+use crate::{metrics, Config};
 use crate::{
     types::{ConcurrencySetting, PartSize},
     DEFAULT_CONCURRENCY, MEBIBYTE,
@@ -54,6 +54,16 @@ impl Handle {
         match self.config.part_size() {
             PartSize::Auto => 5 * MEBIBYTE,
             PartSize::Target(explicit) => *explicit,
+        }
+    }
+
+    /// Get the concrete target throughput to reach for
+    pub(crate) fn target_throughput(&self) -> metrics::Throughput {
+        match self.config.target_throughput() {
+            crate::types::TargetThroughput::Auto => metrics::Throughput::new_bytes_per_sec(
+                10 * metrics::unit::Bytes::Gigabit.as_bytes_u64(),
+            ),
+            crate::types::TargetThroughput::Explicit(t) => *t,
         }
     }
 }

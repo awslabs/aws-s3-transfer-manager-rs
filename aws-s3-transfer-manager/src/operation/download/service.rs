@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
+use crate::middleware::limit::concurrency::estimated_throughput::EstimatedThroughputConcurrencyLimitLayer;
 use crate::middleware::retry;
 use crate::operation::download::header;
 use crate::operation::download::DownloadContext;
@@ -62,6 +63,7 @@ pub(super) fn chunk_service(
 
     ServiceBuilder::new()
         .concurrency_limit(ctx.handle.num_workers())
+        // .layer(EstimatedThroughputConcurrencyLimitLayer::s3_defaults(ctx.handle.target_throughput()))
         .retry(retry::RetryPolicy::default())
         .service(svc)
 }

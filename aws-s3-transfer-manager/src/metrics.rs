@@ -106,7 +106,20 @@ impl Throughput {
         }
     }
 
-    pub(crate) fn new_bytes_per_sec(bytes_transferred: u64) -> Throughput {
+    /// Create a new throughput measurement assuming a one second duration
+    ///
+    /// This is convenience for:
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use aws_s3_transfer_manager::metrics::unit;
+    /// let bytes_transferred = 5 * unit::Megabyte.as_bytes_u64();
+    /// assert_eq!(
+    ///     Throughput::new(bytes_transferred, Duration::from_secs(1)),
+    ///     Throughput::new_bytes_per_sec(bytes_transferred)
+    /// );
+    /// ```
+    pub fn new_bytes_per_sec(bytes_transferred: u64) -> Throughput {
         Self::new(bytes_transferred, Duration::from_secs(1))
     }
 

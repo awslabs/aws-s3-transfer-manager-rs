@@ -3,26 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
- just throttle on the total estimated Gbit/s of requests in flight, where the per-request estimate is the min of 90MB/s and (request size / 30ms).
-90MB/s and 30ms (which is about the p50 S3 request latency) are magic numbers here, and probably you need some bounds to avoid going too wild on lots of 1kB requests. and it’s not the most satisfying algorithm. but maybe it’s good enough? just spitballing really
-
-
-target_throughput = 50 Gbps (Gbit/sec)
-
-30 ms is ~= p50 s3 request latency
-
-per-request estimate: min(90 MB/sec, size(req) / 30 ms)
-
-4096 / .030
-
-*/
-
-use std::{cmp, collections::VecDeque, task::Poll, time::Duration};
+use std::{
+    cmp,
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
+};
 
 use crate::metrics::{self, Throughput};
 use futures_util::ready;
-use tower::Service;
+use tower::{Layer, Service};
 
 /// Enforces a limit on the number of concurrent requests the underlying service
 /// can handle based on a configured target throughput objective and estimated in-flight
@@ -33,9 +24,15 @@ pub(crate) struct EstimatedThroughputConcurrencyLimit<T> {
     estimated_p50_latency_ms: usize,
     /// estimated per/request max throughput of the service
     estimated_max_request_throughput: metrics::Throughput,
-    state: State,
+    state: Arc<Mutex<State>>,
     inner: T,
 }
+
+/// Estimated P50 latency for S3
+const S3_P50_REQUEST_LATENCY_MS: usize = 30;
+
+/// Estimated per/request max throughput S3 is capable of
+const S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC: u64 = 90;
 
 impl<T> EstimatedThroughputConcurrencyLimit<T> {
     pub(crate) fn new(
@@ -47,35 +44,38 @@ impl<T> EstimatedThroughputConcurrencyLimit<T> {
         Self {
             estimated_p50_latency_ms,
             estimated_max_request_throughput,
-            state: State::new(target_throughput),
+            state: Arc::new(Mutex::new(State::new(target_throughput))),
             inner,
+        }
+    }
+
+    /// Create a new estimated throughput limiter using S3 service defaults for
+    /// estimated p50 latency and estimated max request throughput
+    pub(crate) fn s3_defaults(inner: T, target_throughput: metrics::Throughput) -> Self {
+        Self::new(
+            inner,
+            S3_P50_REQUEST_LATENCY_MS,
+            Throughput::new_bytes_per_sec(S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC),
+            target_throughput,
+        )
+    }
+}
+
+impl<T> Clone for EstimatedThroughputConcurrencyLimit<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            estimated_p50_latency_ms: self.estimated_p50_latency_ms.clone(),
+            estimated_max_request_throughput: self.estimated_max_request_throughput.clone(),
+            state: self.state.clone(),
+            inner: self.inner.clone(),
         }
     }
 }
 
 // TODO - high water mark?
-
-// #[derive(Debug, Default)]
-// struct EstimatedThroughput {
-// }
-//
-// impl EstimatedThroughput {
-//     /// Add throughput to the current in-flight estimate
-//     fn add(&mut self, throughput: Throughput) {
-//         self.estimated_in_flight_bps += throughput.as_bytes_per_sec();
-//     }
-//
-//     /// Get an estimated throughput currently in-flight
-//     fn estimated_in_flight(&self) -> metrics::Throughput {
-//         let estimated = self.estimated_in_flight_bps.round() as u64;
-//         Throughput::new(estimated, Duration::from_secs(1))
-//     }
-//
-//     /// Remove throughput to the current in-flight estimate
-//     fn subtract(&mut self, throughput: Throughput) {
-//         self.estimated_in_flight_bps -= throughput.as_bytes_per_sec();
-//     }
-// }
 
 #[derive(Debug)]
 struct State {
@@ -104,10 +104,6 @@ impl State {
                 "estimated in-flight throughput {} exceeds target, throttling",
                 in_flight_estimate
             );
-            // need to store the waiter to be woken up
-            // let f = self.notify_waiting.notified();
-            // tokio::pin!(f);
-            // f.as_mut().poll(cx)
             self.waiters.push_back(cx.waker().clone());
             Poll::Pending
         }
@@ -119,7 +115,8 @@ impl State {
         Throughput::new_bytes_per_sec(estimated)
     }
 
-    fn notify_one(&mut self) {
+    /// Attempt to wake up any pending requests if we have capacity
+    fn try_notify_one(&mut self) {
         let in_flight_estimate = self.estimated_in_flight();
         if in_flight_estimate < self.target_throughput {
             if let Some(waker) = self.waiters.pop_front() {
@@ -138,7 +135,7 @@ impl State {
         // If we still have capacity, keep trying to make progress.
         // This prevents lots of small pending requests from making progress when a large
         // request (throughput) is done.
-        self.notify_one();
+        self.try_notify_one();
     }
 
     fn end_request(&mut self, throughput: metrics::Throughput) {
@@ -150,7 +147,9 @@ impl State {
     }
 }
 
+/// Provide the request/response payload size
 trait ProvidePayloadSize {
+    /// Payload size in bytes
     fn payload_size(&self) -> u64;
 }
 
@@ -171,7 +170,7 @@ where
         //   * Yes -> Throttle
         //   * No -> Allow the request through
         //       * TODO - cap on small requests we allow through?
-        ready!(self.state.poll_ready(cx));
+        ready!(self.state.lock().unwrap().poll_ready(cx));
         self.inner.poll_ready(cx)
     }
 
@@ -183,12 +182,15 @@ where
             self.estimated_max_request_throughput,
         );
 
-        self.state.start_request(delta);
+        self.state.lock().unwrap().start_request(delta);
 
         let result = self.inner.call(req);
 
-        self.state.end_request(delta);
-        self.state.notify_one();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.end_request(delta);
+            state.try_notify_one();
+        }
 
         result
     }
@@ -208,6 +210,42 @@ fn estimated_throughput(
     cmp::min_by(estimated_max_request_throughput, req_estimate, |x, y| {
         x.partial_cmp(y).expect("valid order")
     })
+}
+
+/// Enforces a limit on the number of concurrent requests the underlying service
+/// can handle based on a configured target throughput objective and estimated in-flight
+/// throughput using heuristics.
+#[derive(Debug, Clone)]
+pub(crate) struct EstimatedThroughputConcurrencyLimitLayer {
+    estimated_p50_latency_ms: usize,
+    estimated_max_request_throughput: metrics::Throughput,
+    target_throughput: metrics::Throughput,
+}
+
+impl EstimatedThroughputConcurrencyLimitLayer {
+    /// Create a new estimated throughput limit layer using S3 service defaults for
+    /// estimated p50 latency and estimated max request throughput
+    pub(crate) fn s3_defaults(target_throughput: metrics::Throughput) -> Self {
+        Self {
+            estimated_p50_latency_ms: S3_P50_REQUEST_LATENCY_MS,
+            estimated_max_request_throughput: Throughput::new_bytes_per_sec(
+                S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC,
+            ),
+            target_throughput,
+        }
+    }
+}
+
+impl<S> Layer<S> for EstimatedThroughputConcurrencyLimitLayer {
+    type Service = EstimatedThroughputConcurrencyLimit<S>;
+    fn layer(&self, service: S) -> Self::Service {
+        EstimatedThroughputConcurrencyLimit::new(
+            service,
+            self.estimated_p50_latency_ms,
+            self.estimated_max_request_throughput,
+            self.target_throughput,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -279,7 +317,7 @@ mod tests {
         state.end_request(r2);
 
         // should wake our pending task
-        state.notify_one();
+        state.try_notify_one();
         assert_eq!(1, wake_count.get());
     }
 
@@ -311,7 +349,7 @@ mod tests {
         state.end_request(large);
 
         // wake first small request, assume it gets started
-        state.notify_one();
+        state.try_notify_one();
         assert_eq!(1, wake_count.get());
         assert_ready!(state.poll_ready(&mut cx));
         state.start_request(small);
