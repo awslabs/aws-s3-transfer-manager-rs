@@ -150,7 +150,7 @@ impl State {
 }
 
 /// Provide the request/response payload size
-trait ProvidePayloadSize {
+pub(crate) trait ProvidePayloadSize {
     /// Payload size in bytes
     fn payload_size(&self) -> u64;
 }
