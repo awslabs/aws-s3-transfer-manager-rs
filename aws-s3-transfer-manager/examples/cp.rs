@@ -169,7 +169,8 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
         // FIXME - add parse implementation for target throughput and shorten what it takes to
         // create various units
         .target_throughput(TargetThroughput::Explicit(Throughput::new_bytes_per_sec(
-            100 * aws_s3_transfer_manager::metrics::unit::Bytes::Megabit.as_bytes_u64() * 100,
+            // 100 * aws_s3_transfer_manager::metrics::unit::Bytes::Megabit.as_bytes_u64(),
+            2 * aws_s3_transfer_manager::metrics::unit::Bytes::Gigabit.as_bytes_u64(),
         )))
         .build();
 

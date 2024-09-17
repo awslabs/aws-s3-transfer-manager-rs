@@ -4,7 +4,7 @@
  */
 
 use super::service::EstimatedThroughputConcurrencyLimit;
-use crate::metrics::Throughput;
+use crate::metrics::{self, Throughput};
 use tower::Layer;
 
 /// Estimated P50 latency for S3
@@ -30,7 +30,8 @@ impl EstimatedThroughputConcurrencyLimitLayer {
         Self {
             estimated_p50_latency_ms: S3_P50_REQUEST_LATENCY_MS,
             estimated_max_request_throughput: Throughput::new_bytes_per_sec(
-                S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC,
+                S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC
+                    * metrics::unit::Bytes::Megabyte.as_bytes_u64(),
             ),
             target_throughput,
         }
