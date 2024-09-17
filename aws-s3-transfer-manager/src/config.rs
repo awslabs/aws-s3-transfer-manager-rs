@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics;
+use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencySetting, PartSize};
 use std::cmp;
 
 /// Minimum upload part size in bytes
-const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * metrics::unit::Bytes::Mebibyte.as_bytes_u64();
+const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
 /// Configuration for a [`Client`](crate::client::Client)
 #[derive(Debug, Clone)]
