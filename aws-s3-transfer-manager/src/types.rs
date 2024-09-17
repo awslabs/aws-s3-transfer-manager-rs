@@ -6,8 +6,6 @@
 use core::fmt;
 use std::sync::Arc;
 
-use crate::metrics;
-
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -31,17 +29,6 @@ pub enum ConcurrencySetting {
 
     /// Explicitly configured concurrency setting.
     Explicit(usize),
-}
-
-/// The target throughput to reach for
-#[derive(Debug, Clone, Default)]
-pub enum TargetThroughput {
-    /// Automatically configure an optimal target throughput setting based on the execution environment.
-    #[default]
-    Auto,
-
-    /// Explicitly configured target throughput settingsetting.
-    Explicit(metrics::Throughput),
 }
 
 /// Policy for how to handle a failed multipart upload

@@ -8,9 +8,8 @@ use std::str::FromStr;
 use std::time;
 
 use aws_s3_transfer_manager::io::InputStream;
-use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::body::Body;
-use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize, TargetThroughput};
+use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_types::SdkConfig;
@@ -166,12 +165,6 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
         .client(s3_client)
-        // FIXME - add parse implementation for target throughput and shorten what it takes to
-        // create various units
-        .target_throughput(TargetThroughput::Explicit(Throughput::new_bytes_per_sec(
-            // 100 * aws_s3_transfer_manager::metrics::unit::Bytes::Megabit.as_bytes_u64(),
-            2 * aws_s3_transfer_manager::metrics::unit::Bytes::Gigabit.as_bytes_u64(),
-        )))
         .build();
 
     let tm = aws_s3_transfer_manager::Client::new(tm_config);

@@ -3,9 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
-use crate::middleware::limit::estimated_throughput::{
-    EstimatedThroughputConcurrencyLimitLayer, ProvidePayloadSize,
-};
 use crate::middleware::retry;
 use crate::operation::download::header;
 use crate::operation::download::DownloadContext;
@@ -25,12 +22,6 @@ use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
     pub(super) request: ChunkRequest,
-}
-
-impl ProvidePayloadSize for DownloadChunkRequest {
-    fn payload_size(&self) -> u64 {
-        self.request.size()
-    }
 }
 
 /// handler (service fn) for a single chunk
@@ -70,10 +61,7 @@ pub(super) fn chunk_service(
     let svc = service_fn(download_chunk_handler);
 
     ServiceBuilder::new()
-        // .concurrency_limit(ctx.handle.num_workers())
-        .layer(EstimatedThroughputConcurrencyLimitLayer::s3_defaults(
-            ctx.handle.target_throughput(),
-        ))
+        .concurrency_limit(ctx.handle.num_workers())
         .retry(retry::RetryPolicy::default())
         .service(svc)
 }
