@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::{Arc, Mutex as StdMutex}, time::Duration};
 
 use crate::{
     error,
@@ -10,16 +10,33 @@ use crate::{
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
-use tokio::{sync::Mutex, task, time::Instant};
-use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
+use tokio::{task, time::Instant};
+use tower::{hedge::{rotating_histogram::RotatingHistogram, Hedge, Policy} , service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
-
+use tokio::sync::Mutex;
 use super::UploadHandle;
 
 /// Request/input type for our "upload_part" service.
+#[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UploadPolicy;
+
+impl Policy<UploadPartRequest> for UploadPolicy {
+    /// Attempts to clone the request. If cloning is allowed, it returns a new instance.
+    fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
+        Some(req.clone())
+    }
+
+    /// Determines if the request can be retried based on custom logic.
+    fn can_retry(&self, _req: &UploadPartRequest) -> bool {
+        // Example policy: Only allow retry if part_data is not empty
+        true
+    }
 }
 
 /// handler (service fn) for a single part
@@ -95,12 +112,17 @@ pub(super) async fn distribute_work(
     );
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
+    
+    let histo = Arc::new(StdMutex::new(RotatingHistogram::new(Duration::new(3,0))));
+
+
     for i in 0..n_workers {
         let worker = read_body(
             part_reader.clone(),
             handle.ctx.clone(),
             svc.clone(),
             handle.upload_tasks.clone(),
+            histo.clone(),
         )
         .instrument(tracing::debug_span!("read_body", worker = i));
         handle.read_tasks.spawn(worker);
@@ -119,6 +141,7 @@ pub(super) async fn read_body(
         + Send
         + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    histo: Arc<StdMutex<RotatingHistogram>>,
 ) -> Result<(), error::Error> {
     loop {
         let part_data = part_reader.next_part().await?;
@@ -132,9 +155,18 @@ pub(super) async fn read_body(
             part_data,
         };
         let svc = svc.clone();
-        let task = async move { svc.oneshot(req).await }
+        let histo = histo.clone();
+        let task = async move { 
+            let hedge = Hedge::new_with_histo(svc, UploadPolicy, 10, 99.0, histo);
+            hedge.oneshot(req).await.map_err( |err| {
+                let e = err.downcast::<error::Error>()
+                    .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
+               *e
+            })
+        }
             .instrument(tracing::trace_span!("upload_part", worker = part_number));
-        upload_tasks.lock().await.spawn(task);
+        let mut tasks = upload_tasks.lock().await;
+        tasks.spawn(task);
     }
     Ok(())
 }
