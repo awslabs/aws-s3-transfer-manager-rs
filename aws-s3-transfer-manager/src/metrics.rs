@@ -12,7 +12,7 @@ pub mod unit {
     use std::str::FromStr;
 
     /// SI byte units
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ByteUnit {
         /// 1 byte
         Byte,
@@ -97,14 +97,35 @@ pub mod unit {
         }
     }
 
-    // TODO - finish
-    // impl FromStr for Bytes {
-    //     type Err;
-    //
-    //     fn from_str(s: &str) -> Result<Self, Self::Err> {
-    //         todo!()
-    //     }
-    // }
+    impl FromStr for ByteUnit {
+        type Err = crate::error::Error;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let unit = match s {
+                "B" => ByteUnit::Byte,
+                "Kb" => ByteUnit::Kilobit,
+                "Kib" => ByteUnit::Kibibit,
+                "KB" => ByteUnit::Kilobyte,
+                "KiB" => ByteUnit::Kibibyte,
+                "Mb" => ByteUnit::Megabit,
+                "Mib" => ByteUnit::Mebibit,
+                "MB" => ByteUnit::Megabyte,
+                "MiB" => ByteUnit::Mebibyte,
+                "Gb" => ByteUnit::Gigabit,
+                "Gib" => ByteUnit::Gibibit,
+                "GB" => ByteUnit::Gigabyte,
+                "GiB" => ByteUnit::Gibibyte,
+                _ => {
+                    return Err(crate::error::invalid_input(format!(
+                        "unknown byte unit '{}'",
+                        s
+                    )))
+                }
+            };
+
+            Ok(unit)
+        }
+    }
 }
 
 /// Measured bytes transferred over some duration
@@ -150,6 +171,11 @@ impl Throughput {
         self.as_unit_per_sec(unit::ByteUnit::Byte)
     }
 
+    /// Total bytes transferred
+    pub fn bytes_transferred(&self) -> u64 {
+        self.bytes_transferred
+    }
+
     /// Returns a type that can be used to format/display this throughput in a particular unit
     pub fn display_as(&self, unit: unit::ByteUnit) -> ThroughputDisplayContext<'_> {
         ThroughputDisplayContext {
@@ -172,7 +198,44 @@ impl PartialOrd for Throughput {
     }
 }
 
-// TODO - implement ops::Add, etc
+/// Add two throughputs
+impl ops::Add for Throughput {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let bps = self.as_bytes_per_sec() + rhs.as_bytes_per_sec();
+
+        Throughput::new_bytes_per_sec(bps.round() as u64)
+    }
+}
+
+/// Subtract throughput
+impl ops::Sub for Throughput {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let bps = self.as_bytes_per_sec() - rhs.as_bytes_per_sec();
+        Throughput::new_bytes_per_sec(bps.round() as u64)
+    }
+}
+
+/// Multiply throughput by a scalar
+impl ops::Mul<u64> for Throughput {
+    type Output = Self;
+
+    fn mul(self, rhs: u64) -> Self::Output {
+        Throughput::new(self.bytes_transferred * rhs, self.elapsed)
+    }
+}
+
+/// Divide throughput by a scalar
+impl ops::Div<u64> for Throughput {
+    type Output = Self;
+
+    fn div(self, rhs: u64) -> Self::Output {
+        Throughput::new(self.bytes_transferred / rhs, self.elapsed)
+    }
+}
 
 impl fmt::Display for Throughput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -216,7 +279,7 @@ impl<'a> fmt::Display for ThroughputDisplayContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{str::FromStr, time::Duration};
 
     use super::{unit::ByteUnit, Throughput};
 
@@ -265,5 +328,48 @@ mod tests {
             "0.00093 GiB/s",
             format!("{:.5}", t.display_as(ByteUnit::Gibibyte))
         );
+    }
+
+    #[test]
+    fn test_from_str() {
+        let units = &[
+            ByteUnit::Byte,
+            ByteUnit::Kilobit,
+            ByteUnit::Kibibit,
+            ByteUnit::Kilobyte,
+            ByteUnit::Kibibyte,
+            ByteUnit::Megabit,
+            ByteUnit::Mebibit,
+            ByteUnit::Megabyte,
+            ByteUnit::Mebibyte,
+            ByteUnit::Gigabit,
+            ByteUnit::Gibibit,
+            ByteUnit::Gigabyte,
+            ByteUnit::Gibibyte,
+        ];
+
+        for u in units {
+            let u2 = ByteUnit::from_str(u.as_str()).unwrap();
+            assert_eq!(*u, u2);
+        }
+
+        assert!(ByteUnit::from_str("kb").is_err());
+    }
+
+    #[test]
+    fn test_ops() {
+        let t = Throughput::new_bytes_per_sec(10 * ByteUnit::Megabyte.as_bytes_u64());
+        let t2 = Throughput::new_bytes_per_sec(5 * ByteUnit::Megabyte.as_bytes_u64());
+
+        assert_eq!(
+            t + t2,
+            Throughput::new_bytes_per_sec(t.bytes_transferred() + t2.bytes_transferred())
+        );
+        assert_eq!(t - t2, t2);
+        assert_eq!(
+            t * 2,
+            Throughput::new_bytes_per_sec(t.bytes_transferred() * 2)
+        );
+        assert_eq!(t / 2, t2);
     }
 }
