@@ -12,9 +12,7 @@ use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
-use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use aws_sdk_s3::error::DisplayErrorContext;
-use aws_types::SdkConfig;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use tokio::fs;
@@ -148,20 +146,15 @@ async fn do_recursive_download(
 }
 
 async fn do_download(args: Args) -> Result<(), BoxError> {
-    let config = aws_config::from_env()
-        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
-        .load()
-        .await;
     let (bucket, _) = args.source.expect_s3().parts();
-    warmup(&config, bucket).await?;
 
-    let s3_client = aws_sdk_s3::Client::new(&config);
-
-    let tm_config = aws_s3_transfer_manager::Config::builder()
+    let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .client(s3_client)
-        .build();
+        .load()
+        .await;
+
+    warmup(&tm_config, bucket).await?;
 
     let tm = aws_s3_transfer_manager::Client::new(tm_config);
 
@@ -201,18 +194,15 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
         unimplemented!("recursive upload not supported yet")
     }
 
-    let config = aws_config::from_env().load().await;
     let (bucket, key) = args.dest.expect_s3().parts();
 
-    warmup(&config, bucket).await?;
-
-    let s3_client = aws_sdk_s3::Client::new(&config);
-
-    let tm_config = aws_s3_transfer_manager::Config::builder()
+    let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .client(s3_client)
-        .build();
+        .load()
+        .await;
+
+    warmup(&tm_config, bucket).await?;
 
     let tm = aws_s3_transfer_manager::Client::new(tm_config);
 
@@ -288,9 +278,9 @@ async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError>
     Ok(())
 }
 
-async fn warmup(config: &SdkConfig, bucket: &str) -> Result<(), BoxError> {
+async fn warmup(config: &aws_s3_transfer_manager::Config, bucket: &str) -> Result<(), BoxError> {
     println!("warming up client...");
-    let s3 = aws_sdk_s3::Client::new(config);
+    let s3 = config.client();
 
     let mut handles = Vec::new();
     for _ in 0..16 {
