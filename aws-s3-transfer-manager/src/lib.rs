@@ -44,6 +44,9 @@ pub mod config;
 /// Tower related middleware and components
 pub(crate) mod middleware;
 
+/// HTTP related components and utils
+pub(crate) mod http;
+
 /// Metrics
 pub mod metrics;
 

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
+use crate::http::header;
 use crate::middleware::retry;
-use crate::operation::download::header;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};

@@ -8,7 +8,7 @@ use std::str::FromStr;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 
-use super::header;
+use crate::http::header;
 
 // TODO(aws-sdk-rust#1159,design): how many of these fields should we expose?
 // TODO(aws-sdk-rust#1159,docs): Document fields
