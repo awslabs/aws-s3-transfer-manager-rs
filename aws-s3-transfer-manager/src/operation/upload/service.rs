@@ -65,7 +65,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .send()
         .await?;
     let elasped = instant.elapsed();
-    eprint!("{0},", elasped.as_nanos());
+    //eprint!("{0},", elasped.as_nanos());
 
     tracing::trace!("completed upload of part number {}", part_number);
     let completed = CompletedPart::builder()
@@ -113,7 +113,7 @@ pub(super) async fn distribute_work(
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
     
-    let histo = Arc::new(StdMutex::new(RotatingHistogram::new(Duration::new(3,0))));
+    let histo = Arc::new(StdMutex::new(RotatingHistogram::new(Duration::new(1,0))));
 
 
     for i in 0..n_workers {
@@ -157,7 +157,7 @@ pub(super) async fn read_body(
         let svc = svc.clone();
         let histo = histo.clone();
         let task = async move { 
-            let hedge = Hedge::new_with_histo(svc, UploadPolicy, 10, 99.0, histo);
+            let hedge = Hedge::new_with_histo(svc, UploadPolicy, 10, 95.0, histo);
             hedge.oneshot(req).await.map_err( |err| {
                 let e = err.downcast::<error::Error>()
                     .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
