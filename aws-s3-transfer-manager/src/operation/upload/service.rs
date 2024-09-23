@@ -1,4 +1,4 @@
-use std::{sync::{Arc, Mutex as StdMutex}, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     error,
@@ -11,7 +11,7 @@ use crate::{
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::{task, time::Instant};
-use tower::{hedge::{rotating_histogram::RotatingHistogram, Hedge, Policy} , service_fn, Service, ServiceBuilder, ServiceExt};
+use tower::{hedge::{Hedge, Policy} , service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 use tokio::sync::Mutex;
 use super::UploadHandle;
@@ -86,10 +86,20 @@ pub(super) fn upload_part_service(
 ) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
        + Clone
        + Send {
+
     let svc = service_fn(upload_part_handler);
-    ServiceBuilder::new()
+    let hedge = Hedge::new(svc, UploadPolicy, 100, 95.0, Duration::new(1,0));
+    let svc = ServiceBuilder::new()
+        .buffer(60)
         .concurrency_limit(ctx.handle.num_workers())
-        .service(svc)
+        .service(hedge);
+    svc.map_err(|err| {
+        let e = err
+            .downcast::<error::Error>()
+            .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
+        *e
+    })
+
 }
 
 /// Spawn tasks to read the body and upload the remaining parts of object
@@ -112,17 +122,12 @@ pub(super) async fn distribute_work(
     );
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
-    
-    let histo = Arc::new(StdMutex::new(RotatingHistogram::new(Duration::new(1,0))));
-
-
     for i in 0..n_workers {
         let worker = read_body(
             part_reader.clone(),
             handle.ctx.clone(),
             svc.clone(),
             handle.upload_tasks.clone(),
-            histo.clone(),
         )
         .instrument(tracing::debug_span!("read_body", worker = i));
         handle.read_tasks.spawn(worker);
@@ -141,7 +146,6 @@ pub(super) async fn read_body(
         + Send
         + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-    histo: Arc<StdMutex<RotatingHistogram>>,
 ) -> Result<(), error::Error> {
     loop {
         let part_data = part_reader.next_part().await?;
@@ -155,16 +159,9 @@ pub(super) async fn read_body(
             part_data,
         };
         let svc = svc.clone();
-        let histo = histo.clone();
         let task = async move { 
-            let hedge = Hedge::new_with_histo(svc, UploadPolicy, 10, 95.0, histo);
-            hedge.oneshot(req).await.map_err( |err| {
-                let e = err.downcast::<error::Error>()
-                    .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
-               *e
-            })
-        }
-            .instrument(tracing::trace_span!("upload_part", worker = part_number));
+            svc.oneshot(req).await
+        }.instrument(tracing::trace_span!("upload_part", worker = part_number));
         let mut tasks = upload_tasks.lock().await;
         tasks.spawn(task);
     }
