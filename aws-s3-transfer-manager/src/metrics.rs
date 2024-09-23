@@ -9,7 +9,7 @@ use std::time::Duration;
 
 /// Units of measurement
 pub mod unit {
-    use std::str::FromStr;
+    use std::{fmt, str::FromStr};
 
     /// SI byte units
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,21 @@ pub mod unit {
         /// Convert some number of bytes into this unit as an `f64`
         pub fn convert(&self, bytes: u64) -> f64 {
             bytes as f64 / self.as_bytes_u64() as f64
+        }
+
+        /// Figure out the best unit to display the given number of bytes in
+        /// and return a [`ByteCountDisplayContext`] with the appropriate units set
+        pub fn display(total_bytes: u64) -> ByteCountDisplayContext {
+            let units = &[ByteUnit::Gibibyte, ByteUnit::Mebibyte, ByteUnit::Kibibyte];
+            let mut unit = ByteUnit::Byte;
+            for u in units {
+                if total_bytes >= u.as_bytes_u64() {
+                    unit = *u;
+                    break;
+                }
+            }
+
+            ByteCountDisplayContext::new(total_bytes, unit)
         }
 
         /// The number of bits represented by this unit
@@ -124,6 +139,39 @@ pub mod unit {
             };
 
             Ok(unit)
+        }
+    }
+
+    /// Display context to format a value representing number of bytres in a particular unit
+    #[derive(Debug)]
+    pub struct ByteCountDisplayContext {
+        /// The throughput measurment to display
+        pub total_bytes: u64,
+        /// The precise unit to display the throughput as
+        pub unit: ByteUnit,
+    }
+
+    impl ByteCountDisplayContext {
+        /// Create a new display context for the number of bytes in a specific unit
+        pub fn new(total_bytes: u64, unit: ByteUnit) -> Self {
+            Self { total_bytes, unit }
+        }
+    }
+
+    impl fmt::Display for ByteCountDisplayContext {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if self.total_bytes % self.unit.as_bytes_u64() == 0 {
+                let converted = self.total_bytes / self.unit.as_bytes_u64();
+                return write!(f, "{converted} {}", self.unit.as_str());
+            }
+            let precision = f.precision().unwrap_or(3);
+            write!(
+                f,
+                "{1:.*} {2:}",
+                precision,
+                self.unit.convert(self.total_bytes),
+                self.unit.as_str()
+            )
         }
     }
 }
@@ -281,6 +329,8 @@ impl<'a> fmt::Display for ThroughputDisplayContext<'a> {
 mod tests {
     use std::{str::FromStr, time::Duration};
 
+    use crate::metrics::unit::ByteCountDisplayContext;
+
     use super::{unit::ByteUnit, Throughput};
 
     #[test]
@@ -371,5 +421,41 @@ mod tests {
             Throughput::new_bytes_per_sec(t.bytes_transferred() * 2)
         );
         assert_eq!(t / 2, t2);
+    }
+
+    #[test]
+    fn test_byte_display_context() {
+        assert_eq!("1 KiB", format!("{}", ByteUnit::display(1024)));
+        assert_eq!("1 MiB", format!("{}", ByteUnit::display(1024 * 1024)));
+        assert_eq!(
+            "1 GiB",
+            format!("{}", ByteUnit::display(1024 * 1024 * 1024))
+        );
+
+        assert_eq!("727 B", format!("{}", ByteUnit::display(727)));
+        assert_eq!(
+            "0.710 KiB",
+            format!("{}", ByteCountDisplayContext::new(727, ByteUnit::Kibibyte))
+        );
+        assert_eq!("3.420 KiB", format!("{}", ByteUnit::display(3502)));
+        assert_eq!("3.41992 KiB", format!("{:.5}", ByteUnit::display(3502)));
+
+        assert_eq!("7.201 MiB", format!("{}", ByteUnit::display(7550498)));
+        assert_eq!(
+            "0.007 GiB",
+            format!(
+                "{}",
+                ByteCountDisplayContext::new(7550498, ByteUnit::Gibibyte)
+            )
+        );
+
+        assert_eq!("1.016 GiB", format!("{}", ByteUnit::display(1091242563)));
+        assert_eq!(
+            "1040.690 MiB",
+            format!(
+                "{}",
+                ByteCountDisplayContext::new(1091242563, ByteUnit::Mebibyte)
+            )
+        );
     }
 }

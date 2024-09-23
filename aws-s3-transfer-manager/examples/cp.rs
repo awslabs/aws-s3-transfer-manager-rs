@@ -138,11 +138,11 @@ async fn do_recursive_download(
     let elapsed = start.elapsed();
     let transfer_size_bytes = output.total_bytes_transferred();
     let throughput = Throughput::new(transfer_size_bytes, elapsed);
-    let transfer_size_megabytes = ByteUnit::Megabyte.convert(transfer_size_bytes);
 
     println!(
-        "downloaded {} objects totalling {transfer_size_bytes} bytes ({transfer_size_megabytes} MB) in {elapsed:?}; {throughput}",
+        "downloaded {} objects totalling {transfer_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
         output.objects_downloaded(),
+        ByteUnit::display(transfer_size_bytes)
     );
     Ok(())
 }
@@ -186,11 +186,11 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
     let elapsed = start.elapsed();
     let obj_size_bytes = handle.object_meta.total_size();
-    let obj_size_megabytes = ByteUnit::Megabyte.convert(obj_size_bytes);
     let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(
-        "downloaded {obj_size_bytes} bytes ({obj_size_megabytes} MB) in {elapsed:?}; {throughput}"
+        "downloaded {obj_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
+        ByteUnit::display(obj_size_bytes)
     );
 
     Ok(())
@@ -236,11 +236,11 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let elapsed = start.elapsed();
 
     let obj_size_bytes = file_meta.len();
-    let obj_size_megabytes = ByteUnit::Megabyte.convert(obj_size_bytes);
+    let obj_size_mebibytes = ByteUnit::Mebibyte.convert(obj_size_bytes);
     let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(
-        "uploaded {obj_size_bytes} bytes ({obj_size_megabytes} MB) in {elapsed:?}; {throughput}"
+        "uploaded {obj_size_bytes} bytes ({obj_size_mebibytes} MiB) in {elapsed:?}; {throughput}"
     );
 
     Ok(())
