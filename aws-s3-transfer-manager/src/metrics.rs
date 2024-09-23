@@ -18,26 +18,14 @@ pub mod unit {
         Byte,
         /// 1000 bits (125 bytes)
         Kilobit,
-        /// 1024 bits (128 bytes)
-        Kibibit,
-        /// 10<sup>3</sup> bytes.
-        Kilobyte,
         /// 2<sup>10</sup> bytes.
         Kibibyte,
         /// 125 * 10<sup>3</sup> bytes.
         Megabit,
-        /// 2<sup>17</sup> bytes.
-        Mebibit,
-        /// 10<sup>6</sup> bytes.
-        Megabyte,
         /// 2<sup>20</sup> bytes.
         Mebibyte,
         /// 125 * 10<sup>6</sup> bytes.
         Gigabit,
-        /// 2<sup>27</sup> bytes.
-        Gibibit,
-        /// 10<sup>9</sup> bytes.
-        Gigabyte,
         /// 2<sup>30</sup> bytes.
         Gibibyte,
     }
@@ -68,17 +56,11 @@ pub mod unit {
             match self {
                 ByteUnit::Byte => 8,
                 ByteUnit::Kilobit => 1_000,
-                ByteUnit::Kibibit => 1 << 10,
-                ByteUnit::Kilobyte => ByteUnit::Kilobit.as_bits_u64() << 3,
-                ByteUnit::Kibibyte => ByteUnit::Kibibit.as_bits_u64() << 3,
+                ByteUnit::Kibibyte => 1 << 13,
                 ByteUnit::Megabit => 1_000_000,
-                ByteUnit::Mebibit => 1 << 20,
-                ByteUnit::Megabyte => ByteUnit::Megabit.as_bits_u64() << 3,
-                ByteUnit::Mebibyte => ByteUnit::Mebibit.as_bits_u64() << 3,
+                ByteUnit::Mebibyte => 1 << 23,
                 ByteUnit::Gigabit => 1_000_000_000,
-                ByteUnit::Gibibit => 1 << 30,
-                ByteUnit::Gigabyte => ByteUnit::Gigabit.as_bits_u64() << 3,
-                ByteUnit::Gibibyte => ByteUnit::Gibibit.as_bits_u64() << 3,
+                ByteUnit::Gibibyte => 1 << 33,
             }
         }
 
@@ -91,16 +73,10 @@ pub mod unit {
             match self {
                 ByteUnit::Byte => "B",
                 ByteUnit::Kilobit => "Kb",
-                ByteUnit::Kibibit => "Kib",
-                ByteUnit::Kilobyte => "KB",
                 ByteUnit::Kibibyte => "KiB",
                 ByteUnit::Megabit => "Mb",
-                ByteUnit::Mebibit => "Mib",
-                ByteUnit::Megabyte => "MB",
                 ByteUnit::Mebibyte => "MiB",
                 ByteUnit::Gigabit => "Gb",
-                ByteUnit::Gibibit => "Gib",
-                ByteUnit::Gigabyte => "GB",
                 ByteUnit::Gibibyte => "GiB",
             }
         }
@@ -119,16 +95,10 @@ pub mod unit {
             let unit = match s {
                 "B" => ByteUnit::Byte,
                 "Kb" => ByteUnit::Kilobit,
-                "Kib" => ByteUnit::Kibibit,
-                "KB" => ByteUnit::Kilobyte,
                 "KiB" => ByteUnit::Kibibyte,
                 "Mb" => ByteUnit::Megabit,
-                "Mib" => ByteUnit::Mebibit,
-                "MB" => ByteUnit::Megabyte,
                 "MiB" => ByteUnit::Mebibyte,
                 "Gb" => ByteUnit::Gigabit,
-                "Gib" => ByteUnit::Gibibit,
-                "GB" => ByteUnit::Gigabyte,
                 "GiB" => ByteUnit::Gibibyte,
                 _ => {
                     return Err(crate::error::invalid_input(format!(
@@ -199,7 +169,7 @@ impl Throughput {
     /// ```
     /// use std::time::Duration;
     /// use aws_s3_transfer_manager::metrics::{unit, Throughput};
-    /// let bytes_transferred = 5 * unit::ByteUnit::Megabyte.as_bytes_u64();
+    /// let bytes_transferred = 5 * unit::ByteUnit::Mebibyte.as_bytes_u64();
     /// assert_eq!(
     ///     Throughput::new(bytes_transferred, Duration::from_secs(1)),
     ///     Throughput::new_bytes_per_sec(bytes_transferred)
@@ -346,34 +316,16 @@ mod tests {
         // explicit
         assert_eq!("1000000 B/s", format!("{}", t.display_as(ByteUnit::Byte)));
         assert_eq!("8000 Kb/s", format!("{}", t.display_as(ByteUnit::Kilobit)));
-        assert_eq!("1000 KB/s", format!("{}", t.display_as(ByteUnit::Kilobyte)));
-        assert_eq!(
-            "7812.5 Kib/s",
-            format!("{}", t.display_as(ByteUnit::Kibibit))
-        );
         assert_eq!(
             "976.5625 KiB/s",
             format!("{}", t.display_as(ByteUnit::Kibibyte))
         );
         assert_eq!("8 Mb/s", format!("{}", t.display_as(ByteUnit::Megabit)));
-        assert_eq!("1 MB/s", format!("{}", t.display_as(ByteUnit::Megabyte)));
-        assert_eq!(
-            "7.629 Mib/s",
-            format!("{:.3}", t.display_as(ByteUnit::Mebibit))
-        );
         assert_eq!(
             "0.954 MiB/s",
             format!("{:.3}", t.display_as(ByteUnit::Mebibyte))
         );
         assert_eq!("0.008 Gb/s", format!("{}", t.display_as(ByteUnit::Gigabit)));
-        assert_eq!(
-            "0.001 GB/s",
-            format!("{}", t.display_as(ByteUnit::Gigabyte))
-        );
-        assert_eq!(
-            "0.00745 Gib/s",
-            format!("{:.5}", t.display_as(ByteUnit::Gibibit))
-        );
         assert_eq!(
             "0.00093 GiB/s",
             format!("{:.5}", t.display_as(ByteUnit::Gibibyte))
@@ -385,16 +337,10 @@ mod tests {
         let units = &[
             ByteUnit::Byte,
             ByteUnit::Kilobit,
-            ByteUnit::Kibibit,
-            ByteUnit::Kilobyte,
             ByteUnit::Kibibyte,
             ByteUnit::Megabit,
-            ByteUnit::Mebibit,
-            ByteUnit::Megabyte,
             ByteUnit::Mebibyte,
             ByteUnit::Gigabit,
-            ByteUnit::Gibibit,
-            ByteUnit::Gigabyte,
             ByteUnit::Gibibyte,
         ];
 
@@ -408,8 +354,8 @@ mod tests {
 
     #[test]
     fn test_ops() {
-        let t = Throughput::new_bytes_per_sec(10 * ByteUnit::Megabyte.as_bytes_u64());
-        let t2 = Throughput::new_bytes_per_sec(5 * ByteUnit::Megabyte.as_bytes_u64());
+        let t = Throughput::new_bytes_per_sec(10 * ByteUnit::Mebibyte.as_bytes_u64());
+        let t2 = Throughput::new_bytes_per_sec(5 * ByteUnit::Mebibyte.as_bytes_u64());
 
         assert_eq!(
             t + t2,
