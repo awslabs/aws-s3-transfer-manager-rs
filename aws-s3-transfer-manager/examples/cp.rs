@@ -8,6 +8,8 @@ use std::str::FromStr;
 use std::time;
 
 use aws_s3_transfer_manager::io::InputStream;
+use aws_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::config::StalledStreamProtectionConfig;
@@ -20,8 +22,6 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug_span, Instrument};
 
 type BoxError = Box<dyn Error + Send + Sync>;
-
-const ONE_MEGABYTE: u64 = 1000 * 1000;
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -137,13 +137,12 @@ async fn do_recursive_download(
 
     let elapsed = start.elapsed();
     let transfer_size_bytes = output.total_bytes_transferred();
-    let transfer_size_megabytes = transfer_size_bytes as f64 / ONE_MEGABYTE as f64;
-    let transfer_size_megabits = transfer_size_megabytes * 8f64;
+    let throughput = Throughput::new(transfer_size_bytes, elapsed);
 
     println!(
-        "downloaded {} objects totalling {transfer_size_bytes} bytes ({transfer_size_megabytes} MB) in {elapsed:?}; Mb/s: {}",
+        "downloaded {} objects totalling {transfer_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
         output.objects_downloaded(),
-        transfer_size_megabits / elapsed.as_secs_f64(),
+        ByteUnit::display(transfer_size_bytes)
     );
     Ok(())
 }
@@ -187,12 +186,11 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
     let elapsed = start.elapsed();
     let obj_size_bytes = handle.object_meta.total_size();
-    let obj_size_megabytes = obj_size_bytes as f64 / ONE_MEGABYTE as f64;
-    let obj_size_megabits = obj_size_megabytes * 8f64;
+    let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(
-        "downloaded {obj_size_bytes} bytes ({obj_size_megabytes} MB) in {elapsed:?}; Mb/s: {}",
-        obj_size_megabits / elapsed.as_secs_f64(),
+        "downloaded {obj_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
+        ByteUnit::display(obj_size_bytes)
     );
 
     Ok(())
@@ -238,12 +236,11 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let elapsed = start.elapsed();
 
     let obj_size_bytes = file_meta.len();
-    let obj_size_megabytes = obj_size_bytes as f64 / ONE_MEGABYTE as f64;
-    let obj_size_megabits = obj_size_megabytes * 8f64;
+    let obj_size_mebibytes = ByteUnit::Mebibyte.convert(obj_size_bytes);
+    let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(
-        "uploaded {obj_size_bytes} bytes ({obj_size_megabytes} MB) in {elapsed:?}; Mb/s: {}",
-        obj_size_megabits / elapsed.as_secs_f64()
+        "uploaded {obj_size_bytes} bytes ({obj_size_mebibytes} MiB) in {elapsed:?}; {throughput}"
     );
 
     Ok(())

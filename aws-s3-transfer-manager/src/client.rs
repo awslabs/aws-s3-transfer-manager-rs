@@ -5,8 +5,9 @@
 
 use crate::Config;
 use crate::{
+    metrics::unit::ByteUnit,
     types::{ConcurrencySetting, PartSize},
-    DEFAULT_CONCURRENCY, MEBIBYTE,
+    DEFAULT_CONCURRENCY,
 };
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ impl Handle {
     /// are enabled for a given request.
     pub(crate) fn mpu_threshold_bytes(&self) -> u64 {
         match self.config.multipart_threshold() {
-            PartSize::Auto => 16 * MEBIBYTE,
+            PartSize::Auto => 16 * ByteUnit::Mebibyte.as_bytes_u64(),
             PartSize::Target(explicit) => *explicit,
         }
     }
@@ -44,7 +45,7 @@ impl Handle {
     /// Get the concrete target part size to use for uploads
     pub(crate) fn upload_part_size_bytes(&self) -> u64 {
         match self.config.part_size() {
-            PartSize::Auto => 8 * MEBIBYTE,
+            PartSize::Auto => 8 * ByteUnit::Mebibyte.as_bytes_u64(),
             PartSize::Target(explicit) => *explicit,
         }
     }
@@ -52,7 +53,7 @@ impl Handle {
     /// Get the concrete target part size to use for downloads
     pub(crate) fn download_part_size_bytes(&self) -> u64 {
         match self.config.part_size() {
-            PartSize::Auto => 5 * MEBIBYTE,
+            PartSize::Auto => 5 * ByteUnit::Mebibyte.as_bytes_u64(),
             PartSize::Target(explicit) => *explicit,
         }
     }

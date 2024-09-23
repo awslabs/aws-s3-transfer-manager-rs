@@ -162,6 +162,7 @@ async fn discover_obj_with_get(
 mod tests {
     use std::sync::Arc;
 
+    use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
@@ -169,7 +170,6 @@ mod tests {
     use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
     use crate::types::PartSize;
-    use crate::MEBIBYTE;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
@@ -226,7 +226,7 @@ mod tests {
             .then_output(|| HeadObjectOutput::builder().content_length(500).build());
         let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, 5 * MEBIBYTE));
+        let ctx = DownloadContext::new(test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
