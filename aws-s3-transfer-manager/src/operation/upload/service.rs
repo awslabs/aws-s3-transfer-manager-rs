@@ -68,6 +68,7 @@ pub(super) fn upload_part_service(
        + Send {
     let svc = service_fn(upload_part_handler);
     ServiceBuilder::new()
+        // FIXME - This setting will need to be globalized.
         .concurrency_limit(ctx.handle.num_workers())
         .service(svc)
 }
@@ -79,7 +80,7 @@ pub(super) fn upload_part_service(
 /// * handle - the handle for this upload
 /// * stream - the body input stream
 /// * part_size - the part_size for each part
-pub(super) async fn distribute_work(
+pub(super) fn distribute_work(
     handle: &mut UploadHandle,
     stream: InputStream,
     part_size: u64,
@@ -117,20 +118,17 @@ pub(super) async fn read_body(
         + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
 ) -> Result<(), error::Error> {
-    loop {
-        let part_data = part_reader.next_part().await?;
-        let part_data = match part_data {
-            None => break,
-            Some(part_data) => part_data,
-        };
+    while let Some(part_data) = part_reader.next_part().await? {
         let part_number = part_data.part_number;
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
         };
         let svc = svc.clone();
-        let task = async move { svc.oneshot(req).await }
-            .instrument(tracing::trace_span!("upload_part", worker = part_number));
+        let task = svc.oneshot(req).instrument(tracing::trace_span!(
+            "upload_part",
+            part_number = part_number
+        ));
         upload_tasks.lock().await.spawn(task);
     }
     Ok(())
