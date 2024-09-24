@@ -3,11 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::sync::Arc;
+
 use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use tokio::sync::Mutex;
 use tokio::task;
 
 /// Response type for a single upload object request.
@@ -15,7 +18,9 @@ use tokio::task;
 #[non_exhaustive]
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
-    pub(crate) tasks: task::JoinSet<Result<Vec<CompletedPart>, crate::error::Error>>,
+    pub(crate) upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    /// All child read body tasks spawned for this upload
+    pub(crate) read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -26,7 +31,8 @@ impl UploadHandle {
     /// Create a new upload handle with the given request context
     pub(crate) fn new(ctx: UploadContext) -> Self {
         Self {
-            tasks: task::JoinSet::new(),
+            upload_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
+            read_tasks: task::JoinSet::new(),
             ctx,
             response: None,
         }
@@ -54,11 +60,16 @@ impl UploadHandle {
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
-        // cancel in-progress uploads
-        self.tasks.abort_all();
+        // cancel in-progress read_body tasks
+        self.read_tasks.abort_all();
+        while (self.read_tasks.join_next().await).is_some() {}
+
+        // cancel in-progress upload tasks
+        let mut tasks = self.upload_tasks.lock().await;
+        tasks.abort_all();
 
         // join all tasks
-        while (self.tasks.join_next().await).is_some() {}
+        while (tasks.join_next().await).is_some() {}
 
         if !self.ctx.is_multipart_upload() {
             return Ok(AbortedUpload::default());
@@ -107,19 +118,29 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
     let _enter = span.enter();
 
-    let mut all_parts = Vec::new();
+    while let Some(join_result) = handle.read_tasks.join_next().await {
+        if let Err(err) = join_result.expect("task completed") {
+            tracing::error!("multipart upload failed while trying to read the body, aborting");
+            // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
+            if let Err(err) = handle.abort().await {
+                tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
+            };
+            return Err(err);
+        }
+    }
 
-    // join all the upload tasks
-    while let Some(join_result) = handle.tasks.join_next().await {
+    let mut all_parts = Vec::new();
+    // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
+    let mut tasks = handle.upload_tasks.lock().await;
+    while let Some(join_result) = tasks.join_next().await {
         let result = join_result.expect("task completed");
         match result {
-            Ok(mut completed_parts) => {
-                all_parts.append(&mut completed_parts);
-            }
+            Ok(completed_part) => all_parts.push(completed_part),
             // TODO(aws-sdk-rust#1159, design) - do we want to return first error or collect all errors?
             Err(err) => {
                 tracing::error!("multipart upload failed, aborting");
                 // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
+                drop(tasks);
                 if let Err(err) = handle.abort().await {
                     tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                 };
