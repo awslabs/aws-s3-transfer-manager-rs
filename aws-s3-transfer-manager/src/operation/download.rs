@@ -104,7 +104,7 @@ fn handle_discovery_chunk(
 
             if let Err(send_err) = completed.send(chunk).await {
                 tracing::error!(
-                    "channel closed, initil chunk from discovery not sent: {}",
+                    "channel closed, initial chunk from discovery not sent: {}",
                     &DisplayErrorContext(send_err)
                 );
             }
