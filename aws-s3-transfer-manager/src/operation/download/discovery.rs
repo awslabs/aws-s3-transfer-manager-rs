@@ -155,7 +155,7 @@ async fn discover_obj_with_get(
     let body = mem::replace(&mut resp.body, empty_stream);
 
     let meta: ObjectMetadata = resp.into();
-    let content_len = meta.inferred_content_length();
+    let content_len = meta.content_length();
 
     let remaining = match range {
         Some(range) => (*range.start() + content_len)..=*range.end(),
