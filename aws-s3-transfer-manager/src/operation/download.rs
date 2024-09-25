@@ -70,6 +70,8 @@ impl Download {
             ctx,
         };
 
+        // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
+        // that we can begin concurrently downloading any reamining chunks/parts ASAP
         let start_seq = handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx);
 
         if !discovery.remaining.is_empty() {
@@ -83,6 +85,11 @@ impl Download {
 
 /// Handle possibly sending the first chunk of data received through discovery. Returns
 /// the starting sequence number to use for remaining chunks.
+///
+/// NOTE: This function does _not_ wait to read the initial chunk from discovery but
+/// instead spawns a new task to read the stream and send it over the body channel.
+/// This allows remaining work to start immediately (and concurrently) without
+/// waiting for the first chunk.
 fn handle_discovery_chunk(
     handle: &mut DownloadHandle,
     initial_chunk: Option<ByteStream>,
@@ -92,6 +99,8 @@ fn handle_discovery_chunk(
 
     if let Some(stream) = initial_chunk {
         let completed = completed.clone();
+        // spawn a task to actually read the discovery chunk without waiting for it so we
+        // can get started sooner on any remaining work (if any)
         handle.tasks.spawn(async move {
             let chunk = stream
                 .collect()

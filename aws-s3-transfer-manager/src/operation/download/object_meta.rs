@@ -71,7 +71,7 @@ impl ObjectMetadata {
     }
 
     /// Content length from either the `Content-Range` or `Content-Length` headers
-    pub(crate) fn inferred_content_length(&self) -> u64 {
+    pub(crate) fn content_length(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
             (Some(length), _) => {
                 debug_assert!(length > 0, "content length invalid");
@@ -195,13 +195,13 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(4, meta.inferred_content_length());
+        assert_eq!(4, meta.content_length());
 
         let meta = ObjectMetadata {
             content_length: None,
             content_range: Some("bytes 0-499/900".to_owned()),
             ..Default::default()
         };
-        assert_eq!(500, meta.inferred_content_length());
+        assert_eq!(500, meta.content_length());
     }
 }
