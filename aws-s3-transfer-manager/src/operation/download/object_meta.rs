@@ -3,8 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::str::FromStr;
+
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+
+use super::header;
 
 // TODO(aws-sdk-rust#1159,design): how many of these fields should we expose?
 // TODO(aws-sdk-rust#1159,docs): Document fields
@@ -58,7 +62,34 @@ impl ObjectMetadata {
                 let total = range.split_once('/').map(|x| x.1).expect("content range total");
                 total.parse().expect("valid range total")
             }
-            (Some(length), None) => length as u64,
+            (Some(length), None) => {
+                debug_assert!(length > 0, "content length invalid");
+                length as u64
+            },
+            (None, None) => panic!("total object size cannot be calculated without either content length or content range headers")
+        }
+    }
+
+    /// Content length from either the `Content-Range` or `Content-Length` headers
+    pub(crate) fn inferred_content_length(&self) -> u64 {
+        match (self.content_length, self.content_range.as_ref()) {
+            (Some(length), _) => {
+                debug_assert!(length > 0, "content length invalid");
+                length as u64
+            },
+            (None, Some(range)) => {
+                let byte_range_str = range
+                    .strip_prefix("bytes ")
+                    .expect("content range bytes-unit recognized")
+                    .split_once('/')
+                    .map(|x| x.0)
+                    .expect("content range valid");
+
+                match header::ByteRange::from_str(byte_range_str).expect("valid byte range") {
+                    header::ByteRange::Inclusive(start, end) => end - start + 1,
+                    _ => unreachable!("Content-Range header invalid")
+                }
+            }
             (None, None) => panic!("total object size cannot be calculated without either content length or content range headers")
         }
     }
@@ -149,5 +180,28 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectMetadata;
+
+    #[test]
+    fn test_inferred_content_length() {
+        let meta = ObjectMetadata {
+            content_length: Some(4),
+            content_range: Some("should ignore".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(4, meta.inferred_content_length());
+
+        let meta = ObjectMetadata {
+            content_length: None,
+            content_range: Some("bytes 0-499/900".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(500, meta.inferred_content_length());
     }
 }
