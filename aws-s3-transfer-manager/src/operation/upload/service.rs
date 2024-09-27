@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use super::UploadHandle;
 use crate::{
     error,
     io::{
@@ -9,13 +9,16 @@ use crate::{
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
-use tokio::{task, time::Instant};
-use tower::{hedge::{Hedge, Policy} , service_fn, Service, ServiceBuilder, ServiceExt};
-use tracing::Instrument;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
-use super::UploadHandle;
 use tokio::{sync::Mutex, task};
+use tokio::{task, time::Instant};
+use tower::{
+    hedge::{Hedge, Policy},
+    service_fn, Service, ServiceBuilder, ServiceExt,
+};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
+use tracing::Instrument;
 use tracing::Instrument;
 
 use super::UploadHandle;
@@ -89,9 +92,8 @@ pub(super) fn upload_part_service(
 ) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
        + Clone
        + Send {
-
     let svc = service_fn(upload_part_handler);
-    let hedge = Hedge::new(svc, UploadPolicy, 100, 95.0, Duration::new(1,0));
+    let hedge = Hedge::new(svc, UploadPolicy, 100, 95.0, Duration::new(1, 0));
     let svc = ServiceBuilder::new()
         // FIXME - This setting will need to be globalized.
         .buffer(60)

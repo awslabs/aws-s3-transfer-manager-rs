@@ -23,7 +23,7 @@ hyper = { version = "0.14.29", features = ["client"] }
 path-clean = "1.0.1"
 pin-project-lite = "0.2.14"
 tokio = { version = "1.38.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
-tower = { version = "0.5.1", features = ["limit", "util", "hedge", "buffer"] }
+tower = { version = "0.5.1", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
 
 [dev-dependencies]
