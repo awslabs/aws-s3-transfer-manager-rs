@@ -5,8 +5,9 @@
 
 use crate::runtime::scheduler::OwnedWorkPermit;
 
+use futures_util::ready;
 use pin_project_lite::pin_project;
-use std::future::Future;
+use std::{future::Future, task::Poll};
 
 pin_project! {
     #[derive(Debug)]
@@ -30,10 +31,7 @@ where
 {
     type Output = Result<T, E>;
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        todo!()
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(ready!(self.project().inner.poll(cx)))
     }
 }

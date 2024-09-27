@@ -13,6 +13,8 @@ use tower::Service;
 use super::future::ResponseFuture;
 use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit, Scheduler};
 
+// TODO - add tests for this service
+
 /// Enforces a limit on the concurrent requests an underlying service receives
 /// using the given [`Scheduler`].
 #[derive(Debug)]
