@@ -4,7 +4,6 @@
  */
 
 use futures_util::ready;
-use pin_project_lite::pin_project;
 use std::future::Future;
 use std::mem;
 use std::pin::pin;
@@ -37,23 +36,17 @@ impl<T> ConcurrencyLimit<T> {
     }
 }
 
-pin_project! {
-    #[project = StateProj]
-    #[derive(Debug)]
-    enum State {
-        /// Permit acquired and ready
-        Ready{permit: OwnedWorkPermit },
-        /// Waiting on a permit (or haven't attempted to acquire one)
-        Pending {
-            #[pin]
-            future: Option<AcquirePermitFuture>
-        }
-    }
+#[derive(Debug)]
+enum State {
+    /// Permit acquired and ready
+    Ready(OwnedWorkPermit),
+    /// Waiting on a permit (or haven't attempted to acquire one)
+    Pending(Option<AcquirePermitFuture>),
 }
 
 impl State {
     fn pending(future: Option<AcquirePermitFuture>) -> Self {
-        Self::Pending { future }
+        Self::Pending(future)
     }
 }
 
@@ -71,16 +64,14 @@ where
     ) -> std::task::Poll<Result<(), Self::Error>> {
         loop {
             match &mut self.state {
-                State::Ready { .. } => break,
-                State::Pending {
-                    future: Some(permit_fut),
-                } => {
+                State::Ready(_) => break,
+                State::Pending(Some(permit_fut)) => {
                     let permit_fut = pin!(permit_fut);
                     let permit =
                         ready!(permit_fut.poll(cx)).expect("permit acquisition never fails");
-                    self.state = State::Ready { permit };
+                    self.state = State::Ready(permit);
                 }
-                State::Pending { future: None } => {
+                State::Pending(None) => {
                     // we loop to ensure we poll this at least once to ensure we are woken up when ready
                     let permit_fut = self.scheduler.acquire_permit();
                     self.state = State::pending(Some(permit_fut));
@@ -93,9 +84,8 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         // extract our permit and reset the state
-        let state = mem::replace(&mut self.state, State::pending(None));
-        let permit = match state {
-            State::Ready { permit } => permit,
+        let permit = match mem::replace(&mut self.state, State::pending(None)) {
+            State::Ready(permit) => permit,
             _ => panic!("poll_ready must be called first!"),
         };
 
