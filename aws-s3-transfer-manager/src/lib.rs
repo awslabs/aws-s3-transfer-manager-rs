@@ -21,8 +21,6 @@
     rust_2018_idioms
 )]
 
-pub(crate) const MEBIBYTE: u64 = 1024 * 1024;
-
 pub(crate) const DEFAULT_CONCURRENCY: usize = 8;
 
 /// Error types emitted by `aws-s3-transfer-manager`
@@ -42,6 +40,12 @@ pub mod operation;
 
 /// Transfer manager configuration
 pub mod config;
+
+/// Tower related middleware and components
+pub(crate) mod middleware;
+
+/// Metrics
+pub mod metrics;
 
 pub use self::client::Client;
 pub use self::config::Config;

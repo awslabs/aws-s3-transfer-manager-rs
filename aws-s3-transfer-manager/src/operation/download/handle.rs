@@ -50,3 +50,17 @@ impl DownloadHandle {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DownloadHandle;
+
+    fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
+
+    #[test]
+    fn test_handle_properties() {
+        is_send::<DownloadHandle>();
+        is_sync::<DownloadHandle>();
+    }
+}

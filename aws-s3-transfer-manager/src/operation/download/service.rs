@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
+use crate::middleware::retry;
 use crate::operation::download::header;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
@@ -61,6 +62,7 @@ pub(super) fn chunk_service(
 
     ServiceBuilder::new()
         .concurrency_limit(ctx.handle.num_workers())
+        .retry(retry::RetryPolicy::default())
         .service(svc)
 }
 

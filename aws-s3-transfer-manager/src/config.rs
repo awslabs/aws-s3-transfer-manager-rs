@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencySetting, PartSize};
-use crate::MEBIBYTE;
 use std::cmp;
 
 /// Minimum upload part size in bytes
-const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * MEBIBYTE;
+const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
 /// Configuration for a [`Client`](crate::client::Client)
 #[derive(Debug, Clone)]
@@ -125,6 +125,12 @@ impl Builder {
         self
     }
 
+    /// Set an explicit S3 client to use.
+    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
     /// Consumes the builder and constructs a [`Config`](crate::config::Config)
     pub fn build(self) -> Config {
         Config {
@@ -133,11 +139,5 @@ impl Builder {
             concurrency: self.concurrency,
             client: self.client.expect("client set"),
         }
-    }
-
-    /// Set an explicit S3 client to use.
-    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
-        self.client = Some(client);
-        self
     }
 }

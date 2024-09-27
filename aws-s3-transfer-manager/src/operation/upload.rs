@@ -87,7 +87,7 @@ async fn try_start_mpu_upload(
     );
 
     handle.set_response(mpu);
-    distribute_work(handle, stream, part_size).await?;
+    distribute_work(handle, stream, part_size)?;
     Ok(())
 }
 

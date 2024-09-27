@@ -1,5 +1,4 @@
 use std::{sync::Arc, time::Duration};
-
 use crate::{
     error,
     io::{
@@ -15,7 +14,11 @@ use tower::{hedge::{Hedge, Policy} , service_fn, Service, ServiceBuilder, Servic
 use tracing::Instrument;
 use tokio::sync::Mutex;
 use super::UploadHandle;
+use tokio::{sync::Mutex, task};
+use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
+use tracing::Instrument;
 
+use super::UploadHandle;
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
@@ -90,6 +93,7 @@ pub(super) fn upload_part_service(
     let svc = service_fn(upload_part_handler);
     let hedge = Hedge::new(svc, UploadPolicy, 100, 95.0, Duration::new(1,0));
     let svc = ServiceBuilder::new()
+        // FIXME - This setting will need to be globalized.
         .buffer(60)
         .concurrency_limit(ctx.handle.num_workers())
         .service(hedge);
@@ -99,7 +103,6 @@ pub(super) fn upload_part_service(
             .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
         *e
     })
-
 }
 
 /// Spawn tasks to read the body and upload the remaining parts of object
@@ -109,7 +112,7 @@ pub(super) fn upload_part_service(
 /// * handle - the handle for this upload
 /// * stream - the body input stream
 /// * part_size - the part_size for each part
-pub(super) async fn distribute_work(
+pub(super) fn distribute_work(
     handle: &mut UploadHandle,
     stream: InputStream,
     part_size: u64,
@@ -147,23 +150,18 @@ pub(super) async fn read_body(
         + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
 ) -> Result<(), error::Error> {
-    loop {
-        let part_data = part_reader.next_part().await?;
-        let part_data = match part_data {
-            None => break,
-            Some(part_data) => part_data,
-        };
+    while let Some(part_data) = part_reader.next_part().await? {
         let part_number = part_data.part_number;
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
         };
         let svc = svc.clone();
-        let task = async move { 
-            svc.oneshot(req).await
-        }.instrument(tracing::trace_span!("upload_part", worker = part_number));
-        let mut tasks = upload_tasks.lock().await;
-        tasks.spawn(task);
+        let task = svc.oneshot(req).instrument(tracing::trace_span!(
+            "upload_part",
+            part_number = part_number
+        ));
+        upload_tasks.lock().await.spawn(task);
     }
     Ok(())
 }

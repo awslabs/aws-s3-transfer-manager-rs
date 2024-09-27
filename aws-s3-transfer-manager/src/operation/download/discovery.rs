@@ -9,15 +9,13 @@ use std::{cmp, mem};
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
-
-use crate::error;
-use bytes::Buf;
+use aws_smithy_types::byte_stream::ByteStream;
 
 use super::header::{self, ByteRange};
 use super::object_meta::ObjectMetadata;
 use super::DownloadContext;
 use super::DownloadInput;
+use crate::error;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -39,7 +37,7 @@ pub(super) struct ObjectDiscovery {
     pub(super) meta: ObjectMetadata,
 
     /// the first chunk of data if fetched during discovery
-    pub(super) initial_chunk: Option<AggregatedBytes>,
+    pub(super) initial_chunk: Option<ByteStream>,
 }
 
 impl ObjectDiscoveryStrategy {
@@ -72,7 +70,8 @@ pub(super) async fn discover_obj(
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
-    match strategy {
+    tracing::trace!("discovering object with strategy {:?}", strategy);
+    let discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject(byte_range) => {
             discover_obj_with_head(ctx, input, byte_range).await
         }
@@ -91,7 +90,20 @@ pub(super) async fn discover_obj(
 
             discover_obj_with_get(ctx, r, range).await
         }
-    }
+    }?;
+
+    debug_assert!(
+        discovery.initial_chunk.is_none() || *discovery.remaining.start() > 0,
+        "initial chunk set but remaining range starts at zero"
+    );
+
+    tracing::trace!(
+        "discovered object, remaining: {:?}; initial chunk set: {}",
+        discovery.remaining,
+        discovery.initial_chunk.is_some()
+    );
+
+    Ok(discovery)
 }
 
 async fn discover_obj_with_head(
@@ -142,19 +154,23 @@ async fn discover_obj_with_get(
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
 
-    let data = body.collect().await.map_err(error::discovery_failed)?;
-
     let meta: ObjectMetadata = resp.into();
+    let content_len = meta.content_length();
 
     let remaining = match range {
-        Some(range) => (*range.start() + data.remaining() as u64)..=*range.end(),
-        None => (data.remaining() as u64)..=meta.total_size() - 1,
+        Some(range) => (*range.start() + content_len)..=*range.end(),
+        None => content_len..=meta.total_size() - 1,
+    };
+
+    let initial_chunk = match remaining.is_empty() {
+        true => None,
+        false => Some(body),
     };
 
     Ok(ObjectDiscovery {
         remaining,
         meta,
-        initial_chunk: Some(data),
+        initial_chunk,
     })
 }
 
@@ -162,6 +178,7 @@ async fn discover_obj_with_get(
 mod tests {
     use std::sync::Arc;
 
+    use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
@@ -169,7 +186,6 @@ mod tests {
     use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
     use crate::types::PartSize;
-    use crate::MEBIBYTE;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
@@ -226,7 +242,7 @@ mod tests {
             .then_output(|| HeadObjectOutput::builder().content_length(500).build());
         let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, 5 * MEBIBYTE));
+        let ctx = DownloadContext::new(test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -286,10 +302,14 @@ mod tests {
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         assert_eq!(200, discovery.remaining.clone().count());
         assert_eq!(500..=699, discovery.remaining);
-        assert_eq!(
-            500,
-            discovery.initial_chunk.expect("initial chunk").remaining()
-        );
+
+        let initial_chunk = discovery
+            .initial_chunk
+            .expect("initial chunk")
+            .collect()
+            .await
+            .expect("valid body");
+        assert_eq!(500, initial_chunk.remaining());
     }
 
     #[tokio::test]
@@ -319,9 +339,13 @@ mod tests {
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         assert_eq!(200, discovery.remaining.clone().count());
         assert_eq!(300..=499, discovery.remaining);
-        assert_eq!(
-            100,
-            discovery.initial_chunk.expect("initial chunk").remaining()
-        );
+
+        let initial_chunk = discovery
+            .initial_chunk
+            .expect("initial chunk")
+            .collect()
+            .await
+            .expect("valid body");
+        assert_eq!(100, initial_chunk.remaining());
     }
 }

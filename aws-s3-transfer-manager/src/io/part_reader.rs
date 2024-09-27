@@ -12,7 +12,7 @@ use crate::io::error::Error;
 use crate::io::path_body::PathBody;
 use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
-use crate::MEBIBYTE;
+use crate::metrics::unit::ByteUnit;
 
 /// Builder for creating a `ReadPart` implementation.
 #[derive(Debug)]
@@ -25,7 +25,7 @@ impl Builder {
     pub(crate) fn new() -> Self {
         Self {
             stream: None,
-            part_size: 5 * MEBIBYTE as usize,
+            part_size: 5 * ByteUnit::Mebibyte.as_bytes_u64() as usize,
         }
     }
 
