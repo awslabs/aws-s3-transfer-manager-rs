@@ -11,3 +11,6 @@
 mod future;
 mod layer;
 mod service;
+
+pub(crate) use self::future::ResponseFuture;
+pub(crate) use self::layer::ConcurrencyLimitLayer;
