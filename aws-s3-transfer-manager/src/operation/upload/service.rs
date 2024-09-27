@@ -6,6 +6,7 @@ use crate::{
         part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
         InputStream,
     },
+    middleware::limit::concurrency::ConcurrencyLimitLayer,
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
@@ -67,10 +68,8 @@ pub(super) fn upload_part_service(
        + Clone
        + Send {
     let svc = service_fn(upload_part_handler);
-    ServiceBuilder::new()
-        // FIXME - This setting will need to be globalized.
-        .concurrency_limit(ctx.handle.num_workers())
-        .service(svc)
+    let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
+    ServiceBuilder::new().layer(concurrency_limit).service(svc)
 }
 
 /// Spawn tasks to read the body and upload the remaining parts of object

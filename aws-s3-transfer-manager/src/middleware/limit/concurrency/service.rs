@@ -12,10 +12,6 @@ use tower::Service;
 use super::future::ResponseFuture;
 use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit, Scheduler};
 
-// TODO - thread scheduler through client and replace existing limit middleware(s)
-// TODO - benchmark for regressions
-// TODO - benchmark middleware compared to simple semaphore/tower concurrency limit
-
 /// Enforces a limit on the concurrent requests an underlying service receives
 /// using the given [`Scheduler`].
 #[derive(Debug)]

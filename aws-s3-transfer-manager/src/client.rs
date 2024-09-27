@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::runtime::scheduler::Scheduler;
 use crate::Config;
 use crate::{
     metrics::unit::ByteUnit,
@@ -21,6 +22,7 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
+    pub(crate) scheduler: Scheduler,
 }
 
 impl Handle {
@@ -62,8 +64,14 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        let handle = Arc::new(Handle { config });
+        // TODO - scheduler should _probably_ take the setting directly
+        let permits = match config.concurrency() {
+            ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
+            ConcurrencySetting::Explicit(explicit) => *explicit,
+        };
+        let scheduler = Scheduler::new(permits);
 
+        let handle = Arc::new(Handle { config, scheduler });
         Client { handle }
     }
 
