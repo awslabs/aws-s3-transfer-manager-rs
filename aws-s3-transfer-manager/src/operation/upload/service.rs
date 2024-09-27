@@ -1,4 +1,3 @@
-use super::UploadHandle;
 use crate::{
     error,
     io::{
@@ -10,18 +9,16 @@ use crate::{
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tokio::{sync::Mutex, task};
-use tokio::{task, time::Instant};
 use tower::{
     hedge::{Hedge, Policy},
     service_fn, Service, ServiceBuilder, ServiceExt,
 };
-use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
-use tracing::Instrument;
 use tracing::Instrument;
 
 use super::UploadHandle;
+
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
