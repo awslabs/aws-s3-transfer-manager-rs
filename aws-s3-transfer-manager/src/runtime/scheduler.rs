@@ -5,6 +5,9 @@
 
 use crate::error;
 
+use futures_util::TryFutureExt;
+use pin_project_lite::pin_project;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -28,15 +31,21 @@ impl Scheduler {
     // for scheduler to make choices on what work gets prioritized
 
     /// Acquire a permit to perform some unit of work
-    pub(crate) async fn acquire_permit(&self) -> Result<OwnedWorkPermit, error::Error> {
-        let inner = self
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(error::from_kind(error::ErrorKind::RuntimeError))?;
+    pub(crate) fn acquire_permit(&self) -> AcquirePermitFuture {
+        match self.try_acquire_permit() {
+            Ok(Some(permit)) => AcquirePermitFuture::ready(Ok(permit)),
+            Ok(None) => {
+                let inner = self
+                    .sem
+                    .clone()
+                    .acquire_owned()
+                    .map_ok(OwnedWorkPermit::from)
+                    .map_err(error::from_kind(error::ErrorKind::RuntimeError));
 
-        Ok(inner.into())
+                AcquirePermitFuture::new(inner)
+            }
+            Err(err) => AcquirePermitFuture::ready(Err(err)),
+        }
     }
 
     /// Try to acquire a permit for some unit of work.
@@ -67,6 +76,46 @@ pub(crate) struct OwnedWorkPermit {
 impl From<OwnedSemaphorePermit> for OwnedWorkPermit {
     fn from(value: OwnedSemaphorePermit) -> Self {
         Self { _inner: value }
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    pub(crate) struct AcquirePermitFuture {
+        #[pin]
+        inner: aws_smithy_async::future::now_or_later::NowOrLater<
+            Result<OwnedWorkPermit, error::Error>,
+            aws_smithy_async::future::BoxFuture<'static, OwnedWorkPermit, error::Error>
+        >,
+    }
+}
+
+impl AcquirePermitFuture {
+    fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = Result<OwnedWorkPermit, error::Error>> + Send + 'static,
+    {
+        Self {
+            inner: aws_smithy_async::future::now_or_later::NowOrLater::new(Box::pin(future)),
+        }
+    }
+
+    fn ready(result: Result<OwnedWorkPermit, error::Error>) -> Self {
+        Self {
+            inner: aws_smithy_async::future::now_or_later::NowOrLater::ready(result),
+        }
+    }
+}
+
+impl Future for AcquirePermitFuture {
+    type Output = Result<OwnedWorkPermit, error::Error>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        this.inner.poll(cx)
     }
 }
 
