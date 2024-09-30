@@ -11,11 +11,11 @@ use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 
-use super::header::{self, ByteRange};
 use super::object_meta::ObjectMetadata;
 use super::DownloadContext;
 use super::DownloadInput;
 use crate::error;
+use crate::http::header::{self, ByteRange};
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -178,11 +178,11 @@ async fn discover_obj_with_get(
 mod tests {
     use std::sync::Arc;
 
+    use crate::http::header::ByteRange;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
-    use crate::operation::download::header::ByteRange;
     use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
     use crate::types::PartSize;

@@ -19,7 +19,6 @@ mod discovery;
 mod handle;
 pub use handle::DownloadHandle;
 
-mod header;
 mod object_meta;
 mod service;
 
