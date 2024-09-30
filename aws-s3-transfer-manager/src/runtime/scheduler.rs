@@ -23,6 +23,7 @@ impl Scheduler {
     /// Create a new scheduler with the initial number of work permits.
     pub(crate) fn new(permits: usize) -> Self {
         Self {
+            // NOTE: tokio semahpore is fair, permits are given out in the order requested
             sem: Arc::new(Semaphore::new(permits)),
         }
     }

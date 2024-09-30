@@ -63,7 +63,7 @@
 
 
 /// Default in-flight concurrency
-pub(crate) const DEFAULT_CONCURRENCY: usize = 96;
+pub(crate) const DEFAULT_CONCURRENCY: usize = 128;
 
 /// Error types emitted by `aws-s3-transfer-manager`
 pub mod error;
