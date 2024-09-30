@@ -23,6 +23,7 @@ mod object_meta;
 mod service;
 
 use crate::error;
+use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
 use body::Body;
 use discovery::discover_obj;
@@ -51,8 +52,8 @@ impl Download {
         let concurrency = handle.num_workers();
         let ctx = DownloadContext::new(handle);
 
-        // FIXME - discovery network requests should go through hedging, as well as scheduler to
-        // prevent hurting throughput by not coordinating the work
+        // acquire a permit for discovery
+        let permit = ctx.handle.scheduler.acquire_permit().await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &input).await?;
@@ -71,7 +72,7 @@ impl Download {
 
         // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
         // that we can begin concurrently downloading any reamining chunks/parts ASAP
-        let start_seq = handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx);
+        let start_seq = handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx, permit);
 
         if !discovery.remaining.is_empty() {
             let remaining = discovery.remaining.clone();
@@ -93,6 +94,7 @@ fn handle_discovery_chunk(
     handle: &mut DownloadHandle,
     initial_chunk: Option<ByteStream>,
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
+    permit: OwnedWorkPermit,
 ) -> u64 {
     let mut start_seq = 0;
 
@@ -110,6 +112,7 @@ fn handle_discovery_chunk(
                 })
                 .map_err(error::discovery_failed);
 
+            drop(permit);
             if let Err(send_err) = completed.send(chunk).await {
                 tracing::error!(
                     "channel closed, initial chunk from discovery not sent: {}",
