@@ -6,7 +6,8 @@
 /* Automatically managed default lints */
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 /* End of automatically managed default lints */
-#![warn(missing_debug_implementations,
+#![warn(
+    missing_debug_implementations,
     missing_docs,
     rustdoc::missing_crate_level_docs,
     unreachable_pub,
@@ -60,7 +61,6 @@
 //! * [`upload`](crate::Client::upload) - upload a single object
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
-
 
 /// Default in-flight concurrency
 pub(crate) const DEFAULT_CONCURRENCY: usize = 128;
