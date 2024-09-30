@@ -64,7 +64,6 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        // TODO - scheduler should _probably_ take the setting directly
         let permits = match config.concurrency() {
             ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
             ConcurrencySetting::Explicit(explicit) => *explicit,
