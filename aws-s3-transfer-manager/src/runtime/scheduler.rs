@@ -53,7 +53,7 @@ impl Scheduler {
     ///
     /// If there are no permits left, this returns `Ok(None)`. Otherwise, this returns
     /// `Ok(Some(OwnedWorkPermit))`
-    pub(crate) fn try_acquire_permit(&self) -> Result<Option<OwnedWorkPermit>, error::Error> {
+    fn try_acquire_permit(&self) -> Result<Option<OwnedWorkPermit>, error::Error> {
         match self.sem.clone().try_acquire_owned() {
             Ok(permit) => Ok(Some(permit.into())),
             Err(err) => match err {
