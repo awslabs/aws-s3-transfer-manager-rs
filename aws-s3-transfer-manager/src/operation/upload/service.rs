@@ -24,9 +24,9 @@ pub(super) struct UploadPartRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UploadPolicy;
+pub(crate) struct UploadPartPolicy;
 
-impl Policy<UploadPartRequest> for UploadPolicy {
+impl Policy<UploadPartRequest> for UploadPartPolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
         Some(req.clone())
     }
@@ -82,7 +82,7 @@ pub(super) fn upload_part_service(
        + Send {
     let svc = service_fn(upload_part_handler);
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
-    let hedge_builder = HedgeBuilder::new(UploadPolicy);
+    let hedge_builder = HedgeBuilder::new(UploadPartPolicy);
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
