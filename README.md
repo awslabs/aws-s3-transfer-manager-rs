@@ -6,7 +6,7 @@ A high performance Amazon S3 client for Rust.
 
 It is meant for early access and feedback purposes at this time.
 
-See the AWS SDK and Tools [maintenance policy](https://docs.aws.amazon.com/sdkref/latest/guide/maint-policy.html) 
+See the AWS SDK and Tools [maintenance policy](https://docs.aws.amazon.com/sdkref/latest/guide/maint-policy.html#version-life-cycle)
 descriptions for more information.
 
 
