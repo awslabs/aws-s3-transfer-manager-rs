@@ -3,6 +3,4 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-pub(crate) mod hedge;
-pub(crate) mod limit;
-pub(crate) mod retry;
+pub(crate) mod concurrency;

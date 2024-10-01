@@ -2,6 +2,15 @@
 
 A high performance Amazon S3 client for Rust.
 
+## :warning: Developer Preview
+
+This library is currently in developer preview and is **NOT** recommended for production environments.
+
+It is meant for early access and feedback purposes at this time. We'd love to hear from you on use cases, feature prioritization, and API feedback.
+
+See the AWS SDK and Tools [maintenance policy](https://docs.aws.amazon.com/sdkref/latest/guide/maint-policy.html#version-life-cycle)
+descriptions for more information.
+
 
 ## Development
 

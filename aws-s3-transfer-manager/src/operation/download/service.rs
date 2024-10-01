@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
+use crate::http::header;
+use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
 use crate::middleware::retry;
-use crate::operation::download::header;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
@@ -59,9 +60,10 @@ pub(super) fn chunk_service(
        + Clone
        + Send {
     let svc = service_fn(download_chunk_handler);
+    let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
 
     ServiceBuilder::new()
-        .concurrency_limit(ctx.handle.num_workers())
+        .layer(concurrency_limit)
         .retry(retry::RetryPolicy::default())
         .service(svc)
 }
