@@ -11,10 +11,7 @@ use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use std::sync::Arc;
 use tokio::{sync::Mutex, task};
-use tower::{
-    hedge::Policy,
-    service_fn, Service, ServiceBuilder, ServiceExt,
-};
+use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
 use super::UploadHandle;
@@ -83,7 +80,6 @@ pub(super) fn upload_part_service(
 ) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
        + Clone
        + Send {
-
     let svc = service_fn(upload_part_handler);
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
     let hedge_builder = HedgeBuilder::new(UploadPolicy);

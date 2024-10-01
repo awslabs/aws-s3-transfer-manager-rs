@@ -10,6 +10,14 @@ use tower::{
     BoxError, Layer, Service,
 };
 
+/*
+* During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
+* as some requests can experience high time to first byte. If a slow part is hit near the end of the request,
+* the application may spend the last few seconds waiting for those final parts to complete, which can reduce overall
+* throughput. This layer is used to retry the slowest 5% of requests to improve performance.
+* Based on our experiments, this makes a significant difference for multipart upload use-cases and
+* does not have a noticeable impact for the Download.
+*/
 pub(crate) struct HedgeBuilder<P> {
     policy: P,
     latency_percentile: f32,
@@ -20,15 +28,6 @@ pub(crate) struct HedgeBuilder<P> {
 impl<P> HedgeBuilder<P> {
     pub(crate) fn new(policy: P) -> Self {
         Self {
-            /*
-             * During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
-             * as some requests can experience high time to first byte. If a slow part is hit near the end of the request,
-             * the application may spend the last few seconds waiting for those final parts to complete, which can reduce overall
-             * throughput. This layer is used to retry the slowest 5% of requests to improve performance.
-             * Based on our experiments, this makes a significant difference for multipart upload use-cases and
-             * does not have a noticeable impact for the Download.
-             * not a noticeable impact for Download.
-             */
             policy,
             latency_percentile: 95.0,
             min_data_points: 20,
