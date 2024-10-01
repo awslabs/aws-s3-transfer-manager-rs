@@ -9,11 +9,10 @@ use crate::{
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
-use std::{sync::Arc, time::Duration};
-use tokio::time::Instant;
+use std::sync::Arc;
 use tokio::{sync::Mutex, task};
 use tower::{
-    hedge::{Hedge, Policy},
+    hedge::Policy,
     service_fn, Service, ServiceBuilder, ServiceExt,
 };
 use tracing::Instrument;
@@ -31,14 +30,11 @@ pub(super) struct UploadPartRequest {
 pub(crate) struct UploadPolicy;
 
 impl Policy<UploadPartRequest> for UploadPolicy {
-    /// Attempts to clone the request. If cloning is allowed, it returns a new instance.
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
         Some(req.clone())
     }
 
-    /// Determines if the request can be retried based on custom logic.
     fn can_retry(&self, _req: &UploadPartRequest) -> bool {
-        // Example policy: Only allow retry if part_data is not empty
         true
     }
 }
@@ -51,7 +47,6 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
 
     // TODO(aws-sdk-rust#1159): disable payload signing
     // TODO(aws-sdk-rust#1159): set checksum fields if applicable
-    let instant = Instant::now();
     let resp = ctx
         .client()
         .upload_part()
@@ -68,8 +63,6 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .send()
         .await?;
-    let elasped = instant.elapsed();
-    //eprint!("{0},", elasped.as_nanos());
 
     tracing::trace!("completed upload of part number {}", part_number);
     let completed = CompletedPart::builder()
@@ -90,8 +83,8 @@ pub(super) fn upload_part_service(
 ) -> impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
        + Clone
        + Send {
-    let svc = service_fn(upload_part_handler);
 
+    let svc = service_fn(upload_part_handler);
     let hedge_builder = HedgeBuilder::new(UploadPolicy);
 
     let svc = ServiceBuilder::new()
