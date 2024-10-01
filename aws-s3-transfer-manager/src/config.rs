@@ -37,13 +37,8 @@ impl Config {
         &self.target_part_size
     }
 
-    // TODO(design) - should we separate upload/download part size and concurrency settings?
-    //
-    // FIXME - this setting is wrong, we don't use it right. This should feed into scheduling and
-    // whether an individual operation can execute an SDK/HTTP request. We should be free to spin
-    // however many tasks we want per transfer operation OR have separate config for task
-    // concurrency.
-    /// Returns the concurrency setting to use for individual transfer operations.
+    /// Returns the concurrency setting to use for transfer operations.
+    /// This is the maximum number of in-flight requests allowed across _all_ operations.
     pub fn concurrency(&self) -> &ConcurrencySetting {
         &self.concurrency
     }
@@ -120,7 +115,7 @@ impl Builder {
 
     /// Set the concurrency level this component is allowed to use.
     ///
-    /// This sets the maximum number of concurrent in-flight requests.
+    /// This sets the maximum number of concurrent in-flight requests across _all_ operations.
     /// Default is [ConcurrencySetting::Auto].
     pub fn concurrency(mut self, concurrency: ConcurrencySetting) -> Self {
         self.concurrency = concurrency;
