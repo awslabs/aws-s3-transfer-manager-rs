@@ -82,7 +82,7 @@ pub(super) fn upload_part_service(
        + Send {
     let svc = service_fn(upload_part_handler);
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
-    let hedge= HedgeBuilder::new(UploadPartPolicy);
+    let hedge = HedgeBuilder::new(UploadPartPolicy);
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
