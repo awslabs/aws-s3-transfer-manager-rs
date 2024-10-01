@@ -112,6 +112,8 @@ fn handle_discovery_chunk(
                 })
                 .map_err(error::discovery_failed);
 
+            // release the permit _before_ sending the chunk to sequencing so that other requests
+            // can make progress
             drop(permit);
             if let Err(send_err) = completed.send(chunk).await {
                 tracing::error!(
