@@ -33,7 +33,7 @@ async fn download_chunk_handler(
     let request = request.request;
 
     let op = request.input.into_sdk_operation(ctx.client());
-
+    println!("start={request.seq}");
     let mut resp = op
         .send()
         .await
@@ -147,7 +147,7 @@ pub(super) fn distribute_work(
             }
         }
         .instrument(tracing::debug_span!("download-chunk", seq = seq));
-
+        println!("spawn={seq}");
         handle.tasks.spawn(task);
 
         seq += 1;
