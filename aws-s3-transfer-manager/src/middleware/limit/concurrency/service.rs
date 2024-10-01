@@ -27,7 +27,7 @@ impl<T> ConcurrencyLimit<T> {
         ConcurrencyLimit {
             inner,
             scheduler,
-            state: State::pending(None),
+            state: State::Idle,
         }
     }
 }
@@ -36,14 +36,10 @@ impl<T> ConcurrencyLimit<T> {
 enum State {
     /// Permit acquired and ready
     Ready(OwnedWorkPermit),
-    /// Waiting on a permit (or haven't attempted to acquire one)
-    Pending(Option<AcquirePermitFuture>),
-}
-
-impl State {
-    fn pending(future: Option<AcquirePermitFuture>) -> Self {
-        Self::Pending(future)
-    }
+    /// Waiting on a permit
+    PendingAcquire(AcquirePermitFuture),
+    /// No permit acquired or pending
+    Idle,
 }
 
 impl<S, Request> Service<Request> for ConcurrencyLimit<S>
@@ -61,16 +57,16 @@ where
         loop {
             match &mut self.state {
                 State::Ready(_) => break,
-                State::Pending(Some(permit_fut)) => {
+                State::PendingAcquire(permit_fut) => {
                     let permit_fut = pin!(permit_fut);
                     let permit =
                         ready!(permit_fut.poll(cx)).expect("permit acquisition never fails");
                     self.state = State::Ready(permit);
                 }
-                State::Pending(None) => {
+                State::Idle => {
                     // we loop to ensure we poll this at least once to ensure we are woken up when ready
                     let permit_fut = self.scheduler.acquire_permit();
-                    self.state = State::pending(Some(permit_fut));
+                    self.state = State::PendingAcquire(permit_fut);
                 }
             }
         }
@@ -80,7 +76,7 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         // extract our permit and reset the state
-        let permit = match mem::replace(&mut self.state, State::pending(None)) {
+        let permit = match mem::replace(&mut self.state, State::Idle) {
             State::Ready(permit) => permit,
             _ => panic!("poll_ready must be called first!"),
         };
@@ -96,7 +92,7 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
         Self {
             inner: self.inner.clone(),
             scheduler: self.scheduler.clone(),
-            state: State::pending(None),
+            state: State::Idle,
         }
     }
 }
