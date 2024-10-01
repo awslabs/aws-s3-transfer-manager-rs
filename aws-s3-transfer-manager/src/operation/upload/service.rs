@@ -4,6 +4,7 @@ use crate::{
         part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
         InputStream,
     },
+    middleware::hedge::HedgeBuilder,
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
@@ -90,12 +91,16 @@ pub(super) fn upload_part_service(
        + Clone
        + Send {
     let svc = service_fn(upload_part_handler);
-    let hedge = Hedge::new(svc, UploadPolicy, 100, 95.0, Duration::new(1, 0));
+
+    let hedge_builder = HedgeBuilder::new(UploadPolicy);
+
     let svc = ServiceBuilder::new()
         // FIXME - This setting will need to be globalized.
-        .buffer(60)
+        .buffer(ctx.handle.num_workers())
+        .layer(hedge_builder.into_layer())
+        // FIXME - This setting will need to be globalized.
         .concurrency_limit(ctx.handle.num_workers())
-        .service(hedge);
+        .service(svc);
     svc.map_err(|err| {
         let e = err
             .downcast::<error::Error>()
