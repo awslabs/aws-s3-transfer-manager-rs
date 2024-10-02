@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     error,
     io::{
@@ -9,7 +11,6 @@ use crate::{
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
-use std::sync::Arc;
 use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
