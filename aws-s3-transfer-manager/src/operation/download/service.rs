@@ -39,6 +39,7 @@ async fn download_chunk_handler(
     let end_inclusive = cmp::min(start + part_size - 1, end);
     let request = next_chunk(start, end_inclusive, part_number, request.input.clone());
 
+    //println!("{0}-{1}={2}", start, end_inclusive, part_number);
     let op = request.input.into_sdk_operation(ctx.client());
     let mut resp = op
         .send()
@@ -132,6 +133,7 @@ pub(super) fn distribute_work(
         let end_inclusive = cmp::min(pos + part_size - 1, end);
 
         let chunk_req = next_chunk(start, end_inclusive, seq, input.clone());
+        //println!("{0}-{1}={2}", start, end_inclusive, seq);
         tracing::trace!(
             "distributing chunk(size={}): {:?}",
             chunk_req.size(),
@@ -156,7 +158,6 @@ pub(super) fn distribute_work(
             }
         }
         .instrument(tracing::debug_span!("download-chunk", seq = seq));
-        println!("spawn={seq}");
         handle.tasks.spawn(task);
 
         seq += 1;
