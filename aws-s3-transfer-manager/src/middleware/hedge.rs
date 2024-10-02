@@ -18,41 +18,48 @@ use tower::{
 * Based on our experiments, this makes a significant difference for multipart upload use-cases and
 * does not have a noticeable impact for the Download.
 */
-pub(crate) struct HedgeBuilder<P> {
+
+/// S3 recommends retrying the slowest 5% of the requests.
+const LATENCY_PERCENTILE: f32 = 95.0;
+/// This value was chosen randomly and empirically tested.
+const MIN_DATA_POINTS: u64 = 20;
+/// The Hedge layer maintains two rotating histograms, i.e., ReadHistogram and WriteHistogram. They
+/// are switched every period. This value was chosen randomly while taking into consideration that most 8-16 MB part
+/// requests take on average 0.2 seconds, and we should retry it if it takes more than a second.
+const PERIOD: Duration = Duration::new(2,0);
+
+pub(crate) struct Builder<P> {
     policy: P,
     latency_percentile: f32,
     min_data_points: u64,
     period: Duration,
 }
 
-impl<P> HedgeBuilder<P> {
-    pub(crate) fn new(policy: P) -> Self {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DefaultPolicy;
+
+impl<T: Clone> Policy<T> for DefaultPolicy {
+    fn clone_request(&self, req: &T) -> Option<T> {
+        Some(req.clone())
+    }
+
+    fn can_retry(&self, _req: &T) -> bool {
+        true
+    }
+}
+
+impl Default for Builder<DefaultPolicy> {
+    fn default() -> Self {
         Self {
-            policy,
-            latency_percentile: 95.0,
-            min_data_points: 20,
-            period: Duration::new(2, 0),
+            policy: DefaultPolicy,
+            latency_percentile: LATENCY_PERCENTILE,
+            min_data_points: MIN_DATA_POINTS,
+            period: PERIOD,
         }
     }
+}
 
-    #[allow(dead_code)]
-    pub(crate) fn with_percentile(mut self, percentile: f32) -> Self {
-        self.latency_percentile = percentile;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn with_min_data_points(mut self, min_data_points: u64) -> Self {
-        self.min_data_points = min_data_points;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn with_duration(mut self, duration: Duration) -> Self {
-        self.period = duration;
-        self
-    }
-
+impl<P> Builder<P> {
     /// Converts the `Hedge` into a `Layer` that can be used in a service stack.
     pub(crate) fn into_layer<Request, S>(self) -> impl Layer<S, Service = Hedge<S, P>> + Clone
     where

@@ -4,14 +4,14 @@ use crate::{
         part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
         InputStream,
     },
-    middleware::{hedge::HedgeBuilder, limit::concurrency::ConcurrencyLimitLayer},
+    middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use std::sync::Arc;
 use tokio::{sync::Mutex, task};
-use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
+use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
 use super::UploadHandle;
@@ -21,19 +21,6 @@ use super::UploadHandle;
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct UploadPartPolicy;
-
-impl Policy<UploadPartRequest> for UploadPartPolicy {
-    fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
-        Some(req.clone())
-    }
-
-    fn can_retry(&self, _req: &UploadPartRequest) -> bool {
-        true
-    }
 }
 
 /// handler (service fn) for a single part
@@ -82,13 +69,12 @@ pub(super) fn upload_part_service(
        + Send {
     let svc = service_fn(upload_part_handler);
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
-    let hedge = HedgeBuilder::new(UploadPartPolicy);
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
         // FIXME - This setting will need to be globalized.
         .buffer(ctx.handle.num_workers())
-        .layer(hedge.into_layer())
+        .layer(hedge::Builder::default().into_layer())
         .service(svc);
     svc.map_err(|err| {
         let e = err
