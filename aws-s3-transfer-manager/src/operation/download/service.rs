@@ -23,6 +23,8 @@ use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
     pub(super) request: ChunkRequest,
+    pub(super) range: RangeInclusive<u64>,
+    pub(super) input: DownloadInputBuilder,
 }
 
 /// handler (service fn) for a single chunk
@@ -30,10 +32,14 @@ async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkResponse, error::Error> {
     let ctx = request.ctx;
-    let request = request.request;
+    let part_number = ctx.next_part() as u64;
+    let part_size = ctx.handle.download_part_size_bytes();
+    let start = request.range.start().clone() + ((part_number-1) * part_size);
+    let end = *request.range.end();
+    let end_inclusive = cmp::min(start + part_size - 1, end);
+    let request = next_chunk(start, end_inclusive, part_number, request.input.clone());
 
     let op = request.input.into_sdk_operation(ctx.client());
-    println!("start={request.seq}");
     let mut resp = op
         .send()
         .await
@@ -112,6 +118,7 @@ pub(super) fn distribute_work(
 ) {
     let end = *remaining.end();
     let mut pos = *remaining.start();
+    let range = remaining.clone();
     let mut remaining = end - pos + 1;
     let mut seq = start_seq;
 
@@ -135,6 +142,8 @@ pub(super) fn distribute_work(
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
             request: chunk_req,
+            range: range.clone(),
+            input: input.clone(),
         };
 
         let svc = svc.clone();

@@ -28,7 +28,8 @@ use aws_smithy_types::byte_stream::ByteStream;
 use body::Body;
 use discovery::discover_obj;
 use service::{distribute_work, ChunkResponse};
-use std::sync::Arc;
+use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -129,13 +130,18 @@ fn handle_discovery_chunk(
 
 /// Download operation specific state
 #[derive(Debug)]
-pub(crate) struct DownloadState {}
+pub(crate) struct DownloadState {
+    part_number: u32,
+}
 
-type DownloadContext = TransferContext<DownloadState>;
+type DownloadContext = TransferContext<Mutex<DownloadState>>;
 
 impl DownloadContext {
     fn new(handle: Arc<crate::client::Handle>) -> Self {
-        let state = Arc::new(DownloadState {});
+        let state = Arc::new(
+            Mutex::new(DownloadState {
+                part_number: 1,
+            }));
         TransferContext { handle, state }
     }
 
@@ -143,4 +149,14 @@ impl DownloadContext {
     fn target_part_size_bytes(&self) -> u64 {
         self.handle.download_part_size_bytes()
     }
+
+    fn next_part(&self) -> u32 {
+        let state = self.state.clone();
+        let mut state = state.lock().unwrap();
+        let part_number = state.part_number;
+        state.part_number += 1;
+        part_number
+    }
+
 }
+
