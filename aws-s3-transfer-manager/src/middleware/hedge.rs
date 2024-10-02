@@ -10,15 +10,6 @@ use tower::{
     BoxError, Layer, Service,
 };
 
-/*
-* During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
-* as some requests can experience high time to first byte. If a slow part is hit near the end of the request,
-* the application may spend the last few seconds waiting for those final parts to complete, which can reduce overall
-* throughput. This layer is used to retry the slowest 5% of requests to improve performance.
-* Based on our experiments, this makes a significant difference for multipart upload use-cases and
-* does not have a noticeable impact for the Download.
-*/
-
 /// S3 recommends retrying the slowest 5% of the requests.
 const LATENCY_PERCENTILE: f32 = 95.0;
 /// This value was chosen randomly and empirically tested.
@@ -28,6 +19,14 @@ const MIN_DATA_POINTS: u64 = 20;
 /// requests take on average 0.2 seconds, and we should retry it if it takes more than a second.
 const PERIOD: Duration = Duration::new(2, 0);
 
+/*
+* During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
+* as some requests can experience high time to first byte. If a slow part is hit near the end of the request,
+* the application may spend the last few seconds waiting for those final parts to complete, which can reduce overall
+* throughput. This layer is used to retry the slowest 5% of requests to improve performance.
+* Based on our experiments, this makes a significant difference for multipart upload use-cases and
+* does not have a noticeable impact for the Download.
+*/
 pub(crate) struct Builder<P> {
     policy: P,
     latency_percentile: f32,
