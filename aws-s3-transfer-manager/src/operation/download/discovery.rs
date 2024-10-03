@@ -92,11 +92,6 @@ pub(super) async fn discover_obj(
         }
     }?;
 
-    debug_assert!(
-        discovery.initial_chunk.is_none() || *discovery.remaining.start() > 0,
-        "initial chunk set but remaining range starts at zero"
-    );
-
     tracing::trace!(
         "discovered object, remaining: {:?}; initial chunk set: {}",
         discovery.remaining,
@@ -162,7 +157,7 @@ async fn discover_obj_with_get(
         None => content_len..=meta.total_size() - 1,
     };
 
-    let initial_chunk = match remaining.is_empty() {
+    let initial_chunk = match content_len == 0 {
         true => None,
         false => Some(body),
     };
@@ -310,6 +305,41 @@ mod tests {
             .await
             .expect("valid body");
         assert_eq!(500, initial_chunk.remaining());
+    }
+
+    #[tokio::test]
+    async fn test_discover_obj_with_get_single_part() {
+        let target_part_size = 500;
+        let bytes = &[0u8; 400];
+        let get_obj_rule = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=0-499"))
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(400)
+                    .content_range("0-399/400")
+                    .body(ByteStream::from_static(bytes))
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
+
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        assert_eq!(0, discovery.remaining.clone().count());
+
+        let initial_chunk = discovery
+            .initial_chunk
+            .expect("initial chunk")
+            .collect()
+            .await
+            .expect("valid body");
+        assert_eq!(400, initial_chunk.remaining());
     }
 
     #[tokio::test]
