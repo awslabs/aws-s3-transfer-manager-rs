@@ -98,7 +98,7 @@ fn handle_discovery_chunk(
 ) -> u64 {
     let mut start_seq = 0;
     if let Some(stream) = initial_chunk {
-        let part_number = handle.ctx.next_seq();
+        let seq = handle.ctx.next_seq();
         let completed = completed.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
@@ -107,7 +107,7 @@ fn handle_discovery_chunk(
                 .collect()
                 .await
                 .map(|aggregated| ChunkResponse {
-                    seq: part_number,
+                    seq,
                     data: Some(aggregated),
                 })
                 .map_err(error::discovery_failed);

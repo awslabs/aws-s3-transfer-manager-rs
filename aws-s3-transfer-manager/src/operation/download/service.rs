@@ -120,7 +120,7 @@ pub(super) fn distribute_work(
             ctx: handle.ctx.clone(),
             range: range.clone(),
             input: input.clone(),
-            start_seq: start_seq,
+            start_seq,
         };
 
         let svc = svc.clone();
