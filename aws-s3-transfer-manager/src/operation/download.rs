@@ -73,11 +73,11 @@ impl Download {
 
         // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
         // that we can begin concurrently downloading any reamining chunks/parts ASAP
-        let start_seq = handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx, permit);
+        handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx, permit);
 
         if !discovery.remaining.is_empty() {
             let remaining = discovery.remaining.clone();
-            distribute_work(&mut handle, remaining, input, start_seq, comp_tx)
+            distribute_work(&mut handle, remaining, input, comp_tx)
         }
 
         Ok(handle)
@@ -96,10 +96,9 @@ fn handle_discovery_chunk(
     initial_chunk: Option<ByteStream>,
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
-) -> u64 {
-    let mut start_seq = 0;
-
+) {
     if let Some(stream) = initial_chunk {
+        handle.ctx.next_part();
         let completed = completed.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
@@ -108,7 +107,7 @@ fn handle_discovery_chunk(
                 .collect()
                 .await
                 .map(|aggregated| ChunkResponse {
-                    seq: start_seq,
+                    seq: 0,
                     data: Some(aggregated),
                 })
                 .map_err(error::discovery_failed);
@@ -123,9 +122,7 @@ fn handle_discovery_chunk(
                 );
             }
         });
-        start_seq = 1;
     }
-    start_seq
 }
 
 /// Download operation specific state
@@ -138,10 +135,7 @@ type DownloadContext = TransferContext<Mutex<DownloadState>>;
 
 impl DownloadContext {
     fn new(handle: Arc<crate::client::Handle>) -> Self {
-        let state = Arc::new(
-            Mutex::new(DownloadState {
-                part_number: 1,
-            }));
+        let state = Arc::new(Mutex::new(DownloadState { part_number: 0 }));
         TransferContext { handle, state }
     }
 
@@ -150,13 +144,13 @@ impl DownloadContext {
         self.handle.download_part_size_bytes()
     }
 
+    /// Returns the next part to download
     fn next_part(&self) -> u32 {
         let state = self.state.clone();
         let mut state = state.lock().unwrap();
+
         let part_number = state.part_number;
         state.part_number += 1;
         part_number
     }
-
 }
-

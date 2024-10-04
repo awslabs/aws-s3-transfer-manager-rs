@@ -22,7 +22,6 @@ use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 #[derive(Debug, Clone)]
 pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
-    pub(super) request: ChunkRequest,
     pub(super) range: RangeInclusive<u64>,
     pub(super) input: DownloadInputBuilder,
 }
@@ -32,12 +31,13 @@ async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkResponse, error::Error> {
     let ctx = request.ctx;
+
     let part_number = ctx.next_part() as u64;
     let part_size = ctx.handle.download_part_size_bytes();
-    let start = request.range.start().clone() + ((part_number-1) * part_size);
+    let start = request.range.start() + ((part_number - 1) * part_size);
     let end = *request.range.end();
     let end_inclusive = cmp::min(start + part_size - 1, end);
-    let request = next_chunk(start, end_inclusive, part_number, request.input.clone());
+    let request = next_chunk(start, end_inclusive, part_number, request.input);
 
     //println!("{0}-{1}={2}", start, end_inclusive, part_number);
     let op = request.input.into_sdk_operation(ctx.client());
@@ -108,42 +108,24 @@ pub(crate) struct ChunkResponse {
 /// * handle - the handle for this download
 /// * remaining - the remaining content range that needs to be downloaded
 /// * input - the base transfer request input used to build chunk requests from
-/// * start_seq - the starting sequence number to use for chunks
 /// * comp_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
     handle: &mut DownloadHandle,
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
-    start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
 ) {
-    let end = *remaining.end();
-    let mut pos = *remaining.start();
     let range = remaining.clone();
-    let mut remaining = end - pos + 1;
-    let mut seq = start_seq;
-
+    let remaining = *remaining.end() - *remaining.start() + 1;
     let svc = chunk_service(&handle.ctx);
 
     let part_size = handle.ctx.target_part_size_bytes();
+    let num_parts = (remaining + part_size - 1) / part_size;
     let input: DownloadInputBuilder = input.into();
 
-    while remaining > 0 {
-        let start = pos;
-        let end_inclusive = cmp::min(pos + part_size - 1, end);
-
-        let chunk_req = next_chunk(start, end_inclusive, seq, input.clone());
-        //println!("{0}-{1}={2}", start, end_inclusive, seq);
-        tracing::trace!(
-            "distributing chunk(size={}): {:?}",
-            chunk_req.size(),
-            chunk_req
-        );
-        let chunk_size = chunk_req.size();
-
+    for seq in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
-            request: chunk_req,
             range: range.clone(),
             input: input.clone(),
         };
@@ -159,11 +141,6 @@ pub(super) fn distribute_work(
         }
         .instrument(tracing::debug_span!("download-chunk", seq = seq));
         handle.tasks.spawn(task);
-
-        seq += 1;
-        remaining -= chunk_size;
-        tracing::trace!("remaining = {}", remaining);
-        pos += chunk_size;
     }
 
     tracing::trace!("work fully distributed");
