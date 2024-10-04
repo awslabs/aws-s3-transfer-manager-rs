@@ -28,7 +28,6 @@ use aws_smithy_types::byte_stream::ByteStream;
 use body::Body;
 use discovery::discover_obj;
 use service::{distribute_work, ChunkResponse};
-use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;

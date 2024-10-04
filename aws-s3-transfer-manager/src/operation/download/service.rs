@@ -44,7 +44,7 @@ async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkResponse, error::Error> {
     let ctx = request.ctx;
-    let seq = ctx.next_part();
+    let seq = ctx.next_seq();
     let part_size = ctx.handle.download_part_size_bytes();
     let input = next_chunk(seq, request.range, part_size, request.start_seq, request.input);
 
