@@ -24,6 +24,19 @@ pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
     pub(super) range: RangeInclusive<u64>,
     pub(super) input: DownloadInputBuilder,
+    pub(super) start_seq: u64,
+}
+
+fn next_chunk(
+    seq: u64,
+    range: RangeInclusive<u64>,
+    part_size: u64,
+    start_seq: u64,
+    input: DownloadInputBuilder,
+) -> DownloadInputBuilder {
+    let start = range.start() + ((seq - start_seq) * part_size);
+    let end_inclusive = cmp::min(start + part_size - 1, *range.end());
+    input.range(header::Range::bytes_inclusive(start, end_inclusive))
 }
 
 /// handler (service fn) for a single chunk
@@ -31,16 +44,11 @@ async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkResponse, error::Error> {
     let ctx = request.ctx;
-
-    let part_number = ctx.next_part() as u64;
+    let seq = ctx.next_part();
     let part_size = ctx.handle.download_part_size_bytes();
-    let start = request.range.start() + ((part_number - 1) * part_size);
-    let end = *request.range.end();
-    let end_inclusive = cmp::min(start + part_size - 1, end);
-    let request = next_chunk(start, end_inclusive, part_number, request.input);
+    let input = next_chunk(seq, request.range, part_size, request.start_seq, request.input);
 
-    //println!("{0}-{1}={2}", start, end_inclusive, part_number);
-    let op = request.input.into_sdk_operation(ctx.client());
+    let op = input.into_sdk_operation(ctx.client());
     let mut resp = op
         .send()
         .await
@@ -50,12 +58,12 @@ async fn download_chunk_handler(
 
     let bytes = body
         .collect()
-        .instrument(tracing::debug_span!("collect-body", seq = request.seq))
+        .instrument(tracing::debug_span!("collect-body", seq = seq))
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
     Ok(ChunkResponse {
-        seq: request.seq,
+        seq,
         data: Some(bytes),
     })
 }
@@ -73,23 +81,6 @@ pub(super) fn chunk_service(
         .layer(concurrency_limit)
         .retry(retry::RetryPolicy::default())
         .service(svc)
-}
-
-// FIXME - should probably be enum ChunkRequest { Range(..), Part(..) } or have an inner field like such
-#[derive(Debug, Clone)]
-pub(super) struct ChunkRequest {
-    // byte range to download
-    pub(super) range: RangeInclusive<u64>,
-    pub(super) input: DownloadInputBuilder,
-    // sequence number
-    pub(super) seq: u64,
-}
-
-impl ChunkRequest {
-    /// Size of this chunk request in bytes
-    pub(super) fn size(&self) -> u64 {
-        self.range.end() - self.range.start() + 1
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +104,7 @@ pub(super) fn distribute_work(
     handle: &mut DownloadHandle,
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
+    start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
 ) {
     let range = remaining.clone();
@@ -128,6 +120,7 @@ pub(super) fn distribute_work(
             ctx: handle.ctx.clone(),
             range: range.clone(),
             input: input.clone(),
+            start_seq: start_seq,
         };
 
         let svc = svc.clone();
@@ -144,15 +137,4 @@ pub(super) fn distribute_work(
     }
 
     tracing::trace!("work fully distributed");
-}
-
-fn next_chunk(
-    start: u64,
-    end_inclusive: u64,
-    seq: u64,
-    input: DownloadInputBuilder,
-) -> ChunkRequest {
-    let range = start..=end_inclusive;
-    let input = input.range(header::Range::bytes_inclusive(start, end_inclusive));
-    ChunkRequest { seq, range, input }
 }
