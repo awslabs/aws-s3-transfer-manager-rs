@@ -146,13 +146,13 @@ impl DownloadContext {
         self.handle.download_part_size_bytes()
     }
 
-    /// Returns the next part to download
+    /// Returns the next seq to download
     fn next_seq(&self) -> u64 {
         let state = self.state.clone();
         let mut state = state.lock().unwrap();
 
-        let part_number = state.current_seq;
+        let seq = state.current_seq;
         state.current_seq += 1;
-        part_number
+        seq
     }
 }

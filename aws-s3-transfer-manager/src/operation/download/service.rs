@@ -22,20 +22,20 @@ use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 #[derive(Debug, Clone)]
 pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
-    pub(super) range: RangeInclusive<u64>,
+    pub(super) remaining: RangeInclusive<u64>,
     pub(super) input: DownloadInputBuilder,
     pub(super) start_seq: u64,
 }
 
 fn next_chunk(
     seq: u64,
-    range: RangeInclusive<u64>,
+    remaining: RangeInclusive<u64>,
     part_size: u64,
     start_seq: u64,
     input: DownloadInputBuilder,
 ) -> DownloadInputBuilder {
-    let start = range.start() + ((seq - start_seq) * part_size);
-    let end_inclusive = cmp::min(start + part_size - 1, *range.end());
+    let start = remaining.start() + ((seq - start_seq) * part_size);
+    let end_inclusive = cmp::min(start + part_size - 1, *remaining.end());
     input.range(header::Range::bytes_inclusive(start, end_inclusive))
 }
 
@@ -46,7 +46,7 @@ async fn download_chunk_handler(
     let ctx = request.ctx;
     let seq = ctx.next_seq();
     let part_size = ctx.handle.download_part_size_bytes();
-    let input = next_chunk(seq, request.range, part_size, request.start_seq, request.input);
+    let input = next_chunk(seq, request.remaining, part_size, request.start_seq, request.input);
 
     let op = input.into_sdk_operation(ctx.client());
     let mut resp = op
@@ -99,6 +99,7 @@ pub(crate) struct ChunkResponse {
 /// * handle - the handle for this download
 /// * remaining - the remaining content range that needs to be downloaded
 /// * input - the base transfer request input used to build chunk requests from
+/// * start_seq - the starting sequence number to use for chunks
 /// * comp_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
     handle: &mut DownloadHandle,
@@ -107,18 +108,16 @@ pub(super) fn distribute_work(
     start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
 ) {
-    let range = remaining.clone();
-    let remaining = *remaining.end() - *remaining.start() + 1;
     let svc = chunk_service(&handle.ctx);
-
     let part_size = handle.ctx.target_part_size_bytes();
-    let num_parts = (remaining + part_size - 1) / part_size;
     let input: DownloadInputBuilder = input.into();
 
+    let remaining_length = *remaining.end() - *remaining.start() + 1;
+    let num_parts = (remaining_length + part_size - 1) / part_size;
     for seq in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
-            range: range.clone(),
+            remaining: remaining.clone(),
             input: input.clone(),
             start_seq,
         };
