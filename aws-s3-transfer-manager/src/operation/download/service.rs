@@ -112,8 +112,8 @@ pub(super) fn distribute_work(
     let part_size = handle.ctx.target_part_size_bytes();
     let input: DownloadInputBuilder = input.into();
 
-    let remaining_length = *remaining.end() - *remaining.start() + 1;
-    let num_parts = (remaining_length + part_size - 1) / part_size;
+    let size = *remaining.end() - *remaining.start() + 1;
+    let num_parts = (size + part_size - 1) / part_size;
     for seq in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
