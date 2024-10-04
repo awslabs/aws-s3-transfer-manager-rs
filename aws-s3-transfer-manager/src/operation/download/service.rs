@@ -46,7 +46,13 @@ async fn download_chunk_handler(
     let ctx = request.ctx;
     let seq = ctx.next_seq();
     let part_size = ctx.handle.download_part_size_bytes();
-    let input = next_chunk(seq, request.remaining, part_size, request.start_seq, request.input);
+    let input = next_chunk(
+        seq,
+        request.remaining,
+        part_size,
+        request.start_seq,
+        request.input,
+    );
 
     let op = input.into_sdk_operation(ctx.client());
     let mut resp = op
