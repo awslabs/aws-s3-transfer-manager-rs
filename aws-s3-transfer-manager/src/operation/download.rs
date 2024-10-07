@@ -29,7 +29,7 @@ use body::Body;
 use discovery::discover_obj;
 use service::{distribute_work, ChunkResponse};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
