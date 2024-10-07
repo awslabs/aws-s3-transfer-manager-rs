@@ -152,7 +152,7 @@ impl DownloadContext {
         self.state.current_seq.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Returns the current to download
+    /// Returns the current seq
     fn current_seq(&self) -> u64 {
         self.state.current_seq.load(Ordering::SeqCst)
     }
