@@ -23,7 +23,7 @@ futures-util = "0.3.30"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.14"
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
-tower = { version = "0.5.1", features = ["limit", "retry", "util"] }
+tower = { version = "0.5.1", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
 
 [dev-dependencies]
@@ -31,7 +31,7 @@ aws-sdk-s3 = { version = "1.51.0", features = ["behavior-version-latest", "test-
 aws-smithy-mocks-experimental = "0.2.1"
 aws-smithy-runtime = { version = "1.7.1", features = ["client", "connector-hyper-0-14-x", "test-util", "wire-mock"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
-console-subscriber = "0.3.0"
+console-subscriber = "0.4.0"
 http-02x = { package = "http", version = "0.2.9" }
 http-body-1x = { package = "http-body", version = "1" }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

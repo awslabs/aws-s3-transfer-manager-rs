@@ -6,7 +6,7 @@ use crate::{
         part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
         InputStream,
     },
-    middleware::limit::concurrency::ConcurrencyLimitLayer,
+    middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
@@ -18,6 +18,7 @@ use tracing::Instrument;
 use super::UploadHandle;
 
 /// Request/input type for our "upload_part" service.
+#[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
@@ -69,7 +70,21 @@ pub(super) fn upload_part_service(
        + Send {
     let svc = service_fn(upload_part_handler);
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
-    ServiceBuilder::new().layer(concurrency_limit).service(svc)
+
+    let svc = ServiceBuilder::new()
+        .layer(concurrency_limit)
+        // FIXME - This setting will need to be globalized.
+        .buffer(ctx.handle.num_workers())
+        // FIXME - Hedged request should also get a permit. Currently, it can bypass the
+        // concurrency_limit layer.
+        .layer(hedge::Builder::default().into_layer())
+        .service(svc);
+    svc.map_err(|err| {
+        let e = err
+            .downcast::<error::Error>()
+            .unwrap_or_else(|err| Box::new(error::Error::new(error::ErrorKind::RuntimeError, err)));
+        *e
+    })
 }
 
 /// Spawn tasks to read the body and upload the remaining parts of object
