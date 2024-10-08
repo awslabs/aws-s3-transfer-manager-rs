@@ -12,7 +12,7 @@ use tower::{
 
 /// S3 recommends retrying the slowest 5% of the requests.
 const LATENCY_PERCENTILE: f32 = 95.0;
-/// This value was chosen randomly and empirically tested.
+/// This value was chosen randomly, but seems to work.
 const MIN_DATA_POINTS: u64 = 20;
 /// The Hedge layer maintains two rotating histograms, i.e., ReadHistogram and WriteHistogram. They
 /// are switched every period. This value was chosen randomly but with consideration given to the fact that most 8-16 MB part
