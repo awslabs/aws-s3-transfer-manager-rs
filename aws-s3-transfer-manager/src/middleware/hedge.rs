@@ -17,7 +17,7 @@ const MIN_DATA_POINTS: u64 = 20;
 /// The Hedge layer maintains two rotating histograms, i.e., ReadHistogram and WriteHistogram. They
 /// are switched every period. This value was chosen randomly but with consideration given to the fact that most 8-16 MB part
 /// requests take on average 0.2 seconds, and we should retry it if it takes more than a second.
-const PERIOD: Duration = Duration::new(2, 0);
+const PERIOD: Duration = Duration::from_secs(2);
 
 /*
 * During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
