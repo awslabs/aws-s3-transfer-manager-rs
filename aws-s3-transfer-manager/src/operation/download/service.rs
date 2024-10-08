@@ -119,7 +119,7 @@ pub(super) fn distribute_work(
     let input: DownloadInputBuilder = input.into();
 
     let size = *remaining.end() - *remaining.start() + 1;
-    let num_parts = (size + part_size - 1) / part_size;
+    let num_parts = size.div_ceil(part_size);
     for seq in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
