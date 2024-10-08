@@ -22,7 +22,21 @@ use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 #[derive(Debug, Clone)]
 pub(super) struct DownloadChunkRequest {
     pub(super) ctx: DownloadContext,
-    pub(super) request: ChunkRequest,
+    pub(super) remaining: RangeInclusive<u64>,
+    pub(super) input: DownloadInputBuilder,
+    pub(super) start_seq: u64,
+}
+
+fn next_chunk(
+    seq: u64,
+    remaining: RangeInclusive<u64>,
+    part_size: u64,
+    start_seq: u64,
+    input: DownloadInputBuilder,
+) -> DownloadInputBuilder {
+    let start = remaining.start() + ((seq - start_seq) * part_size);
+    let end_inclusive = cmp::min(start + part_size - 1, *remaining.end());
+    input.range(header::Range::bytes_inclusive(start, end_inclusive))
 }
 
 /// handler (service fn) for a single chunk
@@ -30,10 +44,17 @@ async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkResponse, error::Error> {
     let ctx = request.ctx;
-    let request = request.request;
+    let seq = ctx.next_seq();
+    let part_size = ctx.handle.download_part_size_bytes();
+    let input = next_chunk(
+        seq,
+        request.remaining,
+        part_size,
+        request.start_seq,
+        request.input,
+    );
 
-    let op = request.input.into_sdk_operation(ctx.client());
-
+    let op = input.into_sdk_operation(ctx.client());
     let mut resp = op
         .send()
         .await
@@ -43,12 +64,12 @@ async fn download_chunk_handler(
 
     let bytes = body
         .collect()
-        .instrument(tracing::debug_span!("collect-body", seq = request.seq))
+        .instrument(tracing::debug_span!("collect-body", seq = seq))
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
     Ok(ChunkResponse {
-        seq: request.seq,
+        seq,
         data: Some(bytes),
     })
 }
@@ -66,23 +87,6 @@ pub(super) fn chunk_service(
         .layer(concurrency_limit)
         .retry(retry::RetryPolicy::default())
         .service(svc)
-}
-
-// FIXME - should probably be enum ChunkRequest { Range(..), Part(..) } or have an inner field like such
-#[derive(Debug, Clone)]
-pub(super) struct ChunkRequest {
-    // byte range to download
-    pub(super) range: RangeInclusive<u64>,
-    pub(super) input: DownloadInputBuilder,
-    // sequence number
-    pub(super) seq: u64,
-}
-
-impl ChunkRequest {
-    /// Size of this chunk request in bytes
-    pub(super) fn size(&self) -> u64 {
-        self.range.end() - self.range.start() + 1
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,31 +114,18 @@ pub(super) fn distribute_work(
     start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
 ) {
-    let end = *remaining.end();
-    let mut pos = *remaining.start();
-    let mut remaining = end - pos + 1;
-    let mut seq = start_seq;
-
     let svc = chunk_service(&handle.ctx);
-
     let part_size = handle.ctx.target_part_size_bytes();
     let input: DownloadInputBuilder = input.into();
 
-    while remaining > 0 {
-        let start = pos;
-        let end_inclusive = cmp::min(pos + part_size - 1, end);
-
-        let chunk_req = next_chunk(start, end_inclusive, seq, input.clone());
-        tracing::trace!(
-            "distributing chunk(size={}): {:?}",
-            chunk_req.size(),
-            chunk_req
-        );
-        let chunk_size = chunk_req.size();
-
+    let size = *remaining.end() - *remaining.start() + 1;
+    let num_parts = size.div_ceil(part_size);
+    for seq in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
-            request: chunk_req,
+            remaining: remaining.clone(),
+            input: input.clone(),
+            start_seq,
         };
 
         let svc = svc.clone();
@@ -147,25 +138,8 @@ pub(super) fn distribute_work(
             }
         }
         .instrument(tracing::debug_span!("download-chunk", seq = seq));
-
         handle.tasks.spawn(task);
-
-        seq += 1;
-        remaining -= chunk_size;
-        tracing::trace!("remaining = {}", remaining);
-        pos += chunk_size;
     }
 
     tracing::trace!("work fully distributed");
-}
-
-fn next_chunk(
-    start: u64,
-    end_inclusive: u64,
-    seq: u64,
-    input: DownloadInputBuilder,
-) -> ChunkRequest {
-    let range = start..=end_inclusive;
-    let input = input.range(header::Range::bytes_inclusive(start, end_inclusive));
-    ChunkRequest { seq, range, input }
 }

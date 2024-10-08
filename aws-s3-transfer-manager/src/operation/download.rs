@@ -28,6 +28,7 @@ use aws_smithy_types::byte_stream::ByteStream;
 use body::Body;
 use discovery::discover_obj;
 use service::{distribute_work, ChunkResponse};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -96,9 +97,8 @@ fn handle_discovery_chunk(
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
 ) -> u64 {
-    let mut start_seq = 0;
-
     if let Some(stream) = initial_chunk {
+        let seq = handle.ctx.next_seq();
         let completed = completed.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
@@ -107,7 +107,7 @@ fn handle_discovery_chunk(
                 .collect()
                 .await
                 .map(|aggregated| ChunkResponse {
-                    seq: start_seq,
+                    seq,
                     data: Some(aggregated),
                 })
                 .map_err(error::discovery_failed);
@@ -122,25 +122,38 @@ fn handle_discovery_chunk(
                 );
             }
         });
-        start_seq = 1;
     }
-    start_seq
+    handle.ctx.current_seq()
 }
 
 /// Download operation specific state
 #[derive(Debug)]
-pub(crate) struct DownloadState {}
+pub(crate) struct DownloadState {
+    current_seq: AtomicU64,
+}
 
 type DownloadContext = TransferContext<DownloadState>;
 
 impl DownloadContext {
     fn new(handle: Arc<crate::client::Handle>) -> Self {
-        let state = Arc::new(DownloadState {});
+        let state = Arc::new(DownloadState {
+            current_seq: AtomicU64::new(0),
+        });
         TransferContext { handle, state }
     }
 
     /// The target part size to use for this download
     fn target_part_size_bytes(&self) -> u64 {
         self.handle.download_part_size_bytes()
+    }
+
+    /// Returns the next seq to download
+    fn next_seq(&self) -> u64 {
+        self.state.current_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Returns the current seq
+    fn current_seq(&self) -> u64 {
+        self.state.current_seq.load(Ordering::SeqCst)
     }
 }
