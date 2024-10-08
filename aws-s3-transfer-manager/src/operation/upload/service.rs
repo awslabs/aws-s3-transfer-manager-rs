@@ -75,7 +75,8 @@ pub(super) fn upload_part_service(
         .layer(concurrency_limit)
         // FIXME - This setting will need to be globalized.
         .buffer(ctx.handle.num_workers())
-        // FIXME - Hedged request should also get a permit. Currently, it can bypass the concurreny_limit layer.
+        // FIXME - Hedged request should also get a permit. Currently, it can bypass the
+        // concurrency_limit layer.
         .layer(hedge::Builder::default().into_layer())
         .service(svc);
     svc.map_err(|err| {
