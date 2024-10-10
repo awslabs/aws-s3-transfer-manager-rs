@@ -151,9 +151,12 @@ async fn download_single_obj(
     let mut dest = fs::File::create(key_path).await?;
 
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?;
-        for segment in chunk.into_segments() {
-            dest.write_all(segment.as_ref()).await?;
+        let chunk = chunk;
+        for chunk in chunk {
+        let chunk = chunk?.data.unwrap();
+            for segment in chunk.into_segments() {
+                dest.write_all(segment.as_ref()).await?;
+            }
         }
     }
 

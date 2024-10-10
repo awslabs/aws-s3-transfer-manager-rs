@@ -90,12 +90,12 @@ pub(super) fn chunk_service(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ChunkResponse {
+pub struct ChunkResponse {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
     // the seq number
-    pub(crate) seq: u64,
+    pub seq: u64,
     // chunk data
-    pub(crate) data: Option<AggregatedBytes>,
+    pub data: Option<AggregatedBytes>,
 }
 
 /// Spawn tasks to download the remaining chunks of object data

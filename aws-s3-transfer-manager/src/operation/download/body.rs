@@ -50,32 +50,38 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
-    pub async fn next(&mut self) -> Option<Result<AggregatedBytes, crate::error::Error>> {
+    pub async fn next(&mut self) -> Option<Vec<Result<ChunkResponse, crate::error::Error>>> {
         // TODO(aws-sdk-rust#1159, design) - do we want ChunkResponse (or similar) rather than AggregatedBytes? Would
         //  make additional retries of an individual chunk/part more feasible (though theoretically already exhausted retries)
-        loop {
-            if self.sequencer.is_ordered() {
-                break;
-            }
+       let result = match self.inner.next().await {
+            None => return None,
+            Some(chunk) => chunk, 
+        };
 
-            match self.inner.next().await {
-                None => break,
-                Some(Ok(chunk)) => self.sequencer.push(chunk),
-                Some(Err(err)) => return Some(Err(err)),
-            }
-        }
-
-        let chunk = self
-            .sequencer
-            .pop()
-            .map(|r| Ok(r.data.expect("chunk data")));
-
-        if chunk.is_some() {
-            // if we actually pulled data out, advance the next sequence we expect
-            self.sequencer.advance();
-        }
-
-        chunk
+       Some(result)
+//        loop {
+//            if self.sequencer.is_ordered() {
+//                break;
+//            }
+//
+//           match self.inner.next().await {
+//                None => break,
+//                Some(Ok(chunk)) => self.sequencer.push(chunk),
+//                Some(Err(err)) => return Some(Err(err)),
+//            }
+//        }
+//
+//        let chunk = self
+//            .sequencer
+//            .pop()
+//            .map(|r| Ok(r.data.expect("chunk data")));
+//
+//        if chunk.is_some() {
+//            // if we actually pulled data out, advance the next sequence we expect
+//            self.sequencer.advance();
+//        }
+//
+//        chunk
     }
 
     /// Close the body, no more data will flow from it and all publishers will be notified.
@@ -164,10 +170,20 @@ impl UnorderedBody {
     /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
-    pub(crate) async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
+    pub(crate) async fn next(&mut self) -> Option<Vec<Result<ChunkResponse, crate::error::Error>>> { 
         match self.chunks.as_mut() {
             None => None,
-            Some(ch) => ch.recv().await,
+            Some(ch) => {
+                let recv_many = 123;
+                let mut result = Vec::new();
+                let count = ch.recv_many(&mut result, 100).await;
+                if count == 0 {
+                     None
+                } else {
+                    Some(result)
+                }                
+                //ch.recv().await
+            }
         }
     }
 
