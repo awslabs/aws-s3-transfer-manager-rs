@@ -58,7 +58,7 @@ impl Download {
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &input).await?;
-        let (comp_tx, comp_rx) = mpsc::channel(concurrency);
+        let (comp_tx, comp_rx) = mpsc::channel(concurrency*10);
 
         let initial_chunk = discovery.initial_chunk.take();
         let mut handle = DownloadHandle {
