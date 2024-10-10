@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::operation::download::service::ChunkResponse;
-use aws_smithy_types::byte_stream::AggregatedBytes;
+//use aws_smithy_types::byte_stream::AggregatedBytes;
 use std::cmp;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use tokio::sync::mpsc;
-
+#[allow(dead_code)]
 /// Stream of binary data representing an Amazon S3 Object's contents.
 ///
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
@@ -91,12 +91,14 @@ impl Body {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Sequencer {
     /// next expected sequence
     next_seq: u64,
     chunks: BinaryHeap<cmp::Reverse<SequencedChunk>>,
 }
 
+#[allow(dead_code)]
 impl Sequencer {
     fn new() -> Self {
         Self {
@@ -174,7 +176,6 @@ impl UnorderedBody {
         match self.chunks.as_mut() {
             None => None,
             Some(ch) => {
-                let recv_many = 123;
                 let mut result = Vec::new();
                 let count = ch.recv_many(&mut result, 100).await;
                 if count == 0 {
