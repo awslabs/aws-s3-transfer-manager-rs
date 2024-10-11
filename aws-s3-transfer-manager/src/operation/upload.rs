@@ -67,7 +67,6 @@ async fn try_start_put_object(
     stream: InputStream,
     content_length: u64,
 ) -> Result<(), crate::error::Error> {
-    //TODO: Need to acquire a permit
     let byte_stream = stream.into_byte_stream().await?;
     let content_length: i64 = content_length.try_into().map_err(|_| {
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
@@ -85,6 +84,8 @@ async fn put_object(
     body: ByteStream,
     content_length: i64,
 ) -> Result<UploadOutput, error::Error> {
+    // FIXME - This affects performance in a lot of small file case in ram workload. We need a way to schedule more
+    // work for a lot of small files.
     let _permit = ctx.handle.scheduler.acquire_permit().await.unwrap();
     // TODO: add all the fields
     let resp = ctx
