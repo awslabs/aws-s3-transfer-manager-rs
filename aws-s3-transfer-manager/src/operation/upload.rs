@@ -85,6 +85,7 @@ async fn put_object(
     body: ByteStream,
     content_length: i64,
 ) -> Result<UploadOutput, error::Error> {
+    let _permit = ctx.handle.scheduler.acquire_permit().await.unwrap();
     // TODO: add all the fields
     let resp = ctx
         .client()
