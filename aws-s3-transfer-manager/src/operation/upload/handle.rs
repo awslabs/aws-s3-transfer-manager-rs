@@ -11,7 +11,8 @@ use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::sync::Mutex;
-use tokio::task;
+use tokio::task::{self, JoinHandle};
+
 
 /// Response type for a single upload object request.
 #[derive(Debug)]
@@ -25,6 +26,8 @@ pub struct UploadHandle {
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
     response: Option<UploadOutputBuilder>,
+
+    pub(crate) put_object_task: Option<JoinHandle<Result<UploadOutput, crate::error::Error>>>,
 }
 
 impl UploadHandle {
@@ -35,6 +38,7 @@ impl UploadHandle {
             read_tasks: task::JoinSet::new(),
             ctx,
             response: None,
+            put_object_task: None,
         }
     }
 
@@ -59,6 +63,12 @@ impl UploadHandle {
     /// Abort the upload and cancel any in-progress part uploads.
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
+        if !self.ctx.is_multipart_upload() {
+            let put_object_task = self.put_object_task.take().unwrap();
+            put_object_task.abort();
+            let _ = put_object_task.await?;
+            return Ok(AbortedUpload::default());
+        }
 
         // cancel in-progress read_body tasks
         self.read_tasks.abort_all();
@@ -112,7 +122,7 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::err
 
 async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
     if !handle.ctx.is_multipart_upload() {
-        todo!("non mpu upload not implemented yet")
+        return handle.put_object_task.unwrap().await?;
     }
 
     let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);

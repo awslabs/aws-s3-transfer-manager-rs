@@ -14,6 +14,7 @@ mod service;
 
 use crate::error;
 use crate::io::InputStream;
+use aws_sdk_s3::primitives::ByteStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3
@@ -51,15 +52,47 @@ impl Upload {
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
         if content_length < min_mpu_threshold {
-            // TODO - adapt body to ByteStream and send request using `PutObject` for non mpu upload
-            // tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            try_start_mpu_upload(&mut handle, stream, content_length).await?
+            tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
+            try_start_put_object(&mut handle, stream, content_length).await?
         } else {
             try_start_mpu_upload(&mut handle, stream, content_length).await?
         }
 
         Ok(handle)
     }
+}
+
+
+async fn try_start_put_object(
+    handle: &mut UploadHandle,
+    stream: InputStream,
+    content_length: u64,
+) -> Result<(), crate::error::Error> {
+
+    let byte_stream = stream.into_byte_stream().await?;
+    let content_length: i64 = content_length.try_into().map_err(|_| { error::invalid_input(format!("content_length:{} is invalid.", content_length))})?;
+    handle.put_object_task = Some(tokio::spawn(put_object(handle.ctx.clone(), byte_stream, content_length)));
+    Ok(())
+}
+
+async fn put_object(ctx: UploadContext, body: ByteStream, content_length: i64) -> Result<UploadOutput, error::Error> {
+    // TODO: add all the fields
+    let resp = ctx
+        .client()
+        .put_object()
+        .set_bucket(ctx.request.bucket.clone())
+        .set_key(ctx.request.key.clone())
+        .content_length(content_length)
+        .body(body)
+        .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())
+        .set_sse_customer_key(ctx.request.sse_customer_key.clone())
+        .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
+        .set_request_payer(ctx.request.request_payer.clone())
+        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+        .send()
+        .await?;
+    let upload_output: UploadOutputBuilder = resp.into();
+    Ok(upload_output.build()?)
 }
 
 /// Start a multipart upload
@@ -222,5 +255,28 @@ mod test {
         let resp = handle.join().await.unwrap();
         assert_eq!(expected_upload_id.deref(), resp.upload_id.unwrap().deref());
         assert_eq!(expected_e_tag.deref(), resp.e_tag.unwrap().deref());
+    }
+
+    #[tokio::test]
+    async fn test_basic_upload_object() {
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+        let config = aws_config::from_env().load().await;
+        let s3_client = aws_sdk_s3::Client::new(&config);
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencySetting::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10*1024*1024))
+            .client(s3_client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+        let request = UploadInput::builder()
+            .bucket("waqar-s3-test")
+            .key("test-from-rust-tm.txt")
+            .body(stream);
+        let handle = request.send_with(&tm).await.unwrap();
+        let resp = handle.join().await.unwrap();
+        let etag = resp.e_tag.unwrap();
+        println!("{etag}");
     }
 }
