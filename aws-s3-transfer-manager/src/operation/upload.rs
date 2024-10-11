@@ -62,20 +62,29 @@ impl Upload {
     }
 }
 
-
 async fn try_start_put_object(
     handle: &mut UploadHandle,
     stream: InputStream,
     content_length: u64,
 ) -> Result<(), crate::error::Error> {
-
+    //TODO: Need to acquire a permit
     let byte_stream = stream.into_byte_stream().await?;
-    let content_length: i64 = content_length.try_into().map_err(|_| { error::invalid_input(format!("content_length:{} is invalid.", content_length))})?;
-    handle.put_object_task = Some(tokio::spawn(put_object(handle.ctx.clone(), byte_stream, content_length)));
+    let content_length: i64 = content_length.try_into().map_err(|_| {
+        error::invalid_input(format!("content_length:{} is invalid.", content_length))
+    })?;
+    handle.put_object_task = Some(tokio::spawn(put_object(
+        handle.ctx.clone(),
+        byte_stream,
+        content_length,
+    )));
     Ok(())
 }
 
-async fn put_object(ctx: UploadContext, body: ByteStream, content_length: i64) -> Result<UploadOutput, error::Error> {
+async fn put_object(
+    ctx: UploadContext,
+    body: ByteStream,
+    content_length: i64,
+) -> Result<UploadOutput, error::Error> {
     // TODO: add all the fields
     let resp = ctx
         .client()
@@ -257,6 +266,8 @@ mod test {
         assert_eq!(expected_e_tag.deref(), resp.e_tag.unwrap().deref());
     }
 
+
+    // TODO: Fix test to not do auto upload
     #[tokio::test]
     async fn test_basic_upload_object() {
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
@@ -266,17 +277,18 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10*1024*1024))
+            .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
             .client(s3_client)
             .build();
         let tm = crate::Client::new(tm_config);
         let request = UploadInput::builder()
             .bucket("waqar-s3-test")
-            .key("test-from-rust-tm.txt")
+            .key("test-from-rust-tm-2.txt")
             .body(stream);
         let handle = request.send_with(&tm).await.unwrap();
         let resp = handle.join().await.unwrap();
-        let etag = resp.e_tag.unwrap();
+        assert_eq!(resp.upload_id(), None);
+        let etag = resp.e_tag().unwrap();
         println!("{etag}");
     }
 }
