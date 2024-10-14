@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3::operation::{create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput};
+use aws_sdk_s3::operation::{
+    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+};
 use std::fmt::{Debug, Formatter};
 
 /// Common response fields for uploading an object to Amazon S3

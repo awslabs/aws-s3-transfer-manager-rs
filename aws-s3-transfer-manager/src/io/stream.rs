@@ -77,7 +77,7 @@ impl InputStream {
         Self::read_from().path(path).build()
     }
 
-    /// Converts `InputStream` to ByteStream that can be used in PutObject. 
+    /// Converts `InputStream` to ByteStream that can be used in PutObject.
     pub(crate) async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
         match self.inner {
             // TODO: will this read the whole file into memory?

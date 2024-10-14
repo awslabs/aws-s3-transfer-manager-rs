@@ -107,7 +107,7 @@ pub(super) fn distribute_work(
     );
     match &mut handle.tasks {
         crate::operation::upload::handle::UploadType::PutObject { .. } => {
-            panic!("distribute_work mut not needed for PutObject")
+            panic!("distribute_work must not be called for PutObject.")
         }
         crate::operation::upload::handle::UploadType::MultipartUpload {
             upload_tasks,

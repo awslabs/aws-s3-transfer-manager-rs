@@ -71,7 +71,10 @@ async fn try_start_put_object(
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
 
-    Ok(UploadHandle::new_put_object(ctx.clone(), tokio::spawn(put_object(ctx.clone(), byte_stream, content_length))))
+    Ok(UploadHandle::new_put_object(
+        ctx.clone(),
+        tokio::spawn(put_object(ctx.clone(), byte_stream, content_length)),
+    ))
 }
 
 async fn put_object(
@@ -124,7 +127,7 @@ async fn try_start_mpu_upload(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
-    
+
     let mut handle = UploadHandle::new_multipart(ctx);
     handle.set_response(mpu);
     distribute_work(&mut handle, stream, part_size)?;
@@ -189,6 +192,7 @@ mod test {
     use crate::types::{ConcurrencySetting, PartSize};
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+    use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
     use bytes::Bytes;
@@ -264,29 +268,39 @@ mod test {
         assert_eq!(expected_e_tag.deref(), resp.e_tag.unwrap().deref());
     }
 
-
     // TODO: Fix test to not do auto upload
     #[tokio::test]
     async fn test_basic_upload_object() {
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
         let stream = InputStream::from(body);
-        let config = aws_config::from_env().load().await;
-        let s3_client = aws_sdk_s3::Client::new(&config);
+        let expected_e_tag = Arc::new("test-etag".to_owned());
+
+        let e_tag = expected_e_tag.clone();
+        let put_object = mock!(aws_sdk_s3::Client::put_object).then_output(move || {
+            PutObjectOutput::builder().e_tag(e_tag.as_ref().to_owned())
+                .build()
+        });
+
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&put_object]
+        );
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
-            .client(s3_client)
+            .client(client)
             .build();
         let tm = crate::Client::new(tm_config);
+
         let request = UploadInput::builder()
-            .bucket("waqar-s3-test")
-            .key("test-from-rust-tm-2.txt")
+            .bucket("test-bucket")
+            .key("test-key")
             .body(stream);
         let handle = request.send_with(&tm).await.unwrap();
         let resp = handle.join().await.unwrap();
         assert_eq!(resp.upload_id(), None);
-        let etag = resp.e_tag().unwrap();
-        println!("{etag}");
+        assert_eq!(expected_e_tag.deref(), resp.e_tag().unwrap());
     }
 }
