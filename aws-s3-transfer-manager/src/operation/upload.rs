@@ -52,11 +52,9 @@ impl Upload {
 
         let handle = if content_length < min_mpu_threshold {
             tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            try_start_put_object(ctx.clone(), stream, content_length).await?
+            try_start_put_object(ctx, stream, content_length).await?
         } else {
-            let mut handle = UploadHandle::new_multipart(ctx);
-            try_start_mpu_upload(&mut handle, stream, content_length).await?;
-            handle
+            try_start_mpu_upload(ctx, stream, content_length).await?
         };
 
         Ok(handle)
@@ -111,25 +109,26 @@ async fn put_object(
 /// * `stream` - The content to upload
 /// * `content_length` - The upper bound on the content length
 async fn try_start_mpu_upload(
-    handle: &mut UploadHandle,
+    ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<(), crate::error::Error> {
+) -> Result<UploadHandle, crate::error::Error> {
     let part_size = cmp::max(
-        handle.ctx.handle.upload_part_size_bytes(),
+        ctx.handle.upload_part_size_bytes(),
         content_length / MAX_PARTS,
     );
     tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
 
-    let mpu = start_mpu(handle).await?;
+    let mpu = start_mpu(&ctx).await?;
     tracing::trace!(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
-
+    
+    let mut handle = UploadHandle::new_multipart(ctx);
     handle.set_response(mpu);
-    distribute_work(handle, stream, part_size)?;
-    Ok(())
+    distribute_work(&mut handle, stream, part_size)?;
+    Ok(handle)
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
@@ -141,9 +140,9 @@ fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadCo
 }
 
 /// start a new multipart upload by invoking `CreateMultipartUpload`
-async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::error::Error> {
-    let req = handle.ctx.request();
-    let client = handle.ctx.client();
+async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::error::Error> {
+    let req = ctx.request();
+    let client = ctx.client();
 
     let resp = client
         .create_multipart_upload()
