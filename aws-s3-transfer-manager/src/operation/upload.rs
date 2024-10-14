@@ -123,8 +123,7 @@ async fn put_object(
         .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
         .send()
         .await?;
-    let upload_output: UploadOutputBuilder = resp.into();
-    Ok(upload_output.build()?)
+    Ok(UploadOutputBuilder::from(resp).build()?)
 }
 
 /// Start a multipart upload
