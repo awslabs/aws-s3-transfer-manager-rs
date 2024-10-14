@@ -111,7 +111,7 @@ pub(super) fn distribute_work(
         }
         crate::operation::upload::handle::UploadType::MultipartUpload {
             upload_part_tasks,
-            read_tasks,
+            read_body_tasks,
         } => {
             let svc = upload_part_service(&handle.ctx);
             let n_workers = handle.ctx.handle.num_workers();
@@ -123,7 +123,7 @@ pub(super) fn distribute_work(
                     upload_part_tasks.clone(),
                 )
                 .instrument(tracing::debug_span!("read_body", worker = i));
-                read_tasks.spawn(worker);
+                read_body_tasks.spawn(worker);
             }
             tracing::trace!("work distributed for uploading parts");
             Ok(())

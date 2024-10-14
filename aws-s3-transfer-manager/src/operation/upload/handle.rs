@@ -19,10 +19,10 @@ pub(crate) enum UploadType {
         /// All child multipart upload tasks spawned for this upload
         upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
         /// All child read body tasks spawned for this upload
-        read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
+        read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     },
     PutObject {
-        task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
+        put_object_task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
     },
 }
 
@@ -43,7 +43,7 @@ impl UploadHandle {
         Self {
             upload_type: UploadType::MultipartUpload {
                 upload_part_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
-                read_tasks: task::JoinSet::new(),
+                read_body_tasks: task::JoinSet::new(),
             },
             ctx,
             response: None,
@@ -53,10 +53,10 @@ impl UploadHandle {
     /// Create a new put_object upload handle with the given request context
     pub(crate) fn new_put_object(
         ctx: UploadContext,
-        task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
+        put_object_task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
     ) -> Self {
         Self {
-            upload_type: UploadType::PutObject { task },
+            upload_type: UploadType::PutObject { put_object_task },
             ctx,
             response: None,
         }
@@ -84,17 +84,17 @@ impl UploadHandle {
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
         match &mut self.upload_type {
-            UploadType::PutObject { task } => {
-                task.abort();
-                let _ = task.await?;
+            UploadType::PutObject { put_object_task } => {
+                put_object_task.abort();
+                let _ = put_object_task.await?;
             }
             UploadType::MultipartUpload {
                 upload_part_tasks,
-                read_tasks,
+                read_body_tasks,
             } => {
                 // cancel in-progress read_body tasks
-                read_tasks.abort_all();
-                while (read_tasks.join_next().await).is_some() {}
+                read_body_tasks.abort_all();
+                while (read_body_tasks.join_next().await).is_some() {}
 
                 // cancel in-progress upload tasks
                 let mut tasks = upload_part_tasks.lock().await;
@@ -146,14 +146,14 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::err
 
 async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
     match &mut handle.upload_type {
-        UploadType::PutObject { task } => task.await?,
+        UploadType::PutObject { put_object_task } => put_object_task.await?,
         UploadType::MultipartUpload {
             upload_part_tasks,
-            read_tasks,
+            read_body_tasks,
         } => {
             let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
             let _enter = span.enter();
-            while let Some(join_result) = read_tasks.join_next().await {
+            while let Some(join_result) = read_body_tasks.join_next().await {
                 if let Err(err) = join_result.expect("task completed") {
                     tracing::error!(
                         "multipart upload failed while trying to read the body, aborting"
