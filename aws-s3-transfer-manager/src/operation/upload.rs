@@ -82,8 +82,8 @@ async fn put_object(
     body: ByteStream,
     content_length: i64,
 ) -> Result<UploadOutput, error::Error> {
-    // FIXME - This affects performance in a lot of small file case in ram workload. We need a way to schedule more
-    // work for a lot of small files.
+    // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
+    // more work for a lot of small files.
     let _permit = ctx.handle.scheduler.acquire_permit().await.unwrap();
     let resp = ctx
         .client()
@@ -299,15 +299,12 @@ mod test {
 
         let e_tag = expected_e_tag.clone();
         let put_object = mock!(aws_sdk_s3::Client::put_object).then_output(move || {
-            PutObjectOutput::builder().e_tag(e_tag.as_ref().to_owned())
+            PutObjectOutput::builder()
+                .e_tag(e_tag.as_ref().to_owned())
                 .build()
         });
 
-        let client = mock_client!(
-            aws_sdk_s3,
-            RuleMode::Sequential,
-            &[&put_object]
-        );
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
