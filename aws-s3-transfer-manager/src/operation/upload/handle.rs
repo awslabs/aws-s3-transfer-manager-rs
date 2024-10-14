@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
 
 #[derive(Debug)]
-// TODO: Non_exhaustive?
 pub(crate) enum UploadType {
     MultipartUpload {
         /// All child multipart upload tasks spawned for this upload
@@ -31,7 +30,7 @@ pub(crate) enum UploadType {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
-    pub(crate) tasks: UploadType,
+    pub(crate) upload_type: UploadType,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -42,7 +41,7 @@ impl UploadHandle {
     /// Create a new multipart upload handle with the given request context
     pub(crate) fn new_multipart(ctx: UploadContext) -> Self {
         Self {
-            tasks: UploadType::MultipartUpload {
+            upload_type: UploadType::MultipartUpload {
                 upload_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
                 read_tasks: task::JoinSet::new(),
             },
@@ -57,7 +56,7 @@ impl UploadHandle {
         task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
     ) -> Self {
         Self {
-            tasks: UploadType::PutObject { task },
+            upload_type: UploadType::PutObject { task },
             ctx,
             response: None,
         }
@@ -84,7 +83,7 @@ impl UploadHandle {
     /// Abort the upload and cancel any in-progress part uploads.
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
-        match &mut self.tasks {
+        match &mut self.upload_type {
             UploadType::PutObject { task } => {
                 task.abort();
                 let _ = task.await?;
@@ -146,7 +145,7 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::err
 }
 
 async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
-    match &mut handle.tasks {
+    match &mut handle.upload_type {
         UploadType::PutObject { task } => task.await?,
         UploadType::MultipartUpload {
             upload_tasks,

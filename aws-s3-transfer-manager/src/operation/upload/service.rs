@@ -105,7 +105,7 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
-    match &mut handle.tasks {
+    match &mut handle.upload_type {
         crate::operation::upload::handle::UploadType::PutObject { .. } => {
             panic!("distribute_work must not be called for PutObject.")
         }
