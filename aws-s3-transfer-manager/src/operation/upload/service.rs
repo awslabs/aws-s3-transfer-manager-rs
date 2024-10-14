@@ -105,20 +105,30 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
-    let svc = upload_part_service(&handle.ctx);
-    let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
-        let worker = read_body(
-            part_reader.clone(),
-            handle.ctx.clone(),
-            svc.clone(),
-            handle.upload_tasks.clone(),
-        )
-        .instrument(tracing::debug_span!("read_body", worker = i));
-        handle.read_tasks.spawn(worker);
+    match &mut handle.tasks {
+        crate::operation::upload::handle::UploadType::PutObject { .. } => {
+            panic!("distribute_work mut not needed for PutObject")
+        }
+        crate::operation::upload::handle::UploadType::MultipartUpload {
+            upload_tasks,
+            read_tasks,
+        } => {
+            let svc = upload_part_service(&handle.ctx);
+            let n_workers = handle.ctx.handle.num_workers();
+            for i in 0..n_workers {
+                let worker = read_body(
+                    part_reader.clone(),
+                    handle.ctx.clone(),
+                    svc.clone(),
+                    upload_tasks.clone(),
+                )
+                .instrument(tracing::debug_span!("read_body", worker = i));
+                read_tasks.spawn(worker);
+            }
+            tracing::trace!("work distributed for uploading parts");
+            Ok(())
+        }
     }
-    tracing::trace!("work distributed for uploading parts");
-    Ok(())
 }
 
 /// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader

@@ -43,7 +43,6 @@ impl Upload {
 
         let stream = input.take_body();
         let ctx = new_context(handle, input);
-        let mut handle = UploadHandle::new(ctx);
 
         // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
         let content_length = stream
@@ -51,32 +50,30 @@ impl Upload {
             .upper()
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
-        if content_length < min_mpu_threshold {
+        let handle = if content_length < min_mpu_threshold {
             tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            try_start_put_object(&mut handle, stream, content_length).await?
+            try_start_put_object(ctx.clone(), stream, content_length).await?
         } else {
-            try_start_mpu_upload(&mut handle, stream, content_length).await?
-        }
+            let mut handle = UploadHandle::new_multipart(ctx);
+            try_start_mpu_upload(&mut handle, stream, content_length).await?;
+            handle
+        };
 
         Ok(handle)
     }
 }
 
 async fn try_start_put_object(
-    handle: &mut UploadHandle,
+    ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<(), crate::error::Error> {
+) -> Result<UploadHandle, crate::error::Error> {
     let byte_stream = stream.into_byte_stream().await?;
     let content_length: i64 = content_length.try_into().map_err(|_| {
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
-    handle.put_object_task = Some(tokio::spawn(put_object(
-        handle.ctx.clone(),
-        byte_stream,
-        content_length,
-    )));
-    Ok(())
+
+    Ok(UploadHandle::new_put_object(ctx.clone(), tokio::spawn(put_object(ctx.clone(), byte_stream, content_length))))
 }
 
 async fn put_object(
