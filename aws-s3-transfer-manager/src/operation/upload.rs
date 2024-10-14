@@ -84,7 +84,7 @@ async fn put_object(
 ) -> Result<UploadOutput, error::Error> {
     // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
     // more work for a lot of small files.
-    let _permit = ctx.handle.scheduler.acquire_permit().await.unwrap();
+    let _permit = ctx.handle.scheduler.acquire_permit().await?;
     let resp = ctx
         .client()
         .put_object()
