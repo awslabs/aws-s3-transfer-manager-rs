@@ -26,8 +26,13 @@ tokio = { version = "1.40.0", features = ["rt-multi-thread", "io-util", "sync", 
 tower = { version = "0.5.1", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
 aws-smithy-runtime = { version = "1.7.1", features = ["client", "connector-hyper-0-14-x", "test-util", "wire-mock"] }
-hyper-util = "0.1.9"
+# hyper-util = "0.1.9"
+hyper-rustls = "0.24.2"
+once_cell = "1.20.2"
+rustls = { version = "0.21.12" }
+
 hyper = "=0.14.30"
+
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.51.0", features = ["behavior-version-latest", "test-util"] }
