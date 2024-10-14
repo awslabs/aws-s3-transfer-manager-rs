@@ -110,7 +110,7 @@ pub(super) fn distribute_work(
             panic!("distribute_work must not be called for PutObject.")
         }
         crate::operation::upload::handle::UploadType::MultipartUpload {
-            upload_tasks,
+            upload_part_tasks,
             read_tasks,
         } => {
             let svc = upload_part_service(&handle.ctx);
@@ -120,7 +120,7 @@ pub(super) fn distribute_work(
                     part_reader.clone(),
                     handle.ctx.clone(),
                     svc.clone(),
-                    upload_tasks.clone(),
+                    upload_part_tasks.clone(),
                 )
                 .instrument(tracing::debug_span!("read_body", worker = i));
                 read_tasks.spawn(worker);
@@ -140,7 +140,7 @@ pub(super) async fn read_body(
         + Clone
         + Send
         + 'static,
-    upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
 ) -> Result<(), error::Error> {
     while let Some(part_data) = part_reader.next_part().await? {
         let part_number = part_data.part_number;
@@ -153,7 +153,7 @@ pub(super) async fn read_body(
             "upload_part",
             part_number = part_number
         ));
-        upload_tasks.lock().await.spawn(task);
+        upload_part_tasks.lock().await.spawn(task);
     }
     Ok(())
 }

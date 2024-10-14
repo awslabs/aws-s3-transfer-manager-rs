@@ -17,7 +17,7 @@ use tokio::task::{self, JoinHandle};
 pub(crate) enum UploadType {
     MultipartUpload {
         /// All child multipart upload tasks spawned for this upload
-        upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+        upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
         /// All child read body tasks spawned for this upload
         read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     },
@@ -42,7 +42,7 @@ impl UploadHandle {
     pub(crate) fn new_multipart(ctx: UploadContext) -> Self {
         Self {
             upload_type: UploadType::MultipartUpload {
-                upload_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
+                upload_part_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
                 read_tasks: task::JoinSet::new(),
             },
             ctx,
@@ -89,7 +89,7 @@ impl UploadHandle {
                 let _ = task.await?;
             }
             UploadType::MultipartUpload {
-                upload_tasks,
+                upload_part_tasks,
                 read_tasks,
             } => {
                 // cancel in-progress read_body tasks
@@ -97,7 +97,7 @@ impl UploadHandle {
                 while (read_tasks.join_next().await).is_some() {}
 
                 // cancel in-progress upload tasks
-                let mut tasks = upload_tasks.lock().await;
+                let mut tasks = upload_part_tasks.lock().await;
                 tasks.abort_all();
 
                 // join all tasks
@@ -148,7 +148,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     match &mut handle.upload_type {
         UploadType::PutObject { task } => task.await?,
         UploadType::MultipartUpload {
-            upload_tasks,
+            upload_part_tasks,
             read_tasks,
         } => {
             let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
@@ -168,7 +168,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
 
             let mut all_parts = Vec::new();
             // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
-            let mut tasks = upload_tasks.lock().await;
+            let mut tasks = upload_part_tasks.lock().await;
             while let Some(join_result) = tasks.join_next().await {
                 let result = join_result.expect("task completed");
                 match result {
