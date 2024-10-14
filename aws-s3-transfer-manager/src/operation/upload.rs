@@ -85,19 +85,42 @@ async fn put_object(
     // FIXME - This affects performance in a lot of small file case in ram workload. We need a way to schedule more
     // work for a lot of small files.
     let _permit = ctx.handle.scheduler.acquire_permit().await.unwrap();
-    // TODO: add all the fields
     let resp = ctx
         .client()
         .put_object()
-        .set_bucket(ctx.request.bucket.clone())
-        .set_key(ctx.request.key.clone())
-        .content_length(content_length)
+        .set_acl(ctx.request.acl.clone())
         .body(body)
+        .set_bucket(ctx.request.bucket.clone())
+        .set_cache_control(ctx.request.cache_control.clone())
+        .set_content_disposition(ctx.request.content_disposition.clone())
+        .set_content_encoding(ctx.request.content_encoding.clone())
+        .set_content_language(ctx.request.content_language.clone())
+        .content_length(content_length)
+        .set_content_md5(ctx.request.content_md5.clone())
+        .set_content_type(ctx.request.content_type.clone())
+        .set_expires(ctx.request.expires)
+        .set_grant_full_control(ctx.request.grant_full_control.clone())
+        .set_grant_read(ctx.request.grant_read.clone())
+        .set_grant_read_acp(ctx.request.grant_read_acp.clone())
+        .set_grant_write_acp(ctx.request.grant_write_acp.clone())
+        .set_key(ctx.request.key.clone())
+        .set_metadata(ctx.request.metadata.clone())
+        .set_server_side_encryption(ctx.request.server_side_encryption.clone())
+        .set_storage_class(ctx.request.storage_class.clone())
+        .set_website_redirect_location(ctx.request.website_redirect_location.clone())
         .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())
         .set_sse_customer_key(ctx.request.sse_customer_key.clone())
         .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
+        .set_ssekms_key_id(ctx.request.sse_kms_key_id.clone())
+        .set_ssekms_encryption_context(ctx.request.sse_kms_encryption_context.clone())
+        .set_bucket_key_enabled(ctx.request.bucket_key_enabled)
         .set_request_payer(ctx.request.request_payer.clone())
+        .set_tagging(ctx.request.tagging.clone())
+        .set_object_lock_mode(ctx.request.object_lock_mode.clone())
+        .set_object_lock_retain_until_date(ctx.request.object_lock_retain_until_date)
+        .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+        .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
         .send()
         .await?;
     let upload_output: UploadOutputBuilder = resp.into();
@@ -268,7 +291,6 @@ mod test {
         assert_eq!(expected_e_tag.deref(), resp.e_tag.unwrap().deref());
     }
 
-    // TODO: Fix test to not do auto upload
     #[tokio::test]
     async fn test_basic_upload_object() {
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
