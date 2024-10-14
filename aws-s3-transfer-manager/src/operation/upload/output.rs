@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+use aws_sdk_s3::operation::{
+    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+};
 use std::fmt::{Debug, Formatter};
 
 /// Common response fields for uploading an object to Amazon S3
@@ -511,6 +513,28 @@ impl UploadOutputBuilder {
             request_charged: self.request_charged,
             upload_id: self.upload_id,
         })
+    }
+}
+
+impl From<PutObjectOutput> for UploadOutputBuilder {
+    fn from(value: PutObjectOutput) -> Self {
+        UploadOutputBuilder {
+            upload_id: None,
+            server_side_encryption: value.server_side_encryption,
+            sse_customer_algorithm: value.sse_customer_algorithm,
+            sse_customer_key_md5: value.sse_customer_key_md5,
+            sse_kms_key_id: value.ssekms_key_id,
+            sse_kms_encryption_context: value.ssekms_encryption_context,
+            bucket_key_enabled: value.bucket_key_enabled,
+            request_charged: value.request_charged,
+            checksum_sha256: value.checksum_sha256,
+            expiration: value.expiration,
+            e_tag: value.e_tag,
+            checksum_crc32: value.checksum_crc32,
+            checksum_crc32_c: value.checksum_crc32_c,
+            checksum_sha1: value.checksum_sha1,
+            version_id: value.version_id,
+        }
     }
 }
 
