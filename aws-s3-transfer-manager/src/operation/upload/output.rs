@@ -518,7 +518,6 @@ impl UploadOutputBuilder {
 
 impl From<PutObjectOutput> for UploadOutputBuilder {
     fn from(value: PutObjectOutput) -> Self {
-        // TODO: verify the fields
         UploadOutputBuilder {
             upload_id: None,
             server_side_encryption: value.server_side_encryption,
