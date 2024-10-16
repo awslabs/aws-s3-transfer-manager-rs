@@ -47,6 +47,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_request_payer(ctx.request.request_payer.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .send()
+        .instrument(tracing::debug_span!("upload-part", part_number))
         .await?;
 
     tracing::trace!("completed upload of part number {}", part_number);
@@ -107,15 +108,17 @@ pub(super) fn distribute_work(
     );
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
+    for _ in 0..n_workers {
         let worker = read_body(
             part_reader.clone(),
             handle.ctx.clone(),
             svc.clone(),
             handle.upload_tasks.clone(),
-        )
-        .instrument(tracing::debug_span!("read_body", worker = i));
-        handle.read_tasks.spawn(worker);
+            handle.parent_span_for_tasks.clone(),
+        );
+        handle
+            .read_tasks
+            .spawn(worker.instrument(handle.parent_span_for_tasks.clone()));
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())
@@ -131,19 +134,23 @@ pub(super) async fn read_body(
         + Send
         + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    parent_span_for_tasks: tracing::Span,
 ) -> Result<(), error::Error> {
-    while let Some(part_data) = part_reader.next_part().await? {
-        let part_number = part_data.part_number;
+    while let Some(part_data) = part_reader
+        .next_part()
+        .instrument(tracing::debug_span!("read-next-part"))
+        .await?
+    {
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
         };
         let svc = svc.clone();
-        let task = svc.oneshot(req).instrument(tracing::trace_span!(
-            "upload_part",
-            part_number = part_number
-        ));
-        upload_tasks.lock().await.spawn(task);
+        let task = svc.oneshot(req);
+        upload_tasks
+            .lock()
+            .await
+            .spawn(task.instrument(parent_span_for_tasks.clone()));
     }
     Ok(())
 }

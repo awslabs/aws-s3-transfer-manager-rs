@@ -11,6 +11,7 @@ use aws_sdk_s3::{
 };
 use aws_smithy_runtime_api::http::Response;
 use std::mem;
+use tracing::Instrument;
 
 use super::DownloadObjectsContext;
 
@@ -126,7 +127,10 @@ impl ListObjectsPaginator {
                 .set_delimiter(input.delimiter.to_owned()),
         };
 
-        let list_result = request.send_with(self.context.client()).await;
+        let list_result = request
+            .send_with(self.context.client())
+            .instrument(tracing::debug_span!("list-objects-v2"))
+            .await;
         match list_result {
             Ok(output) => {
                 let prev_state = self.state.take().expect("state set");

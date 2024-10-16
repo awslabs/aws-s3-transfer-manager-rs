@@ -43,6 +43,15 @@ impl DownloadObjects {
         let destination = input.destination().expect("destination set");
         validate_destination(destination).await?;
 
+        // create span to serve as parent of spawned child tasks
+        let parent_span_for_tasks = tracing::debug_span!(
+            parent: None,
+            "download-objects-tasks",
+            bucket=input.bucket.as_deref().unwrap_or(""),
+            key_prefix=input.key_prefix.as_deref().unwrap_or(""),
+        );
+        parent_span_for_tasks.follows_from(tracing::Span::current());
+
         let concurrency = handle.num_workers();
         let ctx = DownloadObjectsContext::new(handle.clone(), input);
 
@@ -51,12 +60,14 @@ impl DownloadObjects {
         let (work_tx, work_rx) = async_channel::bounded(concurrency);
 
         // spawn worker to discover/distribute work
-        tasks.spawn(worker::discover_objects(ctx.clone(), work_tx));
+        tasks.spawn(
+            worker::discover_objects(ctx.clone(), work_tx)
+                .instrument(parent_span_for_tasks.clone()),
+        );
 
-        for i in 0..concurrency {
-            let worker = worker::download_objects(ctx.clone(), work_rx.clone())
-                .instrument(tracing::debug_span!("object-downloader", worker = i));
-            tasks.spawn(worker);
+        for _ in 0..concurrency {
+            let worker = worker::download_objects(ctx.clone(), work_rx.clone());
+            tasks.spawn(worker.instrument(parent_span_for_tasks.clone()));
         }
 
         let handle = DownloadObjectsHandle { tasks, ctx };

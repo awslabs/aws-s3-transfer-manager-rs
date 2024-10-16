@@ -17,7 +17,7 @@ use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug_span, Instrument};
+use tracing::Instrument;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -174,7 +174,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let mut handle = tm.download().bucket(bucket).key(key).send().await?;
 
     write_body(handle.body_mut(), dest)
-        .instrument(debug_span!("write-output"))
+        .instrument(tracing::debug_span!("write-output"))
         .await?;
 
     let elapsed = start.elapsed();

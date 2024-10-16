@@ -24,6 +24,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Initiate a download transfer for multiple objects
+    #[tracing::instrument(skip_all, level="debug", fields(bucket=self.inner.bucket.as_deref().unwrap_or(""), key_prefix=self.inner.key_prefix.as_deref().unwrap_or("")))]
     pub async fn send(self) -> Result<DownloadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::download_objects::DownloadObjects::orchestrate(self.handle, input).await

@@ -21,6 +21,7 @@ pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
 use service::distribute_work;
+use tracing::Instrument;
 
 use std::cmp;
 use std::sync::Arc;
@@ -137,6 +138,7 @@ async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::
         .set_expected_bucket_owner(req.expected_bucket_owner.clone())
         .set_checksum_algorithm(req.checksum_algorithm.clone())
         .send()
+        .instrument(tracing::debug_span!("create-multipart-upload"))
         .await?;
 
     Ok(resp.into())

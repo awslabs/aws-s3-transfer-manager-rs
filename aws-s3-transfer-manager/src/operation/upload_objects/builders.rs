@@ -28,6 +28,7 @@ impl UploadObjectsFluentBuilder {
     }
 
     /// Initiate upload of multiple objects
+    #[tracing::instrument(skip_all, level = "debug")]
     pub async fn send(self) -> Result<UploadObjectsHandle, UploadObjectsError> {
         // FIXME - Err(UploadObjectsError) instead of .expect()
         let input = self.inner.build().expect("valid input");

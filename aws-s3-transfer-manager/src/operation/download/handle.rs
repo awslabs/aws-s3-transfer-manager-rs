@@ -21,6 +21,9 @@ pub struct DownloadHandle {
     /// All child tasks spawned for this download
     pub(crate) tasks: task::JoinSet<()>,
 
+    /// Parent tracing span for spawned child tasks.
+    pub(crate) parent_span_for_tasks: tracing::Span,
+
     /// The context used to drive an upload to completion
     pub(crate) ctx: DownloadContext,
 }
@@ -42,6 +45,7 @@ impl DownloadHandle {
     }
 
     /// Consume the handle and wait for download transfer to complete
+    #[tracing::instrument(skip_all, level = "debug")]
     pub async fn join(mut self) -> Result<(), crate::error::Error> {
         self.body.close();
         while let Some(join_result) = self.tasks.join_next().await {

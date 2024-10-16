@@ -18,6 +18,7 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
+use tracing::Instrument;
 
 mod object_meta;
 mod service;
@@ -44,6 +45,7 @@ impl Download {
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
+        existing_span_for_tasks: Option<tracing::span::Id>,
     ) -> Result<DownloadHandle, error::Error> {
         // if there is a part number then just send the default request
         if input.part_number().is_some() {
@@ -53,14 +55,31 @@ impl Download {
         let concurrency = handle.num_workers();
         let ctx = DownloadContext::new(handle);
 
+        // create span to serve as parent of spawned child tasks
+        let parent_span_for_tasks = tracing::debug_span!(
+            parent: existing_span_for_tasks,
+            "download-tasks",
+            bucket = input.bucket.as_deref().unwrap_or(""),
+            key = input.key.as_deref().unwrap_or(""),
+        );
+        parent_span_for_tasks.follows_from(tracing::Span::current());
+
         // acquire a permit for discovery
-        let permit = ctx.handle.scheduler.acquire_permit().await?;
+        let permit = ctx
+            .handle
+            .scheduler
+            .acquire_permit()
+            .instrument(tracing::debug_span!("acquire-permit"))
+            .await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
-        let mut discovery = discover_obj(&ctx, &input).await?;
+        let mut discovery = discover_obj(&ctx, &input)
+            .instrument(tracing::debug_span!("discovery"))
+            .await?;
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
 
         let initial_chunk = discovery.initial_chunk.take();
+
         let mut handle = DownloadHandle {
             // FIXME(aws-sdk-rust#1159) - initial object discovery for a range/first-part will not
             //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
@@ -69,6 +88,7 @@ impl Download {
             // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
             tasks: JoinSet::new(),
             ctx,
+            parent_span_for_tasks,
         };
 
         // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
@@ -121,7 +141,7 @@ fn handle_discovery_chunk(
                     &DisplayErrorContext(send_err)
                 );
             }
-        });
+        }.instrument(tracing::debug_span!(parent: handle.parent_span_for_tasks.clone(), "download-discovery-chunk", seq)));
     }
     handle.ctx.current_seq()
 }

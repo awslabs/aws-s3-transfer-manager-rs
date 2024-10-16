@@ -12,6 +12,7 @@ use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::sync::Mutex;
 use tokio::task;
+use tracing::Instrument;
 
 /// Response type for a single upload object request.
 #[derive(Debug)]
@@ -21,6 +22,8 @@ pub struct UploadHandle {
     pub(crate) upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
     /// All child read body tasks spawned for this upload
     pub(crate) read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
+    /// Parent tracing span for spawned child tasks.
+    pub(crate) parent_span_for_tasks: tracing::Span,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -30,9 +33,17 @@ pub struct UploadHandle {
 impl UploadHandle {
     /// Create a new upload handle with the given request context
     pub(crate) fn new(ctx: UploadContext) -> Self {
+        let parent_span_for_tasks = tracing::debug_span!(
+            parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
+            bucket = ctx.request.bucket.as_deref().unwrap_or(""),
+            key = ctx.request.key.as_deref().unwrap_or("")
+        );
+        parent_span_for_tasks.follows_from(tracing::Span::current());
+
         Self {
             upload_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
             read_tasks: task::JoinSet::new(),
+            parent_span_for_tasks,
             ctx,
             response: None,
         }
@@ -52,11 +63,13 @@ impl UploadHandle {
     }
 
     /// Consume the handle and wait for upload to complete
+    #[tracing::instrument(skip_all, level = "debug")]
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
         complete_upload(self).await
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
+    #[tracing::instrument(skip_all, level = "debug")]
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
@@ -100,6 +113,7 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::err
         .set_request_payer(handle.ctx.request.request_payer.clone())
         .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
         .send()
+        .instrument(tracing::debug_span!("abort-multipart-upload"))
         .await?;
 
     let aborted_upload = AbortedUpload {
@@ -114,9 +128,6 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     if !handle.ctx.is_multipart_upload() {
         todo!("non mpu upload not implemented yet")
     }
-
-    let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
-    let _enter = span.enter();
 
     while let Some(join_result) = handle.read_tasks.join_next().await {
         if let Err(err) = join_result.expect("task completed") {
@@ -178,6 +189,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
         .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
         .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone())
         .send()
+        .instrument(tracing::debug_span!("complete-multipart-upload"))
         .await?;
 
     // set remaining fields from completing the multipart upload
