@@ -20,10 +20,12 @@ use tracing::Instrument;
 pub struct UploadHandle {
     /// All child multipart upload tasks spawned for this upload
     pub(crate) upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    /// Parent tracing span for spawned upload tasks.
+    pub(crate) parent_span_for_upload_tasks: tracing::Span,
     /// All child read body tasks spawned for this upload
     pub(crate) read_tasks: task::JoinSet<Result<(), crate::error::Error>>,
-    /// Parent tracing span for spawned child tasks.
-    pub(crate) parent_span_for_tasks: tracing::Span,
+    /// Parent tracing span for spawned read body tasks.
+    pub(crate) parent_span_for_read_tasks: tracing::Span,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
     /// The response that will eventually be yielded to the caller.
@@ -33,17 +35,30 @@ pub struct UploadHandle {
 impl UploadHandle {
     /// Create a new upload handle with the given request context
     pub(crate) fn new(ctx: UploadContext) -> Self {
-        let parent_span_for_tasks = tracing::debug_span!(
+        let parent_span_for_all_tasks = tracing::debug_span!(
             parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
             bucket = ctx.request.bucket.as_deref().unwrap_or(""),
             key = ctx.request.key.as_deref().unwrap_or("")
         );
-        parent_span_for_tasks.follows_from(tracing::Span::current());
+        parent_span_for_all_tasks.follows_from(tracing::Span::current());
+
+        // group read tasks together
+        let parent_span_for_read_tasks = tracing::debug_span!(
+            parent: parent_span_for_all_tasks.clone(),
+            "upload-read-tasks",
+        );
+
+        // group upload tasks together
+        let parent_span_for_upload_tasks = tracing::debug_span!(
+            parent: parent_span_for_all_tasks,
+            "upload-net-tasks",
+        );
 
         Self {
             upload_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
+            parent_span_for_upload_tasks,
             read_tasks: task::JoinSet::new(),
-            parent_span_for_tasks,
+            parent_span_for_read_tasks,
             ctx,
             response: None,
         }

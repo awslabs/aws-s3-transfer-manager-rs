@@ -106,6 +106,7 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
+    // it looks nice to group all read-workers under single span
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
     for _ in 0..n_workers {
@@ -114,11 +115,11 @@ pub(super) fn distribute_work(
             handle.ctx.clone(),
             svc.clone(),
             handle.upload_tasks.clone(),
-            handle.parent_span_for_tasks.clone(),
+            handle.parent_span_for_upload_tasks.clone(),
         );
         handle
             .read_tasks
-            .spawn(worker.instrument(handle.parent_span_for_tasks.clone()));
+            .spawn(worker.instrument(handle.parent_span_for_read_tasks.clone()));
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())
@@ -134,7 +135,7 @@ pub(super) async fn read_body(
         + Send
         + 'static,
     upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-    parent_span_for_tasks: tracing::Span,
+    parent_span_for_upload_tasks: tracing::Span,
 ) -> Result<(), error::Error> {
     while let Some(part_data) = part_reader
         .next_part()
@@ -150,7 +151,7 @@ pub(super) async fn read_body(
         upload_tasks
             .lock()
             .await
-            .spawn(task.instrument(parent_span_for_tasks.clone()));
+            .spawn(task.instrument(parent_span_for_upload_tasks.clone()));
     }
     Ok(())
 }
