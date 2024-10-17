@@ -59,8 +59,8 @@ impl Download {
         let parent_span_for_tasks = tracing::debug_span!(
             parent: existing_span_for_tasks,
             "download-tasks",
-            bucket = input.bucket.as_deref().unwrap_or(""),
-            key = input.key.as_deref().unwrap_or(""),
+            bucket = input.bucket().unwrap_or_default(),
+            key = input.key().unwrap_or_default(),
         );
         parent_span_for_tasks.follows_from(tracing::Span::current());
 
@@ -69,12 +69,12 @@ impl Download {
             .handle
             .scheduler
             .acquire_permit()
-            .instrument(tracing::debug_span!("acquire-permit"))
+            .instrument(tracing::debug_span!("download-discovery-permit"))
             .await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &input)
-            .instrument(tracing::debug_span!("discovery"))
+            .instrument(tracing::debug_span!("download-discovery"))
             .await?;
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
 

@@ -22,7 +22,10 @@ impl DownloadFluentBuilder {
     }
 
     /// Initiate a download transfer for a single object
-    #[tracing::instrument(skip_all, level="debug", fields(bucket=self.inner.bucket.as_deref().unwrap_or(""), key=self.inner.key.as_deref().unwrap_or("")))]
+    #[tracing::instrument(skip_all, level = "debug", name = "download-initial-send", fields(
+        bucket = self.inner.bucket.as_deref().unwrap_or_default(),
+        key = self.inner.key.as_deref().unwrap_or_default(),
+    ))]
     pub async fn send(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input, None).await

@@ -139,7 +139,7 @@ pub(super) async fn read_body(
 ) -> Result<(), error::Error> {
     while let Some(part_data) = part_reader
         .next_part()
-        .instrument(tracing::debug_span!("read-next-part"))
+        .instrument(tracing::debug_span!("upload-read-next-part"))
         .await?
     {
         let req = UploadPartRequest {

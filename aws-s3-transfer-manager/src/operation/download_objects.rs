@@ -47,8 +47,9 @@ impl DownloadObjects {
         let parent_span_for_tasks = tracing::debug_span!(
             parent: None,
             "download-objects-tasks",
-            bucket=input.bucket.as_deref().unwrap_or(""),
-            key_prefix=input.key_prefix.as_deref().unwrap_or(""),
+            bucket = input.bucket().unwrap_or_default(),
+            destination = input.destination().map(|p| p.to_str().unwrap_or_default()).unwrap_or_default(),
+            key_prefix = input.key_prefix().unwrap_or_default(),
         );
         parent_span_for_tasks.follows_from(tracing::Span::current());
 

@@ -75,7 +75,7 @@ async fn download_specific_chunk(
 
     let bytes = body
         .collect()
-        .instrument(tracing::debug_span!("collect-body", seq = seq))
+        .instrument(tracing::debug_span!("download-chunk-collect-body", seq))
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 

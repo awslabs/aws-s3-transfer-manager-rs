@@ -45,7 +45,7 @@ impl DownloadHandle {
     }
 
     /// Consume the handle and wait for download transfer to complete
-    #[tracing::instrument(skip_all, level = "debug")]
+    #[tracing::instrument(skip_all, level = "debug", name = "download-join")]
     pub async fn join(mut self) -> Result<(), crate::error::Error> {
         self.body.close();
         while let Some(join_result) = self.tasks.join_next().await {

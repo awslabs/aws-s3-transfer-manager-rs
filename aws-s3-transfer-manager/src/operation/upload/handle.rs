@@ -37,21 +37,21 @@ impl UploadHandle {
     pub(crate) fn new(ctx: UploadContext) -> Self {
         let parent_span_for_all_tasks = tracing::debug_span!(
             parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
-            bucket = ctx.request.bucket.as_deref().unwrap_or(""),
-            key = ctx.request.key.as_deref().unwrap_or("")
+            bucket = ctx.request.bucket.as_deref().unwrap_or_default(),
+            key = ctx.request.key.as_deref().unwrap_or_default(),
         );
         parent_span_for_all_tasks.follows_from(tracing::Span::current());
 
         // group read tasks together
         let parent_span_for_read_tasks = tracing::debug_span!(
             parent: parent_span_for_all_tasks.clone(),
-            "upload-read-tasks",
+            "upload-read-tasks"
         );
 
         // group upload tasks together
         let parent_span_for_upload_tasks = tracing::debug_span!(
             parent: parent_span_for_all_tasks,
-            "upload-net-tasks",
+            "upload-net-tasks"
         );
 
         Self {
@@ -78,13 +78,13 @@ impl UploadHandle {
     }
 
     /// Consume the handle and wait for upload to complete
-    #[tracing::instrument(skip_all, level = "debug")]
+    #[tracing::instrument(skip_all, level = "debug", name = "upload-join")]
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
         complete_upload(self).await
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
-    #[tracing::instrument(skip_all, level = "debug")]
+    #[tracing::instrument(skip_all, level = "debug", name = "upload-abort")]
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 

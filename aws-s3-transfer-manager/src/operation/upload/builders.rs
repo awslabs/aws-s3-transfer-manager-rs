@@ -25,7 +25,10 @@ impl UploadFluentBuilder {
     }
 
     /// Initiate an upload transfer for a single object
-    #[tracing::instrument(skip_all, level="debug", fields(bucket=self.inner.bucket.as_deref().unwrap_or(""), key=self.inner.key.as_deref().unwrap_or("")))]
+    #[tracing::instrument(skip_all, level = "debug", name = "upload-initial-send", fields(
+        bucket = self.inner.bucket.as_deref().unwrap_or_default(),
+        key = self.inner.key.as_deref().unwrap_or_default(),
+    ))]
     pub async fn send(self) -> Result<UploadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::upload::Upload::orchestrate(self.handle, input).await
