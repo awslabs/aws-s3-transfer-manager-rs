@@ -65,11 +65,7 @@ impl Download {
         parent_span_for_tasks.follows_from(tracing::Span::current());
 
         // acquire a permit for discovery
-        let permit = ctx
-            .handle
-            .scheduler
-            .acquire_permit()
-            .await?;
+        let permit = ctx.handle.scheduler.acquire_permit().await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &input).await?;
