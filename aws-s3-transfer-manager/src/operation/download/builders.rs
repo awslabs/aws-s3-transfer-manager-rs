@@ -22,7 +22,7 @@ impl DownloadFluentBuilder {
     }
 
     /// Initiate a download transfer for a single object
-    #[tracing::instrument(skip_all, level = "debug", name = "download-initial-send", fields(
+    #[tracing::instrument(skip_all, level = "debug", name = "initiate-download", fields(
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         key = self.inner.key.as_deref().unwrap_or_default(),
     ))]

@@ -69,13 +69,11 @@ impl Download {
             .handle
             .scheduler
             .acquire_permit()
-            .instrument(tracing::debug_span!("download-discovery-permit"))
+            .instrument(tracing::debug_span!("acquire-permit-for-discovery"))
             .await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
-        let mut discovery = discover_obj(&ctx, &input)
-            .instrument(tracing::debug_span!("download-discovery"))
-            .await?;
+        let mut discovery = discover_obj(&ctx, &input).await?;
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
 
         let initial_chunk = discovery.initial_chunk.take();
@@ -141,7 +139,7 @@ fn handle_discovery_chunk(
                     &DisplayErrorContext(send_err)
                 );
             }
-        }.instrument(tracing::debug_span!(parent: handle.parent_span_for_tasks.clone(), "download-discovery-chunk", seq)));
+        }.instrument(tracing::debug_span!(parent: handle.parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
     handle.ctx.current_seq()
 }

@@ -25,7 +25,7 @@ impl UploadFluentBuilder {
     }
 
     /// Initiate an upload transfer for a single object
-    #[tracing::instrument(skip_all, level = "debug", name = "upload-initial-send", fields(
+    #[tracing::instrument(skip_all, level = "debug", name = "initiate-upload", fields(
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         key = self.inner.key.as_deref().unwrap_or_default(),
     ))]

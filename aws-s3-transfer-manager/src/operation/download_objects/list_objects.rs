@@ -129,7 +129,7 @@ impl ListObjectsPaginator {
 
         let list_result = request
             .send_with(self.context.client())
-            .instrument(tracing::debug_span!("list-objects-v2"))
+            .instrument(tracing::debug_span!("send-list-objects-v2"))
             .await;
         match list_result {
             Ok(output) => {

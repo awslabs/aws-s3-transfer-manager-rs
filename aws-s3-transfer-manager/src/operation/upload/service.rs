@@ -47,7 +47,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_request_payer(ctx.request.request_payer.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .send()
-        .instrument(tracing::debug_span!("upload-part", part_number))
+        .instrument(tracing::debug_span!("send-upload-part", part_number))
         .await?;
 
     tracing::trace!("completed upload of part number {}", part_number);
@@ -139,7 +139,7 @@ pub(super) async fn read_body(
 ) -> Result<(), error::Error> {
     while let Some(part_data) = part_reader
         .next_part()
-        .instrument(tracing::debug_span!("upload-read-next-part"))
+        .instrument(tracing::debug_span!("read-upload-body"))
         .await?
     {
         let req = UploadPartRequest {

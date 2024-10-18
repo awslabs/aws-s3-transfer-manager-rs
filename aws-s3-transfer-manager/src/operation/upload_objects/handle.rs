@@ -12,7 +12,7 @@ pub struct UploadObjectsHandle {}
 
 impl UploadObjectsHandle {
     /// Consume the handle and wait for the upload to complete
-    #[tracing::instrument(skip_all, level = "debug", name = "upload-objects-join")]
+    #[tracing::instrument(skip_all, level = "debug", name = "join-upload-objects-")]
     pub async fn join(self) -> Result<UploadObjectsOutput, UploadObjectsError> {
         unimplemented!()
     }

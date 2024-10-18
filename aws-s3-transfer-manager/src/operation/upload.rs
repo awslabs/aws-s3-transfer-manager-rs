@@ -138,7 +138,7 @@ async fn start_mpu(handle: &UploadHandle) -> Result<UploadOutputBuilder, crate::
         .set_expected_bucket_owner(req.expected_bucket_owner.clone())
         .set_checksum_algorithm(req.checksum_algorithm.clone())
         .send()
-        .instrument(tracing::debug_span!("create-multipart-upload"))
+        .instrument(tracing::debug_span!("send-create-multipart-upload"))
         .await?;
 
     Ok(resp.into())
