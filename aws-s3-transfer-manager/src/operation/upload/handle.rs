@@ -12,6 +12,7 @@ use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::sync::Mutex;
 use tokio::task;
+use tracing::Instrument;
 
 /// Response type for a single upload object request.
 #[derive(Debug)]
@@ -52,11 +53,13 @@ impl UploadHandle {
     }
 
     /// Consume the handle and wait for upload to complete
+    #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
         complete_upload(self).await
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
+    #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
 
@@ -100,6 +103,7 @@ async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::err
         .set_request_payer(handle.ctx.request.request_payer.clone())
         .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
         .send()
+        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
         .await?;
 
     let aborted_upload = AbortedUpload {
@@ -114,9 +118,6 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     if !handle.ctx.is_multipart_upload() {
         todo!("non mpu upload not implemented yet")
     }
-
-    let span = tracing::debug_span!("joining upload", upload_id = handle.ctx.upload_id);
-    let _enter = span.enter();
 
     while let Some(join_result) = handle.read_tasks.join_next().await {
         if let Err(err) = join_result.expect("task completed") {
@@ -178,6 +179,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
         .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
         .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone())
         .send()
+        .instrument(tracing::debug_span!("send-complete-multipart-upload"))
         .await?;
 
     // set remaining fields from completing the multipart upload
