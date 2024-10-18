@@ -69,7 +69,6 @@ impl Download {
             .handle
             .scheduler
             .acquire_permit()
-            .instrument(tracing::debug_span!("acquire-permit-for-discovery"))
             .await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
