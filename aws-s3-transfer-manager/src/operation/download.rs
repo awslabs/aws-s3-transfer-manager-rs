@@ -81,16 +81,28 @@ impl Download {
             // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
             tasks: JoinSet::new(),
             ctx,
-            parent_span_for_tasks,
         };
 
         // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
         // that we can begin concurrently downloading any reamining chunks/parts ASAP
-        let start_seq = handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx, permit);
+        let start_seq = handle_discovery_chunk(
+            &mut handle,
+            initial_chunk,
+            &comp_tx,
+            permit,
+            parent_span_for_tasks.clone(),
+        );
 
         if !discovery.remaining.is_empty() {
             let remaining = discovery.remaining.clone();
-            distribute_work(&mut handle, remaining, input, start_seq, comp_tx)
+            distribute_work(
+                &mut handle,
+                remaining,
+                input,
+                start_seq,
+                comp_tx,
+                parent_span_for_tasks,
+            )
         }
 
         Ok(handle)
@@ -109,6 +121,7 @@ fn handle_discovery_chunk(
     initial_chunk: Option<ByteStream>,
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
+    parent_span_for_tasks: tracing::Span,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
         let seq = handle.ctx.next_seq();
@@ -134,7 +147,7 @@ fn handle_discovery_chunk(
                     &DisplayErrorContext(send_err)
                 );
             }
-        }.instrument(tracing::debug_span!(parent: handle.parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
+        }.instrument(tracing::debug_span!(parent: parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
     handle.ctx.current_seq()
 }

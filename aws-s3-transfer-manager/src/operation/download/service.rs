@@ -68,6 +68,7 @@ async fn download_specific_chunk(
     let op = input.into_sdk_operation(ctx.client());
     let mut resp = op
         .send()
+        // no instrument() here because parent span shows duration of send + collect
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
@@ -75,7 +76,10 @@ async fn download_specific_chunk(
 
     let bytes = body
         .collect()
-        .instrument(tracing::debug_span!("download-chunk-collect-body", seq))
+        .instrument(tracing::debug_span!(
+            "collect-body-from-download-chunk",
+            seq
+        ))
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
@@ -124,6 +128,7 @@ pub(super) fn distribute_work(
     input: DownloadInput,
     start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
+    parent_span_for_tasks: tracing::Span,
 ) {
     let svc = chunk_service(&handle.ctx);
     let part_size = handle.ctx.target_part_size_bytes();
@@ -150,7 +155,7 @@ pub(super) fn distribute_work(
         };
         handle
             .tasks
-            .spawn(task.instrument(handle.parent_span_for_tasks.clone()));
+            .spawn(task.instrument(parent_span_for_tasks.clone()));
     }
 
     tracing::trace!("work fully distributed");

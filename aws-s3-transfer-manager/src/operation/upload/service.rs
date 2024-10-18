@@ -106,7 +106,27 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
+
+    // group all spawned tasks together
+    let parent_span_for_all_tasks = tracing::debug_span!(
+        parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
+        bucket = handle.ctx.request.bucket().unwrap_or_default(),
+        key = handle.ctx.request.key().unwrap_or_default(),
+    );
+    parent_span_for_all_tasks.follows_from(tracing::Span::current());
+
     // it looks nice to group all read-workers under single span
+    let parent_span_for_read_tasks = tracing::debug_span!(
+        parent: parent_span_for_all_tasks.clone(),
+        "upload-read-tasks"
+    );
+
+    // it looks nice to group all upload tasks together under single span
+    let parent_span_for_upload_tasks = tracing::debug_span!(
+        parent: parent_span_for_all_tasks,
+        "upload-net-tasks"
+    );
+
     let svc = upload_part_service(&handle.ctx);
     let n_workers = handle.ctx.handle.num_workers();
     for _ in 0..n_workers {
@@ -115,11 +135,11 @@ pub(super) fn distribute_work(
             handle.ctx.clone(),
             svc.clone(),
             handle.upload_tasks.clone(),
-            handle.parent_span_for_upload_tasks.clone(),
+            parent_span_for_upload_tasks.clone(),
         );
         handle
             .read_tasks
-            .spawn(worker.instrument(handle.parent_span_for_read_tasks.clone()));
+            .spawn(worker.instrument(parent_span_for_read_tasks.clone()));
     }
     tracing::trace!("work distributed for uploading parts");
     Ok(())

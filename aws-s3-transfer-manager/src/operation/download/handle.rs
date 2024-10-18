@@ -21,9 +21,6 @@ pub struct DownloadHandle {
     /// All child tasks spawned for this download
     pub(crate) tasks: task::JoinSet<()>,
 
-    /// Parent tracing span for spawned child tasks.
-    pub(crate) parent_span_for_tasks: tracing::Span,
-
     /// The context used to drive an upload to completion
     pub(crate) ctx: DownloadContext,
 }
