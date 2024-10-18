@@ -142,8 +142,12 @@ async fn download_single_obj(
     let delim = ctx.state.input.delimiter();
 
     let key_path = local_key_path(root_dir, key.as_str(), prefix, delim)?;
-    let mut handle =
-        crate::operation::download::Download::orchestrate(ctx.handle.clone(), input).await?;
+    let mut handle = crate::operation::download::Download::orchestrate(
+        ctx.handle.clone(),
+        input,
+        tracing::Span::current().id(),
+    )
+    .await?;
     let mut body = mem::replace(&mut handle.body, Body::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
