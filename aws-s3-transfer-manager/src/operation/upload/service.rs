@@ -47,6 +47,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_request_payer(ctx.request.request_payer.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .send()
+        .instrument(tracing::debug_span!("send-upload-part", part_number))
         .await?;
 
     tracing::trace!("completed upload of part number {}", part_number);
@@ -113,17 +114,37 @@ pub(super) fn distribute_work(
             upload_part_tasks,
             read_body_tasks,
         } => {
+            // group all spawned tasks together
+            let parent_span_for_all_tasks = tracing::debug_span!(
+                parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
+                bucket = handle.ctx.request.bucket().unwrap_or_default(),
+                key = handle.ctx.request.key().unwrap_or_default(),
+            );
+            parent_span_for_all_tasks.follows_from(tracing::Span::current());
+
+            // it looks nice to group all read-workers under single span
+            let parent_span_for_read_tasks = tracing::debug_span!(
+                parent: parent_span_for_all_tasks.clone(),
+                "upload-read-tasks"
+            );
+
+            // it looks nice to group all upload tasks together under single span
+            let parent_span_for_upload_tasks = tracing::debug_span!(
+                parent: parent_span_for_all_tasks,
+                "upload-net-tasks"
+            );
+
             let svc = upload_part_service(&handle.ctx);
             let n_workers = handle.ctx.handle.num_workers();
-            for i in 0..n_workers {
+            for _ in 0..n_workers {
                 let worker = read_body(
                     part_reader.clone(),
                     handle.ctx.clone(),
                     svc.clone(),
                     upload_part_tasks.clone(),
-                )
-                .instrument(tracing::debug_span!("read_body", worker = i));
-                read_body_tasks.spawn(worker);
+                    parent_span_for_upload_tasks.clone(),
+                );
+                read_body_tasks.spawn(worker.instrument(parent_span_for_read_tasks.clone()));
             }
             tracing::trace!("work distributed for uploading parts");
             Ok(())
@@ -141,19 +162,23 @@ pub(super) async fn read_body(
         + Send
         + 'static,
     upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    parent_span_for_upload_tasks: tracing::Span,
 ) -> Result<(), error::Error> {
-    while let Some(part_data) = part_reader.next_part().await? {
-        let part_number = part_data.part_number;
+    while let Some(part_data) = part_reader
+        .next_part()
+        .instrument(tracing::debug_span!("read-upload-body"))
+        .await?
+    {
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
         };
         let svc = svc.clone();
-        let task = svc.oneshot(req).instrument(tracing::trace_span!(
-            "upload_part",
-            part_number = part_number
-        ));
-        upload_part_tasks.lock().await.spawn(task);
+        let task = svc.oneshot(req);
+        upload_part_tasks
+            .lock()
+            .await
+            .spawn(task.instrument(parent_span_for_upload_tasks.clone()));
     }
     Ok(())
 }

@@ -43,8 +43,19 @@ fn next_chunk(
 async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkResponse, error::Error> {
+    let seq: u64 = request.ctx.next_seq();
+
+    // the rest of the work is in its own fn, so we can log `seq` in the tracing span
+    download_specific_chunk(request, seq)
+        .instrument(tracing::debug_span!("download-chunk", seq))
+        .await
+}
+
+async fn download_specific_chunk(
+    request: DownloadChunkRequest,
+    seq: u64,
+) -> Result<ChunkResponse, error::Error> {
     let ctx = request.ctx;
-    let seq = ctx.next_seq();
     let part_size = ctx.handle.download_part_size_bytes();
     let input = next_chunk(
         seq,
@@ -57,6 +68,7 @@ async fn download_chunk_handler(
     let op = input.into_sdk_operation(ctx.client());
     let mut resp = op
         .send()
+        // no instrument() here because parent span shows duration of send + collect
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
@@ -64,7 +76,10 @@ async fn download_chunk_handler(
 
     let bytes = body
         .collect()
-        .instrument(tracing::debug_span!("collect-body", seq = seq))
+        .instrument(tracing::debug_span!(
+            "collect-body-from-download-chunk",
+            seq
+        ))
         .await
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
@@ -113,6 +128,7 @@ pub(super) fn distribute_work(
     input: DownloadInput,
     start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
+    parent_span_for_tasks: tracing::Span,
 ) {
     let svc = chunk_service(&handle.ctx);
     let part_size = handle.ctx.target_part_size_bytes();
@@ -120,7 +136,7 @@ pub(super) fn distribute_work(
 
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
-    for seq in 0..num_parts {
+    for _ in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: handle.ctx.clone(),
             remaining: remaining.clone(),
@@ -136,9 +152,10 @@ pub(super) fn distribute_work(
             if let Err(err) = comp_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
             }
-        }
-        .instrument(tracing::debug_span!("download-chunk", seq = seq));
-        handle.tasks.spawn(task);
+        };
+        handle
+            .tasks
+            .spawn(task.instrument(parent_span_for_tasks.clone()));
     }
 
     tracing::trace!("work fully distributed");
