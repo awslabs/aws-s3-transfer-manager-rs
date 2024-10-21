@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::UploadHandle;
+use super::{handle::UploadType, UploadHandle};
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
@@ -106,10 +106,10 @@ pub(super) fn distribute_work(
             .build(),
     );
     match &mut handle.upload_type {
-        crate::operation::upload::handle::UploadType::PutObject { .. } => {
+        UploadType::PutObject { .. } => {
             panic!("distribute_work must not be called for PutObject.")
         }
-        crate::operation::upload::handle::UploadType::MultipartUpload {
+        UploadType::MultipartUpload {
             upload_part_tasks,
             read_body_tasks,
         } => {
