@@ -123,6 +123,11 @@ async fn put_object(
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
         .send()
+        .instrument(tracing::info_span!(
+            "send-upload-part",
+            bucket = ctx.request.bucket().unwrap_or_default(),
+            key = ctx.request.key().unwrap_or_default()
+        ))
         .await?;
     Ok(UploadOutputBuilder::from(resp).build()?)
 }
