@@ -42,10 +42,20 @@ pub(crate) struct Download;
 
 impl Download {
     /// Execute a single `Download` transfer operation
+    ///
+    /// If `use_current_span_as_parent_for_tasks` is true, spawned tasks will
+    /// be under the current span, and that span will not end until all tasks
+    /// complete. Useful for download-objects, which calls this from a task
+    /// whose span should last until all individual object downloads complete.
+    ///
+    /// If `use_current_span_as_parent_for_tasks` is false, spawned tasks will
+    /// "follow from" the current span, but be under their own root of the trace tree.
+    /// Use this for `TransferManager.download().send()`, where the spawned tasks
+    /// should NOT extend the life of the current `send()` span.
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
-        existing_span_for_tasks: Option<tracing::span::Id>,
+        use_current_span_as_parent_for_tasks: bool,
     ) -> Result<DownloadHandle, error::Error> {
         // if there is a part number then just send the default request
         if input.part_number().is_some() {
@@ -55,14 +65,17 @@ impl Download {
         let concurrency = handle.num_workers();
         let ctx = DownloadContext::new(handle);
 
-        // create span to serve as parent of spawned child tasks
+        // create span to serve as parent of spawned child tasks.
         let parent_span_for_tasks = tracing::debug_span!(
-            parent: existing_span_for_tasks,
+            parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
             "download-tasks",
             bucket = input.bucket().unwrap_or_default(),
             key = input.key().unwrap_or_default(),
         );
-        parent_span_for_tasks.follows_from(tracing::Span::current());
+        if !use_current_span_as_parent_for_tasks {
+            // if not child of current span, then "follows from" current span
+            parent_span_for_tasks.follows_from(tracing::Span::current());
+        }
 
         // acquire a permit for discovery
         let permit = ctx.handle.scheduler.acquire_permit().await?;

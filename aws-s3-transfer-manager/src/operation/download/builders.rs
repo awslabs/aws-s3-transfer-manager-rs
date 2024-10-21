@@ -28,7 +28,7 @@ impl DownloadFluentBuilder {
     ))]
     pub async fn send(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate(self.handle, input, None).await
+        crate::operation::download::Download::orchestrate(self.handle, input, false).await
     }
 
     /// <p>The bucket name containing the object.</p>
