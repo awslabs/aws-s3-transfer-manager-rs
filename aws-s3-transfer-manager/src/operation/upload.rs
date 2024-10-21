@@ -14,7 +14,7 @@ mod service;
 
 use crate::error;
 use crate::io::InputStream;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_types::byte_stream::ByteStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3

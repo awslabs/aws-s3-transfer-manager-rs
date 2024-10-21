@@ -82,7 +82,7 @@ impl InputStream {
         match self.inner {
             RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path)
                 .await
-                .map_err(error::from_kind(error::ErrorKind::InputInvalid)),
+                .map_err( error::from_kind(error::ErrorKind::IOError)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
         }
     }
