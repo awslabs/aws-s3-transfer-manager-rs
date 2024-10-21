@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::UploadHandle;
+use super::{handle::UploadType, UploadHandle};
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
@@ -105,20 +105,30 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
-    let svc = upload_part_service(&handle.ctx);
-    let n_workers = handle.ctx.handle.num_workers();
-    for i in 0..n_workers {
-        let worker = read_body(
-            part_reader.clone(),
-            handle.ctx.clone(),
-            svc.clone(),
-            handle.upload_tasks.clone(),
-        )
-        .instrument(tracing::debug_span!("read_body", worker = i));
-        handle.read_tasks.spawn(worker);
+    match &mut handle.upload_type {
+        UploadType::PutObject { .. } => {
+            panic!("distribute_work must not be called for PutObject.")
+        }
+        UploadType::MultipartUpload {
+            upload_part_tasks,
+            read_body_tasks,
+        } => {
+            let svc = upload_part_service(&handle.ctx);
+            let n_workers = handle.ctx.handle.num_workers();
+            for i in 0..n_workers {
+                let worker = read_body(
+                    part_reader.clone(),
+                    handle.ctx.clone(),
+                    svc.clone(),
+                    upload_part_tasks.clone(),
+                )
+                .instrument(tracing::debug_span!("read_body", worker = i));
+                read_body_tasks.spawn(worker);
+            }
+            tracing::trace!("work distributed for uploading parts");
+            Ok(())
+        }
     }
-    tracing::trace!("work distributed for uploading parts");
-    Ok(())
 }
 
 /// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader
@@ -130,7 +140,7 @@ pub(super) async fn read_body(
         + Clone
         + Send
         + 'static,
-    upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
 ) -> Result<(), error::Error> {
     while let Some(part_data) = part_reader.next_part().await? {
         let part_number = part_data.part_number;
@@ -143,7 +153,7 @@ pub(super) async fn read_body(
             "upload_part",
             part_number = part_number
         ));
-        upload_tasks.lock().await.spawn(task);
+        upload_part_tasks.lock().await.spawn(task);
     }
     Ok(())
 }
