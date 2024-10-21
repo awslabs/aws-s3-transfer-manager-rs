@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::UploadHandle;
+use super::{handle::UploadType, UploadHandle};
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
@@ -106,43 +106,50 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
+    match &mut handle.upload_type {
+        UploadType::PutObject { .. } => {
+            panic!("distribute_work must not be called for PutObject.")
+        }
+        UploadType::MultipartUpload {
+            upload_part_tasks,
+            read_body_tasks,
+        } => {
+            // group all spawned tasks together
+            let parent_span_for_all_tasks = tracing::debug_span!(
+                parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
+                bucket = handle.ctx.request.bucket().unwrap_or_default(),
+                key = handle.ctx.request.key().unwrap_or_default(),
+            );
+            parent_span_for_all_tasks.follows_from(tracing::Span::current());
 
-    // group all spawned tasks together
-    let parent_span_for_all_tasks = tracing::debug_span!(
-        parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
-        bucket = handle.ctx.request.bucket().unwrap_or_default(),
-        key = handle.ctx.request.key().unwrap_or_default(),
-    );
-    parent_span_for_all_tasks.follows_from(tracing::Span::current());
+            // it looks nice to group all read-workers under single span
+            let parent_span_for_read_tasks = tracing::debug_span!(
+                parent: parent_span_for_all_tasks.clone(),
+                "upload-read-tasks"
+            );
 
-    // it looks nice to group all read-workers under single span
-    let parent_span_for_read_tasks = tracing::debug_span!(
-        parent: parent_span_for_all_tasks.clone(),
-        "upload-read-tasks"
-    );
+            // it looks nice to group all upload tasks together under single span
+            let parent_span_for_upload_tasks = tracing::debug_span!(
+                parent: parent_span_for_all_tasks,
+                "upload-net-tasks"
+            );
 
-    // it looks nice to group all upload tasks together under single span
-    let parent_span_for_upload_tasks = tracing::debug_span!(
-        parent: parent_span_for_all_tasks,
-        "upload-net-tasks"
-    );
-
-    let svc = upload_part_service(&handle.ctx);
-    let n_workers = handle.ctx.handle.num_workers();
-    for _ in 0..n_workers {
-        let worker = read_body(
-            part_reader.clone(),
-            handle.ctx.clone(),
-            svc.clone(),
-            handle.upload_tasks.clone(),
-            parent_span_for_upload_tasks.clone(),
-        );
-        handle
-            .read_tasks
-            .spawn(worker.instrument(parent_span_for_read_tasks.clone()));
+            let svc = upload_part_service(&handle.ctx);
+            let n_workers = handle.ctx.handle.num_workers();
+            for _ in 0..n_workers {
+                let worker = read_body(
+                    part_reader.clone(),
+                    handle.ctx.clone(),
+                    svc.clone(),
+                    upload_part_tasks.clone(),
+                    parent_span_for_upload_tasks.clone(),
+                );
+                read_body_tasks.spawn(worker.instrument(parent_span_for_read_tasks.clone()));
+            }
+            tracing::trace!("work distributed for uploading parts");
+            Ok(())
+        }
     }
-    tracing::trace!("work distributed for uploading parts");
-    Ok(())
 }
 
 /// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader
@@ -154,7 +161,7 @@ pub(super) async fn read_body(
         + Clone
         + Send
         + 'static,
-    upload_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
     parent_span_for_upload_tasks: tracing::Span,
 ) -> Result<(), error::Error> {
     while let Some(part_data) = part_reader
@@ -168,7 +175,7 @@ pub(super) async fn read_body(
         };
         let svc = svc.clone();
         let task = svc.oneshot(req);
-        upload_tasks
+        upload_part_tasks
             .lock()
             .await
             .spawn(task.instrument(parent_span_for_upload_tasks.clone()));
