@@ -193,12 +193,12 @@ impl Client {
     /// Examples
     /// ```no_run
     /// use std::path::Path;
-    /// use aws_s3_transfer_manager::operation::upload_objects::UploadObjectsError;
+    /// use aws_s3_transfer_manager::error::Error;
     ///
     /// async fn upload_directory(
     ///     client: &aws_s3_transfer_manager::Client,
     ///     source: &Path,
-    /// ) -> Result<(), UploadObjectsError> {
+    /// ) -> Result<(), Error> {
     ///
     ///     let handle = client
     ///         .upload_objects()

@@ -54,7 +54,7 @@ pub(super) async fn list_directory_contents(
         let entry = entry.unwrap();
         if !(filter.predicate)(&UploadFilterItem::new(
             entry.path(),
-            tokio::fs::metadata(entry.path()).await.unwrap(),
+            tokio::fs::metadata(entry.path()).await?,
         )) {
             tracing::debug!("skipping object due to filter: {:?}", entry.path());
             continue;
@@ -121,7 +121,7 @@ pub(super) async fn upload_objects(
                 tracing::debug!("worker finished uploading object {:?}", key);
             }
             Err(err) => {
-                tracing::debug!("worker failed to upload key {:?}: {}", key, err);
+                tracing::debug!("worker failed to upload object {:?}: {}", key, err);
             }
         }
     }

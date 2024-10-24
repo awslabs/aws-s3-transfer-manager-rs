@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::path::{Path, PathBuf};
-
 use crate::types::{FailedTransferPolicy, UploadFilter};
+use aws_smithy_types::error::operation::BuildError;
+
+use std::path::{Path, PathBuf};
 
 // TODO - docs and examples on the interaction of key_prefix & delimiter
 
@@ -80,7 +81,7 @@ impl UploadObjectsInput {
     }
 }
 
-/// A builder for [UploadObjectsInput]
+/// A builder for [`UploadObjectsInput`]
 #[non_exhaustive]
 #[derive(Clone, Default, Debug)]
 pub struct UploadObjectsInputBuilder {
@@ -99,7 +100,16 @@ impl UploadObjectsInputBuilder {
     pub fn build(
         self,
     ) -> Result<UploadObjectsInput, ::aws_smithy_types::error::operation::BuildError> {
-        // TODO - validate required stuff (i.e. bucket)
+        if self.bucket.is_none() {
+            return Err(BuildError::missing_field("bucket", "A bucket is required"));
+        }
+
+        if self.source.is_none() {
+            return Err(BuildError::missing_field(
+                "source",
+                "Source directory to upload is required",
+            ));
+        }
 
         Ok(UploadObjectsInput {
             bucket: self.bucket,
@@ -199,8 +209,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn get_key_prefix(&self) -> &Option<String> {
-        &self.key_prefix
+    pub fn get_key_prefix(&self) -> Option<&str> {
+        self.key_prefix.as_deref()
     }
 
     /// Character used to group keys.
@@ -216,8 +226,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// Character used to group keys.
-    pub fn get_delimiter(&self) -> &Option<String> {
-        &self.delimiter
+    pub fn get_delimiter(&self) -> Option<&str> {
+        self.delimiter.as_deref()
     }
 
     /// The failure policy to use when any individual object upload fails.
