@@ -190,9 +190,7 @@ impl Default for UploadFilter {
 pub struct UploadFilterItem<'a> {
     pub(crate) path: Cow<'a, Path>,
 
-    // TODO - Should we be passing std::fs::Metadata? It avoids additional syscalls
-    // from naive calls to path.is_dir(), path.is_symlink(), etc. Should
-    // we pass our own custom type so we're not tied to std::fs::Metadata?
+    // TODO - Should we pass our own custom type so we're not tied to std::fs::Metadata?
     pub(crate) metadata: Metadata,
 }
 
@@ -222,15 +220,7 @@ impl<'a> UploadFilterItem<'a> {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct FailedUploadTransfer {
-    // TODO - should we include path? should we wrap UploadInput in an Option?
-    // there could be an error with the file before we even assemble an UploadInput
-
-    // TODO - what about an error caused by a directory?
-    // like, user doesn't have permission to read subdirectory,
-    // but they're using FailedTransferPolicy::Continue, so
-    // it probably shouldn't be fatal, but they'd probably
-    // want the failure list to indicate that it wasn't a perfect run
-    pub(crate) input: crate::operation::upload::UploadInput,
+    pub(crate) input: Option<crate::operation::upload::UploadInput>,
     pub(crate) error: crate::error::Error,
 }
 
@@ -238,8 +228,8 @@ pub struct FailedUploadTransfer {
 // "Transfer" is generic for "upload or download" but this already has "Upload" in the name
 impl FailedUploadTransfer {
     /// The input for the failed object upload
-    pub fn input(&self) -> &crate::operation::upload::UploadInput {
-        &self.input
+    pub fn input(&self) -> Option<&crate::operation::upload::UploadInput> {
+        self.input.as_ref()
     }
 
     /// The error encountered uploading the object
