@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 use super::{UploadObjectsContext, UploadObjectsInput};
 use async_channel::{Receiver, Sender};
 use aws_smithy_types::error::operation::BuildError;
+use blocking::Unblock;
+use futures_util::StreamExt;
 use walkdir::WalkDir;
 
 use crate::io::InputStream;
@@ -34,12 +36,13 @@ pub(super) async fn list_directory_contents(
     ctx: UploadObjectsContext,
     work_tx: Sender<Result<UploadObjectJob, error::Error>>,
 ) -> Result<(), error::Error> {
-    let walker = walker(&ctx.state.input);
+    // Move a blocking I/O to a dedicated thread pool
+    let mut walker = Unblock::new(walker(&ctx.state.input).into_iter());
 
     let default_filter = &UploadFilter::default();
     let filter = ctx.state.input.filter().unwrap_or(default_filter);
 
-    for entry in walker {
+    while let Some(entry) = walker.next().await {
         let job = match entry {
             Ok(entry) => {
                 if !(filter.predicate)(&UploadFilterItem::new(
