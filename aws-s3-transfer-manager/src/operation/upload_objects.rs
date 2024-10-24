@@ -60,11 +60,6 @@ impl UploadObjects {
     }
 }
 
-/// Error type for `UploadObjects` operation
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum UploadObjectsError {}
-
 /// DownloadObjects operation specific state
 #[derive(Debug)]
 pub(crate) struct UploadObjectsState {
