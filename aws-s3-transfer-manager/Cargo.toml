@@ -25,6 +25,7 @@ pin-project-lite = "0.2.14"
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
 tower = { version = "0.5.1", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
+walkdir = "2"
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.51.0", features = ["behavior-version-latest", "test-util"] }
@@ -38,7 +39,6 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tempfile = "3.12.0"
 fastrand = "2.1.1"
 futures-test = "0.3.30"
-walkdir = "2"
 tower-test = "0.4.0"
 tokio-test = "0.4.4"
 

@@ -19,15 +19,14 @@ pub use handle::DownloadObjectsHandle;
 mod list_objects;
 mod worker;
 
-use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use tokio::{fs, task::JoinSet};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::{error, types::FailedDownloadTransfer};
+use crate::types::FailedDownloadTransfer;
 
-use super::TransferContext;
+use super::{validate_target_is_dir, TransferContext};
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -41,7 +40,7 @@ impl DownloadObjects {
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
         //  validate existence of destination and return error if it's not a directory
         let destination = input.destination().expect("destination set");
-        validate_destination(destination).await?;
+        validate_target_is_dir(destination).await?;
 
         let concurrency = handle.num_workers();
         let ctx = DownloadObjectsContext::new(handle.clone(), input);
@@ -62,18 +61,6 @@ impl DownloadObjects {
         let handle = DownloadObjectsHandle { tasks, ctx };
         Ok(handle)
     }
-}
-
-async fn validate_destination(path: &Path) -> Result<(), error::Error> {
-    let meta = fs::metadata(path).await?;
-
-    if !meta.is_dir() {
-        return Err(error::invalid_input(format!(
-            "destination is not a directory: {path:?}"
-        )));
-    }
-
-    Ok(())
 }
 
 /// DownloadObjects operation specific state

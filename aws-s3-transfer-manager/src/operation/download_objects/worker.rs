@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use crate::error;
 use crate::operation::download::body::Body;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
+use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{DownloadFilter, FailedDownloadTransfer, FailedTransferPolicy};
 
 use super::list_objects::ListObjectsStream;
@@ -161,8 +162,6 @@ async fn download_single_obj(
 
     Ok(())
 }
-
-const DEFAULT_DELIMITER: &str = "/";
 
 /// If the prefix is not empty AND the key contains the delimiter, strip the prefix from the key.
 ///

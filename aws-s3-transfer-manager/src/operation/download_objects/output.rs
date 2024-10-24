@@ -71,9 +71,9 @@ impl DownloadObjectsOutputBuilder {
     /// To override the contents of this collection use
     /// [`set_failed_transfers`](Self::set_failed_transfers)
     pub fn failed_transfers(mut self, input: FailedDownloadTransfer) -> Self {
-        let mut v = self.failed_transfers.unwrap_or_default();
-        v.push(input);
-        self.failed_transfers = Some(v);
+        self.failed_transfers
+            .get_or_insert_with(Vec::new)
+            .push(input);
         self
     }
 
