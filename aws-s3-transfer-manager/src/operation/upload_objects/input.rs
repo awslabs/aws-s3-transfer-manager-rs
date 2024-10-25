@@ -9,9 +9,6 @@ use crate::types::{FailedTransferPolicy, UploadFilter};
 
 // TODO - docs and examples on the interaction of key_prefix & delimiter
 
-// TODO - upload_objects has recursive option (defaulting to false, per SEP)
-// but download_objects currently has no such option. Be consistent.
-
 /// Input type for uploading multiple objects
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -111,7 +108,7 @@ impl UploadObjectsInputBuilder {
             follow_symlinks: self.follow_symlinks,
             filter: self.filter,
             key_prefix: self.key_prefix,
-            delimiter: self.delimiter.or(Some("/".into())),
+            delimiter: self.delimiter,
             failure_policy: self.failure_policy,
         })
     }

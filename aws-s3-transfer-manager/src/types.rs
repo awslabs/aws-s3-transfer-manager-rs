@@ -4,7 +4,7 @@
  */
 
 use core::fmt;
-use std::sync::Arc;
+use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
 
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
@@ -148,7 +148,7 @@ impl FailedDownloadTransfer {
 /// A filter for choosing which objects to upload to S3.
 #[derive(Clone)]
 pub struct UploadFilter {
-    pub(crate) _predicate: Arc<dyn Fn(&UploadFilterItem) -> bool + Send + Sync + 'static>,
+    pub(crate) predicate: Arc<dyn Fn(&UploadFilterItem<'_>) -> bool + Send + Sync + 'static>,
 }
 
 impl fmt::Debug for UploadFilter {
@@ -161,11 +161,25 @@ impl fmt::Debug for UploadFilter {
 
 impl<F> From<F> for UploadFilter
 where
-    F: Fn(&UploadFilterItem) -> bool + Send + Sync + 'static,
+    F: Fn(&UploadFilterItem<'_>) -> bool + Send + Sync + 'static,
 {
     fn from(value: F) -> Self {
         UploadFilter {
-            _predicate: Arc::new(value),
+            predicate: Arc::new(value),
+        }
+    }
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().starts_with('.'))
+        .unwrap_or(false)
+}
+
+impl Default for UploadFilter {
+    fn default() -> Self {
+        Self {
+            predicate: Arc::new(|item| item.metadata().is_file() && !is_hidden(item.path())),
         }
     }
 }
@@ -173,25 +187,33 @@ where
 /// An item passed to [`UploadFilter`] for evaluation
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct UploadFilterItem {
-    path: std::path::PathBuf,
+pub struct UploadFilterItem<'a> {
+    pub(crate) path: Cow<'a, Path>,
 
     // TODO - Should we be passing std::fs::Metadata? It avoids additional syscalls
     // from naive calls to path.is_dir(), path.is_symlink(), etc. Should
     // we pass our own custom type so we're not tied to std::fs::Metadata?
-    metadata: std::fs::Metadata,
+    pub(crate) metadata: Metadata,
 }
 
-impl UploadFilterItem {
+impl<'a> UploadFilterItem<'a> {
+    /// Create a new upload filter from `path` and `metadata`
+    pub fn new(path: impl Into<Cow<'a, Path>>, metadata: Metadata) -> Self {
+        Self {
+            path: path.into(),
+            metadata,
+        }
+    }
+
     /// Full path to the file.
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Metadata for the file.
     /// Use this Metadata for queries like `is_dir()` and `is_symlink()`.
     /// This is more efficient than `Path.is_dir()`, which looks up the metadata again with each call.
-    pub fn metadata(&self) -> &std::fs::Metadata {
+    pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 }
