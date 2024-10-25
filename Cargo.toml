@@ -3,3 +3,6 @@ resolver = "2"
 members = [
     "aws-s3-transfer-manager"
 ]
+
+[patch.crates-io]
+hyper-util = { path = "../hyper-util" }
