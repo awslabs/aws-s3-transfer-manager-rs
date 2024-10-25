@@ -54,19 +54,19 @@ pub(super) async fn list_directory_contents(
         let entry = entry.unwrap();
         if !(filter.predicate)(&UploadFilterItem::new(
             entry.path(),
-            tokio::fs::metadata(entry.path()).await.unwrap(),
+            tokio::fs::metadata(entry.path()).await?,
         )) {
             tracing::debug!("skipping object due to filter: {:?}", entry.path());
             continue;
         }
 
-        let recursion_root_dir_path = ctx.state.input.source().unwrap();
-        let relative_filename = entry
-            .path()
+        let recursion_root_dir_path = ctx.state.input.source().expect("source set");
+        let entry_path = entry.path();
+        let relative_filename = entry_path
             .strip_prefix(recursion_root_dir_path)
-            .unwrap()
+            .expect("{entry_path:?} should be a path entry directly or indirectly under {recursion_root_dir_path:?}")
             .to_str()
-            .unwrap();
+            .expect("valid utf-8 path");
 
         let object_key = derive_object_key(
             relative_filename,

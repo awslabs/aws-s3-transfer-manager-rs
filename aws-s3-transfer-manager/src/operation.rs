@@ -53,7 +53,7 @@ pub(crate) async fn validate_target_is_dir(path: &Path) -> Result<(), error::Err
 
     if !meta.is_dir() {
         return Err(error::invalid_input(format!(
-            "destination is not a directory: {path:?}"
+            "target is not a directory: {path:?}"
         )));
     }
 

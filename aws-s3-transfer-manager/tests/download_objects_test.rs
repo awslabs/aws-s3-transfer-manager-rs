@@ -401,5 +401,5 @@ async fn test_destination_dir_not_valid() {
         .unwrap_err();
 
     let err_str = format!("{}", DisplayErrorContext(err));
-    assert!(err_str.contains("destination is not a directory"));
+    assert!(err_str.contains("is not a directory"));
 }

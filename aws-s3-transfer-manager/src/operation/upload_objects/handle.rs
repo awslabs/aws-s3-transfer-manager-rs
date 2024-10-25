@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{UploadObjectsContext, UploadObjectsError, UploadObjectsOutput};
+use super::{UploadObjectsContext, UploadObjectsOutput};
 use tokio::task;
 
 /// Handle for `UploadObjects` operation
@@ -20,9 +20,9 @@ pub struct UploadObjectsHandle {
 
 impl UploadObjectsHandle {
     /// Consume the handle and wait for the upload to complete
-    pub async fn join(mut self) -> Result<UploadObjectsOutput, UploadObjectsError> {
+    pub async fn join(mut self) -> Result<UploadObjectsOutput, crate::error::Error> {
         while let Some(join_result) = self.tasks.join_next().await {
-            join_result.unwrap().unwrap();
+            join_result??;
         }
 
         let failed_uploads = self.ctx.state.failed_uploads.lock().unwrap().take();

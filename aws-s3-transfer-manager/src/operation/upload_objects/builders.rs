@@ -7,7 +7,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::types::{FailedTransferPolicy, UploadFilter};
 
-use super::{UploadObjectsError, UploadObjectsHandle, UploadObjectsInputBuilder};
+use super::{UploadObjectsHandle, UploadObjectsInputBuilder};
 
 /// Fluent builder for constructing a multiple object upload
 #[derive(Debug)]
@@ -15,9 +15,6 @@ pub struct UploadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: UploadObjectsInputBuilder,
 }
-
-// TODO - should Builder getters be nice like the Input getters?
-// e.g. Option<&str> instead of &Option<String>
 
 impl UploadObjectsFluentBuilder {
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> Self {
@@ -28,9 +25,8 @@ impl UploadObjectsFluentBuilder {
     }
 
     /// Initiate upload of multiple objects
-    pub async fn send(self) -> Result<UploadObjectsHandle, UploadObjectsError> {
-        // FIXME - Err(UploadObjectsError) instead of .expect()
-        let input = self.inner.build().expect("valid input");
+    pub async fn send(self) -> Result<UploadObjectsHandle, crate::error::Error> {
+        let input = self.inner.build()?;
         crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input).await
     }
 
@@ -137,7 +133,7 @@ impl UploadObjectsFluentBuilder {
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn get_key_prefix(&self) -> &Option<String> {
+    pub fn get_key_prefix(&self) -> Option<&str> {
         self.inner.get_key_prefix()
     }
 
@@ -155,7 +151,7 @@ impl UploadObjectsFluentBuilder {
     }
 
     /// Character used to group keys.
-    pub fn get_delimiter(&self) -> &Option<String> {
+    pub fn get_delimiter(&self) -> Option<&str> {
         self.inner.get_delimiter()
     }
 
@@ -177,7 +173,7 @@ impl crate::operation::upload_objects::input::UploadObjectsInputBuilder {
     pub async fn send_with(
         self,
         client: &crate::Client,
-    ) -> Result<UploadObjectsHandle, UploadObjectsError> {
+    ) -> Result<UploadObjectsHandle, crate::error::Error> {
         let mut fluent_builder = client.upload_objects();
         fluent_builder.inner = self;
         fluent_builder.send().await

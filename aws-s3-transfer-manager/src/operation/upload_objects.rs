@@ -34,10 +34,10 @@ impl UploadObjects {
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: UploadObjectsInput,
-    ) -> Result<UploadObjectsHandle, UploadObjectsError> {
+    ) -> Result<UploadObjectsHandle, crate::error::Error> {
         //  validate existence of source and return error if it's not a directory
         let source = input.source().expect("source set");
-        validate_target_is_dir(source).await.unwrap();
+        validate_target_is_dir(source).await?;
 
         let concurrency = handle.num_workers();
         let ctx = UploadObjectsContext::new(handle.clone(), input);
