@@ -189,14 +189,12 @@ impl Default for UploadFilter {
 #[derive(Debug)]
 pub struct UploadFilterItem<'a> {
     pub(crate) path: Cow<'a, Path>,
-
-    // TODO - Should we pass our own custom type so we're not tied to std::fs::Metadata?
     pub(crate) metadata: Metadata,
 }
 
 impl<'a> UploadFilterItem<'a> {
     /// Create a new upload filter from `path` and `metadata`
-    pub fn new(path: impl Into<Cow<'a, Path>>, metadata: Metadata) -> Self {
+    pub(crate) fn new(path: impl Into<Cow<'a, Path>>, metadata: Metadata) -> Self {
         Self {
             path: path.into(),
             metadata,

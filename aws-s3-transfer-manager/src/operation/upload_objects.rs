@@ -47,7 +47,10 @@ impl UploadObjects {
         let (work_tx, work_rx) = async_channel::bounded(concurrency);
 
         // spawn worker to discover/distribute work
-        tasks.spawn(worker::list_directory_contents(ctx.clone(), work_tx));
+        tasks.spawn(worker::list_directory_contents(
+            ctx.state.input.clone(),
+            work_tx,
+        ));
 
         for i in 0..concurrency {
             let worker = worker::upload_objects(ctx.clone(), work_rx.clone())
