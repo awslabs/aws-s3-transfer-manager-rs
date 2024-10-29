@@ -335,7 +335,7 @@ mod tests {
             ("photos/2022/February/sample2.jpg", 1),
             ("photos/2022/February/sample3.jpg", 1),
         ];
-        let test_dir = create_test_dir(Some(&recursion_root), files.clone(), &[]);
+        let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
         // Test with only required input fields (no recursion)
         {
@@ -399,7 +399,7 @@ mod tests {
                         // For verification purporses, we manually derive object key without using `derive_object_key`
                         format!(
                             "{key_prefix}{delimiter}{key_suffix}",
-                            key_suffix = entry_path.replace("/", delimiter)
+                            key_suffix = entry_path.replace('/', delimiter)
                         ),
                         *value,
                     )
@@ -425,7 +425,7 @@ mod tests {
         // Make all files inaccessible under `photos/2022/February`
         let inaccessible_dir_relative_path = "photos/2022/February";
         let test_dir = create_test_dir(
-            Some(&recursion_root),
+            Some(recursion_root),
             files.clone(),
             &[inaccessible_dir_relative_path],
         );
@@ -478,7 +478,7 @@ mod tests {
             ("photos/2022/February/sample2.jpg", 1),
             ("photos/2022/February/sample3.jpg", 1),
         ];
-        let test_dir = create_test_dir(Some(&recursion_root), files.clone(), &[]);
+        let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
         let input = UploadObjectsInputBuilder::default()
             .bucket("doesnotmatter")

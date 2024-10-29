@@ -81,7 +81,7 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
         ("photos/2022/February/sample2.jpg", 1),
         ("photos/2022/February/sample3.jpg", 1),
     ];
-    let test_dir = create_test_dir(Some(&recursion_root), files.clone(), &[]);
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
@@ -116,7 +116,7 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
             MIN_MULTIPART_PART_SIZE_BYTES as usize,
         ),
     ];
-    let test_dir = create_test_dir(Some(&recursion_root), files.clone(), &[]);
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
@@ -156,7 +156,7 @@ async fn test_failed_upload_policy_continue() {
     // Make all files inaccessible under `photos/2022/February`
     let inaccessible_dir_relative_path = "photos/2022/February";
     let test_dir = create_test_dir(
-        Some(&recursion_root),
+        Some(recursion_root),
         files.clone(),
         &[inaccessible_dir_relative_path],
     );
@@ -216,7 +216,7 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
         ("photos/2022-February/sample2.jpg", 1),
         ("photos/2022-February/sample3.jpg", 1),
     ];
-    let test_dir = create_test_dir(Some(&recursion_root), files.clone(), &[]);
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
