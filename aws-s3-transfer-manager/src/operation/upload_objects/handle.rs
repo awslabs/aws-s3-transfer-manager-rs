@@ -20,6 +20,7 @@ pub struct UploadObjectsHandle {
 
 impl UploadObjectsHandle {
     /// Consume the handle and wait for the upload to complete
+    #[tracing::instrument(skip_all, level = "debug", name = "join-upload-objects-")]
     pub async fn join(mut self) -> Result<UploadObjectsOutput, crate::error::Error> {
         while let Some(join_result) = self.tasks.join_next().await {
             join_result??;

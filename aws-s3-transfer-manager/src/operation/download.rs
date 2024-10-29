@@ -18,6 +18,7 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
+use tracing::Instrument;
 
 mod object_meta;
 mod service;
@@ -41,9 +42,20 @@ pub(crate) struct Download;
 
 impl Download {
     /// Execute a single `Download` transfer operation
+    ///
+    /// If `use_current_span_as_parent_for_tasks` is true, spawned tasks will
+    /// be under the current span, and that span will not end until all tasks
+    /// complete. Useful for download-objects, which calls this from a task
+    /// whose span should last until all individual object downloads complete.
+    ///
+    /// If `use_current_span_as_parent_for_tasks` is false, spawned tasks will
+    /// "follow from" the current span, but be under their own root of the trace tree.
+    /// Use this for `TransferManager.download().send()`, where the spawned tasks
+    /// should NOT extend the life of the current `send()` span.
     pub(crate) async fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
+        use_current_span_as_parent_for_tasks: bool,
     ) -> Result<DownloadHandle, error::Error> {
         // if there is a part number then just send the default request
         if input.part_number().is_some() {
@@ -53,6 +65,18 @@ impl Download {
         let concurrency = handle.num_workers();
         let ctx = DownloadContext::new(handle);
 
+        // create span to serve as parent of spawned child tasks.
+        let parent_span_for_tasks = tracing::debug_span!(
+            parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
+            "download-tasks",
+            bucket = input.bucket().unwrap_or_default(),
+            key = input.key().unwrap_or_default(),
+        );
+        if !use_current_span_as_parent_for_tasks {
+            // if not child of current span, then "follows from" current span
+            parent_span_for_tasks.follows_from(tracing::Span::current());
+        }
+
         // acquire a permit for discovery
         let permit = ctx.handle.scheduler.acquire_permit().await?;
 
@@ -61,6 +85,7 @@ impl Download {
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
 
         let initial_chunk = discovery.initial_chunk.take();
+
         let mut handle = DownloadHandle {
             // FIXME(aws-sdk-rust#1159) - initial object discovery for a range/first-part will not
             //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
@@ -73,11 +98,24 @@ impl Download {
 
         // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
         // that we can begin concurrently downloading any reamining chunks/parts ASAP
-        let start_seq = handle_discovery_chunk(&mut handle, initial_chunk, &comp_tx, permit);
+        let start_seq = handle_discovery_chunk(
+            &mut handle,
+            initial_chunk,
+            &comp_tx,
+            permit,
+            parent_span_for_tasks.clone(),
+        );
 
         if !discovery.remaining.is_empty() {
             let remaining = discovery.remaining.clone();
-            distribute_work(&mut handle, remaining, input, start_seq, comp_tx)
+            distribute_work(
+                &mut handle,
+                remaining,
+                input,
+                start_seq,
+                comp_tx,
+                parent_span_for_tasks,
+            )
         }
 
         Ok(handle)
@@ -96,6 +134,7 @@ fn handle_discovery_chunk(
     initial_chunk: Option<ByteStream>,
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
+    parent_span_for_tasks: tracing::Span,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
         let seq = handle.ctx.next_seq();
@@ -121,7 +160,7 @@ fn handle_discovery_chunk(
                     &DisplayErrorContext(send_err)
                 );
             }
-        });
+        }.instrument(tracing::debug_span!(parent: parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
     handle.ctx.current_seq()
 }

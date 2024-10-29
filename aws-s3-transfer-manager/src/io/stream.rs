@@ -6,9 +6,10 @@
 use std::default::Default;
 use std::path::Path;
 
+use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 
-use crate::io::error::Error;
+use crate::error;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
@@ -72,8 +73,18 @@ impl InputStream {
     ///     InputStream::from_path("docs/rows.csv").expect("file should be readable")
     /// }
     /// ```
-    pub fn from_path(path: impl AsRef<Path>) -> Result<InputStream, Error> {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<InputStream, crate::io::error::Error> {
         Self::read_from().path(path).build()
+    }
+
+    /// Converts `InputStream` to ByteStream that can be used in PutObject.
+    pub(crate) async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
+        match self.inner {
+            RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path)
+                .await
+                .map_err(error::from_kind(error::ErrorKind::IOError)),
+            RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
+        }
     }
 }
 

@@ -5,24 +5,38 @@
 
 #![cfg(target_family = "unix")]
 
-use aws_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
+use aws_s3_transfer_manager::{
+    error::ErrorKind,
+    metrics::unit::ByteUnit,
+    types::{FailedTransferPolicy, PartSize},
+};
 use aws_sdk_s3::{
     error::DisplayErrorContext,
     operation::{
         complete_multipart_upload::CompleteMultipartUploadOutput,
-        create_multipart_upload::CreateMultipartUploadOutput, upload_part::UploadPartOutput,
+        create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+        upload_part::UploadPartOutput,
     },
     Client,
 };
 use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
 use test_common::create_test_dir;
 
-// Create an S3 client with mock behavior configured
+// Create an S3 client with mock behavior configured for `PutObject`
+fn mock_s3_client_for_put_object(bucket_name: String) -> Client {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(&bucket_name))
+        .then_output(|| PutObjectOutput::builder().build());
+
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object])
+}
+
+// Create an S3 client with mock behavior configured for `MultipartUpload`
 //
 // We intentionally avoid being specific about the expected input and output for mocks,
 // as long as the execution of uploading multiple objects completes successfully.
 // Setting expectations that are too precise can lead to brittle tests.
-fn mock_s3_client(bucket_name: String) -> Client {
+fn mock_s3_client_for_multipart_upload(bucket_name: String) -> Client {
     let upload_id = "test-upload-id".to_owned();
 
     let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
@@ -58,7 +72,7 @@ fn mock_s3_client(bucket_name: String) -> Client {
 }
 
 #[tokio::test]
-async fn test_successful_multiple_objects_upload() {
+async fn test_successful_multiple_objects_upload_via_put_object() {
     let recursion_root = "test";
     let files = vec![
         ("sample.jpg", 1),
@@ -71,7 +85,7 @@ async fn test_successful_multiple_objects_upload() {
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
-        .client(mock_s3_client(bucket_name.to_owned()))
+        .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
     let sut = aws_s3_transfer_manager::Client::new(config);
 
@@ -88,6 +102,45 @@ async fn test_successful_multiple_objects_upload() {
     assert_eq!(5, output.objects_uploaded());
     assert!(output.failed_transfers().is_empty());
     assert_eq!(5, output.total_bytes_transferred());
+}
+
+#[tokio::test]
+async fn test_successful_multiple_objects_upload_via_multipart_upload() {
+    let recursion_root = "test";
+    // should be in sync with `aws-s3-transfer-manager::config::MIN_MULTIPART_PART_SIZE_BYTES`
+    const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+    let files = vec![
+        ("sample.jpg", MIN_MULTIPART_PART_SIZE_BYTES as usize),
+        (
+            "photos/2022/January/sample.jpg",
+            MIN_MULTIPART_PART_SIZE_BYTES as usize,
+        ),
+    ];
+    let test_dir = create_test_dir(Some(&recursion_root), files.clone(), &[]);
+
+    let bucket_name = "test-bucket";
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(mock_s3_client_for_multipart_upload(bucket_name.to_owned()))
+        .multipart_threshold(PartSize::Target(5))
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    let output = handle.join().await.unwrap();
+    assert_eq!(2, output.objects_uploaded());
+    assert!(output.failed_transfers().is_empty());
+    assert_eq!(
+        2 * MIN_MULTIPART_PART_SIZE_BYTES,
+        output.total_bytes_transferred()
+    );
 }
 
 #[tokio::test]
@@ -110,7 +163,7 @@ async fn test_failed_upload_policy_continue() {
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
-        .client(mock_s3_client(bucket_name.to_owned()))
+        .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
     let sut = aws_s3_transfer_manager::Client::new(config);
 
@@ -137,7 +190,7 @@ async fn test_source_dir_not_valid() {
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
-        .client(mock_s3_client(bucket_name.to_owned()))
+        .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
     let sut = aws_s3_transfer_manager::Client::new(config);
 
@@ -167,7 +220,7 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
 
     let bucket_name = "test-bucket";
     let config = aws_s3_transfer_manager::Config::builder()
-        .client(mock_s3_client(bucket_name.to_owned()))
+        .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
     let sut = aws_s3_transfer_manager::Client::new(config);
 

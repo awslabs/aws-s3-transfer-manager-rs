@@ -10,6 +10,7 @@ use std::{cmp, mem};
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
+use tracing::Instrument;
 
 use super::object_meta::ObjectMetadata;
 use super::DownloadContext;
@@ -73,7 +74,9 @@ pub(super) async fn discover_obj(
     tracing::trace!("discovering object with strategy {:?}", strategy);
     let discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject(byte_range) => {
-            discover_obj_with_head(ctx, input, byte_range).await
+            discover_obj_with_head(ctx, input, byte_range)
+                .instrument(tracing::debug_span!("send-head-object-for-discovery"))
+                .await
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
             let byte_range = match range.as_ref() {
@@ -88,7 +91,9 @@ pub(super) async fn discover_obj(
                 .set_part_number(None)
                 .range(header::Range::bytes(byte_range));
 
-            discover_obj_with_get(ctx, r, range).await
+            discover_obj_with_get(ctx, r, range)
+                .instrument(tracing::debug_span!("send-ranged-get-for-discovery"))
+                .await
         }
     }?;
 
