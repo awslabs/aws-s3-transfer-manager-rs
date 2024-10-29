@@ -10,9 +10,9 @@ use tempfile::{tempdir, TempDir};
 
 /// Create a directory structure rooted at `recursion_root`, containing files with sizes
 /// specified in `files`
-/// 
-/// For testing purposes, certain directories (and all files within them) can be made 
-/// inaccessible by providing `inaccessible_dir_relative_paths`, which should be relative 
+///
+/// For testing purposes, certain directories (and all files within them) can be made
+/// inaccessible by providing `inaccessible_dir_relative_paths`, which should be relative
 /// to `recursion_root`.
 pub fn create_test_dir(
     recursion_root: Option<&str>,
