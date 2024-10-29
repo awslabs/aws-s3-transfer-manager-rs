@@ -494,6 +494,8 @@ mod unit {
 
     #[cfg(target_family = "windows")]
     mod window_tests {
+        use crate::operation::upload_objects::worker::*;
+
         #[test]
         fn test_derive_object_key() {
             assert_eq!(
