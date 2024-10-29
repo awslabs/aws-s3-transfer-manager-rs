@@ -230,135 +230,196 @@ fn handle_failed_upload(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::operation::upload_objects::UploadObjectsInputBuilder;
-    use std::collections::BTreeMap;
-    use std::error::Error as _;
-    use test_common::create_test_dir;
-
+mod unit {
     #[cfg(target_family = "unix")]
-    #[test]
-    fn test_derive_object_key() {
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", None, None).unwrap()
-        );
-        assert_eq!(
-            "foobar/2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar"), None).unwrap()
-        );
-        assert_eq!(
-            "foobar/2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar/"), None).unwrap()
-        );
-        assert_eq!(
-            "2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", None, Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar-"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar--2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar--"), Some("-")).unwrap()
-        );
-        {
-            let err = derive_object_key("2023/Jan-1.png", None, Some("-"))
-                .err()
-                .unwrap();
+    mod unix_tests {
+        use crate::operation::upload_objects::worker::*;
+        use crate::operation::upload_objects::UploadObjectsInputBuilder;
+        use std::collections::BTreeMap;
+        use std::error::Error as _;
+        use test_common::create_test_dir;
+
+        #[test]
+        fn test_derive_object_key() {
             assert_eq!(
-                "a custom delimiter `-` should not appear in `2023/Jan-1.png`",
-                format!("{}", err.source().unwrap())
+                "2023/Jan/1.png",
+                derive_object_key("2023/Jan/1.png", None, None).unwrap()
+            );
+            assert_eq!(
+                "foobar/2023/Jan/1.png",
+                derive_object_key("2023/Jan/1.png", Some("foobar"), None).unwrap()
+            );
+            assert_eq!(
+                "foobar/2023/Jan/1.png",
+                derive_object_key("2023/Jan/1.png", Some("foobar/"), None).unwrap()
+            );
+            assert_eq!(
+                "2023-Jan-1.png",
+                derive_object_key("2023/Jan/1.png", None, Some("-")).unwrap()
+            );
+            assert_eq!(
+                "foobar-2023-Jan-1.png",
+                derive_object_key("2023/Jan/1.png", Some("foobar"), Some("-")).unwrap()
+            );
+            assert_eq!(
+                "foobar-2023-Jan-1.png",
+                derive_object_key("2023/Jan/1.png", Some("foobar-"), Some("-")).unwrap()
+            );
+            assert_eq!(
+                "foobar--2023-Jan-1.png",
+                derive_object_key("2023/Jan/1.png", Some("foobar--"), Some("-")).unwrap()
+            );
+            {
+                let err = derive_object_key("2023/Jan-1.png", None, Some("-"))
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    "a custom delimiter `-` should not appear in `2023/Jan-1.png`",
+                    format!("{}", err.source().unwrap())
+                );
+            }
+
+            // Should not replace the path separator in prefix with a custom delimiter
+            assert_eq!(
+                "foo/bar-2023-Jan-1.png",
+                derive_object_key("2023/Jan/1.png", Some("foo/bar"), Some("-")).unwrap()
+            );
+
+            // Should not fail if the user specifies the default delimiter as a custom delimiter
+            assert_eq!(
+                "2023/Jan/1.png",
+                derive_object_key("2023/Jan/1.png", None, Some(DEFAULT_DELIMITER)).unwrap()
             );
         }
 
-        // Should not replace the path separator in prefix with a custom delimiter
-        assert_eq!(
-            "foo/bar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foo/bar"), Some("-")).unwrap()
-        );
+        async fn exercise_list_directory_contents(
+            input: UploadObjectsInput,
+        ) -> (BTreeMap<String, usize>, Vec<error::Error>) {
+            let (work_tx, work_rx) = async_channel::unbounded();
 
-        // Should not fail if the user specifies the default delimiter as a custom delimiter
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", None, Some(DEFAULT_DELIMITER)).unwrap()
-        );
-    }
+            let join_handle = tokio::spawn(list_directory_contents(input, work_tx));
 
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn test_derive_object_key() {
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
-        );
-    }
-
-    async fn exercise_list_directory_contents(
-        input: UploadObjectsInput,
-    ) -> (BTreeMap<String, usize>, Vec<error::Error>) {
-        let (work_tx, work_rx) = async_channel::unbounded();
-
-        let join_handle = tokio::spawn(list_directory_contents(input, work_tx));
-
-        let mut successes = BTreeMap::new();
-        let mut errors = Vec::new();
-        while let Ok(job) = work_rx.recv().await {
-            match job {
-                Ok(job) => {
-                    successes.insert(job.key, job.object.size_hint().upper().unwrap() as usize);
+            let mut successes = BTreeMap::new();
+            let mut errors = Vec::new();
+            while let Ok(job) = work_rx.recv().await {
+                match job {
+                    Ok(job) => {
+                        successes.insert(job.key, job.object.size_hint().upper().unwrap() as usize);
+                    }
+                    Err(e) => errors.push(e),
                 }
-                Err(e) => errors.push(e),
+            }
+
+            let _ = join_handle.await.unwrap();
+
+            (successes, errors)
+        }
+
+        #[tokio::test]
+        async fn test_list_directory_contents_should_send_upload_object_jobs_from_traversed_path_entries(
+        ) {
+            let recursion_root = "test";
+            let files = vec![
+                ("sample.jpg", 1),
+                ("photos/2022/January/sample.jpg", 1),
+                ("photos/2022/February/sample1.jpg", 1),
+                ("photos/2022/February/sample2.jpg", 1),
+                ("photos/2022/February/sample3.jpg", 1),
+            ];
+            let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
+
+            // Test with only required input fields (no recursion)
+            {
+                let input = UploadObjectsInputBuilder::default()
+                    .bucket("doesnotmatter")
+                    .source(test_dir.path())
+                    .build()
+                    .unwrap();
+
+                let (actual, errors) = exercise_list_directory_contents(input).await;
+
+                let expected = files
+                    .iter()
+                    .take(1)
+                    .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
+                    .collect::<BTreeMap<_, _>>();
+
+                assert_eq!(expected, actual);
+                assert!(errors.is_empty());
+            }
+
+            // Test with recursion
+            {
+                let input = UploadObjectsInputBuilder::default()
+                    .bucket("doesnotmatter")
+                    .source(test_dir.path())
+                    .recursive(true)
+                    .build()
+                    .unwrap();
+
+                let (actual, errors) = exercise_list_directory_contents(input).await;
+
+                let expected = files
+                    .iter()
+                    .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
+                    .collect::<BTreeMap<_, _>>();
+
+                assert_eq!(expected, actual);
+                assert!(errors.is_empty());
+            }
+
+            // Test with recursion, a custom key prefix, and a custom delimiter
+            {
+                let key_prefix = "test";
+                let delimiter = "-";
+                let input = UploadObjectsInputBuilder::default()
+                    .bucket("doesnotmatter")
+                    .source(test_dir.path())
+                    .recursive(true)
+                    .key_prefix(key_prefix)
+                    .delimiter(delimiter)
+                    .build()
+                    .unwrap();
+
+                let (actual, errors) = exercise_list_directory_contents(input).await;
+
+                let expected = files
+                    .iter()
+                    .map(|(entry_path, value)| {
+                        (
+                            // For verification purporses, we manually derive object key without using `derive_object_key`
+                            format!(
+                                "{key_prefix}{delimiter}{key_suffix}",
+                                key_suffix = entry_path.replace('/', delimiter)
+                            ),
+                            *value,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+
+                assert_eq!(expected, actual);
+                assert!(errors.is_empty());
             }
         }
 
-        let _ = join_handle.await.unwrap();
+        #[tokio::test]
+        async fn test_list_directory_contents_should_send_both_upload_object_jobs_and_errors() {
+            let recursion_root = "test";
+            let files = vec![
+                ("sample.jpg", 1),
+                ("photos/2022/January/sample.jpg", 1),
+                ("photos/2022/February/sample1.jpg", 1),
+                ("photos/2022/February/sample2.jpg", 1),
+                ("photos/2022/February/sample3.jpg", 1),
+            ];
+            // Make all files inaccessible under `photos/2022/February`
+            let inaccessible_dir_relative_path = "photos/2022/February";
+            let test_dir = create_test_dir(
+                Some(recursion_root),
+                files.clone(),
+                &[inaccessible_dir_relative_path],
+            );
 
-        (successes, errors)
-    }
-
-    #[cfg(target_family = "unix")]
-    #[tokio::test]
-    async fn test_list_directory_contents_should_send_upload_object_jobs_from_traversed_path_entries(
-    ) {
-        let recursion_root = "test";
-        let files = vec![
-            ("sample.jpg", 1),
-            ("photos/2022/January/sample.jpg", 1),
-            ("photos/2022/February/sample1.jpg", 1),
-            ("photos/2022/February/sample2.jpg", 1),
-            ("photos/2022/February/sample3.jpg", 1),
-        ];
-        let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
-
-        // Test with only required input fields (no recursion)
-        {
-            let input = UploadObjectsInputBuilder::default()
-                .bucket("doesnotmatter")
-                .source(test_dir.path())
-                .build()
-                .unwrap();
-
-            let (actual, errors) = exercise_list_directory_contents(input).await;
-
-            let expected = files
-                .iter()
-                .take(1)
-                .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
-                .collect::<BTreeMap<_, _>>();
-
-            assert_eq!(expected, actual);
-            assert!(errors.is_empty());
-        }
-
-        // Test with recursion
-        {
             let input = UploadObjectsInputBuilder::default()
                 .bucket("doesnotmatter")
                 .source(test_dir.path())
@@ -370,40 +431,60 @@ mod tests {
 
             let expected = files
                 .iter()
+                .filter(|(entry_path, _)| !entry_path.starts_with(inaccessible_dir_relative_path))
                 .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
                 .collect::<BTreeMap<_, _>>();
 
             assert_eq!(expected, actual);
-            assert!(errors.is_empty());
+            assert_eq!(1, errors.len());
+            let build_error = errors[0]
+                .source()
+                .unwrap()
+                .downcast_ref::<aws_smithy_types::error::operation::BuildError>()
+                .expect("should downcast to `aws_smithy_types::error::operation::BuildError`");
+            let walkdir_error = build_error
+                .source()
+                .unwrap()
+                .downcast_ref::<walkdir::Error>()
+                .expect("should downcast to `walkdir::Error`");
+            assert!(walkdir_error
+                .path()
+                .unwrap()
+                .ends_with(inaccessible_dir_relative_path));
+            assert_eq!(
+                std::io::ErrorKind::PermissionDenied,
+                walkdir_error.io_error().unwrap().kind()
+            );
         }
 
-        // Test with recursion, a custom key prefix, and a custom delimiter
-        {
-            let key_prefix = "test";
-            let delimiter = "-";
+        #[tokio::test]
+        async fn test_upload_filter() {
+            let recursion_root = "test";
+            let files = vec![
+                ("sample.jpg", 1),
+                ("photos/2022/January/sample.jpg", 1),
+                ("photos/2022/February/sample1.jpg", 1),
+                ("photos/2022/February/sample2.jpg", 1),
+                ("photos/2022/February/sample3.jpg", 1),
+            ];
+            let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
+
             let input = UploadObjectsInputBuilder::default()
                 .bucket("doesnotmatter")
                 .source(test_dir.path())
                 .recursive(true)
-                .key_prefix(key_prefix)
-                .delimiter(delimiter)
-                .build()
-                .unwrap();
-
-            let (actual, errors) = exercise_list_directory_contents(input).await;
-
-            let expected = files
-                .iter()
-                .map(|(entry_path, value)| {
-                    (
-                        // For verification purporses, we manually derive object key without using `derive_object_key`
-                        format!(
-                            "{key_prefix}{delimiter}{key_suffix}",
-                            key_suffix = entry_path.replace('/', delimiter)
-                        ),
-                        *value,
-                    )
+                .filter(|item: &UploadFilterItem<'_>| {
+                    !item.path().to_str().unwrap().contains("February") && item.metadata().is_file()
                 })
+                .build()
+                .unwrap();
+
+            let (actual, errors) = exercise_list_directory_contents(input).await;
+
+            let expected = files
+                .iter()
+                .filter(|(entry_path, _)| !entry_path.contains("February"))
+                .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
                 .collect::<BTreeMap<_, _>>();
 
             assert_eq!(expected, actual);
@@ -411,94 +492,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_family = "unix")]
-    #[tokio::test]
-    async fn test_list_directory_contents_should_send_both_upload_object_jobs_and_errors() {
-        let recursion_root = "test";
-        let files = vec![
-            ("sample.jpg", 1),
-            ("photos/2022/January/sample.jpg", 1),
-            ("photos/2022/February/sample1.jpg", 1),
-            ("photos/2022/February/sample2.jpg", 1),
-            ("photos/2022/February/sample3.jpg", 1),
-        ];
-        // Make all files inaccessible under `photos/2022/February`
-        let inaccessible_dir_relative_path = "photos/2022/February";
-        let test_dir = create_test_dir(
-            Some(recursion_root),
-            files.clone(),
-            &[inaccessible_dir_relative_path],
-        );
-
-        let input = UploadObjectsInputBuilder::default()
-            .bucket("doesnotmatter")
-            .source(test_dir.path())
-            .recursive(true)
-            .build()
-            .unwrap();
-
-        let (actual, errors) = exercise_list_directory_contents(input).await;
-
-        let expected = files
-            .iter()
-            .filter(|(entry_path, _)| !entry_path.starts_with(inaccessible_dir_relative_path))
-            .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(expected, actual);
-        assert_eq!(1, errors.len());
-        let build_error = errors[0]
-            .source()
-            .unwrap()
-            .downcast_ref::<aws_smithy_types::error::operation::BuildError>()
-            .expect("should downcast to `aws_smithy_types::error::operation::BuildError`");
-        let walkdir_error = build_error
-            .source()
-            .unwrap()
-            .downcast_ref::<walkdir::Error>()
-            .expect("should downcast to `walkdir::Error`");
-        assert!(walkdir_error
-            .path()
-            .unwrap()
-            .ends_with(inaccessible_dir_relative_path));
-        assert_eq!(
-            std::io::ErrorKind::PermissionDenied,
-            walkdir_error.io_error().unwrap().kind()
-        );
-    }
-
-    #[cfg(target_family = "unix")]
-    #[tokio::test]
-    async fn test_upload_filter() {
-        let recursion_root = "test";
-        let files = vec![
-            ("sample.jpg", 1),
-            ("photos/2022/January/sample.jpg", 1),
-            ("photos/2022/February/sample1.jpg", 1),
-            ("photos/2022/February/sample2.jpg", 1),
-            ("photos/2022/February/sample3.jpg", 1),
-        ];
-        let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
-
-        let input = UploadObjectsInputBuilder::default()
-            .bucket("doesnotmatter")
-            .source(test_dir.path())
-            .recursive(true)
-            .filter(|item: &UploadFilterItem<'_>| {
-                !item.path().to_str().unwrap().contains("February") && item.metadata().is_file()
-            })
-            .build()
-            .unwrap();
-
-        let (actual, errors) = exercise_list_directory_contents(input).await;
-
-        let expected = files
-            .iter()
-            .filter(|(entry_path, _)| !entry_path.contains("February"))
-            .map(|(entry_path, value)| ((*entry_path).to_owned(), *value))
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(expected, actual);
-        assert!(errors.is_empty());
+    #[cfg(target_family = "windows")]
+    mod window_tests {
+        #[test]
+        fn test_derive_object_key() {
+            assert_eq!(
+                "2023/Jan/1.png",
+                derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
+            );
+        }
     }
 }
