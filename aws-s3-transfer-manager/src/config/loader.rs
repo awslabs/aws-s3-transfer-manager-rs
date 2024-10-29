@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_smithy_experimental::hyper_1_0::{CryptoMode, HyperClientBuilder};
+
 use crate::config::Builder;
 use crate::{
     http,
@@ -57,12 +59,18 @@ impl ConfigLoader {
     /// If fields have been overridden during builder construction, the override values will be
     /// used. Otherwise, the default values for each field will be provided.
     pub async fn load(self) -> Config {
-        let shared_config = aws_config::from_env()
-            .http_client(http::default_client())
-            .load()
-            .await;
-        let s3_client = aws_sdk_s3::Client::new(&shared_config);
-        let builder = self.builder.client(s3_client);
+        let interfaces = vec!["ens5".to_string(), "ens6".to_string()];
+        let mut clients = Vec::new();
+        for interface in interfaces {
+            let http_client = HyperClientBuilder::new()
+                .crypto_mode(CryptoMode::AwsLc)
+                .build_https(interface);
+
+            let shared_config = aws_config::from_env().http_client(http_client).load().await;
+            let s3_client = aws_sdk_s3::Client::new(&shared_config);
+            clients.push(s3_client);
+        }
+        let builder = self.builder.client(clients);
         builder.build()
     }
 }

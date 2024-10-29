@@ -149,7 +149,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let (bucket, _) = args.source.expect_s3().parts();
 
     let tm_config = aws_s3_transfer_manager::from_env()
-        .concurrency(ConcurrencySetting::Explicit(args.concurrency))
+        .concurrency(ConcurrencySetting::Explicit(125))
         .part_size(PartSize::Target(args.part_size))
         .load()
         .await;

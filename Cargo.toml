@@ -4,5 +4,5 @@ members = [
     "aws-s3-transfer-manager"
 ]
 
-[patch.crates-io]
-hyper-util = { path = "../hyper-util" }
+# [patch.crates-io]
+# hyper-util = { path = "../hyper-util" }

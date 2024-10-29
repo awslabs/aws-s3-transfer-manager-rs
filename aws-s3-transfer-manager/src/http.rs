@@ -11,5 +11,5 @@ pub(crate) mod header;
 pub(crate) fn default_client() -> SharedHttpClient {
     HyperClientBuilder::new()
         .crypto_mode(CryptoMode::AwsLc)
-        .build_https()
+        .build_https("ens6".to_string())
 }

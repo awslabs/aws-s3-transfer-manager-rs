@@ -6,6 +6,7 @@
 use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencySetting, PartSize};
 use std::cmp;
+use std::sync::atomic::AtomicU32;
 
 pub(crate) mod loader;
 
@@ -18,7 +19,7 @@ pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
-    client: aws_sdk_s3::client::Client,
+    client: Vec<aws_sdk_s3::client::Client>,
 }
 
 impl Config {
@@ -45,7 +46,8 @@ impl Config {
 
     /// The Amazon S3 client instance that will be used to send requests to S3.
     pub fn client(&self) -> &aws_sdk_s3::Client {
-        &self.client
+        let index = fastrand::usize(..self.client.len());
+        &self.client[index]
     }
 }
 
@@ -55,7 +57,7 @@ pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
-    client: Option<aws_sdk_s3::Client>,
+    client: Vec<aws_sdk_s3::Client>,
 }
 
 impl Builder {
@@ -123,18 +125,19 @@ impl Builder {
     }
 
     /// Set an explicit S3 client to use.
-    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
-        self.client = Some(client);
+    pub fn client(mut self, client: Vec<aws_sdk_s3::Client>) -> Self {
+        self.client = client;
         self
     }
 
     /// Consumes the builder and constructs a [`Config`](crate::config::Config)
     pub fn build(self) -> Config {
+        assert!(self.client.len() > 0);
         Config {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
-            client: self.client.expect("client set"),
+            client: self.client,
         }
     }
 }
