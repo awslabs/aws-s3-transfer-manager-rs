@@ -36,12 +36,13 @@ clap = { version = "4.5.7", default-features = false, features = ["derive", "std
 console-subscriber = "0.4.0"
 http-02x = { package = "http", version = "0.2.9" }
 http-body-1x = { package = "http-body", version = "1" }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-tempfile = "3.12.0"
 fastrand = "2.1.1"
 futures-test = "0.3.30"
-tower-test = "0.4.0"
+tempfile = "3.12.0"
+test-common = { path = "./test-common" }
 tokio-test = "0.4.4"
+tower-test = "0.4.0"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 jemallocator = "0.5.4"

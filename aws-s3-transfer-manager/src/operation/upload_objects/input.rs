@@ -8,8 +8,6 @@ use aws_smithy_types::error::operation::BuildError;
 
 use std::path::{Path, PathBuf};
 
-// TODO - docs and examples on the interaction of key_prefix & delimiter
-
 /// Input type for uploading multiple objects
 #[non_exhaustive]
 #[derive(Clone, Debug)]

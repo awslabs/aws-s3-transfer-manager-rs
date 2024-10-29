@@ -36,7 +36,7 @@ impl UploadObjectsOutput {
         self.failed_transfers.as_deref().unwrap_or_default()
     }
 
-    /// The number of bytes successfully transferred (downloaded)
+    /// The number of bytes successfully transferred (uploaded)
     pub fn total_bytes_transferred(&self) -> u64 {
         self.total_bytes_transferred
     }
