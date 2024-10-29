@@ -39,7 +39,7 @@ http-body-1x = { package = "http-body", version = "1" }
 fastrand = "2.1.1"
 futures-test = "0.3.30"
 tempfile = "3.12.0"
-test-common = { path = "./test-common" }
+test-common = { path = "./test-common", version = "0.1.0" }
 tokio-test = "0.4.4"
 tower-test = "0.4.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
