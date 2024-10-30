@@ -4,7 +4,7 @@
  */
 
 use std::borrow::Cow;
-use std::path::MAIN_SEPARATOR;
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::sync::atomic::Ordering;
 
 use super::{UploadObjectsContext, UploadObjectsInput};
@@ -110,7 +110,7 @@ fn derive_object_key<'a>(
 
     let delim = object_key_delimiter.unwrap_or(DEFAULT_DELIMITER);
 
-    let relative_filename = if delim.starts_with(MAIN_SEPARATOR) {
+    let relative_filename = if delim == MAIN_SEPARATOR_STR {
         Cow::Borrowed(relative_filename)
     } else {
         Cow::Owned(relative_filename.replace(MAIN_SEPARATOR, delim))
@@ -268,6 +268,10 @@ mod unit {
             assert_eq!(
                 "foobar--2023-Jan-1.png",
                 derive_object_key("2023/Jan/1.png", Some("foobar--"), Some("-")).unwrap()
+            );
+            assert_eq!(
+                "2023/MYLONGDELIMJan/MYLONGDELIM1.png",
+                derive_object_key("2023/Jan/1.png", None, Some("/MYLONGDELIM")).unwrap()
             );
             {
                 let err = derive_object_key("2023/Jan-1.png", None, Some("-"))
