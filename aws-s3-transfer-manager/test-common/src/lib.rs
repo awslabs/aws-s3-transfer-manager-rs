@@ -32,7 +32,7 @@ pub fn create_test_dir(
         // Create the parent directories if they don't exist
         fs::create_dir_all(parent).unwrap();
 
-        // Create the .jpg file with the specified size
+        // Create the file with the specified size
         let mut file = fs::File::create(&full_path).unwrap();
         file.write_all(&vec![0; size]).unwrap(); // Writing `size` byte
     }
