@@ -205,8 +205,7 @@ async fn do_recursive_upload(
         .key_prefix(key_prefix)
         .recursive(true)
         .send()
-        .await
-        .unwrap();
+        .await?;
 
     let output = handle.join().await?;
     tracing::info!("recursive upload output: {output:?}");
