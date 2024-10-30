@@ -44,16 +44,16 @@ impl UploadObjects {
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
         let mut tasks = JoinSet::new();
-        let (work_tx, work_rx) = async_channel::bounded(concurrency);
+        let (list_directory_tx, list_directory_rx) = async_channel::bounded(concurrency);
 
         // spawn worker to discover/distribute work
         tasks.spawn(worker::list_directory_contents(
             ctx.state.input.clone(),
-            work_tx,
+            list_directory_tx,
         ));
 
         for i in 0..concurrency {
-            let worker = worker::upload_objects(ctx.clone(), work_rx.clone())
+            let worker = worker::upload_objects(ctx.clone(), list_directory_rx.clone())
                 .instrument(tracing::debug_span!("object-uploader", worker = i));
             tasks.spawn(worker);
         }

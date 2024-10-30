@@ -34,7 +34,7 @@ impl UploadObjectJob {
 
 pub(super) async fn list_directory_contents(
     input: UploadObjectsInput,
-    work_tx: Sender<Result<UploadObjectJob, error::Error>>,
+    list_directory_tx: Sender<Result<UploadObjectJob, error::Error>>,
 ) -> Result<(), error::Error> {
     // Move a blocking I/O to a dedicated thread pool
     let mut walker = Unblock::new(walker(&input).into_iter());
@@ -77,7 +77,7 @@ pub(super) async fn list_directory_contents(
             }
             Err(e) => Err(crate::error::Error::from(BuildError::other(e))),
         };
-        work_tx.send(job).await.expect("channel valid");
+        list_directory_tx.send(job).await.expect("channel valid");
     }
 
     Ok(())
@@ -131,9 +131,9 @@ fn derive_object_key<'a>(
 
 pub(super) async fn upload_objects(
     ctx: UploadObjectsContext,
-    work_rx: Receiver<Result<UploadObjectJob, error::Error>>,
+    list_directory_rx: Receiver<Result<UploadObjectJob, error::Error>>,
 ) -> Result<(), error::Error> {
-    while let Ok(job) = work_rx.recv().await {
+    while let Ok(job) = list_directory_rx.recv().await {
         match job {
             Ok(job) => {
                 let key = job.key.clone();
@@ -299,13 +299,13 @@ mod unit {
         async fn exercise_list_directory_contents(
             input: UploadObjectsInput,
         ) -> (BTreeMap<String, usize>, Vec<error::Error>) {
-            let (work_tx, work_rx) = async_channel::unbounded();
+            let (list_directory_tx, list_directory_rx) = async_channel::unbounded();
 
-            let join_handle = tokio::spawn(list_directory_contents(input, work_tx));
+            let join_handle = tokio::spawn(list_directory_contents(input, list_directory_tx));
 
             let mut successes = BTreeMap::new();
             let mut errors = Vec::new();
-            while let Ok(job) = work_rx.recv().await {
+            while let Ok(job) = list_directory_rx.recv().await {
                 match job {
                     Ok(job) => {
                         successes.insert(job.key, job.object.size_hint().upper().unwrap() as usize);
