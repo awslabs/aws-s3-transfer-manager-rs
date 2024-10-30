@@ -16,6 +16,9 @@ pub struct UploadObjectsFluentBuilder {
     inner: UploadObjectsInputBuilder,
 }
 
+// TODO(https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/68):
+// Use `Option<&str>` instead of `&Option<String>` consistently throughout the codebase
+
 impl UploadObjectsFluentBuilder {
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> Self {
         Self {
