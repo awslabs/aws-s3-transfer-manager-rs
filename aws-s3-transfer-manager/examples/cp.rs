@@ -195,18 +195,20 @@ async fn do_recursive_upload(
 ) -> Result<(), BoxError> {
     let Args { source, dest, .. } = args;
     let source_dir = source.expect_local();
-    let (bucket, _) = dest.expect_s3().parts();
+    let (bucket, key_prefix) = dest.expect_s3().parts();
 
     let start = time::Instant::now();
     let handle = tm
         .upload_objects()
         .source(source_dir)
         .bucket(bucket)
+        .key_prefix(key_prefix)
+        .recursive(true)
         .send()
         .await
         .unwrap();
 
-    let output = handle.join().await.unwrap();
+    let output = handle.join().await?;
     tracing::info!("recursive upload output: {output:?}");
 
     let elapsed = start.elapsed();
