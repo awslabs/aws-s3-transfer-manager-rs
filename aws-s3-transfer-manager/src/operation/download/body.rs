@@ -8,6 +8,8 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use tokio::sync::mpsc;
 
+use super::object_meta::ObjectMetadata;
+
 /// Stream of binary data representing an Amazon S3 Object's contents.
 ///
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
@@ -28,6 +30,8 @@ pub struct ChunkResponse {
     pub(crate) seq: u64,
     /// data: chunk data
     pub data: AggregatedBytes,
+    /// metadata
+    pub metadata: ObjectMetadata,
 }
 
 impl Body {

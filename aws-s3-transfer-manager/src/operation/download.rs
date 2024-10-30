@@ -18,6 +18,7 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
+use object_meta::ObjectMetadata;
 use tracing::Instrument;
 
 mod object_meta;
@@ -84,6 +85,8 @@ impl Download {
         let mut discovery = discover_obj(&ctx, &input).await?;
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
 
+        // TODO: waahm7 fix
+        let meta_data = discovery.meta.clone();
         let initial_chunk = discovery.initial_chunk.take();
 
         let mut handle = DownloadHandle {
@@ -104,6 +107,7 @@ impl Download {
             &comp_tx,
             permit,
             parent_span_for_tasks.clone(),
+            meta_data,
         );
 
         if !discovery.remaining.is_empty() {
@@ -135,6 +139,7 @@ fn handle_discovery_chunk(
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
     parent_span_for_tasks: tracing::Span,
+    meta_data: ObjectMetadata,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
         let seq = handle.ctx.next_seq();
@@ -148,6 +153,7 @@ fn handle_discovery_chunk(
                 .map(|aggregated| ChunkResponse {
                     seq,
                     data: aggregated,
+                    metadata: meta_data,
                 })
                 .map_err(error::discovery_failed);
 
