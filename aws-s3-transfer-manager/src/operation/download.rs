@@ -26,9 +26,9 @@ mod service;
 use crate::error;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::Body;
+use body::{Body, ChunkResponse};
 use discovery::discover_obj;
-use service::{distribute_work, ChunkResponse};
+use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -147,7 +147,7 @@ fn handle_discovery_chunk(
                 .await
                 .map(|aggregated| ChunkResponse {
                     seq,
-                    data: Some(aggregated),
+                    data: aggregated,
                 })
                 .map_err(error::discovery_failed);
 

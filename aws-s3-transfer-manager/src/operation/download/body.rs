@@ -2,7 +2,6 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::service::ChunkResponse;
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use std::cmp;
 use std::cmp::Ordering;
@@ -20,6 +19,16 @@ pub struct Body {
 }
 
 type BodyChannel = mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>;
+
+#[derive(Debug, Clone)]
+/// TODO: DOcs
+pub struct ChunkResponse {
+    // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
+    // the seq number
+    pub(crate) seq: u64,
+    /// data: chunk data
+    pub data: AggregatedBytes,
+}
 
 impl Body {
     /// Create a new empty Body
@@ -50,7 +59,7 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
-    pub async fn next(&mut self) -> Option<Result<AggregatedBytes, crate::error::Error>> {
+    pub async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
         // TODO(aws-sdk-rust#1159, design) - do we want ChunkResponse (or similar) rather than AggregatedBytes? Would
         //  make additional retries of an individual chunk/part more feasible (though theoretically already exhausted retries)
         loop {
@@ -67,15 +76,13 @@ impl Body {
 
         let chunk = self
             .sequencer
-            .pop()
-            .map(|r| Ok(r.data.expect("chunk data")));
-
-        if chunk.is_some() {
-            // if we actually pulled data out, advance the next sequence we expect
+            .pop();
+        if let Some(chunk) = chunk {
             self.sequencer.advance();
+            Some(Ok(chunk))
+        } else {
+            None
         }
-
-        chunk
     }
 
     /// Close the body, no more data will flow from it and all publishers will be notified.
@@ -219,7 +226,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
             received.push(data);
         }
 

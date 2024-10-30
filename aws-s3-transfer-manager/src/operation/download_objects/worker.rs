@@ -152,7 +152,7 @@ async fn download_single_obj(
 
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        for segment in chunk.into_segments() {
+        for segment in chunk.data.into_segments() {
             dest.write_all(segment.as_ref()).await?;
         }
     }

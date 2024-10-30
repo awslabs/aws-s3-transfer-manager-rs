@@ -8,7 +8,7 @@ use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
 use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
+use aws_smithy_types::byte_stream::ByteStream;
 use std::cmp;
 use std::mem;
 use std::ops::RangeInclusive;
@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
+use super::body::ChunkResponse;
 use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
@@ -85,7 +86,7 @@ async fn download_specific_chunk(
 
     Ok(ChunkResponse {
         seq,
-        data: Some(bytes),
+        data: bytes,
     })
 }
 
@@ -104,14 +105,6 @@ pub(super) fn chunk_service(
         .service(svc)
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ChunkResponse {
-    // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
-    // the seq number
-    pub(crate) seq: u64,
-    // chunk data
-    pub(crate) data: Option<AggregatedBytes>,
-}
 
 /// Spawn tasks to download the remaining chunks of object data
 ///
