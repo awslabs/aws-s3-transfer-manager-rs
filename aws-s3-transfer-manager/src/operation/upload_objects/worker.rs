@@ -72,7 +72,7 @@ pub(super) async fn list_directory_contents(
                         );
                         Ok(UploadObjectJob::new(object_key.into_owned(), object))
                     }
-                    Err(e) => Err(crate::error::Error::from(BuildError::other(e))),
+                    Err(e) => Err(e.into()),
                 }
             }
             Err(e) => Err(crate::error::Error::from(BuildError::other(e))),
