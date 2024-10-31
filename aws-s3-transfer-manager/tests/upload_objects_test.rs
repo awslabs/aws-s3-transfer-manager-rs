@@ -217,7 +217,7 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
     assert_eq!(1, output.failed_transfers().len());
     assert!(output.failed_transfers()[0]
         .input()
-        .map(|input| input.bucket() == Some(bucket_name))
+        .map(|input| input.bucket() == Some(bucket_name) && input.key() == Some("sample.jpg"))
         .unwrap_or_default());
     assert_eq!(0, output.total_bytes_transferred());
 }
