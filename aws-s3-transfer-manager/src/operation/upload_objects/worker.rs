@@ -146,15 +146,18 @@ pub(super) async fn upload_objects(
                             .total_bytes_transferred
                             .fetch_add(bytes_transferred, Ordering::SeqCst);
 
-                        tracing::debug!("worker finished uploading object {:?}", key);
+                        tracing::debug!("worker finished uploading object {key:?}");
                     }
                     Err(err) => {
-                        tracing::debug!("worker failed to upload object {:?}: {}", key, err);
+                        tracing::debug!("worker failed to upload object {key:?}: {err}");
                         handle_failed_upload(err, &ctx, Some(key))?;
                     }
                 }
             }
-            Err(err) => handle_failed_upload(err, &ctx, None)?,
+            Err(err) => {
+                tracing::debug!("worker received an error from the `list_directory` task: {err}");
+                handle_failed_upload(err, &ctx, None)?;
+            }
         }
     }
 
