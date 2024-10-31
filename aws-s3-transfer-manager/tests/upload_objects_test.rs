@@ -11,6 +11,7 @@ use aws_s3_transfer_manager::{
     types::{FailedTransferPolicy, PartSize},
 };
 use aws_sdk_s3::{
+    config::http::HttpResponse,
     error::DisplayErrorContext,
     operation::{
         complete_multipart_upload::CompleteMultipartUploadOutput,
@@ -20,6 +21,8 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
+use aws_smithy_runtime_api::http::StatusCode;
+use aws_smithy_types::body::SdkBody;
 use test_common::create_test_dir;
 
 // Create an S3 client with mock behavior configured for `PutObject`
@@ -180,7 +183,43 @@ async fn test_failed_upload_policy_continue() {
     let output = handle.join().await.unwrap();
     assert_eq!(2, output.objects_uploaded());
     assert_eq!(1, output.failed_transfers().len()); // Cannot traverse inaccessible dir to count how many files are in it
+    assert!(output.failed_transfers()[0].input().is_none()); // No `UploadInput` in the case of client error
     assert_eq!(2, output.total_bytes_transferred());
+}
+
+#[tokio::test]
+async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
+    let test_dir = create_test_dir(Some("test"), vec![("sample.jpg", 1)], &[]);
+
+    let bucket_name = "test-bucket";
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_http_response(|| {
+            HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
+        });
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .failure_policy(FailedTransferPolicy::Continue)
+        .send()
+        .await
+        .unwrap();
+
+    let output = handle.join().await.unwrap();
+    assert_eq!(0, output.objects_uploaded());
+    assert_eq!(1, output.failed_transfers().len());
+    assert!(output.failed_transfers()[0]
+        .input()
+        .map(|input| input.bucket() == Some(bucket_name))
+        .unwrap_or_default());
+    assert_eq!(0, output.total_bytes_transferred());
 }
 
 /// Fail when source is not a directory
