@@ -21,6 +21,7 @@ pub mod download_objects;
 /// Types for multiple object upload operation
 pub mod upload_objects;
 
+// The default delimiter of the S3 object key
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
 /// Container for maintaining context required to carry out a single operation/transfer.
