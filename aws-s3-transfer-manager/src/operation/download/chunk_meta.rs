@@ -7,6 +7,8 @@ use std::str::FromStr;
 
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::operation::RequestId;
+use aws_sdk_s3::operation::RequestIdExt;
 
 use crate::http::header;
 
@@ -15,7 +17,9 @@ use crate::http::header;
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 #[derive(Debug, Clone, Default)]
-pub struct ObjectMetadata {
+pub struct ChunkMetadata {
+    pub requet_id: Option<String>,
+    pub extended_request_id: Option<String>,
     pub delete_marker: Option<bool>,
     pub accept_ranges: Option<String>,
     pub expiration: Option<String>,
@@ -54,7 +58,7 @@ pub struct ObjectMetadata {
     pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
 }
 
-impl ObjectMetadata {
+impl ChunkMetadata {
     /// The total object size
     pub fn total_size(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
@@ -95,9 +99,11 @@ impl ObjectMetadata {
     }
 }
 
-impl From<GetObjectOutput> for ObjectMetadata {
+impl From<GetObjectOutput> for ChunkMetadata {
     fn from(value: GetObjectOutput) -> Self {
         Self {
+            requet_id: value.request_id().map(|s| s.to_string()),
+            extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
             accept_ranges: value.accept_ranges,
             expiration: value.expiration,
@@ -139,9 +145,11 @@ impl From<GetObjectOutput> for ObjectMetadata {
     }
 }
 
-impl From<HeadObjectOutput> for ObjectMetadata {
+impl From<HeadObjectOutput> for ChunkMetadata {
     fn from(value: HeadObjectOutput) -> Self {
         Self {
+            requet_id: value.request_id().map(|s| s.to_string()),
+            extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
             accept_ranges: value.accept_ranges,
             expiration: value.expiration,
@@ -185,11 +193,11 @@ impl From<HeadObjectOutput> for ObjectMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::ObjectMetadata;
+    use super::ChunkMetadata;
 
     #[test]
     fn test_inferred_content_length() {
-        let meta = ObjectMetadata {
+        let meta = ChunkMetadata {
             content_length: Some(4),
             content_range: Some("should ignore".to_owned()),
             ..Default::default()
@@ -197,7 +205,7 @@ mod tests {
 
         assert_eq!(4, meta.content_length());
 
-        let meta = ObjectMetadata {
+        let meta = ChunkMetadata {
             content_length: None,
             content_range: Some("bytes 0-499/900".to_owned()),
             ..Default::default()

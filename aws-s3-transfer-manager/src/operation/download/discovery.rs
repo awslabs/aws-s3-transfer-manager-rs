@@ -12,7 +12,7 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use tracing::Instrument;
 
-use super::object_meta::ObjectMetadata;
+use super::chunk_meta::ChunkMetadata;
 use super::DownloadContext;
 use super::DownloadInput;
 use crate::error;
@@ -35,7 +35,7 @@ pub(super) struct ObjectDiscovery {
     pub(super) remaining: RangeInclusive<u64>,
 
     /// the discovered metadata
-    pub(super) meta: ObjectMetadata,
+    pub(super) meta: ChunkMetadata,
 
     /// the first chunk of data if fetched during discovery
     pub(super) initial_chunk: Option<ByteStream>,
@@ -111,7 +111,7 @@ async fn discover_obj_with_head(
     input: &DownloadInput,
     byte_range: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let meta: ObjectMetadata = ctx
+    let meta: ChunkMetadata = ctx
         .client()
         .head_object()
         .set_bucket(input.bucket().map(str::to_string))
@@ -154,7 +154,7 @@ async fn discover_obj_with_get(
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
 
-    let meta: ObjectMetadata = resp.into();
+    let meta: ChunkMetadata = resp.into();
     let content_len = meta.content_length();
 
     let remaining = match range {

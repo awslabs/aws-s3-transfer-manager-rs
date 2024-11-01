@@ -106,7 +106,6 @@ pub(super) fn chunk_service(
         .service(svc)
 }
 
-
 /// Spawn tasks to download the remaining chunks of object data
 ///
 /// # Arguments

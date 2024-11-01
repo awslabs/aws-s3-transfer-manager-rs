@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use tokio::sync::mpsc;
 
-use super::object_meta::ObjectMetadata;
+use super::chunk_meta::ChunkMetadata;
 
 /// Stream of binary data representing an Amazon S3 Object's contents.
 ///
@@ -31,7 +31,7 @@ pub struct ChunkResponse {
     /// data: chunk data
     pub data: AggregatedBytes,
     /// metadata
-    pub metadata: ObjectMetadata,
+    pub metadata: ChunkMetadata,
 }
 
 impl Body {
@@ -78,9 +78,7 @@ impl Body {
             }
         }
 
-        let chunk = self
-            .sequencer
-            .pop();
+        let chunk = self.sequencer.pop();
         if let Some(chunk) = chunk {
             self.sequencer.advance();
             Some(Ok(chunk))

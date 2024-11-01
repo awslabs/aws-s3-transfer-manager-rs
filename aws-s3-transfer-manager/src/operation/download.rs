@@ -6,6 +6,7 @@
 mod input;
 
 use aws_sdk_s3::error::DisplayErrorContext;
+use chunk_meta::ChunkMetadata;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
@@ -18,10 +19,9 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
-use object_meta::ObjectMetadata;
 use tracing::Instrument;
 
-mod object_meta;
+mod chunk_meta;
 mod service;
 
 use crate::error;
@@ -139,7 +139,7 @@ fn handle_discovery_chunk(
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
     parent_span_for_tasks: tracing::Span,
-    meta_data: ObjectMetadata,
+    meta_data: ChunkMetadata,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
         let seq = handle.ctx.next_seq();

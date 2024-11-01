@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::operation::download::body::Body;
-use crate::operation::download::object_meta::ObjectMetadata;
+use crate::operation::download::chunk_meta::ChunkMetadata;
 use tokio::task;
 
 use super::DownloadContext;
@@ -13,7 +13,7 @@ use super::DownloadContext;
 #[non_exhaustive]
 pub struct DownloadHandle {
     /// Object metadata
-    pub object_meta: ObjectMetadata,
+    pub object_meta: ChunkMetadata,
 
     /// The object content
     pub(crate) body: Body,
@@ -27,7 +27,7 @@ pub struct DownloadHandle {
 
 impl DownloadHandle {
     /// Object metadata
-    pub fn object_meta(&self) -> &ObjectMetadata {
+    pub fn object_meta(&self) -> &ChunkMetadata {
         &self.object_meta
     }
 
