@@ -5,7 +5,9 @@
 
 use std::default::Default;
 use std::fmt;
+use std::future::poll_fn;
 use std::path::Path;
+use std::pin::Pin;
 
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
@@ -127,14 +129,18 @@ pub trait PartStream {
 }
 
 pub(crate) struct BoxStream {
-    inner: Box<dyn PartStream + Send + Sync + 'static>,
+    inner: Pin<Box<dyn PartStream + Send + Sync + 'static>>,
 }
 
 impl BoxStream {
     fn new<T: PartStream + Send + Sync + 'static>(inner: T) -> Self {
         BoxStream {
-            inner: Box::new(inner),
+            inner: Box::pin(inner),
         }
+    }
+
+    pub(crate) async fn next(&mut self) -> Option<std::io::Result<PartData>> {
+        poll_fn(|cx| self.inner.as_mut().poll_part(cx)).await
     }
 }
 

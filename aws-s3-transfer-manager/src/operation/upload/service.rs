@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     error,
     io::{
-        part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
+        part_reader::{Builder as PartReaderBuilder, PartData, PartReader},
         InputStream,
     },
     middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
@@ -155,7 +155,7 @@ pub(super) fn distribute_work(
 /// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader
 /// is exhausted. If any part fails, the worker will return the error and stop processing.
 pub(super) async fn read_body(
-    part_reader: Arc<impl ReadPart>,
+    part_reader: Arc<PartReader>,
     ctx: UploadContext,
     svc: impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
         + Clone

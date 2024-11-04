@@ -14,7 +14,9 @@ use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
 use crate::metrics::unit::ByteUnit;
 
-/// Builder for creating a `ReadPart` implementation.
+use super::stream::BoxStream;
+
+/// Builder for creating a `PartReader`
 #[derive(Debug)]
 pub(crate) struct Builder {
     stream: Option<RawInputStream>,
@@ -43,31 +45,44 @@ impl Builder {
         self
     }
 
-    pub(crate) fn build(self) -> impl ReadPart {
+    pub(crate) fn build(self) -> PartReader {
         let stream = self.stream.expect("input stream set");
-        match stream {
-            RawInputStream::Buf(buf) => {
-                PartReader::Bytes(BytesPartReader::new(buf, self.part_size))
-            }
-            RawInputStream::Fs(path_body) => {
-                PartReader::Fs(PathBodyPartReader::new(path_body, self.part_size))
-            }
-            RawInputStream::Dyn(_) => todo!(),
-        }
+        PartReader::new(stream, self.part_size)
     }
 }
 
 #[derive(Debug)]
-enum PartReader {
-    Bytes(BytesPartReader),
-    Fs(PathBodyPartReader),
+pub(crate) struct PartReader {
+    inner: Inner,
 }
 
-impl ReadPart for PartReader {
-    async fn next_part(&self) -> Result<Option<PartData>, Error> {
-        match self {
-            PartReader::Bytes(bytes) => bytes.next_part().await,
-            PartReader::Fs(path_body) => path_body.next_part().await,
+impl PartReader {
+    fn new(raw: RawInputStream, part_size: usize) -> Self {
+        let inner = match raw {
+            RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf, part_size)),
+            RawInputStream::Fs(path_body) => {
+                Inner::Fs(PathBodyPartReader::new(path_body, part_size))
+            }
+            RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
+        };
+
+        Self { inner }
+    }
+}
+
+#[derive(Debug)]
+enum Inner {
+    Bytes(BytesPartReader),
+    Fs(PathBodyPartReader),
+    Dyn(DynPartReader),
+}
+
+impl PartReader {
+    pub(crate) async fn next_part(&self) -> Result<Option<PartData>, Error> {
+        match &self.inner {
+            Inner::Bytes(bytes) => bytes.next_part().await,
+            Inner::Fs(path_body) => path_body.next_part().await,
+            Inner::Dyn(part_stream) => part_stream.next_part().await,
         }
     }
 }
@@ -81,17 +96,14 @@ pub struct PartData {
     pub(crate) data: Bytes,
 }
 
-/// The `ReadPart` trait allows for reading data from an `InputStream` and packaging the raw
-/// data into `PartData` which carries additional metadata needed for uploading a part.
-pub(crate) trait ReadPart {
-    /// Request the next "part" of data.
-    ///
-    /// When there is no more data readers should return `Ok(None)`.
-    /// NOTE: Implementations are allowed to return data in any order and consumers are
-    /// expected to order data by the part number.
-    fn next_part(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Option<PartData>, Error>> + Send;
+impl PartData {
+    /// Create a new part
+    fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+        Self {
+            part_number,
+            data: data.into(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -120,7 +132,7 @@ impl PartReaderState {
     }
 }
 
-/// [ReadPart] implementation for in-memory input streams.
+/// Implementation for in-memory input streams.
 #[derive(Debug)]
 struct BytesPartReader {
     buf: Bytes,
@@ -139,7 +151,7 @@ impl BytesPartReader {
     }
 }
 
-impl ReadPart for BytesPartReader {
+impl BytesPartReader {
     async fn next_part(&self) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.remaining == 0 {
@@ -153,12 +165,12 @@ impl ReadPart for BytesPartReader {
         state.part_number += 1;
         state.offset += data.len() as u64;
         state.remaining -= data.len() as u64;
-        let part = PartData { data, part_number };
+        let part = PartData::new(part_number, data);
         Ok(Some(part))
     }
 }
 
-/// [ReadPart] implementation for path based input streams
+/// Implementation for path based input streams
 #[derive(Debug)]
 struct PathBodyPartReader {
     body: PathBody,
@@ -178,7 +190,7 @@ impl PathBodyPartReader {
     }
 }
 
-impl ReadPart for PathBodyPartReader {
+impl PathBodyPartReader {
     async fn next_part(&self) -> Result<Option<PartData>, Error> {
         let (offset, part_number, part_size) = {
             let mut state = self.state.lock().expect("lock valid");
@@ -205,7 +217,7 @@ impl ReadPart for PathBodyPartReader {
             unsafe { dst.set_len(dst.capacity()) }
             file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
             let data = dst.freeze();
-            Ok::<PartData, Error>(PartData { data, part_number })
+            Ok::<PartData, Error>(PartData::new(part_number, data))
         });
 
         handle.await?.map(Some)
@@ -254,17 +266,40 @@ mod file_util {
     }
 }
 
+#[derive(Debug)]
+struct DynPartReader {
+    inner: tokio::sync::Mutex<BoxStream>,
+}
+
+impl DynPartReader {
+    fn new(inner: BoxStream) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(inner),
+        }
+    }
+    async fn next_part(&self) -> Result<Option<PartData>, Error> {
+        // TODO - can we do better than a mutex here? should we spawn a dedicated task and use channels instead
+        let mut stream = self.inner.lock().await;
+        match stream.next().await {
+            Some(result) => result.map(Some).map_err(|err| err.into()),
+            None => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::io::Write;
+    use std::task::Poll;
 
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
-    use crate::io::part_reader::{Builder, PartData, ReadPart};
+    use crate::io::part_reader::{Builder, PartData, PartReader};
+    use crate::io::stream::PartStream;
     use crate::io::InputStream;
 
-    async fn collect_parts(reader: impl ReadPart) -> Vec<PartData> {
+    async fn collect_parts(reader: PartReader) -> Vec<PartData> {
         let mut parts = Vec::new();
         let mut expected_part_number = 1;
         while let Some(part) = reader.next_part().await.unwrap() {
@@ -333,5 +368,53 @@ mod test {
     #[tokio::test]
     async fn test_path_part_reader_with_length_and_offset() {
         path_reader_test(Some(23), Some(4)).await;
+    }
+
+    #[derive(Debug)]
+    struct TestStream {
+        data: Vec<Bytes>,
+        idx: usize,
+    }
+
+    impl TestStream {
+        fn new(data: Vec<Bytes>) -> Self {
+            Self { data, idx: 0 }
+        }
+    }
+
+    impl PartStream for TestStream {
+        fn poll_part(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<Option<std::io::Result<PartData>>> {
+            if self.idx < self.data.len() {
+                let part = PartData::new(self.idx as u64 + 1, self.data[self.idx].clone());
+                self.as_mut().idx += 1;
+                Poll::Ready(Some(Ok(part)))
+            } else {
+                Poll::Ready(None)
+            }
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            unimplemented!()
+        }
+    }
+
+    // sanity test custom PollPart is wired up and can be supplied to input stream
+    #[tokio::test]
+    async fn test_dyn_reader() {
+        let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
+        let expected = data.chunks(5).collect::<Vec<_>>();
+        let stream = TestStream::new(
+            data.chunks(5)
+                .map(|x| Bytes::from(x.to_owned()))
+                .collect::<Vec<_>>(),
+        );
+        let stream = InputStream::from_part_stream(stream);
+        let reader = Builder::new().part_size(5).stream(stream).build();
+        let parts = collect_parts(reader).await;
+        let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
+        assert_eq!(expected, actual);
     }
 }
