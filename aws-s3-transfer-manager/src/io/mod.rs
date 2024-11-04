@@ -6,6 +6,7 @@
 pub(crate) mod part_reader;
 mod path_body;
 mod stream;
+//mod part_stream;
 
 /// Error types related to I/O abstractions
 pub mod error;

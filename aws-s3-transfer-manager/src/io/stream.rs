@@ -4,6 +4,7 @@
  */
 
 use std::default::Default;
+use std::fmt;
 use std::path::Path;
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -13,6 +14,8 @@ use crate::error;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
+
+use super::part_reader::PartData;
 
 /// Source of binary data.
 ///
@@ -84,7 +87,14 @@ impl InputStream {
                 .await
                 .map_err(error::from_kind(error::ErrorKind::IOError)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
+            RawInputStream::Dyn(_) => todo!(),
         }
+    }
+
+    /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation.
+    pub fn from_part_stream<T: PartStream + Send + Sync + 'static>(stream: T) -> Self {
+        let inner = RawInputStream::Dyn(BoxStream::new(stream));
+        Self { inner }
     }
 }
 
@@ -94,6 +104,44 @@ pub(super) enum RawInputStream {
     Buf(Bytes),
     /// File based input
     Fs(PathBody),
+    /// User provided custom stream
+    Dyn(BoxStream),
+}
+
+/// Trait representing a stream of object parts (streaming body).
+///
+/// Individual parts are streamed via the `poll_part` function, which asynchronously yields
+/// instances of `PartData`. When `Poll::Ready(None)` is returned the stream is assumed to have
+/// reached EOF and is finished.
+///
+/// The `size_hint` function provides insight into the total number of bytes that will be streamed.
+pub trait PartStream {
+    /// Attempt to pull the next part from the stream
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::io::Result<PartData>>>;
+
+    /// Returns the bounds on the total size of the stream
+    fn size_hint(&self) -> crate::io::SizeHint;
+}
+
+pub(crate) struct BoxStream {
+    inner: Box<dyn PartStream + Send + Sync + 'static>,
+}
+
+impl BoxStream {
+    fn new<T: PartStream + Send + Sync + 'static>(inner: T) -> Self {
+        BoxStream {
+            inner: Box::new(inner),
+        }
+    }
+}
+
+impl fmt::Debug for BoxStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoxStream(dyn PartStream)").finish()
+    }
 }
 
 impl RawInputStream {
@@ -101,6 +149,7 @@ impl RawInputStream {
         match self {
             RawInputStream::Buf(bytes) => SizeHint::exact(bytes.remaining() as u64),
             RawInputStream::Fs(path_body) => SizeHint::exact(path_body.length),
+            RawInputStream::Dyn(box_body) => box_body.inner.size_hint(),
         }
     }
 }

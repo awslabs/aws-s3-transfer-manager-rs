@@ -127,6 +127,7 @@ mod test {
     fn path_body(stream: &InputStream) -> &PathBody {
         match &stream.inner {
             crate::io::stream::RawInputStream::Buf(_) => panic!("unexpected inner body"),
+            crate::io::stream::RawInputStream::Dyn(_) => panic!("unexpected inner body"),
             crate::io::stream::RawInputStream::Fs(path_body) => path_body,
         }
     }

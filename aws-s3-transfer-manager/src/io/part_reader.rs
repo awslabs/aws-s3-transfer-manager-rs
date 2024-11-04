@@ -52,6 +52,7 @@ impl Builder {
             RawInputStream::Fs(path_body) => {
                 PartReader::Fs(PathBodyPartReader::new(path_body, self.part_size))
             }
+            RawInputStream::Dyn(_) => todo!(),
         }
     }
 }
@@ -71,9 +72,10 @@ impl ReadPart for PartReader {
     }
 }
 
+// TODO - relocate type and add new(...) methods
 /// Data for a single part
 #[derive(Debug, Clone)]
-pub(crate) struct PartData {
+pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
