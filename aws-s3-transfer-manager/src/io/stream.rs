@@ -13,11 +13,11 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 
 use crate::error;
+use crate::io::part_reader::PartData;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
-
-use super::part_reader::PartData;
+use crate::io::Buffer;
 
 /// Source of binary data.
 ///
@@ -152,10 +152,12 @@ impl StreamContext {
         self.part_size
     }
 
-    // TODO - add a way to get a new buffer allocation to fill from this context
-    // fn new_buffer(&self) -> impl bytes::BufMut {
-    //     todo!()
-    // }
+    // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.
+    /// Request a new buffer to fill
+    pub(crate) fn new_buffer(&self, capacity: usize) -> Buffer {
+        // TODO - replace allocation with memory pool
+        Buffer::new(capacity)
+    }
 }
 
 /// Trait representing a stream of object parts (streaming body).

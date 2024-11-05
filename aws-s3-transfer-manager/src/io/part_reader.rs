@@ -205,15 +205,19 @@ impl PathBodyPartReader {
             (offset, part_number, part_size)
         };
         let path = self.body.path.clone();
+        // grab a buffer to fill from the context
+        let mut dst = stream_cx.new_buffer(part_size as usize);
         let handle = tokio::task::spawn_blocking(move || {
-            // TODO(aws-sdk-rust#1159) - replace allocation with memory pool
-            let mut dst = BytesMut::with_capacity(part_size as usize);
-            // we need to set the length so that the raw &[u8] slice has the correct
-            // size, we are guaranteed to read exactly part_size data from file on success
+            // SAFETY:  std::io::Read and FileExt traits take `&mut [u8]` buffer arguments (i.e.
+            // initialized). The `Deref` and `DerefMut` implementations of `Buffer`
+            // only return a slice of the _initialized_ portion of the buffer though.
+            // We need to set the length so that the raw `&[u8]` slice has the correct
+            // size. We are guaranteed to read exactly part_size data from file on success so
+            // any read of that slice after `read_file_chunk_sync` returns successfully will have
+            // been initialized.
             unsafe { dst.set_len(dst.capacity()) }
             file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
-            let data = dst.freeze();
-            Ok::<PartData, Error>(PartData::new(part_number, data))
+            Ok::<PartData, Error>(PartData::new(part_number, dst))
         });
 
         handle.await?.map(Some)
