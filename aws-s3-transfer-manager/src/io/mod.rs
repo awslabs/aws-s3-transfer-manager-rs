@@ -16,3 +16,4 @@ mod size_hint;
 pub use self::path_body::PathBodyBuilder;
 pub use self::size_hint::SizeHint;
 pub use self::stream::InputStream;
+pub use self::stream::PartStream;

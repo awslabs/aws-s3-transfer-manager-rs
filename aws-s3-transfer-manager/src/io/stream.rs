@@ -22,6 +22,18 @@ use super::part_reader::PartData;
 /// Source of binary data.
 ///
 /// `InputStream` wraps a stream of data for ease of use.
+///
+/// To create an `InputStream`:
+///
+/// * From an in-memory source: use [`from_static`] or one of the provided `From` implementations.
+/// * From a file path: use [`from_path`] or [`read_from`]
+/// * From a custom implementation: use [`from_part_stream`]
+///
+/// [`from_static`]: InputStream::from_static
+/// [`from_path`]: InputStream::from_path
+/// [`read_from`]: InputStream::read_from
+/// [`from_part_stream`]: InputStream::from_part_stream
+///
 #[derive(Debug)]
 pub struct InputStream {
     pub(super) inner: RawInputStream,
@@ -89,11 +101,19 @@ impl InputStream {
                 .await
                 .map_err(error::from_kind(error::ErrorKind::IOError)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
+            // FIXME - if we add checksums this conversion wouldn't be valid, we need to check in
+            // upload if it's a dyn stream or not as well as part size
             RawInputStream::Dyn(_) => todo!(),
         }
     }
 
-    /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation.
+    /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation
+    /// for a [multipart upload].
+    ///
+    /// NOTE: Implementing `PartStream` directly is a more advanced use case. You should reach for
+    /// one of the provided implementations or adapters first if possible.
+    ///
+    /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
     pub fn from_part_stream<T: PartStream + Send + Sync + 'static>(stream: T) -> Self {
         let inner = RawInputStream::Dyn(BoxStream::new(stream));
         Self { inner }
@@ -110,6 +130,26 @@ pub(super) enum RawInputStream {
     Dyn(BoxStream),
 }
 
+/// The context of an input stream.
+#[derive(Debug)]
+pub struct StreamContext {
+    pub(super) part_size: usize,
+}
+
+impl StreamContext {
+    /// The part size to use when yielding parts.
+    /// NOTE: this _may_ differ from the configured part size (e.g. if the target part size would
+    /// result in exceeding the maximum number of parts allowed).
+    pub fn part_size(&self) -> usize {
+        self.part_size
+    }
+
+    // TODO - add a way to get a new buffer allocation to fill from this context
+    // fn new_buffer(&self) -> impl bytes::BufMut {
+    //     todo!()
+    // }
+}
+
 /// Trait representing a stream of object parts (streaming body).
 ///
 /// Individual parts are streamed via the `poll_part` function, which asynchronously yields
@@ -118,9 +158,14 @@ pub(super) enum RawInputStream {
 ///
 /// The `size_hint` function provides insight into the total number of bytes that will be streamed.
 pub trait PartStream {
-    /// Attempt to pull the next part from the stream
+    /// Attempt to pull the next part from the stream.
+    ///
+    /// The `stream_cx` will have the part size that should be utilized. Implementations should be
+    /// careful to only yield full parts for every part except the last one, which _may_ be less
+    /// than the full part size.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
+        stream_cx: &StreamContext,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<std::io::Result<PartData>>>;
 
@@ -139,8 +184,11 @@ impl BoxStream {
         }
     }
 
-    pub(crate) async fn next(&mut self) -> Option<std::io::Result<PartData>> {
-        poll_fn(|cx| self.inner.as_mut().poll_part(cx)).await
+    pub(crate) async fn next(
+        &mut self,
+        stream_cx: &StreamContext,
+    ) -> Option<std::io::Result<PartData>> {
+        poll_fn(|cx| self.inner.as_mut().poll_part(stream_cx, cx)).await
     }
 }
 

@@ -14,7 +14,7 @@ use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
 use crate::metrics::unit::ByteUnit;
 
-use super::stream::BoxStream;
+use super::stream::{BoxStream, StreamContext};
 
 /// Builder for creating a `PartReader`
 #[derive(Debug)]
@@ -54,19 +54,19 @@ impl Builder {
 #[derive(Debug)]
 pub(crate) struct PartReader {
     inner: Inner,
+    stream_cx: StreamContext,
 }
 
 impl PartReader {
     fn new(raw: RawInputStream, part_size: usize) -> Self {
         let inner = match raw {
-            RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf, part_size)),
-            RawInputStream::Fs(path_body) => {
-                Inner::Fs(PathBodyPartReader::new(path_body, part_size))
-            }
+            RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
+            RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)),
             RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
         };
 
-        Self { inner }
+        let stream_cx = StreamContext { part_size };
+        Self { inner, stream_cx }
     }
 }
 
@@ -80,15 +80,16 @@ enum Inner {
 impl PartReader {
     pub(crate) async fn next_part(&self) -> Result<Option<PartData>, Error> {
         match &self.inner {
-            Inner::Bytes(bytes) => bytes.next_part().await,
-            Inner::Fs(path_body) => path_body.next_part().await,
-            Inner::Dyn(part_stream) => part_stream.next_part().await,
+            Inner::Bytes(bytes) => bytes.next_part(&self.stream_cx).await,
+            Inner::Fs(path_body) => path_body.next_part(&self.stream_cx).await,
+            Inner::Dyn(part_stream) => part_stream.next_part(&self.stream_cx).await,
         }
     }
 }
 
-// TODO - relocate type and add new(...) methods
-/// Data for a single part
+/// Contents and (optional) metadata for a single part of a [multipart upload].
+///
+/// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
 #[derive(Debug, Clone)]
 pub struct PartData {
     // 1-indexed
@@ -136,30 +137,28 @@ impl PartReaderState {
 #[derive(Debug)]
 struct BytesPartReader {
     buf: Bytes,
-    part_size: usize,
     state: Mutex<PartReaderState>,
 }
 
 impl BytesPartReader {
-    fn new(buf: Bytes, part_size: usize) -> Self {
+    fn new(buf: Bytes) -> Self {
         let content_length = buf.remaining() as u64;
         Self {
             buf,
-            part_size,
             state: Mutex::new(PartReaderState::new(content_length)), // std Mutex
         }
     }
 }
 
 impl BytesPartReader {
-    async fn next_part(&self) -> Result<Option<PartData>, Error> {
+    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.remaining == 0 {
             return Ok(None);
         }
 
         let start = state.offset as usize;
-        let end = cmp::min(start + self.part_size, self.buf.len());
+        let end = cmp::min(start + stream_cx.part_size(), self.buf.len());
         let data = self.buf.slice(start..end);
         let part_number = state.part_number;
         state.part_number += 1;
@@ -174,24 +173,22 @@ impl BytesPartReader {
 #[derive(Debug)]
 struct PathBodyPartReader {
     body: PathBody,
-    part_size: usize,
     state: Mutex<PartReaderState>, // std Mutex
 }
 
 impl PathBodyPartReader {
-    fn new(body: PathBody, part_size: usize) -> Self {
+    fn new(body: PathBody) -> Self {
         let offset = body.offset;
         let content_length = body.length;
         Self {
             body,
-            part_size,
             state: Mutex::new(PartReaderState::new(content_length).with_offset(offset)), // std Mutex
         }
     }
 }
 
 impl PathBodyPartReader {
-    async fn next_part(&self) -> Result<Option<PartData>, Error> {
+    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let (offset, part_number, part_size) = {
             let mut state = self.state.lock().expect("lock valid");
             if state.remaining == 0 {
@@ -200,7 +197,7 @@ impl PathBodyPartReader {
             let offset = state.offset;
             let part_number = state.part_number;
 
-            let part_size = cmp::min(self.part_size as u64, state.remaining);
+            let part_size = cmp::min(stream_cx.part_size() as u64, state.remaining);
             state.offset += part_size;
             state.part_number += 1;
             state.remaining -= part_size;
@@ -213,7 +210,6 @@ impl PathBodyPartReader {
             let mut dst = BytesMut::with_capacity(part_size as usize);
             // we need to set the length so that the raw &[u8] slice has the correct
             // size, we are guaranteed to read exactly part_size data from file on success
-            // FIXME(aws-sdk-rust#1159) - can we get rid of this use of unsafe?
             unsafe { dst.set_len(dst.capacity()) }
             file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
             let data = dst.freeze();
@@ -277,10 +273,10 @@ impl DynPartReader {
             inner: tokio::sync::Mutex::new(inner),
         }
     }
-    async fn next_part(&self) -> Result<Option<PartData>, Error> {
+    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         // TODO - can we do better than a mutex here? should we spawn a dedicated task and use channels instead
         let mut stream = self.inner.lock().await;
-        match stream.next().await {
+        match stream.next(stream_cx).await {
             Some(result) => result.map(Some).map_err(|err| err.into()),
             None => Ok(None),
         }
@@ -296,7 +292,7 @@ mod test {
     use tempfile::NamedTempFile;
 
     use crate::io::part_reader::{Builder, PartData, PartReader};
-    use crate::io::stream::PartStream;
+    use crate::io::stream::{PartStream, StreamContext};
     use crate::io::InputStream;
 
     async fn collect_parts(reader: PartReader) -> Vec<PartData> {
@@ -385,6 +381,7 @@ mod test {
     impl PartStream for TestStream {
         fn poll_part(
             mut self: std::pin::Pin<&mut Self>,
+            _stream_cx: &StreamContext,
             _cx: &mut std::task::Context<'_>,
         ) -> Poll<Option<std::io::Result<PartData>>> {
             if self.idx < self.data.len() {
