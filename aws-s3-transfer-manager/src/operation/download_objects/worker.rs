@@ -12,7 +12,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::error;
-use crate::operation::download::body::Body;
+use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
 use crate::types::{DownloadFilter, FailedDownloadTransfer, FailedTransferPolicy};
 
@@ -144,7 +144,7 @@ async fn download_single_obj(
     let key_path = local_key_path(root_dir, key.as_str(), prefix, delim)?;
     let mut handle =
         crate::operation::download::Download::orchestrate(ctx.handle.clone(), input, true).await?;
-    let mut body = mem::replace(&mut handle.body, Body::empty());
+    let mut body = mem::replace(&mut handle.body, DownloadOutput::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
     fs::create_dir_all(parent_dir).await?;

@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::body::ChunkResponse;
+use super::output::ChunkResponse;
 use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.

@@ -10,7 +10,7 @@ use std::time;
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
-use aws_s3_transfer_manager::operation::download::body::Body;
+use aws_s3_transfer_manager::operation::download::output::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;

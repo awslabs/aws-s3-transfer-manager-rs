@@ -2,7 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::body::Body;
+use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use tokio::task;
 
@@ -16,7 +16,7 @@ pub struct DownloadHandle {
     pub object_meta: ChunkMetadata,
 
     /// The object content
-    pub(crate) body: Body,
+    pub(crate) body: DownloadOutput,
 
     /// All child tasks spawned for this download
     pub(crate) tasks: task::JoinSet<()>,
@@ -32,12 +32,12 @@ impl DownloadHandle {
     }
 
     /// Object content
-    pub fn body(&self) -> &Body {
+    pub fn body(&self) -> &DownloadOutput {
         &self.body
     }
 
     /// Mutable reference to the body
-    pub fn body_mut(&mut self) -> &mut Body {
+    pub fn body_mut(&mut self) -> &mut DownloadOutput {
         &mut self.body
     }
 

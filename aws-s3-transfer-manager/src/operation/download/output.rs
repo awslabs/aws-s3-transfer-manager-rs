@@ -15,7 +15,7 @@ use super::chunk_meta::ChunkMetadata;
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
 /// The data on this stream is sequenced into the correct order.
 #[derive(Debug)]
-pub struct Body {
+pub struct DownloadOutput {
     inner: UnorderedBody,
     sequencer: Sequencer,
 }
@@ -34,7 +34,7 @@ pub struct ChunkResponse {
     pub metadata: ChunkMetadata,
 }
 
-impl Body {
+impl DownloadOutput {
     /// Create a new empty Body
     pub fn empty() -> Self {
         Self::new_from_channel(None)
@@ -195,7 +195,7 @@ mod tests {
     use bytes::Bytes;
     use tokio::sync::mpsc;
 
-    use super::{Body, Sequencer};
+    use super::{DownloadOutput, Sequencer};
 
     fn chunk_resp(seq: u64, data: Option<AggregatedBytes>) -> ChunkResponse {
         ChunkResponse { seq, data }
@@ -214,7 +214,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let mut body = DownloadOutput::new(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -239,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let mut body = DownloadOutput::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let aggregated = ByteStream::from(data).collect().await.unwrap();

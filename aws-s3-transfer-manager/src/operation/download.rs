@@ -11,7 +11,7 @@ use chunk_meta::ChunkMetadata;
 pub use input::{DownloadInput, DownloadInputBuilder};
 
 /// Abstractions for response bodies and consuming data streams.
-pub mod body;
+pub mod output;
 /// Operation builders
 pub mod builders;
 
@@ -27,7 +27,7 @@ mod service;
 use crate::error;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::{Body, ChunkResponse};
+use output::{DownloadOutput, ChunkResponse};
 use discovery::discover_obj;
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,7 +93,7 @@ impl Download {
             // FIXME(aws-sdk-rust#1159) - initial object discovery for a range/first-part will not
             //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
             object_meta: discovery.meta,
-            body: Body::new(comp_rx),
+            body: DownloadOutput::new(comp_rx),
             // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
             tasks: JoinSet::new(),
             ctx,
