@@ -101,10 +101,18 @@ impl InputStream {
                 .await
                 .map_err(error::from_kind(error::ErrorKind::IOError)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
-            // FIXME - if we add checksums this conversion wouldn't be valid, we need to check in
-            // upload if it's a dyn stream or not as well as part size
-            RawInputStream::Dyn(_) => todo!(),
+            RawInputStream::Dyn(_) => {
+                unreachable!("dyn InputStream should not have into_byte_stream called on it!")
+            }
         }
+    }
+
+    /// Test if this InputStream can only be uploaded via MPU (e.g. a custom `PartStream`
+    /// implementation from a user can only be a MPU due to the ability to provide custom
+    /// metadata like checksums).
+    pub(crate) fn is_mpu_only(&self) -> bool {
+        // TODO - for our own wrappers we can probably be smarter
+        matches!(self.inner, RawInputStream::Dyn(_))
     }
 
     /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation
