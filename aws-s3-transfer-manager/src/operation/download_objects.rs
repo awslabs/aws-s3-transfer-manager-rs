@@ -19,15 +19,14 @@ pub use handle::DownloadObjectsHandle;
 mod list_objects;
 mod worker;
 
-use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use tokio::{fs, task::JoinSet};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::{error, types::FailedDownloadTransfer};
+use crate::types::FailedDownloadTransfer;
 
-use super::TransferContext;
+use super::{validate_target_is_dir, TransferContext};
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -41,7 +40,7 @@ impl DownloadObjects {
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
         //  validate existence of destination and return error if it's not a directory
         let destination = input.destination().expect("destination set");
-        validate_destination(destination).await?;
+        validate_target_is_dir(destination).await?;
 
         // create span to serve as parent of spawned child tasks
         let parent_span_for_tasks = tracing::debug_span!(
@@ -76,23 +75,13 @@ impl DownloadObjects {
     }
 }
 
-async fn validate_destination(path: &Path) -> Result<(), error::Error> {
-    let meta = fs::metadata(path).await?;
-
-    if !meta.is_dir() {
-        return Err(error::invalid_input(format!(
-            "destination is not a directory: {path:?}"
-        )));
-    }
-
-    Ok(())
-}
-
 /// DownloadObjects operation specific state
 #[derive(Debug)]
 pub(crate) struct DownloadObjectsState {
+    // TODO - Determine if `input` should be separated from this struct
+    // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: DownloadObjectsInput,
-    failed_downloads: Mutex<Option<Vec<FailedDownloadTransfer>>>,
+    failed_downloads: Mutex<Vec<FailedDownloadTransfer>>,
     successful_downloads: AtomicU64,
     total_bytes_transferred: AtomicU64,
 }
@@ -103,7 +92,7 @@ impl DownloadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: DownloadObjectsInput) -> Self {
         let state = Arc::new(DownloadObjectsState {
             input,
-            failed_downloads: Mutex::new(None),
+            failed_downloads: Mutex::new(Vec::new()),
             successful_downloads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
         });

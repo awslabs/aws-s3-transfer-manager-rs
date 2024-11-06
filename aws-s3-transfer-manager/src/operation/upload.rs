@@ -46,6 +46,7 @@ impl Upload {
         let ctx = new_context(handle, input);
 
         // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
+        // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
         let content_length = stream
             .size_hint()
             .upper()

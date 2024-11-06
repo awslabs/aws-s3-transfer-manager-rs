@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use crate::error;
 use crate::operation::download::body::Body;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
+use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{DownloadFilter, FailedDownloadTransfer, FailedTransferPolicy};
 
 use super::list_objects::ListObjectsStream;
@@ -110,8 +111,7 @@ pub(super) async fn download_objects(
                     // the tasks on error rather than relying on join and then drop.
                     FailedTransferPolicy::Abort => return Err(err),
                     FailedTransferPolicy::Continue => {
-                        let mut guard = ctx.state.failed_downloads.lock().unwrap();
-                        let mut failures = mem::take(&mut *guard).unwrap_or_default();
+                        let mut failures = ctx.state.failed_downloads.lock().unwrap();
 
                         let failed_transfer = FailedDownloadTransfer {
                             input: job.input(&ctx),
@@ -119,8 +119,6 @@ pub(super) async fn download_objects(
                         };
 
                         failures.push(failed_transfer);
-
-                        let _ = mem::replace(&mut *guard, Some(failures));
                     }
                 }
             }
@@ -161,8 +159,6 @@ async fn download_single_obj(
 
     Ok(())
 }
-
-const DEFAULT_DELIMITER: &str = "/";
 
 /// If the prefix is not empty AND the key contains the delimiter, strip the prefix from the key.
 ///

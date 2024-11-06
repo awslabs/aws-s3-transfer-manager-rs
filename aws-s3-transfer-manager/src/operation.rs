@@ -3,7 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
+
+use tokio::fs;
+
+use crate::error;
 
 /// Types for single object upload operation
 pub mod upload;
@@ -16,6 +20,9 @@ pub mod download_objects;
 
 /// Types for multiple object upload operation
 pub mod upload_objects;
+
+// The default delimiter of the S3 object key
+pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
 /// Container for maintaining context required to carry out a single operation/transfer.
 ///
@@ -40,4 +47,16 @@ impl<State> Clone for TransferContext<State> {
             state: self.state.clone(),
         }
     }
+}
+
+pub(crate) async fn validate_target_is_dir(path: &Path) -> Result<(), error::Error> {
+    let meta = fs::metadata(path).await?;
+
+    if !meta.is_dir() {
+        return Err(error::invalid_input(format!(
+            "target is not a directory: {path:?}"
+        )));
+    }
+
+    Ok(())
 }
