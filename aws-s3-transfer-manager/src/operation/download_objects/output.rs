@@ -13,7 +13,7 @@ pub struct DownloadObjectsOutput {
     pub objects_downloaded: u64,
 
     /// A list of failed object transfers
-    pub failed_transfers: Option<Vec<FailedDownloadTransfer>>,
+    pub failed_transfers: Vec<FailedDownloadTransfer>,
 
     // FIXME - likely remove when progress is implemented?
     /// Total number of bytes transferred
@@ -32,11 +32,8 @@ impl DownloadObjectsOutput {
     }
 
     /// A slice of failed object transfers
-    ///
-    /// If no value was sent for this field, a default will be set. If you want to determine if no value was
-    /// set, use `.failed_transfers.is_none()`
     pub fn failed_transfers(&self) -> &[FailedDownloadTransfer] {
-        self.failed_transfers.as_deref().unwrap_or_default()
+        self.failed_transfers.as_slice()
     }
 
     /// The number of bytes successfully transferred (downloaded)
@@ -50,7 +47,7 @@ impl DownloadObjectsOutput {
 #[derive(Debug, Default)]
 pub struct DownloadObjectsOutputBuilder {
     pub(crate) objects_downloaded: u64,
-    pub(crate) failed_transfers: Option<Vec<FailedDownloadTransfer>>,
+    pub(crate) failed_transfers: Vec<FailedDownloadTransfer>,
     pub(crate) total_bytes_transferred: u64,
 }
 
@@ -71,21 +68,19 @@ impl DownloadObjectsOutputBuilder {
     /// To override the contents of this collection use
     /// [`set_failed_transfers`](Self::set_failed_transfers)
     pub fn failed_transfers(mut self, input: FailedDownloadTransfer) -> Self {
-        self.failed_transfers
-            .get_or_insert_with(Vec::new)
-            .push(input);
+        self.failed_transfers.push(input);
         self
     }
 
-    /// A list of failed object transfers
-    pub fn set_failed_transfers(mut self, input: Option<Vec<FailedDownloadTransfer>>) -> Self {
+    /// Set a list of failed object transfers
+    pub fn set_failed_transfers(mut self, input: Vec<FailedDownloadTransfer>) -> Self {
         self.failed_transfers = input;
         self
     }
 
-    /// A list of failed object transfers
-    pub fn get_failed_transfers(&self) -> &Option<Vec<FailedDownloadTransfer>> {
-        &self.failed_transfers
+    /// Get a list of failed object transfers
+    pub fn get_failed_transfers(&self) -> &[FailedDownloadTransfer] {
+        self.failed_transfers.as_slice()
     }
 
     /// The number of bytes successfully transferred (downloaded)

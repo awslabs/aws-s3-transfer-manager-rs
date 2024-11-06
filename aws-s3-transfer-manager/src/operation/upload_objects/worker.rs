@@ -210,8 +210,7 @@ fn handle_failed_upload(
         // the tasks on error rather than relying on join and then drop.
         FailedTransferPolicy::Abort => Err(err),
         FailedTransferPolicy::Continue => {
-            let mut guard = ctx.state.failed_uploads.lock().unwrap();
-            let mut failures = std::mem::take(&mut *guard).unwrap_or_default();
+            let mut failures = ctx.state.failed_uploads.lock().unwrap();
 
             let failed_transfer = FailedUploadTransfer {
                 input: match object_key {
@@ -230,8 +229,6 @@ fn handle_failed_upload(
             };
 
             failures.push(failed_transfer);
-
-            let _ = std::mem::replace(&mut *guard, Some(failures));
 
             Ok(())
         }

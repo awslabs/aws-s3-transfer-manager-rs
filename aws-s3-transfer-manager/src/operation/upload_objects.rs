@@ -63,11 +63,11 @@ impl UploadObjects {
     }
 }
 
-/// DownloadObjects operation specific state
+/// UploadObjects operation specific state
 #[derive(Debug)]
 pub(crate) struct UploadObjectsState {
     input: UploadObjectsInput,
-    failed_uploads: Mutex<Option<Vec<FailedUploadTransfer>>>,
+    failed_uploads: Mutex<Vec<FailedUploadTransfer>>,
     successful_uploads: AtomicU64,
     total_bytes_transferred: AtomicU64,
 }
@@ -78,7 +78,7 @@ impl UploadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
         let state = Arc::new(UploadObjectsState {
             input,
-            failed_uploads: Mutex::new(None),
+            failed_uploads: Mutex::new(Vec::new()),
             successful_uploads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
         });

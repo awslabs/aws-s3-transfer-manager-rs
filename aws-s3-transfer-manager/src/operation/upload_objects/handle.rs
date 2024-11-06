@@ -26,7 +26,7 @@ impl UploadObjectsHandle {
             join_result??;
         }
 
-        let failed_uploads = self.ctx.state.failed_uploads.lock().unwrap().take();
+        let failed_uploads = std::mem::take(&mut *self.ctx.state.failed_uploads.lock().unwrap());
         let successful_uploads = self.ctx.state.successful_uploads.load(Ordering::SeqCst);
         let total_bytes_transferred = self
             .ctx

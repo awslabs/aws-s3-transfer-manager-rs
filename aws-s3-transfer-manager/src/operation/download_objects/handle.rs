@@ -28,7 +28,8 @@ impl DownloadObjectsHandle {
             join_result??;
         }
 
-        let failed_downloads = self.ctx.state.failed_downloads.lock().unwrap().take();
+        let failed_downloads =
+            std::mem::take(&mut *self.ctx.state.failed_downloads.lock().unwrap());
         let successful_downloads = self.ctx.state.successful_downloads.load(Ordering::SeqCst);
         let total_bytes_transferred = self
             .ctx

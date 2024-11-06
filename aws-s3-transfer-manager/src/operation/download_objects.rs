@@ -79,7 +79,7 @@ impl DownloadObjects {
 #[derive(Debug)]
 pub(crate) struct DownloadObjectsState {
     input: DownloadObjectsInput,
-    failed_downloads: Mutex<Option<Vec<FailedDownloadTransfer>>>,
+    failed_downloads: Mutex<Vec<FailedDownloadTransfer>>,
     successful_downloads: AtomicU64,
     total_bytes_transferred: AtomicU64,
 }
@@ -90,7 +90,7 @@ impl DownloadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: DownloadObjectsInput) -> Self {
         let state = Arc::new(DownloadObjectsState {
             input,
-            failed_downloads: Mutex::new(None),
+            failed_downloads: Mutex::new(Vec::new()),
             successful_downloads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
         });
