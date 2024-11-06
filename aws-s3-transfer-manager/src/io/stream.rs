@@ -13,7 +13,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 
 use crate::error;
-use crate::io::part_reader::PartData;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
@@ -141,10 +140,14 @@ pub(super) enum RawInputStream {
 /// The context of an input stream.
 #[derive(Debug)]
 pub struct StreamContext {
-    pub(super) part_size: usize,
+    part_size: usize,
 }
 
 impl StreamContext {
+    pub(super) fn new(part_size: usize) -> Self {
+        Self { part_size }
+    }
+
     /// The part size to use when yielding parts.
     /// NOTE: this _may_ differ from the configured part size (e.g. if the target part size would
     /// result in exceeding the maximum number of parts allowed).
@@ -157,6 +160,26 @@ impl StreamContext {
     pub(crate) fn new_buffer(&self, capacity: usize) -> Buffer {
         // TODO - replace allocation with memory pool
         Buffer::new(capacity)
+    }
+}
+
+/// Contents and (optional) metadata for a single part of a [multipart upload].
+///
+/// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartData {
+    // 1-indexed
+    pub(crate) part_number: u64,
+    pub(crate) data: Bytes,
+}
+
+impl PartData {
+    /// Create a new part
+    pub(super) fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+        Self {
+            part_number,
+            data: data.into(),
+        }
     }
 }
 

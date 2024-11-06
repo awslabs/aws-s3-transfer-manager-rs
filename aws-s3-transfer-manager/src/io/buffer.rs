@@ -15,6 +15,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 // our path to pooling buffers (for uploads at least).
 
 /// A mutable buffer for writing sequential bytes to.
+#[derive(Debug)]
 pub(crate) struct Buffer {
     inner: BytesMut,
 }

@@ -6,12 +6,13 @@ use std::cmp;
 use std::ops::DerefMut;
 use std::sync::Mutex;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 
 use crate::io::error::Error;
 use crate::io::path_body::PathBody;
 use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
+use crate::io::PartData;
 use crate::metrics::unit::ByteUnit;
 
 use super::stream::{BoxStream, StreamContext};
@@ -65,7 +66,7 @@ impl PartReader {
             RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
         };
 
-        let stream_cx = StreamContext { part_size };
+        let stream_cx = StreamContext::new(part_size);
         Self { inner, stream_cx }
     }
 }
@@ -83,26 +84,6 @@ impl PartReader {
             Inner::Bytes(bytes) => bytes.next_part(&self.stream_cx).await,
             Inner::Fs(path_body) => path_body.next_part(&self.stream_cx).await,
             Inner::Dyn(part_stream) => part_stream.next_part(&self.stream_cx).await,
-        }
-    }
-}
-
-/// Contents and (optional) metadata for a single part of a [multipart upload].
-///
-/// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
-#[derive(Debug, Clone)]
-pub struct PartData {
-    // 1-indexed
-    pub(crate) part_number: u64,
-    pub(crate) data: Bytes,
-}
-
-impl PartData {
-    /// Create a new part
-    fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
-        Self {
-            part_number,
-            data: data.into(),
         }
     }
 }

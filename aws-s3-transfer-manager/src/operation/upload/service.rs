@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::{
     error,
     io::{
-        part_reader::{Builder as PartReaderBuilder, PartData, PartReader},
-        InputStream,
+        part_reader::{Builder as PartReaderBuilder, PartReader},
+        InputStream, PartData,
     },
     middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
     operation::upload::UploadContext,
