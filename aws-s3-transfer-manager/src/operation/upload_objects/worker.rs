@@ -36,6 +36,12 @@ pub(super) async fn list_directory_contents(
     input: UploadObjectsInput,
     list_directory_tx: Sender<Result<UploadObjectJob, error::Error>>,
 ) -> Result<(), error::Error> {
+    // TODO - Reevaluate the need for the `blocking` crate once we implement stricter task cancellation for download and upload.
+    // If we switch to using `tokio::task::spawn_blocking` instead of the `blocking` crate, the entire `list_directory_contents` function
+    // would need to be passed to `spawn_blocking`, which implies the following:
+    // - `list_directory_contents` would need to become a regular, non-async function, complicating the use of `async_channel::Sender` within it.
+    // - The `AbortHandle` returned by `spawn_blocking` would not have any effect when calling `abort`, which may impact our task cancellation behavior.
+
     // Move a blocking I/O to a dedicated thread pool
     let mut walker = Unblock::new(walker(&input).into_iter());
 
