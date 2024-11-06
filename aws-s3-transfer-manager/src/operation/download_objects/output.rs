@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use super::DownloadObjectsState;
 use crate::types::FailedDownloadTransfer;
+use std::sync::atomic::Ordering;
 
 /// Output type for downloading multiple objects
 #[non_exhaustive]
@@ -39,6 +41,20 @@ impl DownloadObjectsOutput {
     /// The number of bytes successfully transferred (downloaded)
     pub fn total_bytes_transferred(&self) -> u64 {
         self.total_bytes_transferred
+    }
+}
+
+impl From<&DownloadObjectsState> for DownloadObjectsOutput {
+    fn from(state: &DownloadObjectsState) -> Self {
+        let failed_downloads = std::mem::take(&mut *state.failed_downloads.lock().unwrap());
+        let successful_downloads = state.successful_downloads.load(Ordering::SeqCst);
+        let total_bytes_transferred = state.total_bytes_transferred.load(Ordering::SeqCst);
+
+        DownloadObjectsOutput::builder()
+            .objects_downloaded(successful_downloads)
+            .set_failed_transfers(failed_downloads)
+            .total_bytes_transferred(total_bytes_transferred)
+            .build()
     }
 }
 

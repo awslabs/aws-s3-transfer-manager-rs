@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::atomic::Ordering;
-
 use tokio::task;
 
 use super::{DownloadObjectsContext, DownloadObjectsOutput};
@@ -29,21 +27,6 @@ impl DownloadObjectsHandle {
             join_result??;
         }
 
-        let failed_downloads =
-            std::mem::take(&mut *self.ctx.state.failed_downloads.lock().unwrap());
-        let successful_downloads = self.ctx.state.successful_downloads.load(Ordering::SeqCst);
-        let total_bytes_transferred = self
-            .ctx
-            .state
-            .total_bytes_transferred
-            .load(Ordering::SeqCst);
-
-        let output = DownloadObjectsOutput::builder()
-            .objects_downloaded(successful_downloads)
-            .set_failed_transfers(failed_downloads)
-            .total_bytes_transferred(total_bytes_transferred)
-            .build();
-
-        Ok(output)
+        Ok(DownloadObjectsOutput::from(self.ctx.state.as_ref()))
     }
 }

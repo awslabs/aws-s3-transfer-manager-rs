@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::atomic::Ordering;
-
 use super::{UploadObjectsContext, UploadObjectsOutput};
 use tokio::task;
 
@@ -27,20 +25,6 @@ impl UploadObjectsHandle {
             join_result??;
         }
 
-        let failed_uploads = std::mem::take(&mut *self.ctx.state.failed_uploads.lock().unwrap());
-        let successful_uploads = self.ctx.state.successful_uploads.load(Ordering::SeqCst);
-        let total_bytes_transferred = self
-            .ctx
-            .state
-            .total_bytes_transferred
-            .load(Ordering::SeqCst);
-
-        let output = UploadObjectsOutput::builder()
-            .objects_uploaded(successful_uploads)
-            .set_failed_transfers(failed_uploads)
-            .total_bytes_transferred(total_bytes_transferred)
-            .build();
-
-        Ok(output)
+        Ok(UploadObjectsOutput::from(self.ctx.state.as_ref()))
     }
 }

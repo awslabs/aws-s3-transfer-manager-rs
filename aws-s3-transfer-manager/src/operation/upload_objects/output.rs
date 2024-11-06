@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use super::UploadObjectsState;
 use crate::types::FailedUploadTransfer;
+use std::sync::atomic::Ordering;
 
 /// Output type for uploading multiple objects
 #[non_exhaustive]
@@ -39,6 +41,20 @@ impl UploadObjectsOutput {
     /// The number of bytes successfully transferred (uploaded)
     pub fn total_bytes_transferred(&self) -> u64 {
         self.total_bytes_transferred
+    }
+}
+
+impl From<&UploadObjectsState> for UploadObjectsOutput {
+    fn from(state: &UploadObjectsState) -> Self {
+        let failed_uploads = std::mem::take(&mut *state.failed_uploads.lock().unwrap());
+        let successful_uploads = state.successful_uploads.load(Ordering::SeqCst);
+        let total_bytes_transferred = state.total_bytes_transferred.load(Ordering::SeqCst);
+
+        UploadObjectsOutput::builder()
+            .objects_uploaded(successful_uploads)
+            .set_failed_transfers(failed_uploads)
+            .total_bytes_transferred(total_bytes_transferred)
+            .build()
     }
 }
 
