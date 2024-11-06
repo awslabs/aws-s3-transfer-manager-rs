@@ -22,6 +22,7 @@ impl UploadObjectsHandle {
     /// Consume the handle and wait for the upload to complete
     #[tracing::instrument(skip_all, level = "debug", name = "join-upload-objects-")]
     pub async fn join(mut self) -> Result<UploadObjectsOutput, crate::error::Error> {
+        // TODO - Consider implementing more sophisticated error handling such as canceling in-progress transfers
         while let Some(join_result) = self.tasks.join_next().await {
             join_result??;
         }

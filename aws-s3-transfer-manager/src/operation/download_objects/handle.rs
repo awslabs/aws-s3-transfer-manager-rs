@@ -23,6 +23,7 @@ impl DownloadObjectsHandle {
     /// Consume the handle and wait for download transfer to complete
     #[tracing::instrument(skip_all, level = "debug", name = "join-download-objects")]
     pub async fn join(mut self) -> Result<DownloadObjectsOutput, crate::error::Error> {
+        // TODO - Consider implementing more sophisticated error handling such as canceling in-progress transfers
         // join all tasks
         while let Some(join_result) = self.tasks.join_next().await {
             join_result??;
