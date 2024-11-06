@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 
 use super::{UploadObjectsContext, UploadObjectsInput};
 use async_channel::{Receiver, Sender};
-use aws_smithy_types::error::operation::BuildError;
 use blocking::Unblock;
 use futures_util::StreamExt;
 use walkdir::WalkDir;
 
+use crate::error::ErrorKind;
 use crate::io::InputStream;
 use crate::operation::upload::UploadInputBuilder;
 use crate::operation::DEFAULT_DELIMITER;
@@ -81,7 +81,17 @@ pub(super) async fn list_directory_contents(
                     Err(e) => Err(e.into()),
                 }
             }
-            Err(e) => Err(crate::error::Error::from(BuildError::other(e))),
+            Err(walkdir_error) => {
+                let error_kind = if walkdir_error.io_error().is_some() {
+                    ErrorKind::IOError
+                } else {
+                    ErrorKind::InputInvalid
+                };
+
+                // We avoid converting `walkdir::Error` into `std::io::Error` to preserve important information,
+                // such as which path entry triggered a `PermissionDenied` error.
+                Err(crate::error::Error::new(error_kind, walkdir_error))
+            }
         };
         list_directory_tx.send(job).await.expect("channel valid");
     }
@@ -448,12 +458,7 @@ mod unit {
 
             assert_eq!(expected, actual);
             assert_eq!(1, errors.len());
-            let build_error = errors[0]
-                .source()
-                .unwrap()
-                .downcast_ref::<aws_smithy_types::error::operation::BuildError>()
-                .expect("should downcast to `aws_smithy_types::error::operation::BuildError`");
-            let walkdir_error = build_error
+            let walkdir_error = errors[0]
                 .source()
                 .unwrap()
                 .downcast_ref::<walkdir::Error>()
