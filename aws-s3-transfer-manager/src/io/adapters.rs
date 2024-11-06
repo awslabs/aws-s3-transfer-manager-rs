@@ -96,7 +96,6 @@ where
         let mut this = self.project();
         let mut inner_buf = this.buf.take_or_acquire(stream_cx);
 
-        println!("loop outer");
         loop {
             // SAFETY: `ReadBuf` and `poll_read` promise not to set any uninitialized bytes into `dst`.
             let dst = unsafe { inner_buf.chunk_mut().as_uninit_slice_mut() };
@@ -106,7 +105,6 @@ where
                 Poll::Ready(result) => match result {
                     Ok(_) => {
                         let n = buf.filled().len();
-                        println!("read {} bytes", n);
                         if n > 0 {
                             // SAFETY: we just read that many bytes into the uninitialized part of the buffer
                             unsafe {
