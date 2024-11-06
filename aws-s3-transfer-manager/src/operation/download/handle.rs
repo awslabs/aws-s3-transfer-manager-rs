@@ -2,8 +2,8 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::chunk_meta::ChunkMetadata;
+use crate::operation::download::output::DownloadOutput;
 use tokio::task;
 
 use super::DownloadContext;

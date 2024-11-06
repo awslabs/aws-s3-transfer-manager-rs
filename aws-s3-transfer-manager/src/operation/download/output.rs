@@ -2,13 +2,83 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use aws_smithy_types::byte_stream::AggregatedBytes;
+use aws_smithy_types::byte_stream::ByteStream;
+use bytes::{Buf, Bytes};
+use bytes_utils::SegmentedBuf;
 use std::cmp;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::io::IoSlice;
 use tokio::sync::mpsc;
 
+use crate::error::ErrorKind;
+
 use super::chunk_meta::ChunkMetadata;
+
+#[derive(Debug, Clone)]
+/// TODO: waahm7 doc
+pub struct AggregatedBytes(SegmentedBuf<Bytes>);
+
+impl AggregatedBytes {
+    /// Convert this buffer into [`Bytes`].
+    ///
+    /// # Why does this consume `self`?
+    /// Technically, [`copy_to_bytes`](bytes::Buf::copy_to_bytes) can be called without ownership of self. However, since this
+    /// mutates the underlying buffer such that no data is remaining, it is more misuse resistant to
+    /// prevent the caller from attempting to reread the buffer.
+    ///
+    /// If the caller only holds a mutable reference, they may use [`copy_to_bytes`](bytes::Buf::copy_to_bytes)
+    /// directly on `AggregatedBytes`.
+    pub fn into_bytes(mut self) -> Bytes {
+        self.0.copy_to_bytes(self.0.remaining())
+    }
+
+    /// Convert this buffer into an [`Iterator`] of underlying non-contiguous segments of [`Bytes`]
+    pub fn into_segments(self) -> impl Iterator<Item = Bytes> {
+        self.0.into_inner().into_iter()
+    }
+
+    /// Convert this buffer into a `Vec<u8>`
+    pub fn to_vec(self) -> Vec<u8> {
+        self.0.into_inner().into_iter().flatten().collect()
+    }
+
+    /// TODO: waahm7 doc
+    pub async fn from_byte_stream(value: ByteStream) -> Result<Self, crate::error::Error> {
+        let mut value = value;
+        let mut output = SegmentedBuf::new();
+        while let Some(buf) = value.next().await {
+            match buf {
+                Ok(buf) => output.push(buf),
+                Err(err) => return Err(crate::error::from_kind(ErrorKind::IOError)(err)),
+            };
+        }
+        Ok(AggregatedBytes(output))
+    }
+}
+
+impl Buf for AggregatedBytes {
+    // Forward all methods that SegmentedBuf has custom implementations of.
+    fn remaining(&self) -> usize {
+        self.0.remaining()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.0.chunk()
+    }
+
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        self.0.chunks_vectored(dst)
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        self.0.advance(cnt)
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        self.0.copy_to_bytes(len)
+    }
+}
 
 /// Stream of binary data representing an Amazon S3 Object's contents.
 ///
@@ -29,7 +99,7 @@ pub struct ChunkResponse {
     // the seq number
     pub(crate) seq: u64,
     /// data: chunk data
-    pub data: Option<AggregatedBytes>,
+    pub data: AggregatedBytes,
     /// metadata
     pub metadata: ChunkMetadata,
 }
@@ -184,23 +254,27 @@ impl UnorderedOutput {
 #[cfg(test)]
 mod tests {
     use crate::{error, operation::download::output::ChunkResponse};
-    use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
     use bytes::Bytes;
+    use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
 
-    use super::{DownloadOutput, Sequencer};
+    use super::{AggregatedBytes, DownloadOutput, Sequencer};
 
-    fn chunk_resp(seq: u64, data: Option<AggregatedBytes>) -> ChunkResponse {
-        ChunkResponse { seq, data, metadata: Default::default() }
+    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkResponse {
+        ChunkResponse {
+            seq,
+            data,
+            metadata: Default::default(),
+        }
     }
 
     #[test]
     fn test_sequencer() {
         let mut sequencer = Sequencer::new();
-        sequencer.push(chunk_resp(1, None));
-        sequencer.push(chunk_resp(2, None));
+        sequencer.push(chunk_resp(1, AggregatedBytes(SegmentedBuf::new())));
+        sequencer.push(chunk_resp(2, AggregatedBytes(SegmentedBuf::new())));
         assert_eq!(sequencer.peek().unwrap().seq, 1);
-        sequencer.push(chunk_resp(0, None));
+        sequencer.push(chunk_resp(0, AggregatedBytes(SegmentedBuf::new())));
         assert_eq!(sequencer.pop().unwrap().seq, 0);
     }
 
@@ -212,8 +286,9 @@ mod tests {
             let seq = vec![2, 0, 1];
             for i in seq {
                 let data = Bytes::from(format!("chunk {i}"));
-                let aggregated = ByteStream::from(data).collect().await.unwrap();
-                let chunk = chunk_resp(i as u64, Some(aggregated));
+                let mut aggregated = SegmentedBuf::new();
+                aggregated.push(data);
+                let chunk = chunk_resp(i as u64, AggregatedBytes(aggregated));
                 tx.send(Ok(chunk)).await.unwrap();
             }
         });
@@ -221,7 +296,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.data.unwrap().to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
             received.push(data);
         }
 
@@ -235,8 +310,9 @@ mod tests {
         let mut body = DownloadOutput::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
-            let aggregated = ByteStream::from(data).collect().await.unwrap();
-            let chunk = chunk_resp(0, Some(aggregated));
+            let mut aggregated = SegmentedBuf::new();
+            aggregated.push(data);
+            let chunk = chunk_resp(0, AggregatedBytes(aggregated));
             tx.send(Ok(chunk)).await.unwrap();
             let err = error::Error::new(error::ErrorKind::InputInvalid, "test errors".to_string());
             tx.send(Err(err)).await.unwrap();

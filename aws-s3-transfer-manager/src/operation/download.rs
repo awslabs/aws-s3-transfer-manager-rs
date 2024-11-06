@@ -10,10 +10,10 @@ use chunk_meta::ChunkMetadata;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
-/// Abstractions for response bodies and consuming data streams.
-pub mod output;
 /// Operation builders
 pub mod builders;
+/// Abstractions for response bodies and consuming data streams.
+pub mod output;
 
 mod discovery;
 
@@ -27,8 +27,8 @@ mod service;
 use crate::error;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use output::{DownloadOutput, ChunkResponse};
 use discovery::discover_obj;
+use output::{AggregatedBytes, ChunkResponse, DownloadOutput};
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -147,8 +147,8 @@ fn handle_discovery_chunk(
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
         handle.tasks.spawn(async move {
-            let chunk = stream
-                .collect()
+            
+            let chunk = AggregatedBytes::from_byte_stream(stream)
                 .await
                 .map(|aggregated| ChunkResponse {
                     seq,

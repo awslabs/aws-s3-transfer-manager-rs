@@ -49,7 +49,7 @@ async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
     let body = handle.body_mut();
     let mut data = BytesMut::new();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?.into_bytes();
+        let chunk = chunk?.data.into_bytes();
         data.put(chunk);
     }
 

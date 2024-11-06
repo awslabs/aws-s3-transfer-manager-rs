@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
+use super::output::AggregatedBytes;
 use super::output::ChunkResponse;
 use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
 
@@ -74,19 +75,16 @@ async fn download_specific_chunk(
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
-
-    let bytes = body
-        .collect()
+    let body = AggregatedBytes::from_byte_stream(body)
         .instrument(tracing::debug_span!(
             "collect-body-from-download-chunk",
             seq
         ))
-        .await
-        .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
+        .await?;
 
     Ok(ChunkResponse {
         seq,
-        data: Some(bytes),
+        data: body,
         metadata: resp.into(),
     })
 }
