@@ -177,7 +177,8 @@ async fn upload_single_obj(
 ) -> Result<u64, error::Error> {
     let UploadObjectJob { object, key } = job;
 
-    // `object` gets consumed by `input` so calculate the content length in advance
+    // `object` gets consumed by `input` so calculate the content length in advance.
+    // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
     let bytes_transferred: u64 = object
         .size_hint()
         .upper()
