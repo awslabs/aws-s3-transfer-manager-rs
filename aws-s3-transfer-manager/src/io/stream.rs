@@ -198,8 +198,8 @@ pub trait PartStream {
     /// than the full part size.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
-        stream_cx: &StreamContext,
         cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
     ) -> std::task::Poll<Option<std::io::Result<PartData>>>;
 
     /// Returns the bounds on the total size of the stream
@@ -221,7 +221,7 @@ impl BoxStream {
         &mut self,
         stream_cx: &StreamContext,
     ) -> Option<std::io::Result<PartData>> {
-        poll_fn(|cx| self.inner.as_mut().poll_part(stream_cx, cx)).await
+        poll_fn(|cx| self.inner.as_mut().poll_part(cx, stream_cx)).await
     }
 }
 

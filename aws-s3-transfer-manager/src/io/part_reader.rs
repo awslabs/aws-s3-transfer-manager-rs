@@ -366,8 +366,8 @@ mod test {
     impl PartStream for TestStream {
         fn poll_part(
             mut self: std::pin::Pin<&mut Self>,
-            _stream_cx: &StreamContext,
             _cx: &mut std::task::Context<'_>,
+            _stream_cx: &StreamContext,
         ) -> Poll<Option<std::io::Result<PartData>>> {
             if self.idx < self.data.len() {
                 let part = PartData::new(self.idx as u64 + 1, self.data[self.idx].clone());

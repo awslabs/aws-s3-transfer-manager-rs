@@ -89,8 +89,8 @@ where
 {
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
-        stream_cx: &StreamContext,
         cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
     ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
         use bytes::BufMut;
         let mut this = self.project();
@@ -165,28 +165,28 @@ mod tests {
         let mut task_cx = Context::from_waker(&waker);
         let stream_cx = StreamContext::new(part_size);
 
-        assert_pending!(io.as_mut().poll_part(&stream_cx, &mut task_cx));
+        assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"hello");
         assert_eq!(awoken_cnt.get(), 1);
 
-        let result = assert_ready!(io.as_mut().poll_part(&stream_cx, &mut task_cx))
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
             .unwrap()
             .unwrap();
         let expected = PartData::new(1, "hello");
         assert_eq!(expected, result);
 
-        assert_pending!(io.as_mut().poll_part(&stream_cx, &mut task_cx));
+        assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"world");
         assert_eq!(awoken_cnt.get(), 2);
 
-        let result = assert_ready!(io.as_mut().poll_part(&stream_cx, &mut task_cx))
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
             .unwrap()
             .unwrap();
         let expected = PartData::new(2, "world");
         assert_eq!(expected, result);
 
         drop(handle);
-        let result = assert_ready!(io.as_mut().poll_part(&stream_cx, &mut task_cx));
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
     }
 
@@ -202,7 +202,7 @@ mod tests {
 
         // partial read
         handle.read(b"hello");
-        assert_pending!(io.as_mut().poll_part(&stream_cx, &mut task_cx));
+        assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
 
         handle.read(b"world"); // full part available
         handle.read(b"second"); // last part less than part size
@@ -210,21 +210,21 @@ mod tests {
         assert_eq!(awoken_cnt.get(), 1);
 
         // we have a full part available at this point so it should be yielded
-        let result = assert_ready!(io.as_mut().poll_part(&stream_cx, &mut task_cx))
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
             .unwrap()
             .unwrap();
         let expected = PartData::new(1, "helloworld");
         assert_eq!(expected, result);
 
         // should hit EOF and get the last part less than configured part size
-        let result = assert_ready!(io.as_mut().poll_part(&stream_cx, &mut task_cx))
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
             .unwrap()
             .unwrap();
         let expected = PartData::new(2, "second");
         assert_eq!(expected, result);
 
         // one final poll to actual get done signal
-        let result = assert_ready!(io.as_mut().poll_part(&stream_cx, &mut task_cx));
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
     }
 }
