@@ -78,6 +78,8 @@ impl DownloadObjects {
 /// DownloadObjects operation specific state
 #[derive(Debug)]
 pub(crate) struct DownloadObjectsState {
+    // TODO - Determine if `input` should be separated from this struct
+    // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: DownloadObjectsInput,
     failed_downloads: Mutex<Vec<FailedDownloadTransfer>>,
     successful_downloads: AtomicU64,

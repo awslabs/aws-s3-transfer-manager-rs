@@ -66,6 +66,8 @@ impl UploadObjects {
 /// UploadObjects operation specific state
 #[derive(Debug)]
 pub(crate) struct UploadObjectsState {
+    // TODO - Determine if `input` should be separated from this struct
+    // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: UploadObjectsInput,
     failed_uploads: Mutex<Vec<FailedUploadTransfer>>,
     successful_uploads: AtomicU64,
