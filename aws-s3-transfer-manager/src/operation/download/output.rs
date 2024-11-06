@@ -16,7 +16,7 @@ use super::chunk_meta::ChunkMetadata;
 /// The data on this stream is sequenced into the correct order.
 #[derive(Debug)]
 pub struct DownloadOutput {
-    inner: UnorderedBody,
+    inner: UnorderedOutput,
     sequencer: Sequencer,
 }
 
@@ -29,13 +29,13 @@ pub struct ChunkResponse {
     // the seq number
     pub(crate) seq: u64,
     /// data: chunk data
-    pub data: AggregatedBytes,
+    pub data: Option<AggregatedBytes>,
     /// metadata
     pub metadata: ChunkMetadata,
 }
 
 impl DownloadOutput {
-    /// Create a new empty Body
+    /// Create a new empty output
     pub fn empty() -> Self {
         Self::new_from_channel(None)
     }
@@ -46,22 +46,15 @@ impl DownloadOutput {
 
     fn new_from_channel(chunks: Option<BodyChannel>) -> Self {
         Self {
-            inner: UnorderedBody::new(chunks),
+            inner: UnorderedOutput::new(chunks),
             sequencer: Sequencer::new(),
         }
-    }
-
-    /// Convert this body into an unordered stream of chunks.
-    // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream
-    #[allow(dead_code)]
-    pub(crate) fn unordered(self) -> UnorderedBody {
-        self.inner
     }
 
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
-    /// Chunks returned from a [Body] are guaranteed to be sequenced
+    /// Chunks returned from a [DownloadOutput] are guaranteed to be sequenced
     /// in the right order.
     pub async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
         // TODO(aws-sdk-rust#1159, design) - do we want ChunkResponse (or similar) rather than AggregatedBytes? Would
@@ -158,11 +151,11 @@ impl PartialEq for SequencedChunk {
 
 /// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
-pub(crate) struct UnorderedBody {
+pub(crate) struct UnorderedOutput {
     chunks: Option<mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>>,
 }
 
-impl UnorderedBody {
+impl UnorderedOutput {
     fn new(chunks: Option<BodyChannel>) -> Self {
         Self { chunks }
     }
@@ -170,7 +163,7 @@ impl UnorderedBody {
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
-    /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
+    /// Chunks returned from an [UnorderedOutput] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
     pub(crate) async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
@@ -190,7 +183,7 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::service::ChunkResponse};
+    use crate::{error, operation::download::output::ChunkResponse};
     use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
     use bytes::Bytes;
     use tokio::sync::mpsc;
@@ -198,7 +191,7 @@ mod tests {
     use super::{DownloadOutput, Sequencer};
 
     fn chunk_resp(seq: u64, data: Option<AggregatedBytes>) -> ChunkResponse {
-        ChunkResponse { seq, data }
+        ChunkResponse { seq, data, metadata: Default::default() }
     }
 
     #[test]
@@ -228,7 +221,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.unwrap().to_vec()).unwrap();
             received.push(data);
         }
 

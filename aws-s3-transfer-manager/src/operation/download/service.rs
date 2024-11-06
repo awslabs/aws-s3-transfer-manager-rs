@@ -86,7 +86,7 @@ async fn download_specific_chunk(
 
     Ok(ChunkResponse {
         seq,
-        data: bytes,
+        data: Some(bytes),
         metadata: resp.into(),
     })
 }
