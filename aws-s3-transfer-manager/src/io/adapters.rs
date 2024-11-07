@@ -113,7 +113,7 @@ where
                         }
 
                         // full part available or EOF with partial data already buffered
-                        if inner_buf.len() >= stream_cx.part_size()
+                        if inner_buf.len() == stream_cx.part_size()
                             || (n == 0 && inner_buf.len() > 0)
                         {
                             let data: Bytes = inner_buf.into();

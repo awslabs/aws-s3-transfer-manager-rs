@@ -108,7 +108,7 @@ pub(super) fn distribute_work(
     );
     match &mut handle.upload_type {
         UploadType::PutObject { .. } => {
-            panic!("distribute_work must not be called for PutObject.")
+            unreachable!("distribute_work must not be called for PutObject.")
         }
         UploadType::MultipartUpload {
             upload_part_tasks,
