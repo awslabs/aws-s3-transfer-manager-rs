@@ -9,6 +9,7 @@ use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
+use tokio::task;
 use std::cmp;
 use std::mem;
 use std::ops::RangeInclusive;
@@ -18,7 +19,7 @@ use tracing::Instrument;
 
 use super::output::AggregatedBytes;
 use super::output::ChunkResponse;
-use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
+use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
 #[derive(Debug, Clone)]
@@ -114,22 +115,23 @@ pub(super) fn chunk_service(
 /// * start_seq - the starting sequence number to use for chunks
 /// * comp_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
-    handle: &mut DownloadHandle,
+    tasks: &mut task::JoinSet<()>,
+    ctx: DownloadContext,
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
     start_seq: u64,
     comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
     parent_span_for_tasks: tracing::Span,
 ) {
-    let svc = chunk_service(&handle.ctx);
-    let part_size = handle.ctx.target_part_size_bytes();
+    let svc = chunk_service(&ctx);
+    let part_size = ctx.target_part_size_bytes();
     let input: DownloadInputBuilder = input.into();
 
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
     for _ in 0..num_parts {
         let req = DownloadChunkRequest {
-            ctx: handle.ctx.clone(),
+            ctx: ctx.clone(),
             remaining: remaining.clone(),
             input: input.clone(),
             start_seq,
@@ -139,14 +141,13 @@ pub(super) fn distribute_work(
         let comp_tx = comp_tx.clone();
 
         let task = async move {
+            // TODO: If downloading a chunk fails, do we want to abort the download?
             let resp = svc.oneshot(req).await;
             if let Err(err) = comp_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
             }
         };
-        handle
-            .tasks
-            .spawn(task.instrument(parent_span_for_tasks.clone()));
+        tasks.spawn(task.instrument(parent_span_for_tasks.clone()));
     }
 
     tracing::trace!("work fully distributed");

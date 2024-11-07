@@ -19,8 +19,10 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
+use object_meta::ObjectMetadata;
 use tracing::Instrument;
 
+mod object_meta;
 mod chunk_meta;
 mod service;
 
@@ -32,8 +34,8 @@ use output::{AggregatedBytes, ChunkResponse, DownloadOutput};
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::task::{self, JoinSet};
 
 use super::TransferContext;
 
@@ -63,8 +65,34 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let concurrency = handle.num_workers();
         let ctx = DownloadContext::new(handle);
+        let concurrency = ctx.handle.num_workers();
+        let (comp_tx, comp_rx) = mpsc::channel(concurrency);
+        let (meta_tx, meta_rx) = oneshot::channel();
+
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let discovery = tokio::spawn(send_discovery(tasks.clone(), ctx.clone(), comp_tx, meta_tx, input, use_current_span_as_parent_for_tasks));
+
+
+        Ok(DownloadHandle {
+            body: DownloadOutput::new(comp_rx),
+            tasks,
+            discovery,
+            object_meta_receiver: Some(meta_rx),
+            object_meta: OnceCell::new(),
+        })
+    }
+}
+
+async fn send_discovery(
+    tasks: Arc<Mutex<task::JoinSet<()>>>,
+    ctx: DownloadContext,
+    comp_tx: mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
+    meta_tx: oneshot::Sender<ObjectMetadata>,
+    input: DownloadInput,
+    use_current_span_as_parent_for_tasks: bool,
+    ) -> Result<(), crate::error::Error> {
+        let mut tasks = tasks.lock().await;
 
         // create span to serve as parent of spawned child tasks.
         let parent_span_for_tasks = tracing::debug_span!(
@@ -78,31 +106,22 @@ impl Download {
             parent_span_for_tasks.follows_from(tracing::Span::current());
         }
 
-        // acquire a permit for discovery
+            // acquire a permit for discovery
         let permit = ctx.handle.scheduler.acquire_permit().await?;
 
         // make initial discovery about the object size, metadata, possibly first chunk
         let mut discovery = discover_obj(&ctx, &input).await?;
-        let (comp_tx, comp_rx) = mpsc::channel(concurrency);
-
         // TODO: waahm7 fix
         let meta_data = discovery.meta.clone();
-        let initial_chunk = discovery.initial_chunk.take();
+        let _ = meta_tx.send(meta_data.clone().into());
 
-        let mut handle = DownloadHandle {
-            // FIXME(aws-sdk-rust#1159) - initial object discovery for a range/first-part will not
-            //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
-            object_meta: discovery.meta,
-            body: DownloadOutput::new(comp_rx),
-            // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
-            tasks: JoinSet::new(),
-            ctx,
-        };
+        let initial_chunk = discovery.initial_chunk.take();
 
         // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
         // that we can begin concurrently downloading any reamining chunks/parts ASAP
         let start_seq = handle_discovery_chunk(
-            &mut handle,
+            &mut tasks,
+            ctx.clone(),
             initial_chunk,
             &comp_tx,
             permit,
@@ -113,17 +132,16 @@ impl Download {
         if !discovery.remaining.is_empty() {
             let remaining = discovery.remaining.clone();
             distribute_work(
-                &mut handle,
+                &mut tasks,
+                ctx.clone(),
                 remaining,
                 input,
                 start_seq,
                 comp_tx,
                 parent_span_for_tasks,
-            )
+            );
         }
-
-        Ok(handle)
-    }
+        Ok(())
 }
 
 /// Handle possibly sending the first chunk of data received through discovery. Returns
@@ -134,7 +152,9 @@ impl Download {
 /// This allows remaining work to start immediately (and concurrently) without
 /// waiting for the first chunk.
 fn handle_discovery_chunk(
-    handle: &mut DownloadHandle,
+    //handle: &mut DownloadHandle,
+    tasks: &mut task::JoinSet<()>,
+    ctx: DownloadContext,
     initial_chunk: Option<ByteStream>,
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
@@ -142,11 +162,11 @@ fn handle_discovery_chunk(
     meta_data: ChunkMetadata,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
-        let seq = handle.ctx.next_seq();
+        let seq = ctx.next_seq();
         let completed = completed.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
-        handle.tasks.spawn(async move {
+        tasks.spawn(async move {
             
             let chunk = AggregatedBytes::from_byte_stream(stream)
                 .await
@@ -168,7 +188,7 @@ fn handle_discovery_chunk(
             }
         }.instrument(tracing::debug_span!(parent: parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
-    handle.ctx.current_seq()
+    ctx.current_seq()
 }
 
 /// Download operation specific state

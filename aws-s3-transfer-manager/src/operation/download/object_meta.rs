@@ -12,13 +12,15 @@ use aws_sdk_s3::operation::RequestIdExt;
 
 use crate::http::header;
 
+use super::chunk_meta::ChunkMetadata;
+
 // TODO(aws-sdk-rust#1159,design): how many of these fields should we expose?
 // TODO(aws-sdk-rust#1159,docs): Document fields
 
 /// Object metadata other than the body
 #[derive(Debug, Clone, Default)]
-pub struct ChunkMetadata {
-    pub request_id: Option<String>,
+pub struct ObjectMetadata {
+    pub requet_id: Option<String>,
     pub extended_request_id: Option<String>,
     pub delete_marker: Option<bool>,
     pub accept_ranges: Option<String>,
@@ -60,7 +62,7 @@ pub struct ChunkMetadata {
 
 
 // TODO: waahm7 figure out the content-length vs total_size
-impl ChunkMetadata {
+impl ObjectMetadata {
     /// The total object size
     pub fn total_size(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
@@ -101,11 +103,57 @@ impl ChunkMetadata {
     }
 }
 
-impl From<GetObjectOutput> for ChunkMetadata {
+impl From<ChunkMetadata> for ObjectMetadata {
+    fn from(value: ChunkMetadata) -> Self {
+        Self {
+            requet_id: value.request_id,
+            extended_request_id: value.extended_request_id,
+            delete_marker: value.delete_marker,
+            accept_ranges: value.accept_ranges,
+            expiration: value.expiration,
+            restore: value.restore,
+            last_modified: value.last_modified,
+            content_length: value.content_length,
+            e_tag: value.e_tag,
+            checksum_crc32: value.checksum_crc32,
+            checksum_crc32_c: value.checksum_crc32_c,
+            checksum_sha1: value.checksum_sha1,
+            checksum_sha256: value.checksum_sha256,
+            missing_meta: value.missing_meta,
+            version_id: value.version_id,
+            cache_control: value.cache_control,
+            content_disposition: value.content_disposition,
+            content_encoding: value.content_encoding,
+            content_language: value.content_language,
+            content_range: value.content_range,
+            content_type: value.content_type,
+            #[allow(deprecated)]
+            expires: value.expires,
+            expires_string: value.expires_string,
+            website_redirect_location: value.website_redirect_location,
+            server_side_encryption: value.server_side_encryption,
+            metadata: value.metadata,
+            sse_customer_algorithm: value.sse_customer_algorithm,
+            sse_customer_key_md5: value.sse_customer_key_md5,
+            ssekms_key_id: value.ssekms_key_id,
+            bucket_key_enabled: value.bucket_key_enabled,
+            storage_class: value.storage_class,
+            request_charged: value.request_charged,
+            replication_status: value.replication_status,
+            parts_count: value.parts_count,
+            tag_count: value.tag_count,
+            object_lock_mode: value.object_lock_mode,
+            object_lock_retain_until_date: value.object_lock_retain_until_date,
+            object_lock_legal_hold_status: value.object_lock_legal_hold_status,
+        }
+    }
+}
+
+impl From<GetObjectOutput> for ObjectMetadata {
     fn from(value: GetObjectOutput) -> Self {
         Self {
             // TODO: waahm7 should we just impl the traits? why traits?
-            request_id: value.request_id().map(|s| s.to_string()),
+            requet_id: value.request_id().map(|s| s.to_string()),
             extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
             accept_ranges: value.accept_ranges,
@@ -148,10 +196,10 @@ impl From<GetObjectOutput> for ChunkMetadata {
     }
 }
 
-impl From<HeadObjectOutput> for ChunkMetadata {
+impl From<HeadObjectOutput> for ObjectMetadata {
     fn from(value: HeadObjectOutput) -> Self {
         Self {
-            request_id: value.request_id().map(|s| s.to_string()),
+            requet_id: value.request_id().map(|s| s.to_string()),
             extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
             accept_ranges: value.accept_ranges,
@@ -196,11 +244,11 @@ impl From<HeadObjectOutput> for ChunkMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::ChunkMetadata;
+    use super::ObjectMetadata;
 
     #[test]
     fn test_inferred_content_length() {
-        let meta = ChunkMetadata {
+        let meta = ObjectMetadata {
             content_length: Some(4),
             content_range: Some("should ignore".to_owned()),
             ..Default::default()
@@ -208,7 +256,7 @@ mod tests {
 
         assert_eq!(4, meta.content_length());
 
-        let meta = ChunkMetadata {
+        let meta = ObjectMetadata {
             content_length: None,
             content_range: Some("bytes 0-499/900".to_owned()),
             ..Default::default()
