@@ -16,7 +16,6 @@ use std::task::Poll;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 
-// TODO - add feature gate for this?
 pin_project! {
     /// A wrapper that implements [`PartStream`] trait for an inner type
     /// that implements Tokio's IO traits.
