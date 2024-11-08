@@ -21,7 +21,7 @@ use tracing::Instrument;
 
 mod worker;
 
-use crate::types::FailedUploadTransfer;
+use crate::{error, types::FailedUploadTransfer};
 
 use super::{validate_target_is_dir, TransferContext};
 
@@ -37,7 +37,15 @@ impl UploadObjects {
     ) -> Result<UploadObjectsHandle, crate::error::Error> {
         //  validate existence of source and return error if it's not a directory
         let source = input.source().expect("source set");
-        validate_target_is_dir(source).await?;
+        let metadata = tokio::fs::symlink_metadata(source).await?;
+        validate_target_is_dir(source).await.and_then(|_| {
+            if !input.follow_symlinks() && metadata.is_symlink() {
+                return Err(error::invalid_input(
+                    format!("{source:?} is a symbolic link to a directory but the current upload operation does not follow symbolic links"))
+                );
+            }
+            Ok(())
+        })?;
 
         let concurrency = handle.num_workers();
         let ctx = UploadObjectsContext::new(handle.clone(), input);
