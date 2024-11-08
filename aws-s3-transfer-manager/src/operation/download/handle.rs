@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::error::{self, ErrorKind};
 use tokio::{
-    sync::{oneshot::Receiver, Mutex, OnceCell},
+    sync::{oneshot::Receiver, Mutex},
     task,
 };
 
@@ -20,7 +20,7 @@ use super::object_meta::ObjectMetadata;
 pub struct DownloadHandle {
     /// Object metadata. TODO: Is there a better way to do this than tokio oncecell?
     pub(crate) object_meta_receiver: Option<Receiver<ObjectMetadata>>,
-    pub(crate) object_meta: OnceCell<Result<ObjectMetadata, error::Error>>,
+    pub(crate) object_meta: Option<ObjectMetadata>,
 
     /// The object content
     pub(crate) body: DownloadOutput,
@@ -36,17 +36,19 @@ pub struct DownloadHandle {
 
 impl DownloadHandle {
     /// Object metadata
-    pub async fn object_meta(&mut self) -> &Result<ObjectMetadata, error::Error> {
-        let meta = self
-            .object_meta
-            .get_or_init(|| async {
-                let meta = self.object_meta_receiver.take().unwrap();
-                meta.await
-                    .map_err(error::from_kind(ErrorKind::RuntimeError))
-            })
-            .await;
-
-        meta
+    pub async fn object_meta(&mut self) -> Result<ObjectMetadata, error::Error> {
+        if let Some(object_meta) = &self.object_meta {
+            Ok(object_meta.clone())
+        } else {
+            let meta = self
+                .object_meta_receiver
+                .take()
+                .expect("metadata is not initialized yet");
+             self.object_meta = Some(meta
+                .await
+                .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))?);
+            Ok(self.object_meta.clone().unwrap())
+        }
     }
 
     /// Object content
