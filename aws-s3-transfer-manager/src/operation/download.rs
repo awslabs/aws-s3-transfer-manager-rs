@@ -55,7 +55,7 @@ impl Download {
     /// "follow from" the current span, but be under their own root of the trace tree.
     /// Use this for `TransferManager.download().send()`, where the spawned tasks
     /// should NOT extend the life of the current `send()` span.
-    pub(crate) async fn orchestrate(
+    pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
         use_current_span_as_parent_for_tasks: bool,
@@ -135,11 +135,10 @@ async fn send_discovery(
     );
 
     if !discovery.remaining.is_empty() {
-        let remaining = discovery.remaining.clone();
         distribute_work(
             &mut tasks,
             ctx.clone(),
-            remaining,
+            discovery.remaining,
             input,
             start_seq,
             comp_tx,

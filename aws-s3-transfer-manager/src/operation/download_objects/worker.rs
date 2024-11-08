@@ -143,7 +143,7 @@ async fn download_single_obj(
 
     let key_path = local_key_path(root_dir, key.as_str(), prefix, delim)?;
     let mut handle =
-        crate::operation::download::Download::orchestrate(ctx.handle.clone(), input, true).await?;
+        crate::operation::download::Download::orchestrate(ctx.handle.clone(), input, true)?;
     let mut body = mem::replace(&mut handle.body, DownloadOutput::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");

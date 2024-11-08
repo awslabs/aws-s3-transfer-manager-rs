@@ -5,6 +5,8 @@
 
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::operation::RequestId;
+use aws_sdk_s3::operation::RequestIdExt;
 
 // TODO(aws-sdk-rust#1159,design): how many of these fields should we expose?
 // TODO(aws-sdk-rust#1159,docs): Document fields
@@ -47,6 +49,13 @@ pub struct ObjectMetadata {
     pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
     pub object_lock_retain_until_date: Option<::aws_smithy_types::DateTime>,
     pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
+
+    // request_id if the client made a request to get object metadata, like HeadObject.
+    pub request_id: Option<String>,
+    // extended_request_id if the client made a request to get object metadata, like HeadObject.
+    pub extended_request_id: Option<String>,
+    // whether the request that client made only to object metadata, like HeadObject.
+    pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
 }
 
 impl ObjectMetadata {
@@ -103,8 +112,11 @@ impl From<&GetObjectOutput> for ObjectMetadata {
             parts_count: value.parts_count,
             tag_count: value.tag_count,
             object_lock_mode: value.object_lock_mode.clone(),
-            object_lock_retain_until_date: value.object_lock_retain_until_date.clone(),
+            object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status.clone(),
+            request_id: None,
+            extended_request_id: None,
+            request_charged: None,
         }
     }
 }
@@ -146,8 +158,11 @@ impl From<&HeadObjectOutput> for ObjectMetadata {
             parts_count: value.parts_count,
             tag_count: None,
             object_lock_mode: value.object_lock_mode.clone(),
-            object_lock_retain_until_date: value.object_lock_retain_until_date.clone(),
+            object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status.clone(),
+            request_id: value.request_id().map(|s| s.to_string()),
+            extended_request_id: value.extended_request_id().map(|s| s.to_string()),
+            request_charged: value.request_charged.clone(),
         }
     }
 }
