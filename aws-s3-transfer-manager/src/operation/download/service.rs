@@ -9,11 +9,11 @@ use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use tokio::task;
 use std::cmp;
 use std::mem;
 use std::ops::RangeInclusive;
 use tokio::sync::mpsc;
+use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 

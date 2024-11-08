@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crate::error::{self, ErrorKind};
-use tokio::{sync::{oneshot::Receiver, Mutex, OnceCell}, task};
+use tokio::{
+    sync::{oneshot::Receiver, Mutex, OnceCell},
+    task,
+};
 
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
@@ -27,20 +30,21 @@ pub struct DownloadHandle {
 
     /// All child tasks spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
-
     // /// The context used to drive an upload to completion
     // pub(crate) ctx: DownloadContext,
 }
 
 impl DownloadHandle {
-
     /// Object metadata
     pub async fn object_meta(&mut self) -> &Result<ObjectMetadata, error::Error> {
-
-        let meta = self.object_meta.get_or_init(|| async {
-            let meta = self.object_meta_receiver.take().unwrap();
-            meta.await.map_err(error::from_kind(ErrorKind::RuntimeError))
-        }).await;
+        let meta = self
+            .object_meta
+            .get_or_init(|| async {
+                let meta = self.object_meta_receiver.take().unwrap();
+                meta.await
+                    .map_err(error::from_kind(ErrorKind::RuntimeError))
+            })
+            .await;
 
         meta
     }

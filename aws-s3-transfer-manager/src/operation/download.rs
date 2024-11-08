@@ -6,7 +6,6 @@
 mod input;
 
 use aws_sdk_s3::error::DisplayErrorContext;
-use chunk_meta::ChunkMetadata;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
@@ -19,11 +18,10 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
-use object_meta::ObjectMetadata;
 use tracing::Instrument;
 
-mod object_meta;
 mod chunk_meta;
+mod object_meta;
 mod service;
 
 use crate::error;
@@ -36,6 +34,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
+use chunk_meta::ChunkMetadata;
+use object_meta::ObjectMetadata;
 
 use super::TransferContext;
 
@@ -71,8 +71,14 @@ impl Download {
         let (meta_tx, meta_rx) = oneshot::channel();
 
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
-        let discovery = tokio::spawn(send_discovery(tasks.clone(), ctx.clone(), comp_tx, meta_tx, input, use_current_span_as_parent_for_tasks));
-
+        let discovery = tokio::spawn(send_discovery(
+            tasks.clone(),
+            ctx.clone(),
+            comp_tx,
+            meta_tx,
+            input,
+            use_current_span_as_parent_for_tasks,
+        ));
 
         Ok(DownloadHandle {
             body: DownloadOutput::new(comp_rx),
@@ -91,57 +97,56 @@ async fn send_discovery(
     meta_tx: oneshot::Sender<ObjectMetadata>,
     input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
-    ) -> Result<(), crate::error::Error> {
-        let mut tasks = tasks.lock().await;
+) -> Result<(), crate::error::Error> {
+    let mut tasks = tasks.lock().await;
 
-        // create span to serve as parent of spawned child tasks.
-        let parent_span_for_tasks = tracing::debug_span!(
-            parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
-            "download-tasks",
-            bucket = input.bucket().unwrap_or_default(),
-            key = input.key().unwrap_or_default(),
-        );
-        if !use_current_span_as_parent_for_tasks {
-            // if not child of current span, then "follows from" current span
-            parent_span_for_tasks.follows_from(tracing::Span::current());
-        }
+    // create span to serve as parent of spawned child tasks.
+    let parent_span_for_tasks = tracing::debug_span!(
+        parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
+        "download-tasks",
+        bucket = input.bucket().unwrap_or_default(),
+        key = input.key().unwrap_or_default(),
+    );
+    if !use_current_span_as_parent_for_tasks {
+        // if not child of current span, then "follows from" current span
+        parent_span_for_tasks.follows_from(tracing::Span::current());
+    }
 
-            // acquire a permit for discovery
-        let permit = ctx.handle.scheduler.acquire_permit().await?;
+    // acquire a permit for discovery
+    let permit = ctx.handle.scheduler.acquire_permit().await?;
 
-        // make initial discovery about the object size, metadata, possibly first chunk
-        let mut discovery = discover_obj(&ctx, &input).await?;
-        // TODO: waahm7 fix
-        let meta_data = discovery.meta.clone();
-        let _ = meta_tx.send(meta_data.clone().into());
+    // make initial discovery about the object size, metadata, possibly first chunk
+    let mut discovery = discover_obj(&ctx, &input).await?;
+    // TODO: waahm7 fix
+    let _ = meta_tx.send(discovery.object_meta);
 
-        let initial_chunk = discovery.initial_chunk.take();
+    let initial_chunk = discovery.initial_chunk.take();
 
-        // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
-        // that we can begin concurrently downloading any reamining chunks/parts ASAP
-        let start_seq = handle_discovery_chunk(
+    // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
+    // that we can begin concurrently downloading any remaining chunks/parts ASAP
+    let start_seq = handle_discovery_chunk(
+        &mut tasks,
+        ctx.clone(),
+        initial_chunk,
+        &comp_tx,
+        permit,
+        parent_span_for_tasks.clone(),
+        discovery.chunk_meta,
+    );
+
+    if !discovery.remaining.is_empty() {
+        let remaining = discovery.remaining.clone();
+        distribute_work(
             &mut tasks,
             ctx.clone(),
-            initial_chunk,
-            &comp_tx,
-            permit,
-            parent_span_for_tasks.clone(),
-            meta_data,
+            remaining,
+            input,
+            start_seq,
+            comp_tx,
+            parent_span_for_tasks,
         );
-
-        if !discovery.remaining.is_empty() {
-            let remaining = discovery.remaining.clone();
-            distribute_work(
-                &mut tasks,
-                ctx.clone(),
-                remaining,
-                input,
-                start_seq,
-                comp_tx,
-                parent_span_for_tasks,
-            );
-        }
-        Ok(())
+    }
+    Ok(())
 }
 
 /// Handle possibly sending the first chunk of data received through discovery. Returns
@@ -188,6 +193,7 @@ fn handle_discovery_chunk(
             }
         }.instrument(tracing::debug_span!(parent: parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
+    // TODO: waahm7 handle head-object metadata. Discussion point
     ctx.current_seq()
 }
 
