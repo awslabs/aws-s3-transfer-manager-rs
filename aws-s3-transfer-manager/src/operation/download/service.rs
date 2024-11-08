@@ -17,8 +17,8 @@ use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::output::AggregatedBytes;
-use super::output::ChunkResponse;
+use super::body::AggregatedBytes;
+use super::body::ChunkResponse;
 use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.

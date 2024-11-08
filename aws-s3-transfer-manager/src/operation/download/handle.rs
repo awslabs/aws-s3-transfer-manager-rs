@@ -10,7 +10,7 @@ use tokio::{
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::output::DownloadOutput;
+use crate::operation::download::body::Body;
 
 use super::object_meta::ObjectMetadata;
 
@@ -23,7 +23,7 @@ pub struct DownloadHandle {
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
     /// The object content
-    pub(crate) body: DownloadOutput,
+    pub(crate) body: Body,
 
     /// Discovery task
     pub(crate) discovery: task::JoinHandle<Result<(), error::Error>>,
@@ -47,12 +47,12 @@ impl DownloadHandle {
     }
 
     /// Object content
-    pub fn body(&self) -> &DownloadOutput {
+    pub fn body(&self) -> &Body {
         &self.body
     }
 
     /// Mutable reference to the body
-    pub fn body_mut(&mut self) -> &mut DownloadOutput {
+    pub fn body_mut(&mut self) -> &mut Body {
         &mut self.body
     }
 

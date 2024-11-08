@@ -54,7 +54,7 @@ pub struct ObjectMetadata {
     pub request_id: Option<String>,
     // extended_request_id if the client made a request to get object metadata, like HeadObject.
     pub extended_request_id: Option<String>,
-    // whether the request that client made only to object metadata, like HeadObject.
+    // whether the request that client made only to get object metadata, like HeadObject.
     pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
 }
 
