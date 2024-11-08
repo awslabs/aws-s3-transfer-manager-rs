@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::error::{self, ErrorKind};
 use tokio::{
-    sync::{oneshot::Receiver, Mutex},
+    sync::{oneshot::Receiver, Mutex, OnceCell},
     task,
 };
 
@@ -19,8 +19,8 @@ use super::object_meta::ObjectMetadata;
 #[non_exhaustive]
 pub struct DownloadHandle {
     /// Object metadata. TODO: Is there a better way to do this than tokio oncecell?
-    pub(crate) object_meta_receiver: Option<Receiver<ObjectMetadata>>,
-    pub(crate) object_meta: Option<ObjectMetadata>,
+    pub(crate) object_meta_receiver: Mutex<Option<Receiver<ObjectMetadata>>>,
+    pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
     /// The object content
     pub(crate) body: DownloadOutput,
@@ -30,25 +30,20 @@ pub struct DownloadHandle {
 
     /// All child tasks spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
-    // /// The context used to drive an upload to completion
-    // pub(crate) ctx: DownloadContext,
 }
 
 impl DownloadHandle {
     /// Object metadata
-    pub async fn object_meta(&mut self) -> Result<ObjectMetadata, error::Error> {
-        if let Some(object_meta) = &self.object_meta {
-            Ok(object_meta.clone())
-        } else {
-            let meta = self
-                .object_meta_receiver
-                .take()
-                .expect("metadata is not initialized yet");
-             self.object_meta = Some(meta
-                .await
-                .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))?);
-            Ok(self.object_meta.clone().unwrap())
+    pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
+        if !self.object_meta.initialized() {
+            let mut object_meta_receiver = self.object_meta_receiver.lock().await;
+            let object_meta_receiver = object_meta_receiver.take().unwrap();
+            let meta = object_meta_receiver.await.map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))?;
+            // TODO: handle error
+            let _ = self.object_meta.set(meta);
         }
+
+        return Ok(self.object_meta.get().unwrap());
     }
 
     /// Object content

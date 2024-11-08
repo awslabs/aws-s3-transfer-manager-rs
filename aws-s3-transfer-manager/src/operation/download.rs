@@ -32,7 +32,7 @@ use output::{AggregatedBytes, ChunkResponse, DownloadOutput};
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
 use chunk_meta::ChunkMetadata;
 use object_meta::ObjectMetadata;
@@ -84,8 +84,8 @@ impl Download {
             body: DownloadOutput::new(comp_rx),
             tasks,
             discovery,
-            object_meta_receiver: Some(meta_rx),
-            object_meta: None,
+            object_meta_receiver: Mutex::new(Some(meta_rx)),
+            object_meta: OnceCell::new(),
         })
     }
 }

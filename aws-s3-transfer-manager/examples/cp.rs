@@ -172,14 +172,13 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     //      likely abstract this into performant utils for single file download. Higher level
     //      TM will handle it's own thread pool for filesystem work
     let mut handle = tm.download().bucket(bucket).key(key).send()?;
-    let metadata = handle.object_meta().await?;
 
     write_body(handle.body_mut(), dest)
         .instrument(tracing::debug_span!("write-output"))
         .await?;
 
     let elapsed = start.elapsed();
-    let obj_size_bytes = metadata.total_size();
+    let obj_size_bytes = handle.object_meta().await?.total_size();
     let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(
