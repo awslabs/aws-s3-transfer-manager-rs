@@ -15,12 +15,14 @@ use aws_sdk_s3::operation::RequestIdExt;
 #[derive(Debug, Clone, Default)]
 pub struct ObjectMetadata {
     pub delete_marker: Option<bool>,
+    // TODO: remove
     pub accept_ranges: Option<String>,
     pub expiration: Option<String>,
     pub restore: Option<String>,
     pub last_modified: Option<::aws_smithy_types::DateTime>,
     pub(crate) content_length: Option<i64>,
     pub e_tag: Option<String>,
+    // todo: wrong for first part 
     pub checksum_crc32: Option<String>,
     pub checksum_crc32_c: Option<String>,
     pub checksum_sha1: Option<String>,

@@ -157,14 +157,13 @@ async fn send_discovery(
 /// This allows remaining work to start immediately (and concurrently) without
 /// waiting for the first chunk.
 fn handle_discovery_chunk(
-    //handle: &mut DownloadHandle,
     tasks: &mut task::JoinSet<()>,
     ctx: DownloadContext,
     initial_chunk: Option<ByteStream>,
     completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
     permit: OwnedWorkPermit,
     parent_span_for_tasks: tracing::Span,
-    meta_data: ChunkMetadata,
+    metadata: Option<ChunkMetadata>,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
         let seq = ctx.next_seq();
@@ -178,7 +177,7 @@ fn handle_discovery_chunk(
                 .map(|aggregated| ChunkResponse {
                     seq,
                     data: aggregated,
-                    metadata: meta_data,
+                    metadata: metadata.expect("metadata is available"),
                 })
                 .map_err(error::discovery_failed);
 
@@ -193,7 +192,6 @@ fn handle_discovery_chunk(
             }
         }.instrument(tracing::debug_span!(parent: parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
-    // TODO: waahm7 handle head-object metadata. Discussion point
     ctx.current_seq()
 }
 

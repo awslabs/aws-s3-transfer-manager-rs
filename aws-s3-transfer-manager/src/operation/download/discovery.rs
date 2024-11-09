@@ -36,7 +36,7 @@ pub(super) struct ObjectDiscovery {
     pub(super) remaining: RangeInclusive<u64>,
 
     /// the discovered metadata
-    pub(super) chunk_meta: ChunkMetadata,
+    pub(super) chunk_meta: Option<ChunkMetadata>,
     pub(super) object_meta: ObjectMetadata,
 
     /// the first chunk of data if fetched during discovery
@@ -122,7 +122,6 @@ async fn discover_obj_with_head(
         .await
         .map_err(error::discovery_failed)?;
     let object_meta: ObjectMetadata = (&resp).into();
-    let chunk_meta: ChunkMetadata = resp.into();
 
     let remaining = match byte_range {
         Some(range) => match range {
@@ -135,7 +134,7 @@ async fn discover_obj_with_head(
 
     Ok(ObjectDiscovery {
         remaining,
-        chunk_meta,
+        chunk_meta: None,
         object_meta,
         initial_chunk: None,
     })
@@ -174,7 +173,7 @@ async fn discover_obj_with_get(
 
     Ok(ObjectDiscovery {
         remaining,
-        chunk_meta,
+        chunk_meta: Some(chunk_meta),
         object_meta,
         initial_chunk,
     })
