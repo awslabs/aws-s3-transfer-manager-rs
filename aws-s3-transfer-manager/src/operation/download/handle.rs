@@ -28,7 +28,7 @@ pub struct DownloadHandle {
     /// Discovery task
     pub(crate) discovery: task::JoinHandle<Result<(), error::Error>>,
 
-    /// All child tasks spawned for this download
+    /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
 }
 
@@ -39,7 +39,6 @@ impl DownloadHandle {
             let mut object_meta_receiver = self.object_meta_receiver.lock().await;
             let object_meta_receiver = object_meta_receiver.take().unwrap();
             object_meta_receiver.await.map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))
-
         }).await?;
 
         Ok(meta)

@@ -101,6 +101,7 @@ type BodyChannel = mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>;
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ChunkResponse {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
     // the seq number

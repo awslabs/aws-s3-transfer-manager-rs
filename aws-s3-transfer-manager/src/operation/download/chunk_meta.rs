@@ -8,6 +8,7 @@ use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
 
 /// request metadata other than the body that will be set from `GetObject`
+// TODO: Document fields
 #[derive(Debug, Clone, Default)]
 pub struct ChunkMetadata {
     pub request_id: Option<String>,

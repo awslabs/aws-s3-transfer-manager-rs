@@ -11,7 +11,7 @@ use aws_sdk_s3::operation::RequestIdExt;
 // TODO(aws-sdk-rust#1159,design): how many of these fields should we expose?
 // TODO(aws-sdk-rust#1159,docs): Document fields
 
-/// Object metadata other than the body
+/// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 #[derive(Debug, Clone, Default)]
 pub struct ObjectMetadata {
     pub delete_marker: Option<bool>,
@@ -44,11 +44,11 @@ pub struct ObjectMetadata {
     pub object_lock_retain_until_date: Option<::aws_smithy_types::DateTime>,
     pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
 
-    // request_id if the client made a request to get object metadata, like HeadObject.
+    /// The request_id if the client made a request to retrieve object metadata, such as with HeadObject.
     pub request_id: Option<String>,
-    // extended_request_id if the client made a request to get object metadata, like HeadObject.
+    /// The extended_request_id if the client made a request to retrieve object metadata, such as with HeadObject.
     pub extended_request_id: Option<String>,
-    // whether the request that client made only to get object metadata, like HeadObject.
+    /// Indicates whether the request was charged for a request made only to retrieve object metadata, such as HeadObject.
     pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
 }
 
