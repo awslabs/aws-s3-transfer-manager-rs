@@ -152,23 +152,22 @@ impl From<HeadObjectOutput> for ObjectMetadata {
 
 #[cfg(test)]
 mod tests {
-    // use super::ObjectMetadata;
+    use super::ObjectMetadata;
 
-    // #[test]
-    // fn test_inferred_content_length() {
-    //     let meta = ObjectMetadata {
-    //         content_length: Some(4),
-    //         content_range: Some("should ignore".to_owned()),
-    //         ..Default::default()
-    //     };
+    #[test]
+    fn test_inferred_total_size() {
+        let meta = ObjectMetadata {
+            content_length: Some(15),
+            ..Default::default()
+        };
 
-    //     assert_eq!(4, meta.content_length());
+        assert_eq!(15, meta.total_size());
 
-    //     let meta = ObjectMetadata {
-    //         content_length: None,
-    //         content_range: Some("bytes 0-499/900".to_owned()),
-    //         ..Default::default()
-    //     };
-    //     assert_eq!(500, meta.content_length());
-    // }
+        let meta = ObjectMetadata {
+            content_range: Some("bytes 0-499/900".to_owned()),
+            content_length: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(900, meta.total_size());
+    }
 }
