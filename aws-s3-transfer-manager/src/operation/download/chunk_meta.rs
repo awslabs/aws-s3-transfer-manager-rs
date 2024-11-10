@@ -96,4 +96,3 @@ impl From<GetObjectOutput> for ChunkMetadata {
         }
     }
 }
-

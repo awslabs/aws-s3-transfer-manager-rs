@@ -524,10 +524,7 @@ impl DownloadFluentBuilder {
 
 impl crate::operation::download::input::DownloadInputBuilder {
     /// Initiate a download transfer for a single object with this input using the given client.
-    pub fn send_with(
-        self,
-        client: &crate::Client,
-    ) -> Result<DownloadHandle, crate::error::Error> {
+    pub fn send_with(self, client: &crate::Client) -> Result<DownloadHandle, crate::error::Error> {
         let mut fluent_builder = client.download();
         fluent_builder.inner = self;
         fluent_builder.send()

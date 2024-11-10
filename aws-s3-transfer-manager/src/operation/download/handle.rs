@@ -35,11 +35,16 @@ pub struct DownloadHandle {
 impl DownloadHandle {
     /// Object metadata
     pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
-        let meta = self.object_meta.get_or_try_init(|| async {
-            let mut object_meta_receiver = self.object_meta_receiver.lock().await;
-            let object_meta_receiver = object_meta_receiver.take().unwrap();
-            object_meta_receiver.await.map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))
-        }).await?;
+        let meta = self
+            .object_meta
+            .get_or_try_init(|| async {
+                let mut object_meta_receiver = self.object_meta_receiver.lock().await;
+                let object_meta_receiver = object_meta_receiver.take().unwrap();
+                object_meta_receiver
+                    .await
+                    .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))
+            })
+            .await?;
 
         Ok(meta)
     }

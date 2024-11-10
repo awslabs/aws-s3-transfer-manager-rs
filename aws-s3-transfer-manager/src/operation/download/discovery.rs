@@ -113,7 +113,7 @@ async fn discover_obj_with_head(
     input: &DownloadInput,
     byte_range: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let resp  = ctx
+    let resp = ctx
         .client()
         .head_object()
         .set_bucket(input.bucket().map(str::to_string))

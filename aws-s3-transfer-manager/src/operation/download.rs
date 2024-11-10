@@ -9,10 +9,10 @@ use aws_sdk_s3::error::DisplayErrorContext;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
-/// Operation builders
-pub mod builders;
 /// Abstractions for response bodies and consuming data streams.
 pub mod body;
+/// Operation builders
+pub mod builders;
 
 mod discovery;
 
@@ -27,15 +27,15 @@ mod service;
 use crate::error;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
+use body::{AggregatedBytes, Body, ChunkResponse};
+use chunk_meta::ChunkMetadata;
 use discovery::discover_obj;
-use body::{AggregatedBytes, ChunkResponse, Body};
+use object_meta::ObjectMetadata;
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
-use chunk_meta::ChunkMetadata;
-use object_meta::ObjectMetadata;
 
 use super::TransferContext;
 
@@ -98,7 +98,6 @@ async fn send_discovery(
     input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
 ) -> Result<(), crate::error::Error> {
-
     // create span to serve as parent of spawned child tasks.
     let parent_span_for_tasks = tracing::debug_span!(
         parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
@@ -112,7 +111,7 @@ async fn send_discovery(
     }
 
     // acquire a permit for discovery
-    // TODO: Verify, if this fails we are not stuck. 
+    // TODO: Verify, if this fails we are not stuck.
     let permit = ctx.handle.scheduler.acquire_permit().await?;
 
     // make initial discovery about the object size, metadata, possibly first chunk
@@ -170,7 +169,6 @@ fn handle_discovery_chunk(
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
         tasks.spawn(async move {
-            
             let chunk = AggregatedBytes::from_byte_stream(stream)
                 .await
                 .map(|aggregated| ChunkResponse {

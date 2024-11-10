@@ -49,7 +49,7 @@ impl AggregatedBytes {
         self.0.into_inner().into_iter().flatten().collect()
     }
 
-    /// Make this buffer from a ByteStream 
+    /// Make this buffer from a ByteStream
     pub(crate) async fn from_byte_stream(value: ByteStream) -> Result<Self, crate::error::Error> {
         let mut value = value;
         let mut output = SegmentedBuf::new();
