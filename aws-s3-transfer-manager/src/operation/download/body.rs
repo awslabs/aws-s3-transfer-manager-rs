@@ -98,15 +98,16 @@ pub struct Body {
 
 type BodyChannel = mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>;
 
+/// Contains body and metadata for each GetObject call made. This will be delivered sequentially
+/// in-order.
 #[derive(Debug, Clone)]
-/// TODO: DOcs
 pub struct ChunkResponse {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
     // the seq number
     pub(crate) seq: u64,
-    /// data: chunk data
+    /// data: body of the object
     pub data: AggregatedBytes,
-    /// metadata
+    /// metadata: metadata returned by the S3.
     pub metadata: ChunkMetadata,
 }
 
@@ -127,14 +128,20 @@ impl Body {
         }
     }
 
+    /// Convert this body into an unordered stream of chunks.
+    // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
+    // download_objects should utilize this so that it can write in parallel to files.
+    #[allow(dead_code)]
+    pub(crate) fn unordered(self) -> UnorderedBody {
+        self.inner
+    }
+
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
     pub async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
-        // TODO(aws-sdk-rust#1159, design) - do we want ChunkResponse (or similar) rather than AggregatedBytes? Would
-        //  make additional retries of an individual chunk/part more feasible (though theoretically already exhausted retries)
         loop {
             if self.sequencer.is_ordered() {
                 break;
