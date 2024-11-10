@@ -136,8 +136,7 @@ impl Client {
     ///         .download()
     ///         .bucket("my-bucket")
     ///         .key("my-key")
-    ///         .send()
-    ///         .await?;
+    ///         .send()?;
     ///
     ///     // process data off handle...
     ///

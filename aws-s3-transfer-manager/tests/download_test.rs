@@ -70,13 +70,18 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
         .enumerate()
         .map(|(idx, chunk)| {
             let start = idx * part_size;
-            let end = part_size * (idx + 1) - 1;
+            let end = std::cmp::min(start+part_size, data.len()) - 1;
+            eprintln!("{},{}-{}", end-start+1, start,end);
             ReplayEvent::new(
                 // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
                 // make our own assertions against the captured requests.
                 dummy_expected_request(),
                 http_02x::Response::builder()
                     .status(200)
+                    .header(
+                        "Content-Length",
+                        format!("{}", end-start+1),
+                    )
                     .header(
                         "Content-Range",
                         format!("bytes {start}-{end}/{}", data.len()),
@@ -228,6 +233,10 @@ async fn test_retry_failed_chunk() {
             http_02x::Response::builder()
                 .status(200)
                 .header(
+                    "Content-Length",
+                    format!("{}", part_size),
+                )
+                .header(
                     "Content-Range",
                     format!("bytes 0-{}/{}", part_size - 1, data.len()),
                 )
@@ -239,6 +248,10 @@ async fn test_retry_failed_chunk() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header(
+                    "Content-Length",
+                    format!("{}", data.len() - part_size),
+                )
                 .header(
                     "Content-Range",
                     format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
@@ -255,6 +268,10 @@ async fn test_retry_failed_chunk() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header(
+                    "Content-Length",
+                    format!("{}", data.len() - part_size),
+                )
                 .header(
                     "Content-Range",
                     format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
@@ -302,6 +319,10 @@ async fn test_non_retryable_error() {
             http_02x::Response::builder()
                 .status(200)
                 .header(
+                    "Content-Length",
+                    format!("{}", part_size),
+                )
+                .header(
                     "Content-Range",
                     format!("bytes 0-{}/{}", part_size - 1, data.len()),
                 )
@@ -348,6 +369,10 @@ async fn test_retry_max_attempts() {
             http_02x::Response::builder()
                 .status(200)
                 .header(
+                    "Content-Length",
+                    format!("{}", part_size),
+                )
+                .header(
                     "Content-Range",
                     format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
                 )
@@ -366,6 +391,10 @@ async fn test_retry_max_attempts() {
         dummy_expected_request(),
         http_02x::Response::builder()
             .status(200)
+            .header(
+                "Content-Length",
+                format!("{}", part_size),
+            )
             .header(
                 "Content-Range",
                 format!("bytes 0-{}/{}", part_size - 1, data.len()),
