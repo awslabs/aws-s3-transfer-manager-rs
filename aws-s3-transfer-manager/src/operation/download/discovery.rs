@@ -121,7 +121,7 @@ async fn discover_obj_with_head(
         .send()
         .await
         .map_err(error::discovery_failed)?;
-    let object_meta: ObjectMetadata = (&resp).into();
+    let object_meta: ObjectMetadata = resp.into();
 
     let remaining = match byte_range {
         Some(range) => match range {

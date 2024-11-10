@@ -98,7 +98,6 @@ async fn send_discovery(
     input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
 ) -> Result<(), crate::error::Error> {
-    let mut tasks = tasks.lock().await;
 
     // create span to serve as parent of spawned child tasks.
     let parent_span_for_tasks = tracing::debug_span!(
@@ -118,11 +117,11 @@ async fn send_discovery(
 
     // make initial discovery about the object size, metadata, possibly first chunk
     let mut discovery = discover_obj(&ctx, &input).await?;
-    // TODO: waahm7 fix
     let _ = meta_tx.send(discovery.object_meta);
 
     let initial_chunk = discovery.initial_chunk.take();
 
+    let mut tasks = tasks.lock().await;
     // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
     // that we can begin concurrently downloading any remaining chunks/parts ASAP
     let start_seq = handle_discovery_chunk(

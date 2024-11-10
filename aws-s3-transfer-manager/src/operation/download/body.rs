@@ -16,7 +16,13 @@ use crate::error::ErrorKind;
 use super::chunk_meta::ChunkMetadata;
 
 #[derive(Debug, Clone)]
-/// TODO: waahm7 doc
+
+/// Non-contiguous Binary Data Storage
+///
+/// When data is read from the network, it is read in a sequence of chunks that are not in
+/// contiguous memory. [`AggregatedBytes`](crate::byte_stream::AggregatedBytes) provides a view of
+/// this data via [`impl Buf`](bytes::Buf) or it can be copied into contiguous storage with
+/// [`.into_bytes()`](crate::byte_stream::AggregatedBytes::into_bytes).
 pub struct AggregatedBytes(SegmentedBuf<Bytes>);
 
 impl AggregatedBytes {
@@ -43,8 +49,8 @@ impl AggregatedBytes {
         self.0.into_inner().into_iter().flatten().collect()
     }
 
-    /// TODO: waahm7 doc
-    pub async fn from_byte_stream(value: ByteStream) -> Result<Self, crate::error::Error> {
+    /// Make this buffer from a ByteStream 
+    pub(crate) async fn from_byte_stream(value: ByteStream) -> Result<Self, crate::error::Error> {
         let mut value = value;
         let mut output = SegmentedBuf::new();
         while let Some(buf) = value.next().await {
