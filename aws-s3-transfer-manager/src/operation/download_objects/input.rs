@@ -135,8 +135,8 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// The destination directory to which files should be downloaded
-    pub fn get_destination(&self) -> &Option<PathBuf> {
-        &self.destination
+    pub fn get_destination(&self) -> Option<&Path> {
+        self.destination.as_deref()
     }
 
     /// Limit the response to keys that begin with the given prefix

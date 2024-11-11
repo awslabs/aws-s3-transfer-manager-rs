@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::types::{FailedTransferPolicy, UploadFilter};
 
@@ -67,7 +70,7 @@ impl UploadObjectsFluentBuilder {
     }
 
     /// The local directory to upload from.
-    pub fn get_source(&self) -> &Option<PathBuf> {
+    pub fn get_source(&self) -> Option<&Path> {
         self.inner.get_source()
     }
 

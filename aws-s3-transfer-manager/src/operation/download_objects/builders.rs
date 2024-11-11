@@ -4,7 +4,10 @@
  */
 
 use crate::types::{DownloadFilter, FailedTransferPolicy};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 
@@ -64,7 +67,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The destination directory to which files should be downloaded
-    pub fn get_destination(&self) -> &Option<PathBuf> {
+    pub fn get_destination(&self) -> Option<&Path> {
         self.inner.get_destination()
     }
 
