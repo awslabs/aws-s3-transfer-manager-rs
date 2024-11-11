@@ -5,5 +5,5 @@ allowed_external_types = [
     "aws_smithy_types::*",
     "tokio::runtime::task::error::JoinError",
     "bytes::bytes::Bytes",
-    "bytes::bytes::Buf",
+    "bytes::buf::buf_impl::Buf",
 ]
