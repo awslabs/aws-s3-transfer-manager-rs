@@ -116,7 +116,6 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             request_charged: value.request_charged,
             delete_marker: value.delete_marker,
-            // accept_ranges: value.accept_ranges,
             expiration: value.expiration,
             restore: value.restore,
             last_modified: value.last_modified,

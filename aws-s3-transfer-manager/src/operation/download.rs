@@ -174,7 +174,7 @@ fn handle_discovery_chunk(
                 .map(|aggregated| ChunkResponse {
                     seq,
                     data: aggregated,
-                    metadata: metadata.expect("metadata is available"),
+                    metadata: metadata.expect("chunk metadata is available"),
                 })
                 .map_err(error::discovery_failed);
 
