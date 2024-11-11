@@ -15,7 +15,7 @@ use crate::error;
 use crate::operation::download::body::Body;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
 use crate::operation::DEFAULT_DELIMITER;
-use crate::types::{DownloadFilter, FailedDownloadTransfer, FailedTransferPolicy};
+use crate::types::{DownloadFilter, FailedDownload, FailedTransferPolicy};
 
 use super::list_objects::ListObjectsStream;
 use super::DownloadObjectsContext;
@@ -113,7 +113,7 @@ pub(super) async fn download_objects(
                     FailedTransferPolicy::Continue => {
                         let mut failures = ctx.state.failed_downloads.lock().unwrap();
 
-                        let failed_transfer = FailedDownloadTransfer {
+                        let failed_transfer = FailedDownload {
                             input: job.input(&ctx),
                             error: err,
                         };

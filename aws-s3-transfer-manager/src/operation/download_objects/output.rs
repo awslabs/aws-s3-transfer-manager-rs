@@ -4,7 +4,7 @@
  */
 
 use super::DownloadObjectsState;
-use crate::types::FailedDownloadTransfer;
+use crate::types::FailedDownload;
 use std::sync::atomic::Ordering;
 
 /// Output type for downloading multiple objects
@@ -15,7 +15,7 @@ pub struct DownloadObjectsOutput {
     pub objects_downloaded: u64,
 
     /// A list of failed object transfers
-    pub failed_transfers: Vec<FailedDownloadTransfer>,
+    pub failed_transfers: Vec<FailedDownload>,
 
     // FIXME - likely remove when progress is implemented?
     /// Total number of bytes transferred
@@ -34,7 +34,7 @@ impl DownloadObjectsOutput {
     }
 
     /// A slice of failed object transfers
-    pub fn failed_transfers(&self) -> &[FailedDownloadTransfer] {
+    pub fn failed_transfers(&self) -> &[FailedDownload] {
         self.failed_transfers.as_slice()
     }
 
@@ -63,7 +63,7 @@ impl From<&DownloadObjectsState> for DownloadObjectsOutput {
 #[derive(Debug, Default)]
 pub struct DownloadObjectsOutputBuilder {
     pub(crate) objects_downloaded: u64,
-    pub(crate) failed_transfers: Vec<FailedDownloadTransfer>,
+    pub(crate) failed_transfers: Vec<FailedDownload>,
     pub(crate) total_bytes_transferred: u64,
 }
 
@@ -83,19 +83,19 @@ impl DownloadObjectsOutputBuilder {
     ///
     /// To override the contents of this collection use
     /// [`set_failed_transfers`](Self::set_failed_transfers)
-    pub fn failed_transfers(mut self, input: FailedDownloadTransfer) -> Self {
+    pub fn failed_transfers(mut self, input: FailedDownload) -> Self {
         self.failed_transfers.push(input);
         self
     }
 
     /// Set a list of failed object transfers
-    pub fn set_failed_transfers(mut self, input: Vec<FailedDownloadTransfer>) -> Self {
+    pub fn set_failed_transfers(mut self, input: Vec<FailedDownload>) -> Self {
         self.failed_transfers = input;
         self
     }
 
     /// Get a list of failed object transfers
-    pub fn get_failed_transfers(&self) -> &[FailedDownloadTransfer] {
+    pub fn get_failed_transfers(&self) -> &[FailedDownload] {
         self.failed_transfers.as_slice()
     }
 

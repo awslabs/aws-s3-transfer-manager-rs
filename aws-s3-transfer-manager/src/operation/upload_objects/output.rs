@@ -4,7 +4,7 @@
  */
 
 use super::UploadObjectsState;
-use crate::types::FailedUploadTransfer;
+use crate::types::FailedUpload;
 use std::sync::atomic::Ordering;
 
 /// Output type for uploading multiple objects
@@ -15,7 +15,7 @@ pub struct UploadObjectsOutput {
     objects_uploaded: u64,
 
     /// The list of failed uploads
-    failed_transfers: Vec<FailedUploadTransfer>,
+    failed_transfers: Vec<FailedUpload>,
 
     // FIXME - likely remove when progress is implemented (let's be consistent with downloads for now)?
     /// Total number of bytes transferred
@@ -34,7 +34,7 @@ impl UploadObjectsOutput {
     }
 
     /// The list of failed uploads
-    pub fn failed_transfers(&self) -> &[FailedUploadTransfer] {
+    pub fn failed_transfers(&self) -> &[FailedUpload] {
         self.failed_transfers.as_slice()
     }
 
@@ -63,7 +63,7 @@ impl From<&UploadObjectsState> for UploadObjectsOutput {
 #[derive(Debug, Default)]
 pub struct UploadObjectsOutputBuilder {
     pub(crate) objects_uploaded: u64,
-    pub(crate) failed_transfers: Vec<FailedUploadTransfer>,
+    pub(crate) failed_transfers: Vec<FailedUpload>,
     pub(crate) total_bytes_transferred: u64,
 }
 
@@ -82,13 +82,13 @@ impl UploadObjectsOutputBuilder {
     /// Append a failed transfer.
     ///
     /// To override the contents of this collection use [`set_failed_transfers`](Self::set_failed_transfers)
-    pub fn failed_transfers(mut self, input: FailedUploadTransfer) -> Self {
+    pub fn failed_transfers(mut self, input: FailedUpload) -> Self {
         self.failed_transfers.push(input);
         self
     }
 
     /// Set a list of failed uploads
-    pub fn set_failed_transfers(mut self, input: Vec<FailedUploadTransfer>) -> Self {
+    pub fn set_failed_transfers(mut self, input: Vec<FailedUpload>) -> Self {
         self.failed_transfers = input;
         self
     }

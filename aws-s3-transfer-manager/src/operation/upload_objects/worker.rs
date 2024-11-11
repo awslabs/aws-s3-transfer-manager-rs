@@ -17,7 +17,7 @@ use crate::error::ErrorKind;
 use crate::io::InputStream;
 use crate::operation::upload::UploadInputBuilder;
 use crate::operation::DEFAULT_DELIMITER;
-use crate::types::{FailedTransferPolicy, FailedUploadTransfer, UploadFilter};
+use crate::types::{FailedTransferPolicy, FailedUpload, UploadFilter};
 use crate::{error, types::UploadFilterItem};
 
 #[derive(Debug)]
@@ -223,7 +223,7 @@ fn handle_failed_upload(
         FailedTransferPolicy::Continue => {
             let mut failures = ctx.state.failed_uploads.lock().unwrap();
 
-            let failed_transfer = FailedUploadTransfer {
+            let failed_transfer = FailedUpload {
                 input: match object_key {
                     key @ Some(_) => Some(
                         UploadInputBuilder::default()
