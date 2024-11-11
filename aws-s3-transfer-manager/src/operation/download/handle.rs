@@ -18,8 +18,9 @@ use super::object_meta::ObjectMetadata;
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DownloadHandle {
-    /// Object metadata. TODO: Is there a better way to do this than tokio oncecell?
+    /// Object metadata receiver.
     pub(crate) object_meta_receiver: Mutex<Option<Receiver<ObjectMetadata>>>,
+    /// Object metadata.
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
     /// The object content
