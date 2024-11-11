@@ -114,8 +114,8 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// The bucket name containing the object(s).
-    pub fn get_bucket(&self) -> &Option<String> {
-        &self.bucket
+    pub fn get_bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
     }
 
     /// Set the destination directory to which files should be downloaded
@@ -152,8 +152,8 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// The key_prefix name containing the object(s).
-    pub fn get_key_prefix(&self) -> &Option<String> {
-        &self.key_prefix
+    pub fn get_key_prefix(&self) -> Option<&str> {
+        self.key_prefix.as_deref()
     }
 
     /// Character used to group keys
@@ -169,8 +169,8 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// Character used to group keys
-    pub fn get_delimiter(&self) -> &Option<String> {
-        &self.delimiter
+    pub fn get_delimiter(&self) -> Option<&str> {
+        self.delimiter.as_deref()
     }
 
     /// The failure policy to use when any individual object download fails.

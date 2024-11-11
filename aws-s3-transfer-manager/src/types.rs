@@ -54,8 +54,8 @@ impl AbortedUpload {
     /// Get the multipart upload ID that was cancelled
     ///
     /// Not present for uploads that did not utilize a multipart upload
-    pub fn upload_id(&self) -> &Option<String> {
-        &self.upload_id
+    pub fn upload_id(&self) -> Option<&str> {
+        self.upload_id.as_deref()
     }
 
     /// If present, indicates that the requester was successfully charged for the request.

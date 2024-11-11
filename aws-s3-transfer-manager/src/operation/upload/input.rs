@@ -648,8 +648,8 @@ impl UploadInputBuilder {
     /// <p>Access points and Object Lambda access points are not supported by directory buckets.</p>
     /// </note>
     /// <p><b>S3 on Outposts</b> - When you use this action with Amazon S3 on Outposts, you must direct requests to the S3 on Outposts hostname. The S3 on Outposts hostname takes the form <code> <i>AccessPointName</i>-<i>AccountId</i>.<i>outpostID</i>.s3-outposts.<i>Region</i>.amazonaws.com</code>. When you use this action with S3 on Outposts through the Amazon Web Services SDKs, you provide the Outposts access point ARN in place of the bucket name. For more information about S3 on Outposts ARNs, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/S3onOutposts.html">What is S3 on Outposts?</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_bucket(&self) -> &Option<String> {
-        &self.bucket
+    pub fn get_bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
     }
     /// <p>Can be used to specify caching behavior along the request/reply chain. For more information, see <a href="http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9">http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9</a>.</p>
     pub fn cache_control(mut self, input: impl Into<String>) -> Self {
@@ -662,8 +662,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>Can be used to specify caching behavior along the request/reply chain. For more information, see <a href="http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9">http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9</a>.</p>
-    pub fn get_cache_control(&self) -> &Option<String> {
-        &self.cache_control
+    pub fn get_cache_control(&self) -> Option<&str> {
+        self.cache_control.as_deref()
     }
     /// <p>Specifies presentational information for the object. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc6266#section-4">https://www.rfc-editor.org/rfc/rfc6266#section-4</a>.</p>
     pub fn content_disposition(mut self, input: impl Into<String>) -> Self {
@@ -676,8 +676,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>Specifies presentational information for the object. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc6266#section-4">https://www.rfc-editor.org/rfc/rfc6266#section-4</a>.</p>
-    pub fn get_content_disposition(&self) -> &Option<String> {
-        &self.content_disposition
+    pub fn get_content_disposition(&self) -> Option<&str> {
+        self.content_disposition.as_deref()
     }
     /// <p>Specifies what content encodings have been applied to the object and thus what decoding mechanisms must be applied to obtain the media-type referenced by the Content-Type header field. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#field.content-encoding">https://www.rfc-editor.org/rfc/rfc9110.html#field.content-encoding</a>.</p>
     pub fn content_encoding(mut self, input: impl Into<String>) -> Self {
@@ -690,8 +690,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>Specifies what content encodings have been applied to the object and thus what decoding mechanisms must be applied to obtain the media-type referenced by the Content-Type header field. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#field.content-encoding">https://www.rfc-editor.org/rfc/rfc9110.html#field.content-encoding</a>.</p>
-    pub fn get_content_encoding(&self) -> &Option<String> {
-        &self.content_encoding
+    pub fn get_content_encoding(&self) -> Option<&str> {
+        self.content_encoding.as_deref()
     }
     /// <p>The language the content is in.</p>
     pub fn content_language(mut self, input: impl Into<String>) -> Self {
@@ -704,8 +704,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>The language the content is in.</p>
-    pub fn get_content_language(&self) -> &Option<String> {
-        &self.content_language
+    pub fn get_content_language(&self) -> Option<&str> {
+        self.content_language.as_deref()
     }
     /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
     pub fn content_length(mut self, input: i64) -> Self {
@@ -744,8 +744,8 @@ impl UploadInputBuilder {
     /// </note> <note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_content_md5(&self) -> &Option<String> {
-        &self.content_md5
+    pub fn get_content_md5(&self) -> Option<&str> {
+        self.content_md5.as_deref()
     }
     /// <p>A standard MIME type describing the format of the contents. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-type">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-type</a>.</p>
     pub fn content_type(mut self, input: impl Into<String>) -> Self {
@@ -758,8 +758,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>A standard MIME type describing the format of the contents. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-type">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-type</a>.</p>
-    pub fn get_content_type(&self) -> &Option<String> {
-        &self.content_type
+    pub fn get_content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
     }
     /// <p>Indicates the algorithm used to create the checksum for the object when you use the SDK. This header will not provide any additional functionality if you don't use the SDK. When you send this header, there must be a corresponding <code>x-amz-checksum-<i>algorithm</i> </code> or <code>x-amz-trailer</code> header sent. Otherwise, Amazon S3 fails the request with the HTTP status code <code>400 Bad Request</code>.</p>
     /// <p>For the <code>x-amz-checksum-<i>algorithm</i> </code> header, replace <code> <i>algorithm</i> </code> with the supported algorithm from the following list:</p>
@@ -834,8 +834,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_crc32(&self) -> &Option<String> {
-        &self.checksum_crc32
+    pub fn get_checksum_crc32(&self) -> Option<&str> {
+        self.checksum_crc32.as_deref()
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32C checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn checksum_crc32_c(mut self, input: impl Into<String>) -> Self {
@@ -848,8 +848,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32C checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_crc32_c(&self) -> &Option<String> {
-        &self.checksum_crc32_c
+    pub fn get_checksum_crc32_c(&self) -> Option<&str> {
+        self.checksum_crc32_c.as_deref()
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 160-bit SHA-1 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn checksum_sha1(mut self, input: impl Into<String>) -> Self {
@@ -862,8 +862,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 160-bit SHA-1 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_sha1(&self) -> &Option<String> {
-        &self.checksum_sha1
+    pub fn get_checksum_sha1(&self) -> Option<&str> {
+        self.checksum_sha1.as_deref()
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 256-bit SHA-256 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn checksum_sha256(mut self, input: impl Into<String>) -> Self {
@@ -876,8 +876,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 256-bit SHA-256 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_sha256(&self) -> &Option<String> {
-        &self.checksum_sha256
+    pub fn get_checksum_sha256(&self) -> Option<&str> {
+        self.checksum_sha256.as_deref()
     }
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub fn expires(mut self, input: ::aws_smithy_types::DateTime) -> Self {
@@ -925,8 +925,8 @@ impl UploadInputBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn get_grant_full_control(&self) -> &Option<String> {
-        &self.grant_full_control
+    pub fn get_grant_full_control(&self) -> Option<&str> {
+        self.grant_full_control.as_deref()
     }
     /// <p>Allows grantee to read the object data and its metadata.</p><note>
     /// <ul>
@@ -960,8 +960,8 @@ impl UploadInputBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn get_grant_read(&self) -> &Option<String> {
-        &self.grant_read
+    pub fn get_grant_read(&self) -> Option<&str> {
+        self.grant_read.as_deref()
     }
     /// <p>Allows grantee to read the object ACL.</p><note>
     /// <ul>
@@ -995,8 +995,8 @@ impl UploadInputBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn get_grant_read_acp(&self) -> &Option<String> {
-        &self.grant_read_acp
+    pub fn get_grant_read_acp(&self) -> Option<&str> {
+        self.grant_read_acp.as_deref()
     }
     /// <p>Allows grantee to write the ACL for the applicable object.</p><note>
     /// <ul>
@@ -1030,8 +1030,8 @@ impl UploadInputBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn get_grant_write_acp(&self) -> &Option<String> {
-        &self.grant_write_acp
+    pub fn get_grant_write_acp(&self) -> Option<&str> {
+        self.grant_write_acp.as_deref()
     }
     /// <p>Object key for which the PUT action was initiated.</p>
     /// This field is required.
@@ -1045,8 +1045,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>Object key for which the PUT action was initiated.</p>
-    pub fn get_key(&self) -> &Option<String> {
-        &self.key
+    pub fn get_key(&self) -> Option<&str> {
+        self.key.as_deref()
     }
     /// Adds a key-value pair to `metadata`.
     ///
@@ -1164,8 +1164,8 @@ impl UploadInputBuilder {
     /// <p>For more information about website hosting in Amazon S3, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/WebsiteHosting.html">Hosting Websites on Amazon S3</a> and <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/how-to-page-redirect.html">How to Configure Website Page Redirects</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_website_redirect_location(&self) -> &Option<String> {
-        &self.website_redirect_location
+    pub fn get_website_redirect_location(&self) -> Option<&str> {
+        self.website_redirect_location.as_deref()
     }
     /// <p>Specifies the algorithm to use when encrypting the object (for example, <code>AES256</code>).</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
@@ -1184,8 +1184,8 @@ impl UploadInputBuilder {
     /// <p>Specifies the algorithm to use when encrypting the object (for example, <code>AES256</code>).</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_sse_customer_algorithm(&self) -> &Option<String> {
-        &self.sse_customer_algorithm
+    pub fn get_sse_customer_algorithm(&self) -> Option<&str> {
+        self.sse_customer_algorithm.as_deref()
     }
     /// <p>Specifies the customer-provided encryption key for Amazon S3 to use in encrypting data. This value is used to store the object and then it is discarded; Amazon S3 does not store the encryption key. The key must be appropriate for use with the algorithm specified in the <code>x-amz-server-side-encryption-customer-algorithm</code> header.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
@@ -1204,8 +1204,8 @@ impl UploadInputBuilder {
     /// <p>Specifies the customer-provided encryption key for Amazon S3 to use in encrypting data. This value is used to store the object and then it is discarded; Amazon S3 does not store the encryption key. The key must be appropriate for use with the algorithm specified in the <code>x-amz-server-side-encryption-customer-algorithm</code> header.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_sse_customer_key(&self) -> &Option<String> {
-        &self.sse_customer_key
+    pub fn get_sse_customer_key(&self) -> Option<&str> {
+        self.sse_customer_key.as_deref()
     }
     /// <p>Specifies the 128-bit MD5 digest of the encryption key according to RFC 1321. Amazon S3 uses this header for a message integrity check to ensure that the encryption key was transmitted without error.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
@@ -1224,8 +1224,8 @@ impl UploadInputBuilder {
     /// <p>Specifies the 128-bit MD5 digest of the encryption key according to RFC 1321. Amazon S3 uses this header for a message integrity check to ensure that the encryption key was transmitted without error.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_sse_customer_key_md5(&self) -> &Option<String> {
-        &self.sse_customer_key_md5
+    pub fn get_sse_customer_key_md5(&self) -> Option<&str> {
+        self.sse_customer_key_md5.as_deref()
     }
     /// <p>If <code>x-amz-server-side-encryption</code> has a valid value of <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the Key Management Service (KMS) symmetric encryption customer managed key that was used for the object. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide<code> x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data. If the KMS key does not exist in the same account that's issuing the command, you must use the full ARN and not just the ID.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
@@ -1244,8 +1244,8 @@ impl UploadInputBuilder {
     /// <p>If <code>x-amz-server-side-encryption</code> has a valid value of <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the Key Management Service (KMS) symmetric encryption customer managed key that was used for the object. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide<code> x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data. If the KMS key does not exist in the same account that's issuing the command, you must use the full ARN and not just the ID.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_sse_kms_key_id(&self) -> &Option<String> {
-        &self.sse_kms_key_id
+    pub fn get_sse_kms_key_id(&self) -> Option<&str> {
+        self.sse_kms_key_id.as_deref()
     }
     /// <p>Specifies the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a base64-encoded UTF-8 string holding JSON with the encryption context key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> or <code>CopyObject</code> operations on this object. This value must be explicitly added during <code>CopyObject</code> operations.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
@@ -1264,8 +1264,8 @@ impl UploadInputBuilder {
     /// <p>Specifies the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a base64-encoded UTF-8 string holding JSON with the encryption context key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> or <code>CopyObject</code> operations on this object. This value must be explicitly added during <code>CopyObject</code> operations.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_sse_kms_encryption_context(&self) -> &Option<String> {
-        &self.sse_kms_encryption_context
+    pub fn get_sse_kms_encryption_context(&self) -> Option<&str> {
+        self.sse_kms_encryption_context.as_deref()
     }
     /// <p>Specifies whether Amazon S3 should use an S3 Bucket Key for object encryption with server-side encryption using Key Management Service (KMS) keys (SSE-KMS). Setting this header to <code>true</code> causes Amazon S3 to use an S3 Bucket Key for object encryption with SSE-KMS.</p>
     /// <p>Specifying this header with a PUT action doesn’t affect bucket-level settings for S3 Bucket Key.</p><note>
@@ -1327,8 +1327,8 @@ impl UploadInputBuilder {
     /// <p>The tag-set for the object. The tag-set must be encoded as URL Query parameters. (For example, "Key1=Value1")</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_tagging(&self) -> &Option<String> {
-        &self.tagging
+    pub fn get_tagging(&self) -> Option<&str> {
+        self.tagging.as_deref()
     }
     /// <p>The Object Lock mode that you want to apply to this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
@@ -1415,8 +1415,8 @@ impl UploadInputBuilder {
         self
     }
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
-    pub fn get_expected_bucket_owner(&self) -> &Option<String> {
-        &self.expected_bucket_owner
+    pub fn get_expected_bucket_owner(&self) -> Option<&str> {
+        self.expected_bucket_owner.as_deref()
     }
 
     /// The policy that describes how to handle a failed multipart upload.

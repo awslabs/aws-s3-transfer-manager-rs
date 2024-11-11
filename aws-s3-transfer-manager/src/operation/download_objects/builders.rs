@@ -47,7 +47,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The bucket name containing the object(s).
-    pub fn get_bucket(&self) -> &Option<String> {
+    pub fn get_bucket(&self) -> Option<&str> {
         self.inner.get_bucket()
     }
 
@@ -81,7 +81,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The key_prefix name containing the object(s).
-    pub fn get_key_prefix(&self) -> &Option<String> {
+    pub fn get_key_prefix(&self) -> Option<&str> {
         self.inner.get_key_prefix()
     }
 
@@ -98,7 +98,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Character used to group keys
-    pub fn get_delimiter(&self) -> &Option<String> {
+    pub fn get_delimiter(&self) -> Option<&str> {
         self.inner.get_delimiter()
     }
 

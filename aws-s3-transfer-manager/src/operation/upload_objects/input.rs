@@ -134,8 +134,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The S3 bucket name that objects will upload to.
-    pub fn get_bucket(&self) -> &Option<String> {
-        &self.bucket
+    pub fn get_bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
     }
 
     /// The local directory to upload from.
