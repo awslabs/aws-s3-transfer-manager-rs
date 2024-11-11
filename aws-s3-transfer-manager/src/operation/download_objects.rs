@@ -15,6 +15,7 @@ pub use output::{DownloadObjectsOutput, DownloadObjectsOutputBuilder};
 
 mod handle;
 pub use handle::DownloadObjectsHandle;
+use tokio::fs;
 
 mod list_objects;
 mod worker;
@@ -40,7 +41,8 @@ impl DownloadObjects {
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
         //  validate existence of destination and return error if it's not a directory
         let destination = input.destination().expect("destination set");
-        validate_target_is_dir(destination).await?;
+        let metadata = fs::metadata(destination).await?;
+        validate_target_is_dir(&metadata, destination)?;
 
         // create span to serve as parent of spawned child tasks
         let parent_span_for_tasks = tracing::debug_span!(

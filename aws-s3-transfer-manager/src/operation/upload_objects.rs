@@ -35,17 +35,23 @@ impl UploadObjects {
         handle: Arc<crate::client::Handle>,
         input: UploadObjectsInput,
     ) -> Result<UploadObjectsHandle, crate::error::Error> {
-        //  validate existence of source and return error if it's not a directory
+        //  validate existence of source, possibly a symlink, and return error if it's not a directory
         let source = input.source().expect("source set");
-        let metadata = tokio::fs::symlink_metadata(source).await?;
-        validate_target_is_dir(source).await.and_then(|_| {
-            if !input.follow_symlinks() && metadata.is_symlink() {
-                return Err(error::invalid_input(
-                    format!("{source:?} is a symbolic link to a directory but the current upload operation does not follow symbolic links"))
-                );
+        let symlink_metadata = tokio::fs::symlink_metadata(source).await?;
+        if let Err(e) = validate_target_is_dir(&symlink_metadata, source) {
+            if symlink_metadata.is_symlink() {
+                if input.follow_symlinks() {
+                    let metadata = tokio::fs::metadata(source).await?;
+                    validate_target_is_dir(&metadata, source)?;
+                } else {
+                    return Err(error::invalid_input(
+                        format!("{source:?} is a symbolic link to a directory but the current upload operation does not follow symbolic links"))
+                    );
+                }
+            } else {
+                return Err(e);
             }
-            Ok(())
-        })?;
+        };
 
         let concurrency = handle.num_workers();
         let ctx = UploadObjectsContext::new(handle.clone(), input);
