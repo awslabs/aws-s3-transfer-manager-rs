@@ -68,14 +68,14 @@ impl Download {
         let ctx = DownloadContext::new(handle);
         let concurrency = ctx.handle.num_workers();
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
-        let (meta_tx, meta_rx) = oneshot::channel();
+        let (object_meta_tx, object_meta_rx) = oneshot::channel();
 
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
         let discovery = tokio::spawn(send_discovery(
             tasks.clone(),
             ctx.clone(),
             comp_tx,
-            meta_tx,
+            object_meta_tx,
             input,
             use_current_span_as_parent_for_tasks,
         ));
@@ -84,7 +84,7 @@ impl Download {
             body: Body::new(comp_rx),
             tasks,
             discovery,
-            object_meta_receiver: Mutex::new(Some(meta_rx)),
+            object_meta_receiver: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
         })
     }
@@ -94,7 +94,7 @@ async fn send_discovery(
     tasks: Arc<Mutex<task::JoinSet<()>>>,
     ctx: DownloadContext,
     comp_tx: mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
-    meta_tx: oneshot::Sender<ObjectMetadata>,
+    object_meta_tx: oneshot::Sender<ObjectMetadata>,
     input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
 ) -> Result<(), crate::error::Error> {
@@ -115,7 +115,7 @@ async fn send_discovery(
 
     // make initial discovery about the object size, metadata, possibly first chunk
     let mut discovery = discover_obj(&ctx, &input).await?;
-    let _ = meta_tx.send(discovery.object_meta);
+    let _ = object_meta_tx.send(discovery.object_meta);
 
     let initial_chunk = discovery.initial_chunk.take();
 
