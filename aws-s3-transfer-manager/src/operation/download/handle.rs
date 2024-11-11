@@ -39,7 +39,10 @@ impl DownloadHandle {
             .object_meta
             .get_or_try_init(|| async {
                 let mut object_meta_receiver = self.object_meta_receiver.lock().await;
-                let object_meta_receiver = object_meta_receiver.take().unwrap();
+                let object_meta_receiver = object_meta_receiver
+                    .take()
+                    .ok_or("meta_receiver is already taken")
+                    .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))?;
                 object_meta_receiver
                     .await
                     .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))

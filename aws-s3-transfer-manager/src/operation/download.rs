@@ -111,7 +111,6 @@ async fn send_discovery(
     }
 
     // acquire a permit for discovery
-    // TODO: Verify, if this fails we are not stuck.
     let permit = ctx.handle.scheduler.acquire_permit().await?;
 
     // make initial discovery about the object size, metadata, possibly first chunk
