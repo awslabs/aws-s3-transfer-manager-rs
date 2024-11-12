@@ -24,6 +24,7 @@ use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
 use test_common::create_test_dir;
+use tokio::fs::symlink;
 
 // Create an S3 client with mock behavior configured for `PutObject`
 fn mock_s3_client_for_put_object(bucket_name: String) -> Client {
@@ -144,6 +145,125 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
         2 * MIN_MULTIPART_PART_SIZE_BYTES,
         output.total_bytes_transferred()
     );
+}
+
+#[tokio::test]
+async fn test_successful_multiple_objects_upload_with_symlinks() {
+    let temp_dir1 = create_test_dir(Some("temp1"), vec![("sample.jpg", 1)], &[]);
+
+    let temp_dir2 = create_test_dir(
+        Some("temp2"),
+        vec![
+            ("sample.txt", 1),
+            ("docs/2022/January/sample.txt", 1),
+            ("docs/2022/February/sample1.txt", 1),
+            ("docs/2022/February/sample2.txt", 1),
+            ("docs/2022/February/sample3.txt", 1),
+        ],
+        &[],
+    );
+
+    let temp_dir3 = create_test_dir(Some("temp3"), vec![("sample3.png", 1)], &[]);
+
+    // Crate a symbolic link from `temp1/symlink` to `temp2`
+    symlink(&temp_dir2, temp_dir1.path().join("symlink"))
+        .await
+        .unwrap();
+    // Crate a symbolic link from `temp1/symlink2` to `temp3/sample.png`
+    symlink(
+        temp_dir3.path().join("sample3.png"),
+        temp_dir1.path().join("symlink2"),
+    )
+    .await
+    .unwrap();
+
+    let bucket_name = "test-bucket";
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    // Test with following symbolic links while uploading recursively
+    {
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(temp_dir1.path())
+            .recursive(true)
+            .follow_symlinks(true)
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(7, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(7, output.total_bytes_transferred());
+    }
+
+    // Test without following symbolic links while uploading recursively
+    {
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(temp_dir1.path())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(1, output.objects_uploaded()); // should only include "temp1/sample.jpg"
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(1, output.total_bytes_transferred());
+    }
+}
+
+#[tokio::test]
+async fn test_source_dir_is_symlink() {
+    let temp_dir1 = create_test_dir(Some("temp1"), vec![], &[]);
+
+    let temp_dir2 = create_test_dir(Some("temp2"), vec![("sample.txt", 1)], &[]);
+
+    // Crate a symbolic link from `temp1/symlink` to `temp2`
+    let symlink_path = temp_dir1.path().join("symlink");
+    symlink(&temp_dir2, &symlink_path).await.unwrap();
+
+    let bucket_name = "test-bucket";
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    // should fail when the source is a symbolic link to a directory but the operation does not follow symbolic links
+    {
+        let err = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(&symlink_path)
+            .send()
+            .await
+            .unwrap_err();
+
+        assert_eq!(&ErrorKind::InputInvalid, err.kind());
+        assert!(format!("{}", DisplayErrorContext(err)).contains("is a symbolic link to a directory but the current upload operation does not follow symbolic links"));
+    }
+
+    // should succeed when the source is a symbolic link to a directory and the operation follows symbolic links
+    {
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(symlink_path)
+            .follow_symlinks(true)
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(1, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(1, output.total_bytes_transferred());
+    }
 }
 
 #[tokio::test]

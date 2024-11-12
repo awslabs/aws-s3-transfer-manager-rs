@@ -51,8 +51,23 @@ pub(super) async fn list_directory_contents(
     while let Some(entry) = walker.next().await {
         let job = match entry {
             Ok(entry) => {
-                let metadata = tokio::fs::metadata(entry.path()).await?;
-                if !(filter.predicate)(&UploadFilterItem::new(entry.path(), metadata.clone())) {
+                let symlink_metadata = tokio::fs::symlink_metadata(entry.path()).await?;
+                let metadata = if symlink_metadata.is_symlink() {
+                    if input.follow_symlinks {
+                        tokio::fs::metadata(entry.path()).await?
+                    } else {
+                        continue;
+                    }
+                } else {
+                    // In this branch, we know `symlink_metadata` does not represent a symlink link,
+                    // so it can return true for either `is_dir()` or `is_file()`.
+                    symlink_metadata
+                };
+                let filter_item = UploadFilterItem::builder()
+                    .path(entry.path())
+                    .metadata(metadata.clone())
+                    .build();
+                if !(filter.predicate)(&filter_item) {
                     tracing::debug!("skipping object due to filter: {:?}", entry.path());
                     continue;
                 }
@@ -255,6 +270,7 @@ mod unit {
         use std::collections::BTreeMap;
         use std::error::Error as _;
         use test_common::create_test_dir;
+        use tokio::fs::symlink;
 
         #[test]
         fn test_derive_object_key() {
@@ -416,6 +432,87 @@ mod unit {
                             *value,
                         )
                     })
+                    .collect::<BTreeMap<_, _>>();
+
+                assert_eq!(expected, actual);
+                assert!(errors.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn test_list_directory_contents_with_symlinks() {
+            let files1 = vec![("sample.jpg", 1)];
+            let temp_dir1 = create_test_dir(Some("temp1"), files1.clone(), &[]);
+
+            let files2 = vec![
+                ("sample.txt", 1),
+                ("docs/2022/January/sample.txt", 1),
+                ("docs/2022/February/sample1.txt", 1),
+                ("docs/2022/February/sample2.txt", 1),
+                ("docs/2022/February/sample3.txt", 1),
+            ];
+            let temp_dir2 = create_test_dir(Some("temp2"), files2.clone(), &[]);
+
+            let files3 = vec![("sample3.png", 1)];
+            let temp_dir3 = create_test_dir(Some("temp3"), files3.clone(), &[]);
+
+            // Create a symbolic link from `temp1/symlink` to `temp2`
+            symlink(&temp_dir2, temp_dir1.path().join("symlink"))
+                .await
+                .unwrap();
+            // Create a symbolic link from `temp1/symlink2` to `temp3/sample.png`
+            symlink(
+                temp_dir3.path().join("sample3.png"),
+                temp_dir1.path().join("symlink2"),
+            )
+            .await
+            .unwrap();
+
+            // Test with following symlinks
+            {
+                let input = UploadObjectsInputBuilder::default()
+                    .bucket("doesnotmatter")
+                    .source(temp_dir1.path())
+                    .recursive(true)
+                    .follow_symlinks(true)
+                    .build()
+                    .unwrap();
+
+                let (actual, errors) = exercise_list_directory_contents(input).await;
+
+                let expected = files1
+                    .iter()
+                    .map(|(entry_path, size)| ((*entry_path).to_owned(), *size))
+                    .chain(
+                        files2
+                            .iter()
+                            .map(|(entry_path, size)| ("symlink/".to_owned() + *entry_path, *size)),
+                    )
+                    .chain(
+                        files3
+                            .iter()
+                            .map(|(_, size)| ("symlink2".to_owned(), *size)),
+                    )
+                    .collect::<BTreeMap<_, _>>();
+
+                assert_eq!(expected, actual);
+                assert!(errors.is_empty());
+            }
+
+            // Test without following symlinks
+            {
+                let input = UploadObjectsInputBuilder::default()
+                    .bucket("doesnotmatter")
+                    .source(temp_dir1.path())
+                    .recursive(true)
+                    .build()
+                    .unwrap();
+
+                let (actual, errors) = exercise_list_directory_contents(input).await;
+
+                let expected = files1
+                    .iter()
+                    .map(|(entry_path, size)| ((*entry_path).to_owned(), *size))
                     .collect::<BTreeMap<_, _>>();
 
                 assert_eq!(expected, actual);

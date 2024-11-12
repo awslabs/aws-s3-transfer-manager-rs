@@ -3,9 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{path::Path, sync::Arc};
-
-use tokio::fs;
+use std::{fs::Metadata, path::Path, sync::Arc};
 
 use crate::error;
 
@@ -49,14 +47,19 @@ impl<State> Clone for TransferContext<State> {
     }
 }
 
-pub(crate) async fn validate_target_is_dir(path: &Path) -> Result<(), error::Error> {
-    let meta = fs::metadata(path).await?;
-
-    if !meta.is_dir() {
-        return Err(error::invalid_input(format!(
+// Checks if the target path at `path`, with the provided `metadata`, represents a directory.
+//
+// The caller is responsible for providing the correct `Metadata`. If the `Metadata` is obtained
+// via `fs::metadata`, it can only determine whether the path is a file or a directory, but it cannot
+// indicate whether the path is a symbolic link. On the other hand, if `Metadata` is obtained through
+// `fs::symlink_metadata`, it can identify symbolic links, but calling `is_dir()` on a symlink will
+// return false, even if the symlink points to a directory.
+pub(crate) fn validate_target_is_dir(metadata: &Metadata, path: &Path) -> Result<(), error::Error> {
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(error::invalid_input(format!(
             "target is not a directory: {path:?}"
-        )));
+        )))
     }
-
-    Ok(())
 }
