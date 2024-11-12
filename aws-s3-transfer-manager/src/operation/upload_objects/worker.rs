@@ -470,7 +470,7 @@ mod unit {
             symlink(&temp_dir2, temp_dir1.path().join("symlink"))
                 .await
                 .unwrap();
-            // Crate a symbolic link from `temp1/symlink2` to `temp3/sample.png`
+            // Create a symbolic link from `temp1/symlink2` to `temp3/sample.png`
             symlink(
                 temp_dir3.path().join("sample3.png"),
                 temp_dir1.path().join("symlink2"),
