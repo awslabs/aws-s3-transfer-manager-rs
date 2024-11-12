@@ -52,35 +52,25 @@ pub(super) async fn list_directory_contents(
         let job = match entry {
             Ok(entry) => {
                 let symlink_metadata = tokio::fs::symlink_metadata(entry.path()).await?;
+                let metadata = if symlink_metadata.is_symlink() {
+                    if input.follow_symlinks {
+                        tokio::fs::metadata(entry.path()).await?
+                    } else {
+                        continue;
+                    }
+                } else {
+                    // In this branch, we know `symlink_metadata` does not represent a symlink link,
+                    // so it can return true for either `is_dir()` or `is_file()`.
+                    symlink_metadata
+                };
                 let filter_item = UploadFilterItem::builder()
                     .path(entry.path())
-                    .symlink_metadata(symlink_metadata.clone());
-                let filter_item = if input.follow_symlinks() {
-                    // If the upload operation follows symbolic links, we need to determine the file type of the symlink's target
-                    // in case `filter_item.symlink_metadata.is_symlink()` returns true.
-                    filter_item.metadata(tokio::fs::metadata(entry.path()).await?)
-                } else {
-                    filter_item
-                }
-                .build();
+                    .metadata(metadata.clone())
+                    .build();
                 if !(filter.predicate)(&filter_item) {
                     tracing::debug!("skipping object due to filter: {:?}", entry.path());
                     continue;
                 }
-
-                let target_metadata = if filter_item.symlink_metadata.is_symlink() {
-                    match filter_item.metadata {
-                        Some(metadata) => metadata,
-                        None => {
-                            // This arm is likely unreachable when using the default `UploadFilter::default()`,
-                            // but we handle it nonetheless in the case of a custom filter.
-                            tracing::warn!("the path entry {:?} is a symbolic link, but `UploadFilterItem` is missing metadata for the target file", entry.path());
-                            tokio::fs::metadata(entry.path()).await?
-                        }
-                    }
-                } else {
-                    filter_item.symlink_metadata
-                };
 
                 let recursion_root_dir_path = input.source().expect("source set");
                 let entry_path = entry.path();
@@ -93,7 +83,7 @@ pub(super) async fn list_directory_contents(
                     derive_object_key(relative_filename, input.key_prefix(), input.delimiter())?;
                 let object = InputStream::read_from()
                     .path(entry.path())
-                    .metadata(target_metadata)
+                    .metadata(metadata)
                     .build();
 
                 match object {
@@ -597,8 +587,7 @@ mod unit {
                 .source(test_dir.path())
                 .recursive(true)
                 .filter(|item: &UploadFilterItem<'_>| {
-                    !item.path().to_str().unwrap().contains("February")
-                        && item.symlink_metadata().is_file()
+                    !item.path().to_str().unwrap().contains("February") && item.metadata().is_file()
                 })
                 .build()
                 .unwrap();

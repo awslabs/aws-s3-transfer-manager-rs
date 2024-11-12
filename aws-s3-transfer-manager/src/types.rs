@@ -179,20 +179,7 @@ fn is_hidden(path: &Path) -> bool {
 impl Default for UploadFilter {
     fn default() -> Self {
         Self {
-            predicate: Arc::new(|item| {
-                if is_hidden(item.path()) {
-                    return false;
-                }
-                if item.symlink_metadata.is_symlink() {
-                    // `item` represents a symbolic link, so fall back to `item.metadata` (if set)
-                    // to determine the file type of the target of the symlink.
-                    // If `item.metadata` is unset, we don't know the target file type, so return false.
-                    item.metadata.as_ref().map_or(false, |meta| meta.is_file())
-                } else {
-                    // If `symlink_metadata` can say it's either a file or a directory, just trust it.
-                    item.symlink_metadata.is_file()
-                }
-            }),
+            predicate: Arc::new(|item| item.metadata().is_file() && !is_hidden(item.path())),
         }
     }
 }
@@ -202,8 +189,7 @@ impl Default for UploadFilter {
 #[derive(Debug)]
 pub struct UploadFilterItem<'a> {
     pub(crate) path: Cow<'a, Path>,
-    pub(crate) symlink_metadata: Metadata,
-    pub(crate) metadata: Option<Metadata>,
+    pub(crate) metadata: Metadata,
 }
 
 impl<'a> UploadFilterItem<'a> {
@@ -216,31 +202,20 @@ impl<'a> UploadFilterItem<'a> {
         &self.path
     }
 
-    /// Metadata about the file located at `self.path`, without following symbolic links.
-    ///
-    /// This `Metadata` can be used for queries such as `is_file()`, `is_dir()`, and `is_symlink()`.
-    /// If `is_symlink()` returns `true`, it indicates that `self.path` is a symbolic link,
-    /// but no further details are available; `is_file()` and `is_dir()` will return `false`.
-    /// In such cases, use [`Self::metadata`] and call respective methods on the returned `Metadata`
-    /// if it is `Some`.
-    pub fn symlink_metadata(&self) -> &Metadata {
-        &self.symlink_metadata
-    }
-
-    /// Metadata about the file located at `self.path`, following symbolic links.
+    /// Metadata about the file located at `self.path`.
     ///
     /// Use this `Metadata` for queries `is_dir()` and `is_file()`. However, it cannot
     /// be used to determine whether `self.path` is a symbolic link because the metadata
-    /// was obtained using `fs::metadata()`, which follows symlinks.
-    pub fn metadata(&self) -> Option<&Metadata> {
-        self.metadata.as_ref()
+    /// set in this struct is assumed to return true for either `is_dir()` or `is_file()`,
+    /// but not for `is_symlink()`.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct UploadFilterItemBuilder<'a> {
     pub(crate) path: Option<Cow<'a, Path>>,
-    pub(crate) symlink_metadata: Option<Metadata>,
     pub(crate) metadata: Option<Metadata>,
 }
 
@@ -253,20 +228,14 @@ impl<'a> UploadFilterItemBuilder<'a> {
         self
     }
 
-    // Set the `Metadata` for `self.path`, obtained via a call to `fs::symlink_metadata()`,
-    // which does not follow symbolic links.
+    // Set the `Metadata` for `self.path`.
     //
-    // NOTE: A symlink metadata is required.
-    pub(crate) fn symlink_metadata(mut self, symlink_metadata: Metadata) -> Self {
-        self.symlink_metadata = Some(symlink_metadata);
-        self
-    }
-
-    // Set the `Metadata` for `self.path`, obtained via a call to `fs::metadata()`,
-    // which follows symbolic links.
+    // This `Metadata` must be one of the following:
+    // - Obtained via `fs::metadata()`, which follows symbolic links.
+    // - Obtained via `fs::symlink_metadata()`, which is guaranteed to return true for either `is_dir()` or `is_file()`,
+    //   but not for `is_symlink()`.
     //
-    // This method should be used when the upload operation follows symbolic links,
-    // as it needs to know the file type of the target of the symlink.
+    // NOTE: A metadata is required.
     pub(crate) fn metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
@@ -275,10 +244,9 @@ impl<'a> UploadFilterItemBuilder<'a> {
     pub(crate) fn build(self) -> UploadFilterItem<'a> {
         UploadFilterItem {
             path: self.path.expect("required field `path` should be set"),
-            symlink_metadata: self
-                .symlink_metadata
-                .expect("required field `symlink_metadata` should be set"),
-            metadata: self.metadata,
+            metadata: self
+                .metadata
+                .expect("required field `metadata` should be set"),
         }
     }
 }
