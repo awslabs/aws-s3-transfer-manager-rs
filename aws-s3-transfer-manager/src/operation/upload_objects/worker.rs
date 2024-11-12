@@ -466,7 +466,7 @@ mod unit {
             let files3 = vec![("sample3.png", 1)];
             let temp_dir3 = create_test_dir(Some("temp3"), files3.clone(), &[]);
 
-            // Crate a symbolic link from `temp1/symlink` to `temp2`
+            // Create a symbolic link from `temp1/symlink` to `temp2`
             symlink(&temp_dir2, temp_dir1.path().join("symlink"))
                 .await
                 .unwrap();
