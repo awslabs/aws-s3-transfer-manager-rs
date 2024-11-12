@@ -54,8 +54,8 @@ impl AbortedUpload {
     /// Get the multipart upload ID that was cancelled
     ///
     /// Not present for uploads that did not utilize a multipart upload
-    pub fn upload_id(&self) -> &Option<String> {
-        &self.upload_id
+    pub fn upload_id(&self) -> Option<&str> {
+        self.upload_id.as_deref()
     }
 
     /// If present, indicates that the requester was successfully charged for the request.
@@ -122,10 +122,10 @@ fn all_objects_filter(obj: &aws_sdk_s3::types::Object) -> bool {
     !is_folder
 }
 
-/// Detailed information about a failed object download transfer
+/// Detailed information about a failed object download
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct FailedDownloadTransfer {
+pub struct FailedDownload {
     /// The input for the download object operation that failed
     pub(crate) input: crate::operation::download::DownloadInput,
 
@@ -133,7 +133,7 @@ pub struct FailedDownloadTransfer {
     pub(crate) error: crate::error::Error,
 }
 
-impl FailedDownloadTransfer {
+impl FailedDownload {
     /// The input for the download object operation that failed
     pub fn input(&self) -> &crate::operation::download::DownloadInput {
         &self.input
@@ -260,14 +260,12 @@ impl<'a> UploadFilterItemBuilder<'a> {
 /// Detailed information about a failed upload
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct FailedUploadTransfer {
+pub struct FailedUpload {
     pub(crate) input: Option<crate::operation::upload::UploadInput>,
     pub(crate) error: crate::error::Error,
 }
 
-// TODO - Omit "Transfer" from struct name?
-// "Transfer" is generic for "upload or download" but this already has "Upload" in the name
-impl FailedUploadTransfer {
+impl FailedUpload {
     /// The input for the failed object upload
     pub fn input(&self) -> Option<&crate::operation::upload::UploadInput> {
         self.input.as_ref()

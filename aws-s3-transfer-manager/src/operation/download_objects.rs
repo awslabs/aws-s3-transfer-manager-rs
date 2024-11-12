@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use crate::types::FailedDownloadTransfer;
+use crate::types::FailedDownload;
 
 use super::{validate_target_is_dir, TransferContext};
 
@@ -83,7 +83,7 @@ pub(crate) struct DownloadObjectsState {
     // TODO - Determine if `input` should be separated from this struct
     // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: DownloadObjectsInput,
-    failed_downloads: Mutex<Vec<FailedDownloadTransfer>>,
+    failed_downloads: Mutex<Vec<FailedDownload>>,
     successful_downloads: AtomicU64,
     total_bytes_transferred: AtomicU64,
 }

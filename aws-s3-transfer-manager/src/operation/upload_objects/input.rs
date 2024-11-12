@@ -134,8 +134,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The S3 bucket name that objects will upload to.
-    pub fn get_bucket(&self) -> &Option<String> {
-        &self.bucket
+    pub fn get_bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
     }
 
     /// The local directory to upload from.
@@ -151,8 +151,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The local directory to upload from.
-    pub fn get_source(&self) -> &Option<PathBuf> {
-        &self.source
+    pub fn get_source(&self) -> Option<&Path> {
+        self.source.as_deref()
     }
 
     /// Whether to recurse into subdirectories when traversing local file tree.
