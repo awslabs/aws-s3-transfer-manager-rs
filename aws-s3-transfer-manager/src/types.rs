@@ -170,16 +170,22 @@ where
     }
 }
 
-fn is_hidden(path: &Path) -> bool {
+fn is_hidden_file_name(path: &Path) -> bool {
     path.file_name()
         .map(|name| name.to_string_lossy().starts_with('.'))
         .unwrap_or(false)
 }
 
+// This default filter does not exclude hidden directories. For example, if an `UploadFilterItem` corresponds to the path
+//   path/to/.hidden/ignore-me.txt
+// the item will not be filtered out and will be uploaded to S3.
+// https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/72#discussion_r1835109128
 impl Default for UploadFilter {
     fn default() -> Self {
         Self {
-            predicate: Arc::new(|item| item.metadata().is_file() && !is_hidden(item.path())),
+            predicate: Arc::new(|item| {
+                item.metadata().is_file() && !is_hidden_file_name(item.path())
+            }),
         }
     }
 }
