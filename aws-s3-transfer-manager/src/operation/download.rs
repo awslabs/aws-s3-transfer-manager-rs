@@ -11,6 +11,10 @@ pub use input::{DownloadInput, DownloadInputBuilder};
 
 /// Abstractions for response bodies and consuming data streams.
 pub mod body;
+
+mod checksum;
+pub use checksum::ChecksumValidationLevel;
+
 /// Operation builders
 pub mod builders;
 
@@ -18,6 +22,8 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
+mod output;
+pub use output::DownloadOutput;
 use tracing::Instrument;
 
 mod chunk_meta;

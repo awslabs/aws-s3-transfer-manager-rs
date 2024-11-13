@@ -12,7 +12,7 @@ use tokio::{
  */
 use crate::operation::download::body::Body;
 
-use super::object_meta::ObjectMetadata;
+use super::{object_meta::ObjectMetadata, ChecksumValidationLevel, DownloadOutput};
 
 /// Response type for a single download object request.
 #[derive(Debug)]
@@ -65,7 +65,7 @@ impl DownloadHandle {
 
     /// Consume the handle and wait for download transfer to complete
     #[tracing::instrument(skip_all, level = "debug", name = "join-download")]
-    pub async fn join(mut self) -> Result<(), crate::error::Error> {
+    pub async fn join(mut self) -> Result<DownloadOutput, crate::error::Error> {
         self.body.close();
 
         self.discovery.await??;
@@ -73,7 +73,10 @@ impl DownloadHandle {
         while let Some(join_result) = tasks.join_next().await {
             join_result?;
         }
-        Ok(())
+
+        Ok(DownloadOutput {
+            checksum_validation_level: ChecksumValidationLevel::NotValidated, // TODO
+        }) // TODO
     }
 }
 
