@@ -21,6 +21,7 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
+use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
 use test_common::create_test_dir;
@@ -400,4 +401,105 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
     assert_eq!(&ErrorKind::InputInvalid, err.kind());
     assert!(format!("{}", DisplayErrorContext(err))
         .contains("a custom delimiter `-` should not appear"));
+}
+
+#[tokio::test]
+async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
+    let (_guard, rx) = capture_test_logs();
+
+    let recursion_root = "test";
+    let files = vec![
+        ("sample.jpg", 1),
+        ("photos/2022-January/sample.jpg", 1),
+        ("photos/2022-February/sample1.jpg", 1),
+        ("photos/2022-February/sample2.jpg", 1),
+        ("photos/2022-February/sample3.jpg", 1),
+    ];
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
+
+    let bucket_name = "test-bucket";
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_output(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            PutObjectOutput::builder().build()
+        });
+
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let mut handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    // give some time to uploaded tasks so they can receive jobs from the task of listing directory contents.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    handle.abort().await.unwrap();
+
+    assert!(rx.contents().contains("received cancellation signal"));
+}
+
+#[tokio::test]
+async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancelled() {
+    let (_guard, rx) = capture_test_logs();
+
+    let recursion_root = "test";
+    let files = vec![
+        ("sample.jpg", 1),
+        ("photos/2022-January/sample.jpg", 1),
+        ("photos/2022-February/sample1.jpg", 1),
+        ("photos/2022-February/sample2.jpg", 1),
+        ("photos/2022-February/sample3.jpg", 1),
+    ];
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
+
+    let bucket_name = "test-bucket";
+    let put_object_success = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.key() != Some("photos/2022-February/sample3.jpg"))
+        .then_output(|| {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            PutObjectOutput::builder().build()
+        });
+
+    let put_object_err = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.key() == Some("photos/2022-February/sample3.jpg"))
+        .then_http_response(|| {
+            HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
+        });
+
+    let s3_client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[put_object_success, put_object_err]
+    );
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    // `join` will report the actual error that triggered cancellation.
+    assert_eq!(
+        &ErrorKind::ChildOperationFailed,
+        handle.join().await.unwrap_err().kind()
+    );
+    // the execution should see at least one cancellation signal being delivered.
+    assert!(rx.contents().contains("received cancellation signal"));
 }
