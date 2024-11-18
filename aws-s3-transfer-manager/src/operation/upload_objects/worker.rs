@@ -315,6 +315,22 @@ fn handle_failed_upload(
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::operation::put_object::PutObjectOutput;
+    use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
+    use bytes::Bytes;
+    use tokio::sync::watch;
+
+    use crate::{
+        client::Handle,
+        io::InputStream,
+        operation::upload_objects::{
+            worker::{upload_single_obj, UploadObjectJob},
+            UploadObjectsContext, UploadObjectsInputBuilder,
+        },
+        runtime::scheduler::Scheduler,
+        DEFAULT_CONCURRENCY,
+    };
+
     #[cfg(target_family = "unix")]
     mod unix {
         use crate::operation::upload_objects::worker::*;
@@ -673,5 +689,37 @@ mod tests {
                 derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_single_upload() {
+        let bucket = "doesnotmatter";
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |input| input.bucket() == Some(bucket))
+            .then_output(|| PutObjectOutput::builder().build());
+
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+        let config = crate::Config::builder().client(s3_client).build();
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let scheduler = Scheduler::new(DEFAULT_CONCURRENCY);
+
+        let handle = std::sync::Arc::new(Handle { config, scheduler });
+        let input = UploadObjectsInputBuilder::default()
+            .source("doesnotmatter")
+            .bucket(bucket)
+            .build()
+            .unwrap();
+        let ctx = UploadObjectsContext::new(handle, input, cancel_tx);
+        let job = UploadObjectJob {
+            object: InputStream::from(Bytes::from_static(b"doesnotmatter")),
+            key: "doesnotmatter".to_owned(),
+        };
+
+        ctx.state.cancel_tx.send(true).unwrap();
+
+        let err = upload_single_obj(&ctx, job, cancel_rx).await.unwrap_err();
+
+        assert_eq!(&crate::error::ErrorKind::OperationCancelled, err.kind());
     }
 }
