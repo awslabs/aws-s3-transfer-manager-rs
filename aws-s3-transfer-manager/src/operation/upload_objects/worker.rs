@@ -6,11 +6,13 @@
 use std::borrow::Cow;
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use super::{UploadObjectsContext, UploadObjectsInput};
+use super::{UploadObjectsContext, UploadObjectsInput, UploadObjectsState};
 use async_channel::{Receiver, Sender};
 use blocking::Unblock;
 use futures_util::StreamExt;
+use tokio::sync::watch;
 use walkdir::WalkDir;
 
 use crate::error::ErrorKind;
@@ -19,6 +21,9 @@ use crate::operation::upload::UploadInputBuilder;
 use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{FailedTransferPolicy, FailedUpload, UploadFilter};
 use crate::{error, types::UploadFilterItem};
+
+const CANCELLATION_ERROR: &str =
+    "at least one operation has been aborted, cancelling all ongoing requests";
 
 #[derive(Debug)]
 pub(super) struct UploadObjectJob {
@@ -33,9 +38,12 @@ impl UploadObjectJob {
 }
 
 pub(super) async fn list_directory_contents(
-    input: UploadObjectsInput,
+    state: Arc<UploadObjectsState>,
     list_directory_tx: Sender<Result<UploadObjectJob, error::Error>>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), error::Error> {
+    let input = &state.input;
+
     // TODO - Reevaluate the need for the `blocking` crate once we implement stricter task cancellation for download and upload.
     // If we switch to using `tokio::task::spawn_blocking` instead of the `blocking` crate, the entire `list_directory_contents` function
     // would need to be passed to `spawn_blocking`, which implies the following:
@@ -43,72 +51,88 @@ pub(super) async fn list_directory_contents(
     // - The `AbortHandle` returned by `spawn_blocking` would not have any effect when calling `abort`, which may impact our task cancellation behavior.
 
     // Move a blocking I/O to a dedicated thread pool
-    let mut walker = Unblock::new(walker(&input).into_iter());
+    let mut walker = Unblock::new(walker(input).into_iter());
 
     let default_filter = &UploadFilter::default();
     let filter = input.filter().unwrap_or(default_filter);
 
-    while let Some(entry) = walker.next().await {
-        let job = match entry {
-            Ok(entry) => {
-                let symlink_metadata = tokio::fs::symlink_metadata(entry.path()).await?;
-                let metadata = if symlink_metadata.is_symlink() {
-                    if input.follow_symlinks {
-                        tokio::fs::metadata(entry.path()).await?
-                    } else {
-                        continue;
-                    }
-                } else {
-                    // In this branch, we know `symlink_metadata` does not represent a symlink link,
-                    // so it can return true for either `is_dir()` or `is_file()`.
-                    symlink_metadata
-                };
-                let filter_item = UploadFilterItem::builder()
-                    .path(entry.path())
-                    .metadata(metadata.clone())
-                    .build();
-                if !(filter.predicate)(&filter_item) {
-                    tracing::debug!("skipping object due to filter: {:?}", entry.path());
-                    continue;
-                }
+    loop {
+        tokio::select! {
+            _ = cancel_rx.changed() => {
+                tracing::error!("received cancellation signal, exiting and not yielding new directory contents");
+                return Err(crate::error::Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR.to_owned()));
+            }
+            entry = walker.next() => {
+                match entry {
+                    None => break,
+                    Some(entry) => {
+                        let job = match entry {
+                            Ok(entry) => {
+                                let symlink_metadata = tokio::fs::symlink_metadata(entry.path()).await?;
+                                let metadata = if symlink_metadata.is_symlink() {
+                                    if input.follow_symlinks {
+                                        tokio::fs::metadata(entry.path()).await?
+                                    } else {
+                                        continue;
+                                    }
+                                } else {
+                                    // In this branch, we know `symlink_metadata` does not represent a symlink link,
+                                    // so it can return true for either `is_dir()` or `is_file()`.
+                                    symlink_metadata
+                                };
+                                let filter_item = UploadFilterItem::builder()
+                                    .path(entry.path())
+                                    .metadata(metadata.clone())
+                                    .build();
+                                if !(filter.predicate)(&filter_item) {
+                                    tracing::debug!("skipping object due to filter: {:?}", entry.path());
+                                    continue;
+                                }
 
-                let recursion_root_dir_path = input.source().expect("source set");
-                let entry_path = entry.path();
-                let relative_filename = entry_path
-                    .strip_prefix(recursion_root_dir_path)
-                    .expect("{entry_path:?} should be a path entry directly or indirectly under {recursion_root_dir_path:?}")
-                    .to_str()
-                    .expect("valid utf-8 path");
-                let object_key =
-                    derive_object_key(relative_filename, input.key_prefix(), input.delimiter())?;
-                let object = InputStream::read_from()
-                    .path(entry.path())
-                    .metadata(metadata)
-                    .build();
+                                let recursion_root_dir_path = input.source().expect("source set");
+                                let entry_path = entry.path();
+                                let relative_filename = entry_path
+                                    .strip_prefix(recursion_root_dir_path)
+                                    .expect("{entry_path:?} should be a path entry directly or indirectly under {recursion_root_dir_path:?}")
+                                    .to_str()
+                                    .expect("valid utf-8 path");
+                                let object_key =
+                                    derive_object_key(relative_filename, input.key_prefix(), input.delimiter())?;
+                                let object = InputStream::read_from()
+                                    .path(entry.path())
+                                    .metadata(metadata)
+                                    .build();
 
-                match object {
-                    Ok(object) => {
-                        tracing::info!(
-                            "uploading {relative_filename} with object key {object_key}..."
-                        );
-                        Ok(UploadObjectJob::new(object_key.into_owned(), object))
+                                match object {
+                                    Ok(object) => {
+                                        tracing::debug!(
+                                            "preparing to upload {relative_filename} with object key {object_key}..."
+                                        );
+                                        Ok(UploadObjectJob::new(object_key.into_owned(), object))
+                                    }
+                                    Err(e) => Err(e.into()),
+                                }
+                            }
+                            Err(walkdir_error) => {
+                                let error_kind = if walkdir_error.io_error().is_some() {
+                                    ErrorKind::IOError
+                                } else {
+                                    ErrorKind::InputInvalid
+                                };
+
+                                // We avoid converting `walkdir::Error` into `std::io::Error` to preserve important information,
+                                // such as which path entry triggered a `PermissionDenied` error.
+                                Err(crate::error::Error::new(error_kind, walkdir_error))
+                            }
+                        };
+                        if list_directory_tx.send(job).await.is_err() {
+                            tracing::error!("all receiver ends have been dropped, unable to send a job!");
+                            break;
+                        }
                     }
-                    Err(e) => Err(e.into()),
                 }
             }
-            Err(walkdir_error) => {
-                let error_kind = if walkdir_error.io_error().is_some() {
-                    ErrorKind::IOError
-                } else {
-                    ErrorKind::InputInvalid
-                };
-
-                // We avoid converting `walkdir::Error` into `std::io::Error` to preserve important information,
-                // such as which path entry triggered a `PermissionDenied` error.
-                Err(crate::error::Error::new(error_kind, walkdir_error))
-            }
-        };
-        list_directory_tx.send(job).await.expect("channel valid");
+        }
     }
 
     Ok(())
@@ -163,42 +187,56 @@ fn derive_object_key<'a>(
 pub(super) async fn upload_objects(
     ctx: UploadObjectsContext,
     list_directory_rx: Receiver<Result<UploadObjectJob, error::Error>>,
+    mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), error::Error> {
-    while let Ok(job) = list_directory_rx.recv().await {
-        match job {
-            Ok(job) => {
-                let key = job.key.clone();
-                let result = upload_single_obj(&ctx, job).await;
-                match result {
-                    Ok(bytes_transferred) => {
-                        ctx.state.successful_uploads.fetch_add(1, Ordering::SeqCst);
+    loop {
+        tokio::select! {
+            _ = cancel_rx.changed() => {
+                tracing::error!("received cancellation signal, exiting and ignoring any future work");
+                return Err(crate::error::Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR.to_owned()));
+            }
+            job = list_directory_rx.recv() => {
+                match job {
+                    Err(_) => break,
+                    Ok(job) => {
+                        match job {
+                            Ok(job) => {
+                                let key = job.key.clone();
+                                let result = upload_single_obj(&ctx, job, cancel_rx.clone()).await;
+                                match result {
+                                    Ok(bytes_transferred) => {
+                                        ctx.state.successful_uploads.fetch_add(1, Ordering::SeqCst);
 
-                        ctx.state
-                            .total_bytes_transferred
-                            .fetch_add(bytes_transferred, Ordering::SeqCst);
+                                        ctx.state
+                                            .total_bytes_transferred
+                                            .fetch_add(bytes_transferred, Ordering::SeqCst);
 
-                        tracing::debug!("worker finished uploading object {key:?}");
-                    }
-                    Err(err) => {
-                        tracing::debug!("worker failed to upload object {key:?}: {err}");
-                        handle_failed_upload(err, &ctx, Some(key))?;
+                                        tracing::debug!("worker finished uploading object {key:?}");
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!("worker failed to upload object {key:?}: {err}");
+                                        handle_failed_upload(err, &ctx, Some(key))?;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!("worker received an error from the `list_directory` task: {err}");
+                                handle_failed_upload(err, &ctx, None)?;
+                            }
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                tracing::debug!("worker received an error from the `list_directory` task: {err}");
-                handle_failed_upload(err, &ctx, None)?;
             }
         }
     }
 
-    tracing::trace!("req channel closed, worker finished");
     Ok(())
 }
 
 async fn upload_single_obj(
     ctx: &UploadObjectsContext,
     job: UploadObjectJob,
+    cancel_rx: watch::Receiver<bool>,
 ) -> Result<u64, error::Error> {
     let UploadObjectJob { object, key } = job;
 
@@ -217,11 +255,19 @@ async fn upload_single_obj(
         .build()
         .expect("valid input");
 
-    let handle = crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input).await?;
+    let mut handle =
+        crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input).await?;
 
-    handle.join().await?;
-
-    Ok(bytes_transferred)
+    if cancel_rx.has_changed().unwrap() {
+        let _ = handle.abort().await;
+        Err(crate::error::Error::new(
+            ErrorKind::OperationCancelled,
+            CANCELLATION_ERROR.to_owned(),
+        ))
+    } else {
+        handle.join().await?;
+        Ok(bytes_transferred)
+    }
 }
 
 fn handle_failed_upload(
@@ -230,11 +276,17 @@ fn handle_failed_upload(
     object_key: Option<String>,
 ) -> Result<(), error::Error> {
     match ctx.state.input.failure_policy() {
-        // TODO - this will abort this worker, the rest of the workers will be aborted
-        // when the handle is joined and the error is propagated and the task set is
-        // dropped. This _may_ be later/too passive and we might consider aborting all
-        // the tasks on error rather than relying on join and then drop.
-        FailedTransferPolicy::Abort => Err(err),
+        FailedTransferPolicy::Abort => {
+            // Sending a cancellation signal during graceful shutdown would be redundant.
+            if err.kind() != &ErrorKind::OperationCancelled
+                && ctx.state.cancel_tx.send(true).is_err()
+            {
+                tracing::warn!(
+                    "all receiver ends have been dropped, unable to send a cancellation signal"
+                );
+            }
+            Err(err)
+        }
         FailedTransferPolicy::Continue => {
             let mut failures = ctx.state.failed_uploads.lock().unwrap();
 
@@ -262,9 +314,9 @@ fn handle_failed_upload(
 }
 
 #[cfg(test)]
-mod unit {
+mod tests {
     #[cfg(target_family = "unix")]
-    mod unix_tests {
+    mod unix {
         use crate::operation::upload_objects::worker::*;
         use crate::operation::upload_objects::UploadObjectsInputBuilder;
         use std::collections::BTreeMap;
@@ -333,8 +385,13 @@ mod unit {
             input: UploadObjectsInput,
         ) -> (BTreeMap<String, usize>, Vec<error::Error>) {
             let (list_directory_tx, list_directory_rx) = async_channel::unbounded();
+            let (cancel_tx, cancel_rx) = watch::channel(false);
 
-            let join_handle = tokio::spawn(list_directory_contents(input, list_directory_tx));
+            let join_handle = tokio::spawn(list_directory_contents(
+                Arc::new(UploadObjectsState::new(input, cancel_tx)),
+                list_directory_tx,
+                cancel_rx,
+            ));
 
             let mut successes = BTreeMap::new();
             let mut errors = Vec::new();
@@ -606,7 +663,7 @@ mod unit {
     }
 
     #[cfg(target_family = "windows")]
-    mod window_tests {
+    mod windows {
         use crate::operation::upload_objects::worker::*;
 
         #[test]

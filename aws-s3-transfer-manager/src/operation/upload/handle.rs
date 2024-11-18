@@ -28,6 +28,22 @@ pub(crate) enum UploadType {
 }
 
 /// Response type for a single upload object request.
+/// 
+/// # Cancellation
+///
+/// The operation can be cancelled either by dropping this handle or by calling
+/// [`Self::abort`]. In both cases, any ongoing tasks will stop processing future work
+/// and will not start processing anything new. However, there are subtle differences in
+/// how each method cancels ongoing tasks.
+///
+/// When the handle is dropped, in-progress tasks are cancelled at their await points,
+/// meaning read body tasks may be interrupted mid-processing, or upload parts may be
+/// terminated without calling `AbortMultipartUpload` for multipart uploads.
+///
+/// In contrast, calling [`Self::abort`] attempts to cancel ongoing tasks more explicitly.
+/// It first calls `.abort_all` on the tasks it owns, and then invokes `AbortMultipartUpload`
+/// to abort any in-progress multipart uploads. Errors encountered during `AbortMultipartUpload`
+/// are logged, but do not affect the overall cancellation flow.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
