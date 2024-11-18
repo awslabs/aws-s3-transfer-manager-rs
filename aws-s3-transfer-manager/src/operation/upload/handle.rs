@@ -28,7 +28,7 @@ pub(crate) enum UploadType {
 }
 
 /// Response type for a single upload object request.
-/// 
+///
 /// # Cancellation
 ///
 /// The operation can be cancelled either by dropping this handle or by calling
