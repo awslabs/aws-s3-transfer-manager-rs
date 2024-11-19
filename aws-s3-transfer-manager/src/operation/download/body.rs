@@ -37,6 +37,8 @@ pub struct ChunkResponse {
     pub metadata: ChunkMetadata,
 }
 
+// TODO: Do we want to expose something to yield multiple chunks in a single call, like
+// recv_many/collect, etc.?
 impl Body {
     /// Create a new empty body
     pub fn empty() -> Self {
