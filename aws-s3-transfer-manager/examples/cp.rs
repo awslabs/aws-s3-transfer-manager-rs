@@ -171,7 +171,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     // TODO(aws-sdk-rust#1159) - rewrite this less naively,
     //      likely abstract this into performant utils for single file download. Higher level
     //      TM will handle it's own thread pool for filesystem work
-    let mut handle = tm.download().bucket(bucket).key(key).send()?;
+    let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
 
     write_body(handle.body_mut(), dest)
         .instrument(tracing::debug_span!("write-output"))

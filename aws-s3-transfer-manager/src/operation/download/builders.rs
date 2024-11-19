@@ -26,7 +26,7 @@ impl DownloadFluentBuilder {
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         key = self.inner.key.as_deref().unwrap_or_default(),
     ))]
-    pub fn send(self) -> Result<DownloadHandle, crate::error::Error> {
+    pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input, false)
     }
@@ -527,6 +527,6 @@ impl crate::operation::download::input::DownloadInputBuilder {
     pub fn send_with(self, client: &crate::Client) -> Result<DownloadHandle, crate::error::Error> {
         let mut fluent_builder = client.download();
         fluent_builder.inner = self;
-        fluent_builder.send()
+        fluent_builder.initiate()
     }
 }

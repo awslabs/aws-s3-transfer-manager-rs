@@ -130,7 +130,7 @@ async fn test_download_ranges() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
+        .initiate()
         .unwrap();
 
     let body = drain(&mut handle).await.unwrap();
@@ -164,7 +164,7 @@ async fn test_body_not_consumed() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
+        .initiate()
         .unwrap();
 
     handle.join().await.unwrap();
@@ -274,7 +274,7 @@ async fn test_retry_failed_chunk() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
+        .initiate()
         .unwrap();
 
     let body = drain(&mut handle).await.unwrap();
@@ -329,7 +329,7 @@ async fn test_non_retryable_error() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
+        .initiate()
         .unwrap();
 
     let _ = drain(&mut handle).await.unwrap_err();
@@ -390,7 +390,7 @@ async fn test_retry_max_attempts() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
+        .initiate()
         .unwrap();
 
     let _ = drain(&mut handle).await.unwrap_err();

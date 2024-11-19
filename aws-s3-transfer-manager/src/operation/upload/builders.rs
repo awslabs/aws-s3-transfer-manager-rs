@@ -29,6 +29,7 @@ impl UploadFluentBuilder {
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         key = self.inner.key.as_deref().unwrap_or_default(),
     ))]
+    // TODO: Make it consistent with download by renaming it to initiate and making it synchronous
     pub async fn send(self) -> Result<UploadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::upload::Upload::orchestrate(self.handle, input).await
