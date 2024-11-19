@@ -127,7 +127,9 @@ async fn discover_obj_with_head(
         Some(range) => match range {
             ByteRange::Inclusive(start, end) => start..=end,
             ByteRange::AllFrom(start) => start..=object_meta.content_length(),
-            ByteRange::Last(n) => (object_meta.content_length() - n + 1)..=object_meta.content_length(),
+            ByteRange::Last(n) => {
+                (object_meta.content_length() - n + 1)..=object_meta.content_length()
+            }
         },
         None => 0..=object_meta.content_length(),
     };

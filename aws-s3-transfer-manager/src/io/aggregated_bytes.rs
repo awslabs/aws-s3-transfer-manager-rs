@@ -80,4 +80,3 @@ impl Buf for AggregatedBytes {
         self.0.copy_to_bytes(len)
     }
 }
-

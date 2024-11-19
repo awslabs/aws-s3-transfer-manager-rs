@@ -211,7 +211,6 @@ impl RequestId for ObjectMetadata {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::ObjectMetadata;

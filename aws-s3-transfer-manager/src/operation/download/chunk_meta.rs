@@ -166,7 +166,6 @@ impl From<GetObjectOutput> for ChunkMetadata {
     }
 }
 
-
 impl RequestIdExt for ChunkMetadata {
     fn extended_request_id(&self) -> Option<&str> {
         self._extended_request_id.as_deref()

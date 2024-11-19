@@ -8,8 +8,8 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use tokio::sync::mpsc;
 
-use crate::io::aggregated_bytes::AggregatedBytes;
 use super::chunk_meta::ChunkMetadata;
+use crate::io::aggregated_bytes::AggregatedBytes;
 
 /// Stream of binary data representing an Amazon S3 Object's contents.
 ///
