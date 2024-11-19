@@ -8,48 +8,106 @@ use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
 
-// TODO(aws-sdk-rust#1159,design): how many of these fields should we expose?
-// TODO(aws-sdk-rust#1159,docs): Document fields
-
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
+/// In the case of GetObject, some data will be duplicated as part of the first chunk.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectMetadata {
     _request_id: Option<String>,
     _extended_request_id: Option<String>,
+    /// <p>Indicates whether the object retrieved was (true) or was not (false) a Delete Marker. If false, this response header does not appear in the response.</p><note>
+    /// <ul>
+    /// <li>
+    /// <p>If the current version of the object is a delete marker, Amazon S3 behaves as if the object was deleted and includes <code>x-amz-delete-marker: true</code> in the response.</p></li>
+    /// <li>
+    /// <p>If the specified version in the request is a delete marker, the response returns a <code>405 Method Not Allowed</code> error and the <code>Last-Modified: timestamp</code> response header.</p></li>
+    /// </ul>
+    /// </note>
     pub delete_marker: Option<bool>,
+    /// <p>If the object expiration is configured (see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html"> <code>PutBucketLifecycleConfiguration</code> </a>), the response includes this header. It includes the <code>expiry-date</code> and <code>rule-id</code> key-value pairs providing object expiration information. The value of the <code>rule-id</code> is URL-encoded.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub expiration: Option<String>,
+    /// <p>Provides information about object restoration action and expiration time of the restored object copy.</p><note>
+    /// <p>This functionality is not supported for directory buckets. Only the S3 Express One Zone storage class is supported by directory buckets to store objects.</p>
+    /// </note>
     pub restore: Option<String>,
+    /// <p>Date and time when the object was last modified.</p>
+    /// <p><b>General purpose buckets </b> - When you specify a <code>versionId</code> of the object in your request, if the specified version in the request is a delete marker, the response returns a <code>405 Method Not Allowed</code> error and the <code>Last-Modified: timestamp</code> response header.</p>
     pub last_modified: Option<::aws_smithy_types::DateTime>,
     pub(crate) content_length: Option<i64>,
+    /// <p>An entity tag (ETag) is an opaque identifier assigned by a web server to a specific version of a resource found at a URL.</p>
     pub e_tag: Option<String>,
+    /// <p>This is set to the number of metadata entries not returned in the headers that are prefixed with <code>x-amz-meta-</code>. This can happen if you create metadata using an API like SOAP that supports more flexible metadata than the REST API. For example, using SOAP, you can create metadata whose values are not legal HTTP headers.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub missing_meta: Option<i32>,
+    /// <p>Version ID of the object.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub version_id: Option<String>,
+    /// <p>Specifies caching behavior along the request/reply chain.</p>
     pub cache_control: Option<String>,
+    /// <p>Specifies presentational information for the object.</p>
     pub content_disposition: Option<String>,
+    /// <p>Indicates what content encodings have been applied to the object and thus what decoding mechanisms must be applied to obtain the media-type referenced by the Content-Type header field.</p>
     pub content_encoding: Option<String>,
+    /// <p>The language the content is in.</p>
     pub content_language: Option<String>,
     pub(crate) content_range: Option<String>,
+    /// <p>A standard MIME type describing the format of the object data.</p>
     pub content_type: Option<String>,
-    pub expires: Option<::aws_smithy_types::DateTime>,
-    pub expires_string: Option<String>,
+    /// <p>If the bucket is configured as a website, redirects requests for this object to another object in the same bucket or to an external URL. Amazon S3 stores the value of this header in the object metadata.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub website_redirect_location: Option<String>,
+    /// <p>The server-side encryption algorithm used when you store this object in Amazon S3.</p>
     pub server_side_encryption: Option<aws_sdk_s3::types::ServerSideEncryption>,
+    /// <p>A map of metadata to store with the object in S3.</p>
     pub metadata: Option<::std::collections::HashMap<String, String>>,
+    /// <p>If server-side encryption with a customer-provided encryption key was requested, the response will include this header to confirm the encryption algorithm that's used.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub sse_customer_algorithm: Option<String>,
+    /// <p>If server-side encryption with a customer-provided encryption key was requested, the response will include this header to provide the round-trip message integrity verification of the customer-provided encryption key.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub sse_customer_key_md5: Option<String>,
+    /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     pub ssekms_key_id: Option<String>,
+    /// <p>Indicates whether the object uses an S3 Bucket Key for server-side encryption with Key Management Service (KMS) keys (SSE-KMS).</p>
     pub bucket_key_enabled: Option<bool>,
+    /// <p>Provides storage class information of the object. Amazon S3 returns this header for all objects except for S3 Standard storage class objects.</p><note>
+    /// <p><b>Directory buckets </b> - Only the S3 Express One Zone storage class is supported by directory buckets to store objects.</p>
+    /// </note>
     pub storage_class: Option<aws_sdk_s3::types::StorageClass>,
-    pub replication_status: Option<aws_sdk_s3::types::ReplicationStatus>,
-    pub parts_count: Option<i32>,
-    pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
-    pub object_lock_retain_until_date: Option<::aws_smithy_types::DateTime>,
-    pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
+    /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
     pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    /// <p>Amazon S3 can return this if your request involves a bucket that is either a source or destination in a replication rule.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
+    pub replication_status: Option<aws_sdk_s3::types::ReplicationStatus>,
+    /// <p>The count of parts this object has. This value is only returned if you specify <code>partNumber</code> in your request and the object was uploaded as a multipart upload.</p>
+    pub parts_count: Option<i32>,
+    /// <p>The Object Lock mode that's currently in place for this object.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
+    pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
+    /// <p>The date and time when this object's Object Lock will expire.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
+    pub object_lock_retain_until_date: Option<::aws_smithy_types::DateTime>,
+    /// <p>Indicates whether this object has an active legal hold. This field is only returned if you have permission to view an object's legal hold status.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
+    pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
+    /// <p>The date and time at which the object is no longer cacheable.</p>
+    pub expires_string: Option<String>,
 }
 
 impl ObjectMetadata {
-    /// The total object size
+    /// <p>Size of the object in bytes.</p>
     pub fn content_length(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
             (_, Some(range)) => {
@@ -84,8 +142,6 @@ impl From<&GetObjectOutput> for ObjectMetadata {
             content_language: value.content_language.clone(),
             content_range: value.content_range.clone(),
             content_type: value.content_type.clone(),
-            #[allow(deprecated)]
-            expires: value.expires,
             expires_string: value.expires_string.clone(),
             website_redirect_location: value.website_redirect_location.clone(),
             server_side_encryption: value.server_side_encryption.clone(),
@@ -124,8 +180,6 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             content_language: value.content_language,
             content_range: None,
             content_type: value.content_type,
-            #[allow(deprecated)]
-            expires: value.expires,
             expires_string: value.expires_string,
             website_redirect_location: value.website_redirect_location,
             server_side_encryption: value.server_side_encryption,
