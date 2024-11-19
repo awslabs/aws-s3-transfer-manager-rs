@@ -11,6 +11,7 @@ use aws_sdk_s3::operation::RequestIdExt;
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 /// In the case of GetObject, some data will be duplicated as part of the first chunk.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ObjectMetadata {
     _request_id: Option<String>,
     _extended_request_id: Option<String>,
