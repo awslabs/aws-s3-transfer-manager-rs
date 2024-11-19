@@ -5,6 +5,11 @@
 
 #![cfg(target_family = "unix")]
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use aws_s3_transfer_manager::{
     error::ErrorKind,
     metrics::unit::ByteUnit,
@@ -25,7 +30,7 @@ use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
 use test_common::create_test_dir;
-use tokio::fs::symlink;
+use tokio::{fs::symlink, sync::watch};
 
 // Create an S3 client with mock behavior configured for `PutObject`
 fn mock_s3_client_for_put_object(bucket_name: String) -> Client {
@@ -417,12 +422,17 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
     ];
     let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
+    let (watch_tx, watch_rx) = watch::channel(());
+
     let bucket_name = "test-bucket";
     let put_object = mock!(aws_sdk_s3::Client::put_object)
         .match_requests(move |input| input.bucket() == Some(bucket_name))
-        .then_output(|| {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            PutObjectOutput::builder().build()
+        .then_output({
+            let rx = watch_rx.clone();
+            move || {
+                while !rx.has_changed().unwrap() {}
+                PutObjectOutput::builder().build()
+            }
         });
 
     let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
@@ -440,8 +450,7 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
         .await
         .unwrap();
 
-    // give some time to uploaded tasks so they can receive jobs from the task of listing directory contents.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    watch_tx.send(()).unwrap();
 
     handle.abort().await.unwrap();
 
@@ -463,24 +472,21 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
     let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
-    let put_object_success = mock!(aws_sdk_s3::Client::put_object)
-        .match_requests(move |input| input.key() != Some("photos/2022-February/sample3.jpg"))
-        .then_output(|| {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            PutObjectOutput::builder().build()
+
+    let accessed = Arc::new(AtomicBool::new(false));
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_http_response(move || {
+            let already_accessed = accessed.swap(true, Ordering::SeqCst);
+            if already_accessed {
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty())
+            } else {
+                // Force the first call to PubObject to fail, triggering operation cancellation for all subsequent PubObject calls.
+                HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
+            }
         });
 
-    let put_object_err = mock!(aws_sdk_s3::Client::put_object)
-        .match_requests(move |input| input.key() == Some("photos/2022-February/sample3.jpg"))
-        .then_http_response(|| {
-            HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
-        });
-
-    let s3_client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[put_object_success, put_object_err]
-    );
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
     let config = aws_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
