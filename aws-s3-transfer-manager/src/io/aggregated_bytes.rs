@@ -11,7 +11,6 @@ use bytes_utils::SegmentedBuf;
 
 use crate::error::ErrorKind;
 
-///
 /// Non-contiguous Binary Data Storage
 ///
 /// When data is read from the network, it is read in a sequence of chunks that are not in
