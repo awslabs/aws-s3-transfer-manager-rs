@@ -31,9 +31,10 @@ pub struct ChunkResponse {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
     // the seq number
     pub(crate) seq: u64,
-    /// data: body of the object
+    /// The content associated with this particular ranged GetObject request.
     pub data: AggregatedBytes,
-    /// metadata: metadata returned by the S3.
+    /// The metadata associated with this particular ranged Get request. This contains all the
+    /// metadata returned by the S3 GetObject call.
     pub metadata: ChunkMetadata,
 }
 
