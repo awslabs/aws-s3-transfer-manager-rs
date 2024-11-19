@@ -11,8 +11,8 @@ use aws_sdk_s3::operation::RequestIdExt;
 // TODO: Document fields
 #[derive(Debug, Clone, Default)]
 pub struct ChunkMetadata {
-    pub request_id: Option<String>,
-    pub extended_request_id: Option<String>,
+    _request_id: Option<String>,
+    _extended_request_id: Option<String>,
     pub delete_marker: Option<bool>,
     pub accept_ranges: Option<String>,
     pub expiration: Option<String>,
@@ -54,8 +54,8 @@ pub struct ChunkMetadata {
 impl From<GetObjectOutput> for ChunkMetadata {
     fn from(value: GetObjectOutput) -> Self {
         Self {
-            request_id: value.request_id().map(|s| s.to_string()),
-            extended_request_id: value.extended_request_id().map(|s| s.to_string()),
+            _request_id: value.request_id().map(|s| s.to_string()),
+            _extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
             accept_ranges: value.accept_ranges,
             expiration: value.expiration,
@@ -94,5 +94,17 @@ impl From<GetObjectOutput> for ChunkMetadata {
             object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status,
         }
+    }
+}
+
+
+impl RequestIdExt for ChunkMetadata {
+    fn extended_request_id(&self) -> Option<&str> {
+        self._extended_request_id.as_deref()
+    }
+}
+impl RequestId for ChunkMetadata {
+    fn request_id(&self) -> Option<&str> {
+        self._request_id.as_deref()
     }
 }
