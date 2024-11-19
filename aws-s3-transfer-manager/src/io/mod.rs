@@ -6,6 +6,8 @@
 pub(crate) mod part_reader;
 mod path_body;
 mod stream;
+/// Download Body Type
+pub mod aggregated_bytes;
 
 /// Error types related to I/O abstractions
 pub mod error;

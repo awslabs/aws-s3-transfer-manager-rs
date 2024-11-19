@@ -25,9 +25,10 @@ mod object_meta;
 mod service;
 
 use crate::error;
+use crate::io::aggregated_bytes::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::{AggregatedBytes, Body, ChunkResponse};
+use body::{Body, ChunkResponse};
 use chunk_meta::ChunkMetadata;
 use discovery::discover_obj;
 use object_meta::ObjectMetadata;
