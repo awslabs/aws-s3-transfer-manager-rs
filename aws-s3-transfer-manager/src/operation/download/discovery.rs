@@ -126,10 +126,10 @@ async fn discover_obj_with_head(
     let remaining = match byte_range {
         Some(range) => match range {
             ByteRange::Inclusive(start, end) => start..=end,
-            ByteRange::AllFrom(start) => start..=object_meta.total_size(),
-            ByteRange::Last(n) => (object_meta.total_size() - n + 1)..=object_meta.total_size(),
+            ByteRange::AllFrom(start) => start..=object_meta.content_length(),
+            ByteRange::Last(n) => (object_meta.content_length() - n + 1)..=object_meta.content_length(),
         },
-        None => 0..=object_meta.total_size(),
+        None => 0..=object_meta.content_length(),
     };
 
     Ok(ObjectDiscovery {
@@ -163,7 +163,7 @@ async fn discover_obj_with_get(
 
     let remaining = match range {
         Some(range) => (*range.start() + content_len)..=*range.end(),
-        None => content_len..=object_meta.total_size() - 1,
+        None => content_len..=object_meta.content_length() - 1,
     };
 
     let initial_chunk = match content_len == 0 {

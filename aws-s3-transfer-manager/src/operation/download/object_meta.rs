@@ -14,9 +14,7 @@ use aws_sdk_s3::operation::RequestIdExt;
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 #[derive(Debug, Clone, Default)]
 pub struct ObjectMetadata {
-    /// The request_id if the client made a request to retrieve object metadata, such as with HeadObject.
     _request_id: Option<String>,
-    /// The extended_request_id if the client made a request to retrieve object metadata, such as with HeadObject.
     _extended_request_id: Option<String>,
     pub delete_marker: Option<bool>,
     pub expiration: Option<String>,
@@ -47,13 +45,12 @@ pub struct ObjectMetadata {
     pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
     pub object_lock_retain_until_date: Option<::aws_smithy_types::DateTime>,
     pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
-    /// Indicates whether the request was charged for a request made only to retrieve object metadata, such as HeadObject.
     pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
 }
 
 impl ObjectMetadata {
     /// The total object size
-    pub fn total_size(&self) -> u64 {
+    pub fn content_length(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
             (_, Some(range)) => {
                 let total = range.split_once('/').map(|x| x.1).expect("content range total");
@@ -71,6 +68,8 @@ impl ObjectMetadata {
 impl From<&GetObjectOutput> for ObjectMetadata {
     fn from(value: &GetObjectOutput) -> Self {
         Self {
+            _request_id: value.request_id().map(|s| s.to_string()),
+            _extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
             expiration: value.expiration.clone(),
             restore: value.restore.clone(),
@@ -101,9 +100,7 @@ impl From<&GetObjectOutput> for ObjectMetadata {
             object_lock_mode: value.object_lock_mode.clone(),
             object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status.clone(),
-            _request_id: None,
-            _extended_request_id: None,
-            request_charged: None,
+            request_charged: value.request_charged.clone(),
         }
     }
 }
@@ -113,7 +110,6 @@ impl From<HeadObjectOutput> for ObjectMetadata {
         Self {
             _request_id: value.request_id().map(|s| s.to_string()),
             _extended_request_id: value.extended_request_id().map(|s| s.to_string()),
-            request_charged: value.request_charged,
             delete_marker: value.delete_marker,
             expiration: value.expiration,
             restore: value.restore,
@@ -144,6 +140,7 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             object_lock_mode: value.object_lock_mode,
             object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status,
+            request_charged: value.request_charged,
         }
     }
 }
@@ -171,13 +168,13 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(15, meta.total_size());
+        assert_eq!(15, meta.content_length());
 
         let meta = ObjectMetadata {
             content_range: Some("bytes 0-499/900".to_owned()),
             content_length: Some(500),
             ..Default::default()
         };
-        assert_eq!(900, meta.total_size());
+        assert_eq!(900, meta.content_length());
     }
 }
