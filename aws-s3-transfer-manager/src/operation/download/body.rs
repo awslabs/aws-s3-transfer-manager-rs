@@ -39,7 +39,8 @@ pub struct ChunkResponse {
 }
 
 // TODO: Do we want to expose something to yield multiple chunks in a single call, like
-// recv_many/collect, etc.?
+// recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
+// we have a better scheduler in place.
 impl Body {
     /// Create a new empty body
     pub fn empty() -> Self {
