@@ -33,8 +33,8 @@ pub struct ChunkResponse {
     pub(crate) seq: u64,
     /// The content associated with this particular ranged GetObject request.
     pub data: AggregatedBytes,
-    /// The metadata associated with this particular ranged Get request. This contains all the
-    /// metadata returned by the S3 GetObject call.
+    /// The metadata associated with this particular ranged GetObject request. This contains all the
+    /// metadata returned by the S3 GetObject operation.
     pub metadata: ChunkMetadata,
 }
 

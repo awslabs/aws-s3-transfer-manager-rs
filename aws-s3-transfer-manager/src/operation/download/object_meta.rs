@@ -10,7 +10,7 @@ use aws_sdk_s3::operation::RequestIdExt;
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 /// In the case of GetObject, some data will be duplicated as part of the first chunk.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ObjectMetadata {
     _request_id: Option<String>,
@@ -208,6 +208,50 @@ impl RequestIdExt for ObjectMetadata {
 impl RequestId for ObjectMetadata {
     fn request_id(&self) -> Option<&str> {
         self._request_id.as_deref()
+    }
+}
+
+impl ::std::fmt::Debug for ObjectMetadata {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        let mut formatter = f.debug_struct("ObjectMetadata");
+        formatter.field("delete_marker", &self.delete_marker);
+        formatter.field("expiration", &self.expiration);
+        formatter.field("restore", &self.restore);
+        formatter.field("last_modified", &self.last_modified);
+        formatter.field("content_length", &self.content_length);
+        formatter.field("e_tag", &self.e_tag);
+        formatter.field("missing_meta", &self.missing_meta);
+        formatter.field("version_id", &self.version_id);
+        formatter.field("cache_control", &self.cache_control);
+        formatter.field("content_disposition", &self.content_disposition);
+        formatter.field("content_encoding", &self.content_encoding);
+        formatter.field("content_language", &self.content_language);
+        formatter.field("content_range", &self.content_range);
+        formatter.field("content_type", &self.content_type);
+        formatter.field("website_redirect_location", &self.website_redirect_location);
+        formatter.field("server_side_encryption", &self.server_side_encryption);
+        formatter.field("metadata", &self.metadata);
+        formatter.field("sse_customer_algorithm", &self.sse_customer_algorithm);
+        formatter.field("sse_customer_key_md5", &self.sse_customer_key_md5);
+        formatter.field("ssekms_key_id", &"*** Sensitive Data Redacted ***");
+        formatter.field("bucket_key_enabled", &self.bucket_key_enabled);
+        formatter.field("storage_class", &self.storage_class);
+        formatter.field("request_charged", &self.request_charged);
+        formatter.field("replication_status", &self.replication_status);
+        formatter.field("parts_count", &self.parts_count);
+        formatter.field("object_lock_mode", &self.object_lock_mode);
+        formatter.field(
+            "object_lock_retain_until_date",
+            &self.object_lock_retain_until_date,
+        );
+        formatter.field(
+            "object_lock_legal_hold_status",
+            &self.object_lock_legal_hold_status,
+        );
+        formatter.field("expires_string", &self.expires_string);
+        formatter.field("_extended_request_id", &self._extended_request_id);
+        formatter.field("_request_id", &self._request_id);
+        formatter.finish()
     }
 }
 
