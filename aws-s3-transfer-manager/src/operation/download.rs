@@ -20,8 +20,10 @@ mod handle;
 pub use handle::DownloadHandle;
 use tracing::Instrument;
 
-mod chunk_meta;
-mod object_meta;
+/// Provides metadata for each chunk during an object download.
+pub mod chunk_meta;
+/// Provides metadata for a single S3 object during download.
+pub mod object_meta;
 mod service;
 
 use crate::error;

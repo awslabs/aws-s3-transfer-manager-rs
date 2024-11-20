@@ -14,9 +14,9 @@ use crate::error::ErrorKind;
 /// Non-contiguous Binary Data Storage
 ///
 /// When data is read from the network, it is read in a sequence of chunks that are not in
-/// contiguous memory. [`AggregatedBytes`](crate::byte_stream::AggregatedBytes) provides a view of
+/// contiguous memory. [`AggregatedBytes`] provides a view of
 /// this data via [`impl Buf`](bytes::Buf) or it can be copied into contiguous storage with
-/// [`.into_bytes()`](crate::byte_stream::AggregatedBytes::into_bytes).
+/// [`.into_bytes()`](crate::io::aggregated_bytes::AggregatedBytes::into_bytes).
 #[derive(Debug, Clone)]
 pub struct AggregatedBytes(pub(crate) SegmentedBuf<Bytes>);
 
