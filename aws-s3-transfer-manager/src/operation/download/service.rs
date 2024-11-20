@@ -18,7 +18,7 @@ use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::body::ChunkResponse;
+use super::body::ChunkOutput;
 use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
@@ -45,7 +45,7 @@ fn next_chunk(
 /// handler (service fn) for a single chunk
 async fn download_chunk_handler(
     request: DownloadChunkRequest,
-) -> Result<ChunkResponse, error::Error> {
+) -> Result<ChunkOutput, error::Error> {
     let seq: u64 = request.ctx.next_seq();
 
     // the rest of the work is in its own fn, so we can log `seq` in the tracing span
@@ -57,7 +57,7 @@ async fn download_chunk_handler(
 async fn download_specific_chunk(
     request: DownloadChunkRequest,
     seq: u64,
-) -> Result<ChunkResponse, error::Error> {
+) -> Result<ChunkOutput, error::Error> {
     let ctx = request.ctx;
     let part_size = ctx.handle.download_part_size_bytes();
     let input = next_chunk(
@@ -83,7 +83,7 @@ async fn download_specific_chunk(
         ))
         .await?;
 
-    Ok(ChunkResponse {
+    Ok(ChunkOutput {
         seq,
         data: body,
         metadata: resp.into(),
@@ -93,7 +93,7 @@ async fn download_specific_chunk(
 /// Create a new tower::Service for downloading individual chunks of an object from S3
 pub(super) fn chunk_service(
     ctx: &DownloadContext,
-) -> impl Service<DownloadChunkRequest, Response = ChunkResponse, Error = error::Error, Future: Send>
+) -> impl Service<DownloadChunkRequest, Response = ChunkOutput, Error = error::Error, Future: Send>
        + Clone
        + Send {
     let svc = service_fn(download_chunk_handler);
@@ -120,7 +120,7 @@ pub(super) fn distribute_work(
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
     start_seq: u64,
-    comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
+    comp_tx: mpsc::Sender<Result<ChunkOutput, error::Error>>,
     parent_span_for_tasks: tracing::Span,
 ) {
     let svc = chunk_service(&ctx);

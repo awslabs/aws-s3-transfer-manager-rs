@@ -28,7 +28,7 @@ use crate::error;
 use crate::io::aggregated_bytes::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::{Body, ChunkResponse};
+use body::{Body, ChunkOutput};
 use chunk_meta::ChunkMetadata;
 use discovery::discover_obj;
 use object_meta::ObjectMetadata;
@@ -94,7 +94,7 @@ impl Download {
 async fn send_discovery(
     tasks: Arc<Mutex<task::JoinSet<()>>>,
     ctx: DownloadContext,
-    comp_tx: mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
+    comp_tx: mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
     object_meta_tx: oneshot::Sender<ObjectMetadata>,
     input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
@@ -158,7 +158,7 @@ fn handle_discovery_chunk(
     tasks: &mut task::JoinSet<()>,
     ctx: DownloadContext,
     initial_chunk: Option<ByteStream>,
-    completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
+    completed: &mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
     permit: OwnedWorkPermit,
     parent_span_for_tasks: tracing::Span,
     metadata: Option<ChunkMetadata>,
@@ -171,7 +171,7 @@ fn handle_discovery_chunk(
         tasks.spawn(async move {
             let chunk = AggregatedBytes::from_byte_stream(stream)
                 .await
-                .map(|aggregated| ChunkResponse {
+                .map(|aggregated| ChunkOutput {
                     seq,
                     data: aggregated,
                     metadata: metadata.expect("chunk metadata is available"),

@@ -21,13 +21,13 @@ pub struct Body {
     sequencer: Sequencer,
 }
 
-type BodyChannel = mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>;
+type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
 
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct ChunkResponse {
+pub struct ChunkOutput {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
     // the seq number
     pub(crate) seq: u64,
@@ -71,7 +71,7 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
-    pub async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
+    pub async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         loop {
             if self.sequencer.is_ordered() {
                 break;
@@ -114,11 +114,11 @@ impl Sequencer {
         }
     }
 
-    fn push(&mut self, chunk: ChunkResponse) {
+    fn push(&mut self, chunk: ChunkOutput) {
         self.chunks.push(cmp::Reverse(SequencedChunk(chunk)))
     }
 
-    fn pop(&mut self) -> Option<ChunkResponse> {
+    fn pop(&mut self) -> Option<ChunkOutput> {
         self.chunks.pop().map(|c| c.0 .0)
     }
 
@@ -131,7 +131,7 @@ impl Sequencer {
         next.unwrap().seq == self.next_seq
     }
 
-    fn peek(&self) -> Option<&ChunkResponse> {
+    fn peek(&self) -> Option<&ChunkOutput> {
         self.chunks.peek().map(|c| &c.0 .0)
     }
 
@@ -141,7 +141,7 @@ impl Sequencer {
 }
 
 #[derive(Debug)]
-struct SequencedChunk(ChunkResponse);
+struct SequencedChunk(ChunkOutput);
 
 impl Ord for SequencedChunk {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -165,7 +165,7 @@ impl PartialEq for SequencedChunk {
 /// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
 pub(crate) struct UnorderedBody {
-    chunks: Option<mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>>,
+    chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
 }
 
 impl UnorderedBody {
@@ -179,7 +179,7 @@ impl UnorderedBody {
     /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
-    pub(crate) async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
+    pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         match self.chunks.as_mut() {
             None => None,
             Some(ch) => ch.recv().await,
@@ -196,15 +196,15 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::body::ChunkResponse};
+    use crate::{error, operation::download::body::ChunkOutput};
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
 
     use super::{AggregatedBytes, Body, Sequencer};
 
-    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkResponse {
-        ChunkResponse {
+    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
+        ChunkOutput {
             seq,
             data,
             metadata: Default::default(),
