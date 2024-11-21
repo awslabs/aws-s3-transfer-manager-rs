@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use super::{UploadObjectsContext, UploadObjectsInput, UploadObjectsState};
 use async_channel::{Receiver, Sender};
+use aws_sdk_s3::error::DisplayErrorContext;
 use blocking::Unblock;
 use futures_util::StreamExt;
-use tokio::sync::watch;
 use walkdir::WalkDir;
 
 use crate::error::ErrorKind;
@@ -40,7 +40,6 @@ impl UploadObjectJob {
 pub(super) async fn list_directory_contents(
     state: Arc<UploadObjectsState>,
     list_directory_tx: Sender<Result<UploadObjectJob, error::Error>>,
-    mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), error::Error> {
     let input = &state.input;
 
@@ -55,6 +54,8 @@ pub(super) async fn list_directory_contents(
 
     let default_filter = &UploadFilter::default();
     let filter = input.filter().unwrap_or(default_filter);
+
+    let mut cancel_rx = state.cancel_rx.clone();
 
     loop {
         tokio::select! {
@@ -187,8 +188,8 @@ fn derive_object_key<'a>(
 pub(super) async fn upload_objects(
     ctx: UploadObjectsContext,
     list_directory_rx: Receiver<Result<UploadObjectJob, error::Error>>,
-    mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), error::Error> {
+    let mut cancel_rx = ctx.state.cancel_rx.clone();
     loop {
         tokio::select! {
             _ = cancel_rx.changed() => {
@@ -202,7 +203,7 @@ pub(super) async fn upload_objects(
                         match job {
                             Ok(job) => {
                                 let key = job.key.clone();
-                                let result = upload_single_obj(&ctx, job, cancel_rx.clone()).await;
+                                let result = upload_single_obj(&ctx, job).await;
                                 match result {
                                     Ok(bytes_transferred) => {
                                         ctx.state.successful_uploads.fetch_add(1, Ordering::SeqCst);
@@ -236,7 +237,6 @@ pub(super) async fn upload_objects(
 async fn upload_single_obj(
     ctx: &UploadObjectsContext,
     job: UploadObjectJob,
-    cancel_rx: watch::Receiver<bool>,
 ) -> Result<u64, error::Error> {
     let UploadObjectJob { object, key } = job;
 
@@ -258,8 +258,18 @@ async fn upload_single_obj(
     let mut handle =
         crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input).await?;
 
-    if cancel_rx.has_changed().unwrap() {
-        let _ = handle.abort().await;
+    if ctx
+        .state
+        .cancel_rx
+        .has_changed()
+        .expect("the channel should be open as it is owned by `UploadObjectsState`")
+    {
+        if let Err(e) = handle.abort().await {
+            tracing::error!(
+                "encountered an error while cancelling a single object upload: {}",
+                DisplayErrorContext(&e)
+            );
+        }
         Err(crate::error::Error::new(
             ErrorKind::OperationCancelled,
             CANCELLATION_ERROR.to_owned(),
@@ -339,6 +349,7 @@ mod tests {
         use std::error::Error as _;
         use test_common::create_test_dir;
         use tokio::fs::symlink;
+        use tokio::sync::watch;
 
         #[test]
         fn test_derive_object_key() {
@@ -404,9 +415,8 @@ mod tests {
             let (cancel_tx, cancel_rx) = watch::channel(false);
 
             let join_handle = tokio::spawn(list_directory_contents(
-                Arc::new(UploadObjectsState::new(input, cancel_tx)),
+                Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx)),
                 list_directory_tx,
-                cancel_rx,
             ));
 
             let mut successes = BTreeMap::new();
@@ -710,7 +720,7 @@ mod tests {
             .bucket(bucket)
             .build()
             .unwrap();
-        let ctx = UploadObjectsContext::new(handle, input, cancel_tx);
+        let ctx = UploadObjectsContext::new(handle, input, cancel_tx, cancel_rx);
         let job = UploadObjectJob {
             object: InputStream::from(Bytes::from_static(b"doesnotmatter")),
             key: "doesnotmatter".to_owned(),
@@ -718,7 +728,7 @@ mod tests {
 
         ctx.state.cancel_tx.send(true).unwrap();
 
-        let err = upload_single_obj(&ctx, job, cancel_rx).await.unwrap_err();
+        let err = upload_single_obj(&ctx, job).await.unwrap_err();
 
         assert_eq!(&crate::error::ErrorKind::OperationCancelled, err.kind());
     }
