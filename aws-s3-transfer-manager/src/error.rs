@@ -21,7 +21,7 @@ pub struct Error {
 }
 
 /// General categories of transfer errors.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
     /// Operation input validation issues

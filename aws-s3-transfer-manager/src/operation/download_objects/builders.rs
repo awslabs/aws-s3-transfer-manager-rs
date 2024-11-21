@@ -4,7 +4,10 @@
  */
 
 use crate::types::{DownloadFilter, FailedTransferPolicy};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 
@@ -47,7 +50,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The bucket name containing the object(s).
-    pub fn get_bucket(&self) -> &Option<String> {
+    pub fn get_bucket(&self) -> Option<&str> {
         self.inner.get_bucket()
     }
 
@@ -64,7 +67,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The destination directory to which files should be downloaded
-    pub fn get_destination(&self) -> &Option<PathBuf> {
+    pub fn get_destination(&self) -> Option<&Path> {
         self.inner.get_destination()
     }
 
@@ -81,7 +84,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The key_prefix name containing the object(s).
-    pub fn get_key_prefix(&self) -> &Option<String> {
+    pub fn get_key_prefix(&self) -> Option<&str> {
         self.inner.get_key_prefix()
     }
 
@@ -98,7 +101,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Character used to group keys
-    pub fn get_delimiter(&self) -> &Option<String> {
+    pub fn get_delimiter(&self) -> Option<&str> {
         self.inner.get_delimiter()
     }
 

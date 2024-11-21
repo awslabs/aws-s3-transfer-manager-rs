@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::Arc;
+use std::{fs::Metadata, path::Path, sync::Arc};
+
+use crate::error;
 
 /// Types for single object upload operation
 pub mod upload;
@@ -16,6 +18,9 @@ pub mod download_objects;
 
 /// Types for multiple object upload operation
 pub mod upload_objects;
+
+// The default delimiter of the S3 object key
+pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
 /// Container for maintaining context required to carry out a single operation/transfer.
 ///
@@ -39,5 +44,22 @@ impl<State> Clone for TransferContext<State> {
             handle: self.handle.clone(),
             state: self.state.clone(),
         }
+    }
+}
+
+// Checks if the target path at `path`, with the provided `metadata`, represents a directory.
+//
+// The caller is responsible for providing the correct `Metadata`. If the `Metadata` is obtained
+// via `fs::metadata`, it can only determine whether the path is a file or a directory, but it cannot
+// indicate whether the path is a symbolic link. On the other hand, if `Metadata` is obtained through
+// `fs::symlink_metadata`, it can identify symbolic links, but calling `is_dir()` on a symlink will
+// return false, even if the symlink points to a directory.
+pub(crate) fn validate_target_is_dir(metadata: &Metadata, path: &Path) -> Result<(), error::Error> {
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(error::invalid_input(format!(
+            "target is not a directory: {path:?}"
+        )))
     }
 }
