@@ -21,3 +21,4 @@ pub use self::size_hint::SizeHint;
 pub use self::stream::InputStream;
 pub use self::stream::PartData;
 pub use self::stream::PartStream;
+pub use self::stream::StreamContext;

@@ -175,7 +175,11 @@ pub struct PartData {
 
 impl PartData {
     /// Create a new part
-    pub(super) fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+    pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+        debug_assert!(
+            part_number > 0,
+            "part numbers are 1-indexed and must be greater than zero"
+        );
         Self {
             part_number,
             data: data.into(),
