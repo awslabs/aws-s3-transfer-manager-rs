@@ -509,3 +509,55 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
     // the execution should see at least one cancellation signal being delivered.
     assert!(rx.contents().contains("received cancellation signal"));
 }
+
+#[tokio::test]
+async fn test_drop_upload_objects_handle() {
+    let test_dir = create_test_dir(
+        Some("test"),
+        vec![
+            ("sample.jpg", 1),
+            ("photos/2022-January/sample.jpg", 1),
+            ("photos/2022-February/sample1.jpg", 1),
+            ("photos/2022-February/sample2.jpg", 1),
+            ("photos/2022-February/sample3.jpg", 1),
+        ],
+        &[],
+    );
+
+    let (watch_tx, watch_rx) = watch::channel(());
+
+    let bucket_name = "test-bucket";
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_output({
+            move || {
+                watch_tx.send(()).unwrap();
+                // sleep for some time so that the main thread proceeds with `drop(handle)`
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                PutObjectOutput::builder().build()
+            }
+        });
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    // Wait until execution reaches the point just before returning `PutObjectOutput`,
+    // as dropping `handle` immediately after creation may not be interesting for testing.
+    while !watch_rx.has_changed().unwrap() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // should not panic
+    drop(handle)
+}
