@@ -46,8 +46,7 @@ pub enum ErrorKind {
     ChildOperationFailed,
 
     /// The operation is being canceled because the user explicitly called `.abort` on the handle,
-    /// or a child operation failed with the abort policy. The operation is now transitioning into
-    /// a graceful shutdown mode.
+    /// or a child operation failed with the abort policy.
     OperationCancelled,
 }
 
