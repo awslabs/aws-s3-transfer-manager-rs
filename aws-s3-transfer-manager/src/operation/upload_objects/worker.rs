@@ -331,7 +331,6 @@ mod tests {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
     use bytes::Bytes;
-    use tokio::sync::watch;
 
     use crate::{
         client::Handle,
@@ -714,7 +713,6 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let (cancel_tx, cancel_rx) = watch::channel(false);
         let scheduler = Scheduler::new(DEFAULT_CONCURRENCY);
 
         let handle = std::sync::Arc::new(Handle { config, scheduler });
@@ -723,7 +721,7 @@ mod tests {
             .bucket(bucket)
             .build()
             .unwrap();
-        let ctx = UploadObjectsContext::new(handle, input, cancel_tx, cancel_rx);
+        let ctx = UploadObjectsContext::new(handle, input);
         let job = UploadObjectJob {
             object: InputStream::from(Bytes::from_static(b"doesnotmatter")),
             key: "doesnotmatter".to_owned(),

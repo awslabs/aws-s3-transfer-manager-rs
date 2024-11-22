@@ -55,9 +55,8 @@ impl UploadObjects {
                 return Err(e);
             }
         };
-        let (cancel_tx, cancel_rx) = watch::channel(false);
         let concurrency = handle.num_workers();
-        let ctx = UploadObjectsContext::new(handle.clone(), input, cancel_tx, cancel_rx);
+        let ctx = UploadObjectsContext::new(handle.clone(), input);
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
         let mut tasks = JoinSet::new();
@@ -113,12 +112,8 @@ impl UploadObjectsState {
 type UploadObjectsContext = TransferContext<UploadObjectsState>;
 
 impl UploadObjectsContext {
-    fn new(
-        handle: Arc<crate::client::Handle>,
-        input: UploadObjectsInput,
-        cancel_tx: Sender<bool>,
-        cancel_rx: Receiver<bool>,
-    ) -> Self {
+    fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
         TransferContext { handle, state }
     }
