@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/// Adapters for other IO library traits to map to `InputStream`
+pub mod adapters;
+mod buffer;
 pub(crate) mod part_reader;
 mod path_body;
 mod stream;
@@ -12,6 +15,10 @@ pub mod error;
 mod size_hint;
 
 // re-exports
+pub(crate) use self::buffer::Buffer;
 pub use self::path_body::PathBodyBuilder;
 pub use self::size_hint::SizeHint;
 pub use self::stream::InputStream;
+pub use self::stream::PartData;
+pub use self::stream::PartStream;
+pub use self::stream::StreamContext;

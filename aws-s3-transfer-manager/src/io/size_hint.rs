@@ -4,7 +4,7 @@
  */
 
 /// A body size hint
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct SizeHint {
     lower: u64,
     upper: Option<u64>,

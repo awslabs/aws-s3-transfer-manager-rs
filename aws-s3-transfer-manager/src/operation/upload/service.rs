@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::{
     error,
     io::{
-        part_reader::{Builder as PartReaderBuilder, PartData, ReadPart},
-        InputStream,
+        part_reader::{Builder as PartReaderBuilder, PartReader},
+        InputStream, PartData,
     },
     middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
     operation::upload::UploadContext,
@@ -108,7 +108,7 @@ pub(super) fn distribute_work(
     );
     match &mut handle.upload_type {
         UploadType::PutObject { .. } => {
-            panic!("distribute_work must not be called for PutObject.")
+            unreachable!("distribute_work must not be called for PutObject.")
         }
         UploadType::MultipartUpload {
             upload_part_tasks,
@@ -155,7 +155,7 @@ pub(super) fn distribute_work(
 /// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader
 /// is exhausted. If any part fails, the worker will return the error and stop processing.
 pub(super) async fn read_body(
-    part_reader: Arc<impl ReadPart>,
+    part_reader: Arc<PartReader>,
     ctx: UploadContext,
     svc: impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
         + Clone

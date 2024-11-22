@@ -52,10 +52,13 @@ impl Upload {
             .upper()
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
-        let handle = if content_length < min_mpu_threshold {
+        // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
+        let handle = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
             tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
             try_start_put_object(ctx, stream, content_length).await?
         } else {
+            // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
+            //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
             try_start_mpu_upload(ctx, stream, content_length).await?
         };
 
