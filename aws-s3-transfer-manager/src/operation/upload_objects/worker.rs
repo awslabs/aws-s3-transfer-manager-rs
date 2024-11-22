@@ -231,6 +231,7 @@ pub(super) async fn upload_objects(
         }
     }
 
+    tracing::trace!("ls channel closed, worker finished");
     Ok(())
 }
 

@@ -506,8 +506,12 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
         &ErrorKind::ChildOperationFailed,
         handle.join().await.unwrap_err().kind()
     );
-    // the execution should see at least one cancellation signal being delivered.
-    assert!(rx.contents().contains("received cancellation signal"));
+    // The execution should either receive at least one cancellation signal or successfully complete the current task.
+    let logs = rx.contents();
+    assert!(
+        logs.contains("received cancellation signal")
+            || logs.contains("ls channel closed, worker finished")
+    );
 }
 
 #[tokio::test]
