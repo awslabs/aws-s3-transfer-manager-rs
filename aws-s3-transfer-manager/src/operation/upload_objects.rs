@@ -16,7 +16,10 @@ pub use handle::UploadObjectsHandle;
 
 mod output;
 pub use output::{UploadObjectsOutput, UploadObjectsOutputBuilder};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::watch::{self, Receiver, Sender},
+    task::JoinSet,
+};
 use tracing::Instrument;
 
 mod worker;
@@ -52,7 +55,6 @@ impl UploadObjects {
                 return Err(e);
             }
         };
-
         let concurrency = handle.num_workers();
         let ctx = UploadObjectsContext::new(handle.clone(), input);
 
@@ -62,7 +64,7 @@ impl UploadObjects {
 
         // spawn worker to discover/distribute work
         tasks.spawn(worker::list_directory_contents(
-            ctx.state.input.clone(),
+            ctx.state.clone(),
             list_directory_tx,
         ));
 
@@ -83,21 +85,36 @@ pub(crate) struct UploadObjectsState {
     // TODO - Determine if `input` should be separated from this struct
     // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: UploadObjectsInput,
+    cancel_tx: Sender<bool>,
+    cancel_rx: Receiver<bool>,
     failed_uploads: Mutex<Vec<FailedUpload>>,
     successful_uploads: AtomicU64,
     total_bytes_transferred: AtomicU64,
+}
+
+impl UploadObjectsState {
+    pub(crate) fn new(
+        input: UploadObjectsInput,
+        cancel_tx: Sender<bool>,
+        cancel_rx: Receiver<bool>,
+    ) -> Self {
+        Self {
+            input,
+            cancel_tx,
+            cancel_rx,
+            failed_uploads: Mutex::new(Vec::new()),
+            successful_uploads: AtomicU64::default(),
+            total_bytes_transferred: AtomicU64::default(),
+        }
+    }
 }
 
 type UploadObjectsContext = TransferContext<UploadObjectsState>;
 
 impl UploadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
-        let state = Arc::new(UploadObjectsState {
-            input,
-            failed_uploads: Mutex::new(Vec::new()),
-            successful_uploads: AtomicU64::default(),
-            total_bytes_transferred: AtomicU64::default(),
-        });
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
         TransferContext { handle, state }
     }
 }

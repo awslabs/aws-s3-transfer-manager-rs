@@ -128,7 +128,7 @@ impl Builder {
         self
     }
 
-    /// Consumes the builder and constructs a [`Config`](crate::config::Config)
+    /// Consumes the builder and constructs a [`Config`]
     pub fn build(self) -> Config {
         Config {
             multipart_threshold: self.multipart_threshold_part_size,

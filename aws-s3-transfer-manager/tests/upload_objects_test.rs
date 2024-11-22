@@ -5,6 +5,11 @@
 
 #![cfg(target_family = "unix")]
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use aws_s3_transfer_manager::{
     error::ErrorKind,
     metrics::unit::ByteUnit,
@@ -21,10 +26,11 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
+use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
 use test_common::create_test_dir;
-use tokio::fs::symlink;
+use tokio::{fs::symlink, sync::watch};
 
 // Create an S3 client with mock behavior configured for `PutObject`
 fn mock_s3_client_for_put_object(bucket_name: String) -> Client {
@@ -400,4 +406,162 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
     assert_eq!(&ErrorKind::InputInvalid, err.kind());
     assert!(format!("{}", DisplayErrorContext(err))
         .contains("a custom delimiter `-` should not appear"));
+}
+
+#[tokio::test]
+async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
+    let (_guard, rx) = capture_test_logs();
+
+    let recursion_root = "test";
+    let files = vec![
+        ("sample.jpg", 1),
+        ("photos/2022-January/sample.jpg", 1),
+        ("photos/2022-February/sample1.jpg", 1),
+        ("photos/2022-February/sample2.jpg", 1),
+        ("photos/2022-February/sample3.jpg", 1),
+    ];
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
+
+    let (watch_tx, watch_rx) = watch::channel(());
+
+    let bucket_name = "test-bucket";
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_output({
+            let rx = watch_rx.clone();
+            move || {
+                while !rx.has_changed().unwrap() {}
+                PutObjectOutput::builder().build()
+            }
+        });
+
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let mut handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    watch_tx.send(()).unwrap();
+
+    handle.abort().await.unwrap();
+
+    assert!(rx.contents().contains("received cancellation signal"));
+}
+
+#[tokio::test]
+async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancelled() {
+    let (_guard, rx) = capture_test_logs();
+
+    let recursion_root = "test";
+    let files = vec![
+        ("sample.jpg", 1),
+        ("photos/2022-January/sample.jpg", 1),
+        ("photos/2022-February/sample1.jpg", 1),
+        ("photos/2022-February/sample2.jpg", 1),
+        ("photos/2022-February/sample3.jpg", 1),
+    ];
+    let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
+
+    let bucket_name = "test-bucket";
+
+    let accessed = Arc::new(AtomicBool::new(false));
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_http_response(move || {
+            let already_accessed = accessed.swap(true, Ordering::SeqCst);
+            if already_accessed {
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty())
+            } else {
+                // Force the first call to PubObject to fail, triggering operation cancellation for all subsequent PubObject calls.
+                HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
+            }
+        });
+
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    // `join` will report the actual error that triggered cancellation.
+    assert_eq!(
+        &ErrorKind::ChildOperationFailed,
+        handle.join().await.unwrap_err().kind()
+    );
+    // The execution should either receive at least one cancellation signal or successfully complete the current task.
+    let logs = rx.contents();
+    assert!(
+        logs.contains("received cancellation signal")
+            || logs.contains("ls channel closed, worker finished")
+    );
+}
+
+#[tokio::test]
+async fn test_drop_upload_objects_handle() {
+    let test_dir = create_test_dir(
+        Some("test"),
+        vec![
+            ("sample.jpg", 1),
+            ("photos/2022-January/sample.jpg", 1),
+            ("photos/2022-February/sample1.jpg", 1),
+            ("photos/2022-February/sample2.jpg", 1),
+            ("photos/2022-February/sample3.jpg", 1),
+        ],
+        &[],
+    );
+
+    let (watch_tx, watch_rx) = watch::channel(());
+
+    let bucket_name = "test-bucket";
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(bucket_name))
+        .then_output({
+            move || {
+                watch_tx.send(()).unwrap();
+                // sleep for some time so that the main thread proceeds with `drop(handle)`
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                PutObjectOutput::builder().build()
+            }
+        });
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let sut = aws_s3_transfer_manager::Client::new(config);
+
+    let handle = sut
+        .upload_objects()
+        .bucket(bucket_name)
+        .source(test_dir.path())
+        .recursive(true)
+        .send()
+        .await
+        .unwrap();
+
+    // Wait until execution reaches the point just before returning `PutObjectOutput`,
+    // as dropping `handle` immediately after creation may not be interesting for testing.
+    while !watch_rx.has_changed().unwrap() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // should not panic
+    drop(handle)
 }
