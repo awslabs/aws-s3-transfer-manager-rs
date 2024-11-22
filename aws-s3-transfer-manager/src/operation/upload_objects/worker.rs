@@ -258,6 +258,9 @@ async fn upload_single_obj(
     let mut handle =
         crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input).await?;
 
+    // The cancellation process would work fine without this if statement.
+    // It's here so we can save a single upload operation that would otherwise
+    // be wasted if the system is already in graceful shutdown mode.
     if ctx
         .state
         .cancel_rx
