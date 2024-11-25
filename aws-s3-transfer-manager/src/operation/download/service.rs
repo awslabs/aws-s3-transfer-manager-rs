@@ -4,19 +4,22 @@
  */
 use crate::error;
 use crate::http::header;
+use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
 use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
+use aws_smithy_types::byte_stream::ByteStream;
 use std::cmp;
 use std::mem;
 use std::ops::RangeInclusive;
 use tokio::sync::mpsc;
+use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::{DownloadHandle, DownloadInput, DownloadInputBuilder};
+use super::body::ChunkOutput;
+use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
 #[derive(Debug, Clone)]
@@ -42,7 +45,7 @@ fn next_chunk(
 /// handler (service fn) for a single chunk
 async fn download_chunk_handler(
     request: DownloadChunkRequest,
-) -> Result<ChunkResponse, error::Error> {
+) -> Result<ChunkOutput, error::Error> {
     let seq: u64 = request.ctx.next_seq();
 
     // the rest of the work is in its own fn, so we can log `seq` in the tracing span
@@ -54,7 +57,7 @@ async fn download_chunk_handler(
 async fn download_specific_chunk(
     request: DownloadChunkRequest,
     seq: u64,
-) -> Result<ChunkResponse, error::Error> {
+) -> Result<ChunkOutput, error::Error> {
     let ctx = request.ctx;
     let part_size = ctx.handle.download_part_size_bytes();
     let input = next_chunk(
@@ -73,26 +76,24 @@ async fn download_specific_chunk(
         .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
 
     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
-
-    let bytes = body
-        .collect()
+    let body = AggregatedBytes::from_byte_stream(body)
         .instrument(tracing::debug_span!(
             "collect-body-from-download-chunk",
             seq
         ))
-        .await
-        .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
+        .await?;
 
-    Ok(ChunkResponse {
+    Ok(ChunkOutput {
         seq,
-        data: Some(bytes),
+        data: body,
+        metadata: resp.into(),
     })
 }
 
 /// Create a new tower::Service for downloading individual chunks of an object from S3
 pub(super) fn chunk_service(
     ctx: &DownloadContext,
-) -> impl Service<DownloadChunkRequest, Response = ChunkResponse, Error = error::Error, Future: Send>
+) -> impl Service<DownloadChunkRequest, Response = ChunkOutput, Error = error::Error, Future: Send>
        + Clone
        + Send {
     let svc = service_fn(download_chunk_handler);
@@ -102,15 +103,6 @@ pub(super) fn chunk_service(
         .layer(concurrency_limit)
         .retry(retry::RetryPolicy::default())
         .service(svc)
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ChunkResponse {
-    // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
-    // the seq number
-    pub(crate) seq: u64,
-    // chunk data
-    pub(crate) data: Option<AggregatedBytes>,
 }
 
 /// Spawn tasks to download the remaining chunks of object data
@@ -123,22 +115,23 @@ pub(crate) struct ChunkResponse {
 /// * start_seq - the starting sequence number to use for chunks
 /// * comp_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
-    handle: &mut DownloadHandle,
+    tasks: &mut task::JoinSet<()>,
+    ctx: DownloadContext,
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
     start_seq: u64,
-    comp_tx: mpsc::Sender<Result<ChunkResponse, error::Error>>,
+    comp_tx: mpsc::Sender<Result<ChunkOutput, error::Error>>,
     parent_span_for_tasks: tracing::Span,
 ) {
-    let svc = chunk_service(&handle.ctx);
-    let part_size = handle.ctx.target_part_size_bytes();
+    let svc = chunk_service(&ctx);
+    let part_size = ctx.target_part_size_bytes();
     let input: DownloadInputBuilder = input.into();
 
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
     for _ in 0..num_parts {
         let req = DownloadChunkRequest {
-            ctx: handle.ctx.clone(),
+            ctx: ctx.clone(),
             remaining: remaining.clone(),
             input: input.clone(),
             start_seq,
@@ -148,14 +141,13 @@ pub(super) fn distribute_work(
         let comp_tx = comp_tx.clone();
 
         let task = async move {
+            // TODO: If downloading a chunk fails, do we want to abort the download?
             let resp = svc.oneshot(req).await;
             if let Err(err) = comp_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
             }
         };
-        handle
-            .tasks
-            .spawn(task.instrument(parent_span_for_tasks.clone()));
+        tasks.spawn(task.instrument(parent_span_for_tasks.clone()));
     }
 
     tracing::trace!("work fully distributed");

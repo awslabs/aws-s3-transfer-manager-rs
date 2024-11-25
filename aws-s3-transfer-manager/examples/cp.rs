@@ -171,14 +171,14 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     // TODO(aws-sdk-rust#1159) - rewrite this less naively,
     //      likely abstract this into performant utils for single file download. Higher level
     //      TM will handle it's own thread pool for filesystem work
-    let mut handle = tm.download().bucket(bucket).key(key).send().await?;
+    let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
 
     write_body(handle.body_mut(), dest)
         .instrument(tracing::debug_span!("write-output"))
         .await?;
 
     let elapsed = start.elapsed();
-    let obj_size_bytes = handle.object_meta.total_size();
+    let obj_size_bytes = handle.object_meta().await?.content_length();
     let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(
@@ -298,7 +298,7 @@ async fn main() -> Result<(), BoxError> {
 
 async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.unwrap();
+        let chunk = chunk.unwrap().data;
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
         let mut segment_cnt = 1;
         for segment in chunk.into_segments() {

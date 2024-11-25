@@ -20,19 +20,26 @@ mod handle;
 pub use handle::DownloadHandle;
 use tracing::Instrument;
 
+/// Provides metadata for each chunk during an object download.
+mod chunk_meta;
+pub use chunk_meta::ChunkMetadata;
+/// Provides metadata for a single S3 object during download.
 mod object_meta;
+pub use object_meta::ObjectMetadata;
+
 mod service;
 
 use crate::error;
+use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::Body;
+use body::{Body, ChunkOutput};
 use discovery::discover_obj;
-use service::{distribute_work, ChunkResponse};
+use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::task::{self, JoinSet};
 
 use super::TransferContext;
 
@@ -50,9 +57,9 @@ impl Download {
     ///
     /// If `use_current_span_as_parent_for_tasks` is false, spawned tasks will
     /// "follow from" the current span, but be under their own root of the trace tree.
-    /// Use this for `TransferManager.download().send()`, where the spawned tasks
-    /// should NOT extend the life of the current `send()` span.
-    pub(crate) async fn orchestrate(
+    /// Use this for `TransferManager.download().initiate()`, where the spawned tasks
+    /// should NOT extend the life of the current `initiate()` span.
+    pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
         use_current_span_as_parent_for_tasks: bool,
@@ -62,64 +69,86 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let concurrency = handle.num_workers();
         let ctx = DownloadContext::new(handle);
-
-        // create span to serve as parent of spawned child tasks.
-        let parent_span_for_tasks = tracing::debug_span!(
-            parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
-            "download-tasks",
-            bucket = input.bucket().unwrap_or_default(),
-            key = input.key().unwrap_or_default(),
-        );
-        if !use_current_span_as_parent_for_tasks {
-            // if not child of current span, then "follows from" current span
-            parent_span_for_tasks.follows_from(tracing::Span::current());
-        }
-
-        // acquire a permit for discovery
-        let permit = ctx.handle.scheduler.acquire_permit().await?;
-
-        // make initial discovery about the object size, metadata, possibly first chunk
-        let mut discovery = discover_obj(&ctx, &input).await?;
+        let concurrency = ctx.handle.num_workers();
         let (comp_tx, comp_rx) = mpsc::channel(concurrency);
+        let (object_meta_tx, object_meta_rx) = oneshot::channel();
 
-        let initial_chunk = discovery.initial_chunk.take();
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let discovery = tokio::spawn(send_discovery(
+            tasks.clone(),
+            ctx.clone(),
+            comp_tx,
+            object_meta_tx,
+            input,
+            use_current_span_as_parent_for_tasks,
+        ));
 
-        let mut handle = DownloadHandle {
-            // FIXME(aws-sdk-rust#1159) - initial object discovery for a range/first-part will not
-            //   have the correct metadata w.r.t. content-length and maybe others for the whole object.
-            object_meta: discovery.meta,
+        Ok(DownloadHandle {
             body: Body::new(comp_rx),
-            // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
-            tasks: JoinSet::new(),
-            ctx,
-        };
-
-        // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
-        // that we can begin concurrently downloading any reamining chunks/parts ASAP
-        let start_seq = handle_discovery_chunk(
-            &mut handle,
-            initial_chunk,
-            &comp_tx,
-            permit,
-            parent_span_for_tasks.clone(),
-        );
-
-        if !discovery.remaining.is_empty() {
-            let remaining = discovery.remaining.clone();
-            distribute_work(
-                &mut handle,
-                remaining,
-                input,
-                start_seq,
-                comp_tx,
-                parent_span_for_tasks,
-            )
-        }
-
-        Ok(handle)
+            tasks,
+            discovery,
+            object_meta_receiver: Mutex::new(Some(object_meta_rx)),
+            object_meta: OnceCell::new(),
+        })
     }
+}
+
+async fn send_discovery(
+    tasks: Arc<Mutex<task::JoinSet<()>>>,
+    ctx: DownloadContext,
+    comp_tx: mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
+    object_meta_tx: oneshot::Sender<ObjectMetadata>,
+    input: DownloadInput,
+    use_current_span_as_parent_for_tasks: bool,
+) -> Result<(), crate::error::Error> {
+    // create span to serve as parent of spawned child tasks.
+    let parent_span_for_tasks = tracing::debug_span!(
+        parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
+        "download-tasks",
+        bucket = input.bucket().unwrap_or_default(),
+        key = input.key().unwrap_or_default(),
+    );
+    if !use_current_span_as_parent_for_tasks {
+        // if not child of current span, then "follows from" current span
+        parent_span_for_tasks.follows_from(tracing::Span::current());
+    }
+
+    // acquire a permit for discovery
+    let permit = ctx.handle.scheduler.acquire_permit().await?;
+
+    // make initial discovery about the object size, metadata, possibly first chunk
+    let mut discovery = discover_obj(&ctx, &input).await?;
+    // FIXME - This will fail if the handle is dropped at this point. We should handle
+    // the cancellation gracefully here.
+    let _ = object_meta_tx.send(discovery.object_meta);
+    let initial_chunk = discovery.initial_chunk.take();
+
+    let mut tasks = tasks.lock().await;
+    // spawn a task (if necessary) to handle the discovery chunk. This returns immediately so
+    // that we can begin concurrently downloading any remaining chunks/parts ASAP
+    let start_seq = handle_discovery_chunk(
+        &mut tasks,
+        ctx.clone(),
+        initial_chunk,
+        &comp_tx,
+        permit,
+        parent_span_for_tasks.clone(),
+        discovery.chunk_meta,
+    );
+
+    if !discovery.remaining.is_empty() {
+        distribute_work(
+            &mut tasks,
+            ctx.clone(),
+            discovery.remaining,
+            input,
+            start_seq,
+            comp_tx,
+            parent_span_for_tasks,
+        );
+    }
+    Ok(())
 }
 
 /// Handle possibly sending the first chunk of data received through discovery. Returns
@@ -130,24 +159,26 @@ impl Download {
 /// This allows remaining work to start immediately (and concurrently) without
 /// waiting for the first chunk.
 fn handle_discovery_chunk(
-    handle: &mut DownloadHandle,
+    tasks: &mut task::JoinSet<()>,
+    ctx: DownloadContext,
     initial_chunk: Option<ByteStream>,
-    completed: &mpsc::Sender<Result<ChunkResponse, crate::error::Error>>,
+    completed: &mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
     permit: OwnedWorkPermit,
     parent_span_for_tasks: tracing::Span,
+    metadata: Option<ChunkMetadata>,
 ) -> u64 {
     if let Some(stream) = initial_chunk {
-        let seq = handle.ctx.next_seq();
+        let seq = ctx.next_seq();
         let completed = completed.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
-        handle.tasks.spawn(async move {
-            let chunk = stream
-                .collect()
+        tasks.spawn(async move {
+            let chunk = AggregatedBytes::from_byte_stream(stream)
                 .await
-                .map(|aggregated| ChunkResponse {
+                .map(|aggregated| ChunkOutput {
                     seq,
-                    data: Some(aggregated),
+                    data: aggregated,
+                    metadata: metadata.expect("chunk metadata is available"),
                 })
                 .map_err(error::discovery_failed);
 
@@ -162,7 +193,7 @@ fn handle_discovery_chunk(
             }
         }.instrument(tracing::debug_span!(parent: parent_span_for_tasks.clone(), "collect-body-from-discovery", seq)));
     }
-    handle.ctx.current_seq()
+    ctx.current_seq()
 }
 
 /// Download operation specific state

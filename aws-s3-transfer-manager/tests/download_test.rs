@@ -49,7 +49,7 @@ async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
     let body = handle.body_mut();
     let mut data = BytesMut::new();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?.into_bytes();
+        let chunk = chunk?.data.into_bytes();
         data.put(chunk);
     }
 
@@ -70,13 +70,14 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
         .enumerate()
         .map(|(idx, chunk)| {
             let start = idx * part_size;
-            let end = part_size * (idx + 1) - 1;
+            let end = std::cmp::min(start + part_size, data.len()) - 1;
             ReplayEvent::new(
                 // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
                 // make our own assertions against the captured requests.
                 dummy_expected_request(),
                 http_02x::Response::builder()
                     .status(200)
+                    .header("Content-Length", format!("{}", end - start + 1))
                     .header(
                         "Content-Range",
                         format!("bytes {start}-{end}/{}", data.len()),
@@ -129,8 +130,7 @@ async fn test_download_ranges() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
-        .await
+        .initiate()
         .unwrap();
 
     let body = drain(&mut handle).await.unwrap();
@@ -164,8 +164,7 @@ async fn test_body_not_consumed() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
-        .await
+        .initiate()
         .unwrap();
 
     handle.join().await.unwrap();
@@ -229,6 +228,7 @@ async fn test_retry_failed_chunk() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header("Content-Length", format!("{}", part_size))
                 .header(
                     "Content-Range",
                     format!("bytes 0-{}/{}", part_size - 1, data.len()),
@@ -241,6 +241,7 @@ async fn test_retry_failed_chunk() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header("Content-Length", format!("{}", data.len() - part_size))
                 .header(
                     "Content-Range",
                     format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
@@ -257,6 +258,7 @@ async fn test_retry_failed_chunk() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header("Content-Length", format!("{}", data.len() - part_size))
                 .header(
                     "Content-Range",
                     format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
@@ -272,8 +274,7 @@ async fn test_retry_failed_chunk() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
-        .await
+        .initiate()
         .unwrap();
 
     let body = drain(&mut handle).await.unwrap();
@@ -304,6 +305,7 @@ async fn test_non_retryable_error() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header("Content-Length", format!("{}", part_size))
                 .header(
                     "Content-Range",
                     format!("bytes 0-{}/{}", part_size - 1, data.len()),
@@ -327,8 +329,7 @@ async fn test_non_retryable_error() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
-        .await
+        .initiate()
         .unwrap();
 
     let _ = drain(&mut handle).await.unwrap_err();
@@ -351,6 +352,7 @@ async fn test_retry_max_attempts() {
             dummy_expected_request(),
             http_02x::Response::builder()
                 .status(200)
+                .header("Content-Length", format!("{}", part_size))
                 .header(
                     "Content-Range",
                     format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
@@ -370,6 +372,7 @@ async fn test_retry_max_attempts() {
         dummy_expected_request(),
         http_02x::Response::builder()
             .status(200)
+            .header("Content-Length", format!("{}", part_size))
             .header(
                 "Content-Range",
                 format!("bytes 0-{}/{}", part_size - 1, data.len()),
@@ -387,8 +390,7 @@ async fn test_retry_max_attempts() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .send()
-        .await
+        .initiate()
         .unwrap();
 
     let _ = drain(&mut handle).await.unwrap_err();

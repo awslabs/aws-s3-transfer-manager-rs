@@ -141,7 +141,8 @@ async fn download_single_obj(
 
     let key_path = local_key_path(root_dir, key.as_str(), prefix, delim)?;
     let mut handle =
-        crate::operation::download::Download::orchestrate(ctx.handle.clone(), input, true).await?;
+        crate::operation::download::Download::orchestrate(ctx.handle.clone(), input, true)?;
+    let _ = handle.object_meta().await?;
     let mut body = mem::replace(&mut handle.body, Body::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
@@ -150,7 +151,7 @@ async fn download_single_obj(
 
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        for segment in chunk.into_segments() {
+        for segment in chunk.data.into_segments() {
             dest.write_all(segment.as_ref()).await?;
         }
     }

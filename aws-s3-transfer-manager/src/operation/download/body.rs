@@ -2,12 +2,15 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::service::ChunkResponse;
-use aws_smithy_types::byte_stream::AggregatedBytes;
+
 use std::cmp;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use tokio::sync::mpsc;
+
+use crate::io::AggregatedBytes;
+
+use super::chunk_meta::ChunkMetadata;
 
 /// Stream of binary data representing an Amazon S3 Object's contents.
 ///
@@ -19,10 +22,28 @@ pub struct Body {
     sequencer: Sequencer,
 }
 
-type BodyChannel = mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>;
+type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
 
+/// Contains body and metadata for each GetObject call made. This will be delivered sequentially
+/// in-order.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ChunkOutput {
+    // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
+    // the seq number
+    pub(crate) seq: u64,
+    /// The content associated with this particular ranged GetObject request.
+    pub data: AggregatedBytes,
+    /// The metadata associated with this particular ranged GetObject request. This contains all the
+    /// metadata returned by the S3 GetObject operation.
+    pub metadata: ChunkMetadata,
+}
+
+// TODO: Do we want to expose something to yield multiple chunks in a single call, like
+// recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
+// we have a better scheduler in place.
 impl Body {
-    /// Create a new empty Body
+    /// Create a new empty body
     pub fn empty() -> Self {
         Self::new_from_channel(None)
     }
@@ -39,7 +60,8 @@ impl Body {
     }
 
     /// Convert this body into an unordered stream of chunks.
-    // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream
+    // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
+    // download_objects should utilize this so that it can write in parallel to files.
     #[allow(dead_code)]
     pub(crate) fn unordered(self) -> UnorderedBody {
         self.inner
@@ -50,9 +72,7 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
-    pub async fn next(&mut self) -> Option<Result<AggregatedBytes, crate::error::Error>> {
-        // TODO(aws-sdk-rust#1159, design) - do we want ChunkResponse (or similar) rather than AggregatedBytes? Would
-        //  make additional retries of an individual chunk/part more feasible (though theoretically already exhausted retries)
+    pub async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         loop {
             if self.sequencer.is_ordered() {
                 break;
@@ -65,17 +85,13 @@ impl Body {
             }
         }
 
-        let chunk = self
-            .sequencer
-            .pop()
-            .map(|r| Ok(r.data.expect("chunk data")));
-
-        if chunk.is_some() {
-            // if we actually pulled data out, advance the next sequence we expect
+        let chunk = self.sequencer.pop();
+        if let Some(chunk) = chunk {
             self.sequencer.advance();
+            Some(Ok(chunk))
+        } else {
+            None
         }
-
-        chunk
     }
 
     /// Close the body, no more data will flow from it and all publishers will be notified.
@@ -99,11 +115,11 @@ impl Sequencer {
         }
     }
 
-    fn push(&mut self, chunk: ChunkResponse) {
+    fn push(&mut self, chunk: ChunkOutput) {
         self.chunks.push(cmp::Reverse(SequencedChunk(chunk)))
     }
 
-    fn pop(&mut self) -> Option<ChunkResponse> {
+    fn pop(&mut self) -> Option<ChunkOutput> {
         self.chunks.pop().map(|c| c.0 .0)
     }
 
@@ -116,7 +132,7 @@ impl Sequencer {
         next.unwrap().seq == self.next_seq
     }
 
-    fn peek(&self) -> Option<&ChunkResponse> {
+    fn peek(&self) -> Option<&ChunkOutput> {
         self.chunks.peek().map(|c| &c.0 .0)
     }
 
@@ -126,7 +142,7 @@ impl Sequencer {
 }
 
 #[derive(Debug)]
-struct SequencedChunk(ChunkResponse);
+struct SequencedChunk(ChunkOutput);
 
 impl Ord for SequencedChunk {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -150,7 +166,7 @@ impl PartialEq for SequencedChunk {
 /// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
 pub(crate) struct UnorderedBody {
-    chunks: Option<mpsc::Receiver<Result<ChunkResponse, crate::error::Error>>>,
+    chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
 }
 
 impl UnorderedBody {
@@ -164,7 +180,7 @@ impl UnorderedBody {
     /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
-    pub(crate) async fn next(&mut self) -> Option<Result<ChunkResponse, crate::error::Error>> {
+    pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         match self.chunks.as_mut() {
             None => None,
             Some(ch) => ch.recv().await,
@@ -181,24 +197,28 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::service::ChunkResponse};
-    use aws_smithy_types::byte_stream::{AggregatedBytes, ByteStream};
+    use crate::{error, operation::download::body::ChunkOutput};
     use bytes::Bytes;
+    use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
 
-    use super::{Body, Sequencer};
+    use super::{AggregatedBytes, Body, Sequencer};
 
-    fn chunk_resp(seq: u64, data: Option<AggregatedBytes>) -> ChunkResponse {
-        ChunkResponse { seq, data }
+    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
+        ChunkOutput {
+            seq,
+            data,
+            metadata: Default::default(),
+        }
     }
 
     #[test]
     fn test_sequencer() {
         let mut sequencer = Sequencer::new();
-        sequencer.push(chunk_resp(1, None));
-        sequencer.push(chunk_resp(2, None));
+        sequencer.push(chunk_resp(1, AggregatedBytes(SegmentedBuf::new())));
+        sequencer.push(chunk_resp(2, AggregatedBytes(SegmentedBuf::new())));
         assert_eq!(sequencer.peek().unwrap().seq, 1);
-        sequencer.push(chunk_resp(0, None));
+        sequencer.push(chunk_resp(0, AggregatedBytes(SegmentedBuf::new())));
         assert_eq!(sequencer.pop().unwrap().seq, 0);
     }
 
@@ -210,8 +230,9 @@ mod tests {
             let seq = vec![2, 0, 1];
             for i in seq {
                 let data = Bytes::from(format!("chunk {i}"));
-                let aggregated = ByteStream::from(data).collect().await.unwrap();
-                let chunk = chunk_resp(i as u64, Some(aggregated));
+                let mut aggregated = SegmentedBuf::new();
+                aggregated.push(data);
+                let chunk = chunk_resp(i as u64, AggregatedBytes(aggregated));
                 tx.send(Ok(chunk)).await.unwrap();
             }
         });
@@ -219,7 +240,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
             received.push(data);
         }
 
@@ -233,8 +254,9 @@ mod tests {
         let mut body = Body::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
-            let aggregated = ByteStream::from(data).collect().await.unwrap();
-            let chunk = chunk_resp(0, Some(aggregated));
+            let mut aggregated = SegmentedBuf::new();
+            aggregated.push(data);
+            let chunk = chunk_resp(0, AggregatedBytes(aggregated));
             tx.send(Ok(chunk)).await.unwrap();
             let err = error::Error::new(error::ErrorKind::InputInvalid, "test errors".to_string());
             tx.send(Err(err)).await.unwrap();

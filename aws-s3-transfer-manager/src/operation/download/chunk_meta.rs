@@ -4,17 +4,13 @@
  */
 
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
 
-/// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
-/// In the case of GetObject, some data will be duplicated as part of the first chunk.
+/// Chunk Metadata, other than the body, that will be set from the `GetObject` request.
 #[derive(Clone, Default)]
 #[non_exhaustive]
-pub struct ObjectMetadata {
-    _request_id: Option<String>,
-    _extended_request_id: Option<String>,
+pub struct ChunkMetadata {
     /// <p>Indicates whether the object retrieved was (true) or was not (false) a Delete Marker. If false, this response header does not appear in the response.</p><note>
     /// <ul>
     /// <li>
@@ -24,6 +20,8 @@ pub struct ObjectMetadata {
     /// </ul>
     /// </note>
     pub delete_marker: Option<bool>,
+    /// <p>Indicates that a range of bytes was specified in the request.</p>
+    pub accept_ranges: Option<String>,
     /// <p>If the object expiration is configured (see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html"> <code>PutBucketLifecycleConfiguration</code> </a>), the response includes this header. It includes the <code>expiry-date</code> and <code>rule-id</code> key-value pairs providing object expiration information. The value of the <code>rule-id</code> is URL-encoded.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -35,9 +33,18 @@ pub struct ObjectMetadata {
     /// <p>Date and time when the object was last modified.</p>
     /// <p><b>General purpose buckets </b> - When you specify a <code>versionId</code> of the object in your request, if the specified version in the request is a delete marker, the response returns a <code>405 Method Not Allowed</code> error and the <code>Last-Modified: timestamp</code> response header.</p>
     pub last_modified: Option<::aws_smithy_types::DateTime>,
-    pub(crate) content_length: Option<i64>,
+    /// <p>Size of the body in bytes.</p>
+    pub content_length: Option<i64>,
     /// <p>An entity tag (ETag) is an opaque identifier assigned by a web server to a specific version of a resource found at a URL.</p>
     pub e_tag: Option<String>,
+    /// <p>The base64-encoded, 32-bit CRC-32 checksum of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub checksum_crc32: Option<String>,
+    /// <p>The base64-encoded, 32-bit CRC-32C checksum of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub checksum_crc32_c: Option<String>,
+    /// <p>The base64-encoded, 160-bit SHA-1 digest of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub checksum_sha1: Option<String>,
+    /// <p>The base64-encoded, 256-bit SHA-256 digest of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub checksum_sha256: Option<String>,
     /// <p>This is set to the number of metadata entries not returned in the headers that are prefixed with <code>x-amz-meta-</code>. This can happen if you create metadata using an API like SOAP that supports more flexible metadata than the REST API. For example, using SOAP, you can create metadata whose values are not legal HTTP headers.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -54,7 +61,8 @@ pub struct ObjectMetadata {
     pub content_encoding: Option<String>,
     /// <p>The language the content is in.</p>
     pub content_language: Option<String>,
-    pub(crate) content_range: Option<String>,
+    /// <p>The portion of the object returned in the response.</p>
+    pub content_range: Option<String>,
     /// <p>A standard MIME type describing the format of the object data.</p>
     pub content_type: Option<String>,
     /// <p>If the bucket is configured as a website, redirects requests for this object to another object in the same bucket or to an external URL. Amazon S3 stores the value of this header in the object metadata.</p><note>
@@ -91,6 +99,11 @@ pub struct ObjectMetadata {
     pub replication_status: Option<aws_sdk_s3::types::ReplicationStatus>,
     /// <p>The count of parts this object has. This value is only returned if you specify <code>partNumber</code> in your request and the object was uploaded as a multipart upload.</p>
     pub parts_count: Option<i32>,
+    /// <p>The number of tags, if any, on the object, when you have the relevant permission to read object tags.</p>
+    /// <p>You can use <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectTagging.html">GetObjectTagging</a> to retrieve the tag set associated with an object.</p><note>
+    /// <p>This functionality is not supported for directory buckets.</p>
+    /// </note>
+    pub tag_count: Option<i32>,
     /// <p>The Object Lock mode that's currently in place for this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -105,86 +118,34 @@ pub struct ObjectMetadata {
     pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
     /// <p>The date and time at which the object is no longer cacheable.</p>
     pub expires_string: Option<String>,
+    _request_id: Option<String>,
+    _extended_request_id: Option<String>,
 }
 
-impl ObjectMetadata {
-    /// <p>Size of the object in bytes.</p>
-    pub fn content_length(&self) -> u64 {
-        match (self.content_length, self.content_range.as_ref()) {
-            (_, Some(range)) => {
-                let total = range.split_once('/').map(|x| x.1).expect("content range total");
-                total.parse().expect("valid range total")
-            }
-            (Some(length), None) => {
-                debug_assert!(length > 0, "content length invalid");
-                length as u64
-            },
-            (None, None) => panic!("total object size cannot be calculated without either content length or content range headers")
-        }
-    }
-}
-
-// The `GetObjectOutput` is used to create both `object_meta` and `chunk_meta`.
-// We take a reference here instead of ownership because `GetObjectOutput` is not cloneable
-// due to containing the body.
-impl From<&GetObjectOutput> for ObjectMetadata {
-    fn from(value: &GetObjectOutput) -> Self {
+impl From<GetObjectOutput> for ChunkMetadata {
+    fn from(value: GetObjectOutput) -> Self {
         Self {
             _request_id: value.request_id().map(|s| s.to_string()),
             _extended_request_id: value.extended_request_id().map(|s| s.to_string()),
             delete_marker: value.delete_marker,
-            expiration: value.expiration.clone(),
-            restore: value.restore.clone(),
-            last_modified: value.last_modified,
-            content_length: value.content_length,
-            e_tag: value.e_tag.clone(),
-            missing_meta: value.missing_meta,
-            version_id: value.version_id.clone(),
-            cache_control: value.cache_control.clone(),
-            content_disposition: value.content_disposition.clone(),
-            content_encoding: value.content_encoding.clone(),
-            content_language: value.content_language.clone(),
-            content_range: value.content_range.clone(),
-            content_type: value.content_type.clone(),
-            expires_string: value.expires_string.clone(),
-            website_redirect_location: value.website_redirect_location.clone(),
-            server_side_encryption: value.server_side_encryption.clone(),
-            metadata: value.metadata.clone(),
-            sse_customer_algorithm: value.sse_customer_algorithm.clone(),
-            sse_customer_key_md5: value.sse_customer_key_md5.clone(),
-            ssekms_key_id: value.ssekms_key_id.clone(),
-            bucket_key_enabled: value.bucket_key_enabled,
-            storage_class: value.storage_class.clone(),
-            replication_status: value.replication_status.clone(),
-            parts_count: value.parts_count,
-            object_lock_mode: value.object_lock_mode.clone(),
-            object_lock_retain_until_date: value.object_lock_retain_until_date,
-            object_lock_legal_hold_status: value.object_lock_legal_hold_status.clone(),
-            request_charged: value.request_charged.clone(),
-        }
-    }
-}
-
-impl From<HeadObjectOutput> for ObjectMetadata {
-    fn from(value: HeadObjectOutput) -> Self {
-        Self {
-            _request_id: value.request_id().map(|s| s.to_string()),
-            _extended_request_id: value.extended_request_id().map(|s| s.to_string()),
-            delete_marker: value.delete_marker,
+            accept_ranges: value.accept_ranges,
             expiration: value.expiration,
             restore: value.restore,
             last_modified: value.last_modified,
             content_length: value.content_length,
             e_tag: value.e_tag,
+            checksum_crc32: value.checksum_crc32,
+            checksum_crc32_c: value.checksum_crc32_c,
+            checksum_sha1: value.checksum_sha1,
+            checksum_sha256: value.checksum_sha256,
             missing_meta: value.missing_meta,
             version_id: value.version_id,
             cache_control: value.cache_control,
             content_disposition: value.content_disposition,
             content_encoding: value.content_encoding,
             content_language: value.content_language,
-            content_range: None,
+            content_range: value.content_range,
             content_type: value.content_type,
-            expires_string: value.expires_string,
             website_redirect_location: value.website_redirect_location,
             server_side_encryption: value.server_side_encryption,
             metadata: value.metadata,
@@ -193,36 +154,43 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             ssekms_key_id: value.ssekms_key_id,
             bucket_key_enabled: value.bucket_key_enabled,
             storage_class: value.storage_class,
+            request_charged: value.request_charged,
             replication_status: value.replication_status,
             parts_count: value.parts_count,
+            tag_count: value.tag_count,
             object_lock_mode: value.object_lock_mode,
             object_lock_retain_until_date: value.object_lock_retain_until_date,
             object_lock_legal_hold_status: value.object_lock_legal_hold_status,
-            request_charged: value.request_charged,
+            expires_string: value.expires_string,
         }
     }
 }
 
-impl RequestIdExt for ObjectMetadata {
+impl RequestIdExt for ChunkMetadata {
     fn extended_request_id(&self) -> Option<&str> {
         self._extended_request_id.as_deref()
     }
 }
-impl RequestId for ObjectMetadata {
+impl RequestId for ChunkMetadata {
     fn request_id(&self) -> Option<&str> {
         self._request_id.as_deref()
     }
 }
 
-impl ::std::fmt::Debug for ObjectMetadata {
+impl ::std::fmt::Debug for ChunkMetadata {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        let mut formatter = f.debug_struct("ObjectMetadata");
+        let mut formatter = f.debug_struct("ChunkMetadata");
         formatter.field("delete_marker", &self.delete_marker);
+        formatter.field("accept_ranges", &self.accept_ranges);
         formatter.field("expiration", &self.expiration);
         formatter.field("restore", &self.restore);
         formatter.field("last_modified", &self.last_modified);
         formatter.field("content_length", &self.content_length);
         formatter.field("e_tag", &self.e_tag);
+        formatter.field("checksum_crc32", &self.checksum_crc32);
+        formatter.field("checksum_crc32_c", &self.checksum_crc32_c);
+        formatter.field("checksum_sha1", &self.checksum_sha1);
+        formatter.field("checksum_sha256", &self.checksum_sha256);
         formatter.field("missing_meta", &self.missing_meta);
         formatter.field("version_id", &self.version_id);
         formatter.field("cache_control", &self.cache_control);
@@ -242,6 +210,7 @@ impl ::std::fmt::Debug for ObjectMetadata {
         formatter.field("request_charged", &self.request_charged);
         formatter.field("replication_status", &self.replication_status);
         formatter.field("parts_count", &self.parts_count);
+        formatter.field("tag_count", &self.tag_count);
         formatter.field("object_lock_mode", &self.object_lock_mode);
         formatter.field(
             "object_lock_retain_until_date",
@@ -255,27 +224,5 @@ impl ::std::fmt::Debug for ObjectMetadata {
         formatter.field("_extended_request_id", &self._extended_request_id);
         formatter.field("_request_id", &self._request_id);
         formatter.finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ObjectMetadata;
-
-    #[test]
-    fn test_inferred_total_size() {
-        let meta = ObjectMetadata {
-            content_length: Some(15),
-            ..Default::default()
-        };
-
-        assert_eq!(15, meta.content_length());
-
-        let meta = ObjectMetadata {
-            content_range: Some("bytes 0-499/900".to_owned()),
-            content_length: Some(500),
-            ..Default::default()
-        };
-        assert_eq!(900, meta.content_length());
     }
 }

@@ -12,6 +12,7 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use tracing::Instrument;
 
+use super::chunk_meta::ChunkMetadata;
 use super::object_meta::ObjectMetadata;
 use super::DownloadContext;
 use super::DownloadInput;
@@ -35,7 +36,8 @@ pub(super) struct ObjectDiscovery {
     pub(super) remaining: RangeInclusive<u64>,
 
     /// the discovered metadata
-    pub(super) meta: ObjectMetadata,
+    pub(super) chunk_meta: Option<ChunkMetadata>,
+    pub(super) object_meta: ObjectMetadata,
 
     /// the first chunk of data if fetched during discovery
     pub(super) initial_chunk: Option<ByteStream>,
@@ -111,28 +113,31 @@ async fn discover_obj_with_head(
     input: &DownloadInput,
     byte_range: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let meta: ObjectMetadata = ctx
+    let resp = ctx
         .client()
         .head_object()
         .set_bucket(input.bucket().map(str::to_string))
         .set_key(input.key().map(str::to_string))
         .send()
         .await
-        .map_err(error::discovery_failed)?
-        .into();
+        .map_err(error::discovery_failed)?;
+    let object_meta: ObjectMetadata = resp.into();
 
     let remaining = match byte_range {
         Some(range) => match range {
             ByteRange::Inclusive(start, end) => start..=end,
-            ByteRange::AllFrom(start) => start..=meta.total_size(),
-            ByteRange::Last(n) => (meta.total_size() - n + 1)..=meta.total_size(),
+            ByteRange::AllFrom(start) => start..=object_meta.content_length(),
+            ByteRange::Last(n) => {
+                (object_meta.content_length() - n + 1)..=object_meta.content_length()
+            }
         },
-        None => 0..=meta.total_size(),
+        None => 0..=object_meta.content_length(),
     };
 
     Ok(ObjectDiscovery {
         remaining,
-        meta,
+        chunk_meta: None,
+        object_meta,
         initial_chunk: None,
     })
 }
@@ -154,12 +159,13 @@ async fn discover_obj_with_get(
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
 
-    let meta: ObjectMetadata = resp.into();
-    let content_len = meta.content_length();
+    let object_meta: ObjectMetadata = (&resp).into();
+    let chunk_meta: ChunkMetadata = resp.into();
+    let content_len = chunk_meta.content_length.expect("expected content_length") as u64;
 
     let remaining = match range {
         Some(range) => (*range.start() + content_len)..=*range.end(),
-        None => content_len..=meta.total_size() - 1,
+        None => content_len..=object_meta.content_length() - 1,
     };
 
     let initial_chunk = match content_len == 0 {
@@ -169,7 +175,8 @@ async fn discover_obj_with_get(
 
     Ok(ObjectDiscovery {
         remaining,
-        meta,
+        chunk_meta: Some(chunk_meta),
+        object_meta,
         initial_chunk,
     })
 }
