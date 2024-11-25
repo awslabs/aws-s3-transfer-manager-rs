@@ -124,8 +124,8 @@ impl ObjectMetadata {
     }
 }
 
-// The `GetObjectOutput` is used to create both `object_meta` and `chunk_meta`. 
-// We take a reference here instead of ownership because `GetObjectOutput` is not cloneable 
+// The `GetObjectOutput` is used to create both `object_meta` and `chunk_meta`.
+// We take a reference here instead of ownership because `GetObjectOutput` is not cloneable
 // due to containing the body.
 impl From<&GetObjectOutput> for ObjectMetadata {
     fn from(value: &GetObjectOutput) -> Self {

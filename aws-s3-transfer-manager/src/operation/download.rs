@@ -119,7 +119,7 @@ async fn send_discovery(
 
     // make initial discovery about the object size, metadata, possibly first chunk
     let mut discovery = discover_obj(&ctx, &input).await?;
-    // This will only fail if the handle has already been dropped. 
+    // This will only fail if the handle has already been dropped.
     let _ = object_meta_tx.send(discovery.object_meta);
 
     let initial_chunk = discovery.initial_chunk.take();
