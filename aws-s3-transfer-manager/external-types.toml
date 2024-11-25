@@ -7,4 +7,6 @@ allowed_external_types = [
     "tokio::io::async_read::AsyncRead",
     "bytes::bytes::Bytes",
     "bytes::buf::buf_impl::Buf",
+    "aws_types::request_id::RequestId",
+    "aws_types::request_id::RequestIdExt"
 ]
