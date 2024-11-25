@@ -4,7 +4,10 @@
  */
 
 use std::default::Default;
+use std::fmt;
+use std::future::poll_fn;
 use std::path::Path;
+use std::pin::Pin;
 
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
@@ -13,10 +16,23 @@ use crate::error;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
+use crate::io::Buffer;
 
 /// Source of binary data.
 ///
 /// `InputStream` wraps a stream of data for ease of use.
+///
+/// To create an `InputStream`:
+///
+/// * From an in-memory source: use [`from_static`] or one of the provided `From` implementations.
+/// * From a file path: use [`from_path`] or [`read_from`]
+/// * From a custom implementation: use [`from_part_stream`]
+///
+/// [`from_static`]: InputStream::from_static
+/// [`from_path`]: InputStream::from_path
+/// [`read_from`]: InputStream::read_from
+/// [`from_part_stream`]: InputStream::from_part_stream
+///
 #[derive(Debug)]
 pub struct InputStream {
     pub(super) inner: RawInputStream,
@@ -84,7 +100,30 @@ impl InputStream {
                 .await
                 .map_err(error::from_kind(error::ErrorKind::IOError)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
+            RawInputStream::Dyn(_) => {
+                unreachable!("dyn InputStream should not have into_byte_stream called on it!")
+            }
         }
+    }
+
+    /// Test if this InputStream can only be uploaded via MPU (e.g. a custom `PartStream`
+    /// implementation from a user can only be a MPU due to the ability to provide custom
+    /// metadata like checksums).
+    pub(crate) fn is_mpu_only(&self) -> bool {
+        // TODO - for our own wrappers we can probably be smarter
+        matches!(self.inner, RawInputStream::Dyn(_))
+    }
+
+    /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation
+    /// for a [multipart upload].
+    ///
+    /// NOTE: Implementing `PartStream` directly is a more advanced use case. You should reach for
+    /// one of the provided implementations or adapters first if possible.
+    ///
+    /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
+    pub fn from_part_stream<T: PartStream + Send + Sync + 'static>(stream: T) -> Self {
+        let inner = RawInputStream::Dyn(BoxStream::new(stream));
+        Self { inner }
     }
 }
 
@@ -94,6 +133,106 @@ pub(super) enum RawInputStream {
     Buf(Bytes),
     /// File based input
     Fs(PathBody),
+    /// User provided custom stream
+    Dyn(BoxStream),
+}
+
+/// The context of an input stream.
+#[derive(Debug)]
+pub struct StreamContext {
+    part_size: usize,
+}
+
+impl StreamContext {
+    pub(super) fn new(part_size: usize) -> Self {
+        Self { part_size }
+    }
+
+    /// The part size to use when yielding parts.
+    /// NOTE: this _may_ differ from the configured part size (e.g. if the target part size would
+    /// result in exceeding the maximum number of parts allowed).
+    pub fn part_size(&self) -> usize {
+        self.part_size
+    }
+
+    // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.
+    /// Request a new buffer to fill
+    pub(crate) fn new_buffer(&self, capacity: usize) -> Buffer {
+        // TODO - replace allocation with memory pool
+        Buffer::new(capacity)
+    }
+}
+
+/// Contents and (optional) metadata for a single part of a [multipart upload].
+///
+/// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartData {
+    // 1-indexed
+    pub(crate) part_number: u64,
+    pub(crate) data: Bytes,
+}
+
+impl PartData {
+    /// Create a new part
+    pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+        debug_assert!(
+            part_number > 0,
+            "part numbers are 1-indexed and must be greater than zero"
+        );
+        Self {
+            part_number,
+            data: data.into(),
+        }
+    }
+}
+
+/// Trait representing a stream of object parts (streaming body).
+///
+/// Individual parts are streamed via the `poll_part` function, which asynchronously yields
+/// instances of `PartData`. When `Poll::Ready(None)` is returned the stream is assumed to have
+/// reached EOF and is finished.
+///
+/// The `size_hint` function provides insight into the total number of bytes that will be streamed.
+pub trait PartStream {
+    /// Attempt to pull the next part from the stream.
+    ///
+    /// The `stream_cx` will have the part size that should be utilized. Implementations should be
+    /// careful to only yield full parts for every part except the last one, which _may_ be less
+    /// than the full part size.
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> std::task::Poll<Option<std::io::Result<PartData>>>;
+
+    /// Returns the bounds on the total size of the stream
+    fn size_hint(&self) -> crate::io::SizeHint;
+}
+
+pub(crate) struct BoxStream {
+    inner: Pin<Box<dyn PartStream + Send + Sync + 'static>>,
+}
+
+impl BoxStream {
+    fn new<T: PartStream + Send + Sync + 'static>(inner: T) -> Self {
+        BoxStream {
+            inner: Box::pin(inner),
+        }
+    }
+
+    pub(crate) async fn next(
+        &mut self,
+        stream_cx: &StreamContext,
+    ) -> Option<std::io::Result<PartData>> {
+        poll_fn(|cx| self.inner.as_mut().poll_part(cx, stream_cx)).await
+    }
+}
+
+impl fmt::Debug for BoxStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoxStream(dyn PartStream)").finish()
+    }
 }
 
 impl RawInputStream {
@@ -101,6 +240,7 @@ impl RawInputStream {
         match self {
             RawInputStream::Buf(bytes) => SizeHint::exact(bytes.remaining() as u64),
             RawInputStream::Fs(path_body) => SizeHint::exact(path_body.length),
+            RawInputStream::Dyn(box_body) => box_body.inner.size_hint(),
         }
     }
 }

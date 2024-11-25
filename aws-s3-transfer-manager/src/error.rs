@@ -21,7 +21,7 @@ pub struct Error {
 }
 
 /// General categories of transfer errors.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
     /// Operation input validation issues
@@ -44,6 +44,10 @@ pub enum ErrorKind {
 
     /// child operation failed (e.g. download of a single object as part of downloading all objects from a bucket)
     ChildOperationFailed,
+
+    /// The operation is being canceled because the user explicitly called `.abort` on the handle,
+    /// or a child operation failed with the abort policy.
+    OperationCancelled,
 }
 
 impl Error {
@@ -75,6 +79,7 @@ impl fmt::Display for Error {
             ErrorKind::ChunkFailed => write!(f, "failed to process chunk"),
             ErrorKind::NotFound => write!(f, "resource not found"),
             ErrorKind::ChildOperationFailed => write!(f, "child operation failed"),
+            ErrorKind::OperationCancelled => write!(f, "operation cancelled"),
         }
     }
 }

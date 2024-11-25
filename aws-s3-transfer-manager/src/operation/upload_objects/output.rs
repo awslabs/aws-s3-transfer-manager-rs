@@ -3,18 +3,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::types::FailedUploadTransfer;
+use super::UploadObjectsState;
+use crate::types::FailedUpload;
+use std::sync::atomic::Ordering;
 
 /// Output type for uploading multiple objects
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct UploadObjectsOutput {
     /// The number of objects successfully uploaded
-    pub objects_uploaded: u64,
+    objects_uploaded: u64,
 
     /// The list of failed uploads
-    pub failed_transfers: Vec<FailedUploadTransfer>,
-    // TODO - DownloadObjectsOutput did Option<Vec<>> instead of just Vec<>. Be consistent
+    failed_transfers: Vec<FailedUpload>,
+
+    // FIXME - likely remove when progress is implemented (let's be consistent with downloads for now)?
+    /// Total number of bytes transferred
+    total_bytes_transferred: u64,
 }
 
 impl UploadObjectsOutput {
@@ -29,8 +34,27 @@ impl UploadObjectsOutput {
     }
 
     /// The list of failed uploads
-    pub fn failed_transfers(&self) -> &[FailedUploadTransfer] {
-        &self.failed_transfers
+    pub fn failed_transfers(&self) -> &[FailedUpload] {
+        self.failed_transfers.as_slice()
+    }
+
+    /// The number of bytes successfully transferred (uploaded)
+    pub fn total_bytes_transferred(&self) -> u64 {
+        self.total_bytes_transferred
+    }
+}
+
+impl From<&UploadObjectsState> for UploadObjectsOutput {
+    fn from(state: &UploadObjectsState) -> Self {
+        let failed_uploads = std::mem::take(&mut *state.failed_uploads.lock().unwrap());
+        let successful_uploads = state.successful_uploads.load(Ordering::SeqCst);
+        let total_bytes_transferred = state.total_bytes_transferred.load(Ordering::SeqCst);
+
+        UploadObjectsOutput::builder()
+            .objects_uploaded(successful_uploads)
+            .set_failed_transfers(failed_uploads)
+            .total_bytes_transferred(total_bytes_transferred)
+            .build()
     }
 }
 
@@ -39,7 +63,8 @@ impl UploadObjectsOutput {
 #[derive(Debug, Default)]
 pub struct UploadObjectsOutputBuilder {
     pub(crate) objects_uploaded: u64,
-    pub(crate) failed_transfers: Vec<FailedUploadTransfer>,
+    pub(crate) failed_transfers: Vec<FailedUpload>,
+    pub(crate) total_bytes_transferred: u64,
 }
 
 impl UploadObjectsOutputBuilder {
@@ -57,14 +82,34 @@ impl UploadObjectsOutputBuilder {
     /// Append a failed transfer.
     ///
     /// To override the contents of this collection use [`set_failed_transfers`](Self::set_failed_transfers)
-    pub fn failed_transfers(mut self, input: FailedUploadTransfer) -> Self {
+    pub fn failed_transfers(mut self, input: FailedUpload) -> Self {
         self.failed_transfers.push(input);
         self
     }
 
-    /// The list of any failed uploads
-    pub fn set_failed_transfers(mut self, input: Vec<FailedUploadTransfer>) -> Self {
+    /// Set a list of failed uploads
+    pub fn set_failed_transfers(mut self, input: Vec<FailedUpload>) -> Self {
         self.failed_transfers = input;
         self
+    }
+
+    /// The number of bytes successfully transferred (uploaded)
+    pub fn total_bytes_transferred(mut self, input: u64) -> Self {
+        self.total_bytes_transferred = input;
+        self
+    }
+
+    /// The number of bytes successfully transferred (uploaded)
+    pub fn get_total_bytes_transferred(&self) -> u64 {
+        self.total_bytes_transferred
+    }
+
+    /// Consume the builder and return the output
+    pub fn build(self) -> UploadObjectsOutput {
+        UploadObjectsOutput {
+            objects_uploaded: self.objects_uploaded,
+            failed_transfers: self.failed_transfers,
+            total_bytes_transferred: self.total_bytes_transferred,
+        }
     }
 }

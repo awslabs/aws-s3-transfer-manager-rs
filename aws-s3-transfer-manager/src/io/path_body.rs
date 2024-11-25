@@ -41,6 +41,7 @@ pub struct PathBodyBuilder {
     path: Option<PathBuf>,
     length: Option<u64>,
     offset: Option<u64>,
+    metadata: Option<fs::Metadata>,
 }
 
 impl PathBodyBuilder {
@@ -81,6 +82,12 @@ impl PathBodyBuilder {
         self
     }
 
+    /// Provide `metadata` for `self.path`, potentially reducing system calls during `build` if pre-set.
+    pub(crate) fn metadata(mut self, metadata: fs::Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
     /// Returns a [`InputStream`] from this builder.
     pub fn build(self) -> Result<InputStream, Error> {
         let path = self.path.expect("path set");
@@ -89,7 +96,7 @@ impl PathBodyBuilder {
         let length = match self.length {
             None => {
                 // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
-                let metadata = fs::metadata(path.clone())?;
+                let metadata = self.metadata.unwrap_or(fs::metadata(path.clone())?);
                 let file_size = metadata.len();
 
                 if offset >= file_size {
@@ -127,6 +134,7 @@ mod test {
     fn path_body(stream: &InputStream) -> &PathBody {
         match &stream.inner {
             crate::io::stream::RawInputStream::Buf(_) => panic!("unexpected inner body"),
+            crate::io::stream::RawInputStream::Dyn(_) => panic!("unexpected inner body"),
             crate::io::stream::RawInputStream::Fs(path_body) => path_body,
         }
     }

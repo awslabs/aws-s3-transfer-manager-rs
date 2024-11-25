@@ -189,11 +189,40 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn do_upload(args: Args) -> Result<(), BoxError> {
-    if args.recursive {
-        unimplemented!("recursive upload not supported yet")
-    }
+async fn do_recursive_upload(
+    args: Args,
+    tm: aws_s3_transfer_manager::Client,
+) -> Result<(), BoxError> {
+    let Args { source, dest, .. } = args;
+    let source_dir = source.expect_local();
+    let (bucket, key_prefix) = dest.expect_s3().parts();
 
+    let start = time::Instant::now();
+    let handle = tm
+        .upload_objects()
+        .source(source_dir)
+        .bucket(bucket)
+        .key_prefix(key_prefix)
+        .recursive(true)
+        .send()
+        .await?;
+
+    let output = handle.join().await?;
+    tracing::info!("recursive upload output: {output:?}");
+
+    let elapsed = start.elapsed();
+    let transfer_size_bytes = output.total_bytes_transferred();
+    let throughput = Throughput::new(transfer_size_bytes, elapsed);
+
+    println!(
+        "uploaded {} objects totalling {transfer_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
+        output.objects_uploaded(),
+        ByteUnit::display(transfer_size_bytes)
+    );
+    Ok(())
+}
+
+async fn do_upload(args: Args) -> Result<(), BoxError> {
     let (bucket, key) = args.dest.expect_s3().parts();
 
     let tm_config = aws_s3_transfer_manager::from_env()
@@ -205,6 +234,10 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     warmup(&tm_config, bucket).await?;
 
     let tm = aws_s3_transfer_manager::Client::new(tm_config);
+
+    if args.recursive {
+        return do_recursive_upload(args, tm).await;
+    }
 
     let path = args.source.expect_local();
     let file_meta = fs::metadata(path).await.expect("file metadata");

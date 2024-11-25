@@ -3,14 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::path::{Path, PathBuf};
-
 use crate::types::{FailedTransferPolicy, UploadFilter};
+use aws_smithy_types::error::operation::BuildError;
 
-// TODO - docs and examples on the interaction of key_prefix & delimiter
-
-// TODO - upload_objects has recursive option (defaulting to false, per SEP)
-// but download_objects currently has no such option. Be consistent.
+use std::path::{Path, PathBuf};
 
 /// Input type for uploading multiple objects
 #[non_exhaustive]
@@ -83,7 +79,7 @@ impl UploadObjectsInput {
     }
 }
 
-/// A builder for [UploadObjectsInput]
+/// A builder for [`UploadObjectsInput`]
 #[non_exhaustive]
 #[derive(Clone, Default, Debug)]
 pub struct UploadObjectsInputBuilder {
@@ -102,7 +98,16 @@ impl UploadObjectsInputBuilder {
     pub fn build(
         self,
     ) -> Result<UploadObjectsInput, ::aws_smithy_types::error::operation::BuildError> {
-        // TODO - validate required stuff (i.e. bucket)
+        if self.bucket.is_none() {
+            return Err(BuildError::missing_field("bucket", "A bucket is required"));
+        }
+
+        if self.source.is_none() {
+            return Err(BuildError::missing_field(
+                "source",
+                "Source directory to upload is required",
+            ));
+        }
 
         Ok(UploadObjectsInput {
             bucket: self.bucket,
@@ -111,7 +116,7 @@ impl UploadObjectsInputBuilder {
             follow_symlinks: self.follow_symlinks,
             filter: self.filter,
             key_prefix: self.key_prefix,
-            delimiter: self.delimiter.or(Some("/".into())),
+            delimiter: self.delimiter,
             failure_policy: self.failure_policy,
         })
     }
@@ -129,8 +134,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The S3 bucket name that objects will upload to.
-    pub fn get_bucket(&self) -> &Option<String> {
-        &self.bucket
+    pub fn get_bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
     }
 
     /// The local directory to upload from.
@@ -146,8 +151,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The local directory to upload from.
-    pub fn get_source(&self) -> &Option<PathBuf> {
-        &self.source
+    pub fn get_source(&self) -> Option<&Path> {
+        self.source.as_deref()
     }
 
     /// Whether to recurse into subdirectories when traversing local file tree.
@@ -202,8 +207,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// The S3 key prefix to use for each object.
-    pub fn get_key_prefix(&self) -> &Option<String> {
-        &self.key_prefix
+    pub fn get_key_prefix(&self) -> Option<&str> {
+        self.key_prefix.as_deref()
     }
 
     /// Character used to group keys.
@@ -219,8 +224,8 @@ impl UploadObjectsInputBuilder {
     }
 
     /// Character used to group keys.
-    pub fn get_delimiter(&self) -> &Option<String> {
-        &self.delimiter
+    pub fn get_delimiter(&self) -> Option<&str> {
+        self.delimiter.as_deref()
     }
 
     /// The failure policy to use when any individual object upload fails.
