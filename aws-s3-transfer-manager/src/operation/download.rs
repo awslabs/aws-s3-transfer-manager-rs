@@ -21,9 +21,12 @@ pub use handle::DownloadHandle;
 use tracing::Instrument;
 
 /// Provides metadata for each chunk during an object download.
-pub mod chunk_meta;
+mod chunk_meta;
+pub use chunk_meta::ChunkMetadata;
 /// Provides metadata for a single S3 object during download.
-pub mod object_meta;
+mod object_meta;
+pub use object_meta::ObjectMetadata;
+
 mod service;
 
 use crate::error;
@@ -31,9 +34,7 @@ use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
 use body::{Body, ChunkOutput};
-use chunk_meta::ChunkMetadata;
 use discovery::discover_obj;
-use object_meta::ObjectMetadata;
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
