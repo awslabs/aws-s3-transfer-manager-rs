@@ -27,7 +27,7 @@ pub mod object_meta;
 mod service;
 
 use crate::error;
-use crate::io::aggregated_bytes::AggregatedBytes;
+use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
 use body::{Body, ChunkOutput};

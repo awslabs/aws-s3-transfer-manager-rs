@@ -4,7 +4,7 @@
  */
 use crate::error;
 use crate::http::header;
-use crate::io::aggregated_bytes::AggregatedBytes;
+use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
 use crate::middleware::retry;
 use crate::operation::download::DownloadContext;

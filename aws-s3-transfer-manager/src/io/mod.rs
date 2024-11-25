@@ -4,7 +4,7 @@
  */
 
 /// Download Body Type
-pub mod aggregated_bytes;
+mod aggregated_bytes;
 pub(crate) mod part_reader;
 mod path_body;
 mod stream;
@@ -17,3 +17,4 @@ mod size_hint;
 pub use self::path_body::PathBodyBuilder;
 pub use self::size_hint::SizeHint;
 pub use self::stream::InputStream;
+pub use self::aggregated_bytes::AggregatedBytes;
