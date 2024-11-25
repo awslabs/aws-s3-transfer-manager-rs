@@ -56,8 +56,8 @@ impl Download {
     ///
     /// If `use_current_span_as_parent_for_tasks` is false, spawned tasks will
     /// "follow from" the current span, but be under their own root of the trace tree.
-    /// Use this for `TransferManager.download().send()`, where the spawned tasks
-    /// should NOT extend the life of the current `send()` span.
+    /// Use this for `TransferManager.download().initiate()`, where the spawned tasks
+    /// should NOT extend the life of the current `initiate()` span.
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::download::DownloadInput,
@@ -118,6 +118,7 @@ async fn send_discovery(
 
     // make initial discovery about the object size, metadata, possibly first chunk
     let mut discovery = discover_obj(&ctx, &input).await?;
+    // This will only fail if the handle has already been dropped. 
     let _ = object_meta_tx.send(discovery.object_meta);
 
     let initial_chunk = discovery.initial_chunk.take();
