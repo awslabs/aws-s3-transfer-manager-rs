@@ -119,9 +119,9 @@ async fn send_discovery(
 
     // make initial discovery about the object size, metadata, possibly first chunk
     let mut discovery = discover_obj(&ctx, &input).await?;
-    // This will only fail if the handle has already been dropped.
+    // FIXME - This will fail if the handle is dropped at this point. We should handle 
+    // the cancellation gracefully here.
     let _ = object_meta_tx.send(discovery.object_meta);
-
     let initial_chunk = discovery.initial_chunk.take();
 
     let mut tasks = tasks.lock().await;
