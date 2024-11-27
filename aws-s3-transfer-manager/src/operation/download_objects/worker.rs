@@ -156,8 +156,6 @@ async fn download_single_obj(
         }
     }
 
-    handle.join().await?;
-
     Ok(())
 }
 

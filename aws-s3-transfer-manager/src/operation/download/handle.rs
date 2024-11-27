@@ -63,20 +63,16 @@ impl DownloadHandle {
         &mut self.body
     }
 
-    /// Consume the handle and wait for download transfer to complete
-    #[tracing::instrument(skip_all, level = "debug", name = "join-download")]
-    pub async fn join(mut self) -> Result<(), crate::error::Error> {
+    /// Abort the download and cancel any in-progress work.
+    pub async fn abort(mut self) {
         self.body.close();
-
-        self.discovery.await??;
-        // It's safe to grab the lock here because discovery is already complete, and we will never
-        // lock tasks again after discovery to spawn more tasks.
+        self.discovery.abort();
+        let _ = self.discovery.await;
         let mut tasks = self.tasks.lock().await;
-        while let Some(join_result) = tasks.join_next().await {
-            join_result?;
-        }
-        Ok(())
+        tasks.abort_all();
+        while (tasks.join_next().await).is_some() {}
     }
+
 }
 
 #[cfg(test)]
