@@ -19,13 +19,8 @@ use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::body::ChunkOutput;
+use super::output::ChunkOutput;
 use super::{DownloadInput, DownloadInputBuilder};
-
-
-// TODO: Move to some common place
-const CANCELLATION_ERROR: &str =
-    "at least one operation has been aborted, cancelling all ongoing requests";
 
 /// Request/input type for our "chunk" service.
 #[derive(Debug, Clone)]
@@ -80,7 +75,7 @@ async fn download_specific_chunk(
         // TODO: Error message
         _ = cancel_rx.changed() => {
             tracing::error!("Received cancellating signal, exiting and not download more chunks");
-            Err(error::Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR.to_owned()))
+            Err(error::operation_cancelled())
         },
         resp = op.send() => {
             match resp {

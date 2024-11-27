@@ -12,17 +12,17 @@ use crate::io::AggregatedBytes;
 
 use super::chunk_meta::ChunkMetadata;
 
-/// Stream of binary data representing an Amazon S3 Object's contents.
+/// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
 ///
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
 /// The data on this stream is sequenced into the correct order.
 #[derive(Debug)]
-pub struct Body {
-    inner: UnorderedBody,
+pub struct Output {
+    inner: UnorderedOutput,
     sequencer: Sequencer,
 }
 
-type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
+type OutputChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
 
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
@@ -42,19 +42,19 @@ pub struct ChunkOutput {
 // TODO: Do we want to expose something to yield multiple chunks in a single call, like
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
-impl Body {
+impl Output {
     /// Create a new empty body
     pub fn empty() -> Self {
         Self::new_from_channel(None)
     }
 
-    pub(crate) fn new(chunks: BodyChannel) -> Self {
+    pub(crate) fn new(chunks: OutputChannel) -> Self {
         Self::new_from_channel(Some(chunks))
     }
 
-    fn new_from_channel(chunks: Option<BodyChannel>) -> Self {
+    fn new_from_channel(chunks: Option<OutputChannel>) -> Self {
         Self {
-            inner: UnorderedBody::new(chunks),
+            inner: UnorderedOutput::new(chunks),
             sequencer: Sequencer::new(),
         }
     }
@@ -63,14 +63,14 @@ impl Body {
     // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
     // download_objects should utilize this so that it can write in parallel to files.
     #[allow(dead_code)]
-    pub(crate) fn unordered(self) -> UnorderedBody {
+    pub(crate) fn unordered(self) -> UnorderedOutput {
         self.inner
     }
 
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
-    /// Chunks returned from a [Body] are guaranteed to be sequenced
+    /// Chunks returned from a [Output] are guaranteed to be sequenced
     /// in the right order.
     pub async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         loop {
@@ -166,21 +166,21 @@ impl PartialEq for SequencedChunk {
     }
 }
 
-/// A body that returns chunks in whatever order they are received.
+/// Returns chunks in whatever order they are received.
 #[derive(Debug)]
-pub(crate) struct UnorderedBody {
+pub(crate) struct UnorderedOutput {
     chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
 }
 
-impl UnorderedBody {
-    fn new(chunks: Option<BodyChannel>) -> Self {
+impl UnorderedOutput {
+    fn new(chunks: Option<OutputChannel>) -> Self {
         Self { chunks }
     }
 
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
-    /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
+    /// Chunks returned from an [UnorderedOutput] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
     pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
@@ -200,12 +200,12 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::body::ChunkOutput};
+    use crate::{error, operation::download::output::ChunkOutput};
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
 
-    use super::{AggregatedBytes, Body, Sequencer};
+    use super::{AggregatedBytes, Output, Sequencer};
 
     fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
         ChunkOutput {
@@ -226,9 +226,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_body_next() {
+    async fn test_ouput_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let mut body = Output::new(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -252,9 +252,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_body_next_error() {
+    async fn test_output_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let mut body = Output::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();

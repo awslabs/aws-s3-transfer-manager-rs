@@ -10,7 +10,7 @@ use std::time;
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
-use aws_s3_transfer_manager::operation::download::body::Body;
+use aws_s3_transfer_manager::operation::download::output::Output;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;
@@ -173,7 +173,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     //      TM will handle it's own thread pool for filesystem work
     let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
 
-    write_body(handle.body_mut(), dest)
+    write_body(handle.ouput_mut(), dest)
         .instrument(tracing::debug_span!("write-output"))
         .await?;
 
@@ -296,7 +296,7 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError> {
+async fn write_body(body: &mut Output, mut dest: fs::File) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk.unwrap().data;
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());

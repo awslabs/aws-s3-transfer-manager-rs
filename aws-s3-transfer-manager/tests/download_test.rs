@@ -46,7 +46,7 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
 
 /// drain/consume the body
 async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
-    let body = handle.body_mut();
+    let body = handle.ouput_mut();
     let mut data = BytesMut::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk?.data.into_bytes();
@@ -165,7 +165,7 @@ async fn test_body_not_consumed() {
         .initiate()
         .unwrap();
 
-    let _ = handle.body_mut().next().await;
+    let _ = handle.ouput_mut().next().await;
 }
 
 pin_project! {

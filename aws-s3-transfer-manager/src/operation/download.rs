@@ -10,7 +10,7 @@ use aws_sdk_s3::error::DisplayErrorContext;
 pub use input::{DownloadInput, DownloadInputBuilder};
 
 /// Abstractions for response bodies and consuming data streams.
-pub mod body;
+pub mod output;
 /// Operation builders
 pub mod builders;
 
@@ -34,7 +34,7 @@ use crate::error;
 use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::{Body, ChunkOutput};
+use output::{Output, ChunkOutput};
 use discovery::discover_obj;
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,7 +86,7 @@ impl Download {
         ));
 
         Ok(DownloadHandle {
-            body: Body::new(comp_rx),
+            output: Output::new(comp_rx),
             tasks,
             discovery,
             object_meta_receiver: Mutex::new(Some(object_meta_rx)),
@@ -170,7 +170,7 @@ async fn send_discovery(
 /// the starting sequence number to use for remaining chunks.
 ///
 /// NOTE: This function does _not_ wait to read the initial chunk from discovery but
-/// instead spawns a new task to read the stream and send it over the body channel.
+/// instead spawns a new task to read the stream and send it over the output channel.
 /// This allows remaining work to start immediately (and concurrently) without
 /// waiting for the first chunk.
 fn handle_discovery_chunk(

@@ -10,7 +10,7 @@ use tokio::{
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::body::Body;
+use crate::operation::download::output::Output;
 
 use super::object_meta::ObjectMetadata;
 
@@ -23,8 +23,8 @@ pub struct DownloadHandle {
     /// Object metadata.
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
-    /// The object content
-    pub(crate) body: Body,
+    /// The object content and metadata
+    pub(crate) output: Output,
 
     /// Discovery task
     // TODO: Can I get rid of this?
@@ -54,19 +54,19 @@ impl DownloadHandle {
         Ok(meta)
     }
 
-    /// Object content
-    pub fn body(&self) -> &Body {
-        &self.body
+    /// Object content and metadata
+    pub fn output(&self) -> &Output {
+        &self.output
     }
 
-    /// Mutable reference to the body
-    pub fn body_mut(&mut self) -> &mut Body {
-        &mut self.body
+    /// Mutable reference to the output
+    pub fn ouput_mut(&mut self) -> &mut Output {
+        &mut self.output
     }
 
     /// Abort the download and cancel any in-progress work.
     pub async fn abort(mut self) {
-        self.body.close();
+        self.output.close();
         self.discovery.abort();
         let _ = self.discovery.await;
         let mut tasks = self.tasks.lock().await;
