@@ -481,7 +481,7 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
             if already_accessed {
                 HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty())
             } else {
-                // Force the first call to PubObject to fail, triggering operation cancellation for all subsequent PubObject calls.
+                // Force the first call to PubObject to fail, triggering operation cancellation for all subsequent PutObject calls.
                 HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
             }
         });
@@ -536,8 +536,6 @@ async fn test_drop_upload_objects_handle() {
         .then_output({
             move || {
                 watch_tx.send(()).unwrap();
-                // sleep for some time so that the main thread proceeds with `drop(handle)`
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 PutObjectOutput::builder().build()
             }
         });
@@ -561,6 +559,9 @@ async fn test_drop_upload_objects_handle() {
     while !watch_rx.has_changed().unwrap() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+
+    // Give some time so spawned tasks might be able to proceed with their tasks a bit.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // should not panic
     drop(handle)

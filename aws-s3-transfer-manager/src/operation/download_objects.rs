@@ -15,7 +15,7 @@ pub use output::{DownloadObjectsOutput, DownloadObjectsOutputBuilder};
 
 mod handle;
 pub use handle::DownloadObjectsHandle;
-use tokio::fs;
+use tokio::{fs, sync::watch};
 
 mod list_objects;
 mod worker;
@@ -27,7 +27,9 @@ use tracing::Instrument;
 
 use crate::types::FailedDownload;
 
-use super::{validate_target_is_dir, TransferContext};
+use super::{
+    validate_target_is_dir, CancelNotificationReceiver, CancelNotificationSender, TransferContext,
+};
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -83,6 +85,8 @@ pub(crate) struct DownloadObjectsState {
     // TODO - Determine if `input` should be separated from this struct
     // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: DownloadObjectsInput,
+    cancel_tx: CancelNotificationSender,
+    cancel_rx: CancelNotificationReceiver,
     failed_downloads: Mutex<Vec<FailedDownload>>,
     successful_downloads: AtomicU64,
     total_bytes_transferred: AtomicU64,
@@ -92,8 +96,11 @@ type DownloadObjectsContext = TransferContext<DownloadObjectsState>;
 
 impl DownloadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: DownloadObjectsInput) -> Self {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadObjectsState {
             input,
+            cancel_tx,
+            cancel_rx,
             failed_downloads: Mutex::new(Vec::new()),
             successful_downloads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
