@@ -44,8 +44,8 @@ impl UploadObjectsHandle {
     /// Consume the handle and wait for the upload to complete
     ///
     /// When the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Abort`], this method
-    /// will return an error if any of the spawned tasks encounter one. The other tasks will
-    /// be canceled, but their cancellations will not be reported as errors by this method;
+    /// will return the first error if any of the spawned tasks encounter one. The other tasks
+    /// will be canceled, but their cancellations will not be reported as errors by this method;
     /// they will be logged as errors, instead.
     ///
     /// If the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Continue`], the
