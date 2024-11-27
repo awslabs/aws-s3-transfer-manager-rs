@@ -22,9 +22,6 @@ use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{FailedTransferPolicy, FailedUpload, UploadFilter};
 use crate::{error, types::UploadFilterItem};
 
-const CANCELLATION_ERROR: &str =
-    "at least one operation has been aborted, cancelling all ongoing requests";
-
 #[derive(Debug)]
 pub(super) struct UploadObjectJob {
     key: String,
@@ -61,7 +58,7 @@ pub(super) async fn list_directory_contents(
         tokio::select! {
             _ = cancel_rx.changed() => {
                 tracing::error!("received cancellation signal, exiting and not yielding new directory contents");
-                return Err(crate::error::Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR.to_owned()));
+                return Err(error::operation_cancelled());
             }
             entry = walker.next() => {
                 match entry {
@@ -194,7 +191,7 @@ pub(super) async fn upload_objects(
         tokio::select! {
             _ = cancel_rx.changed() => {
                 tracing::error!("received cancellation signal, exiting and ignoring any future work");
-                return Err(crate::error::Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR.to_owned()));
+                return Err(error::operation_cancelled());
             }
             job = list_directory_rx.recv() => {
                 match job {
@@ -274,10 +271,7 @@ async fn upload_single_obj(
                 DisplayErrorContext(&e)
             );
         }
-        Err(crate::error::Error::new(
-            ErrorKind::OperationCancelled,
-            CANCELLATION_ERROR.to_owned(),
-        ))
+        Err(error::operation_cancelled())
     } else {
         handle.join().await?;
         Ok(bytes_transferred)
