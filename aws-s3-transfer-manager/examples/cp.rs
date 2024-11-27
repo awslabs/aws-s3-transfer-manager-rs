@@ -296,8 +296,8 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn write_body(body: &mut Output, mut dest: fs::File) -> Result<(), BoxError> {
-    while let Some(chunk) = body.next().await {
+async fn write_body(output: &mut Output, mut dest: fs::File) -> Result<(), BoxError> {
+    while let Some(chunk) = output.next().await {
         let chunk = chunk.unwrap().data;
         tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
         let mut segment_cnt = 1;
