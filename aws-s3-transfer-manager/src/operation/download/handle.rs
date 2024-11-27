@@ -27,7 +27,8 @@ pub struct DownloadHandle {
     pub(crate) body: Body,
 
     /// Discovery task
-    pub(crate) discovery: task::JoinHandle<Result<(), error::Error>>,
+    // TODO: Can I get rid of this?
+    pub(crate) discovery: task::JoinHandle<()>,
 
     /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,

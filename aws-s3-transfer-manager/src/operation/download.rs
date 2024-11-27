@@ -102,7 +102,7 @@ async fn send_discovery(
     object_meta_tx: oneshot::Sender<ObjectMetadata>,
     input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
-) -> Result<(), crate::error::Error> {
+) {
     // create span to serve as parent of spawned child tasks.
     let parent_span_for_tasks = tracing::debug_span!(
         parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
@@ -116,10 +116,25 @@ async fn send_discovery(
     }
 
     // acquire a permit for discovery
-    let permit = ctx.handle.scheduler.acquire_permit().await?;
-
+    let permit = ctx.handle.scheduler.acquire_permit().await;
+    // TODO: Log error if fail to send
+    let permit = match permit {
+        Ok(permit) => permit,
+        Err(err) => {
+            let _ = comp_tx.send(Err(err)).await;
+            return;
+        },
+    };
     // make initial discovery about the object size, metadata, possibly first chunk
-    let mut discovery = discover_obj(&ctx, &input).await?;
+    let discovery = discover_obj(&ctx, &input).await;
+    let mut discovery = match discovery {
+        Ok(discovery) => discovery,
+        Err(err) => {
+            let _ = comp_tx.send(Err(err)).await;
+            return;
+        },
+    };
+    // TODO: We need to send the error through the body channel.
     // FIXME - This will fail if the handle is dropped at this point. We should handle
     // the cancellation gracefully here.
     let _ = object_meta_tx.send(discovery.object_meta);
@@ -149,7 +164,6 @@ async fn send_discovery(
             parent_span_for_tasks,
         );
     }
-    Ok(())
 }
 
 /// Handle possibly sending the first chunk of data received through discovery. Returns
