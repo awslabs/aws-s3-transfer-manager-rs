@@ -18,6 +18,7 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
+use tokio::sync::watch::{self, Receiver, Sender};
 use tracing::Instrument;
 
 /// Provides metadata for each chunk during an object download.
@@ -200,14 +201,19 @@ fn handle_discovery_chunk(
 #[derive(Debug)]
 pub(crate) struct DownloadState {
     current_seq: AtomicU64,
+    cancel_tx: Sender<bool>,
+    cancel_rx: Receiver<bool>,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
 
 impl DownloadContext {
     fn new(handle: Arc<crate::client::Handle>) -> Self {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             current_seq: AtomicU64::new(0),
+            cancel_tx,
+            cancel_rx,
         });
         TransferContext { handle, state }
     }

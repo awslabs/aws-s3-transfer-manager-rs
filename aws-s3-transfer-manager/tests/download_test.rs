@@ -158,13 +158,14 @@ async fn test_body_not_consumed() {
 
     let (tm, _) = simple_test_tm(&data, part_size);
 
-    let _ = tm
+    let mut handle = tm
         .download()
         .bucket("test-bucket")
         .key("test-object")
         .initiate()
         .unwrap();
-    // TODO: Fix test
+
+    let _ = handle.body_mut().next().await;
 }
 
 pin_project! {

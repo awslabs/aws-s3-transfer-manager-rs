@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use crate::error;
+use crate::error::ErrorKind;
 use crate::http::header;
 use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
@@ -20,6 +21,11 @@ use tracing::Instrument;
 
 use super::body::ChunkOutput;
 use super::{DownloadInput, DownloadInputBuilder};
+
+
+// TODO: Move to some common place
+const CANCELLATION_ERROR: &str =
+    "at least one operation has been aborted, cancelling all ongoing requests";
 
 /// Request/input type for our "chunk" service.
 #[derive(Debug, Clone)]
@@ -69,25 +75,35 @@ async fn download_specific_chunk(
     );
 
     let op = input.into_sdk_operation(ctx.client());
-    let mut resp = op
-        .send()
-        // no instrument() here because parent span shows duration of send + collect
-        .await
-        .map_err(error::from_kind(error::ErrorKind::ChunkFailed))?;
+    let mut cancel_rx = ctx.state.cancel_rx.clone();
+    tokio::select! {
+        // TODO: Error message
+        _ = cancel_rx.changed() => {
+            tracing::error!("Received cancellating signal, exiting and not download more chunks");
+            Err(error::Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR.to_owned()))
+        },
+        resp = op.send() => {
+            match resp {
+                Err(err) => Err(error::from_kind(error::ErrorKind::ChunkFailed)(err)),
+                Ok(mut resp) => {
+                    let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
+                    let body = AggregatedBytes::from_byte_stream(body)
+                        .instrument(tracing::debug_span!(
+                            "collect-body-from-download-chunk",
+                            seq
+                        ))
+                        .await?;
 
-    let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
-    let body = AggregatedBytes::from_byte_stream(body)
-        .instrument(tracing::debug_span!(
-            "collect-body-from-download-chunk",
-            seq
-        ))
-        .await?;
+                    Ok(ChunkOutput {
+                        seq,
+                        data: body,
+                        metadata: resp.into(),
+                    })
+                },
+            }
+        }
+    }
 
-    Ok(ChunkOutput {
-        seq,
-        data: body,
-        metadata: resp.into(),
-    })
 }
 
 /// Create a new tower::Service for downloading individual chunks of an object from S3
@@ -139,10 +155,17 @@ pub(super) fn distribute_work(
 
         let svc = svc.clone();
         let comp_tx = comp_tx.clone();
+        let cancel_tx = ctx.state.cancel_tx.clone();
 
         let task = async move {
             // TODO: If downloading a chunk fails, do we want to abort the download?
             let resp = svc.oneshot(req).await;
+            if let Err(err) = &resp {
+                if *err.kind() != ErrorKind::OperationCancelled && cancel_tx.send(true).is_err() {
+                    tracing::warn!("all receiver ends have dropped, unable to send a cancellation signal");
+                }
+            }
+
             if let Err(err) = comp_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
             }

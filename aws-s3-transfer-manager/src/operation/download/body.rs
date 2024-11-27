@@ -81,7 +81,10 @@ impl Body {
             match self.inner.next().await {
                 None => break,
                 Some(Ok(chunk)) => self.sequencer.push(chunk),
-                Some(Err(err)) => return Some(Err(err)),
+                Some(Err(err)) => {
+                    self.close();
+                    return Some(Err(err));
+                },
             }
         }
 
