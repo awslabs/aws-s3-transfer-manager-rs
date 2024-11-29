@@ -783,7 +783,7 @@ mod tests {
         let contents = vec![0; MIN_MULTIPART_PART_SIZE_BYTES as usize];
         let ctx = UploadObjectsContext::new(handle, input);
         let job = UploadObjectJob {
-            object: InputStream::from(Bytes::from_static(Box::leak(contents.into_boxed_slice()))),
+            object: InputStream::from(Bytes::copy_from_slice(contents.as_slice())),
             key: key.to_owned(),
         };
 
