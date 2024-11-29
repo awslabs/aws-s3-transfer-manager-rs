@@ -48,11 +48,17 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
 async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
     let body = handle.ouput_mut();
     let mut data = BytesMut::new();
+    let mut error: Option<BoxError> = None;
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?.data.into_bytes();
-        data.put(chunk);
+        match chunk {
+            Ok(chunk) => data.put(chunk.data.into_bytes()),
+            Err(err) => { error.get_or_insert(Box::new(err)); },
+        }
     }
 
+    if let Some(error) = error {
+        return Err(error);
+    }
     Ok(data.into())
 }
 
