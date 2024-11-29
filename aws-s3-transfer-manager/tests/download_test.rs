@@ -294,7 +294,7 @@ const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Test non retryable SdkError
 #[tokio::test]
 async fn test_non_retryable_error() {
-    let data = rand_data(12 * MEBIBYTE);
+    let data = rand_data(20 * MEBIBYTE);
     let part_size = 8 * MEBIBYTE;
 
     let http_client = StaticReplayClient::new(vec![
