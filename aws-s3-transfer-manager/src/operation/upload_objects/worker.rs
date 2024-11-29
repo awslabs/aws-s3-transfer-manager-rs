@@ -329,18 +329,23 @@ fn handle_failed_upload(
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::operation::put_object::PutObjectOutput;
+    use aws_sdk_s3::operation::{
+        abort_multipart_upload::AbortMultipartUploadOutput,
+        create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+    };
     use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
     use bytes::Bytes;
 
     use crate::{
         client::Handle,
+        config::MIN_MULTIPART_PART_SIZE_BYTES,
         io::InputStream,
         operation::upload_objects::{
             worker::{upload_single_obj, UploadObjectJob},
             UploadObjectsContext, UploadObjectsInputBuilder,
         },
         runtime::scheduler::Scheduler,
+        types::PartSize,
         DEFAULT_CONCURRENCY,
     };
 
@@ -705,7 +710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_single_upload() {
+    async fn test_cancel_single_upload_via_put_object() {
         let bucket = "doesnotmatter";
         let put_object = mock!(aws_sdk_s3::Client::put_object)
             .match_requests(move |input| input.bucket() == Some(bucket))
@@ -726,6 +731,60 @@ mod tests {
         let job = UploadObjectJob {
             object: InputStream::from(Bytes::from_static(b"doesnotmatter")),
             key: "doesnotmatter".to_owned(),
+        };
+
+        ctx.state.cancel_tx.send(true).unwrap();
+
+        let err = upload_single_obj(&ctx, job).await.unwrap_err();
+
+        assert_eq!(&crate::error::ErrorKind::OperationCancelled, err.kind());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_single_upload_via_multipart_upload() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let upload_id: String = "test-upload-id".to_owned();
+
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+            let upload_id = upload_id.clone();
+            move || {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id(upload_id.clone())
+                    .build()
+            }
+        });
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests({
+                let upload_id = upload_id.clone();
+                move |input| {
+                    input.upload_id.as_ref() == Some(&upload_id)
+                        && input.bucket() == Some(bucket)
+                        && input.key() == Some(key)
+                }
+            })
+            .then_output(|| AbortMultipartUploadOutput::builder().build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[create_mpu, abort_mpu]);
+        let config = crate::Config::builder()
+            .set_multipart_threshold(PartSize::Target(MIN_MULTIPART_PART_SIZE_BYTES))
+            .client(s3_client)
+            .build();
+
+        let scheduler = Scheduler::new(DEFAULT_CONCURRENCY);
+
+        let handle = std::sync::Arc::new(Handle { config, scheduler });
+        let input = UploadObjectsInputBuilder::default()
+            .source("doesnotmatter")
+            .bucket(bucket)
+            .build()
+            .unwrap();
+
+        // specify the size of the contents so it triggers multipart upload
+        let contents = vec![0; MIN_MULTIPART_PART_SIZE_BYTES as usize];
+        let ctx = UploadObjectsContext::new(handle, input);
+        let job = UploadObjectJob {
+            object: InputStream::from(Bytes::from_static(Box::leak(contents.into_boxed_slice()))),
+            key: key.to_owned(),
         };
 
         ctx.state.cancel_tx.send(true).unwrap();
