@@ -18,7 +18,6 @@ mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
-use tokio::sync::watch::{self, Receiver, Sender};
 use tracing::Instrument;
 
 /// Provides metadata for each chunk during an object download.
@@ -39,10 +38,10 @@ use discovery::discover_obj;
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
 
-use super::TransferContext;
+use super::{CancelNotificationReceiver, CancelNotificationSender, TransferContext};
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -215,8 +214,8 @@ fn handle_discovery_chunk(
 #[derive(Debug)]
 pub(crate) struct DownloadState {
     current_seq: AtomicU64,
-    cancel_tx: Sender<bool>,
-    cancel_rx: Receiver<bool>,
+    cancel_tx: CancelNotificationSender,
+    cancel_rx: CancelNotificationReceiver,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
