@@ -49,7 +49,7 @@ impl UploadObjectsHandle {
     /// they will be logged as errors, instead.
     ///
     /// If the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Continue`], the
-    /// [`UploadObjectsOutput`] will include a detailed breakdown, such as the number of
+    /// [`UploadObjectsOutput`] will include a detailed breakdown, including the number of
     /// successful uploads and the number of failed ones.
     ///
     // TODO(aws-sdk-rust#1159) - Consider if we want to return failed `AbortMultipartUpload` during cancellation.

@@ -28,7 +28,7 @@ impl DownloadObjectsHandle {
     /// they will be logged as errors, instead.
     ///
     /// If the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Continue`], the
-    /// [`DownloadObjectsOutput`] will include a detailed breakdown, such as the number of
+    /// [`DownloadObjectsOutput`] will include a detailed breakdown, including the number of
     /// successful downloads and the number of failed ones.
     ///
     // TODO(aws-sdk-rust#1159) - Consider if we want to return other all errors encountered during cancellation.
