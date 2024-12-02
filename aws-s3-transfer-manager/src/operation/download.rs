@@ -116,7 +116,6 @@ async fn send_discovery(
 
     // acquire a permit for discovery
     let permit = ctx.handle.scheduler.acquire_permit().await;
-    // TODO: Log error if fail to send
     let permit = match permit {
         Ok(permit) => permit,
         Err(err) => {
@@ -124,6 +123,7 @@ async fn send_discovery(
             return;
         },
     };
+
     // make initial discovery about the object size, metadata, possibly first chunk
     let discovery = discover_obj(&ctx, &input).await;
     let mut discovery = match discovery {
@@ -133,10 +133,12 @@ async fn send_discovery(
             return;
         },
     };
-    // TODO: We need to send the error through the body channel.
-    // FIXME - This will fail if the handle is dropped at this point. We should handle
-    // the cancellation gracefully here.
-    let _ = object_meta_tx.send(discovery.object_meta);
+
+    if object_meta_tx.send(discovery.object_meta).is_err() {
+        tracing::warn!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.expect("key is available"));
+        return;
+    }
+        
     let initial_chunk = discovery.initial_chunk.take();
 
     let mut tasks = tasks.lock().await;
