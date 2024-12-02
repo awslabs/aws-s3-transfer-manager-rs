@@ -9,10 +9,10 @@ use aws_sdk_s3::error::DisplayErrorContext;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
-/// Abstractions for response bodies and consuming data streams.
-pub mod output;
 /// Operation builders
 pub mod builders;
+/// Abstractions for response bodies and consuming data streams.
+pub mod output;
 
 mod discovery;
 
@@ -33,8 +33,8 @@ use crate::error;
 use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use output::{Output, ChunkOutput};
 use discovery::discover_obj;
+use output::{ChunkOutput, Output};
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -123,7 +123,7 @@ async fn send_discovery(
                 tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
             }
             return;
-        },
+        }
     };
 
     // make initial discovery about the object size, metadata, possibly first chunk
@@ -135,14 +135,17 @@ async fn send_discovery(
                 tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
             }
             return;
-        },
+        }
     };
 
     if object_meta_tx.send(discovery.object_meta).is_err() {
-        tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
+        tracing::debug!(
+            "Download handle for key({}) has been dropped, aborting during the discovery phase",
+            input.key.unwrap_or("None".to_string())
+        );
         return;
     }
-        
+
     let initial_chunk = discovery.initial_chunk.take();
 
     let mut tasks = tasks.lock().await;
