@@ -119,7 +119,9 @@ async fn send_discovery(
     let permit = match permit {
         Ok(permit) => permit,
         Err(err) => {
-            let _ = comp_tx.send(Err(err)).await;
+            if comp_tx.send(Err(err)).await.is_err() {
+                tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
+            }
             return;
         },
     };
@@ -129,13 +131,15 @@ async fn send_discovery(
     let mut discovery = match discovery {
         Ok(discovery) => discovery,
         Err(err) => {
-            let _ = comp_tx.send(Err(err)).await;
+            if comp_tx.send(Err(err)).await.is_err() {
+                tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
+            }
             return;
         },
     };
 
     if object_meta_tx.send(discovery.object_meta).is_err() {
-        tracing::warn!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.expect("key is available"));
+        tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
         return;
     }
         
