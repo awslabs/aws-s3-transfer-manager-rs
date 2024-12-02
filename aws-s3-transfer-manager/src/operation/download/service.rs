@@ -72,9 +72,8 @@ async fn download_specific_chunk(
     let op = input.into_sdk_operation(ctx.client());
     let mut cancel_rx = ctx.state.cancel_rx.clone();
     tokio::select! {
-        // TODO: Error message
         _ = cancel_rx.changed() => {
-            tracing::error!("Received cancellating signal, exiting and not download more chunks");
+            tracing::debug!("Received cancellating signal, exiting and not downloading chunk#{seq}");
             Err(error::operation_cancelled())
         },
         resp = op.send() => {
@@ -153,7 +152,6 @@ pub(super) fn distribute_work(
         let cancel_tx = ctx.state.cancel_tx.clone();
 
         let task = async move {
-            // TODO: If downloading a chunk fails, do we want to abort the download?
             let resp = svc.oneshot(req).await;
             if let Err(err) = &resp {
                 if *err.kind() != ErrorKind::OperationCancelled && cancel_tx.send(true).is_err() {
