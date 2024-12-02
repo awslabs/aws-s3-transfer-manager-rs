@@ -43,7 +43,7 @@ pub struct ChunkOutput {
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
 impl Output {
-    /// Create a new empty body
+    /// Create a new empty output
     pub fn empty() -> Self {
         Self::new_from_channel(None)
     }
@@ -59,7 +59,7 @@ impl Output {
         }
     }
 
-    /// Convert this body into an unordered stream of chunks.
+    /// Convert this output into an unordered stream of chunks.
     // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
     // download_objects should utilize this so that it can write in parallel to files.
     #[allow(dead_code)]
@@ -84,7 +84,7 @@ impl Output {
                 Some(Err(err)) => {
                     self.close();
                     return Some(Err(err));
-                },
+                }
             }
         }
 
@@ -97,7 +97,7 @@ impl Output {
         }
     }
 
-    /// Close the body, no more data will flow from it and all publishers will be notified.
+    /// Close the output, no more data will flow from it and all publishers will be notified.
     pub(crate) fn close(&mut self) {
         self.inner.close()
     }
@@ -190,7 +190,7 @@ impl UnorderedOutput {
         }
     }
 
-    /// Close the body
+    /// Close the output
     pub(crate) fn close(&mut self) {
         if let Some(ch) = &mut self.chunks {
             ch.close();
@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_ouput_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Output::new(rx);
+        let mut output = Output::new(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -241,7 +241,7 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Some(chunk) = body.next().await {
+        while let Some(chunk) = output.next().await {
             let chunk = chunk.expect("chunk ok");
             let data = String::from_utf8(chunk.data.to_vec()).unwrap();
             received.push(data);
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_output_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Output::new(rx);
+        let mut output: Output = Output::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();
@@ -266,7 +266,7 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Some(chunk) = body.next().await {
+        while let Some(chunk) = output.next().await {
             received.push(chunk);
         }
 
