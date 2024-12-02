@@ -11,11 +11,12 @@ use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, S
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
+use aws_smithy_mocks_experimental::{mock, RuleMode};
 use aws_smithy_runtime::client::http::test_util::infallible_client_fn;
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
+use test_common::mock_client_with_stubbed_http_client;
 use tokio::sync::mpsc;
 
 /// number of simultaneous uploads to create
@@ -93,7 +94,7 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
         })
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
 
-    mock_client!(
+    mock_client_with_stubbed_http_client!(
         aws_sdk_s3,
         RuleMode::MatchAny,
         &[create_mpu, upload_part, complete_mpu]
