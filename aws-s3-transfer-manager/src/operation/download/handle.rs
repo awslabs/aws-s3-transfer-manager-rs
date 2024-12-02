@@ -27,7 +27,6 @@ pub struct DownloadHandle {
     pub(crate) output: Output,
 
     /// Discovery task
-    // TODO: Can I get rid of this?
     pub(crate) discovery: task::JoinHandle<()>,
 
     /// All child tasks (ranged GetObject) spawned for this download
