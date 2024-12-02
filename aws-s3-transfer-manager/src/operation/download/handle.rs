@@ -68,6 +68,8 @@ impl DownloadHandle {
         self.output.close();
         self.discovery.abort();
         let _ = self.discovery.await;
+        // It's safe to grab the lock here because discovery is already complete, and we will never
+        // lock tasks again after discovery to spawn more tasks.
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while (tasks.join_next().await).is_some() {}

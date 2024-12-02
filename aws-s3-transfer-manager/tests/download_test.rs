@@ -5,11 +5,12 @@
 
 use aws_config::Region;
 use aws_s3_transfer_manager::{
-    error::BoxError,
+    error::{BoxError, Error},
     operation::download::DownloadHandle,
     types::{ConcurrencySetting, PartSize},
 };
 use pin_project_lite::pin_project;
+use std::io::Write;
 use std::{
     cmp,
     iter::{self, repeat_with},
@@ -45,15 +46,15 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
 }
 
 /// drain/consume the output and return the body.
-async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
+async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
     let output = handle.ouput_mut();
     let mut data = BytesMut::new();
-    let mut error: Option<BoxError> = None;
+    let mut error: Option<Error> = None;
     while let Some(chunk) = output.next().await {
         match chunk {
             Ok(chunk) => data.put(chunk.data.into_bytes()),
             Err(err) => {
-                error.get_or_insert(Box::new(err));
+                error.get_or_insert(err);
             }
         }
     }
