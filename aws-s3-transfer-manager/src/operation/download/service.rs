@@ -97,7 +97,6 @@ async fn download_specific_chunk(
             }
         }
     }
-
 }
 
 /// Create a new tower::Service for downloading individual chunks of an object from S3
@@ -155,12 +154,19 @@ pub(super) fn distribute_work(
             let resp = svc.oneshot(req).await;
             if let Err(err) = &resp {
                 if *err.kind() != ErrorKind::OperationCancelled && cancel_tx.send(true).is_err() {
-                    tracing::warn!("all receiver ends have dropped, unable to send a cancellation signal");
+                    tracing::warn!(
+                        "all receiver ends have dropped, unable to send a cancellation signal"
+                    );
                 }
             }
 
             if let Err(err) = comp_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
+                if cancel_tx.send(true).is_err() {
+                    tracing::warn!(
+                        "all receiver ends have dropped, unable to send a cancellation signal"
+                    );
+                }
             }
         };
         tasks.spawn(task.instrument(parent_span_for_tasks.clone()));
