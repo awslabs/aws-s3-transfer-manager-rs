@@ -51,7 +51,7 @@ pub fn create_test_dir(
 
 /// A macro to generate a mock S3 client with the underlying HTTP client stubbed out
 ///
-/// This macro wraps [`infallible_client_fn`](aws_smithy_runtime::client::http::test_util::infallible_client_fn) to work around the issue
+/// This macro wraps [`mock_client`](aws_smithy_mocks_experimental::mock_client) to work around the issue
 /// where the inner macro, when used alone, does not stub the HTTP client, causing real HTTP requests to be sent.
 // TODO(https://github.com/smithy-lang/smithy-rs/issues/3926): Once resolved, remove this macro and have the callers use the upstream version instead.
 #[macro_export]

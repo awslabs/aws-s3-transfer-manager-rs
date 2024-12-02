@@ -7,6 +7,6 @@ publish = false
 
 [dependencies]
 aws-sdk-s3 = { version = "1.51.0", features = ["behavior-version-latest", "test-util"] }
-aws-smithy-runtime = { version = "1.7.1", features = ["client", "connector-hyper-0-14-x", "test-util"] }
+aws-smithy-mocks-experimental = "0.2.1"
 http-02x = { package = "http", version = "0.2.9" }
 tempfile = "3.12.0"
