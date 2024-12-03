@@ -294,7 +294,8 @@ mod tests {
     use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};
 
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
-    use aws_smithy_mocks_experimental::{mock, mock_client};
+    use aws_smithy_mocks_experimental::mock;
+    use test_common::mock_client_with_stubbed_http_client;
 
     use std::path::PathBuf;
 
@@ -503,7 +504,7 @@ mod tests {
                 .build()
         });
 
-        let s3_client = mock_client!(aws_sdk_s3, &[&list_objects_rule]);
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&list_objects_rule]);
         let config = crate::Config::builder().client(s3_client).build();
         let client = crate::Client::new(config);
         let input = DownloadObjectsInput::builder()
@@ -560,7 +561,7 @@ mod tests {
                 .build()
         });
 
-        let s3_client = mock_client!(aws_sdk_s3, &[&list_objects_rule]);
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&list_objects_rule]);
         let config = crate::Config::builder().client(s3_client).build();
         let client = crate::Client::new(config);
         let input = DownloadObjectsInput::builder()

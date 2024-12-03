@@ -28,7 +28,7 @@ impl DownloadObjectsHandle {
     /// they will be logged as errors, instead.
     ///
     /// If the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Continue`], the
-    /// [`DownloadObjectsOutput`] will include a detailed breakdown, such as the number of
+    /// [`DownloadObjectsOutput`] will include a detailed breakdown, including the number of
     /// successful downloads and the number of failed ones.
     ///
     // TODO(aws-sdk-rust#1159) - Consider if we want to return other all errors encountered during cancellation.
@@ -65,7 +65,7 @@ impl DownloadObjectsHandle {
     pub async fn abort(&mut self) -> Result<(), crate::error::Error> {
         if self.ctx.state.input.failure_policy() == &FailedTransferPolicy::Abort {
             if self.ctx.state.cancel_tx.send(true).is_err() {
-                tracing::warn!(
+                tracing::debug!(
                     "all receiver ends have been dropped, unable to send a cancellation signal"
                 );
             }
