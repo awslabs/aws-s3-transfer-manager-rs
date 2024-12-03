@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use crate::error;
+use crate::error::{self, ErrorKind};
 use crate::operation::download::body::Body;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
 use crate::operation::DEFAULT_DELIMITER;
@@ -49,18 +49,37 @@ pub(super) async fn discover_objects(
     let default_filter = &DownloadFilter::default();
     let filter = ctx.state.input.filter().unwrap_or(default_filter);
 
-    while let Some(obj_result) = stream.next().await {
-        let object = obj_result?;
-        if !(filter.predicate)(&object) {
-            // TODO(SEP) - The S3 Transfer Manager MAY add validation to handle the case for the objects whose
-            // keys differ only by case in case-insensitive filesystems such as Windows. For example, throw
-            // validation exception if a user attempts to download a bucket that contains "foobar" and "FOOBAR" in Windows.
-            tracing::debug!("skipping object due to filter: {:?}", object);
-            continue;
-        }
+    let mut cancel_rx = ctx.state.cancel_rx.clone();
 
-        let job = DownloadObjectJob { object };
-        work_tx.send(job).await.expect("channel valid");
+    loop {
+        tokio::select! {
+            _ = cancel_rx.changed() => {
+                tracing::error!("received cancellation signal, exiting and not listing new objects");
+                return Err(error::operation_cancelled());
+            }
+            obj_result = stream.next() => {
+                match obj_result {
+                    None => break,
+                    Some(obj_result) => {
+                        let object = obj_result?;
+
+                        if !(filter.predicate)(&object) {
+                            // TODO(SEP) - The S3 Transfer Manager MAY add validation to handle the case for the objects whose
+                            // keys differ only by case in case-insensitive filesystems such as Windows. For example, throw
+                            // validation exception if a user attempts to download a bucket that contains "foobar" and "FOOBAR" in Windows.
+                            tracing::debug!("skipping object due to filter: {:?}", object);
+                            continue;
+                        }
+
+                        let job = DownloadObjectJob { object };
+                        if work_tx.send(job).await.is_err() {
+                            tracing::error!("all receiver ends have been dropped, unable to send a job!");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -71,54 +90,74 @@ pub(super) async fn download_objects(
     ctx: DownloadObjectsContext,
     work_rx: Receiver<DownloadObjectJob>,
 ) -> Result<(), error::Error> {
-    while let Ok(job) = work_rx.recv().await {
-        tracing::debug!(
-            "worker recv'd request for key {:?} ({:?} bytes)",
-            job.object.key,
-            job.object.size()
-        );
-
-        let dl_result = download_single_obj(&ctx, &job).await;
-        match dl_result {
-            Ok(_) => {
-                ctx.state
-                    .successful_downloads
-                    .fetch_add(1, Ordering::SeqCst);
-
-                let bytes_transferred: u64 = job
-                    .object
-                    .size()
-                    .unwrap_or_default()
-                    .try_into()
-                    .unwrap_or_default();
-
-                ctx.state
-                    .total_bytes_transferred
-                    .fetch_add(bytes_transferred, Ordering::SeqCst);
-
-                tracing::debug!("worker finished downloading key {:?}", job.object.key);
+    let mut cancel_rx = ctx.state.cancel_rx.clone();
+    loop {
+        tokio::select! {
+            _ = cancel_rx.changed() => {
+                tracing::error!("received cancellation signal, exiting and not downloading a new object");
+                return Err(error::operation_cancelled());
             }
-            Err(err) => {
-                tracing::debug!(
-                    "worker failed to download key {:?}: {}",
-                    job.object.key,
-                    err
-                );
-                match ctx.state.input.failure_policy() {
-                    // TODO - this will abort this worker, the rest of the workers will be aborted
-                    // when the handle is joined and the error is propagated and the task set is
-                    // dropped. This _may_ be later/too passive and we might consider aborting all
-                    // the tasks on error rather than relying on join and then drop.
-                    FailedTransferPolicy::Abort => return Err(err),
-                    FailedTransferPolicy::Continue => {
-                        let mut failures = ctx.state.failed_downloads.lock().unwrap();
+            job = work_rx.recv() => {
+                match job {
+                    Err(_) => break,
+                    Ok(job) => {
+                        tracing::debug!(
+                            "worker recv'd request for key {:?} ({:?} bytes)",
+                            job.object.key,
+                            job.object.size()
+                        );
 
-                        let failed_transfer = FailedDownload {
-                            input: job.input(&ctx),
-                            error: err,
-                        };
+                        let dl_result = download_single_obj(&ctx, &job).await;
+                        match dl_result {
+                            Ok(_) => {
+                                ctx.state
+                                    .successful_downloads
+                                    .fetch_add(1, Ordering::SeqCst);
 
-                        failures.push(failed_transfer);
+                                let bytes_transferred: u64 = job
+                                    .object
+                                    .size()
+                                    .unwrap_or_default()
+                                    .try_into()
+                                    .unwrap_or_default();
+
+                                ctx.state
+                                    .total_bytes_transferred
+                                    .fetch_add(bytes_transferred, Ordering::SeqCst);
+
+                                tracing::debug!("worker finished downloading key {:?}", job.object.key);
+                            }
+                            Err(err) => {
+                                tracing::debug!(
+                                    "worker failed to download key {:?}: {}",
+                                    job.object.key,
+                                    err
+                                );
+                                match ctx.state.input.failure_policy() {
+                                    FailedTransferPolicy::Abort => {
+                                        // Sending a cancellation signal during graceful shutdown would be redundant.
+                                        if err.kind() != &ErrorKind::OperationCancelled
+                                            && ctx.state.cancel_tx.send(true).is_err()
+                                        {
+                                            tracing::warn!(
+                                                "all receiver ends have been dropped, unable to send a cancellation signal"
+                                            );
+                                        }
+                                        return Err(err);
+                                    }
+                                    FailedTransferPolicy::Continue => {
+                                        let mut failures = ctx.state.failed_downloads.lock().unwrap();
+
+                                        let failed_transfer = FailedDownload {
+                                            input: job.input(&ctx),
+                                            error: err,
+                                        };
+
+                                        failures.push(failed_transfer);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -142,6 +181,25 @@ async fn download_single_obj(
     let key_path = local_key_path(root_dir, key.as_str(), prefix, delim)?;
     let mut handle =
         crate::operation::download::Download::orchestrate(ctx.handle.clone(), input, true)?;
+
+    // The cancellation process would work fine without this if statement.
+    // It's here so we can save a single download operation that would otherwise
+    // be wasted if the system is already in graceful shutdown mode.
+    if ctx
+        .state
+        .cancel_rx
+        .has_changed()
+        .expect("the channel should be open as it is owned by `DownloadObjectsState`")
+    {
+        /*
+         * TODO(single download cleanup): Comment in the following lines of code once single download has been cleaned up.
+         *   Note that it may not be called `.abort()` depending on the outcome of the cleanup.
+         *
+         * handle.abort().await;
+         * return Err(error::operation_cancelled());
+         */
+    }
+
     let _ = handle.object_meta().await?;
     let mut body = mem::replace(&mut handle.body, Body::empty());
 
@@ -233,14 +291,14 @@ fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), er
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};
+
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
-    use aws_smithy_mocks_experimental::{mock, mock_client};
+    use aws_smithy_mocks_experimental::mock;
+    use test_common::mock_client_with_stubbed_http_client;
 
-    use crate::operation::download_objects::{
-        worker::discover_objects, DownloadObjectsContext, DownloadObjectsInput,
-    };
-
-    use super::{local_key_path, strip_key_prefix};
     use std::path::PathBuf;
 
     struct ObjectKeyPathTest {
@@ -448,7 +506,7 @@ mod tests {
                 .build()
         });
 
-        let s3_client = mock_client!(aws_sdk_s3, &[&list_objects_rule]);
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&list_objects_rule]);
         let config = crate::Config::builder().client(s3_client).build();
         let client = crate::Client::new(config);
         let input = DownloadObjectsInput::builder()
@@ -505,7 +563,7 @@ mod tests {
                 .build()
         });
 
-        let s3_client = mock_client!(aws_sdk_s3, &[&list_objects_rule]);
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&list_objects_rule]);
         let config = crate::Config::builder().client(s3_client).build();
         let client = crate::Client::new(config);
         let input = DownloadObjectsInput::builder()

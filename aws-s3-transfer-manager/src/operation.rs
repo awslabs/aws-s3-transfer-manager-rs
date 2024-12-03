@@ -22,6 +22,10 @@ pub mod upload_objects;
 // The default delimiter of the S3 object key
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
+// Type aliases to channel ends to send/receive cancel notification
+pub(crate) type CancelNotificationSender = tokio::sync::watch::Sender<bool>;
+pub(crate) type CancelNotificationReceiver = tokio::sync::watch::Receiver<bool>;
+
 /// Container for maintaining context required to carry out a single operation/transfer.
 ///
 /// `State` is whatever additional operation specific state is required for the operation.

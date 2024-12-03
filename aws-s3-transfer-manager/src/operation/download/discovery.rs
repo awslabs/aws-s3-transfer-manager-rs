@@ -196,9 +196,10 @@ mod tests {
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
-    use aws_smithy_mocks_experimental::{mock, mock_client};
+    use aws_smithy_mocks_experimental::mock;
     use aws_smithy_types::byte_stream::ByteStream;
     use bytes::Buf;
+    use test_common::mock_client_with_stubbed_http_client;
 
     use super::ObjectDiscovery;
 
@@ -247,7 +248,7 @@ mod tests {
     async fn get_discovery_from_head(range: Option<ByteRange>) -> ObjectDiscovery {
         let head_obj_rule = mock!(Client::head_object)
             .then_output(|| HeadObjectOutput::builder().content_length(500).build());
-        let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
+        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&head_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()));
 
@@ -296,7 +297,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size));
 
@@ -332,7 +333,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size));
 
@@ -367,7 +368,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size));
 
