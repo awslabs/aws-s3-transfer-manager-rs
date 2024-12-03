@@ -16,17 +16,16 @@ pub use handle::UploadObjectsHandle;
 
 mod output;
 pub use output::{UploadObjectsOutput, UploadObjectsOutputBuilder};
-use tokio::{
-    sync::watch::{self, Receiver, Sender},
-    task::JoinSet,
-};
+use tokio::{sync::watch, task::JoinSet};
 use tracing::Instrument;
 
 mod worker;
 
 use crate::{error, types::FailedUpload};
 
-use super::{validate_target_is_dir, TransferContext};
+use super::{
+    validate_target_is_dir, CancelNotificationReceiver, CancelNotificationSender, TransferContext,
+};
 
 /// Operation struct for uploading multiple objects to Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -85,8 +84,8 @@ pub(crate) struct UploadObjectsState {
     // TODO - Determine if `input` should be separated from this struct
     // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: UploadObjectsInput,
-    cancel_tx: Sender<bool>,
-    cancel_rx: Receiver<bool>,
+    cancel_tx: CancelNotificationSender,
+    cancel_rx: CancelNotificationReceiver,
     failed_uploads: Mutex<Vec<FailedUpload>>,
     successful_uploads: AtomicU64,
     total_bytes_transferred: AtomicU64,
@@ -95,8 +94,8 @@ pub(crate) struct UploadObjectsState {
 impl UploadObjectsState {
     pub(crate) fn new(
         input: UploadObjectsInput,
-        cancel_tx: Sender<bool>,
-        cancel_rx: Receiver<bool>,
+        cancel_tx: CancelNotificationSender,
+        cancel_rx: CancelNotificationReceiver,
     ) -> Self {
         Self {
             input,

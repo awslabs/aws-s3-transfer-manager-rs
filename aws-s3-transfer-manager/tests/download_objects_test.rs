@@ -4,16 +4,25 @@
  */
 #![cfg(target_family = "unix")]
 
-use aws_s3_transfer_manager::types::FailedTransferPolicy;
+use aws_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
 use aws_sdk_s3::{
-    error::DisplayErrorContext,
-    operation::{get_object::GetObjectOutput, list_objects_v2::ListObjectsV2Output},
+    error::{DisplayErrorContext, SdkError},
+    operation::{
+        get_object::GetObjectOutput,
+        list_objects_v2::{ListObjectsV2Error, ListObjectsV2Output},
+    },
     primitives::ByteStream,
 };
-use aws_smithy_mocks_experimental::{mock, mock_client, Rule, RuleMode};
-use aws_smithy_runtime_api::{client::orchestrator::HttpResponse, http::StatusCode};
+use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
+use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
+use aws_smithy_runtime_api::{
+    client::orchestrator::HttpResponse,
+    http::{Response, StatusCode},
+};
 use bytes::Bytes;
-use std::{io, iter, path::Path, sync::Arc};
+use std::{error::Error as _, io, iter, path::Path, sync::Arc};
+use test_common::mock_client_with_stubbed_http_client;
+use tokio::sync::watch;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -63,23 +72,28 @@ impl MockObject {
     }
 }
 
-fn get_object_error_http_resp() -> HttpResponse {
+fn error_http_resp() -> HttpResponse {
     HttpResponse::new(StatusCode::try_from(500).unwrap(), Bytes::new().into())
 }
 
 /// Get the mock rule for this object when `get_object` API is invoked for the corresponding key
 fn get_object_rule(mobj: &MockObject) -> Rule {
-    let share1 = Arc::new(mobj.clone());
-    let share2 = share1.clone();
+    let mock_obj = Arc::new(mobj.clone());
 
     if mobj.error_on_get {
         mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(move |r| r.key() == share1.object.key())
-            .then_http_response(get_object_error_http_resp)
+            .match_requests({
+                let mock_obj = mock_obj.clone();
+                move |r| r.key() == mock_obj.object.key()
+            })
+            .then_http_response(error_http_resp)
     } else {
         mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(move |r| r.key() == share1.object.key())
-            .then_output(move || share2.get_object_output())
+            .match_requests({
+                let mock_obj = mock_obj.clone();
+                move |r| r.key() == mock_obj.object.key()
+            })
+            .then_output(move || mock_obj.get_object_output())
     }
 }
 
@@ -98,21 +112,27 @@ impl MockBucket {
         MockBucketBuilder::default()
     }
 
-    /// Return the mock rules representing this bucket. This includes
-    /// the `ListObjectsV2` call as well as all of the `GetObject` calls.
-    fn rules(&self) -> Vec<aws_smithy_mocks_experimental::Rule> {
+    /// Configure the mock behavior listing `objects` stored in this `MockBucket`.
+    fn list_objects_rule(&self) -> Rule {
         let contents = self.objects.iter().map(|m| m.object.clone()).collect();
 
         let list_output = ListObjectsV2Output::builder()
             .set_contents(Some(contents))
             .build();
 
-        let list_rule =
-            mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || list_output.clone());
+        mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || list_output.clone())
+    }
 
-        let mut rules: Vec<Rule> = self.objects.iter().map(get_object_rule).collect();
+    /// Configure the mock behavior of `GetObject` for `objects` stored in this `MockBucket`.
+    fn get_object_rules(&self) -> Vec<aws_smithy_mocks_experimental::Rule> {
+        self.objects.iter().map(get_object_rule).collect()
+    }
 
-        rules.push(list_rule);
+    /// Return the mock rules representing this bucket. This includes
+    /// the `ListObjectsV2` call as well as all of the `GetObject` calls.
+    fn rules(&self) -> Vec<aws_smithy_mocks_experimental::Rule> {
+        let mut rules = self.get_object_rules();
+        rules.push(self.list_objects_rule());
         rules
     }
 }
@@ -173,7 +193,11 @@ async fn test_strip_prefix_in_destination_path() {
         .key_with_size("abc/def/ghi/xyz.txt", 5)
         .build();
 
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
 
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
@@ -212,7 +236,11 @@ async fn test_object_with_prefix_included() {
         .key_with_size("abcd", 5)
         .build();
 
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
 
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
@@ -251,7 +279,11 @@ async fn test_failed_download_policy_continue() {
         .key_with_error("key3")
         .build();
 
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
 
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
@@ -309,7 +341,11 @@ async fn test_recursively_downloads() {
         builder.build()
     };
 
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
 
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
@@ -345,7 +381,11 @@ async fn test_delimiter() {
         .key_with_size("2023|1|1.png", 5)
         .build();
 
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
 
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
@@ -383,7 +423,11 @@ async fn test_delimiter() {
 async fn test_destination_dir_not_valid() {
     let bucket = MockBucket::builder().key_with_size("image.png", 12).build();
 
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
 
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
@@ -402,4 +446,178 @@ async fn test_destination_dir_not_valid() {
 
     let err_str = format!("{}", DisplayErrorContext(err));
     assert!(err_str.contains("target is not a directory"));
+}
+
+#[tokio::test]
+async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
+    let (_guard, rx) = capture_test_logs();
+
+    let bucket = MockBucket::builder()
+        .key_with_size("key1", 12)
+        .key_with_error("key2")
+        .key_with_size("key3", 7)
+        .build();
+
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
+
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_s3_transfer_manager::Client::new(config);
+
+    let dest = tempfile::tempdir().unwrap();
+
+    let mut handle = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .send()
+        .await
+        .unwrap();
+
+    handle.abort().await.unwrap();
+
+    assert!(rx.contents().contains("received cancellation signal"));
+}
+
+#[tokio::test]
+async fn test_failed_list_objects_should_cancel_the_operation() {
+    let (_guard, rx) = capture_test_logs();
+
+    let bucket = MockBucket::builder()
+        .key_with_size("key1", 12)
+        .key_with_error("key2")
+        .key_with_size("key3", 7)
+        .build();
+
+    let mut rules = bucket.get_object_rules();
+    rules.push(mock!(aws_sdk_s3::Client::list_objects_v2).then_http_response(error_http_resp));
+    let client =
+        mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
+
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_s3_transfer_manager::Client::new(config);
+
+    let dest = tempfile::tempdir().unwrap();
+
+    let handle = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .send()
+        .await
+        .unwrap();
+
+    let err = handle.join().await.unwrap_err();
+    assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
+    let service_error = err
+        .source()
+        .unwrap()
+        .downcast_ref::<SdkError<ListObjectsV2Error, Response>>()
+        .expect("should downcast to `SdkError`");
+    assert!(service_error
+        .raw_response()
+        .unwrap()
+        .status()
+        .is_server_error());
+
+    // `ListObjectsV2` didn't list a single object and existed, so no one received a cancellation signal.
+    // Configuring the mock behavior of `ListObjectsV2` so it falis to list halfway through is more interesting
+    // for testing, but can make the test more complex.
+    assert!(!rx.contents().contains("received cancellation signal"));
+}
+
+#[tokio::test]
+async fn test_failed_get_object_should_cancel_the_operation() {
+    let (_guard, rx) = capture_test_logs();
+
+    let bucket = MockBucket::builder()
+        .key_with_size("key1", 12)
+        .key_with_error("key2")
+        .key_with_size("key3", 7)
+        .build();
+
+    let client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        bucket.rules().as_slice()
+    );
+
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_s3_transfer_manager::Client::new(config);
+
+    let dest = tempfile::tempdir().unwrap();
+
+    let handle = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .send()
+        .await
+        .unwrap();
+
+    let err = handle.join().await.unwrap_err();
+    assert_eq!(&ErrorKind::ObjectNotDiscoverable, err.kind());
+
+    let logs = rx.contents();
+    assert!(
+        logs.contains("received cancellation signal")
+            || logs.contains("req channel closed, worker finished")
+    );
+}
+
+#[tokio::test]
+async fn test_drop_download_objects_handle() {
+    let bucket = MockBucket::builder()
+        .key_with_size("key1", 12)
+        .key_with_error("key2")
+        .key_with_size("key3", 7)
+        .build();
+
+    let (watch_tx, watch_rx) = watch::channel(());
+
+    let rule = mock!(aws_sdk_s3::Client::get_object).then_output({
+        watch_tx.send(()).unwrap();
+        move || GetObjectOutput::builder().build()
+    });
+
+    let s3_client = mock_client_with_stubbed_http_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        vec![rule, bucket.list_objects_rule()].as_slice()
+    );
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let tm = aws_s3_transfer_manager::Client::new(config);
+
+    let dest = tempfile::tempdir().unwrap();
+
+    let handle = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .send()
+        .await
+        .unwrap();
+
+    // Wait until execution reaches the point just before returning `GetObjectOutput`,
+    // as dropping `handle` immediately after creation may not be interesting for testing.
+    while !watch_rx.has_changed().unwrap() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Give some time so spawned tasks might be able to proceed with their tasks a bit.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // should not panic
+    drop(handle)
 }

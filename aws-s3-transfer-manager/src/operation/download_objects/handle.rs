@@ -5,6 +5,8 @@
 
 use tokio::task;
 
+use crate::{error::ErrorKind, types::FailedTransferPolicy};
+
 use super::{DownloadObjectsContext, DownloadObjectsOutput};
 
 /// Handle for `DownloadObjects` transfer operation
@@ -19,14 +21,57 @@ pub struct DownloadObjectsHandle {
 
 impl DownloadObjectsHandle {
     /// Consume the handle and wait for download transfer to complete
+    ///
+    /// When the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Abort`], this method
+    /// will return the first error if any of the spawned tasks encounter one. The other tasks
+    /// will be canceled, but their cancellations will not be reported as errors by this method;
+    /// they will be logged as errors, instead.
+    ///
+    /// If the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Continue`], the
+    /// [`DownloadObjectsOutput`] will include a detailed breakdown, including the number of
+    /// successful downloads and the number of failed ones.
+    ///
+    // TODO(aws-sdk-rust#1159) - Consider if we want to return other all errors encountered during cancellation.
     #[tracing::instrument(skip_all, level = "debug", name = "join-download-objects")]
     pub async fn join(mut self) -> Result<DownloadObjectsOutput, crate::error::Error> {
-        // TODO - Consider implementing more sophisticated error handling such as canceling in-progress transfers
+        let mut first_error_to_report = None;
         // join all tasks
         while let Some(join_result) = self.tasks.join_next().await {
-            join_result??;
+            let result = join_result.expect("task completed");
+            if let Err(e) = result {
+                match self.ctx.state.input.failure_policy() {
+                    FailedTransferPolicy::Abort
+                        if first_error_to_report.is_none()
+                            && e.kind() != &ErrorKind::OperationCancelled =>
+                    {
+                        first_error_to_report = Some(e);
+                    }
+                    FailedTransferPolicy::Continue => {
+                        tracing::warn!("encountered but dismissed error when the failure policy is `Continue`: {e}")
+                    }
+                    _ => {}
+                }
+            }
         }
 
-        Ok(DownloadObjectsOutput::from(self.ctx.state.as_ref()))
+        if let Some(e) = first_error_to_report {
+            Err(e)
+        } else {
+            Ok(DownloadObjectsOutput::from(self.ctx.state.as_ref()))
+        }
+    }
+
+    /// Aborts all tasks owned by the handle.
+    pub async fn abort(&mut self) -> Result<(), crate::error::Error> {
+        if self.ctx.state.input.failure_policy() == &FailedTransferPolicy::Abort {
+            if self.ctx.state.cancel_tx.send(true).is_err() {
+                tracing::debug!(
+                    "all receiver ends have been dropped, unable to send a cancellation signal"
+                );
+            }
+            while (self.tasks.join_next().await).is_some() {}
+        }
+
+        Ok(())
     }
 }
