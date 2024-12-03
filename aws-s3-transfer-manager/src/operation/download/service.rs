@@ -154,7 +154,7 @@ pub(super) fn distribute_work(
             let resp = svc.oneshot(req).await;
             if let Err(err) = &resp {
                 if *err.kind() != ErrorKind::OperationCancelled && cancel_tx.send(true).is_err() {
-                    tracing::warn!(
+                    tracing::debug!(
                         "all receiver ends have dropped, unable to send a cancellation signal"
                     );
                 }
@@ -163,7 +163,7 @@ pub(super) fn distribute_work(
             if let Err(err) = comp_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
                 if cancel_tx.send(true).is_err() {
-                    tracing::warn!(
+                    tracing::debug!(
                         "all receiver ends have dropped, unable to send a cancellation signal"
                     );
                 }
