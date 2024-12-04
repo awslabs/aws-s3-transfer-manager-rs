@@ -7,13 +7,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time;
 
-use aws_config::AppName;
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::error::DisplayErrorContext;
+use aws_types::app_name::AppName;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use tokio::fs;

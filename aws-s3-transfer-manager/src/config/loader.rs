@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_config::{AppName, BehaviorVersion};
+use aws_config::BehaviorVersion;
 use aws_runtime::sdk_feature::AwsSdkFeature;
 use aws_sdk_s3::config::{Intercept, IntoShared};
+use aws_types::app_name::AppName;
 
 use crate::config::Builder;
 use crate::{
@@ -28,7 +29,7 @@ impl Intercept for TransferManagerFeatureInterceptor {
         cfg: &mut aws_sdk_s3::config::ConfigBag,
     ) -> Result<(), aws_sdk_s3::error::BoxError> {
         cfg.interceptor_state()
-            .store_append(AwsSdkFeature::S3Transfer);
+            .store_append::<AwsSdkFeature>(AwsSdkFeature::S3Transfer);
         Ok(())
     }
 }

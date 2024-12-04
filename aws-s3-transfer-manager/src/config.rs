@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_config::AppName;
+use aws_types::app_name::AppName;
 
 use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencySetting, PartSize};
