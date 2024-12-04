@@ -105,3 +105,31 @@ impl ConfigLoader {
         builder.build()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::types::{ConcurrencySetting, PartSize};
+    use aws_sdk_s3::config::Intercept;
+    use aws_types::app_name::AppName;
+
+    #[tokio::test]
+    async fn load_with_app_name_and_interceptor() {
+        let expected_app_name = "bananas";
+
+        let config = crate::from_env()
+            .concurrency(ConcurrencySetting::Explicit(123))
+            .part_size(PartSize::Target(8))
+            .app_name(Some(AppName::new(expected_app_name).unwrap()))
+            .load()
+            .await;
+        let sdk_s3_config = config.client().config();
+        assert_eq!(
+            sdk_s3_config.app_name().unwrap().as_ref(),
+            expected_app_name
+        );
+        let tm_interceptor_exists = sdk_s3_config
+            .interceptors()
+            .any(|item| item.name() == "TransferManagerFeature");
+        assert!(tm_interceptor_exists);
+    }
+}
