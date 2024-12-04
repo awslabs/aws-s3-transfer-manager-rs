@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time;
 
+use aws_config::AppName;
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
@@ -151,6 +152,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
+        .app_name(Some(AppName::new("rust_ts_cp").unwrap()))
         .load()
         .await;
 
@@ -228,6 +230,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
+        .app_name(Some(AppName::new("rust_ts_cp").unwrap()))
         .load()
         .await;
 
@@ -278,6 +281,7 @@ async fn main() -> Result<(), BoxError> {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_thread_ids(true)
+            .with_ansi(false) // Disable ANSI colors
             .init();
     }
 

@@ -3,12 +3,38 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_config::{AppName, BehaviorVersion};
+use aws_sdk_s3::config::{Intercept, IntoShared};
+use aws_smithy_runtime::client::sdk_feature::SmithySdkFeature;
+
 use crate::config::Builder;
 use crate::{
     http,
     types::{ConcurrencySetting, PartSize},
     Config,
 };
+
+#[derive(Debug)]
+struct TransferManagerFeatureInterceptor;
+
+impl Intercept for TransferManagerFeatureInterceptor {
+    fn name(&self) -> &'static str {
+        "TransferManagerFeature"
+    }
+
+    fn read_before_execution(
+        &self,
+        _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        cfg.interceptor_state()
+            // .store_put(AppName::new("crt-dengket").unwrap())
+            // .store_append(AwsSdkFeature::S3Transfer)
+            .store_append::<SmithySdkFeature>(SmithySdkFeature::ProtocolRpcV2Cbor)
+            .store_append::<SmithySdkFeature>(SmithySdkFeature::Waiter);
+        Ok(())
+    }
+}
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
@@ -52,17 +78,32 @@ impl ConfigLoader {
         self
     }
 
+    /// Sets the name of the app that is using the client.
+    ///
+    /// This _optional_ name is used to identify the application in the user agent that
+    /// gets sent along with requests.
+    pub fn app_name(mut self, app_name: Option<AppName>) -> Self {
+        self.builder = self.builder.app_name(app_name);
+        self
+    }
+
     /// Load the default configuration
     ///
     /// If fields have been overridden during builder construction, the override values will be
     /// used. Otherwise, the default values for each field will be provided.
     pub async fn load(self) -> Config {
-        let shared_config = aws_config::from_env()
-            .http_client(http::default_client())
-            .load()
-            .await;
-        let s3_client = aws_sdk_s3::Client::new(&shared_config);
-        let builder = self.builder.client(s3_client);
+        let mut config_loader =
+            aws_config::defaults(BehaviorVersion::latest()).http_client(http::default_client());
+        if let Some(app_name) = self.builder.app_name.as_ref() {
+            config_loader = config_loader.app_name(app_name.clone());
+        }
+        let shared_config = config_loader.load().await;
+
+        let mut sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
+        sdk_client_builder.push_interceptor(TransferManagerFeatureInterceptor.into_shared());
+        let builder = self
+            .builder
+            .client(aws_sdk_s3::Client::from_conf(sdk_client_builder.build()));
         builder.build()
     }
 }

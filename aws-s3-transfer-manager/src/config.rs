@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_config::AppName;
+
 use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencySetting, PartSize};
 use std::cmp;
@@ -18,6 +20,7 @@ pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
+    app_name: Option<AppName>,
     client: aws_sdk_s3::client::Client,
 }
 
@@ -43,6 +46,11 @@ impl Config {
         &self.concurrency
     }
 
+    /// Returns the name of the app that is using the transfer manager, if it was provided.
+    pub fn app_name(&self) -> Option<&AppName> {
+        self.app_name.as_ref()
+    }
+
     /// The Amazon S3 client instance that will be used to send requests to S3.
     pub fn client(&self) -> &aws_sdk_s3::Client {
         &self.client
@@ -55,6 +63,7 @@ pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
+    app_name: Option<AppName>,
     client: Option<aws_sdk_s3::Client>,
 }
 
@@ -122,8 +131,20 @@ impl Builder {
         self
     }
 
+    /// Sets the name of the app that is using the client.
+    ///
+    /// This _optional_ name is used to identify the application in the user agent that
+    /// gets sent along with requests.
+    pub fn app_name(mut self, app_name: Option<AppName>) -> Self {
+        self.app_name = app_name;
+        self
+    }
+
     /// Set an explicit S3 client to use.
     pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
+        // TODO - decide the approach here:
+        // - Convert the client to build to modify it based on other configs for transfer manager
+        // - Instead of taking the client, take sdk-config/s3-config/builder?
         self.client = Some(client);
         self
     }
@@ -134,6 +155,7 @@ impl Builder {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
+            app_name: self.app_name,
             client: self.client.expect("client set"),
         }
     }
