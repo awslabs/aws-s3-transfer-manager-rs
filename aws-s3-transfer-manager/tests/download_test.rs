@@ -192,8 +192,7 @@ async fn test_abort_download() {
     let _ = handle.object_meta().await;
     handle.abort().await;
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert!(requests.len() < data.len()/part_size);
-
+    assert!(requests.len() < data.len() / part_size);
 }
 
 pin_project! {
