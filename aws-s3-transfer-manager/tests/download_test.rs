@@ -10,7 +10,6 @@ use aws_s3_transfer_manager::{
     types::{ConcurrencySetting, PartSize},
 };
 use pin_project_lite::pin_project;
-use std::io::Write;
 use std::{
     cmp,
     iter::{self, repeat_with},
@@ -175,6 +174,26 @@ async fn test_output_not_consumed() {
         .unwrap();
 
     let _ = handle.ouput_mut().next().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_abort_download() {
+    let data = rand_data(25 * MEBIBYTE);
+    let part_size = 5 * MEBIBYTE;
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = handle.object_meta().await;
+    handle.abort().await;
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert!(requests.len() < data.len()/part_size);
+
 }
 
 pin_project! {

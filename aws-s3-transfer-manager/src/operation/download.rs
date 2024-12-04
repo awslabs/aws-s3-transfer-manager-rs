@@ -11,7 +11,7 @@ pub use input::{DownloadInput, DownloadInputBuilder};
 
 /// Operation builders
 pub mod builders;
-/// Abstractions for response bodies and consuming data streams.
+/// Abstractions for responses and consuming data streams.
 pub mod output;
 
 mod discovery;
