@@ -191,8 +191,8 @@ async fn download_single_obj(
         .has_changed()
         .expect("the channel should be open as it is owned by `DownloadObjectsState`")
     {
-         handle.abort().await;
-         return Err(error::operation_cancelled());
+        handle.abort().await;
+        return Err(error::operation_cancelled());
     }
 
     let _ = handle.object_meta().await?;
