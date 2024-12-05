@@ -10,7 +10,7 @@ use std::cmp;
 pub(crate) mod loader;
 
 /// Minimum upload part size in bytes
-const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
 /// Configuration for a [`Client`](crate::client::Client)
 #[derive(Debug, Clone)]

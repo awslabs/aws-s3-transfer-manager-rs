@@ -12,7 +12,6 @@ use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOut
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_smithy_mocks_experimental::{mock, RuleMode};
-use aws_smithy_runtime::client::http::test_util::infallible_client_fn;
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
@@ -116,15 +115,6 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
 async fn test_many_uploads_no_deadlock() {
     let (_guard, _rx) = capture_test_logs();
     let client = mock_s3_client_for_multipart_upload();
-    let client = aws_sdk_s3::Client::from_conf(
-        client
-            .config()
-            .to_builder()
-            .http_client(infallible_client_fn(|_req| {
-                http_02x::Response::builder().status(200).body("").unwrap()
-            }))
-            .build(),
-    );
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
