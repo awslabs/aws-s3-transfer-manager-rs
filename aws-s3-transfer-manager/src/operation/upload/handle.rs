@@ -127,11 +127,12 @@ impl UploadHandle {
             Some(UploadType::PutObject { put_object_task }) => {
                 put_object_task.abort();
                 let _ = put_object_task.await?;
+                Ok(AbortedUpload::default())
             }
             Some(UploadType::MultipartUpload {
                 upload_part_tasks,
                 read_body_tasks,
-                response: _
+                response,
             }) => {
                 // cancel in-progress read_body tasks
                 read_body_tasks.abort_all();
@@ -143,43 +144,42 @@ impl UploadHandle {
 
                 // join all tasks
                 while (tasks.join_next().await).is_some() {}
+
+                let abort_policy = self
+                    .ctx
+                    .request
+                    .failed_multipart_upload_policy
+                    .clone()
+                    .unwrap_or_default();
+                    // todo: fix unwrap
+                let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
+                match abort_policy {
+                    FailedMultipartUploadPolicy::AbortUpload => abort_upload(&self.ctx, upload_id).await,
+                    FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+                }
             }
-        };
-
-        if !self.ctx.is_multipart_upload() {
-            return Ok(AbortedUpload::default());
-        }
-
-        let abort_policy = self
-            .ctx
-            .request
-            .failed_multipart_upload_policy
-            .clone()
-            .unwrap_or_default();
-
-        match abort_policy {
-            FailedMultipartUploadPolicy::AbortUpload => abort_upload(self).await,
-            FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
         }
     }
 }
 
-async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::error::Error> {
-    let abort_mpu_resp = handle
-        .ctx
+async fn abort_upload(
+    ctx: &UploadContext,
+    upload_id: String,
+) -> Result<AbortedUpload, crate::error::Error> {
+    let abort_mpu_resp = ctx
         .client()
         .abort_multipart_upload()
-        .set_bucket(handle.ctx.request.bucket.clone())
-        .set_key(handle.ctx.request.key.clone())
-        .set_upload_id(handle.ctx.upload_id.clone())
-        .set_request_payer(handle.ctx.request.request_payer.clone())
-        .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
+        .set_bucket(ctx.request.bucket.clone())
+        .set_key(ctx.request.key.clone())
+        .set_upload_id(Some(upload_id.clone()))
+        .set_request_payer(ctx.request.request_payer.clone())
+        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .send()
         .instrument(tracing::debug_span!("send-abort-multipart-upload"))
         .await?;
 
     let aborted_upload = AbortedUpload {
-        upload_id: handle.ctx.upload_id.clone(),
+        upload_id: Some(upload_id),
         request_charged: abort_mpu_resp.request_charged,
     };
 
@@ -242,6 +242,8 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
             // parts must be sorted
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
 
+            // todo: fix
+            let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
             // complete the multipart upload
             let complete_mpu_resp = handle
                 .ctx
@@ -249,7 +251,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                 .complete_multipart_upload()
                 .set_bucket(handle.ctx.request.bucket.clone())
                 .set_key(handle.ctx.request.key.clone())
-                .set_upload_id(handle.ctx.upload_id.clone())
+                .set_upload_id(Some(upload_id))
                 .multipart_upload(
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(all_parts))

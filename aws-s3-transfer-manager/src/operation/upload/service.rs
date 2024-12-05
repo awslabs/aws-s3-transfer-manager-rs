@@ -15,13 +15,14 @@ use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::{handle::UploadType, UploadHandle};
+use super::handle::UploadType;
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
+    pub(super) upload_id: String,
 }
 
 /// handler (service fn) for a single part
@@ -37,7 +38,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .upload_part()
         .set_bucket(ctx.request.bucket.clone())
         .set_key(ctx.request.key.clone())
-        .set_upload_id(ctx.upload_id.clone())
+        .set_upload_id(Some(request.upload_id))
         .part_number(part_number)
         .content_length(part_data.data.remaining() as i64)
         .body(ByteStream::from(part_data.data))
@@ -100,6 +101,7 @@ pub(super) fn distribute_work(
     ctx: UploadContext,
     stream: InputStream,
     part_size: u64,
+    upload_id: String,
 ) -> Result<(), error::Error> {
     let part_reader = Arc::new(
         PartReaderBuilder::new()
@@ -142,6 +144,7 @@ pub(super) fn distribute_work(
                 let worker = read_body(
                     part_reader.clone(),
                     ctx.clone(),
+                    upload_id.clone(),
                     svc.clone(),
                     upload_part_tasks.clone(),
                     parent_span_for_upload_tasks.clone(),
@@ -159,6 +162,7 @@ pub(super) fn distribute_work(
 pub(super) async fn read_body(
     part_reader: Arc<PartReader>,
     ctx: UploadContext,
+    upload_id: String,
     svc: impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
         + Clone
         + Send
@@ -174,6 +178,7 @@ pub(super) async fn read_body(
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
+            upload_id: upload_id.clone(),
         };
         let svc = svc.clone();
         let task = svc.oneshot(req);

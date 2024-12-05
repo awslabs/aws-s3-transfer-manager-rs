@@ -171,12 +171,13 @@ async fn try_start_mpu_upload(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
+    let upload_id = mpu.upload_id.clone().expect("upload_id is present");
 
     let mut upload_type = UploadType::MultipartUpload { upload_part_tasks: Default::default(), read_body_tasks: Default::default(), response: Some(mpu) };
     //let mut handle = UploadHandle::new_multipart(ctx);
     // TODO: Fix
     //handle.set_response(mpu);
-    distribute_work(&mut upload_type, ctx, stream, part_size)?;
+    distribute_work(&mut upload_type, ctx, stream, part_size, upload_id)?;
     Ok(upload_type)
 }
 
@@ -184,7 +185,6 @@ fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadCo
     UploadContext {
         handle,
         request: Arc::new(req),
-        upload_id: None,
     }
 }
 
