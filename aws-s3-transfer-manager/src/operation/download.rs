@@ -120,7 +120,7 @@ async fn send_discovery(
         Ok(permit) => permit,
         Err(err) => {
             if comp_tx.send(Err(err)).await.is_err() {
-                tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
+                tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
             }
             return;
         }
@@ -132,7 +132,7 @@ async fn send_discovery(
         Ok(discovery) => discovery,
         Err(err) => {
             if comp_tx.send(Err(err)).await.is_err() {
-                tracing::debug!("Download handle for key({}) has been dropped, aborting during the discovery phase", input.key.unwrap_or("None".to_string()));
+                tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
             }
             return;
         }
@@ -140,8 +140,8 @@ async fn send_discovery(
 
     if object_meta_tx.send(discovery.object_meta).is_err() {
         tracing::debug!(
-            "Download handle for key({}) has been dropped, aborting during the discovery phase",
-            input.key.unwrap_or("None".to_string())
+            "Download handle for key({:?}) has been dropped, aborting during the discovery phase",
+            input.key
         );
         return;
     }
