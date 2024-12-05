@@ -59,7 +59,7 @@ impl DownloadHandle {
     }
 
     /// Mutable reference to the output
-    pub fn ouput_mut(&mut self) -> &mut DownloadOutput {
+    pub fn output_mut(&mut self) -> &mut DownloadOutput {
         &mut self.output
     }
 

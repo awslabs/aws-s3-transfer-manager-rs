@@ -173,7 +173,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     //      TM will handle it's own thread pool for filesystem work
     let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
 
-    write_body(handle.ouput_mut(), dest)
+    write_body(handle.output_mut(), dest)
         .instrument(tracing::debug_span!("write-output"))
         .await?;
 
