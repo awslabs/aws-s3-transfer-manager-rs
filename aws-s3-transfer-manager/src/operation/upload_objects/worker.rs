@@ -751,11 +751,11 @@ mod tests {
         let resume_upload_single_obj_tx = Arc::new(resume_upload_single_obj_tx);
 
         let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-            let c = wait_till_create_mpu.clone();
+            let wait_till_create_mpu = wait_till_create_mpu.clone();
             let upload_id = upload_id.clone();
             move || {
                 // This ensures that a cancellation signal won't be sent until `create_multipart_upload`.
-                c.wait();
+                wait_till_create_mpu.wait();
 
                 // This increases the reliability of the test, ensuring that the cancellation signal has been sent
                 // and that `upload_single_obj` can now resume.
