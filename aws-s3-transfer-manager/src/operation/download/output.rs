@@ -17,7 +17,7 @@ use super::chunk_meta::ChunkMetadata;
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
 /// The data on this stream is sequenced into the correct order.
 #[derive(Debug)]
-pub struct Output {
+pub struct DownloadOutput {
     inner: UnorderedOutput,
     sequencer: Sequencer,
 }
@@ -42,7 +42,7 @@ pub struct ChunkOutput {
 // TODO: Do we want to expose something to yield multiple chunks in a single call, like
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
-impl Output {
+impl DownloadOutput {
     /// Create a new empty output
     pub fn empty() -> Self {
         Self::new_from_channel(None)
@@ -205,7 +205,7 @@ mod tests {
     use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
 
-    use super::{AggregatedBytes, Output, Sequencer};
+    use super::{AggregatedBytes, DownloadOutput, Sequencer};
 
     fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
         ChunkOutput {
@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_ouput_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut output = Output::new(rx);
+        let mut output = DownloadOutput::new(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_output_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut output: Output = Output::new(rx);
+        let mut output: DownloadOutput = DownloadOutput::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();

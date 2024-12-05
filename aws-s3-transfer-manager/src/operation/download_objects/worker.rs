@@ -2,6 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+use crate::operation::download::DownloadOutput;
 use async_channel::{Receiver, Sender};
 use path_clean::PathClean;
 use std::borrow::Cow;
@@ -12,7 +13,6 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::{self, ErrorKind};
-use crate::operation::download::output::Output;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
 use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{DownloadFilter, FailedDownload, FailedTransferPolicy};
@@ -196,7 +196,7 @@ async fn download_single_obj(
     }
 
     let _ = handle.object_meta().await?;
-    let mut output: Output = mem::replace(&mut handle.output, Output::empty());
+    let mut output: DownloadOutput = mem::replace(&mut handle.output, DownloadOutput::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
     fs::create_dir_all(parent_dir).await?;

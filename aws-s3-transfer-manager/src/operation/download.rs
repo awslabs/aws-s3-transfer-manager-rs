@@ -12,7 +12,8 @@ pub use input::{DownloadInput, DownloadInputBuilder};
 /// Operation builders
 pub mod builders;
 /// Abstractions for responses and consuming data streams.
-pub mod output;
+mod output;
+pub use output::{ChunkOutput, DownloadOutput};
 
 mod discovery;
 
@@ -34,7 +35,6 @@ use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
 use discovery::discover_obj;
-use output::{ChunkOutput, Output};
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -85,7 +85,7 @@ impl Download {
         ));
 
         Ok(DownloadHandle {
-            output: Output::new(comp_rx),
+            output: DownloadOutput::new(comp_rx),
             tasks,
             discovery,
             object_meta_receiver: Mutex::new(Some(object_meta_rx)),
