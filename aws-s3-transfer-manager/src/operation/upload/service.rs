@@ -96,7 +96,8 @@ pub(super) fn upload_part_service(
 /// * stream - the body input stream
 /// * part_size - the part_size for each part
 pub(super) fn distribute_work(
-    handle: &mut UploadHandle,
+    upload_type: &mut UploadType,
+    ctx: UploadContext,
     stream: InputStream,
     part_size: u64,
 ) -> Result<(), error::Error> {
@@ -106,19 +107,20 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
-    match &mut handle.upload_type {
+    match upload_type {
         UploadType::PutObject { .. } => {
             unreachable!("distribute_work must not be called for PutObject.")
         }
         UploadType::MultipartUpload {
             upload_part_tasks,
             read_body_tasks,
+            response: _,
         } => {
             // group all spawned tasks together
             let parent_span_for_all_tasks = tracing::debug_span!(
                 parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
-                bucket = handle.ctx.request.bucket().unwrap_or_default(),
-                key = handle.ctx.request.key().unwrap_or_default(),
+                bucket = ctx.request.bucket().unwrap_or_default(),
+                key = ctx.request.key().unwrap_or_default(),
             );
             parent_span_for_all_tasks.follows_from(tracing::Span::current());
 
@@ -134,12 +136,12 @@ pub(super) fn distribute_work(
                 "upload-net-tasks"
             );
 
-            let svc = upload_part_service(&handle.ctx);
-            let n_workers = handle.ctx.handle.num_workers();
+            let svc = upload_part_service(&ctx);
+            let n_workers = ctx.handle.num_workers();
             for _ in 0..n_workers {
                 let worker = read_body(
                     part_reader.clone(),
-                    handle.ctx.clone(),
+                    ctx.clone(),
                     svc.clone(),
                     upload_part_tasks.clone(),
                     parent_span_for_upload_tasks.clone(),

@@ -17,11 +17,13 @@ use crate::io::InputStream;
 use aws_smithy_types::byte_stream::ByteStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
+use handle::UploadType;
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
 use service::distribute_work;
+use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use std::cmp;
@@ -40,10 +42,24 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
+        let stream = input.take_body();
+        let ctx = new_context(handle.clone(), input);
+        // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
+        let upload_type: Arc<Mutex<Option<UploadType>>> = Default::default();
+        let task = tokio::spawn(try_start_upload(handle.clone(), stream, ctx.clone(), upload_type.clone()));
+
+        Ok(UploadHandle::new(ctx, task, upload_type))
+    }
+}
+
+async fn try_start_upload(
+    handle: Arc<crate::client::Handle>,
+    stream: InputStream,
+    ctx: UploadContext,
+    upload_type: Arc<Mutex<Option<UploadType>>>,
+) -> Result<(), crate::error::Error> {
         let min_mpu_threshold = handle.mpu_threshold_bytes();
 
-        let stream = input.take_body();
-        let ctx = new_context(handle, input);
 
         // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
         // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
@@ -52,8 +68,7 @@ impl Upload {
             .upper()
             .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
-        // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
-        let handle = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
+    let final_upload_type = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
             tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
             try_start_put_object(ctx, stream, content_length).await?
         } else {
@@ -62,24 +77,21 @@ impl Upload {
             try_start_mpu_upload(ctx, stream, content_length).await?
         };
 
-        Ok(handle)
-    }
+    let mut upload_type = upload_type.lock().await;
+    upload_type.insert(final_upload_type);
+    Ok(())
 }
-
 async fn try_start_put_object(
     ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<UploadHandle, crate::error::Error> {
+) -> Result<UploadType, crate::error::Error> {
     let byte_stream = stream.into_byte_stream().await?;
     let content_length: i64 = content_length.try_into().map_err(|_| {
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
-
-    Ok(UploadHandle::new_put_object(
-        ctx.clone(),
-        tokio::spawn(put_object(ctx.clone(), byte_stream, content_length)),
-    ))
+    let task = tokio::spawn(put_object(ctx.clone(), byte_stream, content_length));
+    Ok(UploadType::PutObject { put_object_task: task })
 }
 
 async fn put_object(
@@ -147,7 +159,7 @@ async fn try_start_mpu_upload(
     ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<UploadHandle, crate::error::Error> {
+) -> Result<UploadType, crate::error::Error> {
     let part_size = cmp::max(
         ctx.handle.upload_part_size_bytes(),
         content_length / MAX_PARTS,
@@ -160,10 +172,12 @@ async fn try_start_mpu_upload(
         mpu.upload_id
     );
 
-    let mut handle = UploadHandle::new_multipart(ctx);
-    handle.set_response(mpu);
-    distribute_work(&mut handle, stream, part_size)?;
-    Ok(handle)
+    let mut upload_type = UploadType::MultipartUpload { upload_part_tasks: Default::default(), read_body_tasks: Default::default(), response: Some(mpu) };
+    //let mut handle = UploadHandle::new_multipart(ctx);
+    // TODO: Fix
+    //handle.set_response(mpu);
+    distribute_work(&mut upload_type, ctx, stream, part_size)?;
+    Ok(upload_type)
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
