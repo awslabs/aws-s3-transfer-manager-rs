@@ -152,7 +152,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .app_name(Some(AppName::new("rust_ts_cp").unwrap()))
+        .app_name(Some(AppName::new("transfer_manager_example_cp").unwrap()))
         .load()
         .await;
 
@@ -230,7 +230,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .app_name(Some(AppName::new("rust_ts_cp").unwrap()))
+        .app_name(Some(AppName::new("transfer_manager_example_cp").unwrap()))
         .load()
         .await;
 
