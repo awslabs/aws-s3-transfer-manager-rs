@@ -5,8 +5,9 @@
 
 use aws_config::BehaviorVersion;
 use aws_runtime::sdk_feature::AwsSdkFeature;
+use aws_runtime::user_agent::{ApiMetadata, AwsUserAgent, FrameworkMetadata};
 use aws_sdk_s3::config::{Intercept, IntoShared};
-use aws_types::app_name::AppName;
+use aws_types::os_shim_internal::Env;
 
 use crate::config::Builder;
 use crate::{
@@ -16,11 +17,13 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct TransferManagerFeatureInterceptor;
+struct S3TransferManagerInterceptor {
+    frame_work_meta_data: Option<FrameworkMetadata>,
+}
 
-impl Intercept for TransferManagerFeatureInterceptor {
+impl Intercept for S3TransferManagerInterceptor {
     fn name(&self) -> &'static str {
-        "TransferManagerFeature"
+        "S3TransferManager"
     }
 
     fn read_before_execution(
@@ -28,8 +31,20 @@ impl Intercept for TransferManagerFeatureInterceptor {
         _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
         cfg: &mut aws_sdk_s3::config::ConfigBag,
     ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        // Assume the interceptor only be added to the client constructed by the loader.
+        // In this case, there should not be any user agent was sent before this interceptor starts.
+        // Create our own user agent with S3Transfer feature and user passed-in framework_meta_data if any.
         cfg.interceptor_state()
-            .store_append::<AwsSdkFeature>(AwsSdkFeature::S3Transfer);
+            .store_append(AwsSdkFeature::S3Transfer);
+        let api_metadata = cfg.load::<ApiMetadata>().unwrap();
+        // TODO: maybe APP Name someday
+        let mut ua = AwsUserAgent::new_from_environment(Env::real(), api_metadata.clone());
+        if let Some(framework_metadata) = self.frame_work_meta_data.clone() {
+            ua = ua.with_framework_metadata(framework_metadata);
+        }
+
+        cfg.interceptor_state().store_put(ua);
+
         Ok(())
     }
 }
@@ -80,8 +95,8 @@ impl ConfigLoader {
     ///
     /// This _optional_ name is used to identify the application in the user agent that
     /// gets sent along with requests.
-    pub fn app_name(mut self, app_name: Option<AppName>) -> Self {
-        self.builder = self.builder.app_name(app_name);
+    pub fn frame_metadata(mut self, frame_metadata: Option<FrameworkMetadata>) -> Self {
+        self.builder = self.builder.frame_metadata(frame_metadata);
         self
     }
 
@@ -90,15 +105,17 @@ impl ConfigLoader {
     /// If fields have been overridden during builder construction, the override values will be
     /// used. Otherwise, the default values for each field will be provided.
     pub async fn load(self) -> Config {
-        let mut config_loader =
-            aws_config::defaults(BehaviorVersion::latest()).http_client(http::default_client());
-        if let Some(app_name) = self.builder.app_name.as_ref() {
-            config_loader = config_loader.app_name(app_name.clone());
-        }
-        let shared_config = config_loader.load().await;
+        let shared_config = aws_config::defaults(BehaviorVersion::latest())
+            .http_client(http::default_client())
+            .load()
+            .await;
 
         let mut sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
-        sdk_client_builder.push_interceptor(TransferManagerFeatureInterceptor.into_shared());
+
+        let interceptor = S3TransferManagerInterceptor {
+            frame_work_meta_data: self.builder.frame_metadata.clone(),
+        };
+        sdk_client_builder.push_interceptor(S3TransferManagerInterceptor::into_shared(interceptor));
         let builder = self
             .builder
             .client(aws_sdk_s3::Client::from_conf(sdk_client_builder.build()));
@@ -110,26 +127,20 @@ impl ConfigLoader {
 mod tests {
     use crate::types::{ConcurrencySetting, PartSize};
     use aws_sdk_s3::config::Intercept;
-    use aws_types::app_name::AppName;
 
     #[tokio::test]
-    async fn load_with_app_name_and_interceptor() {
-        let expected_app_name = "bananas";
-
+    async fn load_with_frame_metadata_and_interceptor() {
         let config = crate::from_env()
             .concurrency(ConcurrencySetting::Explicit(123))
             .part_size(PartSize::Target(8))
-            .app_name(Some(AppName::new(expected_app_name).unwrap()))
             .load()
             .await;
         let sdk_s3_config = config.client().config();
-        assert_eq!(
-            sdk_s3_config.app_name().unwrap().as_ref(),
-            expected_app_name
-        );
         let tm_interceptor_exists = sdk_s3_config
             .interceptors()
-            .any(|item| item.name() == "TransferManagerFeature");
+            .any(|item| item.name() == "S3TransferManager");
         assert!(tm_interceptor_exists);
     }
+
+    /* TODO: test the framework metadata added correctly */
 }

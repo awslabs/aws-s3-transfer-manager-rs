@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_types::app_name::AppName;
+use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencySetting, PartSize};
@@ -20,7 +20,7 @@ pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
-    app_name: Option<AppName>,
+    frame_metadata: Option<FrameworkMetadata>,
     client: aws_sdk_s3::client::Client,
 }
 
@@ -47,8 +47,8 @@ impl Config {
     }
 
     /// Returns the name of the app that is using the transfer manager, if it was provided.
-    pub fn app_name(&self) -> Option<&AppName> {
-        self.app_name.as_ref()
+    pub fn frame_metadata(&self) -> Option<&FrameworkMetadata> {
+        self.frame_metadata.as_ref()
     }
 
     /// The Amazon S3 client instance that will be used to send requests to S3.
@@ -63,7 +63,7 @@ pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencySetting,
-    app_name: Option<AppName>,
+    frame_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
 }
 
@@ -135,8 +135,8 @@ impl Builder {
     ///
     /// This _optional_ name is used to identify the application in the user agent that
     /// gets sent along with requests.
-    pub fn app_name(mut self, app_name: Option<AppName>) -> Self {
-        self.app_name = app_name;
+    pub fn frame_metadata(mut self, frame_metadata: Option<FrameworkMetadata>) -> Self {
+        self.frame_metadata = frame_metadata;
         self
     }
 
@@ -155,7 +155,7 @@ impl Builder {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
-            app_name: self.app_name,
+            frame_metadata: self.frame_metadata,
             client: self.client.expect("client set"),
         }
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -7,13 +8,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time;
 
+use aws_runtime::user_agent::FrameworkMetadata;
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::body::Body;
 use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
 use aws_sdk_s3::error::DisplayErrorContext;
-use aws_types::app_name::AppName;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use tokio::fs;
@@ -152,7 +153,9 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .app_name(Some(AppName::new("transfer_manager_example_cp").unwrap()))
+        .frame_metadata(Some(
+            FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
+        ))
         .load()
         .await;
 
@@ -230,7 +233,9 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .app_name(Some(AppName::new("transfer_manager_example_cp").unwrap()))
+        .frame_metadata(Some(
+            FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
+        ))
         .load()
         .await;
 
