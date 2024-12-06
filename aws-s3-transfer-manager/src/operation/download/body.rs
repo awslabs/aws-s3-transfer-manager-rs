@@ -22,7 +22,7 @@ pub struct Body {
     sequencer: Sequencer,
 }
 
-type OutputChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
+type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
 
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
@@ -43,23 +43,23 @@ pub struct ChunkOutput {
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
 impl Body {
-    /// Create a new empty output
+    /// Create a new empty body
     pub fn empty() -> Self {
         Self::new_from_channel(None)
     }
 
-    pub(crate) fn new(chunks: OutputChannel) -> Self {
+    pub(crate) fn new(chunks: BodyChannel) -> Self {
         Self::new_from_channel(Some(chunks))
     }
 
-    fn new_from_channel(chunks: Option<OutputChannel>) -> Self {
+    fn new_from_channel(chunks: Option<BodyChannel>) -> Self {
         Self {
             inner: UnorderedBody::new(chunks),
             sequencer: Sequencer::new(),
         }
     }
 
-    /// Convert this output into an unordered stream of chunks.
+    /// Convert this body into an unordered stream of chunks.
     // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
     // download_objects should utilize this so that it can write in parallel to files.
     #[allow(dead_code)]
@@ -70,7 +70,7 @@ impl Body {
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
-    /// Chunks returned from a [Output] are guaranteed to be sequenced
+    /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
     pub async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         loop {
@@ -97,7 +97,7 @@ impl Body {
         }
     }
 
-    /// Close the output, no more data will flow from it and all publishers will be notified.
+    /// Close the body, no more data will flow from it and all publishers will be notified.
     pub(crate) fn close(&mut self) {
         self.inner.close()
     }
@@ -166,14 +166,14 @@ impl PartialEq for SequencedChunk {
     }
 }
 
-/// Returns chunks in whatever order they are received.
+/// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
 pub(crate) struct UnorderedBody {
     chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
 }
 
 impl UnorderedBody {
-    fn new(chunks: Option<OutputChannel>) -> Self {
+    fn new(chunks: Option<BodyChannel>) -> Self {
         Self { chunks }
     }
 
@@ -190,7 +190,7 @@ impl UnorderedBody {
         }
     }
 
-    /// Close the output
+    /// Close the body
     pub(crate) fn close(&mut self) {
         if let Some(ch) = &mut self.chunks {
             ch.close();
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ouput_next() {
+    async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
         let mut output = Body::new(rx);
         tokio::spawn(async move {
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_output_next_error() {
+    async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
         let mut output: Body = Body::new(rx);
         tokio::spawn(async move {

@@ -178,7 +178,7 @@ async fn send_discovery(
 /// the starting sequence number to use for remaining chunks.
 ///
 /// NOTE: This function does _not_ wait to read the initial chunk from discovery but
-/// instead spawns a new task to read the stream and send it over the output channel.
+/// instead spawns a new task to read the stream and send it over the body channel.
 /// This allows remaining work to start immediately (and concurrently) without
 /// waiting for the first chunk.
 fn handle_discovery_chunk(
