@@ -19,7 +19,7 @@ use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::output::ChunkOutput;
+use super::body::ChunkOutput;
 use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.

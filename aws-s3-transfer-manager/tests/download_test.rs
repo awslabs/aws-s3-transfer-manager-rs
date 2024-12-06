@@ -46,7 +46,7 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
 
 /// drain/consume the output and return the body.
 async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
-    let output = handle.output_mut();
+    let output = handle.body_mut();
     let mut data = BytesMut::new();
     let mut error: Option<Error> = None;
     while let Some(chunk) = output.next().await {
@@ -173,7 +173,7 @@ async fn test_output_not_consumed() {
         .initiate()
         .unwrap();
 
-    let _ = handle.output_mut().next().await;
+    let _ = handle.body_mut().next().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

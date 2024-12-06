@@ -12,8 +12,8 @@ pub use input::{DownloadInput, DownloadInputBuilder};
 /// Operation builders
 pub mod builders;
 /// Abstractions for responses and consuming data streams.
-mod output;
-pub use output::{ChunkOutput, DownloadOutput};
+mod body;
+pub use body::{ChunkOutput, Body};
 
 mod discovery;
 
@@ -85,7 +85,7 @@ impl Download {
         ));
 
         Ok(DownloadHandle {
-            output: DownloadOutput::new(comp_rx),
+            body: Body::new(comp_rx),
             tasks,
             discovery,
             object_meta_receiver: Mutex::new(Some(object_meta_rx)),

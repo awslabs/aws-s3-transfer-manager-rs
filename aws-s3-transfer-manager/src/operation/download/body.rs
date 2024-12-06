@@ -17,8 +17,8 @@ use super::chunk_meta::ChunkMetadata;
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
 /// The data on this stream is sequenced into the correct order.
 #[derive(Debug)]
-pub struct DownloadOutput {
-    inner: UnorderedOutput,
+pub struct Body {
+    inner: UnorderedBody,
     sequencer: Sequencer,
 }
 
@@ -42,7 +42,7 @@ pub struct ChunkOutput {
 // TODO: Do we want to expose something to yield multiple chunks in a single call, like
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
-impl DownloadOutput {
+impl Body {
     /// Create a new empty output
     pub fn empty() -> Self {
         Self::new_from_channel(None)
@@ -54,7 +54,7 @@ impl DownloadOutput {
 
     fn new_from_channel(chunks: Option<OutputChannel>) -> Self {
         Self {
-            inner: UnorderedOutput::new(chunks),
+            inner: UnorderedBody::new(chunks),
             sequencer: Sequencer::new(),
         }
     }
@@ -63,7 +63,7 @@ impl DownloadOutput {
     // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
     // download_objects should utilize this so that it can write in parallel to files.
     #[allow(dead_code)]
-    pub(crate) fn unordered(self) -> UnorderedOutput {
+    pub(crate) fn unordered(self) -> UnorderedBody {
         self.inner
     }
 
@@ -168,11 +168,11 @@ impl PartialEq for SequencedChunk {
 
 /// Returns chunks in whatever order they are received.
 #[derive(Debug)]
-pub(crate) struct UnorderedOutput {
+pub(crate) struct UnorderedBody {
     chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
 }
 
-impl UnorderedOutput {
+impl UnorderedBody {
     fn new(chunks: Option<OutputChannel>) -> Self {
         Self { chunks }
     }
@@ -180,7 +180,7 @@ impl UnorderedOutput {
     /// Pull the next chunk of data off the stream.
     ///
     /// Returns [None] when there is no more data.
-    /// Chunks returned from an [UnorderedOutput] are not guaranteed to be sorted
+    /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
     pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
@@ -200,12 +200,12 @@ impl UnorderedOutput {
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::output::ChunkOutput};
+    use crate::{error, operation::download::body::ChunkOutput};
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
 
-    use super::{AggregatedBytes, DownloadOutput, Sequencer};
+    use super::{AggregatedBytes, Body, Sequencer};
 
     fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
         ChunkOutput {
@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_ouput_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut output = DownloadOutput::new(rx);
+        let mut output = Body::new(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_output_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut output: DownloadOutput = DownloadOutput::new(rx);
+        let mut output: Body = Body::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();

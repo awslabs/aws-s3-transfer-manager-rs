@@ -2,7 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::DownloadOutput;
+use crate::operation::download::Body;
 use async_channel::{Receiver, Sender};
 use path_clean::PathClean;
 use std::borrow::Cow;
@@ -196,7 +196,7 @@ async fn download_single_obj(
     }
 
     let _ = handle.object_meta().await?;
-    let mut output: DownloadOutput = mem::replace(&mut handle.output, DownloadOutput::empty());
+    let mut output: Body = mem::replace(&mut handle.body, Body::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
     fs::create_dir_all(parent_dir).await?;
