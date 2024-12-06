@@ -2,6 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+use crate::operation::download::Body;
 use async_channel::{Receiver, Sender};
 use path_clean::PathClean;
 use std::borrow::Cow;
@@ -12,7 +13,6 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::{self, ErrorKind};
-use crate::operation::download::body::Body;
 use crate::operation::download::{DownloadInput, DownloadInputBuilder};
 use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{DownloadFilter, FailedDownload, FailedTransferPolicy};
@@ -191,13 +191,8 @@ async fn download_single_obj(
         .has_changed()
         .expect("the channel should be open as it is owned by `DownloadObjectsState`")
     {
-        /*
-         * TODO(single download cleanup): Comment in the following lines of code once single download has been cleaned up.
-         *   Note that it may not be called `.abort()` depending on the outcome of the cleanup.
-         *
-         * handle.abort().await;
-         * return Err(error::operation_cancelled());
-         */
+        handle.abort().await;
+        return Err(error::operation_cancelled());
     }
 
     let _ = handle.object_meta().await?;
@@ -213,8 +208,6 @@ async fn download_single_obj(
             dest.write_all(segment.as_ref()).await?;
         }
     }
-
-    handle.join().await?;
 
     Ok(())
 }
