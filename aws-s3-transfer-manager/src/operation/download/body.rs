@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body: Body = Body::new(rx);
+        let mut body = Body::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();

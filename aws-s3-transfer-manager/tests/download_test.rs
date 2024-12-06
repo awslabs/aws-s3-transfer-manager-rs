@@ -44,12 +44,12 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
         .unwrap()
 }
 
-/// drain/consume the body 
+/// drain/consume the body
 async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
-    let output = handle.body_mut();
+    let body = handle.body_mut();
     let mut data = BytesMut::new();
     let mut error: Option<Error> = None;
-    while let Some(chunk) = output.next().await {
+    while let Some(chunk) = body.next().await {
         match chunk {
             Ok(chunk) => data.put(chunk.data.into_bytes()),
             Err(err) => {
@@ -160,7 +160,7 @@ async fn test_download_ranges() {
 
 /// Test body not consumed which should not prevent the handle from being dropped
 #[tokio::test]
-async fn test_output_not_consumed() {
+async fn test_body_not_consumed() {
     let data = rand_data(12 * MEBIBYTE);
     let part_size = 5 * MEBIBYTE;
 
