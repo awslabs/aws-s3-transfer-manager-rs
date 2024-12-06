@@ -3,12 +3,51 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_config::BehaviorVersion;
+use aws_runtime::sdk_feature::AwsSdkFeature;
+use aws_runtime::user_agent::{ApiMetadata, AwsUserAgent, FrameworkMetadata};
+use aws_sdk_s3::config::{Intercept, IntoShared};
+use aws_types::os_shim_internal::Env;
+
 use crate::config::Builder;
 use crate::{
     http,
     types::{ConcurrencySetting, PartSize},
     Config,
 };
+
+#[derive(Debug)]
+struct S3TransferManagerInterceptor {
+    frame_work_meta_data: Option<FrameworkMetadata>,
+}
+
+impl Intercept for S3TransferManagerInterceptor {
+    fn name(&self) -> &'static str {
+        "S3TransferManager"
+    }
+
+    fn read_before_execution(
+        &self,
+        _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        // Assume the interceptor only be added to the client constructed by the loader.
+        // In this case, there should not be any user agent was sent before this interceptor starts.
+        // Create our own user agent with S3Transfer feature and user passed-in framework_meta_data if any.
+        cfg.interceptor_state()
+            .store_append(AwsSdkFeature::S3Transfer);
+        let api_metadata = cfg.load::<ApiMetadata>().unwrap();
+        // TODO: maybe APP Name someday
+        let mut ua = AwsUserAgent::new_from_environment(Env::real(), api_metadata.clone());
+        if let Some(framework_metadata) = self.frame_work_meta_data.clone() {
+            ua = ua.with_framework_metadata(framework_metadata);
+        }
+
+        cfg.interceptor_state().store_put(ua);
+
+        Ok(())
+    }
+}
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
@@ -52,17 +91,57 @@ impl ConfigLoader {
         self
     }
 
+    #[doc(hidden)]
+    /// Sets the framework metadata for the transfer manager.
+    ///
+    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
+    /// gets sent along with requests.
+    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
+        self.builder = self.builder.framework_metadata(framework_metadata);
+        self
+    }
+
     /// Load the default configuration
     ///
     /// If fields have been overridden during builder construction, the override values will be
     /// used. Otherwise, the default values for each field will be provided.
     pub async fn load(self) -> Config {
-        let shared_config = aws_config::from_env()
+        let shared_config = aws_config::defaults(BehaviorVersion::latest())
             .http_client(http::default_client())
             .load()
             .await;
-        let s3_client = aws_sdk_s3::Client::new(&shared_config);
-        let builder = self.builder.client(s3_client);
+
+        let mut sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
+
+        let interceptor = S3TransferManagerInterceptor {
+            frame_work_meta_data: self.builder.framework_metadata.clone(),
+        };
+        sdk_client_builder.push_interceptor(S3TransferManagerInterceptor::into_shared(interceptor));
+        let builder = self
+            .builder
+            .client(aws_sdk_s3::Client::from_conf(sdk_client_builder.build()));
         builder.build()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::{ConcurrencySetting, PartSize};
+    use aws_sdk_s3::config::Intercept;
+
+    #[tokio::test]
+    async fn load_with_framework_metadata_and_interceptor() {
+        let config = crate::from_env()
+            .concurrency(ConcurrencySetting::Explicit(123))
+            .part_size(PartSize::Target(8))
+            .load()
+            .await;
+        let sdk_s3_config = config.client().config();
+        let tm_interceptor_exists = sdk_s3_config
+            .interceptors()
+            .any(|item| item.name() == "S3TransferManager");
+        assert!(tm_interceptor_exists);
+    }
+
+    /* TODO: test the framework metadata added correctly */
 }
