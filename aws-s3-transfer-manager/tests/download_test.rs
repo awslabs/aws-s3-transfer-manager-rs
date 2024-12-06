@@ -44,7 +44,7 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
         .unwrap()
 }
 
-/// drain/consume the output and return the body.
+/// drain/consume the body 
 async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
     let output = handle.body_mut();
     let mut data = BytesMut::new();
@@ -158,7 +158,7 @@ async fn test_download_ranges() {
     );
 }
 
-/// Test output not consumed which should not prevent the handle from being dropped
+/// Test body not consumed which should not prevent the handle from being dropped
 #[tokio::test]
 async fn test_output_not_consumed() {
     let data = rand_data(12 * MEBIBYTE);

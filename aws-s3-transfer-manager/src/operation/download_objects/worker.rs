@@ -196,13 +196,13 @@ async fn download_single_obj(
     }
 
     let _ = handle.object_meta().await?;
-    let mut output: Body = mem::replace(&mut handle.body, Body::empty());
+    let mut body = mem::replace(&mut handle.body, Body::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
     fs::create_dir_all(parent_dir).await?;
     let mut dest = fs::File::create(key_path).await?;
 
-    while let Some(chunk) = output.next().await {
+    while let Some(chunk) = body.next().await {
         let chunk = chunk?;
         for segment in chunk.data.into_segments() {
             dest.write_all(segment.as_ref()).await?;

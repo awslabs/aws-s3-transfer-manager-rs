@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut output = Body::new(rx);
+        let mut body = Body::new(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -241,7 +241,7 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Some(chunk) = output.next().await {
+        while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
             let data = String::from_utf8(chunk.data.to_vec()).unwrap();
             received.push(data);
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut output: Body = Body::new(rx);
+        let mut body: Body = Body::new(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();
@@ -266,7 +266,7 @@ mod tests {
         });
 
         let mut received = Vec::new();
-        while let Some(chunk) = output.next().await {
+        while let Some(chunk) = body.next().await {
             received.push(chunk);
         }
 
