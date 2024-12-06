@@ -152,7 +152,7 @@ pub(super) fn distribute_work(
 
         let task = async move {
             let resp = svc.oneshot(req).await;
-            // If any chunk fails, send cancel notification, to kill any other in-flight chunks 
+            // If any chunk fails, send cancel notification, to kill any other in-flight chunks
             if let Err(err) = &resp {
                 if *err.kind() != ErrorKind::OperationCancelled && cancel_tx.send(true).is_err() {
                     tracing::debug!(
