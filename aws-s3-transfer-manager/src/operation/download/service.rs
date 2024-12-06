@@ -155,7 +155,7 @@ pub(super) fn distribute_work(
             // If any chunk fails, send cancel notification, to kill any other in-flight chunks
             if let Err(err) = &resp {
                 if *err.kind() == ErrorKind::OperationCancelled {
-                    // Ignore any OperationCancelled errors. 
+                    // Ignore any OperationCancelled errors.
                     return;
                 }
                 if cancel_tx.send(true).is_err() {
