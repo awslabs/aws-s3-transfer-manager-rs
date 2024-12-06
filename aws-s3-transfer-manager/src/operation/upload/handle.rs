@@ -15,6 +15,7 @@ use tokio::task::{self, JoinHandle};
 use tracing::Instrument;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum UploadType {
     MultipartUpload {
         /// All child multipart upload tasks spawned for this upload
@@ -68,7 +69,7 @@ impl UploadHandle {
             ctx,
         }
     }
-    /// Create a new multipart upload handle with the given request context
+    // /// Create a new multipart upload handle with the given request context
     // pub(crate) fn new_multipart(ctx: UploadContext) -> Self {
     //     Self {
     //         upload_type: UploadType::MultipartUpload {
@@ -92,10 +93,10 @@ impl UploadHandle {
     //     }
     // }
 
-    /// Set the initial response builder once available
-    ///
-    /// This is usually after `CreateMultipartUpload` is initiated (or
-    /// `PutObject` is invoked for uploads less than the required MPU threshold).
+    // /// Set the initial response builder once available
+    // ///
+    // /// This is usually after `CreateMultipartUpload` is initiated (or
+    // /// `PutObject` is invoked for uploads less than the required MPU threshold).
     // pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
     //     if builder.upload_id.is_some() {
     //         let upload_id = builder.upload_id.clone().expect("upload ID present");
@@ -115,7 +116,7 @@ impl UploadHandle {
     #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
         if let Some(initiate_task) = self.initiate_task.take() {
-            initiate_task.await?;
+            initiate_task.await??;
         }
         let mut upload_type = self.upload_type.lock().await;
         if upload_type.is_none() {
@@ -187,13 +188,11 @@ async fn abort_upload(
 }
 
 async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
+    // TODO: What if initiate task is not set here?
     if let Some(initiate_task) = handle.initiate_task.take() {
-        initiate_task.await?;
+        initiate_task.await??;
     }
     let mut upload_type = handle.upload_type.lock().await;
-    if upload_type.is_none() {
-        // What to do?
-    }
     match &mut *upload_type {
         None => todo!("what to do"),
         Some(UploadType::PutObject { put_object_task }) => put_object_task.await?,
