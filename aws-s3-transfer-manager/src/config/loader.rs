@@ -91,12 +91,13 @@ impl ConfigLoader {
         self
     }
 
-    /// Sets the name of the app that is using the client.
+    #[doc(hidden)]
+    /// Sets the framework metadata for the transfer manager.
     ///
-    /// This _optional_ name is used to identify the application in the user agent that
+    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
     /// gets sent along with requests.
-    pub fn frame_metadata(mut self, frame_metadata: Option<FrameworkMetadata>) -> Self {
-        self.builder = self.builder.frame_metadata(frame_metadata);
+    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
+        self.builder = self.builder.framework_metadata(framework_metadata);
         self
     }
 
@@ -113,7 +114,7 @@ impl ConfigLoader {
         let mut sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
 
         let interceptor = S3TransferManagerInterceptor {
-            frame_work_meta_data: self.builder.frame_metadata.clone(),
+            frame_work_meta_data: self.builder.framework_metadata.clone(),
         };
         sdk_client_builder.push_interceptor(S3TransferManagerInterceptor::into_shared(interceptor));
         let builder = self
@@ -129,7 +130,7 @@ mod tests {
     use aws_sdk_s3::config::Intercept;
 
     #[tokio::test]
-    async fn load_with_frame_metadata_and_interceptor() {
+    async fn load_with_framework_metadata_and_interceptor() {
         let config = crate::from_env()
             .concurrency(ConcurrencySetting::Explicit(123))
             .part_size(PartSize::Target(8))

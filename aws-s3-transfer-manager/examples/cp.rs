@@ -153,9 +153,6 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .frame_metadata(Some(
-            FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
-        ))
         .load()
         .await;
 
@@ -233,9 +230,6 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let tm_config = aws_s3_transfer_manager::from_env()
         .concurrency(ConcurrencySetting::Explicit(args.concurrency))
         .part_size(PartSize::Target(args.part_size))
-        .frame_metadata(Some(
-            FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
-        ))
         .load()
         .await;
 
