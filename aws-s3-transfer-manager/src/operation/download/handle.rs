@@ -23,7 +23,7 @@ pub struct DownloadHandle {
     /// Object metadata.
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
-    /// The object content and metadata
+    /// The object content, in chunks, and the metadata for each chunk
     pub(crate) body: Body,
 
     /// Discovery task
