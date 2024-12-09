@@ -17,17 +17,17 @@ use tracing::Instrument;
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum UploadType {
-    MultipartUpload {
-        /// All child multipart upload tasks spawned for this upload
-        upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-        /// All child read body tasks spawned for this upload
-        read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
-        /// The response that will eventually be yielded to the caller.
-        response: Option<UploadOutputBuilder>,
-    },
-    PutObject {
-        put_object_task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
-    },
+    MultipartUpload(MultipartUploadContext),
+    PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
+}
+
+// TODO: waahm7 better naming? 
+#[derive(Debug)]
+pub(crate) struct MultipartUploadContext {
+    pub(crate) upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
+    pub(crate) response: Option<UploadOutputBuilder>,
+    pub(crate) upload_id: String,
 }
 
 /// Response type for a single upload object request.
@@ -80,22 +80,15 @@ impl UploadHandle {
         initiate_task.abort();
         if let Ok(Ok(upload_type)) = initiate_task.await {
             match upload_type {
-                UploadType::PutObject { put_object_task } => {
+                UploadType::PutObject(put_object_task) => {
                     put_object_task.abort();
                     let _ = put_object_task.await?;
                     Ok(AbortedUpload::default())
                 }
-                UploadType::MultipartUpload {
-                    upload_part_tasks,
-                    mut read_body_tasks,
-                    response,
-                } => {
-                    let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
+                UploadType::MultipartUpload(mpu_ctx) => {
                     abort_multipart_upload(
                         self.ctx.clone(),
-                        upload_part_tasks,
-                        &mut read_body_tasks,
-                        upload_id,
+                        mpu_ctx,
                     )
                     .await
                 }
@@ -111,16 +104,14 @@ impl UploadHandle {
 /// Abort the upload and cancel any in-progress part uploads.
 pub(crate) async fn abort_multipart_upload(
     ctx: UploadContext,
-    upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-    read_body_tasks: &mut task::JoinSet<Result<(), crate::error::Error>>,
-    upload_id: String,
+    mut mpu_ctx: MultipartUploadContext,
 ) -> Result<AbortedUpload, crate::error::Error> {
     // cancel in-progress read_body tasks
-    read_body_tasks.abort_all();
-    while (read_body_tasks.join_next().await).is_some() {}
+    mpu_ctx.read_body_tasks.abort_all();
+    while (mpu_ctx.read_body_tasks.join_next().await).is_some() {}
 
     // cancel in-progress upload tasks
-    let mut tasks = upload_part_tasks.lock().await;
+    let mut tasks = mpu_ctx.upload_part_tasks.lock().await;
     tasks.abort_all();
 
     // join all tasks
@@ -132,7 +123,7 @@ pub(crate) async fn abort_multipart_upload(
         .clone()
         .unwrap_or_default();
     match abort_policy {
-        FailedMultipartUploadPolicy::AbortUpload => abort_upload(&ctx, upload_id).await,
+        FailedMultipartUploadPolicy::AbortUpload => abort_upload(&ctx, mpu_ctx.upload_id).await,
         FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
     }
 }
@@ -165,14 +156,9 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
     let initiate_task = handle.initiate_task.take().unwrap();
     let upload_type = initiate_task.await??;
     match upload_type {
-        UploadType::PutObject { put_object_task } => put_object_task.await?,
-        UploadType::MultipartUpload {
-            upload_part_tasks,
-            mut read_body_tasks,
-            mut response,
-        } => {
-            let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
-            while let Some(join_result) = read_body_tasks.join_next().await {
+        UploadType::PutObject(put_object_task) => put_object_task.await?,
+        UploadType::MultipartUpload (mut mpu_ctx) => {
+            while let Some(join_result) = mpu_ctx.read_body_tasks.join_next().await {
                 if let Err(err) = join_result.expect("task completed") {
                     tracing::error!(
                         "multipart upload failed while trying to read the body, aborting"
@@ -181,9 +167,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
 
                     if let Err(err) = abort_multipart_upload(
                         handle.ctx,
-                        upload_part_tasks,
-                        &mut read_body_tasks,
-                        upload_id,
+                        mpu_ctx
                     )
                     .await
                     {
@@ -195,7 +179,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
 
             let mut all_parts = Vec::new();
             // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
-            let mut tasks = upload_part_tasks.lock().await;
+            let mut tasks = mpu_ctx.upload_part_tasks.lock().await;
             while let Some(join_result) = tasks.join_next().await {
                 let result = join_result.expect("task completed");
                 match result {
@@ -207,9 +191,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                         drop(tasks);
                         if let Err(err) = abort_multipart_upload(
                             handle.ctx,
-                            upload_part_tasks,
-                            &mut read_body_tasks,
-                            upload_id,
+                            mpu_ctx,
                         )
                         .await
                         {
@@ -226,7 +208,6 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
 
             // todo: fix
-            let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
             // complete the multipart upload
             let complete_mpu_resp = handle
                 .ctx
@@ -234,7 +215,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                 .complete_multipart_upload()
                 .set_bucket(handle.ctx.request.bucket.clone())
                 .set_key(handle.ctx.request.key.clone())
-                .set_upload_id(Some(upload_id))
+                .set_upload_id(Some(mpu_ctx.upload_id))
                 .multipart_upload(
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(all_parts))
@@ -255,7 +236,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                 .await?;
 
             // set remaining fields from completing the multipart upload
-            let resp = response
+            let resp = mpu_ctx.response
                 .take()
                 .expect("response set")
                 .set_e_tag(complete_mpu_resp.e_tag.clone())

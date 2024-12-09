@@ -17,13 +17,12 @@ use crate::io::InputStream;
 use aws_smithy_types::byte_stream::ByteStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
-use handle::UploadType;
+use handle::{MultipartUploadContext, UploadType};
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
 pub use output::{UploadOutput, UploadOutputBuilder};
 use service::distribute_work;
-use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use std::cmp;
@@ -86,9 +85,7 @@ async fn try_start_put_object(
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
     let task = tokio::spawn(put_object(ctx.clone(), byte_stream, content_length));
-    Ok(UploadType::PutObject {
-        put_object_task: task,
-    })
+    Ok(UploadType::PutObject(task))
 }
 
 async fn put_object(
@@ -170,16 +167,14 @@ async fn try_start_mpu_upload(
     );
     let upload_id = mpu.upload_id.clone().expect("upload_id is present");
 
-    let mut upload_type = UploadType::MultipartUpload {
+    let mut mpu_context = MultipartUploadContext {
         upload_part_tasks: Default::default(),
         read_body_tasks: Default::default(),
         response: Some(mpu),
+        upload_id: upload_id.clone(),
     };
-    //let mut handle = UploadHandle::new_multipart(ctx);
-    // TODO: Fix
-    //handle.set_response(mpu);
-    distribute_work(&mut upload_type, ctx, stream, part_size, upload_id)?;
-    Ok(upload_type)
+    distribute_work(&mut mpu_context, ctx, stream, part_size, upload_id)?;
+    Ok(UploadType::MultipartUpload(mpu_context))
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
