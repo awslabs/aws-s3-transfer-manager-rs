@@ -51,7 +51,7 @@ pub(crate) struct MultipartUploadContext {
 #[non_exhaustive]
 pub struct UploadHandle {
     /// Initial task which determines the upload type
-    initiate_task: Option<JoinHandle<Result<UploadType, crate::error::Error>>>,
+    initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
 }
@@ -62,7 +62,7 @@ impl UploadHandle {
         task: JoinHandle<Result<UploadType, crate::error::Error>>,
     ) -> Self {
         Self {
-            initiate_task: Some(task),
+            initiate_task: task,
             ctx,
         }
     }
@@ -75,10 +75,9 @@ impl UploadHandle {
 
     /// Abort the upload and cancel any in-progress part uploads.
     #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
-    pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
-        let initiate_task = self.initiate_task.take().unwrap();
-        initiate_task.abort();
-        if let Ok(Ok(upload_type)) = initiate_task.await {
+    pub async fn abort(self) -> Result<AbortedUpload, crate::error::Error> {
+        self.initiate_task.abort();
+        if let Ok(Ok(upload_type)) = self.initiate_task.await {
             match upload_type {
                 UploadType::PutObject(put_object_task) => {
                     put_object_task.abort();
@@ -152,9 +151,8 @@ async fn abort_upload(
     Ok(aborted_upload)
 }
 
-async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
-    let initiate_task = handle.initiate_task.take().unwrap();
-    let upload_type = initiate_task.await??;
+async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
+    let upload_type = handle.initiate_task.await??;
     match upload_type {
         UploadType::PutObject(put_object_task) => put_object_task.await?,
         UploadType::MultipartUpload (mut mpu_ctx) => {
