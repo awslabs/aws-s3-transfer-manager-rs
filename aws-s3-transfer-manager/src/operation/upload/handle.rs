@@ -51,8 +51,8 @@ pub(crate) enum UploadType {
 #[non_exhaustive]
 pub struct UploadHandle {
     // TODO: StdMutex?
-    pub(crate) upload_type: Arc<Mutex<Option<UploadType>>>,
-    initiate_task: Option<JoinHandle<Result<(), crate::error::Error>>>,
+    //pub(crate) upload_type: Arc<Mutex<Option<UploadType>>>,
+    initiate_task: Option<JoinHandle<Result<UploadType, crate::error::Error>>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
 }
@@ -60,11 +60,9 @@ pub struct UploadHandle {
 impl UploadHandle {
     pub(crate) fn new(
         ctx: UploadContext,
-        task: JoinHandle<Result<(), crate::error::Error>>,
-        upload_type: Arc<Mutex<Option<UploadType>>>,
+        task: JoinHandle<Result<UploadType, crate::error::Error>>,
     ) -> Self {
         Self {
-            upload_type,
             initiate_task: Some(task),
             ctx,
         }
@@ -115,51 +113,52 @@ impl UploadHandle {
     /// Abort the upload and cancel any in-progress part uploads.
     #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
-        if let Some(initiate_task) = self.initiate_task.take() {
-            initiate_task.await??;
-        }
-        let mut upload_type = self.upload_type.lock().await;
-        if upload_type.is_none() {
-            // What to do?
-        }
-        match &mut *upload_type {
-            None => todo!("what to do"),
-
-            Some(UploadType::PutObject { put_object_task }) => {
+        // TODO: waahm7 verify unwrap
+        let initiate_task = self.initiate_task.take().unwrap();
+        let upload_type = initiate_task.await??;
+        match upload_type {
+            UploadType::PutObject { put_object_task } => {
                 put_object_task.abort();
                 let _ = put_object_task.await?;
                 Ok(AbortedUpload::default())
             }
-            Some(UploadType::MultipartUpload {
+            UploadType::MultipartUpload {
                 upload_part_tasks,
-                read_body_tasks,
+                mut read_body_tasks,
                 response,
-            }) => {
-                // cancel in-progress read_body tasks
-                read_body_tasks.abort_all();
-                while (read_body_tasks.join_next().await).is_some() {}
-
-                // cancel in-progress upload tasks
-                let mut tasks = upload_part_tasks.lock().await;
-                tasks.abort_all();
-
-                // join all tasks
-                while (tasks.join_next().await).is_some() {}
-
-                let abort_policy = self
-                    .ctx
-                    .request
-                    .failed_multipart_upload_policy
-                    .clone()
-                    .unwrap_or_default();
-                    // todo: fix unwrap
+            } => {
                 let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
-                match abort_policy {
-                    FailedMultipartUploadPolicy::AbortUpload => abort_upload(&self.ctx, upload_id).await,
-                    FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
-                }
+                abort_inner(self.ctx.clone(), upload_part_tasks, &mut read_body_tasks, upload_id).await
             }
         }
+    }
+}
+/// Abort the upload and cancel any in-progress part uploads.
+pub(crate) async fn abort_inner(
+    ctx: UploadContext,
+    upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    read_body_tasks: &mut task::JoinSet<Result<(), crate::error::Error>>,
+    upload_id: String,
+) -> Result<AbortedUpload, crate::error::Error> {
+    // cancel in-progress read_body tasks
+    read_body_tasks.abort_all();
+    while (read_body_tasks.join_next().await).is_some() {}
+
+    // cancel in-progress upload tasks
+    let mut tasks = upload_part_tasks.lock().await;
+    tasks.abort_all();
+
+    // join all tasks
+    while (tasks.join_next().await).is_some() {}
+
+    let abort_policy = ctx
+        .request
+        .failed_multipart_upload_policy
+        .clone()
+        .unwrap_or_default();
+    match abort_policy {
+        FailedMultipartUploadPolicy::AbortUpload => abort_upload(&ctx, upload_id).await,
+        FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
     }
 }
 
@@ -189,26 +188,31 @@ async fn abort_upload(
 
 async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
     // TODO: What if initiate task is not set here?
-    if let Some(initiate_task) = handle.initiate_task.take() {
-        initiate_task.await??;
-    }
-    let mut upload_type = handle.upload_type.lock().await;
-    match &mut *upload_type {
-        None => todo!("what to do"),
-        Some(UploadType::PutObject { put_object_task }) => put_object_task.await?,
-        Some(UploadType::MultipartUpload {
+    let initiate_task = handle.initiate_task.take().unwrap();
+    let upload_type = initiate_task.await??;
+    match upload_type {
+        UploadType::PutObject { put_object_task } => put_object_task.await?,
+        UploadType::MultipartUpload {
             upload_part_tasks,
-            read_body_tasks,
-            response,
-        }) => {
+            mut read_body_tasks,
+            mut response,
+        } => {
+            let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
             while let Some(join_result) = read_body_tasks.join_next().await {
                 if let Err(err) = join_result.expect("task completed") {
                     tracing::error!(
                         "multipart upload failed while trying to read the body, aborting"
                     );
                     // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                    drop(upload_type);
-                    if let Err(err) = handle.abort().await {
+
+                    if let Err(err) = abort_inner(
+                        handle.ctx,
+                        upload_part_tasks,
+                        &mut read_body_tasks,
+                        upload_id,
+                    )
+                    .await
+                    {
                         tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                     };
                     return Err(err);
@@ -227,8 +231,15 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                         tracing::error!("multipart upload failed, aborting");
                         // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
                         drop(tasks);
-                        drop(upload_type);
-                        if let Err(err) = handle.abort().await {
+                        //drop(upload_type);
+                        if let Err(err) = abort_inner(
+                            handle.ctx,
+                            upload_part_tasks,
+                            &mut read_body_tasks,
+                            upload_id,
+                        )
+                        .await
+                        {
                             tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                         };
                         return Err(err);

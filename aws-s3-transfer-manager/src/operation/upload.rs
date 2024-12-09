@@ -45,10 +45,9 @@ impl Upload {
         let stream = input.take_body();
         let ctx = new_context(handle.clone(), input);
         // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
-        let upload_type: Arc<Mutex<Option<UploadType>>> = Default::default();
-        let task = tokio::spawn(try_start_upload(handle.clone(), stream, ctx.clone(), upload_type.clone()));
+        let task = tokio::spawn(try_start_upload(handle.clone(), stream, ctx.clone()));
 
-        Ok(UploadHandle::new(ctx, task, upload_type))
+        Ok(UploadHandle::new(ctx, task))
     }
 }
 
@@ -56,8 +55,7 @@ async fn try_start_upload(
     handle: Arc<crate::client::Handle>,
     stream: InputStream,
     ctx: UploadContext,
-    upload_type: Arc<Mutex<Option<UploadType>>>,
-) -> Result<(), crate::error::Error> {
+) -> Result<UploadType, crate::error::Error> {
         let min_mpu_threshold = handle.mpu_threshold_bytes();
 
 
@@ -77,9 +75,7 @@ async fn try_start_upload(
             try_start_mpu_upload(ctx, stream, content_length).await?
         };
 
-    let mut upload_type = upload_type.lock().await;
-    upload_type.insert(final_upload_type);
-    Ok(())
+    Ok(final_upload_type)
 }
 async fn try_start_put_object(
     ctx: UploadContext,
