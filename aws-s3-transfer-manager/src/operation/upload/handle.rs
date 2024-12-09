@@ -50,8 +50,7 @@ pub(crate) enum UploadType {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
-    // TODO: StdMutex?
-    //pub(crate) upload_type: Arc<Mutex<Option<UploadType>>>,
+    /// Initial task which determines the upload type
     initiate_task: Option<JoinHandle<Result<UploadType, crate::error::Error>>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
@@ -67,42 +66,6 @@ impl UploadHandle {
             ctx,
         }
     }
-    // /// Create a new multipart upload handle with the given request context
-    // pub(crate) fn new_multipart(ctx: UploadContext) -> Self {
-    //     Self {
-    //         upload_type: UploadType::MultipartUpload {
-    //             upload_part_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
-    //             read_body_tasks: task::JoinSet::new(),
-    //         },
-    //         ctx,
-    //         response: None,
-    //     }
-    // }
-
-    // /// Create a new put_object upload handle with the given request context
-    // pub(crate) fn new_put_object(
-    //     ctx: UploadContext,
-    //     put_object_task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
-    // ) -> Self {
-    //     Self {
-    //         upload_type: UploadType::PutObject { put_object_task },
-    //         ctx,
-    //         response: None,
-    //     }
-    // }
-
-    // /// Set the initial response builder once available
-    // ///
-    // /// This is usually after `CreateMultipartUpload` is initiated (or
-    // /// `PutObject` is invoked for uploads less than the required MPU threshold).
-    // pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
-    //     if builder.upload_id.is_some() {
-    //         let upload_id = builder.upload_id.clone().expect("upload ID present");
-    //         self.ctx.set_upload_id(upload_id);
-    //     }
-
-    //     self.response = Some(builder);
-    // }
 
     /// Consume the handle and wait for upload to complete
     #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
@@ -113,28 +76,40 @@ impl UploadHandle {
     /// Abort the upload and cancel any in-progress part uploads.
     #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
     pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
-        // TODO: waahm7 verify unwrap
         let initiate_task = self.initiate_task.take().unwrap();
-        let upload_type = initiate_task.await??;
-        match upload_type {
-            UploadType::PutObject { put_object_task } => {
-                put_object_task.abort();
-                let _ = put_object_task.await?;
-                Ok(AbortedUpload::default())
+        initiate_task.abort();
+        if let Ok(Ok(upload_type)) = initiate_task.await {
+            match upload_type {
+                UploadType::PutObject { put_object_task } => {
+                    put_object_task.abort();
+                    let _ = put_object_task.await?;
+                    Ok(AbortedUpload::default())
+                }
+                UploadType::MultipartUpload {
+                    upload_part_tasks,
+                    mut read_body_tasks,
+                    response,
+                } => {
+                    let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
+                    abort_multipart_upload(
+                        self.ctx.clone(),
+                        upload_part_tasks,
+                        &mut read_body_tasks,
+                        upload_id,
+                    )
+                    .await
+                }
             }
-            UploadType::MultipartUpload {
-                upload_part_tasks,
-                mut read_body_tasks,
-                response,
-            } => {
-                let upload_id = response.as_ref().unwrap().upload_id.clone().unwrap();
-                abort_inner(self.ctx.clone(), upload_part_tasks, &mut read_body_tasks, upload_id).await
-            }
+        } else {
+            // Nothing to abort since initiate task was not successful.
+            Ok(AbortedUpload::default())
         }
     }
 }
+
+// TODO: Can I pass something better here instead of three individual fields?
 /// Abort the upload and cancel any in-progress part uploads.
-pub(crate) async fn abort_inner(
+pub(crate) async fn abort_multipart_upload(
     ctx: UploadContext,
     upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
     read_body_tasks: &mut task::JoinSet<Result<(), crate::error::Error>>,
@@ -187,7 +162,6 @@ async fn abort_upload(
 }
 
 async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
-    // TODO: What if initiate task is not set here?
     let initiate_task = handle.initiate_task.take().unwrap();
     let upload_type = initiate_task.await??;
     match upload_type {
@@ -205,7 +179,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                     );
                     // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
 
-                    if let Err(err) = abort_inner(
+                    if let Err(err) = abort_multipart_upload(
                         handle.ctx,
                         upload_part_tasks,
                         &mut read_body_tasks,
@@ -231,8 +205,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                         tracing::error!("multipart upload failed, aborting");
                         // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
                         drop(tasks);
-                        //drop(upload_type);
-                        if let Err(err) = abort_inner(
+                        if let Err(err) = abort_multipart_upload(
                             handle.ctx,
                             upload_part_tasks,
                             &mut read_body_tasks,

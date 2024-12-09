@@ -56,24 +56,23 @@ async fn try_start_upload(
     stream: InputStream,
     ctx: UploadContext,
 ) -> Result<UploadType, crate::error::Error> {
-        let min_mpu_threshold = handle.mpu_threshold_bytes();
+    let min_mpu_threshold = handle.mpu_threshold_bytes();
 
-
-        // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
-        // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
-        let content_length = stream
-            .size_hint()
-            .upper()
-            .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
+    // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
+    // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
+    let content_length = stream
+        .size_hint()
+        .upper()
+        .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
     let final_upload_type = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
-            tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            try_start_put_object(ctx, stream, content_length).await?
-        } else {
-            // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
-            //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
-            try_start_mpu_upload(ctx, stream, content_length).await?
-        };
+        tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
+        try_start_put_object(ctx, stream, content_length).await?
+    } else {
+        // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
+        //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
+        try_start_mpu_upload(ctx, stream, content_length).await?
+    };
 
     Ok(final_upload_type)
 }
@@ -87,7 +86,9 @@ async fn try_start_put_object(
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
     let task = tokio::spawn(put_object(ctx.clone(), byte_stream, content_length));
-    Ok(UploadType::PutObject { put_object_task: task })
+    Ok(UploadType::PutObject {
+        put_object_task: task,
+    })
 }
 
 async fn put_object(
@@ -169,7 +170,11 @@ async fn try_start_mpu_upload(
     );
     let upload_id = mpu.upload_id.clone().expect("upload_id is present");
 
-    let mut upload_type = UploadType::MultipartUpload { upload_part_tasks: Default::default(), read_body_tasks: Default::default(), response: Some(mpu) };
+    let mut upload_type = UploadType::MultipartUpload {
+        upload_part_tasks: Default::default(),
+        read_body_tasks: Default::default(),
+        response: Some(mpu),
+    };
     //let mut handle = UploadHandle::new_multipart(ctx);
     // TODO: Fix
     //handle.set_response(mpu);
