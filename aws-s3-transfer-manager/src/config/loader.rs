@@ -126,11 +126,15 @@ impl ConfigLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use crate::types::{ConcurrencySetting, PartSize};
+    use aws_runtime::user_agent::FrameworkMetadata;
     use aws_sdk_s3::config::Intercept;
+    use aws_smithy_runtime::client::http::test_util::capture_request;
 
     #[tokio::test]
-    async fn load_with_framework_metadata_and_interceptor() {
+    async fn load_with_interceptor() {
         let config = crate::from_env()
             .concurrency(ConcurrencySetting::Explicit(123))
             .part_size(PartSize::Target(8))
@@ -144,4 +148,44 @@ mod tests {
     }
 
     /* TODO: test the framework metadata added correctly */
+    #[tokio::test]
+    async fn load_with_interceptor_and_framework_metadata() {
+        let (http_client, captured_request) = capture_request(None);
+        let config = crate::from_env()
+            .concurrency(ConcurrencySetting::Explicit(123))
+            .part_size(PartSize::Target(8))
+            .framework_metadata(Some(
+                FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
+            ))
+            .load()
+            .await;
+        let sdk_s3_config = config
+            .client()
+            .config()
+            .to_builder()
+            .http_client(http_client)
+            .build();
+
+        let capture_request_config = crate::Config::builder()
+            .client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
+            .concurrency(ConcurrencySetting::Explicit(123))
+            .part_size(PartSize::Target(8))
+            .build();
+
+        let transfer_manager = crate::Client::new(capture_request_config);
+
+        let handle = transfer_manager
+            .download()
+            .bucket("foo")
+            .key("bar")
+            .initiate()
+            .unwrap();
+
+        // let body = drain(&mut handle).await.unwrap();
+
+        let _ = handle.join().await;
+        let expected_req = captured_request.expect_request();
+        let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
+        assert!(user_agent.contains("lib/some-framework/1.3"));
+    }
 }
