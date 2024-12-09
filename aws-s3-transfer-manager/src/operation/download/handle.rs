@@ -53,7 +53,7 @@ impl DownloadHandle {
         Ok(meta)
     }
 
-    /// Object content and metadata
+    /// The object content, in chunks, and the metadata for each chunk
     pub fn body(&self) -> &Body {
         &self.body
     }
