@@ -21,10 +21,11 @@ pub(crate) enum UploadType {
     PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
 }
 
-// TODO: waahm7 better naming? 
+// TODO: waahm7 better naming?
 #[derive(Debug)]
 pub(crate) struct MultipartUploadContext {
-    pub(crate) upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    pub(crate) upload_part_tasks:
+        Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
     pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
     pub(crate) response: Option<UploadOutputBuilder>,
     pub(crate) upload_id: String,
@@ -59,12 +60,9 @@ pub struct UploadHandle {
 impl UploadHandle {
     pub(crate) fn new(
         ctx: UploadContext,
-        task: JoinHandle<Result<UploadType, crate::error::Error>>,
+        initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
     ) -> Self {
-        Self {
-            initiate_task: task,
-            ctx,
-        }
+        Self { initiate_task, ctx }
     }
 
     /// Consume the handle and wait for upload to complete
@@ -85,11 +83,7 @@ impl UploadHandle {
                     Ok(AbortedUpload::default())
                 }
                 UploadType::MultipartUpload(mpu_ctx) => {
-                    abort_multipart_upload(
-                        self.ctx.clone(),
-                        mpu_ctx,
-                    )
-                    .await
+                    abort_multipart_upload(self.ctx.clone(), mpu_ctx).await
                 }
             }
         } else {
@@ -101,7 +95,7 @@ impl UploadHandle {
 
 // TODO: Can I pass something better here instead of three individual fields?
 /// Abort the upload and cancel any in-progress part uploads.
-pub(crate) async fn abort_multipart_upload(
+async fn abort_multipart_upload(
     ctx: UploadContext,
     mut mpu_ctx: MultipartUploadContext,
 ) -> Result<AbortedUpload, crate::error::Error> {
@@ -122,40 +116,35 @@ pub(crate) async fn abort_multipart_upload(
         .clone()
         .unwrap_or_default();
     match abort_policy {
-        FailedMultipartUploadPolicy::AbortUpload => abort_upload(&ctx, mpu_ctx.upload_id).await,
         FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+        FailedMultipartUploadPolicy::AbortUpload => {
+            let abort_mpu_resp = ctx
+                .client()
+                .abort_multipart_upload()
+                .set_bucket(ctx.request.bucket.clone())
+                .set_key(ctx.request.key.clone())
+                .set_upload_id(Some(mpu_ctx.upload_id.clone()))
+                .set_request_payer(ctx.request.request_payer.clone())
+                .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+                .send()
+                .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                .await?;
+
+            let aborted_upload = AbortedUpload {
+                upload_id: Some(mpu_ctx.upload_id),
+                request_charged: abort_mpu_resp.request_charged,
+            };
+
+            Ok(aborted_upload)
+        }
     }
-}
-
-async fn abort_upload(
-    ctx: &UploadContext,
-    upload_id: String,
-) -> Result<AbortedUpload, crate::error::Error> {
-    let abort_mpu_resp = ctx
-        .client()
-        .abort_multipart_upload()
-        .set_bucket(ctx.request.bucket.clone())
-        .set_key(ctx.request.key.clone())
-        .set_upload_id(Some(upload_id.clone()))
-        .set_request_payer(ctx.request.request_payer.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
-        .send()
-        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-        .await?;
-
-    let aborted_upload = AbortedUpload {
-        upload_id: Some(upload_id),
-        request_charged: abort_mpu_resp.request_charged,
-    };
-
-    Ok(aborted_upload)
 }
 
 async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
     let upload_type = handle.initiate_task.await??;
     match upload_type {
         UploadType::PutObject(put_object_task) => put_object_task.await?,
-        UploadType::MultipartUpload (mut mpu_ctx) => {
+        UploadType::MultipartUpload(mut mpu_ctx) => {
             while let Some(join_result) = mpu_ctx.read_body_tasks.join_next().await {
                 if let Err(err) = join_result.expect("task completed") {
                     tracing::error!(
@@ -163,12 +152,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                     );
                     // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
 
-                    if let Err(err) = abort_multipart_upload(
-                        handle.ctx,
-                        mpu_ctx
-                    )
-                    .await
-                    {
+                    if let Err(err) = abort_multipart_upload(handle.ctx, mpu_ctx).await {
                         tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                     };
                     return Err(err);
@@ -187,12 +171,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                         tracing::error!("multipart upload failed, aborting");
                         // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
                         drop(tasks);
-                        if let Err(err) = abort_multipart_upload(
-                            handle.ctx,
-                            mpu_ctx,
-                        )
-                        .await
-                        {
+                        if let Err(err) = abort_multipart_upload(handle.ctx, mpu_ctx).await {
                             tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                         };
                         return Err(err);
@@ -234,7 +213,8 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .await?;
 
             // set remaining fields from completing the multipart upload
-            let resp = mpu_ctx.response
+            let resp = mpu_ctx
+                .response
                 .take()
                 .expect("response set")
                 .set_e_tag(complete_mpu_resp.e_tag.clone())
