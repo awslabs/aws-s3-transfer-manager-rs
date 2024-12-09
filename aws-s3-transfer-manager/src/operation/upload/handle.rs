@@ -15,7 +15,6 @@ use tokio::task::{self, JoinHandle};
 use tracing::Instrument;
 
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum UploadType {
     MultipartUpload(MultipartUploadContext),
     PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
@@ -24,6 +23,7 @@ pub(crate) enum UploadType {
 // TODO: waahm7 better naming?
 #[derive(Debug)]
 pub(crate) struct MultipartUploadContext {
+    // TODO: docs
     pub(crate) upload_part_tasks:
         Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
     pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
