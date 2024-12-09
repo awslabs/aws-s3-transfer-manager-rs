@@ -179,7 +179,7 @@ async fn test_body_not_consumed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_abort_download() {
     let data = rand_data(25 * MEBIBYTE);
-    let part_size = 5 * MEBIBYTE;
+    let part_size = MEBIBYTE;
 
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
