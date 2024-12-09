@@ -5,7 +5,7 @@
 
 use aws_config::Region;
 use aws_s3_transfer_manager::{
-    error::BoxError,
+    error::{BoxError, Error},
     operation::download::DownloadHandle,
     types::{ConcurrencySetting, PartSize},
 };
@@ -45,14 +45,22 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
 }
 
 /// drain/consume the body
-async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, BoxError> {
+async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
     let body = handle.body_mut();
     let mut data = BytesMut::new();
+    let mut error: Option<Error> = None;
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?.data.into_bytes();
-        data.put(chunk);
+        match chunk {
+            Ok(chunk) => data.put(chunk.data.into_bytes()),
+            Err(err) => {
+                error.get_or_insert(err);
+            }
+        }
     }
 
+    if let Some(error) = error {
+        return Err(error);
+    }
     Ok(data.into())
 }
 
@@ -148,11 +156,9 @@ async fn test_download_ranges() {
         requests[2].headers().get("Range"),
         Some("bytes=10485760-12582911")
     );
-
-    handle.join().await.unwrap();
 }
 
-/// Test body not consumed which should not prevent the handle from being joined
+/// Test body not consumed which should not prevent the handle from being dropped
 #[tokio::test]
 async fn test_body_not_consumed() {
     let data = rand_data(12 * MEBIBYTE);
@@ -160,14 +166,33 @@ async fn test_body_not_consumed() {
 
     let (tm, _) = simple_test_tm(&data, part_size);
 
-    let handle = tm
+    let mut handle = tm
         .download()
         .bucket("test-bucket")
         .key("test-object")
         .initiate()
         .unwrap();
 
-    handle.join().await.unwrap();
+    let _ = handle.body_mut().next().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_abort_download() {
+    let data = rand_data(25 * MEBIBYTE);
+    let part_size = MEBIBYTE;
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = handle.object_meta().await;
+    handle.abort().await;
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert!(requests.len() < data.len() / part_size);
 }
 
 pin_project! {
@@ -282,7 +307,6 @@ async fn test_retry_failed_chunk() {
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(3, requests.len());
-    handle.join().await.unwrap();
 }
 
 const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -297,7 +321,7 @@ const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Test non retryable SdkError
 #[tokio::test]
 async fn test_non_retryable_error() {
-    let data = rand_data(12 * MEBIBYTE);
+    let data = rand_data(20 * MEBIBYTE);
     let part_size = 8 * MEBIBYTE;
 
     let http_client = StaticReplayClient::new(vec![
@@ -334,7 +358,6 @@ async fn test_non_retryable_error() {
 
     let _ = drain(&mut handle).await.unwrap_err();
 
-    handle.join().await.unwrap();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(2, requests.len());
 }
@@ -394,7 +417,6 @@ async fn test_retry_max_attempts() {
         .unwrap();
 
     let _ = drain(&mut handle).await.unwrap_err();
-    handle.join().await.unwrap();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(4, requests.len());
 }
