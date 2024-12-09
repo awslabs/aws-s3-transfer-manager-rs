@@ -46,8 +46,8 @@ impl Config {
         &self.concurrency
     }
 
-    #[doc(hidden)]
     /// Returns the framework metadata setting when using transfer manager.
+    #[doc(hidden)]
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
         self.framework_metadata.as_ref()
     }
@@ -132,11 +132,11 @@ impl Builder {
         self
     }
 
-    #[doc(hidden)]
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
     /// gets sent along with requests.
+    #[doc(hidden)]
     pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
         self.framework_metadata = framework_metadata;
         self
