@@ -180,9 +180,7 @@ mod tests {
             .key("bar")
             .initiate()
             .unwrap();
-
-        // let body = drain(&mut handle).await.unwrap();
-
+        // Expect to fail
         let _ = handle.join().await;
         let expected_req = captured_request.expect_request();
         let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
