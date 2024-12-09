@@ -174,14 +174,14 @@ mod tests {
 
         let transfer_manager = crate::Client::new(capture_request_config);
 
-        let handle = transfer_manager
+        let mut handle = transfer_manager
             .download()
             .bucket("foo")
             .key("bar")
             .initiate()
             .unwrap();
         // Expect to fail
-        let _ = handle.join().await;
+        let _ = handle.body_mut().next().await;
         let expected_req = captured_request.expect_request();
         let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
         assert!(user_agent.contains("lib/some-framework/1.3"));
