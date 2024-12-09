@@ -12,7 +12,7 @@ use crate::io::AggregatedBytes;
 
 use super::chunk_meta::ChunkMetadata;
 
-/// Stream of binary data representing an Amazon S3 Object's contents.
+/// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
 ///
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
 /// The data on this stream is sequenced into the correct order.
@@ -81,7 +81,10 @@ impl Body {
             match self.inner.next().await {
                 None => break,
                 Some(Ok(chunk)) => self.sequencer.push(chunk),
-                Some(Err(err)) => return Some(Err(err)),
+                Some(Err(err)) => {
+                    self.close();
+                    return Some(Err(err));
+                }
             }
         }
 
