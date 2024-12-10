@@ -129,6 +129,7 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::types::{ConcurrencySetting, PartSize};
+    use aws_config::Region;
     use aws_runtime::user_agent::FrameworkMetadata;
     use aws_sdk_s3::config::Intercept;
     use aws_smithy_runtime::client::http::test_util::capture_request;
@@ -162,6 +163,7 @@ mod tests {
             .client()
             .config()
             .to_builder()
+            .region(Region::from_static("us-west-2"))
             .http_client(http_client)
             .build();
 
