@@ -163,8 +163,9 @@ mod tests {
             .client()
             .config()
             .to_builder()
-            .region(Region::from_static("us-west-2"))
             .http_client(http_client)
+            .region(Region::from_static("us-west-2"))
+            .with_test_defaults()
             .build();
 
         let capture_request_config = crate::Config::builder()
