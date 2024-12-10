@@ -183,8 +183,7 @@ mod tests {
             .initiate()
             .unwrap();
         // Expect to fail
-        let output = handle.body_mut().next().await;
-        print!("{:#?}", output);
+        let _ = handle.body_mut().next().await;
         let expected_req = captured_request.expect_request();
         let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
         assert!(user_agent.contains("lib/some-framework/1.3"));
