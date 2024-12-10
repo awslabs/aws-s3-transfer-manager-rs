@@ -159,6 +159,7 @@ mod tests {
             ))
             .load()
             .await;
+        // Inject the captured request to the http client to capture the request made from transfer manager.
         let sdk_s3_config = config
             .client()
             .config()
@@ -184,6 +185,7 @@ mod tests {
             .unwrap();
         // Expect to fail
         let _ = handle.body_mut().next().await;
+        // Check the request made contains the expected framework meta data in user agent.
         let expected_req = captured_request.expect_request();
         let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
         assert!(user_agent.contains("lib/some-framework/1.3"));
