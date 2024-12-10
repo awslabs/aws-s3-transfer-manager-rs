@@ -171,6 +171,13 @@ pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
+
+    // TODO: getters, setters, builders, docs, cats, dogs, etc
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32_c: Option<String>,
+    pub checksum_crc64_nvme: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
 }
 
 impl PartData {
@@ -183,6 +190,11 @@ impl PartData {
         Self {
             part_number,
             data: data.into(),
+            checksum_crc32: None,
+            checksum_crc32_c: None,
+            checksum_crc64_nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
         }
     }
 }

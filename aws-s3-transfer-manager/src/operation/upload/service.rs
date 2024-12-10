@@ -46,6 +46,12 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
         .set_request_payer(ctx.request.request_payer.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+        .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
+        .set_checksum_crc32(part_data.checksum_crc32)
+        .set_checksum_crc32_c(part_data.checksum_crc32_c)
+        .set_checksum_crc64_nvme(part_data.checksum_crc64_nvme)
+        .set_checksum_sha1(part_data.checksum_sha1)
+        .set_checksum_sha256(part_data.checksum_sha256)
         .send()
         .instrument(tracing::debug_span!("send-upload-part", part_number))
         .await?;
@@ -56,6 +62,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_e_tag(resp.e_tag.clone())
         .set_checksum_crc32(resp.checksum_crc32.clone())
         .set_checksum_crc32_c(resp.checksum_crc32_c.clone())
+        .set_checksum_crc64_nvme(resp.checksum_crc64_nvme.clone())
         .set_checksum_sha1(resp.checksum_sha1.clone())
         .set_checksum_sha256(resp.checksum_sha256.clone())
         .build();
