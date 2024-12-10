@@ -40,6 +40,8 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
+        input = validate_and_fix_up_checksum_fields(&handle, input)?;
+
         let min_mpu_threshold = handle.mpu_threshold_bytes();
 
         let stream = input.take_body();
@@ -64,6 +66,95 @@ impl Upload {
 
         Ok(handle)
     }
+}
+
+/// Validate checksum fields.
+/// Fix up the input and return it, so that checksum_algorithm and checksum_type
+/// are both set, if we're doing checksums at all.
+fn validate_and_fix_up_checksum_fields(
+    handle: &crate::client::Handle,
+    mut input: crate::operation::upload::UploadInput,
+) -> Result<crate::operation::upload::UploadInput, error::Error> {
+    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
+
+    // Ensure user didn't pass multiple full_object_checksum_ values
+    let full_object_checksum_count = [
+        &input.full_object_checksum_crc32,
+        &input.full_object_checksum_crc32_c,
+        &input.full_object_checksum_crc64_nvme,
+    ]
+    .iter()
+    .filter(|x| x.is_some())
+    .count();
+    if full_object_checksum_count > 1 {
+        return Err(error::invalid_input(
+            "Expecting a single full_object_checksum_ value. Multiple values are not allowed.",
+        ));
+    }
+
+    // Ensure that, if user set checksum_type, we know the algorithm they want to use
+    if input.checksum_type.is_some()
+        && input.checksum_algorithm.is_none()
+        && full_object_checksum_count == 0
+    {
+        return Err(error::invalid_input(
+            "checksum_type can only be used when a checksum algorithm is specified.",
+        ));
+    }
+
+    // If user set full_object_checksum_ value, ensure checksum_algorithm is set to match
+    if full_object_checksum_count == 1 {
+        let expected_algorithm = if input.full_object_checksum_crc32.is_some() {
+            ChecksumAlgorithm::Crc32
+        } else if input.full_object_checksum_crc32_c.is_some() {
+            ChecksumAlgorithm::Crc32C
+        } else {
+            assert!(input.full_object_checksum_crc64_nvme.is_some());
+            ChecksumAlgorithm::Crc64Nvme
+        };
+
+        match &input.checksum_algorithm {
+            None => input.checksum_algorithm = Some(expected_algorithm),
+            Some(checksum_algorithm) => {
+                if checksum_algorithm != &expected_algorithm {
+                    return Err(error::invalid_input(
+                        "Given checksum_algorithm does not match full_object_checksum_ value",
+                    ));
+                }
+            }
+        }
+    }
+
+    // If checksum_algorithm is still unset, but request_checksum_calculation is WhenSupported,
+    // default to using Crc64Nvme.
+    if input.checksum_algorithm.is_none()
+        && handle
+            .config
+            .client()
+            .config()
+            .request_checksum_calculation()
+            .unwrap()
+            .eq(&aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported)
+    {
+        input.checksum_algorithm = Some(ChecksumAlgorithm::Crc64Nvme);
+    }
+
+    // If checksum_type is still unset, and we know the algorithm,
+    // default to FullObject (unless it's SHA which must use Composite for multipart)
+    if input.checksum_type.is_none() {
+        input.checksum_type = match &input.checksum_algorithm {
+            None => None,
+            Some(
+                ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32C | ChecksumAlgorithm::Crc64Nvme,
+            ) => Some(ChecksumType::FullObject),
+            Some(ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256) => {
+                Some(ChecksumType::Composite)
+            }
+            Some(_) => return Err(error::invalid_input("Unknown checksum_algorithm")),
+        };
+    }
+
+    Ok(input)
 }
 
 async fn try_start_put_object(
@@ -126,6 +217,9 @@ async fn put_object(
         .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
+        .set_checksum_crc32(ctx.request.full_object_checksum_crc32.clone())
+        .set_checksum_crc32_c(ctx.request.full_object_checksum_crc32_c.clone())
+        .set_checksum_crc64_nvme(ctx.request.full_object_checksum_crc64_nvme.clone())
         .send()
         .instrument(tracing::info_span!(
             "send-upload-part",
@@ -211,6 +305,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
         .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
         .set_expected_bucket_owner(req.expected_bucket_owner.clone())
         .set_checksum_algorithm(req.checksum_algorithm.clone())
+        .set_checksum_type(req.checksum_type.clone())
         .send()
         .instrument(tracing::debug_span!("send-create-multipart-upload"))
         .await?;
