@@ -69,7 +69,7 @@ impl Upload {
 }
 
 /// Validate checksum fields.
-/// Fix up the input and return it, so that checksum_algorithm and checksum_type
+/// Fix up the input and return it, so that checksum_algorithm and multipart_checksum_type
 /// are both set, if we're doing checksums at all.
 fn validate_and_fix_up_checksum_fields(
     handle: &crate::client::Handle,
@@ -92,13 +92,13 @@ fn validate_and_fix_up_checksum_fields(
         ));
     }
 
-    // Ensure that, if user set checksum_type, we know the algorithm they want to use
-    if input.checksum_type.is_some()
+    // Ensure that, if user set multipart_checksum_type, we know the algorithm they want to use
+    if input.multipart_checksum_type.is_some()
         && input.checksum_algorithm.is_none()
         && full_object_checksum_count == 0
     {
         return Err(error::invalid_input(
-            "checksum_type can only be used when a checksum algorithm is specified.",
+            "multipart_checksum_type can only be used when a checksum algorithm is specified.",
         ));
     }
 
@@ -139,10 +139,10 @@ fn validate_and_fix_up_checksum_fields(
         input.checksum_algorithm = Some(ChecksumAlgorithm::Crc64Nvme);
     }
 
-    // If checksum_type is still unset, and we know the algorithm,
+    // If multipart_checksum_type is still unset, and we know the algorithm,
     // default to FullObject (unless it's SHA which must use Composite for multipart)
-    if input.checksum_type.is_none() {
-        input.checksum_type = match &input.checksum_algorithm {
+    if input.multipart_checksum_type.is_none() {
+        input.multipart_checksum_type = match &input.checksum_algorithm {
             None => None,
             Some(
                 ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32C | ChecksumAlgorithm::Crc64Nvme,
@@ -305,7 +305,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
         .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
         .set_expected_bucket_owner(req.expected_bucket_owner.clone())
         .set_checksum_algorithm(req.checksum_algorithm.clone())
-        .set_checksum_type(req.checksum_type.clone())
+        .set_checksum_type(req.multipart_checksum_type.clone())
         .send()
         .instrument(tracing::debug_span!("send-create-multipart-upload"))
         .await?;

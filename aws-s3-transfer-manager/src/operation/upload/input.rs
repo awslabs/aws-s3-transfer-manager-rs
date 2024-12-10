@@ -9,7 +9,7 @@ use crate::types::FailedMultipartUploadPolicy;
 use std::fmt::Debug;
 use std::mem;
 
-// TODO: update docs on checksum_type to say we default to FullObject, and how Composite only applies to multipart, etc
+// TODO: update docs on multipart_checksum_type to say we default to FullObject, and how Composite only applies to multipart, etc
 
 // TODO: update docs on checksum_algorithm to say we default to CRC64
 
@@ -76,7 +76,7 @@ pub struct UploadInput {
     /// </note>
     pub checksum_algorithm: Option<aws_sdk_s3::types::ChecksumAlgorithm>,
     /// <p>Indicates the checksum type that you want Amazon S3 to use to calculate the object’s checksum value. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    pub multipart_checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub full_object_checksum_crc32: Option<String>,
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32C checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -288,8 +288,8 @@ impl UploadInput {
         self.checksum_algorithm.as_ref()
     }
     /// <p>Indicates the checksum type that you want Amazon S3 to use to calculate the object’s checksum value. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
-        self.checksum_type.as_ref()
+    pub fn multipart_checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+        self.multipart_checksum_type.as_ref()
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn full_object_checksum_crc32(&self) -> Option<&str> {
@@ -481,7 +481,7 @@ impl Debug for UploadInput {
         formatter.field("content_md5", &self.content_md5);
         formatter.field("content_type", &self.content_type);
         formatter.field("checksum_algorithm", &self.checksum_algorithm);
-        formatter.field("checksum_type", &self.checksum_type);
+        formatter.field("multipart_checksum_type", &self.multipart_checksum_type);
         formatter.field(
             "full_object_checksum_crc32",
             &self.full_object_checksum_crc32,
@@ -551,7 +551,7 @@ pub struct UploadInputBuilder {
     pub(crate) content_md5: Option<String>,
     pub(crate) content_type: Option<String>,
     pub(crate) checksum_algorithm: Option<aws_sdk_s3::types::ChecksumAlgorithm>,
-    pub(crate) checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    pub(crate) multipart_checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
     pub(crate) full_object_checksum_crc32: Option<String>,
     pub(crate) full_object_checksum_crc32_c: Option<String>,
     pub(crate) full_object_checksum_crc64_nvme: Option<String>,
@@ -843,18 +843,18 @@ impl UploadInputBuilder {
         &self.checksum_algorithm
     }
     /// <p>Indicates the checksum type that you want Amazon S3 to use to calculate the object’s checksum value. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn checksum_type(mut self, input: aws_sdk_s3::types::ChecksumType) -> Self {
-        self.checksum_type = Some(input);
+    pub fn multipart_checksum_type(mut self, input: aws_sdk_s3::types::ChecksumType) -> Self {
+        self.multipart_checksum_type = Some(input);
         self
     }
     /// <p>Indicates the checksum type that you want Amazon S3 to use to calculate the object’s checksum value. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn set_checksum_type(mut self, input: Option<aws_sdk_s3::types::ChecksumType>) -> Self {
-        self.checksum_type = input;
+    pub fn set_multipart_checksum_type(mut self, input: Option<aws_sdk_s3::types::ChecksumType>) -> Self {
+        self.multipart_checksum_type = input;
         self
     }
     /// <p>Indicates the checksum type that you want Amazon S3 to use to calculate the object’s checksum value. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn get_checksum_type(&self) -> &Option<aws_sdk_s3::types::ChecksumType> {
-        &self.checksum_type
+    pub fn get_multipart_checksum_type(&self) -> &Option<aws_sdk_s3::types::ChecksumType> {
+        &self.multipart_checksum_type
     }
     /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn full_object_checksum_crc32(mut self, input: impl Into<String>) -> Self {
@@ -1472,7 +1472,7 @@ impl UploadInputBuilder {
             content_md5: self.content_md5,
             content_type: self.content_type,
             checksum_algorithm: self.checksum_algorithm,
-            checksum_type: self.checksum_type,
+            multipart_checksum_type: self.multipart_checksum_type,
             full_object_checksum_crc32: self.full_object_checksum_crc32,
             full_object_checksum_crc32_c: self.full_object_checksum_crc32_c,
             full_object_checksum_crc64_nvme: self.full_object_checksum_crc64_nvme,
@@ -1517,7 +1517,7 @@ impl Debug for UploadInputBuilder {
         formatter.field("content_md5", &self.content_md5);
         formatter.field("content_type", &self.content_type);
         formatter.field("checksum_algorithm", &self.checksum_algorithm);
-        formatter.field("checksum_type", &self.checksum_type);
+        formatter.field("multipart_checksum_type", &self.multipart_checksum_type);
         formatter.field(
             "full_object_checksum_crc32",
             &self.full_object_checksum_crc32,
