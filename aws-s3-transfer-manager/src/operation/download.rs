@@ -142,7 +142,7 @@ async fn send_discovery(
     // Add if_match to the rest of the requests using the etag
     // we got from discovery to ensure the object stays the same
     // during the download process.
-    input.if_match = discovery.object_meta.e_tag.clone();
+    input.if_match.clone_from(&discovery.object_meta.e_tag);
 
     if object_meta_tx.send(discovery.object_meta).is_err() {
         tracing::debug!(
