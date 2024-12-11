@@ -139,7 +139,12 @@ async fn send_discovery(
         }
     };
 
-    if object_meta_tx.send(discovery.object_meta.clone()).is_err() {
+    // Add if_match to the rest of the requests using the etag
+    // we got from discovery to ensure the object stays the same
+    // during the download process.
+    input.if_match = discovery.object_meta.e_tag.clone();
+
+    if object_meta_tx.send(discovery.object_meta).is_err() {
         tracing::debug!(
             "Download handle for key({:?}) has been dropped, aborting during the discovery phase",
             input.key
@@ -163,10 +168,6 @@ async fn send_discovery(
     );
 
     if !discovery.remaining.is_empty() {
-        // Add if_match to the rest of the requests using the etag
-        // we got from discovery to ensure the object stays the same
-        // during the download process.
-        input.if_match = discovery.object_meta.e_tag.clone();
         distribute_work(
             &mut tasks,
             ctx.clone(),
