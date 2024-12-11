@@ -90,6 +90,7 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
                         "Content-Range",
                         format!("bytes {start}-{end}/{}", data.len()),
                     )
+                    .header("ETag", "my-etag")
                     .body(SdkBody::from(chunk))
                     .unwrap(),
             )
@@ -419,4 +420,31 @@ async fn test_retry_max_attempts() {
     let _ = drain(&mut handle).await.unwrap_err();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(4, requests.len());
+}
+
+/// Test the if_match header was added correctly based on the response from server.
+#[tokio::test]
+async fn test_download_if_match() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 5 * MEBIBYTE;
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let _ = drain(&mut handle).await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(3, requests.len());
+
+    // The first request is to discover the object meta data and should not have any if-match
+    assert_eq!(requests[0].headers().get("If-Match"), None);
+    // All the following requests should have the if-match header
+    assert_eq!(requests[1].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
 }
