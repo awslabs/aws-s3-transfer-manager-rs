@@ -90,6 +90,7 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
                         "Content-Range",
                         format!("bytes {start}-{end}/{}", data.len()),
                     )
+                    .header("ETag", "my-etag")
                     .body(SdkBody::from(chunk))
                     .unwrap(),
             )
@@ -419,4 +420,96 @@ async fn test_retry_max_attempts() {
     let _ = drain(&mut handle).await.unwrap_err();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(4, requests.len());
+}
+
+/// Test the if_match header was added correctly based on the response from server.
+#[tokio::test]
+async fn test_download_if_match() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 5 * MEBIBYTE;
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let _ = drain(&mut handle).await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(3, requests.len());
+
+    // The first request is to discover the object meta data and should not have any if-match
+    assert_eq!(requests[0].headers().get("If-Match"), None);
+    // All the following requests should have the if-match header
+    assert_eq!(requests[1].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
+}
+
+const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <Error>
+        <Code>PreconditionFailed</Code>
+        <Message>At least one of the pre-conditions you specified did not hold</Message>
+        <Condition>If-Match</Condition>
+    </Error>
+"#;
+
+/// Test that if the object modified during download.
+#[tokio::test]
+async fn test_download_object_modified() {
+    let data = rand_data(12 * MEBIBYTE);
+    let part_size = 5 * MEBIBYTE;
+
+    // Create a static replay client (http connector) to mock the S3 response when object modified during download.
+    //
+    // Assumptions:
+    //     1. First request for discovery, succeed with etag
+    //     2. Followed requests fail to mock the object changed during download.
+    let events = data
+        .chunks(part_size)
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let start = idx * part_size;
+            let end = std::cmp::min(start + part_size, data.len()) - 1;
+            let mut response = http_02x::Response::builder()
+                .status(206)
+                .header("Content-Length", format!("{}", end - start + 1))
+                .header(
+                    "Content-Range",
+                    format!("bytes {start}-{end}/{}", data.len()),
+                )
+                .header("ETag", "my-etag")
+                .body(SdkBody::from(chunk))
+                .unwrap();
+            if idx > 0 {
+                response = http_02x::Response::builder()
+                    .status(412)
+                    .header("Date", "Thu, 12 Jan 2023 00:04:21 GMT")
+                    .body(SdkBody::from(OBJECT_MODIFIED_RESPONSE))
+                    .unwrap();
+            }
+            ReplayEvent::new(
+                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
+                // make our own assertions against the captured requests.
+                dummy_expected_request(),
+                response,
+            )
+        })
+        .collect();
+
+    let http_client = StaticReplayClient::new(events);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let error = drain(&mut handle).await.unwrap_err();
+    assert!(format!("{:?}", error).contains("PreconditionFailed"));
 }
