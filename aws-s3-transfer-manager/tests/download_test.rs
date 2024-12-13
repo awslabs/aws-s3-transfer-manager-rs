@@ -9,15 +9,16 @@ use aws_s3_transfer_manager::{
     operation::download::DownloadHandle,
     types::{ConcurrencySetting, PartSize},
 };
-use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
-use aws_smithy_types::body::SdkBody;
-use bytes::{BufMut, Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use std::{
     cmp,
     iter::{self, repeat_with},
     task::Poll,
 };
+
+use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_types::body::SdkBody;
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
 /// As an example we generally assume object discovery goes through `GetObject` with a ranged get
