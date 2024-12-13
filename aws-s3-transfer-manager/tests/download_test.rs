@@ -99,56 +99,6 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
 
     StaticReplayClient::new(events)
 }
-const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-    <Error>
-        <Code>PreconditionFailed</Code>
-        <Message>At least one of the pre-conditions you specified did not hold</Message>
-        <Condition>If-Match</Condition>
-    </Error>
-"#;
-
-/// Create a static replay client (http connector) for an object of the given size.
-///
-/// Assumptions:
-///     1. Expected requests are not created. A dummy placeholder is used. Callers need to make
-///        assertions directly on the captured requests.
-///     2. First request for discovery, succeed with etag
-///     3. Followed requests fail to mock the object changed during download.
-fn mock_object_modified_connector(data: &Bytes, part_size: usize) -> StaticReplayClient {
-    let events = data
-        .chunks(part_size)
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let start = idx * part_size;
-            let end = std::cmp::min(start + part_size, data.len()) - 1;
-            let mut response = http_02x::Response::builder()
-                .status(206)
-                .header("Content-Length", format!("{}", end - start + 1))
-                .header(
-                    "Content-Range",
-                    format!("bytes {start}-{end}/{}", data.len()),
-                )
-                .header("ETag", "my-etag")
-                .body(SdkBody::from(chunk))
-                .unwrap();
-            if idx > 0 {
-                response = http_02x::Response::builder()
-                    .status(412)
-                    .header("Date", "Thu, 12 Jan 2023 00:04:21 GMT")
-                    .body(SdkBody::from(OBJECT_MODIFIED_RESPONSE))
-                    .unwrap();
-            }
-            ReplayEvent::new(
-                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
-                // make our own assertions against the captured requests.
-                dummy_expected_request(),
-                response,
-            )
-        })
-        .collect();
-
-    StaticReplayClient::new(events)
-}
 
 fn simple_test_tm(
     data: &Bytes,
@@ -499,13 +449,58 @@ async fn test_download_if_match() {
     assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
 }
 
+const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <Error>
+        <Code>PreconditionFailed</Code>
+        <Message>At least one of the pre-conditions you specified did not hold</Message>
+        <Condition>If-Match</Condition>
+    </Error>
+"#;
+
 /// Test that if the object modified during download.
 #[tokio::test]
 async fn test_download_object_modified() {
     let data = rand_data(12 * MEBIBYTE);
     let part_size = 5 * MEBIBYTE;
 
-    let http_client = mock_object_modified_connector(&data, part_size);
+    /// Create a static replay client (http connector) to mock the S3 response when object modified during download.
+    ///
+    /// Assumptions:
+    ///     1. First request for discovery, succeed with etag
+    ///     2. Followed requests fail to mock the object changed during download.
+    let events = data
+        .chunks(part_size)
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let start = idx * part_size;
+            let end = std::cmp::min(start + part_size, data.len()) - 1;
+            let mut response = http_02x::Response::builder()
+                .status(206)
+                .header("Content-Length", format!("{}", end - start + 1))
+                .header(
+                    "Content-Range",
+                    format!("bytes {start}-{end}/{}", data.len()),
+                )
+                .header("ETag", "my-etag")
+                .body(SdkBody::from(chunk))
+                .unwrap();
+            if idx > 0 {
+                response = http_02x::Response::builder()
+                    .status(412)
+                    .header("Date", "Thu, 12 Jan 2023 00:04:21 GMT")
+                    .body(SdkBody::from(OBJECT_MODIFIED_RESPONSE))
+                    .unwrap();
+            }
+            ReplayEvent::new(
+                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
+                // make our own assertions against the captured requests.
+                dummy_expected_request(),
+                response,
+            )
+        })
+        .collect();
+
+    let http_client = StaticReplayClient::new(events);
     let tm = test_tm(http_client.clone(), part_size);
 
     let mut handle = tm
