@@ -463,11 +463,11 @@ async fn test_download_object_modified() {
     let data = rand_data(12 * MEBIBYTE);
     let part_size = 5 * MEBIBYTE;
 
-    /// Create a static replay client (http connector) to mock the S3 response when object modified during download.
-    ///
-    /// Assumptions:
-    ///     1. First request for discovery, succeed with etag
-    ///     2. Followed requests fail to mock the object changed during download.
+    // Create a static replay client (http connector) to mock the S3 response when object modified during download.
+    //
+    // Assumptions:
+    //     1. First request for discovery, succeed with etag
+    //     2. Followed requests fail to mock the object changed during download.
     let events = data
         .chunks(part_size)
         .enumerate()
