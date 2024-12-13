@@ -5,12 +5,15 @@
 
 /// Operation builders
 pub mod builders;
+mod checksum_strategy;
 mod input;
 mod output;
 
 mod context;
 mod handle;
 mod service;
+
+pub use checksum_strategy::ChecksumStrategy;
 
 use crate::error;
 use crate::io::InputStream;
@@ -90,7 +93,7 @@ async fn put_object(
     // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
     // more work for a lot of small files.
     let _permit = ctx.handle.scheduler.acquire_permit().await?;
-    let resp = ctx
+    let mut req = ctx
         .client()
         .put_object()
         .set_acl(ctx.request.acl.clone())
@@ -124,8 +127,22 @@ async fn put_object(
         .set_object_lock_mode(ctx.request.object_lock_mode.clone())
         .set_object_lock_retain_until_date(ctx.request.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
-        .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
+        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        if let Some(value) = &checksum_strategy.full_object_checksum {
+            req = match &checksum_strategy.algorithm {
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(value),
+                algo => panic!("unexpected algorithm `{algo}` for full object checksum"),
+            };
+        } else {
+            req = req.checksum_algorithm(checksum_strategy.algorithm.clone());
+        }
+    }
+
+    let resp = req
         .send()
         .instrument(tracing::info_span!(
             "send-upload-part",
@@ -179,7 +196,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
     let req = ctx.request();
     let client = ctx.client();
 
-    let resp = client
+    let mut req = client
         .create_multipart_upload()
         .set_acl(req.acl.clone())
         .set_bucket(req.bucket.clone())
@@ -209,8 +226,17 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
         .set_object_lock_mode(req.object_lock_mode.clone())
         .set_object_lock_retain_until_date(req.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(req.expected_bucket_owner.clone())
-        .set_checksum_algorithm(req.checksum_algorithm.clone())
+        .set_expected_bucket_owner(req.expected_bucket_owner.clone());
+
+    // TODO: make sure ctx.request.checksum_strategy is DEFAULT if user didn't set it and config is when_supported
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        req = req
+            .checksum_algorithm(checksum_strategy.algorithm.clone())
+            .checksum_type(checksum_strategy.type_if_multipart.clone());
+    }
+
+    let resp = req
         .send()
         .instrument(tracing::debug_span!("send-create-multipart-upload"))
         .await?;

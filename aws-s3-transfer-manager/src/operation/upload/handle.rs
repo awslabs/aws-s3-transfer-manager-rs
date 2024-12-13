@@ -213,7 +213,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
 
             // complete the multipart upload
-            let complete_mpu_resp = handle
+            let mut req = handle
                 .ctx
                 .client()
                 .complete_multipart_upload()
@@ -225,16 +225,26 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                         .set_parts(Some(all_parts))
                         .build(),
                 )
-                // TODO(aws-sdk-rust#1159) - implement checksums
-                // .set_checksum_crc32()
-                // .set_checksum_crc32_c()
-                // .set_checksum_sha1()
-                // .set_checksum_sha256()
                 .set_request_payer(handle.ctx.request.request_payer.clone())
                 .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
                 .set_sse_customer_algorithm(handle.ctx.request.sse_customer_algorithm.clone())
                 .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
-                .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone())
+                .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
+
+            if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
+                if let Some(value) = &checksum_strategy.full_object_checksum {
+                    req = match &checksum_strategy.algorithm {
+                        aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
+                        aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
+                        aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
+                            req.checksum_crc64_nvme(value)
+                        }
+                        algo => panic!("unexpected algorithm `{algo}` for full object checksum"),
+                    };
+                }
+            }
+
+            let complete_mpu_resp = req
                 .send()
                 .instrument(tracing::debug_span!("send-complete-multipart-upload"))
                 .await?;
