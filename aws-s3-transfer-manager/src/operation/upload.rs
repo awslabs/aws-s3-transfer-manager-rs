@@ -43,6 +43,27 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
+        match &input.checksum_strategy {
+            // User set the checksum strategy: validate it
+            Some(checksum_strategy) => checksum_strategy.validate()?,
+
+            None => {
+                // User didn't explicitly set checksum strategy.
+                // If SDK is configured to send checksums: use default checksum strategy.
+                // Else: continue with no checksums
+                if handle
+                    .config
+                    .client()
+                    .config()
+                    .request_checksum_calculation()
+                    .unwrap()
+                    .eq(&aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported)
+                {
+                    input.checksum_strategy = Some(ChecksumStrategy::default());
+                }
+            }
+        }
+
         let min_mpu_threshold = handle.mpu_threshold_bytes();
 
         let stream = input.take_body();
@@ -131,6 +152,7 @@ async fn put_object(
 
     if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
         if let Some(value) = &checksum_strategy.full_object_checksum {
+            // We have the full-object checksum value, so set it
             req = match &checksum_strategy.algorithm {
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
@@ -138,6 +160,7 @@ async fn put_object(
                 algo => panic!("unexpected algorithm `{algo}` for full object checksum"),
             };
         } else {
+            // Set checksum algorithm, which tells SDK to calculate and add checksum value
             req = req.checksum_algorithm(checksum_strategy.algorithm.clone());
         }
     }
@@ -227,8 +250,6 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
         .set_object_lock_retain_until_date(req.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
         .set_expected_bucket_owner(req.expected_bucket_owner.clone());
-
-    // TODO: make sure ctx.request.checksum_strategy is DEFAULT if user didn't set it and config is when_supported
 
     if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
         req = req

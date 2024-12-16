@@ -3,6 +3,7 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
 use crate::error;
 
 /// TODO: docs
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ChecksumStrategy {
     /// TODO: docs
@@ -117,8 +118,7 @@ impl ChecksumStrategy {
         }
     }
 
-    /// TODO: docs
-    pub fn validate(&self) -> Result<(), crate::error::Error> {
+    pub(crate) fn validate(&self) -> Result<(), crate::error::Error> {
         // Ensure multipart checksum type is something we know about
         match self.type_if_multipart {
             ChecksumType::Composite | ChecksumType::FullObject => (),

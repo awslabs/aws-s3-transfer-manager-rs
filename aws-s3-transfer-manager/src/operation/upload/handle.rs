@@ -232,7 +232,10 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                 .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
 
             if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
+                // TODO(aws-s3-transfer-manager-rs#3): allow user to pass full-object checksum value via callback on PartStream
+
                 if let Some(value) = &checksum_strategy.full_object_checksum {
+                    // We have the full-object checksum value, so set it
                     req = match &checksum_strategy.algorithm {
                         aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
                         aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
@@ -256,6 +259,11 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                 .expect("response set")
                 .set_e_tag(complete_mpu_resp.e_tag.clone())
                 .set_expiration(complete_mpu_resp.expiration.clone())
+                .set_checksum_crc32(complete_mpu_resp.checksum_crc32.clone())
+                .set_checksum_crc32_c(complete_mpu_resp.checksum_crc32_c.clone())
+                .set_checksum_crc64_nvme(complete_mpu_resp.checksum_crc64_nvme.clone())
+                .set_checksum_sha1(complete_mpu_resp.checksum_sha1.clone())
+                .set_checksum_sha256(complete_mpu_resp.checksum_sha256.clone())
                 .set_version_id(complete_mpu_resp.version_id.clone());
 
             tracing::trace!("upload completed successfully");
