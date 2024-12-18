@@ -14,7 +14,6 @@ mod service;
 
 use crate::error;
 use crate::io::InputStream;
-use aws_smithy_types::byte_stream::ByteStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadContext, UploadType};
@@ -66,7 +65,7 @@ async fn try_start_upload(
 
     let final_upload_type = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
         tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-        try_start_put_object(ctx, stream, content_length).await?
+        UploadType::PutObject(tokio::spawn(put_object(ctx.clone(), stream, content_length)))
     } else {
         // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
         //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
@@ -75,24 +74,16 @@ async fn try_start_upload(
 
     Ok(final_upload_type)
 }
-async fn try_start_put_object(
-    ctx: UploadContext,
-    stream: InputStream,
-    content_length: u64,
-) -> Result<UploadType, crate::error::Error> {
-    let byte_stream = stream.into_byte_stream().await?;
-    let content_length: i64 = content_length.try_into().map_err(|_| {
-        error::invalid_input(format!("content_length:{} is invalid.", content_length))
-    })?;
-    let task = tokio::spawn(put_object(ctx.clone(), byte_stream, content_length));
-    Ok(UploadType::PutObject(task))
-}
 
 async fn put_object(
     ctx: UploadContext,
-    body: ByteStream,
-    content_length: i64,
+    stream: InputStream,
+    content_length: u64,
 ) -> Result<UploadOutput, error::Error> {
+    let body = stream.into_byte_stream().await?;
+    let content_length: i64 = content_length.try_into().map_err(|_| {
+        error::invalid_input(format!("content_length:{} is invalid.", content_length))
+    })?;
     // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
     // more work for a lot of small files.
     let _permit = ctx.handle.scheduler.acquire_permit().await?;
