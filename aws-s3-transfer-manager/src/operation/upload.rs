@@ -16,7 +16,7 @@ use crate::error;
 use crate::io::InputStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
-use handle::{MultipartUploadContext, UploadType};
+use handle::{MultipartUploadData, UploadType};
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
@@ -158,14 +158,14 @@ async fn try_start_mpu_upload(
     );
     let upload_id = mpu.upload_id.clone().expect("upload_id is present");
 
-    let mut mpu_context = MultipartUploadContext {
+    let mut mpu_data = MultipartUploadData {
         upload_part_tasks: Default::default(),
         read_body_tasks: Default::default(),
         response: Some(mpu),
         upload_id: upload_id.clone(),
     };
-    distribute_work(&mut mpu_context, ctx, stream, part_size, upload_id)?;
-    Ok(UploadType::MultipartUpload(mpu_context))
+    distribute_work(&mut mpu_data, ctx, stream, part_size, upload_id)?;
+    Ok(UploadType::MultipartUpload(mpu_data))
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {

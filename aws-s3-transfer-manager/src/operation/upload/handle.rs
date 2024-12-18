@@ -16,13 +16,12 @@ use tracing::Instrument;
 
 #[derive(Debug)]
 pub(crate) enum UploadType {
-    MultipartUpload(MultipartUploadContext),
+    MultipartUpload(MultipartUploadData),
     PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
 }
 
-// TODO: waahm7 better naming?
 #[derive(Debug)]
-pub(crate) struct MultipartUploadContext {
+pub(crate) struct MultipartUploadData {
     // TODO: docs
     pub(crate) upload_part_tasks:
         Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
@@ -97,7 +96,7 @@ impl UploadHandle {
 /// Abort the upload and cancel any in-progress part uploads.
 async fn abort_multipart_upload(
     ctx: UploadContext,
-    mut mpu_ctx: MultipartUploadContext,
+    mut mpu_ctx: MultipartUploadData,
 ) -> Result<AbortedUpload, crate::error::Error> {
     // cancel in-progress read_body tasks
     mpu_ctx.read_body_tasks.abort_all();

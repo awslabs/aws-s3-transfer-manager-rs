@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::MultipartUploadContext;
+use super::MultipartUploadData;
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ pub(super) fn upload_part_service(
 /// * stream - the body input stream
 /// * part_size - the part_size for each part
 pub(super) fn distribute_work(
-    mpu_ctx: &mut MultipartUploadContext,
+    mpu_data: &mut MultipartUploadData,
     ctx: UploadContext,
     stream: InputStream,
     part_size: u64,
@@ -137,10 +137,10 @@ pub(super) fn distribute_work(
             ctx.clone(),
             upload_id.clone(),
             svc.clone(),
-            mpu_ctx.upload_part_tasks.clone(),
+            mpu_data.upload_part_tasks.clone(),
             parent_span_for_upload_tasks.clone(),
         );
-        mpu_ctx
+        mpu_data
             .read_body_tasks
             .spawn(worker.instrument(parent_span_for_read_tasks.clone()));
     }
