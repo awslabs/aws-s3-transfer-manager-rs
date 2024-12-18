@@ -70,12 +70,17 @@ impl UploadHandle {
     /// Consume the handle and wait for upload to complete
     #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
+        // TODO: We won't send completeMPU until customers join the future. This can create a
+        // bottleneck where we have many uploads not making the completeMPU call, waiting for the join
+        // to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
+        // this without waiting for join to happen. 
         complete_upload(self).await
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
     #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
     pub async fn abort(self) -> Result<AbortedUpload, crate::error::Error> {
+        // TODO(aws-sdk-rust#1159) - handle already completed upload
         self.initiate_task.abort();
         if let Ok(Ok(upload_type)) = self.initiate_task.await {
             match upload_type {
