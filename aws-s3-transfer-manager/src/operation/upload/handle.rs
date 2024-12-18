@@ -22,11 +22,14 @@ pub(crate) enum UploadType {
 
 #[derive(Debug)]
 pub(crate) struct MultipartUploadData {
-    // TODO: docs
+    /// All child multipart upload tasks spawned for this upload
     pub(crate) upload_part_tasks:
         Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    /// All child read body tasks spawned for this upload
     pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
+    /// The response that will eventually be yielded to the caller.
     pub(crate) response: Option<UploadOutputBuilder>,
+    /// the multipart upload ID
     pub(crate) upload_id: String,
 }
 
@@ -92,18 +95,17 @@ impl UploadHandle {
     }
 }
 
-// TODO: Can I pass something better here instead of three individual fields?
-/// Abort the upload and cancel any in-progress part uploads.
+/// Abort the multipart upload and cancel any in-progress part uploads.
 async fn abort_multipart_upload(
     ctx: UploadContext,
-    mut mpu_ctx: MultipartUploadData,
+    mut mpu_data: MultipartUploadData,
 ) -> Result<AbortedUpload, crate::error::Error> {
     // cancel in-progress read_body tasks
-    mpu_ctx.read_body_tasks.abort_all();
-    while (mpu_ctx.read_body_tasks.join_next().await).is_some() {}
+    mpu_data.read_body_tasks.abort_all();
+    while (mpu_data.read_body_tasks.join_next().await).is_some() {}
 
     // cancel in-progress upload tasks
-    let mut tasks = mpu_ctx.upload_part_tasks.lock().await;
+    let mut tasks = mpu_data.upload_part_tasks.lock().await;
     tasks.abort_all();
 
     // join all tasks
@@ -122,7 +124,7 @@ async fn abort_multipart_upload(
                 .abort_multipart_upload()
                 .set_bucket(ctx.request.bucket.clone())
                 .set_key(ctx.request.key.clone())
-                .set_upload_id(Some(mpu_ctx.upload_id.clone()))
+                .set_upload_id(Some(mpu_data.upload_id.clone()))
                 .set_request_payer(ctx.request.request_payer.clone())
                 .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
                 .send()
@@ -130,7 +132,7 @@ async fn abort_multipart_upload(
                 .await?;
 
             let aborted_upload = AbortedUpload {
-                upload_id: Some(mpu_ctx.upload_id),
+                upload_id: Some(mpu_data.upload_id),
                 request_charged: abort_mpu_resp.request_charged,
             };
 
@@ -143,15 +145,14 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
     let upload_type = handle.initiate_task.await??;
     match upload_type {
         UploadType::PutObject(put_object_task) => put_object_task.await?,
-        UploadType::MultipartUpload(mut mpu_ctx) => {
-            while let Some(join_result) = mpu_ctx.read_body_tasks.join_next().await {
+        UploadType::MultipartUpload(mut mpu_data) => {
+            while let Some(join_result) = mpu_data.read_body_tasks.join_next().await {
                 if let Err(err) = join_result.expect("task completed") {
                     tracing::error!(
                         "multipart upload failed while trying to read the body, aborting"
                     );
                     // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-
-                    if let Err(err) = abort_multipart_upload(handle.ctx, mpu_ctx).await {
+                    if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
                         tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                     };
                     return Err(err);
@@ -160,7 +161,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
 
             let mut all_parts = Vec::new();
             // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
-            let mut tasks = mpu_ctx.upload_part_tasks.lock().await;
+            let mut tasks = mpu_data.upload_part_tasks.lock().await;
             while let Some(join_result) = tasks.join_next().await {
                 let result = join_result.expect("task completed");
                 match result {
@@ -170,7 +171,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                         tracing::error!("multipart upload failed, aborting");
                         // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
                         drop(tasks);
-                        if let Err(err) = abort_multipart_upload(handle.ctx, mpu_ctx).await {
+                        if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
                             tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                         };
                         return Err(err);
@@ -183,7 +184,6 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             // parts must be sorted
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
 
-            // todo: fix
             // complete the multipart upload
             let complete_mpu_resp = handle
                 .ctx
@@ -191,7 +191,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .complete_multipart_upload()
                 .set_bucket(handle.ctx.request.bucket.clone())
                 .set_key(handle.ctx.request.key.clone())
-                .set_upload_id(Some(mpu_ctx.upload_id))
+                .set_upload_id(Some(mpu_data.upload_id))
                 .multipart_upload(
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(all_parts))
@@ -212,7 +212,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .await?;
 
             // set remaining fields from completing the multipart upload
-            let resp = mpu_ctx
+            let resp = mpu_data
                 .response
                 .take()
                 .expect("response set")
