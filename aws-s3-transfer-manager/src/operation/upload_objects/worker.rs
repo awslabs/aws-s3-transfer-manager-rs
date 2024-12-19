@@ -253,8 +253,7 @@ async fn upload_single_obj(
         .build()
         .expect("valid input");
 
-    let mut handle =
-        crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input).await?;
+    let handle = crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input)?;
 
     // The cancellation process would work fine without this if statement.
     // It's here so we can save a single upload operation that would otherwise

@@ -36,7 +36,7 @@ pub(crate) struct Upload;
 
 impl Upload {
     /// Execute a single `Upload` transfer operation
-    pub(crate) async fn orchestrate(
+    pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
@@ -63,21 +63,20 @@ async fn try_start_upload(
         .upper()
         .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
 
-    Ok(
-        if content_length < min_mpu_threshold && !stream.is_mpu_only() {
-            tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            UploadType::PutObject(tokio::spawn(put_object(
-                ctx.clone(),
-                stream,
-                content_length,
-            )))
-        } else {
-            // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
-            //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
-            // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
-            try_start_mpu_upload(ctx, stream, content_length).await?
-        },
-    )
+    let upload_type = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
+        tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
+        UploadType::PutObject(tokio::spawn(put_object(
+            ctx.clone(),
+            stream,
+            content_length,
+        )))
+    } else {
+        // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
+        //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
+        // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
+        try_start_mpu_upload(ctx, stream, content_length).await?
+    };
+    Ok(upload_type)
 }
 
 async fn put_object(
