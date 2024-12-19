@@ -126,6 +126,8 @@ async fn put_object(
         .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
         .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
+        .customize()
+        .disable_payload_signing()
         .send()
         .instrument(tracing::info_span!(
             "send-upload-part",

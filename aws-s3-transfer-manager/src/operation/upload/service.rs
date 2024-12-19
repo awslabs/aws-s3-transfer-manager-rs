@@ -30,7 +30,6 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
 
-    // TODO(aws-sdk-rust#1159): disable payload signing
     // TODO(aws-sdk-rust#1159): set checksum fields if applicable
     let resp = ctx
         .client()
@@ -46,6 +45,8 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
         .set_request_payer(ctx.request.request_payer.clone())
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+        .customize()
+        .disable_payload_signing()
         .send()
         .instrument(tracing::debug_span!("send-upload-part", part_number))
         .await?;
