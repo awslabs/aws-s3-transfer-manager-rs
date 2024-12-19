@@ -380,14 +380,14 @@ mod test {
 
         let client = mock_client_with_stubbed_http_client!(
             aws_sdk_s3,
-            RuleMode::MatchAny,
+            RuleMode::Sequential,
             &[create_mpu, upload_part, abort_mpu]
         );
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(30))
+            .set_target_part_size(PartSize::Target(5 * 1024 * 1024))
             .client(client)
             .build();
 
