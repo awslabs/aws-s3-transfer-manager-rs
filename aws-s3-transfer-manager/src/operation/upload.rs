@@ -397,11 +397,9 @@ mod test {
             .bucket("test-bucket")
             .key("test-key")
             .body(stream);
-
         let handle = request.send_with(&tm).await.unwrap();
         wait_till_create_mpu.wait();
         let abort = handle.abort().await.unwrap();
-
         assert_eq!(abort.upload_id().unwrap(), expected_upload_id.deref());
     }
 }
