@@ -23,11 +23,11 @@ pub struct DownloadHandle {
     /// Object metadata.
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
-    /// The object content
+    /// The object content, in chunks, and the metadata for each chunk
     pub(crate) body: Body,
 
     /// Discovery task
-    pub(crate) discovery: task::JoinHandle<Result<(), error::Error>>,
+    pub(crate) discovery: task::JoinHandle<()>,
 
     /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
@@ -53,7 +53,7 @@ impl DownloadHandle {
         Ok(meta)
     }
 
-    /// Object content
+    /// The object content, in chunks, and the metadata for each chunk
     pub fn body(&self) -> &Body {
         &self.body
     }
@@ -63,19 +63,16 @@ impl DownloadHandle {
         &mut self.body
     }
 
-    /// Consume the handle and wait for download transfer to complete
-    #[tracing::instrument(skip_all, level = "debug", name = "join-download")]
-    pub async fn join(mut self) -> Result<(), crate::error::Error> {
+    /// Abort the download and cancel any in-progress work.
+    pub async fn abort(mut self) {
         self.body.close();
-
-        self.discovery.await??;
+        self.discovery.abort();
+        let _ = self.discovery.await;
         // It's safe to grab the lock here because discovery is already complete, and we will never
         // lock tasks again after discovery to spawn more tasks.
         let mut tasks = self.tasks.lock().await;
-        while let Some(join_result) = tasks.join_next().await {
-            join_result?;
-        }
-        Ok(())
+        tasks.abort_all();
+        while (tasks.join_next().await).is_some() {}
     }
 }
 

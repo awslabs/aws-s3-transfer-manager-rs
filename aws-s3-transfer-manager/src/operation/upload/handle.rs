@@ -50,6 +50,9 @@ pub(crate) struct MultipartUploadData {
 /// It first calls `.abort_all` on the tasks it owns, and then invokes `AbortMultipartUpload`
 /// to abort any in-progress multipart uploads. Errors encountered during `AbortMultipartUpload`
 /// are logged, but do not affect the overall cancellation flow.
+///
+/// In either case, if the upload operation has already been completed before the handle is dropped
+/// or aborted, the uploaded object will not be deleted from S3.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {

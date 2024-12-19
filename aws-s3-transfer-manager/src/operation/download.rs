@@ -9,10 +9,12 @@ use aws_sdk_s3::error::DisplayErrorContext;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
-/// Abstractions for response bodies and consuming data streams.
-pub mod body;
 /// Operation builders
 pub mod builders;
+
+/// Abstractions for responses and consuming data streams.
+mod body;
+pub use body::{Body, ChunkOutput};
 
 mod discovery;
 
@@ -33,15 +35,14 @@ use crate::error;
 use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::OwnedWorkPermit;
 use aws_smithy_types::byte_stream::ByteStream;
-use body::{Body, ChunkOutput};
 use discovery::discover_obj;
 use service::distribute_work;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
 
-use super::TransferContext;
+use super::{CancelNotificationReceiver, CancelNotificationSender, TransferContext};
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -99,9 +100,9 @@ async fn send_discovery(
     ctx: DownloadContext,
     comp_tx: mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
     object_meta_tx: oneshot::Sender<ObjectMetadata>,
-    input: DownloadInput,
+    mut input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
-) -> Result<(), crate::error::Error> {
+) {
     // create span to serve as parent of spawned child tasks.
     let parent_span_for_tasks = tracing::debug_span!(
         parent: if use_current_span_as_parent_for_tasks { tracing::Span::current().id() } else { None } ,
@@ -115,13 +116,42 @@ async fn send_discovery(
     }
 
     // acquire a permit for discovery
-    let permit = ctx.handle.scheduler.acquire_permit().await?;
+    let permit = ctx.handle.scheduler.acquire_permit().await;
+    let permit = match permit {
+        Ok(permit) => permit,
+        Err(err) => {
+            if comp_tx.send(Err(err)).await.is_err() {
+                tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
+            }
+            return;
+        }
+    };
 
     // make initial discovery about the object size, metadata, possibly first chunk
-    let mut discovery = discover_obj(&ctx, &input).await?;
-    // FIXME - This will fail if the handle is dropped at this point. We should handle
-    // the cancellation gracefully here.
-    let _ = object_meta_tx.send(discovery.object_meta);
+    let discovery = discover_obj(&ctx, &input).await;
+    let mut discovery = match discovery {
+        Ok(discovery) => discovery,
+        Err(err) => {
+            if comp_tx.send(Err(err)).await.is_err() {
+                tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
+            }
+            return;
+        }
+    };
+
+    // Add if_match to the rest of the requests using the etag
+    // we got from discovery to ensure the object stays the same
+    // during the download process.
+    input.if_match.clone_from(&discovery.object_meta.e_tag);
+
+    if object_meta_tx.send(discovery.object_meta).is_err() {
+        tracing::debug!(
+            "Download handle for key({:?}) has been dropped, aborting during the discovery phase",
+            input.key
+        );
+        return;
+    }
+
     let initial_chunk = discovery.initial_chunk.take();
 
     let mut tasks = tasks.lock().await;
@@ -148,7 +178,6 @@ async fn send_discovery(
             parent_span_for_tasks,
         );
     }
-    Ok(())
 }
 
 /// Handle possibly sending the first chunk of data received through discovery. Returns
@@ -200,14 +229,19 @@ fn handle_discovery_chunk(
 #[derive(Debug)]
 pub(crate) struct DownloadState {
     current_seq: AtomicU64,
+    cancel_tx: CancelNotificationSender,
+    cancel_rx: CancelNotificationReceiver,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
 
 impl DownloadContext {
     fn new(handle: Arc<crate::client::Handle>) -> Self {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             current_seq: AtomicU64::new(0),
+            cancel_tx,
+            cancel_rx,
         });
         TransferContext { handle, state }
     }
