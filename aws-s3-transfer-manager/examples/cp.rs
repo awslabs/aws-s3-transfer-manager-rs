@@ -252,8 +252,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
         .bucket(bucket)
         .key(key)
         .body(stream)
-        .send()
-        .await?;
+        .initiate()?;
 
     let _resp = handle.join().await?;
     let elapsed = start.elapsed();
