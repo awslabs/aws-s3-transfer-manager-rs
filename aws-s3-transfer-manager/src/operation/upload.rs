@@ -342,66 +342,66 @@ mod test {
         assert_eq!(expected_e_tag.deref(), resp.e_tag().unwrap());
     }
 
-    // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    // async fn test_abort_multipart_upload() {
-    //     let expected_upload_id = Arc::new("test-upload".to_owned());
-    //     let body: Bytes = Bytes::from_static(b"every adolescent dog goes bonkers early");
-    //     let stream = InputStream::from(body);
-    //     let bucket = "test-bucket";
-    //     let key = "test-key";
-    //     let wait_till_create_mpu = Arc::new(Barrier::new(2));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_abort_multipart_upload() {
+        let expected_upload_id = Arc::new("test-upload".to_owned());
+        let body: Bytes = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let wait_till_create_mpu = Arc::new(Barrier::new(2));
 
-    //     let upload_id: Arc<String> = expected_upload_id.clone();
-    //     let create_mpu =
-    //         mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(move || {
-    //             CreateMultipartUploadOutput::builder()
-    //                 .upload_id(upload_id.as_ref().to_owned())
-    //                 .build()
-    //         });
+        let upload_id: Arc<String> = expected_upload_id.clone();
+        let create_mpu =
+            mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(move || {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id(upload_id.as_ref().to_owned())
+                    .build()
+            });
 
-    //     let upload_part = mock!(aws_sdk_s3::Client::upload_part).then_output({
-    //         let wait_till_create_mpu = wait_till_create_mpu.clone();
-    //         move || {
-    //             wait_till_create_mpu.wait();
-    //             UploadPartOutput::builder().build()
-    //         }
-    //     });
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part).then_output({
+            let wait_till_create_mpu = wait_till_create_mpu.clone();
+            move || {
+                wait_till_create_mpu.wait();
+                UploadPartOutput::builder().build()
+            }
+        });
 
-    //     let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
-    //         .match_requests({
-    //             let upload_id: Arc<String> = expected_upload_id.clone();
-    //             move |input| {
-    //                 input.upload_id.as_ref() == Some(&upload_id)
-    //                     && input.bucket() == Some(bucket)
-    //                     && input.key() == Some(key)
-    //             }
-    //         })
-    //         .then_output(|| AbortMultipartUploadOutput::builder().build());
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests({
+                let upload_id: Arc<String> = expected_upload_id.clone();
+                move |input| {
+                    input.upload_id.as_ref() == Some(&upload_id)
+                        && input.bucket() == Some(bucket)
+                        && input.key() == Some(key)
+                }
+            })
+            .then_output(|| AbortMultipartUploadOutput::builder().build());
 
-    //     let client = mock_client_with_stubbed_http_client!(
-    //         aws_sdk_s3,
-    //         RuleMode::MatchAny,
-    //         &[create_mpu, upload_part, abort_mpu]
-    //     );
+        let client = mock_client_with_stubbed_http_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[create_mpu, upload_part, abort_mpu]
+        );
 
-    //     let tm_config = crate::Config::builder()
-    //         .concurrency(ConcurrencySetting::Explicit(1))
-    //         .set_multipart_threshold(PartSize::Target(10))
-    //         .set_target_part_size(PartSize::Target(30))
-    //         .client(client)
-    //         .build();
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencySetting::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(30))
+            .client(client)
+            .build();
 
-    //     let tm = crate::Client::new(tm_config);
+        let tm = crate::Client::new(tm_config);
 
-    //     let request = UploadInput::builder()
-    //         .bucket("test-bucket")
-    //         .key("test-key")
-    //         .body(stream);
+        let request = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream);
 
-    //     let handle = request.send_with(&tm).await.unwrap();
-    //     wait_till_create_mpu.wait();
-    //     let abort = handle.abort().await.unwrap();
+        let handle = request.send_with(&tm).await.unwrap();
+        wait_till_create_mpu.wait();
+        let abort = handle.abort().await.unwrap();
 
-    //     assert_eq!(abort.upload_id().unwrap(), expected_upload_id.deref());
-    // }
+        assert_eq!(abort.upload_id().unwrap(), expected_upload_id.deref());
+    }
 }
