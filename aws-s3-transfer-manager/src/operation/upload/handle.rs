@@ -73,7 +73,7 @@ impl UploadHandle {
         // TODO: We won't send completeMPU until customers join the future. This can create a
         // bottleneck where we have many uploads not making the completeMPU call, waiting for the join
         // to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
-        // this without waiting for join to happen. 
+        // this without waiting for join to happen.
         complete_upload(self).await
     }
 

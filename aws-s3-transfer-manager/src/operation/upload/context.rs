@@ -26,5 +26,4 @@ impl UploadContext {
     pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()
     }
-
 }
