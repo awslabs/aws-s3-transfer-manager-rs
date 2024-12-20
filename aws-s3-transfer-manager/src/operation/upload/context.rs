@@ -12,8 +12,6 @@ use std::sync::Arc;
 pub(crate) struct UploadContext {
     /// reference to client handle used to do actual work
     pub(crate) handle: Arc<crate::client::Handle>,
-    /// the multipart upload ID
-    pub(crate) upload_id: Option<String>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
 }
@@ -27,15 +25,5 @@ impl UploadContext {
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()
-    }
-
-    /// Set the upload ID if the transfer will be done using a multipart upload
-    pub(crate) fn set_upload_id(&mut self, upload_id: String) {
-        self.upload_id = Some(upload_id)
-    }
-
-    /// Check if this transfer is using multipart upload
-    pub(crate) fn is_multipart_upload(&self) -> bool {
-        self.upload_id.is_some()
     }
 }

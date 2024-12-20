@@ -55,7 +55,7 @@ jobs:
       - docs
       - minrust
     steps:
-      - run: exit 0 
+      - run: exit 0
 
   test-hll:
     name: Test S3 transfer manager HLL
@@ -133,7 +133,7 @@ jobs:
         run: |
           cargo doc --lib --no-deps --all-features --document-private-items
         env:
-          RUSTFLAGS: --cfg docsrs 
+          RUSTFLAGS: --cfg docsrs
           RUSTDOCFLAGS: --cfg docsrs
 
   minrust:
@@ -246,7 +246,7 @@ jobs:
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
-      - name: check --feature-powerset 
+      - name: check --feature-powerset
         run: cargo hack check --all --feature-powerset
 
   # TODO - get cross check working
