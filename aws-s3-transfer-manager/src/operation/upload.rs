@@ -345,13 +345,13 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_abort_multipart_upload() {
         let expected_upload_id = Arc::new("test-upload".to_owned());
-        let body  = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
         let stream = InputStream::from(body);
         let bucket = "test-bucket";
         let key = "test-key";
         let wait_till_create_mpu = Arc::new(Barrier::new(2));
 
-        let upload_id= expected_upload_id.clone();
+        let upload_id = expected_upload_id.clone();
         let create_mpu =
             mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(move || {
                 CreateMultipartUploadOutput::builder()
