@@ -161,14 +161,14 @@ async fn try_start_mpu_upload(
         mpu.upload_id
     );
     let upload_id = mpu.upload_id.clone().expect("upload_id is present");
-
     let mut mpu_data = MultipartUploadData {
         upload_part_tasks: Default::default(),
         read_body_tasks: Default::default(),
         response: Some(mpu),
         upload_id: upload_id.clone(),
     };
-    distribute_work(&mut mpu_data, ctx, stream, part_size, upload_id)?;
+
+    distribute_work(&mut mpu_data, ctx, stream, part_size)?;
     Ok(UploadType::MultipartUpload(mpu_data))
 }
 

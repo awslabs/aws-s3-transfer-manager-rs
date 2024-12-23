@@ -101,7 +101,6 @@ pub(super) fn distribute_work(
     ctx: UploadContext,
     stream: InputStream,
     part_size: u64,
-    upload_id: String,
 ) -> Result<(), error::Error> {
     let part_reader = Arc::new(
         PartReaderBuilder::new()
@@ -135,7 +134,7 @@ pub(super) fn distribute_work(
         let worker = read_body(
             part_reader.clone(),
             ctx.clone(),
-            upload_id.clone(),
+            mpu_data.upload_id.clone(),
             svc.clone(),
             mpu_data.upload_part_tasks.clone(),
             parent_span_for_upload_tasks.clone(),
