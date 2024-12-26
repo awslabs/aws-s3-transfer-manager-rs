@@ -100,10 +100,9 @@ impl Client {
     ///         .bucket("my-bucket")
     ///         .key("my-key")
     ///         .body(stream)
-    ///         .send()
-    ///         .await?;
+    ///         .initiate()?;
     ///
-    ///     // send() may return before the transfer is complete.
+    ///     // initiate() will return before the transfer is complete.
     ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
     ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
     ///     let response = handle.join().await?;

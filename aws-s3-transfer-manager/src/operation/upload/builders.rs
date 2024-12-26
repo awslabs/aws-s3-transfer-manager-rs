@@ -29,10 +29,10 @@ impl UploadFluentBuilder {
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         key = self.inner.key.as_deref().unwrap_or_default(),
     ))]
-    // TODO: Make it consistent with download by renaming it to initiate and making it synchronous
-    pub async fn send(self) -> Result<UploadHandle, crate::error::Error> {
+
+    pub fn initiate(self) -> Result<UploadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload::Upload::orchestrate(self.handle, input).await
+        crate::operation::upload::Upload::orchestrate(self.handle, input)
     }
 
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -911,12 +911,12 @@ impl UploadFluentBuilder {
 
 impl crate::operation::upload::input::UploadInputBuilder {
     /// Initiate an upload transfer for a single object with this input using the given client.
-    pub async fn send_with(
+    pub fn initiate_with(
         self,
         client: &crate::Client,
     ) -> Result<UploadHandle, crate::error::Error> {
         let mut fluent_builder = client.upload();
         fluent_builder.inner = self;
-        fluent_builder.send().await
+        fluent_builder.initiate()
     }
 }

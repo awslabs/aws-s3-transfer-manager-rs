@@ -15,13 +15,14 @@ use tokio::{sync::Mutex, task};
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
-use super::{handle::UploadType, UploadHandle};
+use super::MultipartUploadData;
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
+    pub(super) upload_id: String,
 }
 
 /// handler (service fn) for a single part
@@ -36,7 +37,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .upload_part()
         .set_bucket(ctx.request.bucket.clone())
         .set_key(ctx.request.key.clone())
-        .set_upload_id(ctx.upload_id.clone())
+        .set_upload_id(Some(request.upload_id))
         .part_number(part_number)
         .content_length(part_data.data.remaining() as i64)
         .body(ByteStream::from(part_data.data))
@@ -97,7 +98,8 @@ pub(super) fn upload_part_service(
 /// * stream - the body input stream
 /// * part_size - the part_size for each part
 pub(super) fn distribute_work(
-    handle: &mut UploadHandle,
+    mpu_data: &mut MultipartUploadData,
+    ctx: UploadContext,
     stream: InputStream,
     part_size: u64,
 ) -> Result<(), error::Error> {
@@ -107,50 +109,43 @@ pub(super) fn distribute_work(
             .part_size(part_size.try_into().expect("valid part size"))
             .build(),
     );
-    match &mut handle.upload_type {
-        UploadType::PutObject { .. } => {
-            unreachable!("distribute_work must not be called for PutObject.")
-        }
-        UploadType::MultipartUpload {
-            upload_part_tasks,
-            read_body_tasks,
-        } => {
-            // group all spawned tasks together
-            let parent_span_for_all_tasks = tracing::debug_span!(
-                parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
-                bucket = handle.ctx.request.bucket().unwrap_or_default(),
-                key = handle.ctx.request.key().unwrap_or_default(),
-            );
-            parent_span_for_all_tasks.follows_from(tracing::Span::current());
+    // group all spawned tasks together
+    let parent_span_for_all_tasks = tracing::debug_span!(
+        parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
+        bucket = ctx.request.bucket().unwrap_or_default(),
+        key = ctx.request.key().unwrap_or_default(),
+    );
+    parent_span_for_all_tasks.follows_from(tracing::Span::current());
 
-            // it looks nice to group all read-workers under single span
-            let parent_span_for_read_tasks = tracing::debug_span!(
-                parent: parent_span_for_all_tasks.clone(),
-                "upload-read-tasks"
-            );
+    // it looks nice to group all read-workers under single span
+    let parent_span_for_read_tasks = tracing::debug_span!(
+        parent: parent_span_for_all_tasks.clone(),
+        "upload-read-tasks"
+    );
 
-            // it looks nice to group all upload tasks together under single span
-            let parent_span_for_upload_tasks = tracing::debug_span!(
-                parent: parent_span_for_all_tasks,
-                "upload-net-tasks"
-            );
+    // it looks nice to group all upload tasks together under single span
+    let parent_span_for_upload_tasks = tracing::debug_span!(
+        parent: parent_span_for_all_tasks,
+        "upload-net-tasks"
+    );
 
-            let svc = upload_part_service(&handle.ctx);
-            let n_workers = handle.ctx.handle.num_workers();
-            for _ in 0..n_workers {
-                let worker = read_body(
-                    part_reader.clone(),
-                    handle.ctx.clone(),
-                    svc.clone(),
-                    upload_part_tasks.clone(),
-                    parent_span_for_upload_tasks.clone(),
-                );
-                read_body_tasks.spawn(worker.instrument(parent_span_for_read_tasks.clone()));
-            }
-            tracing::trace!("work distributed for uploading parts");
-            Ok(())
-        }
+    let svc = upload_part_service(&ctx);
+    let n_workers = ctx.handle.num_workers();
+    for _ in 0..n_workers {
+        let worker = read_body(
+            part_reader.clone(),
+            ctx.clone(),
+            mpu_data.upload_id.clone(),
+            svc.clone(),
+            mpu_data.upload_part_tasks.clone(),
+            parent_span_for_upload_tasks.clone(),
+        );
+        mpu_data
+            .read_body_tasks
+            .spawn(worker.instrument(parent_span_for_read_tasks.clone()));
     }
+    tracing::trace!("work distributed for uploading parts");
+    Ok(())
 }
 
 /// Worker function that pulls part data from the `part_reader` and spawns tasks to upload each part until the reader
@@ -158,6 +153,7 @@ pub(super) fn distribute_work(
 pub(super) async fn read_body(
     part_reader: Arc<PartReader>,
     ctx: UploadContext,
+    upload_id: String,
     svc: impl Service<UploadPartRequest, Response = CompletedPart, Error = error::Error, Future: Send>
         + Clone
         + Send
@@ -173,6 +169,7 @@ pub(super) async fn read_body(
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,
+            upload_id: upload_id.clone(),
         };
         let svc = svc.clone();
         let task = svc.oneshot(req);

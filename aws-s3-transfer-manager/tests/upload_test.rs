@@ -131,8 +131,7 @@ async fn test_many_uploads_no_deadlock() {
             .bucket("test-bucket")
             .key(format!("many-async-uploads-{}.txt", i))
             .body(InputStream::from_part_stream(stream))
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         transfers.push((handle, tx));
