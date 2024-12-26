@@ -302,7 +302,7 @@ mod test {
             .key("test-key")
             .body(stream);
 
-        let handle = request.initiate_with(&tm).await.unwrap();
+        let handle = request.initiate_with(&tm).unwrap();
 
         let resp = handle.join().await.unwrap();
         assert_eq!(expected_upload_id.deref(), resp.upload_id.unwrap().deref());
@@ -336,7 +336,7 @@ mod test {
             .bucket("test-bucket")
             .key("test-key")
             .body(stream);
-        let handle = request.initiate_with(&tm).await.unwrap();
+        let handle = request.initiate_with(&tm).unwrap();
         let resp = handle.join().await.unwrap();
         assert_eq!(resp.upload_id(), None);
         assert_eq!(expected_e_tag.deref(), resp.e_tag().unwrap());
@@ -397,7 +397,7 @@ mod test {
             .bucket("test-bucket")
             .key("test-key")
             .body(stream);
-        let handle = request.initiate_with(&tm).await.unwrap();
+        let handle = request.initiate_with(&tm).unwrap();
         wait_till_create_mpu.wait();
         let abort = handle.abort().await.unwrap();
         assert_eq!(abort.upload_id().unwrap(), expected_upload_id.deref());
