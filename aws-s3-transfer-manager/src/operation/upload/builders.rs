@@ -911,7 +911,7 @@ impl UploadFluentBuilder {
 
 impl crate::operation::upload::input::UploadInputBuilder {
     /// Initiate an upload transfer for a single object with this input using the given client.
-    pub async fn send_with(
+    pub async fn initiate_with(
         self,
         client: &crate::Client,
     ) -> Result<UploadHandle, crate::error::Error> {
