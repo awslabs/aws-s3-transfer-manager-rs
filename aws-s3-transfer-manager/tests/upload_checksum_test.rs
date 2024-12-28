@@ -7,7 +7,7 @@ use std::{str::FromStr, task::Poll};
 
 use aws_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
-    operation::upload::ChecksumStrategy,
+    operation::upload::{ChecksumStrategy, UploadOutput},
     types::{ConcurrencySetting, PartSize},
 };
 use aws_sdk_s3::{
@@ -24,6 +24,7 @@ use pin_project_lite::pin_project;
 use test_common::mock_client_with_stubbed_http_client;
 
 const MEBIBYTE: usize = 1024 * 1024;
+const PART_SIZE: usize = 5 * MEBIBYTE;
 
 fn calculate_checksum(algorithm: &ChecksumAlgorithm, data: &[u8]) -> String {
     let smithy_algorithm =
@@ -48,7 +49,7 @@ fn calculate_full_object_checksum(algorithm: &ChecksumAlgorithm, parts: &Vec<Byt
 }
 
 fn calculate_composite_checksum(algorithm: &ChecksumAlgorithm, parts: &Vec<Bytes>) -> String {
-    // S3 doesn't allow CRC64-NVME to do composite checksums
+    // S3 doesn't allow CRC-64NVME to do composite checksums
     assert_ne!(algorithm, &ChecksumAlgorithm::Crc64Nvme);
 
     let mut concatenated_part_checksums = String::new();
@@ -306,28 +307,16 @@ fn mock_s3_client_for_multipart_upload(
     mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
 }
 
-// Test user providing a full-object checksum up front, for multipart upload.
-#[tokio::test]
-async fn test_checksums_full_object_up_front_mpu() {
+async fn test_mpu(checksum_strategy: &ChecksumStrategy, parts: &Vec<Bytes>) -> UploadOutput {
     let (_guard, _rx) = capture_test_logs();
 
-    let part_size = 5 * MEBIBYTE;
-
-    let parts = vec![
-        Bytes::from(vec![b'a'; part_size]),
-        Bytes::from("abcdefghijklm".as_bytes()),
-    ];
     let stream = TestStream::new(parts.clone());
-    let checksum_strategy = ChecksumStrategy::with_crc32(calculate_full_object_checksum(
-        &ChecksumAlgorithm::Crc32,
-        &parts,
-    ));
 
-    let client = mock_s3_client_for_multipart_upload(&checksum_strategy, &parts);
+    let client = mock_s3_client_for_multipart_upload(checksum_strategy, &parts);
     let config = aws_s3_transfer_manager::Config::builder()
         .client(client)
-        .part_size(PartSize::Target(part_size as u64))
-        .multipart_threshold(PartSize::Target(part_size as u64))
+        .part_size(PartSize::Target(PART_SIZE as u64))
+        .multipart_threshold(PartSize::Target(PART_SIZE as u64))
         .concurrency(ConcurrencySetting::Explicit(1)) // guarantee parts sent in order
         .build();
     let tm = aws_s3_transfer_manager::Client::new(config);
@@ -336,7 +325,7 @@ async fn test_checksums_full_object_up_front_mpu() {
     let upload_handle = tm
         .upload()
         .bucket("test-bucket")
-        .key("test_checksums_full_object_up_front_mpu")
+        .key("test-key")
         .checksum_strategy(checksum_strategy.clone())
         .body(InputStream::from_part_stream(stream))
         .send()
@@ -344,18 +333,142 @@ async fn test_checksums_full_object_up_front_mpu() {
         .unwrap();
     let upload_output = upload_handle.join().await.unwrap();
 
-    // Check output
+    upload_output
+}
+
+#[tokio::test]
+async fn test_mpu_provided_full_object_crc32() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let full_object_checksum = calculate_full_object_checksum(&ChecksumAlgorithm::Crc32, &parts);
+    let strategy = ChecksumStrategy::with_crc32(&full_object_checksum);
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(output.checksum_crc32(), Some(full_object_checksum.as_ref()));
+}
+
+#[tokio::test]
+async fn test_mpu_provided_full_object_crc32_c() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let full_object_checksum = calculate_full_object_checksum(&ChecksumAlgorithm::Crc32C, &parts);
+    let strategy = ChecksumStrategy::with_crc32_c(&full_object_checksum);
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(
-        upload_output.checksum_type,
-        Some(checksum_strategy.type_if_multipart)
+        output.checksum_crc32_c(),
+        Some(full_object_checksum.as_ref())
     );
-    let (upload_output_checksum_algorithm, upload_output_checksum_value) =
-        get_checksum_value!(upload_output).unwrap();
+}
+
+#[tokio::test]
+async fn test_mpu_provided_full_object_crc64_nvme() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let full_object_checksum =
+        calculate_full_object_checksum(&ChecksumAlgorithm::Crc64Nvme, &parts);
+    let strategy = ChecksumStrategy::with_crc64_nvme(&full_object_checksum);
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(
-        upload_output_checksum_algorithm,
-        checksum_strategy.algorithm
+        output.checksum_crc64_nvme(),
+        Some(full_object_checksum.as_ref())
     );
-    if let Some(full_object_checksum) = &checksum_strategy.full_object_checksum {
-        assert_eq!(&upload_output_checksum_value, full_object_checksum);
-    }
+}
+
+// NOTE: SHA algorithms not currently allowed to provide full-object checksums,
+// because it would prevent Transfer Manager from doing multipart upload.
+
+#[tokio::test]
+async fn test_mpu_calculated_full_object_crc32() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_crc32();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_full_object_crc32_c() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_crc32_c();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32_c().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_full_object_crc64_nvme() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_crc64_nvme();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+// NOTE: SHA full-object MPU checksums not supported by S3
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_crc32() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_crc32_composite_if_multipart();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_crc32().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_crc32_c() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_crc32_c_composite_if_multipart();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_crc32_c().is_some());
+}
+
+// NOTE: CRC-64NVME composite checksums not supported by S3
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_sha1() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_sha1_composite_if_multipart();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_sha1().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_sha256() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::with_calculated_sha256_composite_if_multipart();
+    let output = test_mpu(&strategy, &parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_sha256().is_some());
 }
