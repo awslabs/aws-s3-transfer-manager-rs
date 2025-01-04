@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::{cmp, mem};
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use tracing::Instrument;
@@ -81,19 +82,7 @@ pub(super) async fn discover_obj(
                 .await
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
-            let byte_range = match range.as_ref() {
-                Some(r) => ByteRange::Inclusive(
-                    *r.start(),
-                    cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
-                ),
-                None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
-            };
-            let builder: GetObjectInputBuilder = input.clone().into();
-            let r = builder
-                .set_part_number(None)
-                .range(header::Range::bytes(byte_range));
-
-            discover_obj_with_get(ctx, r, range)
+            discover_obj_with_get(ctx, input, range)
                 .instrument(tracing::debug_span!("send-ranged-get-for-discovery"))
                 .await
         }
@@ -108,64 +97,26 @@ pub(super) async fn discover_obj(
     Ok(discovery)
 }
 
-async fn discover_obj_with_head(
-    ctx: &DownloadContext,
-    input: &DownloadInput,
-    byte_range: Option<ByteRange>,
-) -> Result<ObjectDiscovery, crate::error::Error> {
-    let resp = ctx
-        .client()
-        .head_object()
-        .set_bucket(input.bucket().map(str::to_string))
-        .set_key(input.key().map(str::to_string))
-        .send()
-        .await
-        .map_err(error::discovery_failed)?;
-    let object_meta: ObjectMetadata = resp.into();
-
-    let remaining = match byte_range {
-        Some(range) => match range {
-            ByteRange::Inclusive(start, end) => start..=end,
-            ByteRange::AllFrom(start) => start..=object_meta.content_length(),
-            ByteRange::Last(n) => {
-                (object_meta.content_length() - n + 1)..=object_meta.content_length()
-            }
-        },
-        None => 0..=object_meta.content_length(),
-    };
-
-    Ok(ObjectDiscovery {
-        remaining,
-        chunk_meta: None,
-        object_meta,
-        initial_chunk: None,
-    })
-}
-
-async fn discover_obj_with_get(
-    ctx: &DownloadContext,
-    input: GetObjectInputBuilder,
+fn discover_handler_first_chunk_response(
+    mut resp: GetObjectOutput,
     range: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
-    let resp = input.send_with(ctx.client()).await;
-
-    if resp.is_err() {
-        // TODO(aws-sdk-rust#1159) - deal with empty file errors, see https://github.com/awslabs/aws-c-s3/blob/v0.5.7/source/s3_auto_ranged_get.c#L147-L153
-    }
-
-    let mut resp = resp.map_err(error::discovery_failed)?;
-
-    // take the body so we can convert the metadata
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
-
     let object_meta: ObjectMetadata = (&resp).into();
     let chunk_meta: ChunkMetadata = resp.into();
     let content_len = chunk_meta.content_length.expect("expected content_length") as u64;
 
     let remaining = match range {
         Some(range) => (*range.start() + content_len)..=*range.end(),
-        None => content_len..=object_meta.content_length() - 1,
+        None => {
+            if object_meta.content_length() > content_len {
+                content_len..=object_meta.content_length() - 1
+            } else {
+                // Return empty range. TODO:: what's better option here?
+                1..=0
+            }
+        }
     };
 
     let initial_chunk = match content_len == 0 {
@@ -181,10 +132,106 @@ async fn discover_obj_with_get(
     })
 }
 
+async fn discover_obj_with_get_first_part(
+    ctx: &DownloadContext,
+    input: &DownloadInput,
+) -> Result<ObjectDiscovery, error::Error> {
+    // Get object first part.
+    let builder: GetObjectInputBuilder = input.clone().into();
+    // S3 index starts with 1
+    let resp = builder
+        .set_range(None)
+        .set_part_number(Some(1))
+        .send_with(ctx.client())
+        .await
+        .map_err(error::discovery_failed)?;
+    discover_handler_first_chunk_response(resp, None)
+}
+
+async fn discover_obj_with_head(
+    ctx: &DownloadContext,
+    input: &DownloadInput,
+    byte_range: Option<ByteRange>,
+) -> Result<ObjectDiscovery, crate::error::Error> {
+    let resp = ctx
+        .client()
+        .head_object()
+        .set_bucket(input.bucket().map(str::to_string))
+        .set_key(input.key().map(str::to_string))
+        .send()
+        .await;
+
+    match resp {
+        Err(error) => {
+            match error.as_service_error() {
+                Some(service_error) if service_error.meta().code() == Some("InvalidRange") => {
+                    // Invalid Range because of the empty object, discover the object with the first part instead.
+                    discover_obj_with_get_first_part(ctx, input).await
+                }
+                _ => Err(error::discovery_failed(error)),
+            }
+        }
+        Ok(resp) => {
+            let object_meta: ObjectMetadata = resp.into();
+
+            let remaining = match byte_range {
+                Some(range) => match range {
+                    ByteRange::Inclusive(start, end) => start..=end,
+                    ByteRange::AllFrom(start) => start..=object_meta.content_length(),
+                    ByteRange::Last(n) => {
+                        (object_meta.content_length() - n + 1)..=object_meta.content_length()
+                    }
+                },
+                None => 0..=object_meta.content_length(),
+            };
+
+            Ok(ObjectDiscovery {
+                remaining,
+                chunk_meta: None,
+                object_meta,
+                initial_chunk: None,
+            })
+        }
+    }
+}
+
+async fn discover_obj_with_get(
+    ctx: &DownloadContext,
+    input: &DownloadInput,
+    range: Option<RangeInclusive<u64>>,
+) -> Result<ObjectDiscovery, error::Error> {
+    // Convert input to build and set the range properly as the first range get.
+    let byte_range = match range.as_ref() {
+        Some(r) => ByteRange::Inclusive(
+            *r.start(),
+            cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
+        ),
+        None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
+    };
+    let builder: GetObjectInputBuilder = input.clone().into();
+    let resp = builder
+        .set_part_number(None)
+        .range(header::Range::bytes(byte_range))
+        .send_with(ctx.client())
+        .await;
+    match resp {
+        Err(error) => {
+            match error.as_service_error() {
+                Some(service_error)
+                    if service_error.meta().code() == Some("InvalidRange") && range.is_none() =>
+                {
+                    // Invalid Range and no Range passed in, handle the empty object, discover the object with the first part instead.
+                    discover_obj_with_get_first_part(ctx, input).await
+                }
+                _ => Err(error::discovery_failed(error)),
+            }
+        }
+        Ok(response) => discover_handler_first_chunk_response(response, range),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use crate::http::header::ByteRange;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
@@ -193,12 +240,14 @@ mod tests {
     use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
     use crate::types::PartSize;
-    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
     use aws_smithy_mocks_experimental::mock;
     use aws_smithy_types::byte_stream::ByteStream;
+    use aws_smithy_types::error::ErrorMetadata;
     use bytes::Buf;
+    use std::sync::Arc;
     use test_common::mock_client_with_stubbed_http_client;
 
     use super::ObjectDiscovery;
@@ -390,5 +439,35 @@ mod tests {
             .await
             .expect("valid body");
         assert_eq!(100, initial_chunk.remaining());
+    }
+
+    #[tokio::test]
+    async fn test_discover_obj_with_empty_object() {
+        let target_part_size = 500;
+        let get_range_rule = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=0-499"))
+            .then_error(|| {
+                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
+            });
+        let get_first_part_rule = mock!(Client::get_object)
+            .match_requests(|r| r.part_number() == Some(1))
+            .then_output(|| GetObjectOutput::builder().content_length(0).build());
+        let client = mock_client_with_stubbed_http_client!(
+            aws_sdk_s3,
+            &[&get_range_rule, &get_first_part_rule]
+        );
+
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        assert_eq!(0, discovery.remaining.clone().count());
+        assert_eq!(1..=0, discovery.remaining);
+        assert!(discovery.initial_chunk.is_none());
     }
 }

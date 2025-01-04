@@ -116,7 +116,7 @@ impl ObjectMetadata {
                 total.parse().expect("valid range total")
             }
             (Some(length), None) => {
-                debug_assert!(length > 0, "content length invalid");
+                debug_assert!(length >= 0, "content length invalid");
                 length as u64
             },
             (None, None) => panic!("total object size cannot be calculated without either content length or content range headers")
