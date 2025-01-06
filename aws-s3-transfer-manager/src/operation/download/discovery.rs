@@ -67,7 +67,7 @@ impl ObjectDiscoveryStrategy {
 
 /// Discover metadata about an object.
 ///
-///Returns object metadata, the remaining range of data
+/// Returns object metadata, the remaining range of data
 /// to be fetched, and _(if available)_ the first chunk of data.
 pub(super) async fn discover_obj(
     ctx: &DownloadContext,
@@ -97,6 +97,8 @@ pub(super) async fn discover_obj(
     Ok(discovery)
 }
 
+// Use 1..=0 to represent an empty object, and clippy doesn't allow that.
+#[allow(clippy::reversed_empty_ranges)]
 fn discover_handler_first_chunk_response(
     mut resp: GetObjectOutput,
     range: Option<RangeInclusive<u64>>,
@@ -105,21 +107,23 @@ fn discover_handler_first_chunk_response(
     let body = mem::replace(&mut resp.body, empty_stream);
     let object_meta: ObjectMetadata = (&resp).into();
     let chunk_meta: ChunkMetadata = resp.into();
-    let content_len = chunk_meta.content_length.expect("expected content_length") as u64;
+    let chunk_content_len = chunk_meta
+        .content_length
+        .expect("expected content_length in chunk") as u64;
 
     let remaining = match range {
-        Some(range) => (*range.start() + content_len)..=*range.end(),
+        Some(range) => (*range.start() + chunk_content_len)..=*range.end(),
         None => {
-            if object_meta.content_length() > content_len {
-                content_len..=object_meta.content_length() - 1
+            if object_meta.content_length() > chunk_content_len {
+                chunk_content_len..=object_meta.content_length() - 1
             } else {
-                // Return empty range. TODO:: what's better option here?
+                // Return empty range.
                 1..=0
             }
         }
     };
 
-    let initial_chunk = match content_len == 0 {
+    let initial_chunk = match chunk_content_len == 0 {
         true => None,
         false => Some(body),
     };
@@ -220,7 +224,8 @@ async fn discover_obj_with_get(
                 Some(service_error)
                     if service_error.meta().code() == Some("InvalidRange") && range.is_none() =>
                 {
-                    // Invalid Range and no Range passed in, handle the empty object, discover the object with the first part instead.
+                    // Invalid Range Error found and no Range passed in, try to handle empty object via
+                    // discover the object with the first part instead.
                     discover_obj_with_get_first_part(ctx, input).await
                 }
                 _ => Err(error::discovery_failed(error)),
@@ -441,7 +446,9 @@ mod tests {
         assert_eq!(100, initial_chunk.remaining());
     }
 
+    // Use 1..=0 to represent an empty object, and clippy doesn't allow that.
     #[tokio::test]
+    #[allow(clippy::reversed_empty_ranges)]
     async fn test_discover_obj_with_empty_object() {
         let target_part_size = 500;
         let get_range_rule = mock!(Client::get_object)
