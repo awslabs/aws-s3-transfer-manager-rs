@@ -28,11 +28,17 @@ pub struct UploadOutput {
     /// <p>The base64-encoded, 32-bit CRC32C checksum of the object. This will only be present if it was uploaded with the object. When you use an API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_crc32_c: Option<String>,
 
+    /// <p>The Base64 encoded, 64-bit <code>CRC64NVME</code> checksum of the object. This header is present if the object was uploaded with the <code>CRC64NVME</code> checksum algorithm, or if it was uploaded without a checksum (and Amazon S3 added the default checksum, <code>CRC64NVME</code>, to the uploaded object). For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub checksum_crc64_nvme: Option<String>,
+
     /// <p>The base64-encoded, 160-bit SHA-1 digest of the object. This will only be present if it was uploaded with the object. When you use the API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_sha1: Option<String>,
 
     /// <p>The base64-encoded, 256-bit SHA-256 digest of the object. This will only be present if it was uploaded with the object. When you use an API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_sha256: Option<String>,
+
+    /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
 
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
@@ -101,6 +107,10 @@ impl UploadOutput {
     pub fn checksum_crc32_c(&self) -> Option<&str> {
         self.checksum_crc32_c.as_deref()
     }
+    /// <p>The Base64 encoded, 64-bit <code>CRC64NVME</code> checksum of the object. This header is present if the object was uploaded with the <code>CRC64NVME</code> checksum algorithm, or if it was uploaded without a checksum (and Amazon S3 added the default checksum, <code>CRC64NVME</code>, to the uploaded object). For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn checksum_crc64_nvme(&self) -> Option<&str> {
+        self.checksum_crc64_nvme.as_deref()
+    }
     /// <p>The base64-encoded, 160-bit SHA-1 digest of the object. This will only be present if it was uploaded with the object. When you use the API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn checksum_sha1(&self) -> Option<&str> {
         self.checksum_sha1.as_deref()
@@ -108,6 +118,10 @@ impl UploadOutput {
     /// <p>The base64-encoded, 256-bit SHA-256 digest of the object. This will only be present if it was uploaded with the object. When you use an API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn checksum_sha256(&self) -> Option<&str> {
         self.checksum_sha256.as_deref()
+    }
+    /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+        self.checksum_type.as_ref()
     }
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
@@ -173,8 +187,10 @@ impl Debug for UploadOutput {
         formatter.field("e_tag", &self.e_tag);
         formatter.field("checksum_crc32", &self.checksum_crc32);
         formatter.field("checksum_crc32_c", &self.checksum_crc32_c);
+        formatter.field("checksum_crc64_nvme", &self.checksum_crc64_nvme);
         formatter.field("checksum_sha1", &self.checksum_sha1);
         formatter.field("checksum_sha256", &self.checksum_sha256);
+        formatter.field("checksum_type", &self.checksum_type);
         formatter.field("server_side_encryption", &self.server_side_encryption);
         formatter.field("version_id", &self.version_id);
         formatter.field("sse_customer_algorithm", &self.sse_customer_algorithm);
@@ -199,8 +215,10 @@ pub struct UploadOutputBuilder {
     pub(crate) e_tag: Option<String>,
     pub(crate) checksum_crc32: Option<String>,
     pub(crate) checksum_crc32_c: Option<String>,
+    pub(crate) checksum_crc64_nvme: Option<String>,
     pub(crate) checksum_sha1: Option<String>,
     pub(crate) checksum_sha256: Option<String>,
+    pub(crate) checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
     pub(crate) server_side_encryption: Option<aws_sdk_s3::types::ServerSideEncryption>,
     pub(crate) version_id: Option<String>,
     pub(crate) sse_customer_algorithm: Option<String>,
@@ -281,6 +299,20 @@ impl UploadOutputBuilder {
     pub fn get_checksum_crc32_c(&self) -> Option<&str> {
         self.checksum_crc32_c.as_deref()
     }
+    /// <p>The Base64 encoded, 64-bit <code>CRC64NVME</code> checksum of the object. This header is present if the object was uploaded with the <code>CRC64NVME</code> checksum algorithm, or if it was uploaded without a checksum (and Amazon S3 added the default checksum, <code>CRC64NVME</code>, to the uploaded object). For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn checksum_crc64_nvme(mut self, input: impl Into<String>) -> Self {
+        self.checksum_crc64_nvme = Some(input.into());
+        self
+    }
+    /// <p>The Base64 encoded, 64-bit <code>CRC64NVME</code> checksum of the object. This header is present if the object was uploaded with the <code>CRC64NVME</code> checksum algorithm, or if it was uploaded without a checksum (and Amazon S3 added the default checksum, <code>CRC64NVME</code>, to the uploaded object). For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn set_checksum_crc64_nvme(mut self, input: Option<String>) -> Self {
+        self.checksum_crc64_nvme = input;
+        self
+    }
+    /// <p>The Base64 encoded, 64-bit <code>CRC64NVME</code> checksum of the object. This header is present if the object was uploaded with the <code>CRC64NVME</code> checksum algorithm, or if it was uploaded without a checksum (and Amazon S3 added the default checksum, <code>CRC64NVME</code>, to the uploaded object). For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn get_checksum_crc64_nvme(&self) -> Option<&str> {
+        self.checksum_crc64_nvme.as_deref()
+    }
     /// <p>The base64-encoded, 160-bit SHA-1 digest of the object. This will only be present if it was uploaded with the object. When you use the API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn checksum_sha1(mut self, input: impl Into<String>) -> Self {
         self.checksum_sha1 = Some(input.into());
@@ -308,6 +340,20 @@ impl UploadOutputBuilder {
     /// <p>The base64-encoded, 256-bit SHA-256 digest of the object. This will only be present if it was uploaded with the object. When you use an API operation on an object that was uploaded using multipart uploads, this value may not be a direct checksum value of the full object. Instead, it's a calculation based on the checksum values of each individual part. For more information about how checksums are calculated with multipart uploads, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#large-object-checksums"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub fn get_checksum_sha256(&self) -> Option<&str> {
         self.checksum_sha256.as_deref()
+    }
+    /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn checksum_type(mut self, input: aws_sdk_s3::types::ChecksumType) -> Self {
+        self.checksum_type = Some(input);
+        self
+    }
+    /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn set_checksum_type(mut self, input: Option<aws_sdk_s3::types::ChecksumType>) -> Self {
+        self.checksum_type = input;
+        self
+    }
+    /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub fn get_checksum_type(&self) -> &Option<aws_sdk_s3::types::ChecksumType> {
+        &self.checksum_type
     }
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
@@ -501,8 +547,10 @@ impl UploadOutputBuilder {
             e_tag: self.e_tag,
             checksum_crc32: self.checksum_crc32,
             checksum_crc32_c: self.checksum_crc32_c,
+            checksum_crc64_nvme: self.checksum_crc64_nvme,
             checksum_sha1: self.checksum_sha1,
             checksum_sha256: self.checksum_sha256,
+            checksum_type: self.checksum_type,
             server_side_encryption: self.server_side_encryption,
             version_id: self.version_id,
             sse_customer_algorithm: self.sse_customer_algorithm,
@@ -527,12 +575,14 @@ impl From<PutObjectOutput> for UploadOutputBuilder {
             sse_kms_encryption_context: value.ssekms_encryption_context,
             bucket_key_enabled: value.bucket_key_enabled,
             request_charged: value.request_charged,
-            checksum_sha256: value.checksum_sha256,
             expiration: value.expiration,
             e_tag: value.e_tag,
             checksum_crc32: value.checksum_crc32,
             checksum_crc32_c: value.checksum_crc32_c,
+            checksum_crc64_nvme: value.checksum_crc64_nvme,
             checksum_sha1: value.checksum_sha1,
+            checksum_sha256: value.checksum_sha256,
+            checksum_type: value.checksum_type,
             version_id: value.version_id,
         }
     }
@@ -545,8 +595,10 @@ impl Debug for UploadOutputBuilder {
         formatter.field("e_tag", &self.e_tag);
         formatter.field("checksum_crc32", &self.checksum_crc32);
         formatter.field("checksum_crc32_c", &self.checksum_crc32_c);
+        formatter.field("checksum_crc64_nvme", &self.checksum_crc64_nvme);
         formatter.field("checksum_sha1", &self.checksum_sha1);
         formatter.field("checksum_sha256", &self.checksum_sha256);
+        formatter.field("checksum_type", &self.checksum_type);
         formatter.field("server_side_encryption", &self.server_side_encryption);
         formatter.field("version_id", &self.version_id);
         formatter.field("sse_customer_algorithm", &self.sse_customer_algorithm);
@@ -574,13 +626,15 @@ impl From<CreateMultipartUploadOutput> for UploadOutputBuilder {
             sse_kms_encryption_context: value.ssekms_encryption_context,
             bucket_key_enabled: value.bucket_key_enabled,
             request_charged: value.request_charged,
-            // remaining fields not available from CreateMultipartUploadOutput
-            checksum_sha256: None,
+            checksum_type: value.checksum_type,
+            // remaining fields will be set later, from CompleteMultipartUploadOutput
             expiration: None,
             e_tag: None,
             checksum_crc32: None,
             checksum_crc32_c: None,
+            checksum_crc64_nvme: None,
             checksum_sha1: None,
+            checksum_sha256: None,
             version_id: None,
             // TODO(aws-sdk-rust#1159): abort_rule_id and abort_date seem unique to CreateMultipartUploadOutput
         }
