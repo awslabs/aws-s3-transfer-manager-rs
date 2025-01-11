@@ -56,8 +56,9 @@ impl Upload {
                     .client()
                     .config()
                     .request_checksum_calculation()
-                    .unwrap_or(&aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported)
-                    .eq(&aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported)
+                    .cloned()
+                    .unwrap_or_default()
+                    == aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported
                 {
                     input.checksum_strategy = Some(ChecksumStrategy::default());
                 }
