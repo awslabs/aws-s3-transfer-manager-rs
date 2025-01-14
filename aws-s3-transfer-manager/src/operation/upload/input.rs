@@ -52,18 +52,7 @@ pub struct UploadInput {
     pub content_md5: Option<String>,
     /// <p>A standard MIME type describing the format of the contents. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-type">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-type</a>.</p>
     pub content_type: Option<String>,
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub checksum_strategy: Option<ChecksumStrategy>,
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub expires: Option<::aws_smithy_types::DateTime>,
@@ -250,18 +239,7 @@ impl UploadInput {
     pub fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn checksum_strategy(&self) -> Option<&ChecksumStrategy> {
         self.checksum_strategy.as_ref()
     }
@@ -723,50 +701,17 @@ impl UploadInputBuilder {
     pub fn get_content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn checksum_strategy(mut self, input: ChecksumStrategy) -> Self {
         self.checksum_strategy = Some(input);
         self
     }
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn set_checksum_strategy(mut self, input: Option<ChecksumStrategy>) -> Self {
         self.checksum_strategy = input;
         self
     }
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn get_checksum_strategy(&self) -> Option<&ChecksumStrategy> {
         self.checksum_strategy.as_ref()
     }

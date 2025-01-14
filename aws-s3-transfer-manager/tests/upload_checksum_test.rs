@@ -7,6 +7,7 @@ use std::{str::FromStr, task::Poll};
 
 use aws_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
+    metrics::unit::ByteUnit,
     operation::upload::{ChecksumStrategy, UploadOutput},
     types::{ConcurrencySetting, PartSize},
 };
@@ -24,8 +25,7 @@ use bytes::Bytes;
 use pin_project_lite::pin_project;
 use test_common::mock_client_with_stubbed_http_client;
 
-const MEBIBYTE: usize = 1024 * 1024;
-const PART_SIZE: usize = 5 * MEBIBYTE;
+const PART_SIZE: usize = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
 fn calculate_checksum(algorithm: &ChecksumAlgorithm, data: &[u8]) -> String {
     let smithy_algorithm =

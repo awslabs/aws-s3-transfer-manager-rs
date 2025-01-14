@@ -2,19 +2,7 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
 
 use crate::error;
 
-/// Strategy for calculating checksum values during upload.
-/// These values are sent to S3 and used to verify the integrity of the uploaded data.
-/// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-///
-/// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-/// checksum algorithm or already know the checksum value.
-///
-/// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-/// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-///
-/// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-/// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
-/// If you do this, S3 will still calculate a `CRC64NVME` full object checksum for the object.
+#[doc = std::include_str!("checksum_strategy.md")]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ChecksumStrategy {

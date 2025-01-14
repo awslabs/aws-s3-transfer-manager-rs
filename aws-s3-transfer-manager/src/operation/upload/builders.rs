@@ -233,52 +233,19 @@ impl UploadFluentBuilder {
         self.inner.get_content_type()
     }
 
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn checksum_strategy(mut self, input: ChecksumStrategy) -> Self {
         self.inner = self.inner.checksum_strategy(input);
         self
     }
 
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn set_checksum_strategy(mut self, input: Option<ChecksumStrategy>) -> Self {
         self.inner = self.inner.set_checksum_strategy(input);
         self
     }
 
-    /// Strategy for calculating checksum values during upload.
-    /// These values are sent to S3 and used to verify the integrity of the uploaded data.
-    /// For more information, see <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html>.
-    ///
-    /// You can set a specific [`ChecksumStrategy`], if you wish to choose the
-    /// checksum algorithm or already know the checksum value.
-    ///
-    /// <code>CRC64NVME</code> checksums are calculated by default (if no strategy is set and the underlying
-    /// S3 client is configured with the default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported`]).
-    ///
-    /// To disable checksum calculation, do not set a [`ChecksumStrategy`] and make sure the underlying S3 client is
-    /// configured with the non-default [`aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired`].
+    #[doc = std::include_str!("checksum_strategy.md")]
     pub fn get_checksum_strategy(&self) -> Option<&ChecksumStrategy> {
         self.inner.get_checksum_strategy()
     }

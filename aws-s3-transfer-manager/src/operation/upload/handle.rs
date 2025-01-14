@@ -222,7 +222,9 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                         aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
                             req.checksum_crc64_nvme(value)
                         }
-                        algo => panic!("unexpected algorithm `{algo}` for full object checksum"),
+                        algo => {
+                            unreachable!("unexpected algorithm `{algo}` for full object checksum")
+                        }
                     };
                 }
             }

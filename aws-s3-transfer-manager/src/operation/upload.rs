@@ -159,7 +159,7 @@ async fn put_object(
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(value),
-                algo => panic!("unexpected algorithm `{algo}` for full object checksum"),
+                algo => unreachable!("unexpected algorithm `{algo}` for full object checksum"),
             };
         } else {
             // Set checksum algorithm, which tells SDK to calculate and add checksum value
@@ -276,6 +276,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
 #[cfg(test)]
 mod test {
     use crate::io::InputStream;
+    use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
     use crate::types::{ConcurrencySetting, PartSize};
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
@@ -377,7 +378,7 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
+            .set_multipart_threshold(PartSize::Target(10 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)
             .build();
         let tm = crate::Client::new(tm_config);
@@ -437,7 +438,7 @@ mod test {
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * 1024 * 1024))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)
             .build();
 
