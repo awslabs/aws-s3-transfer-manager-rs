@@ -9,8 +9,10 @@ use std::{cmp, mem};
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
@@ -97,45 +99,6 @@ pub(super) async fn discover_obj(
     Ok(discovery)
 }
 
-// Use 1..=0 to represent an empty object, and clippy doesn't allow that.
-#[allow(clippy::reversed_empty_ranges)]
-fn discover_handler_first_chunk_response(
-    mut resp: GetObjectOutput,
-    range: Option<RangeInclusive<u64>>,
-) -> Result<ObjectDiscovery, error::Error> {
-    let empty_stream = ByteStream::new(SdkBody::empty());
-    let body = mem::replace(&mut resp.body, empty_stream);
-    let object_meta: ObjectMetadata = (&resp).into();
-    let chunk_meta: ChunkMetadata = resp.into();
-    let chunk_content_len = chunk_meta
-        .content_length
-        .expect("expected content_length in chunk") as u64;
-
-    let remaining = match range {
-        Some(range) => (*range.start() + chunk_content_len)..=*range.end(),
-        None => {
-            if object_meta.content_length() > chunk_content_len {
-                chunk_content_len..=object_meta.content_length() - 1
-            } else {
-                // Return empty range.
-                1..=0
-            }
-        }
-    };
-
-    let initial_chunk = match chunk_content_len == 0 {
-        true => None,
-        false => Some(body),
-    };
-
-    Ok(ObjectDiscovery {
-        remaining,
-        chunk_meta: Some(chunk_meta),
-        object_meta,
-        initial_chunk,
-    })
-}
-
 async fn discover_obj_with_get_first_part(
     ctx: &DownloadContext,
     input: &DownloadInput,
@@ -149,13 +112,29 @@ async fn discover_obj_with_get_first_part(
         .send_with(ctx.client())
         .await
         .map_err(error::discovery_failed)?;
-    discover_handler_first_chunk_response(resp, None)
+    first_chunk_response_handler(resp, None)
+}
+
+fn is_empty_object_error<E: ProvideErrorMetadata, T, D>(
+    error: &SdkError<E, D>,
+    customized_range: Option<T>,
+) -> bool {
+    match error.as_service_error() {
+        Some(service_error)
+            if service_error.meta().code() == Some("InvalidRange")
+                && customized_range.is_none() =>
+        {
+            // Invalid Range Error found and no Range passed in it's an empty object.
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn discover_obj_with_head(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    byte_range: Option<ByteRange>,
+    customized_range: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = ctx
         .client()
@@ -167,18 +146,17 @@ async fn discover_obj_with_head(
 
     match resp {
         Err(error) => {
-            match error.as_service_error() {
-                Some(service_error) if service_error.meta().code() == Some("InvalidRange") => {
-                    // Invalid Range because of the empty object, discover the object with the first part instead.
-                    discover_obj_with_get_first_part(ctx, input).await
-                }
-                _ => Err(error::discovery_failed(error)),
+            if is_empty_object_error(&error, customized_range) {
+                // discover the object with the first part instead for empty object.
+                discover_obj_with_get_first_part(ctx, input).await
+            } else {
+                Err(error::discovery_failed(error))
             }
         }
         Ok(resp) => {
             let object_meta: ObjectMetadata = resp.into();
 
-            let remaining = match byte_range {
+            let remaining = match customized_range {
                 Some(range) => match range {
                     ByteRange::Inclusive(start, end) => start..=end,
                     ByteRange::AllFrom(start) => start..=object_meta.content_length(),
@@ -202,10 +180,10 @@ async fn discover_obj_with_head(
 async fn discover_obj_with_get(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    range: Option<RangeInclusive<u64>>,
+    customized_range: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
-    // Convert input to build and set the range properly as the first range get.
-    let byte_range = match range.as_ref() {
+    // Convert input to builder and set the range properly as the first range get.
+    let byte_range = match customized_range.as_ref() {
         Some(r) => ByteRange::Inclusive(
             *r.start(),
             cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
@@ -220,19 +198,49 @@ async fn discover_obj_with_get(
         .await;
     match resp {
         Err(error) => {
-            match error.as_service_error() {
-                Some(service_error)
-                    if service_error.meta().code() == Some("InvalidRange") && range.is_none() =>
-                {
-                    // Invalid Range Error found and no Range passed in, try to handle empty object via
-                    // discover the object with the first part instead.
-                    discover_obj_with_get_first_part(ctx, input).await
-                }
-                _ => Err(error::discovery_failed(error)),
+            if is_empty_object_error(&error, customized_range) {
+                // discover the object with the first part instead for empty object.
+                discover_obj_with_get_first_part(ctx, input).await
+            } else {
+                Err(error::discovery_failed(error))
             }
         }
-        Ok(response) => discover_handler_first_chunk_response(response, range),
+        Ok(response) => first_chunk_response_handler(response, customized_range),
     }
+}
+
+fn first_chunk_response_handler(
+    mut resp: GetObjectOutput,
+    customized_range: Option<RangeInclusive<u64>>,
+) -> Result<ObjectDiscovery, error::Error> {
+    let empty_stream = ByteStream::new(SdkBody::empty());
+    let body = mem::replace(&mut resp.body, empty_stream);
+    let object_meta: ObjectMetadata = (&resp).into();
+    let chunk_meta: ChunkMetadata = resp.into();
+    let chunk_content_len = chunk_meta
+        .content_length
+        .expect("expected content_length in chunk") as u64;
+
+    let remaining = match customized_range {
+        Some(customized_range) => {
+            (*customized_range.start() + chunk_content_len)..=*customized_range.end()
+        }
+        // If no range is provided, the range is from the end of the chunk to the end of the object.
+        // When the chunk is the last part of the object, this result in empty range.
+        None => chunk_content_len..=object_meta.content_length() - 1,
+    };
+
+    let initial_chunk = match chunk_content_len == 0 {
+        true => None,
+        false => Some(body),
+    };
+
+    Ok(ObjectDiscovery {
+        remaining,
+        chunk_meta: Some(chunk_meta),
+        object_meta,
+        initial_chunk,
+    })
 }
 
 #[cfg(test)]
@@ -446,9 +454,7 @@ mod tests {
         assert_eq!(100, initial_chunk.remaining());
     }
 
-    // Use 1..=0 to represent an empty object, and clippy doesn't allow that.
     #[tokio::test]
-    #[allow(clippy::reversed_empty_ranges)]
     async fn test_discover_obj_with_empty_object() {
         let target_part_size = 500;
         let get_range_rule = mock!(Client::get_object)
@@ -474,7 +480,7 @@ mod tests {
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         assert_eq!(0, discovery.remaining.clone().count());
-        assert_eq!(1..=0, discovery.remaining);
+        assert!(discovery.remaining.is_empty());
         assert!(discovery.initial_chunk.is_none());
     }
 }
