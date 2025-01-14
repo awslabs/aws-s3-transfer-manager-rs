@@ -209,8 +209,6 @@ async fn discover_obj_with_get(
     }
 }
 
-const EMPTY_RANGE: RangeInclusive<u64> = 1..=0;
-
 fn first_chunk_response_handler(
     mut resp: GetObjectOutput,
     customized_range: Option<RangeInclusive<u64>>,
@@ -229,12 +227,11 @@ fn first_chunk_response_handler(
         }
         // If no range is provided, the range is from the end of the chunk to the end of the object.
         // When the chunk is the last part of the object, this result in empty range.
-        None => {
-            match object_meta.content_length().checked_sub(1) {
-                Some(end) => chunk_content_len..=end,
-                None => EMPTY_RANGE,
-            }
-        }
+        None => match object_meta.content_length().checked_sub(1) {
+            Some(end) => chunk_content_len..=end,
+            // Empty range when the object is empty.
+            None => chunk_content_len + 1..=chunk_content_len,
+        },
     };
 
     let initial_chunk = match chunk_content_len == 0 {
