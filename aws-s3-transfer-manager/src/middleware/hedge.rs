@@ -20,13 +20,13 @@ const MIN_DATA_POINTS: u64 = 20;
 const PERIOD: Duration = Duration::from_secs(2);
 
 /*
-* During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
-* as some requests can experience high time to first byte. If a slow part is hit near the end of the request,
-* the application may spend the last few seconds waiting for those final parts to complete, which can reduce overall
-* throughput. This layer is used to retry the slowest 5% of requests to improve performance.
-* Based on our experiments, this makes a significant difference for multipart upload use-cases and
-* does not have a noticeable impact for the Download.
-*/
+ * During uploads, S3 recommends retrying the slowest 5% of requests for latency-sensitive applications,
+ * as some requests can experience high time to first byte. If a slow part is hit near the end of the request,
+ * the application may spend the last few seconds waiting for those final parts to complete, which can reduce overall
+ * throughput. This layer is used to retry the slowest 5% of requests to improve performance.
+ * Based on our experiments, this makes a significant difference for multipart upload use-cases and
+ * does not have a noticeable impact for the Download.
+ */
 pub(crate) struct Builder<P> {
     policy: P,
     latency_percentile: f32,
@@ -35,24 +35,12 @@ pub(crate) struct Builder<P> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DefaultPolicy {
-    retry: bool,
-}
+pub(crate) struct DefaultPolicy;
 
-impl<T: Clone> Policy<T> for DefaultPolicy {
-    fn clone_request(&self, req: &T) -> Option<T> {
-        Some(req.clone())
-    }
-
-    fn can_retry(&self, _req: &T) -> bool {
-        self.retry
-    }
-}
-
-impl Builder<DefaultPolicy> {
-    pub(crate) fn new(retry: bool) -> Self {
+impl Default for Builder<DefaultPolicy> {
+    fn default() -> Self {
         Self {
-            policy: DefaultPolicy { retry },
+            policy: DefaultPolicy,
             latency_percentile: LATENCY_PERCENTILE,
             min_data_points: MIN_DATA_POINTS,
             period: PERIOD,
