@@ -178,7 +178,7 @@ fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadCo
     UploadContext {
         handle,
         is_s3_express: match req.bucket() {
-            Some(bucket) => bucket.starts_with("--x-s3"),
+            Some(bucket) => bucket.ends_with("--x-s3"),
             None => false,
         },
         request: Arc::new(req),
