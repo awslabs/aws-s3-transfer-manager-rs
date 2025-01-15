@@ -196,28 +196,34 @@ pub(super) async fn read_body(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::client::Handle;
-    use crate::Config;
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
+    use crate::Config;
     use test_common::mock_client_with_stubbed_http_client;
-    use super::*;
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
-        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3,[]);
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, []);
         UploadPartRequest {
-            ctx: UploadContext{
-                handle: Arc::new(Handle { config: Config::builder().client(s3_client).build(), scheduler: Scheduler::new(0) }),
+            ctx: UploadContext {
+                handle: Arc::new(Handle {
+                    config: Config::builder().client(s3_client).build(),
+                    scheduler: Scheduler::new(0),
+                }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
             },
-            part_data: PartData{ part_number: 0, data: Default::default() },
+            part_data: PartData {
+                part_number: 0,
+                data: Default::default(),
+            },
             upload_id: "test-id".to_string(),
         }
     }
 
     #[test]
     fn test_clone_request() {
-        let policy = hedge::DefaultPolicy::default();
+        let policy = hedge::DefaultPolicy;
 
         // Test S3 Express bucket
         let express_req = _mock_upload_part_request_with_bucket_name("test--x-s3");
