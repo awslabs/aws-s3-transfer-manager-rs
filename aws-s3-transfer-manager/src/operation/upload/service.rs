@@ -75,7 +75,7 @@ pub(super) fn upload_part_service(
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
     // Stop retry for S3 express bucket, since s3 express generates different etag for same content.
     // FIXME - Maybe remove after s3 express fixes this issue.
-    let hedge = hedge::Builder::new(ctx.request.bucket().unwrap().ends_with("--x-s3"));
+    let hedge = hedge::Builder::new(!ctx.request.bucket().unwrap().ends_with("--x-s3"));
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
         // FIXME - This setting will need to be globalized.

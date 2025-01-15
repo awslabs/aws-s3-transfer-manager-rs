@@ -35,7 +35,9 @@ pub(crate) struct Builder<P> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DefaultPolicy;
+pub(crate) struct DefaultPolicy {
+    retry: bool,
+}
 
 impl<T: Clone> Policy<T> for DefaultPolicy {
     fn clone_request(&self, req: &T) -> Option<T> {
@@ -43,14 +45,14 @@ impl<T: Clone> Policy<T> for DefaultPolicy {
     }
 
     fn can_retry(&self, _req: &T) -> bool {
-        true
+        self.retry
     }
 }
 
-impl Default for Builder<DefaultPolicy> {
-    fn default() -> Self {
+impl Builder<DefaultPolicy> {
+    pub(crate) fn new(retry: bool) -> Self {
         Self {
-            policy: DefaultPolicy,
+            policy: DefaultPolicy { retry },
             latency_percentile: LATENCY_PERCENTILE,
             min_data_points: MIN_DATA_POINTS,
             period: PERIOD,
