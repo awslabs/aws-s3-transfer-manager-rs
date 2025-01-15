@@ -73,14 +73,16 @@ pub(super) fn upload_part_service(
        + Send {
     let svc = service_fn(upload_part_handler);
     let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
-
+    // Stop retry for S3 express bucket, since s3 express generates different etag for same content.
+    // FIXME - Maybe remove after s3 express fixes this issue.
+    let hedge = hedge::Builder::new(ctx.request.bucket().unwrap().ends_with("--x-s3"));
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
         // FIXME - This setting will need to be globalized.
         .buffer(ctx.handle.num_workers())
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
         // concurrency_limit layer.
-        .layer(hedge::Builder::default().into_layer())
+        .layer(hedge.into_layer())
         .service(svc);
     svc.map_err(|err| {
         let e = err
@@ -128,7 +130,6 @@ pub(super) fn distribute_work(
         parent: parent_span_for_all_tasks,
         "upload-net-tasks"
     );
-
     let svc = upload_part_service(&ctx);
     let n_workers = ctx.handle.num_workers();
     for _ in 0..n_workers {
