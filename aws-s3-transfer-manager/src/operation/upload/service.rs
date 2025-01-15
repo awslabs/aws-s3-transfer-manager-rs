@@ -24,24 +24,18 @@ pub(super) struct UploadPartRequest {
     pub(super) upload_id: String,
 }
 
-impl UploadPartRequest {
-    pub(super) fn is_s3_express(&self) -> bool {
-        self.ctx.request.bucket().unwrap().ends_with("--x-s3")
-    }
-}
-
 impl Policy<UploadPartRequest> for hedge::DefaultPolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
-        if req.is_s3_express() {
+        if req.ctx.request.bucket().unwrap_or("").ends_with("--x-s3") {
             None
         } else {
             Some(req.clone())
         }
     }
-    fn can_retry(&self, req: &UploadPartRequest) -> bool {
+    fn can_retry(&self, _req: &UploadPartRequest) -> bool {
         // Stop retry for S3 express bucket, since s3 express generates different etag for same content.
         // FIXME - Maybe remove after s3 express fixes this issue.
-        !req.is_s3_express()
+        true
     }
 }
 
@@ -198,4 +192,39 @@ pub(super) async fn read_body(
             .spawn(task.instrument(parent_span_for_upload_tasks.clone()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::Handle;
+    use crate::Config;
+    use crate::operation::upload::UploadInput;
+    use crate::runtime::scheduler::Scheduler;
+    use test_common::mock_client_with_stubbed_http_client;
+    use super::*;
+
+    fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3,[]);
+        UploadPartRequest {
+            ctx: UploadContext{
+                handle: Arc::new(Handle { config: Config::builder().client(s3_client).build(), scheduler: Scheduler::new(0) }),
+                request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
+            },
+            part_data: PartData{ part_number: 0, data: Default::default() },
+            upload_id: "test-id".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_clone_request() {
+        let policy = hedge::DefaultPolicy::default();
+
+        // Test S3 Express bucket
+        let express_req = _mock_upload_part_request_with_bucket_name("test--x-s3");
+        assert!(policy.clone_request(&express_req).is_none());
+
+        // Test regular bucket
+        let regular_req = _mock_upload_part_request_with_bucket_name("test");
+        assert!(policy.clone_request(&regular_req).is_some());
+    }
 }
