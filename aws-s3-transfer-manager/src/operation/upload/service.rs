@@ -24,9 +24,15 @@ pub(super) struct UploadPartRequest {
     pub(super) upload_id: String,
 }
 
+impl UploadPartRequest {
+    pub(super) fn is_s3_express(&self) -> bool {
+        self.ctx.request.bucket().unwrap().ends_with("--x-s3")
+    }
+}
+
 impl Policy<UploadPartRequest> for hedge::DefaultPolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
-        if req.ctx.is_s3_express {
+        if req.is_s3_express() {
             None
         } else {
             Some(req.clone())
@@ -35,7 +41,7 @@ impl Policy<UploadPartRequest> for hedge::DefaultPolicy {
     fn can_retry(&self, req: &UploadPartRequest) -> bool {
         // Stop retry for S3 express bucket, since s3 express generates different etag for same content.
         // FIXME - Maybe remove after s3 express fixes this issue.
-        !req.ctx.is_s3_express
+        !req.is_s3_express()
     }
 }
 
