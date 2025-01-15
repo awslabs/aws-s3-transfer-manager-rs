@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use super::MultipartUploadData;
-use crate::middleware::hedge::DefaultPolicy;
 use crate::{
     error,
     io::{
@@ -14,8 +13,7 @@ use crate::{
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
-use tower::hedge::Policy;
-use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
+use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
 /// Request/input type for our "upload_part" service.
@@ -32,7 +30,7 @@ impl UploadPartRequest {
     }
 }
 
-impl Policy<UploadPartRequest> for DefaultPolicy {
+impl Policy<UploadPartRequest> for hedge::DefaultPolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
         if req.is_s3_express() {
             None
