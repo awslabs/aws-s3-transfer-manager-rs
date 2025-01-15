@@ -115,26 +115,10 @@ async fn discover_obj_with_get_first_part(
     first_chunk_response_handler(resp, None)
 }
 
-fn is_empty_object_error<E: ProvideErrorMetadata, T, D>(
-    error: &SdkError<E, D>,
-    customized_range: Option<T>,
-) -> bool {
-    match error.as_service_error() {
-        Some(service_error)
-            if service_error.meta().code() == Some("InvalidRange")
-                && customized_range.is_none() =>
-        {
-            // Invalid Range Error found and no Range passed in it's an empty object.
-            true
-        }
-        _ => false,
-    }
-}
-
 async fn discover_obj_with_head(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    customized_range: Option<ByteRange>,
+    range_from_user: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = ctx
         .client()
@@ -145,18 +129,11 @@ async fn discover_obj_with_head(
         .await;
 
     match resp {
-        Err(error) => {
-            if is_empty_object_error(&error, customized_range) {
-                // discover the object with the first part instead for empty object.
-                discover_obj_with_get_first_part(ctx, input).await
-            } else {
-                Err(error::discovery_failed(error))
-            }
-        }
+        Err(error) => Err(error::discovery_failed(error)),
         Ok(resp) => {
             let object_meta: ObjectMetadata = resp.into();
 
-            let remaining = match customized_range {
+            let remaining = match range_from_user {
                 Some(range) => match range {
                     ByteRange::Inclusive(start, end) => start..=end,
                     ByteRange::AllFrom(start) => start..=object_meta.content_length(),
@@ -180,10 +157,10 @@ async fn discover_obj_with_head(
 async fn discover_obj_with_get(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    customized_range: Option<RangeInclusive<u64>>,
+    range_from_user: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
     // Convert input to builder and set the range properly as the first range get.
-    let byte_range = match customized_range.as_ref() {
+    let byte_range = match range_from_user.as_ref() {
         Some(r) => ByteRange::Inclusive(
             *r.start(),
             cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
@@ -198,20 +175,25 @@ async fn discover_obj_with_get(
         .await;
     match resp {
         Err(error) => {
-            if is_empty_object_error(&error, customized_range) {
-                // discover the object with the first part instead for empty object.
-                discover_obj_with_get_first_part(ctx, input).await
-            } else {
-                Err(error::discovery_failed(error))
+            match error.as_service_error() {
+                Some(service_error)
+                    if service_error.meta().code() == Some("InvalidRange")
+                        && range_from_user.is_none() =>
+                {
+                    // Invalid Range Error found and no Range passed in it's an empty object.
+                    // discover the object with the first part instead for empty object.
+                    discover_obj_with_get_first_part(ctx, input).await
+                }
+                _ => Err(error::discovery_failed(error)),
             }
         }
-        Ok(response) => first_chunk_response_handler(response, customized_range),
+        Ok(response) => first_chunk_response_handler(response, range_from_user),
     }
 }
 
 fn first_chunk_response_handler(
     mut resp: GetObjectOutput,
-    customized_range: Option<RangeInclusive<u64>>,
+    range_from_user: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
@@ -221,9 +203,9 @@ fn first_chunk_response_handler(
         .content_length
         .expect("expected content_length in chunk") as u64;
 
-    let remaining = match customized_range {
-        Some(customized_range) => {
-            (*customized_range.start() + chunk_content_len)..=*customized_range.end()
+    let remaining = match range_from_user {
+        Some(range_from_user) => {
+            (*range_from_user.start() + chunk_content_len)..=*range_from_user.end()
         }
         // If no range is provided, the range is from the end of the chunk to the end of the object.
         // When the chunk is the last part of the object, this result in empty range.
