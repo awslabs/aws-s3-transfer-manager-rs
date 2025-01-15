@@ -9,10 +9,8 @@ use std::{cmp, mem};
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
-use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
