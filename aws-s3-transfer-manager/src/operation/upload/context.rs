@@ -14,6 +14,8 @@ pub(crate) struct UploadContext {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
+    /// the upload is for S3 express or not
+    pub(crate) is_s3_express: bool,
 }
 
 impl UploadContext {
