@@ -34,21 +34,16 @@ pub(crate) struct Builder<P> {
     period: Duration,
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DefaultPolicy;
-
-impl Default for Builder<DefaultPolicy> {
-    fn default() -> Self {
+impl<P> Builder<P> {
+    pub(crate) fn new(policy: P) -> Self {
         Self {
-            policy: DefaultPolicy,
+            policy: policy,
             latency_percentile: LATENCY_PERCENTILE,
             min_data_points: MIN_DATA_POINTS,
             period: PERIOD,
         }
     }
-}
 
-impl<P> Builder<P> {
     /// Converts the `Hedge` into a `Layer` that can be used in a service stack.
     pub(crate) fn into_layer<Request, S>(self) -> impl Layer<S, Service = Hedge<S, P>> + Clone
     where

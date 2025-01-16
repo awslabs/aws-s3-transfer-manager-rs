@@ -24,7 +24,10 @@ pub(super) struct UploadPartRequest {
     pub(super) upload_id: String,
 }
 
-impl Policy<UploadPartRequest> for hedge::DefaultPolicy {
+#[derive(Debug, Clone)]
+pub(crate) struct UploadPolicy;
+
+impl Policy<UploadPartRequest> for UploadPolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
         if req.ctx.request.bucket().unwrap_or("").ends_with("--x-s3") {
             None
@@ -33,8 +36,6 @@ impl Policy<UploadPartRequest> for hedge::DefaultPolicy {
         }
     }
     fn can_retry(&self, _req: &UploadPartRequest) -> bool {
-        // Stop retry for S3 express bucket, since s3 express generates different etag for same content.
-        // FIXME - Maybe remove after s3 express fixes this issue.
         true
     }
 }
@@ -94,7 +95,7 @@ pub(super) fn upload_part_service(
         .buffer(ctx.handle.num_workers())
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
         // concurrency_limit layer.
-        .layer(hedge::Builder::default().into_layer())
+        .layer(hedge::Builder::new(UploadPolicy).into_layer())
         .service(svc);
     svc.map_err(|err| {
         let e = err
@@ -222,8 +223,8 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_request() {
-        let policy = hedge::DefaultPolicy;
+    fn test_upload_policy_operation() {
+        let policy = UploadPolicy;
 
         // Test S3 Express bucket
         let express_req = _mock_upload_part_request_with_bucket_name("test--x-s3");
