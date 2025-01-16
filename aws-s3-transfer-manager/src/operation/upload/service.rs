@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upload_policy_operation() {
+    fn test_upload_hedge_policy_operation() {
         let policy = UploadHedgePolicy;
 
         // Test S3 Express bucket
