@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::MultipartUploadData;
 use crate::{
     error,
     io::{
@@ -12,10 +13,8 @@ use crate::{
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
-use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
+use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
-
-use super::MultipartUploadData;
 
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
@@ -23,6 +22,22 @@ pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
     pub(super) upload_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UploadHedgePolicy;
+
+impl Policy<UploadPartRequest> for UploadHedgePolicy {
+    fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
+        if req.ctx.request.bucket().unwrap_or("").ends_with("--x-s3") {
+            None
+        } else {
+            Some(req.clone())
+        }
+    }
+    fn can_retry(&self, _req: &UploadPartRequest) -> bool {
+        true
+    }
 }
 
 /// handler (service fn) for a single part
@@ -80,7 +95,7 @@ pub(super) fn upload_part_service(
         .buffer(ctx.handle.num_workers())
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
         // concurrency_limit layer.
-        .layer(hedge::Builder::default().into_layer())
+        .layer(hedge::Builder::new(UploadHedgePolicy).into_layer())
         .service(svc);
     svc.map_err(|err| {
         let e = err
@@ -128,7 +143,6 @@ pub(super) fn distribute_work(
         parent: parent_span_for_all_tasks,
         "upload-net-tasks"
     );
-
     let svc = upload_part_service(&ctx);
     let n_workers = ctx.handle.num_workers();
     for _ in 0..n_workers {
@@ -179,4 +193,45 @@ pub(super) async fn read_body(
             .spawn(task.instrument(parent_span_for_upload_tasks.clone()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Handle;
+    use crate::operation::upload::UploadInput;
+    use crate::runtime::scheduler::Scheduler;
+    use crate::Config;
+    use test_common::mock_client_with_stubbed_http_client;
+
+    fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
+        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, []);
+        UploadPartRequest {
+            ctx: UploadContext {
+                handle: Arc::new(Handle {
+                    config: Config::builder().client(s3_client).build(),
+                    scheduler: Scheduler::new(0),
+                }),
+                request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
+            },
+            part_data: PartData {
+                part_number: 0,
+                data: Default::default(),
+            },
+            upload_id: "test-id".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_upload_hedge_policy_operation() {
+        let policy = UploadHedgePolicy;
+
+        // Test S3 Express bucket
+        let express_req = _mock_upload_part_request_with_bucket_name("test--x-s3");
+        assert!(policy.clone_request(&express_req).is_none());
+
+        // Test regular bucket
+        let regular_req = _mock_upload_part_request_with_bucket_name("test");
+        assert!(policy.clone_request(&regular_req).is_some());
+    }
 }
