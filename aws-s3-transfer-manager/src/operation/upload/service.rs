@@ -25,9 +25,9 @@ pub(super) struct UploadPartRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UploadPolicy;
+pub(crate) struct UploadHedgePolicy;
 
-impl Policy<UploadPartRequest> for UploadPolicy {
+impl Policy<UploadPartRequest> for UploadHedgePolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
         if req.ctx.request.bucket().unwrap_or("").ends_with("--x-s3") {
             None
@@ -95,7 +95,7 @@ pub(super) fn upload_part_service(
         .buffer(ctx.handle.num_workers())
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
         // concurrency_limit layer.
-        .layer(hedge::Builder::new(UploadPolicy).into_layer())
+        .layer(hedge::Builder::new(UploadHedgePolicy).into_layer())
         .service(svc);
     svc.map_err(|err| {
         let e = err
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_upload_policy_operation() {
-        let policy = UploadPolicy;
+        let policy = UploadHedgePolicy;
 
         // Test S3 Express bucket
         let express_req = _mock_upload_part_request_with_bucket_name("test--x-s3");
