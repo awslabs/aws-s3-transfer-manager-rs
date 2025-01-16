@@ -37,7 +37,7 @@ pub(crate) struct Builder<P> {
 impl<P> Builder<P> {
     pub(crate) fn new(policy: P) -> Self {
         Self {
-            policy: policy,
+            policy,
             latency_percentile: LATENCY_PERCENTILE,
             min_data_points: MIN_DATA_POINTS,
             period: PERIOD,
