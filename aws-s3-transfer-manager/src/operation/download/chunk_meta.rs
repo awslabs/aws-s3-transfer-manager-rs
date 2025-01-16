@@ -41,10 +41,14 @@ pub struct ChunkMetadata {
     pub checksum_crc32: Option<String>,
     /// <p>The base64-encoded, 32-bit CRC-32C checksum of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_crc32_c: Option<String>,
+    /// <p>The Base64 encoded, 64-bit <code>CRC64NVME</code> checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub checksum_crc64_nvme: Option<String>,
     /// <p>The base64-encoded, 160-bit SHA-1 digest of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_sha1: Option<String>,
     /// <p>The base64-encoded, 256-bit SHA-256 digest of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_sha256: Option<String>,
+    /// <p>The checksum type, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. You can use this header response to verify that the checksum type that is received is the same checksum type that was specified in the <code>CreateMultipartUpload</code> request. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
+    pub checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
     /// <p>This is set to the number of metadata entries not returned in the headers that are prefixed with <code>x-amz-meta-</code>. This can happen if you create metadata using an API like SOAP that supports more flexible metadata than the REST API. For example, using SOAP, you can create metadata whose values are not legal HTTP headers.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -136,8 +140,10 @@ impl From<GetObjectOutput> for ChunkMetadata {
             e_tag: value.e_tag,
             checksum_crc32: value.checksum_crc32,
             checksum_crc32_c: value.checksum_crc32_c,
+            checksum_crc64_nvme: value.checksum_crc64_nvme,
             checksum_sha1: value.checksum_sha1,
             checksum_sha256: value.checksum_sha256,
+            checksum_type: value.checksum_type,
             missing_meta: value.missing_meta,
             version_id: value.version_id,
             cache_control: value.cache_control,
@@ -189,8 +195,10 @@ impl ::std::fmt::Debug for ChunkMetadata {
         formatter.field("e_tag", &self.e_tag);
         formatter.field("checksum_crc32", &self.checksum_crc32);
         formatter.field("checksum_crc32_c", &self.checksum_crc32_c);
+        formatter.field("checksum_crc64_nvme", &self.checksum_crc64_nvme);
         formatter.field("checksum_sha1", &self.checksum_sha1);
         formatter.field("checksum_sha256", &self.checksum_sha256);
+        formatter.field("checksum_type", &self.checksum_type);
         formatter.field("missing_meta", &self.missing_meta);
         formatter.field("version_id", &self.version_id);
         formatter.field("cache_control", &self.cache_control);
