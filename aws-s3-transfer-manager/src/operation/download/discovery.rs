@@ -121,6 +121,7 @@ async fn discover_obj_with_head(
     let resp = ctx
         .client()
         .head_object()
+        .set_range(input.range.clone())
         .set_bucket(input.bucket().map(str::to_string))
         .set_key(input.key().map(str::to_string))
         .send()
@@ -133,9 +134,8 @@ async fn discover_obj_with_head(
                 Some(range) => match range {
                     ByteRange::Inclusive(start, end) => start..=end,
                     ByteRange::AllFrom(start) => start..=object_end,
-                    // No need to check for overflow as the range should be validated from the head response.
-                    // +1-n to avoid the temp value get overflow
-                    ByteRange::Last(n) => (object_end + 1 - n)..=object_end,
+                    // When overflows, it means get the whole object, so starts from 0.
+                    ByteRange::Last(n) => (object_end + 1).saturating_sub(n)..=object_end,
                 },
                 None => 0..=object_end,
             }
@@ -330,6 +330,12 @@ mod tests {
         assert_eq!(
             0..=499,
             get_discovery_from_head(Some(ByteRange::Last(500)))
+                .await
+                .remaining
+        );
+        assert_eq!(
+            0..=499,
+            get_discovery_from_head(Some(ByteRange::Last(5000)))
                 .await
                 .remaining
         );
