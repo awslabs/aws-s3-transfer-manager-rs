@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::ops::RangeInclusive;
-use std::str::FromStr;
-use std::{cmp, mem};
-
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
+use std::cmp::min;
+use std::ops::RangeInclusive;
+use std::str::FromStr;
+use std::{cmp, mem};
 use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
@@ -131,8 +131,8 @@ async fn discover_obj_with_head(
     let remaining = match object_meta.content_length().checked_sub(1) {
         Some(object_end) => {
             match range_from_user {
-                Some(range) => match range {
-                    ByteRange::Inclusive(start, end) => start..=end,
+                Some(range_from_user) => match range_from_user {
+                    ByteRange::Inclusive(start, end) => start..=min(end, object_end),
                     ByteRange::AllFrom(start) => start..=object_end,
                     // When overflows, it means get the whole object, so starts from 0.
                     ByteRange::Last(n) => (object_end + 1).saturating_sub(n)..=object_end,
@@ -200,17 +200,20 @@ fn first_chunk_response_handler(
         .content_length
         .expect("expected content_length in chunk") as u64;
 
-    let remaining = match range_from_user {
-        Some(range_from_user) => {
-            (*range_from_user.start() + chunk_content_len)..=*range_from_user.end()
+    let remaining = match object_meta.content_length().checked_sub(1) {
+        Some(object_end) => {
+            match range_from_user {
+                Some(range_from_user) => {
+                    (*range_from_user.start() + chunk_content_len)
+                        ..=min(object_end, *range_from_user.end())
+                }
+                // If no range is provided, the range is from the end of the chunk to the end of the object.
+                // When the chunk is the last part of the object, this result in empty range.
+                None => chunk_content_len..=object_end,
+            }
         }
-        // If no range is provided, the range is from the end of the chunk to the end of the object.
-        // When the chunk is the last part of the object, this result in empty range.
-        None => match object_meta.content_length().checked_sub(1) {
-            Some(end) => chunk_content_len..=end,
-            // Empty range when the object is empty.
-            None => chunk_content_len + 1..=chunk_content_len,
-        },
+        // Empty range when the object is empty.
+        None => chunk_content_len + 1..=chunk_content_len,
     };
 
     let initial_chunk = match chunk_content_len == 0 {
@@ -312,6 +315,12 @@ mod tests {
         assert_eq!(
             10..=100,
             get_discovery_from_head(Some(ByteRange::Inclusive(10, 100)))
+                .await
+                .remaining
+        );
+        assert_eq!(
+            10..=499,
+            get_discovery_from_head(Some(ByteRange::Inclusive(10, 10000)))
                 .await
                 .remaining
         );
@@ -447,6 +456,42 @@ mod tests {
             .await
             .expect("valid body");
         assert_eq!(100, initial_chunk.remaining());
+    }
+
+    #[tokio::test]
+    async fn test_discover_obj_with_get_over_range() {
+        let target_part_size = 100;
+        let bytes = &[0u8; 50];
+        let get_obj_rule = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=200-299"))
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(50)
+                    .content_range("200-249/250")
+                    .body(ByteStream::from_static(bytes))
+                    .build()
+            });
+        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
+
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .range("bytes=200-123456")
+            .build()
+            .unwrap();
+
+        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        assert!(discovery.remaining.is_empty());
+
+        let initial_chunk = discovery
+            .initial_chunk
+            .expect("initial chunk")
+            .collect()
+            .await
+            .expect("valid body");
+        assert_eq!(50, initial_chunk.remaining());
     }
 
     #[tokio::test]
