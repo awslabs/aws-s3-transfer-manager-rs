@@ -124,32 +124,32 @@ async fn discover_obj_with_head(
         .set_bucket(input.bucket().map(str::to_string))
         .set_key(input.key().map(str::to_string))
         .send()
-        .await;
-
-    match resp {
-        Err(error) => Err(error::discovery_failed(error)),
-        Ok(resp) => {
-            let object_meta: ObjectMetadata = resp.into();
-
-            let remaining = match range_from_user {
+        .await
+        .map_err(error::discovery_failed)?;
+    let object_meta: ObjectMetadata = resp.into();
+    let remaining = match object_meta.content_length().checked_sub(1) {
+        Some(object_end) => {
+            match range_from_user {
                 Some(range) => match range {
                     ByteRange::Inclusive(start, end) => start..=end,
-                    ByteRange::AllFrom(start) => start..=object_meta.content_length(),
-                    ByteRange::Last(n) => {
-                        (object_meta.content_length() - n + 1)..=object_meta.content_length()
-                    }
+                    ByteRange::AllFrom(start) => start..=object_end,
+                    // No need to check for overflow as the range should be validated from the head response.
+                    // +1-n to avoid the temp value get overflow
+                    ByteRange::Last(n) => (object_end + 1 - n)..=object_end,
                 },
-                None => 0..=object_meta.content_length(),
-            };
-
-            Ok(ObjectDiscovery {
-                remaining,
-                chunk_meta: None,
-                object_meta,
-                initial_chunk: None,
-            })
+                None => 0..=object_end,
+            }
         }
-    }
+        // Empty range when the object is empty.
+        None => object_meta.content_length() + 1..=object_meta.content_length(),
+    };
+
+    Ok(ObjectDiscovery {
+        remaining,
+        chunk_meta: None,
+        object_meta,
+        initial_chunk: None,
+    })
 }
 
 async fn discover_obj_with_get(
@@ -167,7 +167,6 @@ async fn discover_obj_with_get(
     };
     let builder: GetObjectInputBuilder = input.clone().into();
     let resp = builder
-        .set_part_number(None)
         .range(header::Range::bytes(byte_range))
         .send_with(ctx.client())
         .await;
@@ -309,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_obj_with_head() {
-        assert_eq!(0..=500, get_discovery_from_head(None).await.remaining);
+        assert_eq!(0..=499, get_discovery_from_head(None).await.remaining);
         assert_eq!(
             10..=100,
             get_discovery_from_head(Some(ByteRange::Inclusive(10, 100)))
@@ -317,14 +316,20 @@ mod tests {
                 .remaining
         );
         assert_eq!(
-            100..=500,
+            100..=499,
             get_discovery_from_head(Some(ByteRange::AllFrom(100)))
                 .await
                 .remaining
         );
         assert_eq!(
-            401..=500,
+            400..=499,
             get_discovery_from_head(Some(ByteRange::Last(100)))
+                .await
+                .remaining
+        );
+        assert_eq!(
+            0..=499,
+            get_discovery_from_head(Some(ByteRange::Last(500)))
                 .await
                 .remaining
         );
