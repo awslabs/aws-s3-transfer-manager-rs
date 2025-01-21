@@ -128,13 +128,15 @@ async fn discover_obj_with_head(
         .await
         .map_err(error::discovery_failed)?;
     let object_meta: ObjectMetadata = resp.into();
+
+    /// End index of the object should be the content length minus 1.
     let remaining = match object_meta.content_length().checked_sub(1) {
         Some(object_end) => {
             match range_from_user {
                 Some(range_from_user) => match range_from_user {
                     ByteRange::Inclusive(start, end) => start..=min(end, object_end),
                     ByteRange::AllFrom(start) => start..=object_end,
-                    // When overflows, it means get the whole object, so starts from 0.
+                    // When asked bytes is larger than the object size, return the whole object.
                     ByteRange::Last(n) => (object_end + 1).saturating_sub(n)..=object_end,
                 },
                 None => 0..=object_end,
@@ -200,6 +202,7 @@ fn first_chunk_response_handler(
         .content_length
         .expect("expected content_length in chunk") as u64;
 
+    /// End index of the object should be the content length minus 1.
     let remaining = match object_meta.content_length().checked_sub(1) {
         Some(object_end) => {
             match range_from_user {
