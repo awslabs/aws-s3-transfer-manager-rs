@@ -11,6 +11,9 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+// FIXME - track high water mark
+// FIXME - add statistics/telemetry
+
 /// Manages scheduling networking and I/O work
 ///
 /// Scheduler is internally reference-counted and can be freely cloned.
@@ -23,7 +26,7 @@ impl Scheduler {
     /// Create a new scheduler with the initial number of work permits.
     pub(crate) fn new(permits: usize) -> Self {
         Self {
-            // NOTE: tokio semahpore is fair, permits are given out in the order requested
+            // NOTE: tokio semaphore is fair, permits are given out in the order requested
             sem: Arc::new(Semaphore::new(permits)),
         }
     }

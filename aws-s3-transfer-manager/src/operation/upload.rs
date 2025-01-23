@@ -229,7 +229,8 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
 mod test {
     use crate::io::InputStream;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencySetting, PartSize};
+    use crate::types::PartSize;
+    use crate::types::TargetThroughput;
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -291,7 +292,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .target_throughput(TargetThroughput::no_concurrency())
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(30))
             .client(client)
@@ -328,7 +329,7 @@ mod test {
             mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .target_throughput(TargetThroughput::no_concurrency())
             .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
             .client(client)
             .build();
@@ -387,7 +388,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .target_throughput(TargetThroughput::no_concurrency())
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * 1024 * 1024))
             .client(client)

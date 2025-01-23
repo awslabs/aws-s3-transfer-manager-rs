@@ -7,7 +7,7 @@ use aws_config::Region;
 use aws_s3_transfer_manager::{
     error::{BoxError, Error},
     operation::download::DownloadHandle,
-    types::{ConcurrencySetting, PartSize},
+    types::{PartSize, TargetThroughput},
 };
 use pin_project_lite::pin_project;
 use std::{
@@ -121,7 +121,7 @@ fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer
     let config = aws_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencySetting::Explicit(1))
+        .target_throughput(TargetThroughput::no_concurrency())
         .build();
 
     aws_s3_transfer_manager::Client::new(config)

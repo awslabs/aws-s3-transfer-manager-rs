@@ -5,11 +5,7 @@
 
 use crate::runtime::scheduler::Scheduler;
 use crate::Config;
-use crate::{
-    metrics::unit::ByteUnit,
-    types::{ConcurrencySetting, PartSize},
-    DEFAULT_CONCURRENCY,
-};
+use crate::{metrics::unit::ByteUnit, types::PartSize, DEFAULT_CONCURRENCY};
 use std::sync::Arc;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -28,10 +24,12 @@ pub(crate) struct Handle {
 impl Handle {
     /// Get the concrete number of workers to use based on the concurrency setting.
     pub(crate) fn num_workers(&self) -> usize {
-        match self.config.concurrency() {
-            // TODO(aws-sdk-rust#1159): add logic for determining this
-            ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
-            ConcurrencySetting::Explicit(explicit) => *explicit,
+        // FIXME - update logic
+        if self.config.target_throughput().is_no_concurrency() {
+            // special case for allowing tests to rely on non concurrent execution
+            1
+        } else {
+            DEFAULT_CONCURRENCY
         }
     }
 
@@ -64,9 +62,11 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        let permits = match config.concurrency() {
-            ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
-            ConcurrencySetting::Explicit(explicit) => *explicit,
+        // FIXME - pass target throughput and base it on token bucket?
+        let permits = if config.target_throughput().is_no_concurrency() {
+            1
+        } else {
+            DEFAULT_CONCURRENCY
         };
         let scheduler = Scheduler::new(permits);
 

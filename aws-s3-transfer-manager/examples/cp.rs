@@ -11,7 +11,7 @@ use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::Body;
-use aws_s3_transfer_manager::types::{ConcurrencySetting, PartSize};
+use aws_s3_transfer_manager::types::{PartSize, TargetThroughput};
 use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -40,9 +40,10 @@ pub struct Args {
     #[arg(required = true)]
     dest: TransferUri,
 
-    /// Number of concurrent uploads/downloads to perform.
-    #[arg(long, default_value_t = 8)]
-    concurrency: usize,
+    // FIXME - implement support for auto as default
+    /// Target throughput in Gbps
+    #[arg(long, default_value_t = 10)]
+    target_throughput_gbps: usize,
 
     /// Part size to use
     #[arg(long, default_value_t = 8388608)]
@@ -55,6 +56,14 @@ pub struct Args {
     /// Command is performed on all files or objects under the specified directory or prefix
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     recursive: bool,
+}
+
+impl Args {
+    fn target_throughput(&self) -> Throughput {
+        Throughput::new_bytes_per_sec(
+            self.target_throughput_gbps as u64 * ByteUnit::Gigabit.as_bytes_u64(),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -149,7 +158,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let (bucket, _) = args.source.expect_s3().parts();
 
     let tm_config = aws_s3_transfer_manager::from_env()
-        .concurrency(ConcurrencySetting::Explicit(args.concurrency))
+        .target_throughput(TargetThroughput::Explicit(args.target_throughput()))
         .part_size(PartSize::Target(args.part_size))
         .load()
         .await;
@@ -226,7 +235,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let (bucket, key) = args.dest.expect_s3().parts();
 
     let tm_config = aws_s3_transfer_manager::from_env()
-        .concurrency(ConcurrencySetting::Explicit(args.concurrency))
+        .target_throughput(TargetThroughput::Explicit(args.target_throughput()))
         .part_size(PartSize::Target(args.part_size))
         .load()
         .await;

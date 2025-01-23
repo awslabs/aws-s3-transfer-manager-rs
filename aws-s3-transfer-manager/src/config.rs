@@ -6,7 +6,7 @@
 use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencySetting, PartSize};
+use crate::types::{PartSize, TargetThroughput};
 use std::cmp;
 
 pub(crate) mod loader;
@@ -19,7 +19,7 @@ pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_
 pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
-    concurrency: ConcurrencySetting,
+    target_throughput: TargetThroughput,
     framework_metadata: Option<FrameworkMetadata>,
     client: aws_sdk_s3::client::Client,
 }
@@ -40,10 +40,10 @@ impl Config {
         &self.target_part_size
     }
 
-    /// Returns the concurrency setting to use for transfer operations.
-    /// This is the maximum number of in-flight requests allowed across _all_ operations.
-    pub fn concurrency(&self) -> &ConcurrencySetting {
-        &self.concurrency
+    /// Returns the target throughput setting to use for transfer operations.
+    /// This is the target throughput of concurrent in-flight requests across _all_ operations.
+    pub fn target_throughput(&self) -> &TargetThroughput {
+        &self.target_throughput
     }
 
     /// Returns the framework metadata setting when using transfer manager.
@@ -63,7 +63,7 @@ impl Config {
 pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
-    concurrency: ConcurrencySetting,
+    target_throughput: TargetThroughput,
     framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
 }
@@ -123,12 +123,12 @@ impl Builder {
         self
     }
 
-    /// Set the concurrency level this component is allowed to use.
+    /// Set the target throughput this client should aim for.
     ///
-    /// This sets the maximum number of concurrent in-flight requests across _all_ operations.
-    /// Default is [ConcurrencySetting::Auto].
-    pub fn concurrency(mut self, concurrency: ConcurrencySetting) -> Self {
-        self.concurrency = concurrency;
+    /// This sets the target throughput of concurrent in-flight requests across _all_ operations.
+    /// Default is [TargetThroughput::Auto].
+    pub fn target_throughput(mut self, target_throughput: TargetThroughput) -> Self {
+        self.target_throughput = target_throughput;
         self
     }
 
@@ -156,7 +156,7 @@ impl Builder {
         Config {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
-            concurrency: self.concurrency,
+            target_throughput: self.target_throughput,
             framework_metadata: self.framework_metadata,
             client: self.client.expect("client set"),
         }

@@ -6,6 +6,8 @@
 use core::fmt;
 use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
 
+use crate::metrics::Throughput;
+
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -20,15 +22,35 @@ pub enum PartSize {
     Target(u64),
 }
 
-/// The concurrency settings to use for a single upload or download request.
+/// The target throughput the client should aim for.
+///
+/// NOTE: Target throughput is taken as a maximum. Actual throughput may be less than
+/// what is configured and is dependendent on the host, network conditions, etc.
 #[derive(Debug, Clone, Default)]
-pub enum ConcurrencySetting {
-    /// Automatically configure an optimal concurrency setting based on the execution environment.
+pub enum TargetThroughput {
+    /// Automatically configure an optimal target throughput setting based on the execution environment.
     #[default]
     Auto,
 
-    /// Explicitly configured concurrency setting.
-    Explicit(usize),
+    /// Explicitly configured throughput setting.
+    Explicit(Throughput),
+}
+
+impl TargetThroughput {
+    /// Set a target throughput that signals one at a time concurrency.
+    ///
+    /// NOTE: This is used mostly for testing purposes
+    #[doc(hidden)]
+    pub fn no_concurrency() -> TargetThroughput {
+        TargetThroughput::Explicit(Throughput::new_bytes_per_sec(0))
+    }
+
+    pub(crate) fn is_no_concurrency(&self) -> bool {
+        match self {
+            TargetThroughput::Explicit(throughput) => throughput.bytes_transferred() == 0,
+            _ => false,
+        }
+    }
 }
 
 /// Policy for how to handle a failed multipart upload

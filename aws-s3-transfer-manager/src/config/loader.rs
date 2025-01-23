@@ -10,11 +10,8 @@ use aws_sdk_s3::config::{Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
 use crate::config::Builder;
-use crate::{
-    http,
-    types::{ConcurrencySetting, PartSize},
-    Config,
-};
+use crate::types::TargetThroughput;
+use crate::{http, types::PartSize, Config};
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
@@ -82,12 +79,12 @@ impl ConfigLoader {
         self
     }
 
-    /// Set the concurrency level this component is allowed to use.
+    /// Set the target throughput this client should aim for.
     ///
-    /// This sets the maximum number of concurrent in-flight requests.
-    /// Default is [ConcurrencySetting::Auto].
-    pub fn concurrency(mut self, concurrency: ConcurrencySetting) -> Self {
-        self.builder = self.builder.concurrency(concurrency);
+    /// This sets the target throughput of concurrent in-flight requests across _all_ operations.
+    /// Default is [TargetThroughput::Auto].
+    pub fn target_throughput(mut self, target_throughput: TargetThroughput) -> Self {
+        self.builder = self.builder.target_throughput(target_throughput);
         self
     }
 
@@ -128,7 +125,7 @@ impl ConfigLoader {
 mod tests {
     use std::borrow::Cow;
 
-    use crate::types::{ConcurrencySetting, PartSize};
+    use crate::types::PartSize;
     use aws_config::Region;
     use aws_runtime::user_agent::FrameworkMetadata;
     use aws_sdk_s3::config::Intercept;
@@ -137,7 +134,6 @@ mod tests {
     #[tokio::test]
     async fn load_with_interceptor() {
         let config = crate::from_env()
-            .concurrency(ConcurrencySetting::Explicit(123))
             .part_size(PartSize::Target(8))
             .load()
             .await;
@@ -152,7 +148,6 @@ mod tests {
     async fn load_with_interceptor_and_framework_metadata() {
         let (http_client, captured_request) = capture_request(None);
         let config = crate::from_env()
-            .concurrency(ConcurrencySetting::Explicit(123))
             .part_size(PartSize::Target(8))
             .framework_metadata(Some(
                 FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
@@ -171,7 +166,6 @@ mod tests {
 
         let capture_request_config = crate::Config::builder()
             .client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
-            .concurrency(ConcurrencySetting::Explicit(123))
             .part_size(PartSize::Target(8))
             .build();
 
