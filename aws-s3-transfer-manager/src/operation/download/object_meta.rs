@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::ops::RangeInclusive;
+use std::str::FromStr;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
+use crate::http::header;
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 /// In the case of GetObject, some data will be duplicated as part of the first chunk.
@@ -120,6 +123,29 @@ impl ObjectMetadata {
                 length as u64
             },
             (None, None) => panic!("total object size cannot be calculated without either content length or content range headers")
+        }
+    }
+
+    /// <p>Parse the content-range header to the inclusive range..</p>
+    pub(crate) fn range(&self) -> Option<RangeInclusive<u64>> {
+        match self.content_length().checked_sub(1) {
+            Some(object_end) => match self.content_range.as_ref() {
+                Some(range) => {
+                    let byte_range_str = range
+                        .strip_prefix("bytes")
+                        .expect("content range bytes-unit recognized")
+                        .split_once("/")
+                        .map(|x| x.0)
+                        .expect("content range valid");
+                    match header::ByteRange::from_str(byte_range_str).expect("valid byte range") {
+                        header::ByteRange::Inclusive(start, end) => Some(start..=end),
+                        _ => unreachable!("Content-Range header invalid"),
+                    }
+                }
+                // When S3 doesn't provide a content-range header, we can infer the total size from the content-length header.
+                None => Some(0..=object_end),
+            },
+            None => None,
         }
     }
 }
@@ -277,5 +303,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(900, meta.content_length());
+    }
+
+    #[test]
+    fn test_parse_content_range() {
+        let cases = vec![
+            (Some("bytes 0-499/1234".to_string()), Some(0..=499)),
+            (Some("bytes 500-999/1234".to_string()), Some(500..=999)),
+            (Some("0-499/1234".to_string()), Some(0..=499)),
+            (Some("bytes 0-0/1234".to_string()), Some(0..=0)),
+            (Some("invalid".to_string()), None),
+            (Some("bytes -499/1234".to_string()), None),
+            (Some("bytes abc-def/1234".to_string()), None),
+            (None, None),
+        ];
+
+        for (input, expected) in cases {
+            let meta = ObjectMetadata {
+                content_range: input,
+                ..Default::default()
+            };
+            assert_eq!(meta.range(), expected);
+        }
     }
 }

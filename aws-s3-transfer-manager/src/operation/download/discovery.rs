@@ -34,7 +34,7 @@ enum ObjectDiscoveryStrategy {
 #[derive(Debug)]
 pub(super) struct ObjectDiscovery {
     /// range of data remaining to be fetched
-    pub(super) remaining: RangeInclusive<u64>,
+    pub(super) remaining: Option<RangeInclusive<u64>>,
 
     /// the discovered metadata
     pub(super) chunk_meta: Option<ChunkMetadata>,
@@ -116,7 +116,7 @@ async fn discover_obj_with_get_first_part(
 async fn discover_obj_with_head(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    range_from_user: Option<ByteRange>,
+    _range_from_user: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = ctx
         .client()
@@ -129,25 +129,8 @@ async fn discover_obj_with_head(
         .map_err(error::discovery_failed)?;
     let object_meta: ObjectMetadata = resp.into();
 
-    /// End index of the object should be the content length minus 1.
-    let remaining = match object_meta.content_length().checked_sub(1) {
-        Some(object_end) => {
-            match range_from_user {
-                Some(range_from_user) => match range_from_user {
-                    ByteRange::Inclusive(start, end) => start..=min(end, object_end),
-                    ByteRange::AllFrom(start) => start..=object_end,
-                    // When asked bytes is larger than the object size, return the whole object.
-                    ByteRange::Last(n) => (object_end + 1).saturating_sub(n)..=object_end,
-                },
-                None => 0..=object_end,
-            }
-        }
-        // Empty range when the object is empty.
-        None => object_meta.content_length() + 1..=object_meta.content_length(),
-    };
-
     Ok(ObjectDiscovery {
-        remaining,
+        remaining: object_meta.range(),
         chunk_meta: None,
         object_meta,
         initial_chunk: None,
@@ -202,10 +185,9 @@ fn first_chunk_response_handler(
         .content_length
         .expect("expected content_length in chunk") as u64;
 
-    /// End index of the object should be the content length minus 1.
     let remaining = match object_meta.content_length().checked_sub(1) {
         Some(object_end) => {
-            match range_from_user {
+            Some(match range_from_user {
                 Some(range_from_user) => {
                     (*range_from_user.start() + chunk_content_len)
                         ..=min(object_end, *range_from_user.end())
@@ -213,10 +195,10 @@ fn first_chunk_response_handler(
                 // If no range is provided, the range is from the end of the chunk to the end of the object.
                 // When the chunk is the last part of the object, this result in empty range.
                 None => chunk_content_len..=object_end,
-            }
+            })
         }
         // Empty range when the object is empty.
-        None => chunk_content_len + 1..=chunk_content_len,
+        None => None,
     };
 
     let initial_chunk = match chunk_content_len == 0 {
@@ -314,42 +296,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_obj_with_head() {
-        assert_eq!(0..=499, get_discovery_from_head(None).await.remaining);
+        assert_eq!(0..=499, get_discovery_from_head(None).await.remaining.unwrap());
         assert_eq!(
             10..=100,
             get_discovery_from_head(Some(ByteRange::Inclusive(10, 100)))
                 .await
-                .remaining
+                .remaining.unwrap()
         );
         assert_eq!(
             10..=499,
             get_discovery_from_head(Some(ByteRange::Inclusive(10, 10000)))
                 .await
-                .remaining
+                .remaining.unwrap()
         );
         assert_eq!(
             100..=499,
             get_discovery_from_head(Some(ByteRange::AllFrom(100)))
                 .await
-                .remaining
+                .remaining.unwrap()
         );
         assert_eq!(
             400..=499,
             get_discovery_from_head(Some(ByteRange::Last(100)))
                 .await
-                .remaining
+                .remaining.unwrap()
         );
         assert_eq!(
             0..=499,
             get_discovery_from_head(Some(ByteRange::Last(500)))
                 .await
-                .remaining
+                .remaining.unwrap()
         );
         assert_eq!(
             0..=499,
             get_discovery_from_head(Some(ByteRange::Last(5000)))
                 .await
-                .remaining
+                .remaining.unwrap()
         );
     }
 
@@ -377,8 +359,9 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(200, discovery.remaining.clone().count());
-        assert_eq!(500..=699, discovery.remaining);
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(200, remaining.clone().count());
+        assert_eq!(500..=699, remaining);
 
         let initial_chunk = discovery
             .initial_chunk
@@ -413,7 +396,9 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(0, discovery.remaining.clone().count());
+
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(0, remaining.clone().count());
 
         let initial_chunk = discovery
             .initial_chunk
@@ -449,8 +434,9 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(200, discovery.remaining.clone().count());
-        assert_eq!(300..=499, discovery.remaining);
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(200, remaining.clone().count());
+        assert_eq!(300..=499, remaining);
 
         let initial_chunk = discovery
             .initial_chunk
@@ -486,7 +472,7 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert!(discovery.remaining.is_empty());
+        assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
             .initial_chunk
@@ -522,8 +508,7 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(0, discovery.remaining.clone().count());
-        assert!(discovery.remaining.is_empty());
+        assert!(discovery.remaining.is_none());
         assert!(discovery.initial_chunk.is_none());
     }
 }
