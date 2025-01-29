@@ -43,25 +43,20 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
-        match &input.checksum_strategy {
-            // User set the checksum strategy: validate it
-            Some(checksum_strategy) => checksum_strategy.validate()?,
-
-            None => {
-                // User didn't explicitly set checksum strategy.
-                // If SDK is configured to send checksums: use default checksum strategy.
-                // Else: continue with no checksums
-                if handle
-                    .config
-                    .client()
-                    .config()
-                    .request_checksum_calculation()
-                    .cloned()
-                    .unwrap_or_default()
-                    == aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported
-                {
-                    input.checksum_strategy = Some(ChecksumStrategy::default());
-                }
+        if input.checksum_strategy.is_none() {
+            // User didn't explicitly set checksum strategy.
+            // If SDK is configured to send checksums: use default checksum strategy.
+            // Else: continue with no checksums
+            if handle
+                .config
+                .client()
+                .config()
+                .request_checksum_calculation()
+                .cloned()
+                .unwrap_or_default()
+                == aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported
+            {
+                input.checksum_strategy = Some(ChecksumStrategy::default());
             }
         }
 
@@ -153,9 +148,9 @@ async fn put_object(
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
 
     if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
-        if let Some(value) = &checksum_strategy.full_object_checksum {
+        if let Some(value) = checksum_strategy.full_object_checksum() {
             // We have the full-object checksum value, so set it
-            req = match &checksum_strategy.algorithm {
+            req = match checksum_strategy.algorithm() {
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
                 aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(value),
@@ -163,7 +158,7 @@ async fn put_object(
             };
         } else {
             // Set checksum algorithm, which tells SDK to calculate and add checksum value
-            req = req.checksum_algorithm(checksum_strategy.algorithm.clone());
+            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
         }
     }
 
@@ -261,8 +256,8 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
 
     if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
         req = req
-            .checksum_algorithm(checksum_strategy.algorithm.clone())
-            .checksum_type(checksum_strategy.type_if_multipart.clone());
+            .checksum_algorithm(checksum_strategy.algorithm().clone())
+            .checksum_type(checksum_strategy.type_if_multipart().clone());
     }
 
     let resp = req

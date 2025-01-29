@@ -197,11 +197,11 @@ fn mock_s3_client_for_multipart_upload(
                     // checksum algorithm and type should only be specified if a strategy is being used
                     assert_eq!(
                         input.checksum_algorithm(),
-                        request_strategy.as_ref().map(|s| &s.algorithm)
+                        request_strategy.as_ref().map(|s| s.algorithm())
                     );
                     assert_eq!(
                         input.checksum_type(),
-                        request_strategy.as_ref().map(|s| &s.type_if_multipart)
+                        request_strategy.as_ref().map(|s| s.type_if_multipart())
                     );
                     true
                 }
@@ -238,16 +238,16 @@ fn mock_s3_client_for_multipart_upload(
                             // If it doesn't know the part's actual checksum value, it should set the algorithm.
                             if let Some((field_algorithm, field_value)) = get_checksum_value!(input)
                             {
-                                assert_eq!(field_algorithm, request_strategy.algorithm);
+                                assert_eq!(&field_algorithm, request_strategy.algorithm());
                                 assert_eq!(field_value, part_checksum);
                                 // doesn't matter if algorithm is set too, but if it is, it should be correct
                                 if let Some(input_algorithm) = input.checksum_algorithm() {
-                                    assert_eq!(input_algorithm, &request_strategy.algorithm);
+                                    assert_eq!(input_algorithm, request_strategy.algorithm());
                                 }
                             } else {
                                 assert_eq!(
                                     input.checksum_algorithm(),
-                                    Some(&request_strategy.algorithm)
+                                    Some(request_strategy.algorithm())
                                 );
                             }
                         } else {
@@ -289,12 +289,12 @@ fn mock_s3_client_for_multipart_upload(
                     match &request_strategy {
                         None => assert!(input_checksum_field.is_none()),
 
-                        Some(request_strategy) => match &request_strategy.full_object_checksum {
+                        Some(request_strategy) => match &request_strategy.full_object_checksum() {
                             None => assert!(input_checksum_field.is_none()),
 
                             Some(full_object_checksum) => {
                                 let (field_algorithm, field_value) = input_checksum_field.unwrap();
-                                assert_eq!(field_algorithm, request_strategy.algorithm);
+                                assert_eq!(&field_algorithm, request_strategy.algorithm());
                                 assert_eq!(&field_value, full_object_checksum);
                             }
                         },
@@ -358,17 +358,17 @@ fn mock_s3_client_for_put_object(
                 move |input| {
                     if let Some(request_strategy) = &request_strategy {
                         // Transfer Manager is doing checksums.
-                        if let Some(provided_checksum) = &request_strategy.full_object_checksum {
+                        if let Some(provided_checksum) = &request_strategy.full_object_checksum() {
                             // Full-object checksum provided up front. Assert it was used
                             let (input_checksum_algorithm, input_checksum_value) =
                                 get_checksum_value!(input).unwrap();
-                            assert_eq!(input_checksum_algorithm, request_strategy.algorithm);
+                            assert_eq!(&input_checksum_algorithm, request_strategy.algorithm());
                             assert_eq!(&input_checksum_value, provided_checksum);
                         } else {
                             // Transfer Manager should set algorithm, so SDK will calculate actual checksum value
                             assert_eq!(
                                 input.checksum_algorithm(),
-                                Some(&request_strategy.algorithm)
+                                Some(request_strategy.algorithm())
                             );
                         }
                     } else {
@@ -450,8 +450,8 @@ async fn upload_helper(
     let (response_checksum_algorithm, response_checksum_type) = match &request_checksum_strategy {
         None => (ChecksumAlgorithm::Crc64Nvme, ChecksumType::FullObject),
         Some(request_checksum_strategy) => (
-            request_checksum_strategy.algorithm.clone(),
-            request_checksum_strategy.type_if_multipart.clone(),
+            request_checksum_strategy.algorithm().clone(),
+            request_checksum_strategy.type_if_multipart().clone(),
         ),
     };
 

@@ -50,7 +50,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         // TODO(aws-s3-transfer-manager-rs#3): allow user to pass per-part checksum values via PartStream
 
         // Set checksum algorithm, which tells SDK to calculate and add checksum value
-        req = req.checksum_algorithm(checksum_strategy.algorithm.clone());
+        req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
     }
 
     let resp = req

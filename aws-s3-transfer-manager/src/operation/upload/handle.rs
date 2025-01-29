@@ -214,9 +214,9 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
                 // TODO(aws-s3-transfer-manager-rs#3): allow user to pass full-object checksum value via callback on PartStream
 
-                if let Some(value) = &checksum_strategy.full_object_checksum {
+                if let Some(value) = checksum_strategy.full_object_checksum() {
                     // We have the full-object checksum value, so set it
-                    req = match &checksum_strategy.algorithm {
+                    req = match checksum_strategy.algorithm() {
                         aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
                         aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
                         aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
