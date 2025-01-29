@@ -114,14 +114,9 @@ impl ChecksumStrategy {
         }
     }
 
-    /// Builder for [`ChecksumStrategy`].
-    ///
-    /// Note that [`Builder::build()`] can fail if the strategy is invalid.
-    /// E.g. S3 does not allow any `SHA` algorithm to do full object multipart uploads,
-    /// and does not allow `CRC64NVME` to do composite multipart uploads.
-    /// You should prefer the `with_` constructors, which cannot fail.
-    pub fn builder() -> Builder {
-        Builder {
+    #[doc = std::include_str!("checksum_strategy_builder.md")]
+    pub fn builder() -> ChecksumStrategyBuilder {
+        ChecksumStrategyBuilder {
             algorithm: None,
             type_if_multipart: None,
             full_object_checksum: None,
@@ -162,15 +157,15 @@ impl Default for ChecksumStrategy {
     }
 }
 
-/// Builder for [`ChecksumStrategy`].
+#[doc = std::include_str!("checksum_strategy_builder.md")]
 #[derive(Debug)]
-pub struct Builder {
+pub struct ChecksumStrategyBuilder {
     algorithm: Option<ChecksumAlgorithm>,
     type_if_multipart: Option<ChecksumType>,
     full_object_checksum: Option<String>,
 }
 
-impl Builder {
+impl ChecksumStrategyBuilder {
     /// The checksum algorithm to use.
     pub fn algorithm(mut self, input: ChecksumAlgorithm) -> Self {
         self.algorithm = Some(input);
@@ -200,7 +195,11 @@ impl Builder {
         self
     }
 
-    /// TODO: docs
+    /// Returns a [`ChecksumStrategy`] from this builder, or an error if the strategy is illegal
+    /// (e.g. S3 does not allow any `SHA` algorithm to use [`ChecksumType::FullObject`] in multipart uploads).
+    ///
+    /// The `ChecksumStrategy::with_` constructors are recommended over the builder,
+    /// because they cannot fail.
     pub fn build(self) -> Result<ChecksumStrategy, BuildError> {
         let algorithm = self.algorithm.ok_or_else(|| {
             BuildError::missing_field("algorithm", "Checksum algorithm is required")
@@ -360,7 +359,7 @@ mod tests {
     fn test_builder_validation() {
         ChecksumStrategy::builder()
             .build()
-            .expect_err("Builder requires algorithm");
+            .expect_err("ChecksumStrategyBuilder requires algorithm");
 
         ChecksumStrategy::builder()
             .algorithm(ChecksumAlgorithm::Crc64Nvme)

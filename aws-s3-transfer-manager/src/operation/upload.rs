@@ -13,7 +13,7 @@ mod context;
 mod handle;
 mod service;
 
-pub use checksum_strategy::ChecksumStrategy;
+pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 
 use crate::error;
 use crate::io::InputStream;
