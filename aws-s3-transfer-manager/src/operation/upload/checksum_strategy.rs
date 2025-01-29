@@ -251,7 +251,7 @@ impl Builder {
             }
         };
 
-        if self.full_object_checksum.is_some() && &type_if_multipart != &ChecksumType::FullObject {
+        if self.full_object_checksum.is_some() && type_if_multipart != ChecksumType::FullObject {
             return Err(BuildError::invalid_field("full_object_checksum",
                 format!("You cannot provide the full object checksum value up front when the multipart checksum type is `{type_if_multipart}` (algorithm is `{algorithm}`)")
             ));

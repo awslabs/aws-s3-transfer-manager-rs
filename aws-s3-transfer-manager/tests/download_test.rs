@@ -21,9 +21,9 @@ use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClien
 use aws_smithy_types::body::SdkBody;
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
-/// As an example we generally assume object discovery goes through `GetObject` with a ranged get
-/// for the first part.
+// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
+// As an example we generally assume object discovery goes through `GetObject` with a ranged get
+// for the first part.
 
 fn rand_data(size: usize) -> Bytes {
     iter::repeat_with(fastrand::alphanumeric)

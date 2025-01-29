@@ -138,7 +138,7 @@ pin_project! {
 impl TestStream {
     pub fn new(parts: Vec<Bytes>) -> Self {
         TestStream {
-            parts: parts,
+            parts,
             next_part_num: 1,
         }
     }
@@ -347,8 +347,8 @@ fn mock_s3_client_for_put_object(
     let mut mock_client_rules: Vec<Rule> = Vec::new();
 
     // Pre-calculate stuff for later
-    let checksum_value = calculate_checksum(&response_algorithm, &expected_body);
-    let etag = calculate_etag(&expected_body);
+    let checksum_value = calculate_checksum(&response_algorithm, expected_body);
+    let etag = calculate_etag(expected_body);
 
     // PutObject
     mock_client_rules.push(
@@ -477,7 +477,7 @@ async fn upload_helper(
         s3_client
             .config()
             .to_builder()
-            .request_checksum_calculation(sdk_checksum_calculation.clone())
+            .request_checksum_calculation(sdk_checksum_calculation)
             .build(),
     );
 

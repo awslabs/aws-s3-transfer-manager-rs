@@ -284,7 +284,7 @@ pub struct ThroughputDisplayContext<'a> {
     pub unit: unit::ByteUnit,
 }
 
-impl<'a> fmt::Display for ThroughputDisplayContext<'a> {
+impl fmt::Display for ThroughputDisplayContext<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(precision) = f.precision() {
             write!(
