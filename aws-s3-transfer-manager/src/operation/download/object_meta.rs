@@ -3,13 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::ops::RangeInclusive;
-use std::str::FromStr;
+use crate::http::header;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
-use crate::http::header;
+use std::ops::RangeInclusive;
+use std::str::FromStr;
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 /// In the case of GetObject, some data will be duplicated as part of the first chunk.
