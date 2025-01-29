@@ -184,23 +184,18 @@ fn first_chunk_response_handler(
     let chunk_content_len = chunk_meta
         .content_length
         .expect("expected content_length in chunk") as u64;
-
-    let remaining = match object_meta.content_length().checked_sub(1) {
-        Some(object_end) => {
-            Some(match range_from_user {
-                Some(range_from_user) => {
-                    (*range_from_user.start() + chunk_content_len)
-                        ..=min(object_end, *range_from_user.end())
-                }
-                // If no range is provided, the range is from the end of the chunk to the end of the object.
-                // When the chunk is the last part of the object, this result in empty range.
-                None => chunk_content_len..=object_end,
-            })
-        }
-        // Empty range when the object is empty.
-        None => None,
-    };
-
+    let remaining = object_meta
+        .content_length()
+        .checked_sub(1)
+        .map(|object_end| match range_from_user {
+            Some(range_from_user) => {
+                (*range_from_user.start() + chunk_content_len)
+                    ..=min(object_end, *range_from_user.end())
+            }
+            // If no range is provided, the range is from the end of the chunk to the end of the object.
+            // When the chunk is the last part of the object, this result in empty range.
+            None => chunk_content_len..=object_end,
+        });
     let initial_chunk = match chunk_content_len == 0 {
         true => None,
         false => Some(body),
@@ -296,42 +291,51 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_obj_with_head() {
-        assert_eq!(0..=499, get_discovery_from_head(None).await.remaining.unwrap());
+        assert_eq!(
+            0..=499,
+            get_discovery_from_head(None).await.remaining.unwrap()
+        );
         assert_eq!(
             10..=100,
             get_discovery_from_head(Some(ByteRange::Inclusive(10, 100)))
                 .await
-                .remaining.unwrap()
+                .remaining
+                .unwrap()
         );
         assert_eq!(
             10..=499,
             get_discovery_from_head(Some(ByteRange::Inclusive(10, 10000)))
                 .await
-                .remaining.unwrap()
+                .remaining
+                .unwrap()
         );
         assert_eq!(
             100..=499,
             get_discovery_from_head(Some(ByteRange::AllFrom(100)))
                 .await
-                .remaining.unwrap()
+                .remaining
+                .unwrap()
         );
         assert_eq!(
             400..=499,
             get_discovery_from_head(Some(ByteRange::Last(100)))
                 .await
-                .remaining.unwrap()
+                .remaining
+                .unwrap()
         );
         assert_eq!(
             0..=499,
             get_discovery_from_head(Some(ByteRange::Last(500)))
                 .await
-                .remaining.unwrap()
+                .remaining
+                .unwrap()
         );
         assert_eq!(
             0..=499,
             get_discovery_from_head(Some(ByteRange::Last(5000)))
                 .await
-                .remaining.unwrap()
+                .remaining
+                .unwrap()
         );
     }
 
