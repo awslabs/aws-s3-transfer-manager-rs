@@ -6,6 +6,7 @@
 use aws_config::Region;
 use aws_s3_transfer_manager::{
     error::{BoxError, Error},
+    metrics::unit::ByteUnit,
     operation::download::DownloadHandle,
     types::{ConcurrencySetting, PartSize},
 };
@@ -20,11 +21,9 @@ use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClien
 use aws_smithy_types::body::SdkBody;
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
-/// As an example we generally assume object discovery goes through `GetObject` with a ranged get
-/// for the first part.
-
-const MEBIBYTE: usize = 1024 * 1024;
+// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
+// As an example we generally assume object discovery goes through `GetObject` with a ranged get
+// for the first part.
 
 fn rand_data(size: usize) -> Bytes {
     iter::repeat_with(fastrand::alphanumeric)
@@ -130,8 +129,8 @@ fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer
 /// Test the object ranges are expected and we get all the data
 #[tokio::test]
 async fn test_download_ranges() {
-    let data = rand_data(12 * MEBIBYTE);
-    let part_size = 5 * MEBIBYTE;
+    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
@@ -162,8 +161,8 @@ async fn test_download_ranges() {
 /// Test body not consumed which should not prevent the handle from being dropped
 #[tokio::test]
 async fn test_body_not_consumed() {
-    let data = rand_data(12 * MEBIBYTE);
-    let part_size = 5 * MEBIBYTE;
+    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
     let (tm, _) = simple_test_tm(&data, part_size);
 
@@ -179,8 +178,8 @@ async fn test_body_not_consumed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_abort_download() {
-    let data = rand_data(25 * MEBIBYTE);
-    let part_size = MEBIBYTE;
+    let data = rand_data(25 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = ByteUnit::Mebibyte.as_bytes_usize();
 
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
@@ -244,9 +243,9 @@ impl http_body_1x::Body for FailingBody {
 /// Test chunk/part failure is retried
 #[tokio::test]
 async fn test_retry_failed_chunk() {
-    let data = rand_data(12 * MEBIBYTE);
-    let part_size = 8 * MEBIBYTE;
-    let frame_size = 16 * 1024;
+    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let frame_size = 16 * ByteUnit::Kibibyte.as_bytes_usize();
     let fail_after_byte = frame_size * 4;
 
     let http_client = StaticReplayClient::new(vec![
@@ -322,8 +321,8 @@ const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Test non retryable SdkError
 #[tokio::test]
 async fn test_non_retryable_error() {
-    let data = rand_data(20 * MEBIBYTE);
-    let part_size = 8 * MEBIBYTE;
+    let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
 
     let http_client = StaticReplayClient::new(vec![
         ReplayEvent::new(
@@ -366,8 +365,8 @@ async fn test_non_retryable_error() {
 /// Test max attempts exhausted reading a stream
 #[tokio::test]
 async fn test_retry_max_attempts() {
-    let data = rand_data(12 * MEBIBYTE);
-    let part_size = 8 * MEBIBYTE;
+    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
     let frame_size = 16 * 1024;
     let fail_after_byte = frame_size * 4;
 
@@ -425,8 +424,8 @@ async fn test_retry_max_attempts() {
 /// Test the if_match header was added correctly based on the response from server.
 #[tokio::test]
 async fn test_download_if_match() {
-    let data = rand_data(12 * MEBIBYTE);
-    let part_size = 5 * MEBIBYTE;
+    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
@@ -460,8 +459,8 @@ const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Test that if the object modified during download.
 #[tokio::test]
 async fn test_download_object_modified() {
-    let data = rand_data(12 * MEBIBYTE);
-    let part_size = 5 * MEBIBYTE;
+    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
     // Create a static replay client (http connector) to mock the S3 response when object modified during download.
     //

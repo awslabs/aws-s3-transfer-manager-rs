@@ -5,12 +5,15 @@
 
 /// Operation builders
 pub mod builders;
+mod checksum_strategy;
 mod input;
 mod output;
 
 mod context;
 mod handle;
 mod service;
+
+pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 
 use crate::error;
 use crate::io::InputStream;
@@ -40,6 +43,23 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
+        if input.checksum_strategy.is_none() {
+            // User didn't explicitly set checksum strategy.
+            // If SDK is configured to send checksums: use default checksum strategy.
+            // Else: continue with no checksums
+            if handle
+                .config
+                .client()
+                .config()
+                .request_checksum_calculation()
+                .cloned()
+                .unwrap_or_default()
+                == aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported
+            {
+                input.checksum_strategy = Some(ChecksumStrategy::default());
+            }
+        }
+
         let stream = input.take_body();
         let ctx = new_context(handle.clone(), input);
         Ok(UploadHandle::new(
@@ -91,7 +111,7 @@ async fn put_object(
     // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
     // more work for a lot of small files.
     let _permit = ctx.handle.scheduler.acquire_permit().await?;
-    let resp = ctx
+    let mut req = ctx
         .client()
         .put_object()
         .set_acl(ctx.request.acl.clone())
@@ -125,8 +145,24 @@ async fn put_object(
         .set_object_lock_mode(ctx.request.object_lock_mode.clone())
         .set_object_lock_retain_until_date(ctx.request.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
-        .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
+        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        if let Some(value) = checksum_strategy.full_object_checksum() {
+            // We have the full-object checksum value, so set it
+            req = match checksum_strategy.algorithm() {
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(value),
+                algo => unreachable!("unexpected algorithm `{algo}` for full object checksum"),
+            };
+        } else {
+            // Set checksum algorithm, which tells SDK to calculate and add checksum value
+            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+        }
+    }
+
+    let resp = req
         .customize()
         .disable_payload_signing()
         .send()
@@ -186,7 +222,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
     let req = ctx.request();
     let client = ctx.client();
 
-    let resp = client
+    let mut req = client
         .create_multipart_upload()
         .set_acl(req.acl.clone())
         .set_bucket(req.bucket.clone())
@@ -216,8 +252,15 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
         .set_object_lock_mode(req.object_lock_mode.clone())
         .set_object_lock_retain_until_date(req.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(req.expected_bucket_owner.clone())
-        .set_checksum_algorithm(req.checksum_algorithm.clone())
+        .set_expected_bucket_owner(req.expected_bucket_owner.clone());
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        req = req
+            .checksum_algorithm(checksum_strategy.algorithm().clone())
+            .checksum_type(checksum_strategy.type_if_multipart().clone());
+    }
+
+    let resp = req
         .send()
         .instrument(tracing::debug_span!("send-create-multipart-upload"))
         .await?;
@@ -228,6 +271,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
 #[cfg(test)]
 mod test {
     use crate::io::InputStream;
+    use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
     use crate::types::{ConcurrencySetting, PartSize};
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
@@ -329,7 +373,7 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
+            .set_multipart_threshold(PartSize::Target(10 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)
             .build();
         let tm = crate::Client::new(tm_config);
@@ -389,7 +433,7 @@ mod test {
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencySetting::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * 1024 * 1024))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)
             .build();
 

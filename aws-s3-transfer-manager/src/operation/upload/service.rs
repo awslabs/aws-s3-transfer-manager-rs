@@ -46,8 +46,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
 
-    // TODO(aws-sdk-rust#1159): set checksum fields if applicable
-    let resp = ctx
+    let mut req = ctx
         .client()
         .upload_part()
         .set_bucket(ctx.request.bucket.clone())
@@ -60,7 +59,16 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_sse_customer_key(ctx.request.sse_customer_key.clone())
         .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
         .set_request_payer(ctx.request.request_payer.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        // TODO(aws-s3-transfer-manager-rs#3): allow user to pass per-part checksum values via PartStream
+
+        // Set checksum algorithm, which tells SDK to calculate and add checksum value
+        req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+    }
+
+    let resp = req
         .customize()
         .disable_payload_signing()
         .send()
@@ -73,6 +81,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_e_tag(resp.e_tag.clone())
         .set_checksum_crc32(resp.checksum_crc32.clone())
         .set_checksum_crc32_c(resp.checksum_crc32_c.clone())
+        .set_checksum_crc64_nvme(resp.checksum_crc64_nvme.clone())
         .set_checksum_sha1(resp.checksum_sha1.clone())
         .set_checksum_sha256(resp.checksum_sha256.clone())
         .build();
