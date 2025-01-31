@@ -10,7 +10,10 @@ use crate::{
     middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
     operation::upload::UploadContext,
 };
-use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
+use aws_sdk_s3::{
+    primitives::ByteStream,
+    types::{ChecksumAlgorithm, CompletedPart},
+};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
 use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
@@ -62,10 +65,26 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
 
     if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
-        // TODO(aws-s3-transfer-manager-rs#3): allow user to pass per-part checksum values via PartStream
-
-        // Set checksum algorithm, which tells SDK to calculate and add checksum value
-        req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+        // If user passed checksum value via PartStream, add it to request
+        if let Some(checksum_value) = &part_data.checksum {
+            req = match checksum_strategy.algorithm() {
+                ChecksumAlgorithm::Crc32 => req.checksum_crc32(checksum_value),
+                ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(checksum_value),
+                ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(checksum_value),
+                ChecksumAlgorithm::Sha1 => req.checksum_sha1(checksum_value),
+                ChecksumAlgorithm::Sha256 => req.checksum_sha256(checksum_value),
+                algo => unreachable!("unexpected checksum algorithm `{algo}`"),
+            }
+        } else {
+            // Otherwise, set checksum algorithm, which tells SDK to calculate and add checksum value
+            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+        }
+    } else {
+        // Warn if user is passing a checksum value, but the upload isn't doing checksums.
+        // We can't just set a checksum header, because we don't know what algorithm to use.
+        if part_data.checksum.is_some() {
+            tracing::warn!("Ignoring part checksum provided during upload, because no ChecksumStrategy is specified");
+        }
     }
 
     let resp = req

@@ -171,6 +171,7 @@ pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
+    pub(crate) checksum: Option<String>,
 }
 
 impl PartData {
@@ -183,6 +184,19 @@ impl PartData {
         Self {
             part_number,
             data: data.into(),
+            checksum: None,
+        }
+    }
+
+    /// Create a new part, with a precalculated checksum
+    pub fn with_checksum(
+        part_number: u64,
+        data: impl Into<Bytes>,
+        checksum: impl Into<String>,
+    ) -> Self {
+        Self {
+            checksum: Some(checksum.into()),
+            ..Self::new(part_number, data)
         }
     }
 }
