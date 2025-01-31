@@ -4,8 +4,9 @@
  */
 
 use crate::runtime::scheduler::Scheduler;
+use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
-use crate::{metrics::unit::ByteUnit, types::PartSize, DEFAULT_CONCURRENCY};
+use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
 use std::sync::Arc;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -24,12 +25,12 @@ pub(crate) struct Handle {
 impl Handle {
     /// Get the concrete number of workers to use based on the concurrency setting.
     pub(crate) fn num_workers(&self) -> usize {
-        // FIXME - update logic
-        if self.config.target_throughput().is_no_concurrency() {
-            // special case for allowing tests to rely on non concurrent execution
-            1
-        } else {
-            DEFAULT_CONCURRENCY
+        // FIXME - update logic for auto/target throughput or delegate to scheduler?
+        // FIXME - this applies per/transfer!! the concurrency setting probably shouldn't map 1-1
+        // like this as it's meant to be concurrency across operations
+        match self.config.concurrency() {
+            ConcurrencyMode::Explicit(concurrency) => *concurrency,
+            _ => DEFAULT_CONCURRENCY,
         }
     }
 
@@ -62,14 +63,7 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        // FIXME - pass target throughput and base it on token bucket?
-        let permits = if config.target_throughput().is_no_concurrency() {
-            1
-        } else {
-            DEFAULT_CONCURRENCY
-        };
-        let scheduler = Scheduler::new(permits);
-
+        let scheduler = Scheduler::new(config.concurrency().clone());
         let handle = Arc::new(Handle { config, scheduler });
         Client { handle }
     }

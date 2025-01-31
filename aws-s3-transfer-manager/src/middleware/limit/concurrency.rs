@@ -13,3 +13,4 @@ mod layer;
 mod service;
 
 pub(crate) use self::layer::ConcurrencyLimitLayer;
+pub(crate) use self::service::ProvidePayloadSize;

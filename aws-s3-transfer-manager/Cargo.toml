@@ -29,6 +29,7 @@ tokio = { version = "1.42.0", features = ["rt-multi-thread", "io-util", "sync", 
 tower = { version = "0.5.2", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
 walkdir = "2"
+tokio-util = "0.7.13"
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.66.0", features = ["behavior-version-latest", "test-util"] }

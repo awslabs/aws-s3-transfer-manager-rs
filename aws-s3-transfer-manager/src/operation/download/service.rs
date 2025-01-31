@@ -7,6 +7,7 @@ use crate::error::ErrorKind;
 use crate::http::header;
 use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
+use crate::middleware::limit::concurrency::ProvidePayloadSize;
 use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
@@ -29,6 +30,19 @@ pub(super) struct DownloadChunkRequest {
     pub(super) remaining: RangeInclusive<u64>,
     pub(super) input: DownloadInputBuilder,
     pub(super) start_seq: u64,
+}
+
+impl ProvidePayloadSize for DownloadChunkRequest {
+    fn payload_size(&self) -> u64 {
+        // we can't know the actual size by calling next_seq() as that would modify the
+        // state. Instead we give an estimate based on the current sequence.
+        let seq = self.ctx.current_seq();
+        let remaining = self.remaining.clone();
+        let part_size = self.ctx.handle.download_part_size_bytes();
+        let start = remaining.start() + ((seq - self.start_seq) * part_size);
+        let end_inclusive = cmp::min(start + part_size - 1, *remaining.end());
+        end_inclusive - start + 1
+    }
 }
 
 fn next_chunk(

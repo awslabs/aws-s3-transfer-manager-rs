@@ -22,35 +22,20 @@ pub enum PartSize {
     Target(u64),
 }
 
-/// The target throughput the client should aim for.
-///
-/// NOTE: Target throughput is taken as a maximum. Actual throughput may be less than
-/// what is configured and is dependendent on the host, network conditions, etc.
+/// The concurrency mode the client should use for executing requests.
 #[derive(Debug, Clone, Default)]
-pub enum TargetThroughput {
-    /// Automatically configure an optimal target throughput setting based on the execution environment.
+pub enum ConcurrencyMode {
+    /// Automatically configured concurrency based on the execution environment.
     #[default]
     Auto,
 
-    /// Explicitly configured throughput setting.
-    Explicit(Throughput),
-}
-
-impl TargetThroughput {
-    /// Set a target throughput that signals one at a time concurrency.
+    /// Explicitly configured throughput setting the client should aim for.
     ///
-    /// NOTE: This is used mostly for testing purposes
-    #[doc(hidden)]
-    pub fn no_concurrency() -> TargetThroughput {
-        TargetThroughput::Explicit(Throughput::new_bytes_per_sec(0))
-    }
+    /// In this mode, concurrency is limited by attempting to hit a throughput target.
+    TargetThroughput(Throughput),
 
-    pub(crate) fn is_no_concurrency(&self) -> bool {
-        match self {
-            TargetThroughput::Explicit(throughput) => throughput.bytes_transferred() == 0,
-            _ => false,
-        }
-    }
+    /// Explicit concurrency control
+    Explicit(usize),
 }
 
 /// Policy for how to handle a failed multipart upload

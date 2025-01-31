@@ -14,6 +14,7 @@ mod service;
 
 use crate::error;
 use crate::io::InputStream;
+use crate::runtime::scheduler::PermitType;
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadData, UploadType};
@@ -88,9 +89,12 @@ async fn put_object(
     let content_length: i64 = content_length.try_into().map_err(|_| {
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
-    // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
-    // more work for a lot of small files.
-    let _permit = ctx.handle.scheduler.acquire_permit().await?;
+
+    let _permit = ctx
+        .handle
+        .scheduler
+        .acquire_permit(PermitType::DataPlane(content_length as u64))
+        .await?;
     let resp = ctx
         .client()
         .put_object()
@@ -229,8 +233,8 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
 mod test {
     use crate::io::InputStream;
     use crate::operation::upload::UploadInput;
+    use crate::types::ConcurrencyMode;
     use crate::types::PartSize;
-    use crate::types::TargetThroughput;
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -292,7 +296,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .target_throughput(TargetThroughput::no_concurrency())
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(30))
             .client(client)
@@ -329,7 +333,7 @@ mod test {
             mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
 
         let tm_config = crate::Config::builder()
-            .target_throughput(TargetThroughput::no_concurrency())
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
             .client(client)
             .build();
@@ -388,7 +392,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .target_throughput(TargetThroughput::no_concurrency())
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * 1024 * 1024))
             .client(client)

@@ -33,7 +33,7 @@ mod service;
 
 use crate::error;
 use crate::io::AggregatedBytes;
-use crate::runtime::scheduler::OwnedWorkPermit;
+use crate::runtime::scheduler::{OwnedWorkPermit, PermitType};
 use aws_smithy_types::byte_stream::ByteStream;
 use discovery::discover_obj;
 use service::distribute_work;
@@ -115,8 +115,13 @@ async fn send_discovery(
         parent_span_for_tasks.follows_from(tracing::Span::current());
     }
 
+    // FIXME - move acquire permit to where it's used in discovery (where we know the payload size)
     // acquire a permit for discovery
-    let permit = ctx.handle.scheduler.acquire_permit().await;
+    let permit = ctx
+        .handle
+        .scheduler
+        .acquire_permit(PermitType::ControlPlane)
+        .await;
     let permit = match permit {
         Ok(permit) => permit,
         Err(err) => {

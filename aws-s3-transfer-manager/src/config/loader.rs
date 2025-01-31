@@ -10,7 +10,7 @@ use aws_sdk_s3::config::{Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
 use crate::config::Builder;
-use crate::types::TargetThroughput;
+use crate::types::ConcurrencyMode;
 use crate::{http, types::PartSize, Config};
 
 #[derive(Debug)]
@@ -79,12 +79,12 @@ impl ConfigLoader {
         self
     }
 
-    /// Set the target throughput this client should aim for.
+    /// Set the concurrency mode this client should use.
     ///
-    /// This sets the target throughput of concurrent in-flight requests across _all_ operations.
-    /// Default is [TargetThroughput::Auto].
-    pub fn target_throughput(mut self, target_throughput: TargetThroughput) -> Self {
-        self.builder = self.builder.target_throughput(target_throughput);
+    /// This sets the mode used for concurrent in-flight requests across _all_ operations.
+    /// Default is [ConcurrencyMode::Auto].
+    pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
+        self.builder = self.builder.concurrency(mode);
         self
     }
 

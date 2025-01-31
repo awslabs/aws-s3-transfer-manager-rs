@@ -7,7 +7,10 @@ use crate::{
         part_reader::{Builder as PartReaderBuilder, PartReader},
         InputStream, PartData,
     },
-    middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
+    middleware::{
+        hedge,
+        limit::concurrency::{ConcurrencyLimitLayer, ProvidePayloadSize},
+    },
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
@@ -22,6 +25,12 @@ pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
     pub(super) upload_id: String,
+}
+
+impl ProvidePayloadSize for UploadPartRequest {
+    fn payload_size(&self) -> u64 {
+        self.part_data.data.len() as u64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +100,7 @@ pub(super) fn upload_part_service(
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
+        // FIXME - buffer layer needs to be tuned with the concurrency limit
         // FIXME - This setting will need to be globalized.
         .buffer(ctx.handle.num_workers())
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
@@ -201,6 +211,7 @@ mod tests {
     use crate::client::Handle;
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
+    use crate::types::ConcurrencyMode;
     use crate::Config;
     use test_common::mock_client_with_stubbed_http_client;
 
@@ -210,7 +221,7 @@ mod tests {
             ctx: UploadContext {
                 handle: Arc::new(Handle {
                     config: Config::builder().client(s3_client).build(),
-                    scheduler: Scheduler::new(0),
+                    scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
             },

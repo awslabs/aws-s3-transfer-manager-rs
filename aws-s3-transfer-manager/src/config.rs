@@ -4,22 +4,24 @@
  */
 
 use aws_runtime::user_agent::FrameworkMetadata;
+use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{PartSize, TargetThroughput};
-use std::cmp;
+use crate::types::{ConcurrencyMode, PartSize};
 
 pub(crate) mod loader;
 
 /// Minimum upload part size in bytes
 pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
+// FIXME - should target throughput be configurable for upload and download independently?
+
 /// Configuration for a [`Client`](crate::client::Client)
 #[derive(Debug, Clone)]
 pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
-    target_throughput: TargetThroughput,
+    concurrency: ConcurrencyMode,
     framework_metadata: Option<FrameworkMetadata>,
     client: aws_sdk_s3::client::Client,
 }
@@ -40,10 +42,11 @@ impl Config {
         &self.target_part_size
     }
 
-    /// Returns the target throughput setting to use for transfer operations.
-    /// This is the target throughput of concurrent in-flight requests across _all_ operations.
-    pub fn target_throughput(&self) -> &TargetThroughput {
-        &self.target_throughput
+    /// Returns the concurrency mode to use for transfer operations.
+    ///
+    /// This is the mode used for concurrent in-flight requests across _all_ operations.
+    pub fn concurrency(&self) -> &ConcurrencyMode {
+        &self.concurrency
     }
 
     /// Returns the framework metadata setting when using transfer manager.
@@ -63,7 +66,7 @@ impl Config {
 pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
-    target_throughput: TargetThroughput,
+    concurrency: ConcurrencyMode,
     framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
 }
@@ -123,12 +126,12 @@ impl Builder {
         self
     }
 
-    /// Set the target throughput this client should aim for.
+    /// Set the concurrency mode this client should use.
     ///
-    /// This sets the target throughput of concurrent in-flight requests across _all_ operations.
-    /// Default is [TargetThroughput::Auto].
-    pub fn target_throughput(mut self, target_throughput: TargetThroughput) -> Self {
-        self.target_throughput = target_throughput;
+    /// This sets the mode used for concurrent in-flight requests across _all_ operations.
+    /// Default is [ConcurrencyMode::Auto].
+    pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
+        self.concurrency = mode;
         self
     }
 
@@ -156,7 +159,7 @@ impl Builder {
         Config {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
-            target_throughput: self.target_throughput,
+            concurrency: self.concurrency,
             framework_metadata: self.framework_metadata,
             client: self.client.expect("client set"),
         }

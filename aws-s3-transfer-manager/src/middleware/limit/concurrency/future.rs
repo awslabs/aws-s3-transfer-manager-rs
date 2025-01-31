@@ -3,35 +3,89 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::runtime::scheduler::OwnedWorkPermit;
+use crate::error;
+use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit};
 
 use futures_util::ready;
 use pin_project_lite::pin_project;
 use std::{future::Future, task::Poll};
+use tower::Service;
 
 pin_project! {
     #[derive(Debug)]
-    pub(crate) struct ResponseFuture<T> {
+    pub(crate) struct ResponseFuture<S, Request>
+        where S: Service<Request>
+    {
+        request: Option<Request>,
+        inner: S,
         #[pin]
-        inner: T,
-        // retain until dropped when future completes
-        _permit: OwnedWorkPermit
+        state: State<S::Future>
     }
 }
 
-impl<T> ResponseFuture<T> {
-    pub(crate) fn new(inner: T, _permit: OwnedWorkPermit) -> ResponseFuture<T> {
-        ResponseFuture { inner, _permit }
+pin_project! {
+    #[project = StateProj]
+    #[derive(Debug)]
+    enum State<F> {
+        // Polling the future from [`Service::call`]
+        Called {
+            #[pin]
+            fut: F,
+            // retain until dropped when future completes
+            _permit: OwnedWorkPermit,
+        },
+        // Polling the future from [`Scheduler::acquire_permit`]
+        AcquiringPermit {
+            #[pin]
+            permit_fut: AcquirePermitFuture
+        }
     }
 }
 
-impl<F, T, E> Future for ResponseFuture<F>
+impl<S, Request> ResponseFuture<S, Request>
 where
-    F: Future<Output = Result<T, E>>,
+    S: Service<Request>,
 {
-    type Output = Result<T, E>;
+    pub(crate) fn new(
+        inner: S,
+        req: Request,
+        permit_fut: AcquirePermitFuture,
+    ) -> ResponseFuture<S, Request> {
+        ResponseFuture {
+            request: Some(req),
+            inner,
+            state: State::AcquiringPermit { permit_fut },
+        }
+    }
+}
+
+impl<S, Request> Future for ResponseFuture<S, Request>
+where
+    // FIXME - figure out error
+    S: Service<Request, Error = error::Error>,
+{
+    type Output = Result<S::Response, S::Error>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(ready!(self.project().inner.poll(cx)))
+        let mut this = self.project();
+        loop {
+            match this.state.as_mut().project() {
+                StateProj::AcquiringPermit { permit_fut } => {
+                    let res = ready!(permit_fut.poll(cx));
+                    match res {
+                        Ok(_permit) => {
+                            let req = this.request.take().expect("request set");
+                            let fut = this.inner.call(req);
+                            this.state.set(State::Called { fut, _permit });
+                        }
+                        Err(err) => return Poll::Ready(Err(err)),
+                    }
+                }
+                StateProj::Called { fut, .. } => {
+                    let result = ready!(fut.poll(cx));
+                    return Poll::Ready(result);
+                }
+            }
+        }
     }
 }

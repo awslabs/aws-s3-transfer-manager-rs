@@ -3,13 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::error;
-
 use futures_util::TryFutureExt;
 use pin_project_lite::pin_project;
 use std::future::Future;
-use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+
+use crate::error;
+use crate::runtime::token_bucket::{OwnedToken, TokenBucket};
+use crate::types::ConcurrencyMode;
 
 // FIXME - track high water mark
 // FIXME - add statistics/telemetry
@@ -19,54 +19,51 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 /// Scheduler is internally reference-counted and can be freely cloned.
 #[derive(Debug, Clone)]
 pub(crate) struct Scheduler {
-    sem: Arc<Semaphore>,
+    token_bucket: TokenBucket,
 }
 
 impl Scheduler {
     /// Create a new scheduler with the initial number of work permits.
-    pub(crate) fn new(permits: usize) -> Self {
+    pub(crate) fn new(mode: ConcurrencyMode) -> Self {
         Self {
-            // NOTE: tokio semaphore is fair, permits are given out in the order requested
-            sem: Arc::new(Semaphore::new(permits)),
+            token_bucket: TokenBucket::new(mode),
         }
     }
 
-    // TODO - add some notion of "work type" and/or "work estimate" to permit acquisition to allow
-    // for scheduler to make choices on what work gets prioritized
-
     /// Acquire a permit to perform some unit of work
-    pub(crate) fn acquire_permit(&self) -> AcquirePermitFuture {
-        match self.try_acquire_permit() {
-            Ok(Some(permit)) => AcquirePermitFuture::ready(Ok(permit)),
+    pub(crate) fn acquire_permit(&self, ptype: PermitType) -> AcquirePermitFuture {
+        match self.try_acquire_permit(ptype.clone()) {
+            Ok(Some(token)) => AcquirePermitFuture::ready(Ok(token.into())),
             Ok(None) => {
                 let inner = self
-                    .sem
-                    .clone()
-                    .acquire_owned()
-                    .map_ok(OwnedWorkPermit::from)
-                    .map_err(error::from_kind(error::ErrorKind::RuntimeError));
-
+                    .token_bucket
+                    .acquire(ptype)
+                    .map_ok(OwnedWorkPermit::from);
                 AcquirePermitFuture::new(inner)
             }
             Err(err) => AcquirePermitFuture::ready(Err(err)),
         }
     }
 
-    /// Try to acquire a permit for some unit of work.
-    ///
-    /// If there are no permits left, this returns `Ok(None)`. Otherwise, this returns
-    /// `Ok(Some(OwnedWorkPermit))`
-    fn try_acquire_permit(&self) -> Result<Option<OwnedWorkPermit>, error::Error> {
-        match self.sem.clone().try_acquire_owned() {
-            Ok(permit) => Ok(Some(permit.into())),
-            Err(err) => match err {
-                TryAcquireError::Closed => {
-                    Err(error::Error::new(error::ErrorKind::RuntimeError, err))
-                }
-                TryAcquireError::NoPermits => Ok(None),
-            },
-        }
+    fn try_acquire_permit(
+        &self,
+        ptype: PermitType,
+    ) -> Result<Option<OwnedWorkPermit>, error::Error> {
+        self.token_bucket
+            .try_acquire(ptype)
+            .map(|token| token.map(OwnedWorkPermit::from))
     }
+}
+
+pub(crate) type PayloadEstimate = u64;
+
+/// The type of work to be done
+#[derive(Debug, Clone)]
+pub(crate) enum PermitType {
+    /// A network request to a control plane API with insignificant payload
+    ControlPlane,
+    /// A network request to transmit or receive to or from a data plane API with the given payload size estimate
+    DataPlane(PayloadEstimate),
 }
 
 /// An owned permit from the scheduler to perform some unit of work.
@@ -74,11 +71,11 @@ impl Scheduler {
 #[clippy::has_significant_drop]
 #[derive(Debug)]
 pub(crate) struct OwnedWorkPermit {
-    _inner: OwnedSemaphorePermit,
+    _inner: OwnedToken,
 }
 
-impl From<OwnedSemaphorePermit> for OwnedWorkPermit {
-    fn from(value: OwnedSemaphorePermit) -> Self {
+impl From<OwnedToken> for OwnedWorkPermit {
+    fn from(value: OwnedToken) -> Self {
         Self { _inner: value }
     }
 }
@@ -95,6 +92,8 @@ pin_project! {
 }
 
 impl AcquirePermitFuture {
+    // TODO - with the addition of a concrete token future type we can probably get rid of the
+    // boxing of aws_smithy_async::NowOrLater here...
     fn new<F>(future: F) -> Self
     where
         F: Future<Output = Result<OwnedWorkPermit, error::Error>> + Send + 'static,
@@ -125,32 +124,24 @@ impl Future for AcquirePermitFuture {
 
 #[cfg(test)]
 mod tests {
-    use super::Scheduler;
-
-    #[test]
-    fn try_acquire() {
-        let scheduler = Scheduler::new(1);
-        {
-            let p1 = scheduler.try_acquire_permit().unwrap();
-            assert!(p1.is_some());
-            let p2 = scheduler.try_acquire_permit().unwrap();
-            assert!(p2.is_none());
-        }
-        // p1 dropped
-        let p3 = scheduler.try_acquire_permit().unwrap();
-        assert!(p3.is_some());
-    }
+    use super::{PermitType, Scheduler};
+    use crate::types::ConcurrencyMode;
 
     #[tokio::test]
-    async fn test_acquire() {
-        let scheduler = Scheduler::new(1);
-        let p1 = scheduler.acquire_permit().await.unwrap();
+    async fn test_acquire_mode_explicit() {
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
+        let p1 = scheduler
+            .acquire_permit(PermitType::ControlPlane)
+            .await
+            .unwrap();
         let scheduler2 = scheduler.clone();
         let jh = tokio::spawn(async move {
-            let _p2 = scheduler2.acquire_permit().await;
+            let _p2 = scheduler2.acquire_permit(PermitType::ControlPlane).await;
         });
         assert!(!jh.is_finished());
         drop(p1);
         jh.await.unwrap();
     }
+
+    // TODO - add additional tests (e.g. test the example from S3 documentation that we end up with the right concurrency)
 }
