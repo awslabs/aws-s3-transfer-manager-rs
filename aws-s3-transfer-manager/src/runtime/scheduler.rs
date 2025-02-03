@@ -33,7 +33,7 @@ impl Scheduler {
     /// Acquire a permit to perform some unit of work
     pub(crate) fn acquire_permit(&self, ptype: PermitType) -> AcquirePermitFuture {
         match self.try_acquire_permit(ptype.clone()) {
-            Ok(Some(token)) => AcquirePermitFuture::ready(Ok(token.into())),
+            Ok(Some(permit)) => AcquirePermitFuture::ready(Ok(permit)),
             Ok(None) => {
                 let inner = self
                     .token_bucket

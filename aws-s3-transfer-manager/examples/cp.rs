@@ -11,7 +11,7 @@ use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::Body;
-use aws_s3_transfer_manager::types::{PartSize, TargetThroughput};
+use aws_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
 use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -40,10 +40,8 @@ pub struct Args {
     #[arg(required = true)]
     dest: TransferUri,
 
-    // FIXME - implement support for auto as default
-    /// Target throughput in Gbps
-    #[arg(long, default_value_t = 10)]
-    target_throughput_gbps: usize,
+    #[command(flatten)]
+    concurrency: ConcurrencyModeArg,
 
     /// Part size to use
     #[arg(long, default_value_t = 8388608)]
@@ -58,11 +56,35 @@ pub struct Args {
     recursive: bool,
 }
 
-impl Args {
-    fn target_throughput(&self) -> Throughput {
-        Throughput::new_bytes_per_sec(
-            self.target_throughput_gbps as u64 * ByteUnit::Gigabit.as_bytes_u64(),
-        )
+#[derive(Debug, Clone, clap::Args)]
+#[group(multiple = false)]
+struct ConcurrencyModeArg {
+    /// ConcurrencyMode::Auto
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    concurrency_auto: bool,
+
+    /// ConcurrencyMode::TargetThroughput(Gbps)
+    #[arg(long)]
+    target_throughput_gbps: Option<u64>,
+
+    /// ConcurrencyMode::Explicit(n)
+    #[arg(long)]
+    concurrency: Option<usize>,
+}
+
+impl ConcurrencyModeArg {
+    fn mode(&self) -> ConcurrencyMode {
+        if self.concurrency_auto {
+            return ConcurrencyMode::Auto;
+        }
+
+        match (self.target_throughput_gbps, self.concurrency) {
+            (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
+            (Some(gbps), None) => ConcurrencyMode::TargetThroughput(Throughput::new_bytes_per_sec(
+                ByteUnit::Gigabit.as_bytes_u64() * gbps,
+            )),
+            _ => ConcurrencyMode::Auto,
+        }
     }
 }
 
@@ -158,7 +180,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
     let (bucket, _) = args.source.expect_s3().parts();
 
     let tm_config = aws_s3_transfer_manager::from_env()
-        .target_throughput(TargetThroughput::Explicit(args.target_throughput()))
+        .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size))
         .load()
         .await;
@@ -235,7 +257,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
     let (bucket, key) = args.dest.expect_s3().parts();
 
     let tm_config = aws_s3_transfer_manager::from_env()
-        .target_throughput(TargetThroughput::Explicit(args.target_throughput()))
+        .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size))
         .load()
         .await;
@@ -288,6 +310,9 @@ async fn main() -> Result<(), BoxError> {
             .with_thread_ids(true)
             .init();
     }
+
+    // tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
+    println!("using concurrency mode: {:?}", args.concurrency.mode());
 
     use TransferUri::*;
     let result = match (&args.source, &args.dest) {

@@ -7,7 +7,7 @@ use pin_project_lite::pin_project;
 use std::future::Future;
 use std::task::Poll;
 use std::{cmp, sync::Arc, time::Duration};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::PollSemaphore;
 
 use crate::error;
@@ -82,15 +82,6 @@ impl TokenBucket {
         }
     }
 
-    // pub(crate) async fn acquire(&self, ptype: PermitType) -> Result<OwnedToken, error::Error> {
-    //     let cost = self.cost(ptype);
-    //     let permit = self.semaphore.clone().acquire_many_owned(cost)
-    //         .await
-    //         .map_err(error::from_kind(error::ErrorKind::RuntimeError))?;
-    //
-    //     Ok(OwnedToken::new(permit))
-    // }
-
     /// Acquire a token for the given permit type. Tokens are returned to the bucket when the
     /// [OwnedToken] is dropped.
     pub(crate) fn acquire(&self, ptype: PermitType) -> AcquireTokenFuture {
@@ -102,11 +93,13 @@ impl TokenBucket {
         ptype: PermitType,
     ) -> Result<Option<OwnedToken>, error::Error> {
         let cost = self.cost(ptype);
-        self.semaphore
-            .clone()
-            .try_acquire_many_owned(cost)
-            .map(|permit| Some(OwnedToken::new(permit)))
-            .map_err(error::from_kind(error::ErrorKind::RuntimeError))
+        match self.semaphore.clone().try_acquire_many_owned(cost) {
+            Ok(permit) => Ok(Some(OwnedToken::new(permit))),
+            Err(TryAcquireError::NoPermits) => Ok(None),
+            Err(err @ TryAcquireError::Closed) => {
+                Err(error::Error::new(error::ErrorKind::RuntimeError, err))
+            }
+        }
     }
 }
 
@@ -134,7 +127,10 @@ impl Future for AcquireTokenFuture {
         let this = self.project();
         match this.sem.poll_acquire_many(cx, *this.tokens) {
             Poll::Ready(Some(permit)) => Poll::Ready(Ok(OwnedToken::new(permit))),
-            Poll::Ready(None) => todo!(),
+            Poll::Ready(None) => Poll::Ready(Err(error::Error::new(
+                error::ErrorKind::RuntimeError,
+                "semaphore closed",
+            ))),
             Poll::Pending => Poll::Pending,
         }
     }

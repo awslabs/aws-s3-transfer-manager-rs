@@ -61,8 +61,8 @@ where
 
 impl<S, Request> Future for ResponseFuture<S, Request>
 where
-    // FIXME - figure out error
-    S: Service<Request, Error = error::Error>,
+    S: Service<Request>,
+    S::Error: From<error::Error>,
 {
     type Output = Result<S::Response, S::Error>;
 
@@ -78,7 +78,7 @@ where
                             let fut = this.inner.call(req);
                             this.state.set(State::Called { fut, _permit });
                         }
-                        Err(err) => return Poll::Ready(Err(err)),
+                        Err(err) => return Poll::Ready(Err(err.into())),
                     }
                 }
                 StateProj::Called { fut, .. } => {
