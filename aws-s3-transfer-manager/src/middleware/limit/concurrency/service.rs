@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
 use tower::Service;
 
 use super::future::ResponseFuture;
@@ -15,12 +18,17 @@ use crate::runtime::scheduler::{PermitType, Scheduler};
 pub(crate) struct ConcurrencyLimit<T> {
     inner: T,
     scheduler: Scheduler,
+    inflight: Arc<AtomicUsize>,
 }
 
 impl<T> ConcurrencyLimit<T> {
     /// Create a new concurrency limiter
     pub(crate) fn new(inner: T, scheduler: Scheduler) -> Self {
-        ConcurrencyLimit { inner, scheduler }
+        ConcurrencyLimit {
+            inner,
+            scheduler,
+            inflight: Arc::new(AtomicUsize::default()),
+        }
     }
 }
 
@@ -55,7 +63,7 @@ where
         // we make use of tower is for upload/download. If this changes this logic needs updated.
         let ptype = PermitType::DataPlane(req.payload_size());
         let permit_fut = self.scheduler.acquire_permit(ptype);
-        ResponseFuture::new(self.inner.clone(), req, permit_fut)
+        ResponseFuture::new(self.inner.clone(), req, permit_fut, self.inflight.clone())
     }
 }
 
@@ -64,6 +72,7 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
         Self {
             inner: self.inner.clone(),
             scheduler: self.scheduler.clone(),
+            inflight: self.inflight.clone(),
         }
     }
 }

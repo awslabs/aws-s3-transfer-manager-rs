@@ -8,6 +8,8 @@ use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit};
 
 use futures_util::ready;
 use pin_project_lite::pin_project;
+use std::sync::atomic::{self, AtomicUsize};
+use std::sync::Arc;
 use std::{future::Future, task::Poll};
 use tower::Service;
 
@@ -18,6 +20,7 @@ pin_project! {
     {
         request: Option<Request>,
         inner: S,
+        inflight: Arc<AtomicUsize>,
         #[pin]
         state: State<S::Future>
     }
@@ -50,10 +53,12 @@ where
         inner: S,
         req: Request,
         permit_fut: AcquirePermitFuture,
+        inflight: Arc<AtomicUsize>,
     ) -> ResponseFuture<S, Request> {
         ResponseFuture {
             request: Some(req),
             inner,
+            inflight,
             state: State::AcquiringPermit { permit_fut },
         }
     }
@@ -75,6 +80,8 @@ where
                     match res {
                         Ok(_permit) => {
                             let req = this.request.take().expect("request set");
+                            let inflight = this.inflight.fetch_add(1, atomic::Ordering::SeqCst) + 1;
+                            tracing::trace!("in-flight requests: {inflight}");
                             let fut = this.inner.call(req);
                             this.state.set(State::Called { fut, _permit });
                         }
@@ -83,6 +90,8 @@ where
                 }
                 StateProj::Called { fut, .. } => {
                     let result = ready!(fut.poll(cx));
+                    let inflight = this.inflight.fetch_sub(1, atomic::Ordering::SeqCst);
+                    tracing::trace!("in-flight requests: {inflight}");
                     return Poll::Ready(result);
                 }
             }
