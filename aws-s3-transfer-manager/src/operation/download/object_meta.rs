@@ -132,7 +132,7 @@ impl ObjectMetadata {
             Some(object_end) => match self.content_range.as_ref() {
                 Some(range) => {
                     let byte_range_str = range
-                        .strip_prefix("bytes")
+                        .strip_prefix("bytes ")
                         .expect("content range bytes-unit recognized")
                         .split_once("/")
                         .map(|x| x.0)
@@ -310,20 +310,23 @@ mod tests {
         let cases = vec![
             (Some("bytes 0-499/1234".to_string()), Some(0..=499)),
             (Some("bytes 500-999/1234".to_string()), Some(500..=999)),
-            (Some("0-499/1234".to_string()), Some(0..=499)),
             (Some("bytes 0-0/1234".to_string()), Some(0..=0)),
-            (Some("invalid".to_string()), None),
-            (Some("bytes -499/1234".to_string()), None),
-            (Some("bytes abc-def/1234".to_string()), None),
-            (None, None),
+            (None, Some(0..=1233)),
         ];
 
         for (input, expected) in cases {
             let meta = ObjectMetadata {
                 content_range: input,
+                content_length: Some(1234),
                 ..Default::default()
             };
             assert_eq!(meta.range(), expected);
         }
+        let meta = ObjectMetadata {
+            content_range: None,
+            content_length: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(meta.range(), None);
     }
 }

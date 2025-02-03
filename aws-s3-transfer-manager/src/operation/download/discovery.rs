@@ -24,7 +24,7 @@ use crate::http::header::{self, ByteRange};
 enum ObjectDiscoveryStrategy {
     // Send a `HeadObject` request.
     // The overall transfer is optionally constrained to the given range.
-    HeadObject(Option<ByteRange>),
+    HeadObject,
     // Send `GetObject` request using a ranged get.
     // The overall transfer is optionally constrained to the given range.
     RangedGet(Option<RangeInclusive<u64>>),
@@ -55,7 +55,7 @@ impl ObjectDiscoveryStrategy {
                     }
                     // TODO(aws-sdk-rust#1159): explore when given a start range what it would like to just start
                     // sending requests from [start, start+part_size]
-                    _ => ObjectDiscoveryStrategy::HeadObject(Some(byte_range)),
+                    _ => ObjectDiscoveryStrategy::HeadObject,
                 }
             }
             None => ObjectDiscoveryStrategy::RangedGet(None),
@@ -76,8 +76,8 @@ pub(super) async fn discover_obj(
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     tracing::trace!("discovering object with strategy {:?}", strategy);
     let discovery = match strategy {
-        ObjectDiscoveryStrategy::HeadObject(byte_range) => {
-            discover_obj_with_head(ctx, input, byte_range)
+        ObjectDiscoveryStrategy::HeadObject => {
+            discover_obj_with_head(ctx, input)
                 .instrument(tracing::debug_span!("send-head-object-for-discovery"))
                 .await
         }
@@ -116,7 +116,6 @@ async fn discover_obj_with_get_first_part(
 async fn discover_obj_with_head(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    _range_from_user: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = ctx
         .client()
