@@ -3,10 +3,7 @@ use std::sync::Arc;
 use super::MultipartUploadData;
 use crate::{
     error,
-    io::{
-        part_reader::{Builder as PartReaderBuilder, PartReader},
-        InputStream, PartData,
-    },
+    io::{part_reader::PartReader, PartData},
     middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
     operation::upload::UploadContext,
 };
@@ -138,20 +135,10 @@ pub(super) fn upload_part_service(
 /// # Arguments
 ///
 /// * handle - the handle for this upload
-/// * stream - the body input stream
-/// * part_size - the part_size for each part
 pub(super) fn distribute_work(
     mpu_data: &mut MultipartUploadData,
     ctx: UploadContext,
-    stream: InputStream,
-    part_size: u64,
 ) -> Result<(), error::Error> {
-    let part_reader = Arc::new(
-        PartReaderBuilder::new()
-            .stream(stream)
-            .part_size(part_size.try_into().expect("valid part size"))
-            .build(),
-    );
     // group all spawned tasks together
     let parent_span_for_all_tasks = tracing::debug_span!(
         parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
@@ -175,7 +162,7 @@ pub(super) fn distribute_work(
     let n_workers = ctx.handle.num_workers();
     for _ in 0..n_workers {
         let worker = read_body(
-            part_reader.clone(),
+            mpu_data.part_reader.clone(),
             ctx.clone(),
             mpu_data.upload_id.clone(),
             svc.clone(),
@@ -230,6 +217,7 @@ mod tests {
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
     use crate::Config;
+    use bytes::Bytes;
     use test_common::mock_client_with_stubbed_http_client;
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
@@ -242,10 +230,7 @@ mod tests {
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
             },
-            part_data: PartData {
-                part_number: 0,
-                data: Default::default(),
-            },
+            part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),
         }
     }

@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 
+use crate::io::part_reader::PartReader;
 use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 use aws_sdk_s3::error::DisplayErrorContext;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{ChecksumType, CompletedMultipartUpload, CompletedPart};
 use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
 use tracing::Instrument;
@@ -31,6 +32,7 @@ pub(crate) struct MultipartUploadData {
     pub(crate) response: Option<UploadOutputBuilder>,
     /// the multipart upload ID
     pub(crate) upload_id: String,
+    pub(crate) part_reader: Arc<PartReader>,
 }
 
 /// Response type for a single upload object request.
@@ -211,21 +213,37 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
                 .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
 
+            // check for user-provided full-object checksum...
             if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
-                // TODO(aws-s3-transfer-manager-rs#3): allow user to pass full-object checksum value via callback on PartStream
+                if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
+                    // check whether it was passed via ChecksumStrategy
+                    let mut full_object_checksum: Option<String> =
+                        checksum_strategy.full_object_checksum().map(String::from);
 
-                if let Some(value) = checksum_strategy.full_object_checksum() {
-                    // We have the full-object checksum value, so set it
-                    req = match checksum_strategy.algorithm() {
-                        aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
-                        aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
-                        aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
-                            req.checksum_crc64_nvme(value)
-                        }
-                        algo => {
-                            unreachable!("unexpected algorithm `{algo}` for full object checksum")
-                        }
-                    };
+                    // check whether it's provided via callback on PartStream
+                    if full_object_checksum.is_none() {
+                        full_object_checksum = mpu_data.part_reader.full_object_checksum().await;
+                    }
+
+                    // if we got one, set the proper request field
+                    if let Some(value) = full_object_checksum {
+                        req = match checksum_strategy.algorithm() {
+                            aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => {
+                                req.checksum_crc32(value)
+                            }
+                            aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => {
+                                req.checksum_crc32_c(value)
+                            }
+                            aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
+                                req.checksum_crc64_nvme(value)
+                            }
+                            algo => {
+                                unreachable!(
+                                    "unexpected algorithm `{algo}` for full object checksum"
+                                )
+                            }
+                        };
+                    }
                 }
             }
 

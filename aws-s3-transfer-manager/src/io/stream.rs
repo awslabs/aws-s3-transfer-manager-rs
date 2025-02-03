@@ -222,6 +222,20 @@ pub trait PartStream {
 
     /// Returns the bounds on the total size of the stream
     fn size_hint(&self) -> crate::io::SizeHint;
+
+    /// Return the full object checksum value, if you calculated it yourself while streaming.
+    /// S3 can validate this against the checksum value it calculates server side.
+    ///
+    /// If None is returned (the default implementation), S3 will not do this additional validation.
+    ///
+    /// This function is called once, after [`PartStream::poll_part()`] yields the final part,
+    /// if you used a [ChecksumStrategy](crate::operation::upload::ChecksumStrategy) with
+    /// [ChecksumType::FullObject](aws_sdk_s3::types::ChecksumType) and didn't set its
+    /// [full_object_checksum](crate::operation::upload::ChecksumStrategy::full_object_checksum)
+    /// value up front.
+    fn full_object_checksum(&self) -> Option<String> {
+        None
+    }
 }
 
 pub(crate) struct BoxStream {
@@ -240,6 +254,10 @@ impl BoxStream {
         stream_cx: &StreamContext,
     ) -> Option<std::io::Result<PartData>> {
         poll_fn(|cx| self.inner.as_mut().poll_part(cx, stream_cx)).await
+    }
+
+    pub(crate) fn full_object_checksum(&self) -> Option<String> {
+        self.inner.full_object_checksum()
     }
 }
 
