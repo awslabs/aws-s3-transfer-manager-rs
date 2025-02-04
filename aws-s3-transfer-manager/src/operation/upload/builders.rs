@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::types::FailedMultipartUploadPolicy;
 
-use super::{UploadHandle, UploadInputBuilder};
+use super::{ChecksumStrategy, UploadHandle, UploadInputBuilder};
 
 /// Fluent builder for constructing a single object upload transfer
 #[derive(Debug)]
@@ -232,123 +232,22 @@ impl UploadFluentBuilder {
     pub fn get_content_type(&self) -> Option<&str> {
         self.inner.get_content_type()
     }
-    /// <p>Indicates the algorithm used to create the checksum for the object when you use the SDK. This header will not provide any additional functionality if you don't use the SDK. When you send this header, there must be a corresponding <code>x-amz-checksum-<i>algorithm</i> </code> or <code>x-amz-trailer</code> header sent. Otherwise, Amazon S3 fails the request with the HTTP status code <code>400 Bad Request</code>.</p>
-    /// <p>For the <code>x-amz-checksum-<i>algorithm</i> </code> header, replace <code> <i>algorithm</i> </code> with the supported algorithm from the following list:</p>
-    /// <ul>
-    /// <li>
-    /// <p>CRC32</p></li>
-    /// <li>
-    /// <p>CRC32C</p></li>
-    /// <li>
-    /// <p>SHA1</p></li>
-    /// <li>
-    /// <p>SHA256</p></li>
-    /// </ul>
-    /// <p>For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    /// <p>If the individual checksum value you provide through <code>x-amz-checksum-<i>algorithm</i> </code> doesn't match the checksum algorithm you set through <code>x-amz-sdk-checksum-algorithm</code>, Amazon S3 ignores any provided <code>ChecksumAlgorithm</code> parameter and uses the checksum algorithm that matches the provided value in <code>x-amz-checksum-<i>algorithm</i> </code>.</p><note>
-    /// <p>For directory buckets, when you use Amazon Web Services SDKs, <code>CRC32</code> is the default checksum algorithm that's used for performance.</p>
-    /// </note>
-    pub fn checksum_algorithm(mut self, input: aws_sdk_s3::types::ChecksumAlgorithm) -> Self {
-        self.inner = self.inner.checksum_algorithm(input);
+
+    #[doc = std::include_str!("checksum_strategy.md")]
+    pub fn checksum_strategy(mut self, input: ChecksumStrategy) -> Self {
+        self.inner = self.inner.checksum_strategy(input);
         self
     }
-    /// <p>Indicates the algorithm used to create the checksum for the object when you use the SDK. This header will not provide any additional functionality if you don't use the SDK. When you send this header, there must be a corresponding <code>x-amz-checksum-<i>algorithm</i> </code> or <code>x-amz-trailer</code> header sent. Otherwise, Amazon S3 fails the request with the HTTP status code <code>400 Bad Request</code>.</p>
-    /// <p>For the <code>x-amz-checksum-<i>algorithm</i> </code> header, replace <code> <i>algorithm</i> </code> with the supported algorithm from the following list:</p>
-    /// <ul>
-    /// <li>
-    /// <p>CRC32</p></li>
-    /// <li>
-    /// <p>CRC32C</p></li>
-    /// <li>
-    /// <p>SHA1</p></li>
-    /// <li>
-    /// <p>SHA256</p></li>
-    /// </ul>
-    /// <p>For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    /// <p>If the individual checksum value you provide through <code>x-amz-checksum-<i>algorithm</i> </code> doesn't match the checksum algorithm you set through <code>x-amz-sdk-checksum-algorithm</code>, Amazon S3 ignores any provided <code>ChecksumAlgorithm</code> parameter and uses the checksum algorithm that matches the provided value in <code>x-amz-checksum-<i>algorithm</i> </code>.</p><note>
-    /// <p>For directory buckets, when you use Amazon Web Services SDKs, <code>CRC32</code> is the default checksum algorithm that's used for performance.</p>
-    /// </note>
-    pub fn set_checksum_algorithm(
-        mut self,
-        input: Option<aws_sdk_s3::types::ChecksumAlgorithm>,
-    ) -> Self {
-        self.inner = self.inner.set_checksum_algorithm(input);
+
+    #[doc = std::include_str!("checksum_strategy.md")]
+    pub fn set_checksum_strategy(mut self, input: Option<ChecksumStrategy>) -> Self {
+        self.inner = self.inner.set_checksum_strategy(input);
         self
     }
-    /// <p>Indicates the algorithm used to create the checksum for the object when you use the SDK. This header will not provide any additional functionality if you don't use the SDK. When you send this header, there must be a corresponding <code>x-amz-checksum-<i>algorithm</i> </code> or <code>x-amz-trailer</code> header sent. Otherwise, Amazon S3 fails the request with the HTTP status code <code>400 Bad Request</code>.</p>
-    /// <p>For the <code>x-amz-checksum-<i>algorithm</i> </code> header, replace <code> <i>algorithm</i> </code> with the supported algorithm from the following list:</p>
-    /// <ul>
-    /// <li>
-    /// <p>CRC32</p></li>
-    /// <li>
-    /// <p>CRC32C</p></li>
-    /// <li>
-    /// <p>SHA1</p></li>
-    /// <li>
-    /// <p>SHA256</p></li>
-    /// </ul>
-    /// <p>For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    /// <p>If the individual checksum value you provide through <code>x-amz-checksum-<i>algorithm</i> </code> doesn't match the checksum algorithm you set through <code>x-amz-sdk-checksum-algorithm</code>, Amazon S3 ignores any provided <code>ChecksumAlgorithm</code> parameter and uses the checksum algorithm that matches the provided value in <code>x-amz-checksum-<i>algorithm</i> </code>.</p><note>
-    /// <p>For directory buckets, when you use Amazon Web Services SDKs, <code>CRC32</code> is the default checksum algorithm that's used for performance.</p>
-    /// </note>
-    pub fn get_checksum_algorithm(&self) -> &Option<aws_sdk_s3::types::ChecksumAlgorithm> {
-        self.inner.get_checksum_algorithm()
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn checksum_crc32(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.checksum_crc32(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn set_checksum_crc32(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_checksum_crc32(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32 checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_crc32(&self) -> Option<&str> {
-        self.inner.get_checksum_crc32()
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32C checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn checksum_crc32_c(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.checksum_crc32_c(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32C checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn set_checksum_crc32_c(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_checksum_crc32_c(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 32-bit CRC32C checksum of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_crc32_c(&self) -> Option<&str> {
-        self.inner.get_checksum_crc32_c()
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 160-bit SHA-1 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn checksum_sha1(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.checksum_sha1(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 160-bit SHA-1 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn set_checksum_sha1(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_checksum_sha1(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 160-bit SHA-1 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_sha1(&self) -> Option<&str> {
-        self.inner.get_checksum_sha1()
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 256-bit SHA-256 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn checksum_sha256(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.checksum_sha256(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 256-bit SHA-256 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn set_checksum_sha256(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_checksum_sha256(input);
-        self
-    }
-    /// <p>This header can be used as a data integrity check to verify that the data received is the same data that was originally sent. This header specifies the base64-encoded, 256-bit SHA-256 digest of the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
-    pub fn get_checksum_sha256(&self) -> Option<&str> {
-        self.inner.get_checksum_sha256()
+
+    #[doc = std::include_str!("checksum_strategy.md")]
+    pub fn get_checksum_strategy(&self) -> Option<&ChecksumStrategy> {
+        self.inner.get_checksum_strategy()
     }
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub fn expires(mut self, input: ::aws_smithy_types::DateTime) -> Self {

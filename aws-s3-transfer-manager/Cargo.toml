@@ -11,36 +11,38 @@ publish = false
 [dependencies]
 async-channel = "2.3.1"
 async-trait = "0.1.83"
-aws-config = { version = "1.5.11", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.66.0", features = ["behavior-version-latest"] }
-aws-smithy-async = "1.2.2"
-aws-smithy-experimental = { version = "0.1.3", features = ["crypto-aws-lc"] }
+aws-config = { version = "1.5.15", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.72.0", features = ["behavior-version-latest"] }
+aws-smithy-async = "1.2.4"
+aws-smithy-experimental = { version = "0.1.5", features = ["crypto-aws-lc"] }
 aws-smithy-runtime-api = "1.7.3"
-aws-runtime = "1.5.1"
-aws-smithy-types = "1.2.10"
-aws-types = "1.3.3"
+aws-runtime = "1.5.4"
+aws-smithy-types = "1.2.13"
+aws-types = "1.3.4"
 blocking = "1.6.1"
 bytes = "1"
 bytes-utils = "0.1.4"
 futures-util = "0.3.31"
 path-clean = "1.0.1"
-pin-project-lite = "0.2.15"
-tokio = { version = "1.42.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
+pin-project-lite = "0.2.16"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
 tower = { version = "0.5.2", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
 walkdir = "2"
 tokio-util = "0.7.13"
 
 [dev-dependencies]
-aws-sdk-s3 = { version = "1.66.0", features = ["behavior-version-latest", "test-util"] }
+aws-sdk-s3 = { version = "1.72.0", features = ["behavior-version-latest", "test-util"] }
+aws-smithy-checksums = "0.62.0"
 aws-smithy-mocks-experimental = "0.2.1"
-aws-smithy-runtime = { version = "1.7.5", features = ["client", "connector-hyper-0-14-x", "test-util", "wire-mock"] }
+aws-smithy-runtime = { version = "1.7.7", features = ["client", "connector-hyper-0-14-x", "test-util", "wire-mock"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.4.0"
 http-02x = { package = "http", version = "0.2.9" }
 http-body-1x = { package = "http-body", version = "1" }
 fastrand = "2.1.1"
 futures-test = "0.3.30"
+md5 = "0.7.0"
 tempfile = "3.12.0"
 test-common = { path = "./test-common", version = "0.1.0" }
 tokio-test = "0.4.4"
