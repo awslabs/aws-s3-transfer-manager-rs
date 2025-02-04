@@ -11,6 +11,7 @@ use pin_project_lite::pin_project;
 use std::sync::atomic::{self, AtomicUsize};
 use std::sync::Arc;
 use std::{future::Future, task::Poll};
+use tower::util::Oneshot;
 use tower::Service;
 
 pin_project! {
@@ -19,10 +20,10 @@ pin_project! {
         where S: Service<Request>
     {
         request: Option<Request>,
-        inner: S,
+        svc: Option<S>,
         inflight: Arc<AtomicUsize>,
         #[pin]
-        state: State<S::Future>
+        state: State<Oneshot<S, Request>>
     }
 }
 
@@ -57,7 +58,7 @@ where
     ) -> ResponseFuture<S, Request> {
         ResponseFuture {
             request: Some(req),
-            inner,
+            svc: Some(inner),
             inflight,
             state: State::AcquiringPermit { permit_fut },
         }
@@ -82,7 +83,10 @@ where
                             let req = this.request.take().expect("request set");
                             let inflight = this.inflight.fetch_add(1, atomic::Ordering::SeqCst) + 1;
                             tracing::trace!("in-flight requests: {inflight}");
-                            let fut = this.inner.call(req);
+                            let svc = this.svc.take().expect("service set");
+                            // NOTE: because the service was (1) never polled for readiness
+                            // originally and (2) also cloned, we need to ensure it's ready now before calling it.
+                            let fut = Oneshot::new(svc, req);
                             this.state.set(State::Called { fut, _permit });
                         }
                         Err(err) => return Poll::Ready(Err(err.into())),

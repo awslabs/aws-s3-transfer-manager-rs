@@ -5,6 +5,7 @@
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::task::Poll;
 
 use tower::Service;
 
@@ -50,12 +51,14 @@ where
 
     fn poll_ready(
         &mut self,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        // Once we have a permit we still need to make sure the inner service is ready
         // We can't estimate payload size without the request so we
-        // move scheduling/concurrency limiting to `call()`
-        self.inner.poll_ready(cx)
+        // move scheduling/concurrency limiting to `call()`.
+        // Also calling inner.poll_ready() would reserve a slot well in advance of us
+        // actually consuming it potentially as well as invalidating it later due to cloning it.
+        // Instead, signal readiness here and treat the service as a oneshot later.
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Request) -> Self::Future {

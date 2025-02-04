@@ -241,6 +241,7 @@ mod test {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks_experimental::{mock, RuleMode};
+    use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use bytes::Bytes;
     use std::ops::Deref;
     use std::sync::Arc;
@@ -249,6 +250,7 @@ mod test {
 
     #[tokio::test]
     async fn test_basic_mpu() {
+        let _logs = show_test_logs();
         let expected_upload_id = Arc::new("test-upload".to_owned());
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
         let stream = InputStream::from(body);
