@@ -51,7 +51,6 @@ impl PermitType {
 pub(crate) struct TokenBucket {
     // NOTE: tokio semaphore is fair, permits are given out in the order requested
     semaphore: Arc<Semaphore>,
-    max_permits: usize,
     mode: ConcurrencyMode,
 }
 
@@ -68,7 +67,6 @@ impl TokenBucket {
 
         TokenBucket {
             semaphore: Arc::new(Semaphore::new(max_permits)),
-            max_permits,
             mode,
         }
     }

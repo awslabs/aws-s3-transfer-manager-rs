@@ -311,8 +311,7 @@ async fn main() -> Result<(), BoxError> {
             .init();
     }
 
-    // tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
-    println!("using concurrency mode: {:?}", args.concurrency.mode());
+    tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
 
     use TransferUri::*;
     let result = match (&args.source, &args.dest) {

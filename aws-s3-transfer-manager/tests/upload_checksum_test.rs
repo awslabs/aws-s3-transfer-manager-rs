@@ -9,7 +9,7 @@ use aws_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
     metrics::unit::ByteUnit,
     operation::upload::{ChecksumStrategy, UploadOutput},
-    types::{ConcurrencySetting, PartSize},
+    types::{ConcurrencyMode, PartSize},
 };
 use aws_sdk_s3::{
     operation::{
@@ -491,7 +491,7 @@ async fn upload_helper(
         .client(s3_client)
         .part_size(PartSize::Target(PART_SIZE as u64))
         .multipart_threshold(PartSize::Target(PART_SIZE as u64))
-        .concurrency(ConcurrencySetting::Explicit(1)) // guarantee parts sent in order
+        .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order
         .build();
     let tm = aws_s3_transfer_manager::Client::new(tm_config);
 

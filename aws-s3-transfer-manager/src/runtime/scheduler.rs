@@ -11,8 +11,8 @@ use crate::error;
 use crate::runtime::token_bucket::{OwnedToken, TokenBucket};
 use crate::types::ConcurrencyMode;
 
-// FIXME - track high water mark
-// FIXME - add statistics/telemetry
+// TODO - track high water mark
+// TODO - add statistics/telemetry
 
 /// Manages scheduling networking and I/O work
 ///
