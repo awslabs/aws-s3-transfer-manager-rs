@@ -189,6 +189,8 @@ impl PartData {
     }
 
     /// Create a new part, with a precalculated checksum
+    /// (base64 encoding of the big-endian checksum value for this part's data
+    /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
     pub fn with_checksum(
         part_number: u64,
         data: impl Into<Bytes>,
@@ -223,16 +225,19 @@ pub trait PartStream {
     /// Returns the bounds on the total size of the stream
     fn size_hint(&self) -> crate::io::SizeHint;
 
-    /// Return the full object checksum value, if you calculated it yourself while streaming.
-    /// S3 can validate this against the checksum value it calculates server side.
+    /// Return the full object checksum, if you calculated it yourself while streaming.
+    /// S3 can validate this against the checksum it calculates server side.
     ///
     /// If None is returned (the default implementation), S3 will not do this additional validation.
     ///
     /// This function is called once, after [`PartStream::poll_part()`] yields the final part,
-    /// if you used a [ChecksumStrategy](crate::operation::upload::ChecksumStrategy) with
+    /// if and only if you used a [ChecksumStrategy](crate::operation::upload::ChecksumStrategy) with
     /// [ChecksumType::FullObject](aws_sdk_s3::types::ChecksumType) and didn't set its
     /// [full_object_checksum](crate::operation::upload::ChecksumStrategy::full_object_checksum)
     /// value up front.
+    ///
+    /// Return the base64 encoding of the big-endian checksum value of the full object's data,
+    /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
     fn full_object_checksum(&self) -> Option<String> {
         None
     }

@@ -15,7 +15,8 @@ pub struct ChecksumStrategy {
 }
 
 impl ChecksumStrategy {
-    /// Use a precalculated `CRC64NVME` full object checksum value.
+    /// Use a precalculated `CRC64NVME` full object checksum
+    /// (base64 encoding of the big-endian checksum value).
     pub fn with_crc64_nvme(value: impl Into<String>) -> Self {
         Self {
             algorithm: ChecksumAlgorithm::Crc64Nvme,
@@ -24,7 +25,8 @@ impl ChecksumStrategy {
         }
     }
 
-    /// Use a precalculated `CRC32` full object checksum value.
+    /// Use a precalculated `CRC32` full object checksum
+    /// (base64 encoding of the big-endian checksum value).
     pub fn with_crc32(value: impl Into<String>) -> Self {
         Self {
             algorithm: ChecksumAlgorithm::Crc32,
@@ -33,7 +35,8 @@ impl ChecksumStrategy {
         }
     }
 
-    /// Use a precalculated `CRC32C` full object checksum value.
+    /// Use a precalculated `CRC32C` full object checksum
+    /// (base64 encoding of the big-endian checksum value).
     pub fn with_crc32_c(value: impl Into<String>) -> Self {
         Self {
             algorithm: ChecksumAlgorithm::Crc32C,
