@@ -216,14 +216,11 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             // check for user-provided full-object checksum...
             if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
                 if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
-                    // check whether it was passed via ChecksumStrategy
-                    let mut full_object_checksum: Option<String> =
-                        checksum_strategy.full_object_checksum().map(String::from);
-
-                    // check whether it's provided via callback on PartStream
-                    if full_object_checksum.is_none() {
-                        full_object_checksum = mpu_data.part_reader.full_object_checksum().await;
-                    }
+                    // it might have been passed via ChecksumStrategy or PartStream
+                    let full_object_checksum = match checksum_strategy.full_object_checksum() {
+                        Some(checksum) => Some(checksum.into()),
+                        None => mpu_data.part_reader.full_object_checksum().await,
+                    };
 
                     // if we got one, set the proper request field
                     if let Some(value) = full_object_checksum {

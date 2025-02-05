@@ -193,11 +193,11 @@ impl PartStream for TestStream {
         let part = this.parts.get(part_index).map(|b| {
             let part_number = *this.next_part_num;
             *this.next_part_num += 1;
-            let part_data = if let Some(checksum) = &this.part_checksums[part_index] {
-                PartData::with_checksum(part_number, b.clone(), checksum)
-            } else {
-                PartData::new(part_number, b.clone())
-            };
+            let mut part_data = PartData::new(part_number, b.clone());
+            if let Some(checksum) = &this.part_checksums[part_index] {
+                part_data = part_data.with_checksum(checksum);
+            }
+
             Ok(part_data)
         });
         Poll::Ready(part)

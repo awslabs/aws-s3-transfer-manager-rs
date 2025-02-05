@@ -188,18 +188,16 @@ impl PartData {
         }
     }
 
-    /// Create a new part, with a precalculated checksum
+    /// Set this part's checksum, if you've calculated it yourself
     /// (base64 encoding of the big-endian checksum value for this part's data
     /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
-    pub fn with_checksum(
-        part_number: u64,
-        data: impl Into<Bytes>,
-        checksum: impl Into<String>,
-    ) -> Self {
-        Self {
-            checksum: Some(checksum.into()),
-            ..Self::new(part_number, data)
-        }
+    ///
+    /// If you don't set this, the Transfer Manager will calculate one
+    /// automatically, unless you've explicitly disabled checksum calculation
+    /// (see [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
+        self.checksum = Some(checksum.into());
+        self
     }
 }
 
@@ -225,8 +223,8 @@ pub trait PartStream {
     /// Returns the bounds on the total size of the stream
     fn size_hint(&self) -> crate::io::SizeHint;
 
-    /// Return the full object checksum, if you calculated it yourself while streaming.
-    /// S3 can validate this against the checksum it calculates server side.
+    /// If you calculated the full object checksum while streaming, return it.
+    /// This will be sent to S3 for validation against the checksum it calculated server side.
     ///
     /// If None is returned (the default implementation), S3 will not do this additional validation.
     ///
