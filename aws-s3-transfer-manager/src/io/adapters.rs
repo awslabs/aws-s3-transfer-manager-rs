@@ -118,7 +118,7 @@ where
                             let data: Bytes = inner_buf.into();
                             let part_number = *this.next_part;
                             *this.next_part += 1;
-                            let part = PartData { part_number, data };
+                            let part = PartData::new(part_number, data);
                             return Poll::Ready(Some(Ok(part)));
                         } else if n == 0 {
                             // EOF

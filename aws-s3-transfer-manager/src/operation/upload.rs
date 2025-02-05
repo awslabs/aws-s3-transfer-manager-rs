@@ -16,6 +16,7 @@ mod service;
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 
 use crate::error;
+use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
 use context::UploadContext;
 pub use handle::UploadHandle;
@@ -199,14 +200,21 @@ async fn try_start_mpu_upload(
         mpu.upload_id
     );
     let upload_id = mpu.upload_id.clone().expect("upload_id is present");
+    let part_reader = Arc::new(
+        PartReaderBuilder::new()
+            .stream(stream)
+            .part_size(part_size.try_into().expect("valid part size"))
+            .build(),
+    );
     let mut mpu_data = MultipartUploadData {
         upload_part_tasks: Default::default(),
         read_body_tasks: Default::default(),
         response: Some(mpu),
-        upload_id: upload_id.clone(),
+        upload_id,
+        part_reader,
     };
 
-    distribute_work(&mut mpu_data, ctx, stream, part_size)?;
+    distribute_work(&mut mpu_data, ctx)?;
     Ok(UploadType::MultipartUpload(mpu_data))
 }
 
