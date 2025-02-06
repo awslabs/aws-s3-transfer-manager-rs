@@ -15,27 +15,53 @@ use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::scheduler::PermitType;
 use crate::types::ConcurrencyMode;
 
-/// Default throughput target for auto mode
-const AUTO_TARGET_THROUGHPUT_GIGABYTES_PER_SEC: u64 = ByteUnit::Gigabit.as_bytes_u64() * 10;
+/// Default throughput target for auto mode (10 Gbps)
+///
+/// Source: CRT default for target throughput: https://github.com/awslabs/aws-c-s3/blob/6eb8be530b100fed5c6d24ca48a57ee2e6098fbf/source/s3_client.c#L79
+/// Applies to: ConcurrencyMode::TargetThroughput
+const AUTO_TARGET_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(10 * ByteUnit::Gigabit.as_bytes_u64());
 
 /// Estimated P50 latency for S3
-const S3_P50_REQUEST_LATENCY_MS: usize = 30;
+///
+/// Source: S3 team
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_P50_REQUEST_LATENCY: Duration = Duration::from_millis(30);
 
 /// Estimated per/request max throughput S3 is capable of
-const S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC: u64 = 90;
+///
+/// Source: S3 team and S3 docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html#optimizing-performance-parallelization
+/// > Make one concurrent request for each 85-90 MB/s of desired network throughput
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_MAX_PER_REQUEST_THROUGHPUT: Throughput = Throughput::new_bytes_per_sec(90 * 1000 * 1000);
 
 /// Minimum concurrent requests at full throughput we want to support
-const MIN_CONCURRENT_REQUESTS: usize = 8;
+///
+/// Source: None, reasonable default
+/// Applies to: ConcurrencyMode::TargetThroughput
+const MIN_CONCURRENT_REQUESTS: u64 = 8;
 
-/// Min bucket size tokens
-const MIN_TOKENS: usize =
-    (S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC as usize) * 8 * MIN_CONCURRENT_REQUESTS;
+/// Min tokens for a bucket.
+///
+/// NOTE: In target throughput mode 1 token = 1 Mbit of estimated throughput.
+/// To ensure min concurrent requests capacity is available we use the estimated
+/// max S3 throughput for a single connection to figure out the number of tokens
+/// we'd need to achieve that concurrency.
+///
+/// Source: None, reasonable default
+/// Applies to: ConcurrencyMode::TargetThroughput
+const MIN_BUCKET_TOKENS: u64 =
+    (S3_MAX_PER_REQUEST_THROUGHPUT.bytes_transferred() / 1_000_000) * 8 * MIN_CONCURRENT_REQUESTS;
 
 /// Minimum token cost regardless of payload size
-const MIN_PAYLOAD_COST_TOKENS: usize = 5;
+///
+/// Source: None, reasonable default
+/// Applies to: ConcurrencyMode::TargetThroughput
+const MIN_PAYLOAD_COST_TOKENS: u64 = 5;
 
 impl PermitType {
-    fn token_cost(&self) -> u32 {
+    /// The token cost for the permit type in Mbps
+    fn token_cost_megabit_per_sec(&self) -> u32 {
         let cost = match *self {
             PermitType::DataPlane(payload_size) => tokens_for_payload(payload_size),
             _ => MIN_PAYLOAD_COST_TOKENS,
@@ -57,21 +83,23 @@ pub(crate) struct TokenBucket {
 impl TokenBucket {
     /// Create a new token bucket using the given target throughput to set the maximum number of tokens
     pub(crate) fn new(mode: ConcurrencyMode) -> Self {
-        let max_permits = match &mode {
-            ConcurrencyMode::Auto => token_bucket_size(Throughput::new_bytes_per_sec(
-                AUTO_TARGET_THROUGHPUT_GIGABYTES_PER_SEC,
-            )),
+        // Permits/tokens are dependent on the concurrency mode:
+        //
+        // ConcurrencyMode::TargetThroughput -> 1 token = 1 Mbit of throughput
+        // ConcurrencyMode::Explicit -> 1 token = 1 request
+        let max_tokens = match &mode {
+            ConcurrencyMode::Auto => token_bucket_size(AUTO_TARGET_THROUGHPUT),
             ConcurrencyMode::TargetThroughput(target_throughput) => {
-                // TODO - we don't publicly allow configuring upload/download independently so we
+                // TODO - we don't (yet) publicly allow configuring upload/download independently so we
                 // just pick one for now as they must be the same at the moment.
                 let thrpt = target_throughput.download();
                 token_bucket_size(*thrpt)
             }
-            ConcurrencyMode::Explicit(concurrency) => *concurrency,
+            ConcurrencyMode::Explicit(concurrency) => *concurrency as u64,
         };
 
         TokenBucket {
-            semaphore: Arc::new(Semaphore::new(max_permits)),
+            semaphore: Arc::new(Semaphore::new(max_tokens.try_into().unwrap())),
             mode,
         }
     }
@@ -81,7 +109,7 @@ impl TokenBucket {
         match self.mode {
             // in explicit mode each acquire is weighted the same regardless of permit type
             ConcurrencyMode::Explicit(_) => 1,
-            _ => ptype.token_cost(),
+            _ => ptype.token_cost_megabit_per_sec(),
         }
     }
 
@@ -154,21 +182,21 @@ impl OwnedToken {
 }
 
 /// Get the token bucket size to use for a given target throughput
-fn token_bucket_size(throughput: Throughput) -> usize {
-    let megabit_per_sec = throughput.as_unit_per_sec(ByteUnit::Megabit).max(1.0) as usize;
-    cmp::max(MIN_TOKENS, megabit_per_sec)
+fn token_bucket_size(throughput: Throughput) -> u64 {
+    let megabit_per_sec = throughput.as_unit_per_sec(ByteUnit::Megabit).max(1.0) as u64;
+    cmp::max(MIN_BUCKET_TOKENS, megabit_per_sec)
 }
 
 /// Tokens for payload size
-fn tokens_for_payload(payload_size: u64) -> usize {
+fn tokens_for_payload(payload_size: u64) -> u64 {
     let estimated_mbps = estimated_throughput(
         payload_size,
-        S3_P50_REQUEST_LATENCY_MS,
-        Throughput::new_bytes_per_sec(S3_MAX_PER_REQUEST_THROUGHPUT_MB_PER_SEC * 1000 * 1000),
+        S3_P50_REQUEST_LATENCY,
+        S3_MAX_PER_REQUEST_THROUGHPUT,
     )
     .as_unit_per_sec(ByteUnit::Megabit)
     .round()
-    .max(1.0) as usize;
+    .max(1.0) as u64;
 
     cmp::max(estimated_mbps, MIN_PAYLOAD_COST_TOKENS)
 }
@@ -176,14 +204,11 @@ fn tokens_for_payload(payload_size: u64) -> usize {
 /// Estimate the throughput of a given request payload based on S3 latencies
 /// and max per/connection estimates.
 fn estimated_throughput(
-    payload_size: u64,
-    estimated_p50_latency_ms: usize,
+    payload_size_bytes: u64,
+    estimated_p50_latency: Duration,
     estimated_max_request_throughput: Throughput,
 ) -> Throughput {
-    let req_estimate = Throughput::new(
-        payload_size,
-        Duration::from_millis(estimated_p50_latency_ms as u64),
-    );
+    let req_estimate = Throughput::new(payload_size_bytes, estimated_p50_latency);
 
     // take lower of the maximum per request estimate service is capable of or the estimate based on the payload
     cmp::min_by(estimated_max_request_throughput, req_estimate, |x, y| {
@@ -193,24 +218,26 @@ fn estimated_throughput(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::metrics::unit::ByteUnit;
     use crate::runtime::token_bucket::{estimated_throughput, tokens_for_payload};
     use crate::{
         metrics::Throughput,
-        runtime::token_bucket::{token_bucket_size, MIN_TOKENS},
+        runtime::token_bucket::{token_bucket_size, MIN_BUCKET_TOKENS},
     };
 
     const MEGABYTE: u64 = 1000 * 1000;
 
     #[test]
     fn test_estimated_throughput() {
-        let estimated_latency_ms = 1000;
+        let estimated_latency = Duration::from_secs(1);
         let estimated_max_request_throughput = Throughput::new_bytes_per_sec(2 * MEGABYTE);
         assert_eq!(
             Throughput::new_bytes_per_sec(MEGABYTE),
             estimated_throughput(
                 MEGABYTE,
-                estimated_latency_ms,
+                estimated_latency,
                 estimated_max_request_throughput
             )
         );
@@ -218,7 +245,7 @@ mod tests {
             estimated_max_request_throughput,
             estimated_throughput(
                 3 * MEGABYTE,
-                estimated_latency_ms,
+                estimated_latency,
                 estimated_max_request_throughput
             )
         );
@@ -227,7 +254,7 @@ mod tests {
     #[test]
     fn test_token_bucket_size() {
         assert_eq!(
-            MIN_TOKENS,
+            MIN_BUCKET_TOKENS,
             token_bucket_size(Throughput::new_bytes_per_sec(1000))
         );
         assert_eq!(
