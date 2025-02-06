@@ -1,3 +1,7 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 use std::sync::Arc;
 
 use crate::error::{self, ErrorKind};
@@ -6,13 +10,9 @@ use tokio::{
     task,
 };
 
-/*
- * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
- * SPDX-License-Identifier: Apache-2.0
- */
 use crate::operation::download::body::Body;
 
-use super::object_meta::ObjectMetadata;
+use super::{ObjectMetadata, TrailingMetadata};
 
 /// Response type for a single download object request.
 #[derive(Debug)]
@@ -22,6 +22,9 @@ pub struct DownloadHandle {
     pub(crate) object_meta_rx: Mutex<Option<Receiver<ObjectMetadata>>>,
     /// Object metadata.
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
+
+    /// Metadata that isn't available until the download completes.
+    pub(crate) trailing_meta: OnceCell<TrailingMetadata>,
 
     /// The object content, in chunks, and the metadata for each chunk
     pub(crate) body: Body,
@@ -73,6 +76,14 @@ impl DownloadHandle {
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while (tasks.join_next().await).is_some() {}
+    }
+
+    /// Get metadata about the completed download.
+    /// This won't return `Some` until all [`body`] chunks have been successfully received.
+    ///
+    /// [`body`]: method@Self::body
+    pub fn trailing_meta(&self) -> Option<&TrailingMetadata> {
+        self.trailing_meta.get()
     }
 }
 

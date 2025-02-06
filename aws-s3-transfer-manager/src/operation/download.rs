@@ -16,6 +16,10 @@ pub mod builders;
 mod body;
 pub use body::{Body, ChunkOutput};
 
+/// Abstractions for checksum validation
+mod checksums;
+pub use checksums::ChecksumValidationLevel;
+
 mod discovery;
 
 mod handle;
@@ -30,6 +34,10 @@ mod object_meta;
 pub use object_meta::ObjectMetadata;
 
 mod service;
+
+/// Provides metadata that isn't known until the download completes
+mod trailing_meta;
+pub use trailing_meta::TrailingMetadata;
 
 use crate::error;
 use crate::io::AggregatedBytes;
@@ -91,6 +99,7 @@ impl Download {
             discovery,
             object_meta_rx: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
+            trailing_meta: OnceCell::new(),
         })
     }
 }
