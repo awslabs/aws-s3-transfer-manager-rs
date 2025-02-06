@@ -6,7 +6,7 @@
 use core::fmt;
 use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
 
-use crate::metrics::Throughput;
+use crate::metrics::{unit::ByteUnit, Throughput};
 
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
@@ -32,10 +32,47 @@ pub enum ConcurrencyMode {
     /// Explicitly configured throughput setting the client should aim for.
     ///
     /// In this mode, concurrency is limited by attempting to hit a throughput target.
-    TargetThroughput(Throughput),
+    TargetThroughput(TargetThroughput),
 
     /// Explicit concurrency control
     Explicit(usize),
+}
+
+/// Throughput target(s)
+#[derive(Debug, Clone)]
+pub struct TargetThroughput {
+    upload: Throughput,
+    download: Throughput,
+}
+
+impl TargetThroughput {
+    /// Create a new target throughput in Gigabits/sec that is
+    /// the same for both uploads and downloads.
+    pub fn new_gigabits_per_sec(gbps: u64) -> Self {
+        let target = Throughput::new_bytes_per_sec(gbps * ByteUnit::Gigabit.as_bytes_u64());
+        Self::new(target, target)
+    }
+
+    // TODO: we don't actually support limiting throughput by upload/download independently (yet), it will require updates to scheduler.
+
+    /// Create a new target throughput using the given upload and download
+    /// throughputs.
+    fn new(upload_target: Throughput, download_target: Throughput) -> Self {
+        Self {
+            upload: upload_target,
+            download: download_target,
+        }
+    }
+
+    /// Get the target throughput for uploads
+    pub fn upload(&self) -> &Throughput {
+        &self.upload
+    }
+
+    /// Get the target throughput for downloads
+    pub fn download(&self) -> &Throughput {
+        &self.download
+    }
 }
 
 /// Policy for how to handle a failed multipart upload

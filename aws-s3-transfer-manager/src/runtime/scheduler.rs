@@ -57,6 +57,9 @@ impl Scheduler {
 
 pub(crate) type PayloadEstimate = u64;
 
+// TODO - when we support configuring throughput indepently we'll need to distinguish the permit
+// type and track it separately in the token bucket(s).
+
 /// The type of work to be done
 #[derive(Debug, Clone)]
 pub(crate) enum PermitType {

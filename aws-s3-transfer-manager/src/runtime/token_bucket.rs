@@ -61,7 +61,12 @@ impl TokenBucket {
             ConcurrencyMode::Auto => token_bucket_size(Throughput::new_bytes_per_sec(
                 AUTO_TARGET_THROUGHPUT_GIGABYTES_PER_SEC,
             )),
-            ConcurrencyMode::TargetThroughput(thrpt) => token_bucket_size(*thrpt),
+            ConcurrencyMode::TargetThroughput(target_throughput) => {
+                // TODO - we don't publicly allow configuring upload/download independently so we
+                // just pick one for now as they must be the same at the moment.
+                let thrpt = target_throughput.download();
+                token_bucket_size(*thrpt)
+            }
             ConcurrencyMode::Explicit(concurrency) => *concurrency,
         };
 

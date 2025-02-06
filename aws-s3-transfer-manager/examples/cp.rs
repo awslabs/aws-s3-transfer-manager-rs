@@ -11,7 +11,7 @@ use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::metrics::Throughput;
 use aws_s3_transfer_manager::operation::download::Body;
-use aws_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
+use aws_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
 use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -80,9 +80,9 @@ impl ConcurrencyModeArg {
 
         match (self.target_throughput_gbps, self.concurrency) {
             (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
-            (Some(gbps), None) => ConcurrencyMode::TargetThroughput(Throughput::new_bytes_per_sec(
-                ByteUnit::Gigabit.as_bytes_u64() * gbps,
-            )),
+            (Some(gbps), None) => {
+                ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(gbps))
+            }
             _ => ConcurrencyMode::Auto,
         }
     }
