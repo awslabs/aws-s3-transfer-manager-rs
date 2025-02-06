@@ -63,10 +63,8 @@ pub(crate) type PayloadEstimate = u64;
 /// The type of work to be done
 #[derive(Debug, Clone)]
 pub(crate) enum PermitType {
-    /// A network request to a control plane API with insignificant payload
-    ControlPlane,
-    /// A network request to transmit or receive to or from a data plane API with the given payload size estimate
-    DataPlane(PayloadEstimate),
+    /// A network request to transmit or receive to or from an API with the given payload size estimate
+    Network(PayloadEstimate),
 }
 
 /// An owned permit from the scheduler to perform some unit of work.
@@ -134,12 +132,12 @@ mod tests {
     async fn test_acquire_mode_explicit() {
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
         let p1 = scheduler
-            .acquire_permit(PermitType::ControlPlane)
+            .acquire_permit(PermitType::Network(0))
             .await
             .unwrap();
         let scheduler2 = scheduler.clone();
         let jh = tokio::spawn(async move {
-            let _p2 = scheduler2.acquire_permit(PermitType::ControlPlane).await;
+            let _p2 = scheduler2.acquire_permit(PermitType::Network(0)).await;
         });
         assert!(!jh.is_finished());
         drop(p1);

@@ -120,7 +120,7 @@ async fn send_discovery(
     let permit = ctx
         .handle
         .scheduler
-        .acquire_permit(PermitType::ControlPlane)
+        .acquire_permit(PermitType::Network(0))
         .await;
     let permit = match permit {
         Ok(permit) => permit,

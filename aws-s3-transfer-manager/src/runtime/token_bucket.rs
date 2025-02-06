@@ -32,6 +32,7 @@ const S3_P50_REQUEST_LATENCY: Duration = Duration::from_millis(30);
 ///
 /// Source: S3 team and S3 docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html#optimizing-performance-parallelization
 /// > Make one concurrent request for each 85-90 MB/s of desired network throughput
+///
 /// Applies to: ConcurrencyMode::TargetThroughput
 const S3_MAX_PER_REQUEST_THROUGHPUT: Throughput = Throughput::new_bytes_per_sec(90 * 1000 * 1000);
 
@@ -63,8 +64,7 @@ impl PermitType {
     /// The token cost for the permit type in Mbps
     fn token_cost_megabit_per_sec(&self) -> u32 {
         let cost = match *self {
-            PermitType::DataPlane(payload_size) => tokens_for_payload(payload_size),
-            _ => MIN_PAYLOAD_COST_TOKENS,
+            PermitType::Network(payload_size) => tokens_for_payload(payload_size),
         };
         cost.try_into().unwrap()
     }

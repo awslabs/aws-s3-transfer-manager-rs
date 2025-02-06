@@ -113,7 +113,7 @@ async fn put_object(
     let _permit = ctx
         .handle
         .scheduler
-        .acquire_permit(PermitType::DataPlane(content_length as u64))
+        .acquire_permit(PermitType::Network(content_length as u64))
         .await?;
 
     let mut req = ctx

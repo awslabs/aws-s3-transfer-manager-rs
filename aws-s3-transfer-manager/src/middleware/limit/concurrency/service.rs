@@ -64,7 +64,7 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         // NOTE: We assume this is a dataplane request as that is the only place
         // we make use of tower is for upload/download. If this changes this logic needs updated.
-        let ptype = PermitType::DataPlane(req.payload_size());
+        let ptype = PermitType::Network(req.payload_size());
         let permit_fut = self.scheduler.acquire_permit(ptype);
         ResponseFuture::new(self.inner.clone(), req, permit_fut, self.inflight.clone())
     }
