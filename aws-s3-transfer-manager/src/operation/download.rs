@@ -72,24 +72,24 @@ impl Download {
 
         let ctx = DownloadContext::new(handle);
         let concurrency = ctx.handle.num_workers();
-        let (comp_tx, comp_rx) = mpsc::channel(concurrency);
+        let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
         let (object_meta_tx, object_meta_rx) = oneshot::channel();
 
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
         let discovery = tokio::spawn(send_discovery(
             tasks.clone(),
             ctx.clone(),
-            comp_tx,
+            chunk_tx,
             object_meta_tx,
             input,
             use_current_span_as_parent_for_tasks,
         ));
 
         Ok(DownloadHandle {
-            body: Body::new(comp_rx),
+            body: Body::new(chunk_rx),
             tasks,
             discovery,
-            object_meta_receiver: Mutex::new(Some(object_meta_rx)),
+            object_meta_rx: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
         })
     }
@@ -98,7 +98,7 @@ impl Download {
 async fn send_discovery(
     tasks: Arc<Mutex<task::JoinSet<()>>>,
     ctx: DownloadContext,
-    comp_tx: mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
+    chunk_tx: mpsc::Sender<Result<ChunkOutput, crate::error::Error>>,
     object_meta_tx: oneshot::Sender<ObjectMetadata>,
     mut input: DownloadInput,
     use_current_span_as_parent_for_tasks: bool,
@@ -120,7 +120,7 @@ async fn send_discovery(
     let permit = match permit {
         Ok(permit) => permit,
         Err(err) => {
-            if comp_tx.send(Err(err)).await.is_err() {
+            if chunk_tx.send(Err(err)).await.is_err() {
                 tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
             }
             return;
@@ -132,7 +132,7 @@ async fn send_discovery(
     let mut discovery = match discovery {
         Ok(discovery) => discovery,
         Err(err) => {
-            if comp_tx.send(Err(err)).await.is_err() {
+            if chunk_tx.send(Err(err)).await.is_err() {
                 tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
             }
             return;
@@ -161,7 +161,7 @@ async fn send_discovery(
         &mut tasks,
         ctx.clone(),
         initial_chunk,
-        &comp_tx,
+        &chunk_tx,
         permit,
         parent_span_for_tasks.clone(),
         discovery.chunk_meta,
@@ -174,7 +174,7 @@ async fn send_discovery(
             discovery.remaining,
             input,
             start_seq,
-            comp_tx,
+            chunk_tx,
             parent_span_for_tasks,
         );
     }
