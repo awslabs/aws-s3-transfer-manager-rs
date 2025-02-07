@@ -214,8 +214,6 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
 
             if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
-                // The Transfer Manager SEP recommends setting checksum-type on both
-                // CompleteMultipartUpload AND CreateMultipartUpload.
                 req = req.checksum_type(checksum_strategy.type_if_multipart().clone());
 
                 // check for user-provided full-object checksum...
