@@ -5,6 +5,11 @@
 
 // #![cfg(e2e)]
 
+// Tests here requires AWS account with pre-configured S3 bucket to run the tests.
+// Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
+// Set CRT_S3_TEST_BUCKET_NAME environment variables to the bucket created.
+// By default, it uses s3-tm-rs-test-bucket
+
 mod test_utils;
 
 use core::num;
@@ -18,9 +23,13 @@ use test_utils::drain;
 use crate::test_utils::setup_tracing;
 use aws_s3_transfer_manager::types::PartSize;
 
-const S3_EXPRESS_BUCKET_NAME: &str = "aws-c-s3-test-bucket-099565--usw2-az1--x-s3";
-const BUCKET_NAME: &str = "aws-c-s3-test-bucket-099565";
 const PUT_OBJECT_PREFIX: &str = "upload/put-object-test/";
+
+fn get_bucket_names() -> (String, String) {
+    let bucket_name = option_env!("CRT_S3_TEST_BUCKET_NAME").unwrap_or("aws-c-s3-test-bucket-099565").to_owned();
+    let express_bucket_name = format!("{}--usw2-az1--x-s3", bucket_name.as_str());
+    (bucket_name, express_bucket_name)
+}
 
 async fn test_tm() -> (aws_s3_transfer_manager::Client, aws_sdk_s3::Client) {
     let tm_config = aws_s3_transfer_manager::from_env()
@@ -66,7 +75,7 @@ async fn test_round_trip_helper(file_size: usize, bucket_name: &str, object_key:
     perform_upload(&tm, bucket_name, object_key, None, file_size).await;
     let mut download_handle = tm
         .download()
-        .bucket(BUCKET_NAME)
+        .bucket(bucket_name)
         .key(object_key)
         .initiate()
         .unwrap();
@@ -80,16 +89,18 @@ async fn test_round_trip_helper(file_size: usize, bucket_name: &str, object_key:
 async fn test_single_part_file_round_trip() {
     let file_size = 1 * 1024 * 1024;
     let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "1MB");
-    test_round_trip_helper(file_size, BUCKET_NAME, &object_key).await;
-    test_round_trip_helper(file_size, S3_EXPRESS_BUCKET_NAME, &object_key).await;
+    let (bucket_name, express_bucket_name) = get_bucket_names();
+    test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
+    test_round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
 }
 
 #[tokio::test]
 async fn test_multi_part_file_round_trip() {
     let file_size = 20 * 1024 * 1024;
     let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "20MB");
-    test_round_trip_helper(file_size, BUCKET_NAME, &object_key).await;
-    test_round_trip_helper(file_size, S3_EXPRESS_BUCKET_NAME, &object_key).await;
+    let (bucket_name, express_bucket_name) = get_bucket_names();
+    test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
+    test_round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
 }
 
 async fn get_checksum(s3_client: &aws_sdk_s3::Client, bucket_name: &str, key: &str) -> String {
@@ -123,7 +134,9 @@ async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool
     let object_key = format!("{}{}", PUT_OBJECT_PREFIX, key_suffix);
     let (tm, s3_client) = test_tm().await;
 
-    for bucket in [BUCKET_NAME, S3_EXPRESS_BUCKET_NAME] {
+    let (bucket_name, express_bucket_name) = get_bucket_names();
+    // Test both regular S3 and S3 express
+    for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
         // First upload: calculated CRC32
         let checksum = upload_and_get_checksum(
             &tm,
