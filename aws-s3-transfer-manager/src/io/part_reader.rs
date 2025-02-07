@@ -86,6 +86,13 @@ impl PartReader {
             Inner::Dyn(part_stream) => part_stream.next_part(&self.stream_cx).await,
         }
     }
+
+    pub(crate) async fn full_object_checksum(&self) -> Option<String> {
+        match &self.inner {
+            Inner::Dyn(part_stream) => part_stream.full_object_checksum().await,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -265,6 +272,12 @@ impl DynPartReader {
             Some(result) => result.map(Some).map_err(|err| err.into()),
             None => Ok(None),
         }
+    }
+
+    // this is only async because it locks a Tokio Mutex
+    async fn full_object_checksum(&self) -> Option<String> {
+        let stream = self.inner.lock().await;
+        stream.full_object_checksum()
     }
 }
 

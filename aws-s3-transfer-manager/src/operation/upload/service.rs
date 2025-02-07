@@ -3,17 +3,17 @@ use std::sync::Arc;
 use super::MultipartUploadData;
 use crate::{
     error,
-    io::{
-        part_reader::{Builder as PartReaderBuilder, PartReader},
-        InputStream, PartData,
-    },
+    io::{part_reader::PartReader, PartData},
     middleware::{
         hedge,
         limit::concurrency::{ConcurrencyLimitLayer, ProvidePayloadSize},
     },
     operation::upload::UploadContext,
 };
-use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
+use aws_sdk_s3::{
+    primitives::ByteStream,
+    types::{ChecksumAlgorithm, CompletedPart},
+};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
 use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
@@ -82,10 +82,26 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
 
     if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
-        // TODO(aws-s3-transfer-manager-rs#3): allow user to pass per-part checksum values via PartStream
-
-        // Set checksum algorithm, which tells SDK to calculate and add checksum value
-        req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+        // If user passed checksum value via PartStream, add it to request
+        if let Some(checksum_value) = &part_data.checksum {
+            req = match checksum_strategy.algorithm() {
+                ChecksumAlgorithm::Crc32 => req.checksum_crc32(checksum_value),
+                ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(checksum_value),
+                ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(checksum_value),
+                ChecksumAlgorithm::Sha1 => req.checksum_sha1(checksum_value),
+                ChecksumAlgorithm::Sha256 => req.checksum_sha256(checksum_value),
+                algo => unreachable!("unexpected checksum algorithm `{algo}`"),
+            }
+        } else {
+            // Otherwise, set checksum algorithm, which tells SDK to calculate and add checksum value
+            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+        }
+    } else {
+        // Warn if user is passing a checksum value, but the upload isn't doing checksums.
+        // We can't just set a checksum header, because we don't know what algorithm to use.
+        if part_data.checksum.is_some() {
+            tracing::warn!("Ignoring part checksum provided during upload, because no ChecksumStrategy is specified");
+        }
     }
 
     let resp = req
@@ -139,20 +155,10 @@ pub(super) fn upload_part_service(
 /// # Arguments
 ///
 /// * handle - the handle for this upload
-/// * stream - the body input stream
-/// * part_size - the part_size for each part
 pub(super) fn distribute_work(
     mpu_data: &mut MultipartUploadData,
     ctx: UploadContext,
-    stream: InputStream,
-    part_size: u64,
 ) -> Result<(), error::Error> {
-    let part_reader = Arc::new(
-        PartReaderBuilder::new()
-            .stream(stream)
-            .part_size(part_size.try_into().expect("valid part size"))
-            .build(),
-    );
     // group all spawned tasks together
     let parent_span_for_all_tasks = tracing::debug_span!(
         parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
@@ -176,7 +182,7 @@ pub(super) fn distribute_work(
     let n_workers = ctx.handle.num_workers();
     for _ in 0..n_workers {
         let worker = read_body(
-            part_reader.clone(),
+            mpu_data.part_reader.clone(),
             ctx.clone(),
             mpu_data.upload_id.clone(),
             svc.clone(),
@@ -232,6 +238,7 @@ mod tests {
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
     use crate::Config;
+    use bytes::Bytes;
     use test_common::mock_client_with_stubbed_http_client;
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
@@ -244,10 +251,7 @@ mod tests {
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
             },
-            part_data: PartData {
-                part_number: 0,
-                data: Default::default(),
-            },
+            part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),
         }
     }
