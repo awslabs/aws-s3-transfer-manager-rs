@@ -122,14 +122,14 @@ pub(super) fn chunk_service(
 /// * remaining - the remaining content range that needs to be downloaded
 /// * input - the base transfer request input used to build chunk requests from
 /// * start_seq - the starting sequence number to use for chunks
-/// * comp_tx - the channel to send chunk responses to
+/// * chunk_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
     tasks: &mut task::JoinSet<()>,
     ctx: DownloadContext,
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
     start_seq: u64,
-    comp_tx: mpsc::Sender<Result<ChunkOutput, error::Error>>,
+    chunk_tx: mpsc::Sender<Result<ChunkOutput, error::Error>>,
     parent_span_for_tasks: tracing::Span,
 ) {
     let svc = chunk_service(&ctx);
@@ -147,7 +147,7 @@ pub(super) fn distribute_work(
         };
 
         let svc = svc.clone();
-        let comp_tx = comp_tx.clone();
+        let chunk_tx = chunk_tx.clone();
         let cancel_tx = ctx.state.cancel_tx.clone();
 
         let task = async move {
@@ -165,7 +165,7 @@ pub(super) fn distribute_work(
                 }
             }
 
-            if let Err(err) = comp_tx.send(resp).await {
+            if let Err(err) = chunk_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
                 if cancel_tx.send(true).is_err() {
                     tracing::debug!(
