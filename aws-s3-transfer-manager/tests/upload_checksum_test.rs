@@ -346,6 +346,11 @@ fn mock_s3_client_for_multipart_upload(
                     // if it was passed via ChecksumStrategy, or via PartStream.
                     let input_checksum_field = get_checksum_value!(input);
                     if let Some(request_strategy) = &request_strategy {
+                        assert_eq!(
+                            input.checksum_type(),
+                            Some(request_strategy.type_if_multipart())
+                        );
+
                         if let Some((field_algorithm, field_value)) = &input_checksum_field {
                             assert_eq!(field_algorithm, request_strategy.algorithm());
                             assert_eq!(field_value, &multipart_checksum);
@@ -359,6 +364,7 @@ fn mock_s3_client_for_multipart_upload(
                         }
                     } else {
                         assert!(input_checksum_field.is_none());
+                        assert!(input.checksum_type.is_none());
                     }
 
                     // The multipart_upload struct should include info about each part
