@@ -213,8 +213,10 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
                 .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
 
-            // check for user-provided full-object checksum...
             if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
+                req = req.checksum_type(checksum_strategy.type_if_multipart().clone());
+
+                // check for user-provided full-object checksum...
                 if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
                     // it might have been passed via ChecksumStrategy or PartStream
                     let full_object_checksum = match checksum_strategy.full_object_checksum() {
