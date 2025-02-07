@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 use std::task::Poll;
 
 use tower::Service;
@@ -19,17 +17,12 @@ use crate::runtime::scheduler::{PermitType, Scheduler};
 pub(crate) struct ConcurrencyLimit<T> {
     inner: T,
     scheduler: Scheduler,
-    inflight: Arc<AtomicUsize>,
 }
 
 impl<T> ConcurrencyLimit<T> {
     /// Create a new concurrency limiter
     pub(crate) fn new(inner: T, scheduler: Scheduler) -> Self {
-        ConcurrencyLimit {
-            inner,
-            scheduler,
-            inflight: Arc::new(AtomicUsize::default()),
-        }
+        ConcurrencyLimit { inner, scheduler }
     }
 }
 
@@ -66,7 +59,7 @@ where
         // we make use of tower is for upload/download. If this changes this logic needs updated.
         let ptype = PermitType::Network(req.payload_size());
         let permit_fut = self.scheduler.acquire_permit(ptype);
-        ResponseFuture::new(self.inner.clone(), req, permit_fut, self.inflight.clone())
+        ResponseFuture::new(self.inner.clone(), req, permit_fut, self.scheduler.clone())
     }
 }
 
@@ -75,7 +68,6 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
         Self {
             inner: self.inner.clone(),
             scheduler: self.scheduler.clone(),
-            inflight: self.inflight.clone(),
         }
     }
 }
@@ -83,8 +75,11 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
 #[cfg(test)]
 mod tests {
 
+    use crate::metrics::unit::ByteUnit;
     use crate::runtime::scheduler::Scheduler;
+    use crate::types::TargetThroughput;
     use crate::{middleware::limit::concurrency::ConcurrencyLimitLayer, types::ConcurrencyMode};
+    use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use tokio_test::{assert_pending, assert_ready_ok, task};
     use tower_test::{assert_request_eq, mock};
 
@@ -167,5 +162,51 @@ mod tests {
         assert_pending!(t2.poll());
         assert_request_eq!(handle, "req 2").send_response("bar");
         assert_eq!(t2.await.unwrap(), "bar");
+    }
+
+    #[derive(Debug)]
+    struct MockPayload(u64);
+
+    impl ProvidePayloadSize for MockPayload {
+        fn payload_size(&self) -> u64 {
+            self.0
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_throughput_mode() {
+        let _logs = show_test_logs();
+        // sanity test throughput mode limits
+        let scheduler = Scheduler::new(ConcurrencyMode::TargetThroughput(
+            TargetThroughput::new_gigabits_per_sec(100),
+        ));
+
+        let limit = ConcurrencyLimitLayer::new(scheduler.clone());
+        let (mut service, _handle) = mock::spawn_layer::<_, (), _>(limit);
+
+        let part_size = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+
+        let mut tasks = Vec::new();
+
+        for _ in 0..256 {
+            let r = service.call(MockPayload(part_size));
+            let mut t = task::spawn(r);
+            assert_pending!(t.poll());
+            tasks.push(t);
+        }
+
+        // NOTE: this is heavily dependent on the token bucket implementation and constants used.
+        // This is a sanity test that we don't arbitrarily break expected concurrency controls in throughput
+        // mode using an expected result for a given workload.
+        let expected_inflight = 138;
+        assert_eq!(expected_inflight, scheduler.metrics.inflight());
+
+        for fut in tasks.into_iter() {
+            let mut fut = fut;
+            assert_pending!(fut.poll());
+            drop(fut);
+        }
+
+        assert_eq!(0, scheduler.metrics.inflight());
     }
 }

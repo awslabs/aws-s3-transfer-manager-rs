@@ -6,13 +6,14 @@
 use futures_util::TryFutureExt;
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::error;
 use crate::runtime::token_bucket::{OwnedToken, TokenBucket};
 use crate::types::ConcurrencyMode;
 
-// TODO - track high water mark
-// TODO - add statistics/telemetry
+// TODO - measure actual throughput and track high water mark
 
 /// Manages scheduling networking and I/O work
 ///
@@ -20,6 +21,7 @@ use crate::types::ConcurrencyMode;
 #[derive(Debug, Clone)]
 pub(crate) struct Scheduler {
     token_bucket: TokenBucket,
+    pub(crate) metrics: SchedulerMetrics,
 }
 
 impl Scheduler {
@@ -27,6 +29,7 @@ impl Scheduler {
     pub(crate) fn new(mode: ConcurrencyMode) -> Self {
         Self {
             token_bucket: TokenBucket::new(mode),
+            metrics: SchedulerMetrics::default(),
         }
     }
 
@@ -120,6 +123,30 @@ impl Future for AcquirePermitFuture {
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
         this.inner.poll(cx)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchedulerMetrics {
+    // current number of in-flight requests
+    inflight: Arc<AtomicUsize>,
+}
+
+impl SchedulerMetrics {
+    /// Increment the number of in-flight requests and returns the number currently in-flight after
+    /// incrementing.
+    pub(crate) fn increment_inflight(&self) -> usize {
+        self.inflight.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    /// Decrement the number of in-flight requests and returns the number currently in-flight after
+    /// decrementing.
+    pub(crate) fn decrement_inflight(&self) -> usize {
+        self.inflight.fetch_sub(1, Ordering::SeqCst) - 1
+    }
+
+    /// Get the current number of in-flight requests
+    pub(crate) fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
     }
 }
 

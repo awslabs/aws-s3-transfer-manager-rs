@@ -4,12 +4,10 @@
  */
 
 use crate::error;
-use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit};
+use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit, Scheduler};
 
 use futures_util::ready;
 use pin_project_lite::pin_project;
-use std::sync::atomic::{self, AtomicUsize};
-use std::sync::Arc;
 use std::{future::Future, task::Poll};
 use tower::util::Oneshot;
 use tower::Service;
@@ -21,7 +19,7 @@ pin_project! {
     {
         request: Option<Request>,
         svc: Option<S>,
-        inflight: Arc<AtomicUsize>,
+        scheduler: Scheduler,
         #[pin]
         state: State<Oneshot<S, Request>>
     }
@@ -37,6 +35,8 @@ pin_project! {
             fut: F,
             // retain until dropped when future completes
             _permit: OwnedWorkPermit,
+            // auto decrement inflight metrics on drop
+            _inflight: Inflight,
         },
         // Polling the future from [`Scheduler::acquire_permit`]
         AcquiringPermit {
@@ -54,12 +54,12 @@ where
         inner: S,
         req: Request,
         permit_fut: AcquirePermitFuture,
-        inflight: Arc<AtomicUsize>,
+        scheduler: Scheduler,
     ) -> ResponseFuture<S, Request> {
         ResponseFuture {
             request: Some(req),
             svc: Some(inner),
-            inflight,
+            scheduler,
             state: State::AcquiringPermit { permit_fut },
         }
     }
@@ -81,24 +81,37 @@ where
                     match res {
                         Ok(_permit) => {
                             let req = this.request.take().expect("request set");
-                            let inflight = this.inflight.fetch_add(1, atomic::Ordering::SeqCst) + 1;
+                            let inflight = this.scheduler.metrics.increment_inflight();
                             tracing::trace!("in-flight requests: {inflight}");
                             let svc = this.svc.take().expect("service set");
                             // NOTE: because the service was (1) never polled for readiness
                             // originally and (2) also cloned, we need to ensure it's ready now before calling it.
                             let fut = Oneshot::new(svc, req);
-                            this.state.set(State::Called { fut, _permit });
+                            let _inflight = Inflight(this.scheduler.clone());
+                            this.state.set(State::Called {
+                                fut,
+                                _permit,
+                                _inflight,
+                            });
                         }
                         Err(err) => return Poll::Ready(Err(err.into())),
                     }
                 }
                 StateProj::Called { fut, .. } => {
                     let result = ready!(fut.poll(cx));
-                    let inflight = this.inflight.fetch_sub(1, atomic::Ordering::SeqCst);
-                    tracing::trace!("in-flight requests: {inflight}");
                     return Poll::Ready(result);
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct Inflight(Scheduler);
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        // ensure we update metrics if we put a request in-flight
+        self.0.metrics.decrement_inflight();
     }
 }
