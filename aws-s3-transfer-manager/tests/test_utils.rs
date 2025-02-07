@@ -1,5 +1,6 @@
 use aws_s3_transfer_manager::{error::Error, operation::download::DownloadHandle};
 use bytes::{BufMut, Bytes, BytesMut};
+use tracing_subscriber::EnvFilter;
 
 /// drain/consume the body
 pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
@@ -19,4 +20,11 @@ pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
         return Err(error);
     }
     Ok(data.into())
+}
+
+pub fn setup_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
 }

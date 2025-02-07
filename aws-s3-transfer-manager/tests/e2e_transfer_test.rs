@@ -5,18 +5,19 @@
 
 mod test_utils;
 
-use aws_sdk_s3::types::ChecksumMode;
-use tracing_subscriber::EnvFilter;
 use aws_s3_transfer_manager::io::InputStream;
 use aws_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3::types::ChecksumMode;
+use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use test_utils::drain;
 // #![cfg(e2e)]
 
 use aws_s3_transfer_manager::types::PartSize;
+use crate::test_utils::setup_tracing;
 
 async fn test_tm() -> (aws_s3_transfer_manager::Client, aws_sdk_s3::Client) {
     let tm_config = aws_s3_transfer_manager::from_env()
-        .part_size(PartSize::Target(8))
+        .part_size(PartSize::Target(8*ByteUnit::Mebibyte.as_bytes_u64()))
         .load()
         .await;
     let client = tm_config.client().clone();
@@ -34,21 +35,34 @@ fn create_input_stream(size: usize) -> InputStream {
 }
 
 const BUCKET_NAME: &str = "aws-c-s3-test-bucket-099565";
-const PUT_OBJECT_PREFIX: &str = "/upload/put-object-test/";
+const PUT_OBJECT_PREFIX: &str = "upload/put-object-test/";
+
+async fn perform_upload(
+    tm: &aws_s3_transfer_manager::Client,
+    key: &str,
+    strategy: Option<ChecksumStrategy>,
+    size: usize,
+) {
+    let mut upload = tm.upload()
+        .bucket(BUCKET_NAME)
+        .key(key)
+        .body(create_input_stream(size));
+
+    if let Some(strategy) = strategy {
+        upload = upload.checksum_strategy(strategy);
+    }
+
+    upload
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+}
 
 async fn test_round_trip_helper(file_size: usize, object_key: &str) {
     let (tm, _) = test_tm().await;
-
-    let upload_handle = tm
-        .upload()
-        .bucket(BUCKET_NAME)
-        .key(object_key)
-        .body(create_input_stream(file_size))
-        .initiate()
-        .unwrap();
-
-    upload_handle.join().await.unwrap();
-
+    perform_upload(&tm, object_key, None, file_size).await;
     let mut download_handle = tm
         .download()
         .bucket(BUCKET_NAME)
@@ -75,55 +89,36 @@ async fn test_multi_part_file_round_trip() {
     test_round_trip_helper(file_size, &object_key).await;
 }
 
-fn setup_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
-}
-
-
-#[tokio::test]
-async fn test_multi_part_file_checksum_round_trip() {
-    setup_tracing();
-    let file_size = 20 * 1024 * 1024;
-    let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "20MB-crc32");
-    let object_key_ref = object_key.as_str();
-    let (tm, s3_client) = test_tm().await;
-
-    // Transfer manager to calculated the crc32.
-    let upload_handle = tm
-        .upload()
-        .bucket(BUCKET_NAME)
-        .key(object_key_ref)
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
-        .body(create_input_stream(file_size))
-        .initiate()
-        .unwrap();
-
-    upload_handle.join().await.unwrap();
-
-    let output = s3_client
+async fn get_checksum(s3_client: &aws_sdk_s3::Client, key: &str) -> String {
+    s3_client
         .head_object()
         .bucket(BUCKET_NAME)
-        .key(object_key_ref)
+        .key(key)
         .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
-        .unwrap();
-    // Check we do get the crc64 nvme checksum
-    let checksum = output.checksum_crc32().unwrap();
+        .unwrap()
+        .checksum_crc32()
+        .unwrap()
+        .to_owned()
+}
+#[tokio::test]
+async fn test_multi_part_file_checksum_upload() {
+    let file_size = 20 * 1024 * 1024;
+    let (tm, s3_client) = test_tm().await;
 
-    // Do another upload with the checksum we got, and verify it upload successfully.
-    // Transfer manager upload with pre-calculated checksum
-    let upload_handle = tm
-        .upload()
-        .bucket(BUCKET_NAME)
-        .key(object_key_ref)
-        .checksum_strategy(ChecksumStrategy::with_crc32(checksum))
-        .body(create_input_stream(file_size))
-        .initiate()
-        .unwrap();
+    // First upload: calculated CRC32
+    let object_key = format!("{}20MB-crc32", PUT_OBJECT_PREFIX);
+    perform_upload(&tm, &object_key, Some(ChecksumStrategy::with_calculated_crc32()), file_size).await;
+    let checksum = get_checksum(&s3_client, &object_key).await;
 
-    upload_handle.join().await.unwrap();
+    // Second upload: precomputed CRC32
+    perform_upload(&tm, &object_key, Some(ChecksumStrategy::with_crc32(checksum)), file_size).await;
+
+    // Third upload: composite CRC32
+    let composite_key = format!("{}20MB-crc32-composite", PUT_OBJECT_PREFIX);
+    perform_upload(&tm, &composite_key, Some(ChecksumStrategy::with_calculated_crc32_composite_if_multipart()), file_size).await;
+
+    let composite_checksum = get_checksum(&s3_client, &composite_key).await;
+    assert!(composite_checksum.ends_with("-3"));
 }
