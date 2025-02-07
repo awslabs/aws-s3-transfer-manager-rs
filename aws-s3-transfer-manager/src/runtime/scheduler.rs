@@ -145,6 +145,7 @@ impl SchedulerMetrics {
     }
 
     /// Get the current number of in-flight requests
+    #[cfg(test)]
     pub(crate) fn inflight(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
     }
