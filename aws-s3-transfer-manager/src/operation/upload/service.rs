@@ -19,6 +19,17 @@ use tokio::{sync::Mutex, task};
 use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
+/// Maximum requests to buffer in the tower::Buffer layer
+///
+/// This bears some explanation... we introduced the buffer layer solely to
+/// make the resulting service cloneable. The addition of the out of the box hedging layer
+/// makes a service not cloneable and a buffer layer fixes that without much overhead.
+///
+/// The actual number of requests in-flight is limited by our scheduler and the concurrency layer.
+/// Thus, we pick a relatively large enough number to guarantee the buffer layer isn't a
+/// bottleneck or additional limit on concurrency.
+const BUFFER_LAYER_LIMIT: usize = 1024;
+
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
@@ -109,9 +120,8 @@ pub(super) fn upload_part_service(
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
-        // FIXME - buffer layer needs to be tuned with the concurrency limit
-        // FIXME - This setting will need to be globalized.
-        .buffer(ctx.handle.num_workers())
+        // TODO: investigate removing the buffer layer by making the hedging layer cloneable
+        .buffer(BUFFER_LAYER_LIMIT)
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
         // concurrency_limit layer.
         .layer(hedge::Builder::new(UploadHedgePolicy).into_layer())

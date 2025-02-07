@@ -143,6 +143,4 @@ mod tests {
         drop(p1);
         jh.await.unwrap();
     }
-
-    // TODO - add additional tests (e.g. test the example from S3 documentation that we end up with the right concurrency)
 }

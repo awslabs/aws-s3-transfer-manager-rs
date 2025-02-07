@@ -105,158 +105,67 @@ mod tests {
         }
     }
 
-    // #[tokio::test(flavor = "current_thread")]
-    // async fn test_service_limit() {
-    //     let scheduler = Scheduler::new(ConcurrencyMode::Explicit(2));
-    //     let limit = ConcurrencyLimitLayer::new(scheduler);
-    //     let (mut service, mut handle) = mock::spawn_layer(limit);
-    //
-    //     // println!("first call");
-    //     // assert_ready_ok!(service.poll_ready());
-    //     // let r1 = service.call(TestInput("req 1"));
-    //     //
-    //     // println!("second call");
-    //     // assert_ready_ok!(service.poll_ready());
-    //     // let r2 = service.call(TestInput("req 2"));
-    //     //
-    //     // println!("third call");
-    //     // assert_ready_ok!(service.poll_ready());
-    //     // let r3 = service.call(TestInput("req 3"));
-    //
-    //     // assert_pending!(service.poll_ready());
-    //     // assert!(!service.is_woken());
-    //     let mut t1 = task::spawn(async {
-    //         // assert_ready_ok!(service.poll_ready());
-    //         let c = service.call(TestInput("req 1"));
-    //         c.await.unwrap();
-    //     });
-    //
-    //
-    //     // let mut t1 = task::spawn(r1);
-    //     // let mut t2 = task::spawn(r2);
-    //     // let mut t3 = task::spawn(r3);
-    //     println!("poll t1");
-    //     assert_pending!(t1.poll());
-    //
-    //
-    //     println!("pass requests through");
-    //     //
-    //     // // pass requests through
-    //     assert_request_eq!(handle, "req 1").send_response("foo");
-    //     // assert_request_eq!(handle, "req 2").send_response("bar");
-    //     //
-    //     println!("no more requests");
-    //     // // no more requests
-    //     // assert_pending!(handle.poll_request());
-    //     // assert_eq!(r1.await.unwrap(), "foo");
-    //     //
-    //     // assert!(service.is_woken());
-    //     //
-    //     // println!("check no more requests through");
-    //     // // more requests can make it through
-    //     // assert_ready_ok!(service.poll_ready());
-    //     // let r3 = service.call(TestInput("req 3"));
-    //     //
-    //     // // assert_pending!(service.poll_ready());
-    //     //
-    //     // println!("check r2");
-    //     // assert_eq!(r2.await.unwrap(), "bar");
-    //     //
-    //     // println!("check r3");
-    //     // assert_request_eq!(handle, "req 3").send_response("baz");
-    //     // assert_eq!(r3.await.unwrap(), "baz");
-    // }
-    //
-    // #[tokio::test(flavor = "current_thread")]
-    // async fn test_clone() {
-    //     let scheduler = Scheduler::new(1);
-    //     let limit = ConcurrencyLimitLayer::new(scheduler);
-    //     let (mut s1, mut handle) = mock::spawn_layer(limit);
-    //
-    //     assert_ready_ok!(s1.poll_ready());
-    //
-    //     // s2 should share underlying scheduler
-    //     let mut s2 = s1.clone();
-    //     assert_pending!(s2.poll_ready());
-    //
-    //     let r1 = s1.call("req 1");
-    //     assert_request_eq!(handle, "req 1").send_response("foo");
-    //
-    //     // s2 can't get capacity until the future is dropped/consumed
-    //     assert_pending!(s2.poll_ready());
-    //     r1.await.unwrap();
-    //     assert_ready_ok!(s2.poll_ready());
-    // }
-    //
-    // #[tokio::test(flavor = "current_thread")]
-    // async fn test_service_drop_frees_capacity() {
-    //     let scheduler = Scheduler::new(1);
-    //     let limit = ConcurrencyLimitLayer::new(scheduler);
-    //     let (mut s1, mut _handle) = mock::spawn_layer::<(), (), _>(limit);
-    //
-    //     assert_ready_ok!(s1.poll_ready());
-    //
-    //     // s2 should share underlying scheduler
-    //     let mut s2 = s1.clone();
-    //     assert_pending!(s2.poll_ready());
-    //
-    //     drop(s1);
-    //     assert!(s2.is_woken());
-    //     assert_ready_ok!(s2.poll_ready());
-    // }
-    // #[tokio::test(flavor = "current_thread")]
-    // async fn test_drop_resp_future_frees_capacity() {
-    //     let scheduler = Scheduler::new(1);
-    //     let limit = ConcurrencyLimitLayer::new(scheduler);
-    //     let (mut s1, mut _handle) = mock::spawn_layer::<_, (), _>(limit);
-    //     let mut s2 = s1.clone();
-    //
-    //     assert_ready_ok!(s1.poll_ready());
-    //     let r1 = s1.call("req 1");
-    //
-    //     assert_pending!(s2.poll_ready());
-    //     drop(r1);
-    //     assert_ready_ok!(s2.poll_ready());
-    // }
-    //
-    // #[tokio::test(flavor = "current_thread")]
-    // async fn test_service_error_frees_capacity() {
-    //     let scheduler = Scheduler::new(1);
-    //     let limit = ConcurrencyLimitLayer::new(scheduler);
-    //     let (mut s1, mut handle) = mock::spawn_layer::<_, (), _>(limit);
-    //     let mut s2 = s1.clone();
-    //
-    //     // reserve capacity on s1
-    //     assert_ready_ok!(s1.poll_ready());
-    //     assert_pending!(s2.poll_ready());
-    //
-    //     let r1 = s1.call("req 1");
-    //
-    //     assert_request_eq!(handle, "req 1").send_error("blerg");
-    //     r1.await.unwrap_err();
-    //
-    //     assert_ready_ok!(s2.poll_ready());
-    // }
-    //
-    // #[tokio::test(flavor = "current_thread")]
-    // async fn test_multiple_waiting() {
-    //     let scheduler = Scheduler::new(1);
-    //     let limit = ConcurrencyLimitLayer::new(scheduler);
-    //     let (mut s1, mut _handle) = mock::spawn_layer::<(), (), _>(limit);
-    //     let mut s2 = s1.clone();
-    //     let mut s3 = s1.clone();
-    //
-    //     // reserve capacity on s1
-    //     assert_ready_ok!(s1.poll_ready());
-    //     assert_pending!(s2.poll_ready());
-    //     assert_pending!(s3.poll_ready());
-    //
-    //     drop(s1);
-    //
-    //     assert!(s2.is_woken());
-    //     assert!(!s3.is_woken());
-    //
-    //     drop(s2);
-    //     assert!(s3.is_woken());
-    // }
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_service_limit() {
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(2));
+        let limit = ConcurrencyLimitLayer::new(scheduler);
+        let (mut service, mut handle) = mock::spawn_layer(limit);
+
+        assert_ready_ok!(service.poll_ready());
+        let r1 = service.call(TestInput("req 1"));
+        assert_ready_ok!(service.poll_ready());
+        let r2 = service.call(TestInput("req 2"));
+
+        assert_ready_ok!(service.poll_ready());
+        let r3 = service.call(TestInput("req 3"));
+
+        let mut t1 = task::spawn(r1);
+        let mut t2 = task::spawn(r2);
+        let mut t3 = task::spawn(r3);
+        assert_pending!(t1.poll());
+        assert_pending!(t2.poll());
+        assert_pending!(t3.poll());
+
+        // pass requests through
+        assert_request_eq!(handle, "req 1").send_response("foo");
+        assert_request_eq!(handle, "req 2").send_response("bar");
+
+        assert_pending!(handle.poll_request());
+        assert_eq!(t1.await.unwrap(), "foo");
+        assert_eq!(t2.await.unwrap(), "bar");
+
+        // NOTE: because poll_ready() is implemented in poll() for this middleware we have to
+        // manually poll it here for it to pickup the permit and actually call the service
+        // otherwise we'd block on send_response(). This is mismatch between tower-test and
+        // how they expect a service to behave.
+        assert_pending!(t3.poll());
+        assert_request_eq!(handle, "req 3").send_response("baz");
+        assert_eq!(t3.await.unwrap(), "baz");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_clone() {
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
+        let limit = ConcurrencyLimitLayer::new(scheduler);
+        let (mut s1, mut handle) = mock::spawn_layer(limit);
+
+        assert_ready_ok!(s1.poll_ready());
+
+        // s2 should share underlying scheduler
+        let mut s2 = s1.clone();
+        assert_ready_ok!(s2.poll_ready());
+
+        let r1 = s1.call(TestInput("req 1"));
+        let r2 = s2.call(TestInput("req 2"));
+        let mut t1 = task::spawn(r1);
+        let mut t2 = task::spawn(r2);
+        assert_pending!(t1.poll());
+        assert_request_eq!(handle, "req 1").send_response("foo");
+
+        // s2 can't get capacity until the future is dropped/consumed
+        t1.await.unwrap();
+        assert_pending!(t2.poll());
+        assert_request_eq!(handle, "req 2").send_response("bar");
+        assert_eq!(t2.await.unwrap(), "bar");
+    }
 }
