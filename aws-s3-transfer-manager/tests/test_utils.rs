@@ -22,6 +22,7 @@ pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
     Ok(data.into())
 }
 
+// Helper function to setup tracing that enables log.
 pub fn setup_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
