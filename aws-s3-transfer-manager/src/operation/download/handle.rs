@@ -12,6 +12,7 @@ use tokio::{
 
 use crate::operation::download::body::Body;
 
+use super::trailing_meta::TrailingMetadataOnceLock;
 use super::{ObjectMetadata, TrailingMetadata};
 
 /// Response type for a single download object request.
@@ -19,12 +20,15 @@ use super::{ObjectMetadata, TrailingMetadata};
 #[non_exhaustive]
 pub struct DownloadHandle {
     /// Object metadata receiver.
-    pub(crate) object_meta_rx: Mutex<Option<Receiver<ObjectMetadata>>>,
+    pub(crate) object_meta_receiver: Mutex<Option<Receiver<ObjectMetadata>>>,
     /// Object metadata.
     pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
     /// Metadata that isn't available until the download completes.
-    pub(crate) trailing_meta: OnceCell<TrailingMetadata>,
+    /// This is similar to object_meta, in that it's transmitted once to the DownloadHandle.
+    /// But we can simply use an Arc<OnceLock> (instead of Mutex/Channel/Option/OnceCell combo)
+    /// because we never await it.
+    pub(crate) trailing_meta: TrailingMetadataOnceLock,
 
     /// The object content, in chunks, and the metadata for each chunk
     pub(crate) body: Body,
@@ -42,12 +46,12 @@ impl DownloadHandle {
         let meta = self
             .object_meta
             .get_or_try_init(|| async {
-                let mut object_meta_rx = self.object_meta_rx.lock().await;
-                let object_meta_rx = object_meta_rx
+                let mut object_meta_receiver = self.object_meta_receiver.lock().await;
+                let object_meta_receiver = object_meta_receiver
                     .take()
-                    .ok_or("object_meta_rx is already taken")
+                    .ok_or("meta_receiver is already taken")
                     .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))?;
-                object_meta_rx
+                object_meta_receiver
                     .await
                     .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))
             })
