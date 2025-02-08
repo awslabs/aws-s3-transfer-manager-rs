@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 use crate::io::AggregatedBytes;
 
 use super::chunk_meta::ChunkMetadata;
+use super::trailing_meta::TrailingMetadataOnceLock;
+use super::{ChecksumValidationLevel, TrailingMetadata};
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
 ///
@@ -20,6 +22,8 @@ use super::chunk_meta::ChunkMetadata;
 pub struct Body {
     inner: UnorderedBody,
     sequencer: Sequencer,
+    /// Gathers data needed for TrailingMetadata, and sends it after the full body is delivered
+    trailing_meta_builder: Option<TrailingMetadataBuilder>,
 }
 
 type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
@@ -45,17 +49,24 @@ pub struct ChunkOutput {
 impl Body {
     /// Create a new empty body
     pub fn empty() -> Self {
-        Self::new_from_channel(None)
+        Self::new_from_channel(None, None)
     }
 
-    pub(crate) fn new(chunks: BodyChannel) -> Self {
-        Self::new_from_channel(Some(chunks))
+    pub(crate) fn new(
+        chunk_rx: BodyChannel,
+        trailing_meta_oncelock: TrailingMetadataOnceLock,
+    ) -> Self {
+        Self::new_from_channel(Some(chunk_rx), Some(trailing_meta_oncelock))
     }
 
-    fn new_from_channel(chunks: Option<BodyChannel>) -> Self {
+    fn new_from_channel(
+        chunk_rx: Option<BodyChannel>,
+        trailing_meta_oncelock: Option<TrailingMetadataOnceLock>,
+    ) -> Self {
         Self {
-            inner: UnorderedBody::new(chunks),
+            inner: UnorderedBody::new(chunk_rx),
             sequencer: Sequencer::new(),
+            trailing_meta_builder: trailing_meta_oncelock.map(|x| TrailingMetadataBuilder::new(x)),
         }
     }
 
@@ -90,9 +101,19 @@ impl Body {
 
         let chunk = self.sequencer.pop();
         if let Some(chunk) = chunk {
+            self.trailing_meta_builder
+                .as_mut()
+                .unwrap()
+                .inspect_chunk(&chunk);
+
             self.sequencer.advance();
             Some(Ok(chunk))
         } else {
+            // No more chunks, send the TrailingMetadata if we haven't already
+            if let Some(trailing_meta_builder) = self.trailing_meta_builder.take() {
+                trailing_meta_builder.send();
+            }
+
             None
         }
     }
@@ -169,12 +190,12 @@ impl PartialEq for SequencedChunk {
 /// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
 pub(crate) struct UnorderedBody {
-    chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
+    chunk_rx: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
 }
 
 impl UnorderedBody {
-    fn new(chunks: Option<BodyChannel>) -> Self {
-        Self { chunks }
+    fn new(chunk_rx: Option<BodyChannel>) -> Self {
+        Self { chunk_rx }
     }
 
     /// Pull the next chunk of data off the stream.
@@ -184,7 +205,7 @@ impl UnorderedBody {
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
     pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
-        match self.chunks.as_mut() {
+        match self.chunk_rx.as_mut() {
             None => None,
             Some(ch) => ch.recv().await,
         }
@@ -192,15 +213,75 @@ impl UnorderedBody {
 
     /// Close the body
     pub(crate) fn close(&mut self) {
-        if let Some(ch) = &mut self.chunks {
+        if let Some(ch) = &mut self.chunk_rx {
             ch.close();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TrailingMetadataBuilder {
+    /// Once everything is downloaded and we have all the data, "send" it by setting this OnceLock
+    trailing_meta_tx: TrailingMetadataOnceLock,
+
+    num_chunks: u32,
+    num_chunks_validated: u32,
+}
+
+impl TrailingMetadataBuilder {
+    fn new(trailing_meta_tx: TrailingMetadataOnceLock) -> Self {
+        Self {
+            trailing_meta_tx,
+            num_chunks: 0,
+            num_chunks_validated: 0,
+        }
+    }
+
+    fn inspect_chunk(&mut self, chunk: &ChunkOutput) {
+        self.num_chunks += 1;
+
+        let meta = &chunk.metadata;
+
+        // TODO: it's more complicated that this
+        let checksum = meta
+            .checksum_crc32
+            .as_ref()
+            .or(meta.checksum_crc32_c.as_ref())
+            .or(meta.checksum_crc64_nvme.as_ref())
+            .or(meta.checksum_sha1.as_ref())
+            .or(meta.checksum_sha256.as_ref());
+        if let Some(checksum) = checksum {
+            if !checksum.contains("-") {
+                self.num_chunks_validated += 1;
+            }
+        }
+    }
+
+    fn send(self) {
+        // TODO: it's more complicated than this
+        let checksum_validation_level =
+            if self.num_chunks > 0 && self.num_chunks == self.num_chunks_validated {
+                ChecksumValidationLevel::AllChunks
+            } else {
+                ChecksumValidationLevel::NotValidated
+            };
+
+        let trailing_meta = TrailingMetadata {
+            checksum_validation_level,
+        };
+
+        if self.trailing_meta_tx.set(trailing_meta).is_err() {
+            tracing::debug!("TODO: what message");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{error, operation::download::body::ChunkOutput};
+    use crate::{
+        error,
+        operation::download::{body::ChunkOutput, TrailingMetadata},
+    };
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
     use tokio::sync::mpsc;
@@ -228,7 +309,8 @@ mod tests {
     #[tokio::test]
     async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let trailing_meta_oncelock = TrailingMetadata::new_oncelock();
+        let mut body = Body::new(rx, trailing_meta_oncelock);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -254,7 +336,8 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let trailing_meta_oncelock = TrailingMetadata::new_oncelock();
+        let mut body = Body::new(rx, trailing_meta_oncelock);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();
