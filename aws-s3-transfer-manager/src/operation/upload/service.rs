@@ -39,7 +39,7 @@ pub(super) struct UploadPartRequest {
 }
 
 impl ProvidePayloadSize for UploadPartRequest {
-    fn payload_size(&self) -> u64 {
+    fn payload_size_estimate(&self) -> u64 {
         self.part_data.data.len() as u64
     }
 }

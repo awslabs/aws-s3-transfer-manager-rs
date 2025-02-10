@@ -28,8 +28,8 @@ impl<T> ConcurrencyLimit<T> {
 
 /// Provide the request/response payload size estimate
 pub(crate) trait ProvidePayloadSize {
-    /// Payload size in bytes
-    fn payload_size(&self) -> u64;
+    /// Payload size estimate in bytes
+    fn payload_size_estimate(&self) -> u64;
 }
 
 impl<S, Request> Service<Request> for ConcurrencyLimit<S>
@@ -57,7 +57,7 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         // NOTE: We assume this is a dataplane request as that is the only place
         // we make use of tower is for upload/download. If this changes this logic needs updated.
-        let ptype = PermitType::Network(req.payload_size());
+        let ptype = PermitType::Network(req.payload_size_estimate());
         let permit_fut = self.scheduler.acquire_permit(ptype);
         ResponseFuture::new(self.inner.clone(), req, permit_fut, self.scheduler.clone())
     }
@@ -89,7 +89,7 @@ mod tests {
     struct TestInput(&'static str);
 
     impl ProvidePayloadSize for TestInput {
-        fn payload_size(&self) -> u64 {
+        fn payload_size_estimate(&self) -> u64 {
             self.0.len() as u64
         }
     }
@@ -168,7 +168,7 @@ mod tests {
     struct MockPayload(u64);
 
     impl ProvidePayloadSize for MockPayload {
-        fn payload_size(&self) -> u64 {
+        fn payload_size_estimate(&self) -> u64 {
             self.0
         }
     }

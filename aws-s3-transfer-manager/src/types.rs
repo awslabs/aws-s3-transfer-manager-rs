@@ -41,8 +41,8 @@ pub enum ConcurrencyMode {
 /// Throughput target(s)
 #[derive(Debug, Clone)]
 pub struct TargetThroughput {
-    upload: Throughput,
     download: Throughput,
+    upload: Throughput,
 }
 
 impl TargetThroughput {
@@ -57,10 +57,10 @@ impl TargetThroughput {
 
     /// Create a new target throughput using the given upload and download
     /// throughputs.
-    fn new(upload_target: Throughput, download_target: Throughput) -> Self {
+    fn new(download_target: Throughput, upload_target: Throughput) -> Self {
         Self {
-            upload: upload_target,
             download: download_target,
+            upload: upload_target,
         }
     }
 
