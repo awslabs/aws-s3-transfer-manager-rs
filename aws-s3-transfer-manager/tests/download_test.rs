@@ -8,7 +8,7 @@ use aws_s3_transfer_manager::{
     error::{BoxError, Error},
     metrics::unit::ByteUnit,
     operation::download::DownloadHandle,
-    types::{ConcurrencySetting, PartSize},
+    types::{ConcurrencyMode, PartSize},
 };
 use pin_project_lite::pin_project;
 use std::{
@@ -120,7 +120,7 @@ fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer
     let config = aws_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencySetting::Explicit(1))
+        .concurrency(ConcurrencyMode::Explicit(1))
         .build();
 
     aws_s3_transfer_manager::Client::new(config)

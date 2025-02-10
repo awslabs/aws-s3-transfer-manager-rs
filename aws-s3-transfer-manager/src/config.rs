@@ -4,22 +4,24 @@
  */
 
 use aws_runtime::user_agent::FrameworkMetadata;
+use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencySetting, PartSize};
-use std::cmp;
+use crate::types::{ConcurrencyMode, PartSize};
 
 pub(crate) mod loader;
 
 /// Minimum upload part size in bytes
 pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
+// FIXME - should target throughput be configurable for upload and download independently?
+
 /// Configuration for a [`Client`](crate::client::Client)
 #[derive(Debug, Clone)]
 pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
-    concurrency: ConcurrencySetting,
+    concurrency: ConcurrencyMode,
     framework_metadata: Option<FrameworkMetadata>,
     client: aws_sdk_s3::client::Client,
 }
@@ -40,9 +42,10 @@ impl Config {
         &self.target_part_size
     }
 
-    /// Returns the concurrency setting to use for transfer operations.
-    /// This is the maximum number of in-flight requests allowed across _all_ operations.
-    pub fn concurrency(&self) -> &ConcurrencySetting {
+    /// Returns the concurrency mode to use for transfer operations.
+    ///
+    /// This is the mode used for concurrent in-flight requests across _all_ operations.
+    pub fn concurrency(&self) -> &ConcurrencyMode {
         &self.concurrency
     }
 
@@ -63,7 +66,7 @@ impl Config {
 pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
-    concurrency: ConcurrencySetting,
+    concurrency: ConcurrencyMode,
     framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
 }
@@ -123,12 +126,12 @@ impl Builder {
         self
     }
 
-    /// Set the concurrency level this component is allowed to use.
+    /// Set the concurrency mode this client should use.
     ///
-    /// This sets the maximum number of concurrent in-flight requests across _all_ operations.
-    /// Default is [ConcurrencySetting::Auto].
-    pub fn concurrency(mut self, concurrency: ConcurrencySetting) -> Self {
-        self.concurrency = concurrency;
+    /// This sets the mode used for concurrent in-flight requests across _all_ operations.
+    /// Default is [ConcurrencyMode::Auto].
+    pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
+        self.concurrency = mode;
         self
     }
 

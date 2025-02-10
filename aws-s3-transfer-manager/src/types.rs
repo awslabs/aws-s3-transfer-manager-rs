@@ -6,6 +6,8 @@
 use core::fmt;
 use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
 
+use crate::metrics::{unit::ByteUnit, Throughput};
+
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
@@ -20,15 +22,58 @@ pub enum PartSize {
     Target(u64),
 }
 
-/// The concurrency settings to use for a single upload or download request.
+/// The concurrency mode the client should use for executing requests.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
-pub enum ConcurrencySetting {
-    /// Automatically configure an optimal concurrency setting based on the execution environment.
+pub enum ConcurrencyMode {
+    /// Automatically configured concurrency based on the execution environment.
     #[default]
     Auto,
 
-    /// Explicitly configured concurrency setting.
+    /// Explicitly configured throughput setting the client should aim for.
+    ///
+    /// In this mode, concurrency is limited by attempting to hit a throughput target.
+    TargetThroughput(TargetThroughput),
+
+    /// Explicit concurrency control
     Explicit(usize),
+}
+
+/// Throughput target(s)
+#[derive(Debug, Clone)]
+pub struct TargetThroughput {
+    download: Throughput,
+    upload: Throughput,
+}
+
+impl TargetThroughput {
+    /// Create a new target throughput in Gigabits/sec that is
+    /// the same for both uploads and downloads.
+    pub fn new_gigabits_per_sec(gbps: u64) -> Self {
+        let target = Throughput::new_bytes_per_sec(gbps * ByteUnit::Gigabit.as_bytes_u64());
+        Self::new(target, target)
+    }
+
+    // TODO: we don't actually support limiting throughput by upload/download independently (yet), it will require updates to scheduler.
+
+    /// Create a new target throughput using the given upload and download
+    /// throughputs.
+    fn new(download_target: Throughput, upload_target: Throughput) -> Self {
+        Self {
+            download: download_target,
+            upload: upload_target,
+        }
+    }
+
+    /// Get the target throughput for uploads
+    pub fn upload(&self) -> &Throughput {
+        &self.upload
+    }
+
+    /// Get the target throughput for downloads
+    pub fn download(&self) -> &Throughput {
+        &self.download
+    }
 }
 
 /// Policy for how to handle a failed multipart upload

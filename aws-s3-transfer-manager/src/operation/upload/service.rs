@@ -4,7 +4,10 @@ use super::MultipartUploadData;
 use crate::{
     error,
     io::{part_reader::PartReader, PartData},
-    middleware::{hedge, limit::concurrency::ConcurrencyLimitLayer},
+    middleware::{
+        hedge,
+        limit::concurrency::{ConcurrencyLimitLayer, ProvidePayloadSize},
+    },
     operation::upload::UploadContext,
 };
 use aws_sdk_s3::{
@@ -16,12 +19,29 @@ use tokio::{sync::Mutex, task};
 use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
+/// Maximum requests to buffer in the tower::Buffer layer
+///
+/// This bears some explanation... we introduced the buffer layer solely to
+/// make the resulting service cloneable. The addition of the out of the box hedging layer
+/// makes a service not cloneable and a buffer layer fixes that without much overhead.
+///
+/// The actual number of requests in-flight is limited by our scheduler and the concurrency layer.
+/// Thus, we pick a relatively large enough number to guarantee the buffer layer isn't a
+/// bottleneck or additional limit on concurrency.
+const BUFFER_LAYER_LIMIT: usize = 1024;
+
 /// Request/input type for our "upload_part" service.
 #[derive(Debug, Clone)]
 pub(super) struct UploadPartRequest {
     pub(super) ctx: UploadContext,
     pub(super) part_data: PartData,
     pub(super) upload_id: String,
+}
+
+impl ProvidePayloadSize for UploadPartRequest {
+    fn payload_size_estimate(&self) -> u64 {
+        self.part_data.data.len() as u64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,8 +136,8 @@ pub(super) fn upload_part_service(
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
-        // FIXME - This setting will need to be globalized.
-        .buffer(ctx.handle.num_workers())
+        // TODO: investigate removing the buffer layer by making the hedging layer cloneable
+        .buffer(BUFFER_LAYER_LIMIT)
         // FIXME - Hedged request should also get a permit. Currently, it can bypass the
         // concurrency_limit layer.
         .layer(hedge::Builder::new(UploadHedgePolicy).into_layer())
@@ -216,6 +236,7 @@ mod tests {
     use crate::client::Handle;
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
+    use crate::types::ConcurrencyMode;
     use crate::Config;
     use bytes::Bytes;
     use test_common::mock_client_with_stubbed_http_client;
@@ -226,7 +247,7 @@ mod tests {
             ctx: UploadContext {
                 handle: Arc::new(Handle {
                     config: Config::builder().client(s3_client).build(),
-                    scheduler: Scheduler::new(0),
+                    scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
             },

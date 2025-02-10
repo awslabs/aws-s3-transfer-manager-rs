@@ -3,14 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use futures_util::ready;
-use std::future::Future;
-use std::mem;
-use std::pin::pin;
+use std::task::Poll;
+
 use tower::Service;
 
 use super::future::ResponseFuture;
-use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit, Scheduler};
+use crate::error;
+use crate::runtime::scheduler::{PermitType, Scheduler};
 
 /// Enforces a limit on the concurrent requests an underlying service receives
 /// using the given [`Scheduler`].
@@ -18,72 +17,49 @@ use crate::runtime::scheduler::{AcquirePermitFuture, OwnedWorkPermit, Scheduler}
 pub(crate) struct ConcurrencyLimit<T> {
     inner: T,
     scheduler: Scheduler,
-    state: State,
 }
 
 impl<T> ConcurrencyLimit<T> {
     /// Create a new concurrency limiter
     pub(crate) fn new(inner: T, scheduler: Scheduler) -> Self {
-        ConcurrencyLimit {
-            inner,
-            scheduler,
-            state: State::Idle,
-        }
+        ConcurrencyLimit { inner, scheduler }
     }
 }
 
-#[derive(Debug)]
-enum State {
-    /// Permit acquired and ready
-    Ready(OwnedWorkPermit),
-    /// Waiting on a permit
-    PendingAcquire(AcquirePermitFuture),
-    /// No permit acquired or pending
-    Idle,
+/// Provide the request/response payload size estimate
+pub(crate) trait ProvidePayloadSize {
+    /// Payload size estimate in bytes
+    fn payload_size_estimate(&self) -> u64;
 }
 
 impl<S, Request> Service<Request> for ConcurrencyLimit<S>
 where
-    S: Service<Request>,
+    S: Service<Request> + Clone,
+    S::Error: From<error::Error>,
+    Request: ProvidePayloadSize,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = ResponseFuture<S::Future>;
+    type Future = ResponseFuture<S, Request>;
 
     fn poll_ready(
         &mut self,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        loop {
-            match &mut self.state {
-                State::Ready(_) => break,
-                State::PendingAcquire(permit_fut) => {
-                    let permit_fut = pin!(permit_fut);
-                    let permit =
-                        ready!(permit_fut.poll(cx)).expect("permit acquisition never fails");
-                    self.state = State::Ready(permit);
-                }
-                State::Idle => {
-                    // we loop to ensure we poll this at least once to ensure we are woken up when ready
-                    let permit_fut = self.scheduler.acquire_permit();
-                    self.state = State::PendingAcquire(permit_fut);
-                }
-            }
-        }
-        // Once we have a permit we still need to make sure the inner service is ready
-        self.inner.poll_ready(cx)
+        // We can't estimate payload size without the request so we
+        // move scheduling/concurrency limiting to `call()`.
+        // Also calling inner.poll_ready() would reserve a slot well in advance of us
+        // actually consuming it potentially as well as invalidating it later due to cloning it.
+        // Instead, signal readiness here and treat the service as a oneshot later.
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        // extract our permit and reset the state
-        let permit = match mem::replace(&mut self.state, State::Idle) {
-            State::Ready(permit) => permit,
-            _ => panic!("poll_ready must be called first!"),
-        };
-
-        let fut = self.inner.call(req);
-
-        ResponseFuture::new(fut, permit)
+        // NOTE: We assume this is a dataplane request as that is the only place
+        // we make use of tower is for upload/download. If this changes this logic needs updated.
+        let ptype = PermitType::Network(req.payload_size_estimate());
+        let permit_fut = self.scheduler.acquire_permit(ptype);
+        ResponseFuture::new(self.inner.clone(), req, permit_fut, self.scheduler.clone())
     }
 }
 
@@ -92,7 +68,6 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
         Self {
             inner: self.inner.clone(),
             scheduler: self.scheduler.clone(),
-            state: State::Idle,
         }
     }
 }
@@ -100,52 +75,72 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
 #[cfg(test)]
 mod tests {
 
-    use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
+    use crate::metrics::unit::ByteUnit;
     use crate::runtime::scheduler::Scheduler;
-    use tokio_test::{assert_pending, assert_ready_ok};
+    use crate::types::TargetThroughput;
+    use crate::{middleware::limit::concurrency::ConcurrencyLimitLayer, types::ConcurrencyMode};
+    use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
+    use tokio_test::{assert_pending, assert_ready_ok, task};
     use tower_test::{assert_request_eq, mock};
+
+    use super::ProvidePayloadSize;
+
+    #[derive(Debug)]
+    struct TestInput(&'static str);
+
+    impl ProvidePayloadSize for TestInput {
+        fn payload_size_estimate(&self) -> u64 {
+            self.0.len() as u64
+        }
+    }
+
+    impl PartialEq<&'static str> for TestInput {
+        fn eq(&self, other: &&'static str) -> bool {
+            self.0 == *other
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_service_limit() {
-        let scheduler = Scheduler::new(2);
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(2));
         let limit = ConcurrencyLimitLayer::new(scheduler);
         let (mut service, mut handle) = mock::spawn_layer(limit);
 
         assert_ready_ok!(service.poll_ready());
-        let r1 = service.call("req 1");
+        let r1 = service.call(TestInput("req 1"));
+        assert_ready_ok!(service.poll_ready());
+        let r2 = service.call(TestInput("req 2"));
 
         assert_ready_ok!(service.poll_ready());
-        let r2 = service.call("req 2");
+        let r3 = service.call(TestInput("req 3"));
 
-        assert_pending!(service.poll_ready());
-
-        assert!(!service.is_woken());
+        let mut t1 = task::spawn(r1);
+        let mut t2 = task::spawn(r2);
+        let mut t3 = task::spawn(r3);
+        assert_pending!(t1.poll());
+        assert_pending!(t2.poll());
+        assert_pending!(t3.poll());
 
         // pass requests through
         assert_request_eq!(handle, "req 1").send_response("foo");
         assert_request_eq!(handle, "req 2").send_response("bar");
 
-        // no more requests
         assert_pending!(handle.poll_request());
-        assert_eq!(r1.await.unwrap(), "foo");
+        assert_eq!(t1.await.unwrap(), "foo");
+        assert_eq!(t2.await.unwrap(), "bar");
 
-        assert!(service.is_woken());
-
-        // more requests can make it through
-        assert_ready_ok!(service.poll_ready());
-        let r3 = service.call("req 3");
-
-        assert_pending!(service.poll_ready());
-
-        assert_eq!(r2.await.unwrap(), "bar");
-
+        // NOTE: because poll_ready() is implemented in poll() for this middleware we have to
+        // manually poll it here for it to pickup the permit and actually call the service
+        // otherwise we'd block on send_response(). This is mismatch between tower-test and
+        // how they expect a service to behave.
+        assert_pending!(t3.poll());
         assert_request_eq!(handle, "req 3").send_response("baz");
-        assert_eq!(r3.await.unwrap(), "baz");
+        assert_eq!(t3.await.unwrap(), "baz");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_clone() {
-        let scheduler = Scheduler::new(1);
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
         let limit = ConcurrencyLimitLayer::new(scheduler);
         let (mut s1, mut handle) = mock::spawn_layer(limit);
 
@@ -153,86 +148,65 @@ mod tests {
 
         // s2 should share underlying scheduler
         let mut s2 = s1.clone();
-        assert_pending!(s2.poll_ready());
+        assert_ready_ok!(s2.poll_ready());
 
-        let r1 = s1.call("req 1");
+        let r1 = s1.call(TestInput("req 1"));
+        let r2 = s2.call(TestInput("req 2"));
+        let mut t1 = task::spawn(r1);
+        let mut t2 = task::spawn(r2);
+        assert_pending!(t1.poll());
         assert_request_eq!(handle, "req 1").send_response("foo");
 
         // s2 can't get capacity until the future is dropped/consumed
-        assert_pending!(s2.poll_ready());
-        r1.await.unwrap();
-        assert_ready_ok!(s2.poll_ready());
+        t1.await.unwrap();
+        assert_pending!(t2.poll());
+        assert_request_eq!(handle, "req 2").send_response("bar");
+        assert_eq!(t2.await.unwrap(), "bar");
+    }
+
+    #[derive(Debug)]
+    struct MockPayload(u64);
+
+    impl ProvidePayloadSize for MockPayload {
+        fn payload_size_estimate(&self) -> u64 {
+            self.0
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_service_drop_frees_capacity() {
-        let scheduler = Scheduler::new(1);
-        let limit = ConcurrencyLimitLayer::new(scheduler);
-        let (mut s1, mut _handle) = mock::spawn_layer::<(), (), _>(limit);
+    async fn test_throughput_mode() {
+        let _logs = show_test_logs();
+        // sanity test throughput mode limits
+        let scheduler = Scheduler::new(ConcurrencyMode::TargetThroughput(
+            TargetThroughput::new_gigabits_per_sec(100),
+        ));
 
-        assert_ready_ok!(s1.poll_ready());
+        let limit = ConcurrencyLimitLayer::new(scheduler.clone());
+        let (mut service, _handle) = mock::spawn_layer::<_, (), _>(limit);
 
-        // s2 should share underlying scheduler
-        let mut s2 = s1.clone();
-        assert_pending!(s2.poll_ready());
+        let part_size = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
-        drop(s1);
-        assert!(s2.is_woken());
-        assert_ready_ok!(s2.poll_ready());
-    }
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_drop_resp_future_frees_capacity() {
-        let scheduler = Scheduler::new(1);
-        let limit = ConcurrencyLimitLayer::new(scheduler);
-        let (mut s1, mut _handle) = mock::spawn_layer::<_, (), _>(limit);
-        let mut s2 = s1.clone();
+        let mut tasks = Vec::new();
 
-        assert_ready_ok!(s1.poll_ready());
-        let r1 = s1.call("req 1");
+        for _ in 0..256 {
+            let r = service.call(MockPayload(part_size));
+            let mut t = task::spawn(r);
+            assert_pending!(t.poll());
+            tasks.push(t);
+        }
 
-        assert_pending!(s2.poll_ready());
-        drop(r1);
-        assert_ready_ok!(s2.poll_ready());
-    }
+        // NOTE: this is heavily dependent on the token bucket implementation and constants used.
+        // This is a sanity test that we don't arbitrarily break expected concurrency controls in throughput
+        // mode using an expected result for a given workload.
+        let expected_inflight = 138;
+        assert_eq!(expected_inflight, scheduler.metrics.inflight());
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_service_error_frees_capacity() {
-        let scheduler = Scheduler::new(1);
-        let limit = ConcurrencyLimitLayer::new(scheduler);
-        let (mut s1, mut handle) = mock::spawn_layer::<_, (), _>(limit);
-        let mut s2 = s1.clone();
+        for fut in tasks.into_iter() {
+            let mut fut = fut;
+            assert_pending!(fut.poll());
+            drop(fut);
+        }
 
-        // reserve capacity on s1
-        assert_ready_ok!(s1.poll_ready());
-        assert_pending!(s2.poll_ready());
-
-        let r1 = s1.call("req 1");
-
-        assert_request_eq!(handle, "req 1").send_error("blerg");
-        r1.await.unwrap_err();
-
-        assert_ready_ok!(s2.poll_ready());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_multiple_waiting() {
-        let scheduler = Scheduler::new(1);
-        let limit = ConcurrencyLimitLayer::new(scheduler);
-        let (mut s1, mut _handle) = mock::spawn_layer::<(), (), _>(limit);
-        let mut s2 = s1.clone();
-        let mut s3 = s1.clone();
-
-        // reserve capacity on s1
-        assert_ready_ok!(s1.poll_ready());
-        assert_pending!(s2.poll_ready());
-        assert_pending!(s3.poll_ready());
-
-        drop(s1);
-
-        assert!(s2.is_woken());
-        assert!(!s3.is_woken());
-
-        drop(s2);
-        assert!(s3.is_woken());
+        assert_eq!(0, scheduler.metrics.inflight());
     }
 }
