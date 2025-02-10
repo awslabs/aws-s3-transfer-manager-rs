@@ -23,6 +23,7 @@ pub enum PartSize {
 }
 
 /// The concurrency mode the client should use for executing requests.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum ConcurrencyMode {
     /// Automatically configured concurrency based on the execution environment.
