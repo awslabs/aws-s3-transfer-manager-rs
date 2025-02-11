@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e_test")]
+#![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
