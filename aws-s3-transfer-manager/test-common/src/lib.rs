@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_s3_transfer_manager::{error::Error, operation::download::DownloadHandle};
+use bytes::{BufMut, Bytes, BytesMut};
+
 /// Create a directory structure rooted at `recursion_root`, containing files with sizes
 /// specified in `files`
 ///
@@ -73,4 +76,24 @@ macro_rules! mock_client_with_stubbed_http_client {
                 .build(),
         )
     }};
+}
+
+/// drain/consume the body
+pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
+    let body = handle.body_mut();
+    let mut data = BytesMut::new();
+    let mut error: Option<Error> = None;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(chunk) => data.put(chunk.data.into_bytes()),
+            Err(err) => {
+                error.get_or_insert(err);
+            }
+        }
+    }
+
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(data.into())
 }

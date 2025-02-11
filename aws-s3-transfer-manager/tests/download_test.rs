@@ -2,7 +2,6 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-mod test_utils;
 
 use aws_config::Region;
 use aws_s3_transfer_manager::{
@@ -21,7 +20,7 @@ use std::{
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 use bytes::{BufMut, Bytes, BytesMut};
-use test_utils::drain;
+use test_common::drain;
 
 // NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
 // As an example we generally assume object discovery goes through `GetObject` with a ranged get
