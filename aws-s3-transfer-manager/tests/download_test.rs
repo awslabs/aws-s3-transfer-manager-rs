@@ -5,9 +5,8 @@
 
 use aws_config::Region;
 use aws_s3_transfer_manager::{
-    error::{BoxError, Error},
+    error::BoxError,
     metrics::unit::ByteUnit,
-    operation::download::DownloadHandle,
     types::{ConcurrencySetting, PartSize},
 };
 use pin_project_lite::pin_project;
