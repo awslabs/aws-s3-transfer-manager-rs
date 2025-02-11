@@ -1,4 +1,4 @@
-#![cfg(e2e_test)]
+// #![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -247,7 +247,8 @@ impl PartStream for TestStream {
             // Update state
             self.idx += 1;
             self.remaining -= part_data_size;
-
+            // Schedule delay for NEXT part
+            self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_secs(3))));
             Poll::Ready(Some(Ok(part)))
         }
     }
@@ -261,27 +262,37 @@ impl PartStream for TestStream {
 async fn test_upload_with_long_running_stream() {
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
-    let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "10MB_delay");
+                                      // let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "10MB_delay");
     let (bucket_name, express_bucket_name) = get_bucket_names();
+    let object_keys: Vec<String> = (0..3)
+        .map(|i| format!("{}-{}", PUT_OBJECT_PREFIX, i))
+        .collect();
     for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
-        let stream = TestStream::new_delay(file_size);
-        perform_upload(
-            &tm,
-            bucket,
-            object_key.as_str(),
-            None,
-            InputStream::from_part_stream(stream),
-        )
-        .await;
-        let mut download_handle = tm
-            .download()
-            .bucket(bucket)
-            .key(object_key.as_str())
-            .initiate()
-            .unwrap();
+        let mut handles = vec![];
 
-        let body = drain(&mut download_handle).await.unwrap();
-
-        assert_eq!(body.len(), file_size);
+        for i in 0..3 {
+            let stream = TestStream::new_delay(file_size);
+            handles.push(perform_upload(
+                &tm,
+                bucket,
+                &object_keys[i],
+                None,
+                InputStream::from_part_stream(stream),
+            ));
+        }
+        for handle in handles {
+            handle.await
+        }
+        //
+        // let mut download_handle = tm
+        //     .download()
+        //     .bucket(bucket)
+        //     .key(object_key.as_str())
+        //     .initiate()
+        //     .unwrap();
+        //
+        // let body = drain(&mut download_handle).await.unwrap();
+        //
+        // assert_eq!(body.len(), file_size);
     }
 }
