@@ -91,7 +91,7 @@ async fn test_round_trip_helper(file_size: usize, bucket_name: &str, object_key:
 
 #[tokio::test]
 async fn test_single_part_file_round_trip() {
-    let file_size = 1 * 1024 * 1024;
+    let file_size = 1024 * 1024; // 1MB
     let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "1MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
     test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
@@ -100,7 +100,7 @@ async fn test_single_part_file_round_trip() {
 
 #[tokio::test]
 async fn test_multi_part_file_round_trip() {
-    let file_size = 20 * 1024 * 1024;
+    let file_size = 20 * 1024 * 1024; // 20MB
     let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "20MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
     test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
