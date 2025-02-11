@@ -18,7 +18,7 @@ use std::{
 
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use test_common::drain;
 
 // NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
