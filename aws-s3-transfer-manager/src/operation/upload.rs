@@ -18,6 +18,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
+use crate::runtime::scheduler::PermitType;
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadData, UploadType};
@@ -109,9 +110,13 @@ async fn put_object(
     let content_length: i64 = content_length.try_into().map_err(|_| {
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
-    // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
-    // more work for a lot of small files.
-    let _permit = ctx.handle.scheduler.acquire_permit().await?;
+
+    let _permit = ctx
+        .handle
+        .scheduler
+        .acquire_permit(PermitType::Network(content_length as u64))
+        .await?;
+
     let mut req = ctx
         .client()
         .put_object()
@@ -281,13 +286,15 @@ mod test {
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencySetting, PartSize};
+    use crate::types::ConcurrencyMode;
+    use crate::types::PartSize;
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks_experimental::{mock, RuleMode};
+    use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use bytes::Bytes;
     use std::ops::Deref;
     use std::sync::Arc;
@@ -296,6 +303,7 @@ mod test {
 
     #[tokio::test]
     async fn test_basic_mpu() {
+        let _logs = show_test_logs();
         let expected_upload_id = Arc::new("test-upload".to_owned());
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
         let stream = InputStream::from(body);
@@ -343,7 +351,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(30))
             .client(client)
@@ -380,7 +388,7 @@ mod test {
             mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)
             .build();
@@ -439,7 +447,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)

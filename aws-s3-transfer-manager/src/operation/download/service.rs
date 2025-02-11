@@ -7,6 +7,7 @@ use crate::error::ErrorKind;
 use crate::http::header;
 use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
+use crate::middleware::limit::concurrency::ProvidePayloadSize;
 use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
 use aws_smithy_types::body::SdkBody;
@@ -31,6 +32,31 @@ pub(super) struct DownloadChunkRequest {
     pub(super) start_seq: u64,
 }
 
+impl ProvidePayloadSize for DownloadChunkRequest {
+    fn payload_size_estimate(&self) -> u64 {
+        // we can't know the actual size by calling next_seq() as that would modify the
+        // state. Instead we give an estimate based on the current sequence.
+        let seq = self.ctx.current_seq();
+        let remaining = self.remaining.clone();
+        let part_size = self.ctx.handle.download_part_size_bytes();
+        let range = next_range(seq, remaining, part_size, self.start_seq);
+        range.end() - range.start() + 1
+    }
+}
+
+/// Compute the next byte range to fetch as an inclusive range
+fn next_range(
+    seq: u64,
+    remaining: RangeInclusive<u64>,
+    part_size: u64,
+    start_seq: u64,
+) -> RangeInclusive<u64> {
+    let start = remaining.start() + ((seq - start_seq) * part_size);
+    let end_inclusive = cmp::min(start + part_size - 1, *remaining.end());
+    start..=end_inclusive
+}
+
+/// Compute the next input to send for the given sequence, part size, and overall object byte range being fetched
 fn next_chunk(
     seq: u64,
     remaining: RangeInclusive<u64>,
@@ -38,9 +64,8 @@ fn next_chunk(
     start_seq: u64,
     input: DownloadInputBuilder,
 ) -> DownloadInputBuilder {
-    let start = remaining.start() + ((seq - start_seq) * part_size);
-    let end_inclusive = cmp::min(start + part_size - 1, *remaining.end());
-    input.range(header::Range::bytes_inclusive(start, end_inclusive))
+    let range = next_range(seq, remaining, part_size, start_seq);
+    input.range(header::Range::bytes_inclusive(*range.start(), *range.end()))
 }
 
 /// handler (service fn) for a single chunk
@@ -122,14 +147,14 @@ pub(super) fn chunk_service(
 /// * remaining - the remaining content range that needs to be downloaded
 /// * input - the base transfer request input used to build chunk requests from
 /// * start_seq - the starting sequence number to use for chunks
-/// * comp_tx - the channel to send chunk responses to
+/// * chunk_tx - the channel to send chunk responses to
 pub(super) fn distribute_work(
     tasks: &mut task::JoinSet<()>,
     ctx: DownloadContext,
     remaining: RangeInclusive<u64>,
     input: DownloadInput,
     start_seq: u64,
-    comp_tx: mpsc::Sender<Result<ChunkOutput, error::Error>>,
+    chunk_tx: mpsc::Sender<Result<ChunkOutput, error::Error>>,
     parent_span_for_tasks: tracing::Span,
 ) {
     let svc = chunk_service(&ctx);
@@ -147,7 +172,7 @@ pub(super) fn distribute_work(
         };
 
         let svc = svc.clone();
-        let comp_tx = comp_tx.clone();
+        let chunk_tx = chunk_tx.clone();
         let cancel_tx = ctx.state.cancel_tx.clone();
 
         let task = async move {
@@ -165,7 +190,7 @@ pub(super) fn distribute_work(
                 }
             }
 
-            if let Err(err) = comp_tx.send(resp).await {
+            if let Err(err) = chunk_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
                 if cancel_tx.send(true).is_err() {
                     tracing::debug!(
