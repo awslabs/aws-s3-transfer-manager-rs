@@ -1,9 +1,8 @@
+#![cfg(feature = "e2e_test")]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
-// #![cfg(e2e)]
 
 // Tests here requires AWS account with pre-configured S3 bucket to run the tests.
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
