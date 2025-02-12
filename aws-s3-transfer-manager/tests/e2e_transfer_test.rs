@@ -1,4 +1,4 @@
-// #![cfg(e2e_test)]
+#![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -17,12 +17,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
-use test_common::drain;
+use test_common::{drain, global_uuid_str};
+
 use tokio::time::Sleep;
 
 use aws_s3_transfer_manager::types::PartSize;
 
-const PUT_OBJECT_PREFIX: &str = "upload/put-object-test/";
+const PUT_OBJECT_PREFIX: &str = "upload/";
 
 fn get_bucket_names() -> (String, String) {
     let bucket_name = option_env!("CRT_S3_TEST_BUCKET_NAME")
@@ -30,6 +31,15 @@ fn get_bucket_names() -> (String, String) {
         .to_owned();
     let express_bucket_name = format!("{}--usw2-az1--x-s3", bucket_name.as_str());
     (bucket_name, express_bucket_name)
+}
+
+fn generate_key(readable_key: &str) -> String {
+    format!(
+        "{}{}/{}",
+        PUT_OBJECT_PREFIX,
+        global_uuid_str(),
+        readable_key
+    )
 }
 
 async fn test_tm() -> (aws_s3_transfer_manager::Client, aws_sdk_s3::Client) {
@@ -92,7 +102,7 @@ async fn test_round_trip_helper(file_size: usize, bucket_name: &str, object_key:
 #[tokio::test]
 async fn test_single_part_file_round_trip() {
     let file_size = 1024 * 1024; // 1MB
-    let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "1MB");
+    let object_key = generate_key("1MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
     test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
     test_round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
@@ -101,7 +111,7 @@ async fn test_single_part_file_round_trip() {
 #[tokio::test]
 async fn test_multi_part_file_round_trip() {
     let file_size = 20 * 1024 * 1024; // 20MB
-    let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "20MB");
+    let object_key = generate_key("20MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
     test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
     test_round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
@@ -135,7 +145,7 @@ async fn upload_and_get_checksum(
 
 async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool) {
     let file_size = size_mb * 1024 * 1024;
-    let object_key = format!("{}{}", PUT_OBJECT_PREFIX, key_suffix);
+    let object_key = generate_key(key_suffix);
     let (tm, s3_client) = test_tm().await;
 
     let (bucket_name, express_bucket_name) = get_bucket_names();
@@ -258,41 +268,31 @@ impl PartStream for TestStream {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn test_upload_with_long_running_stream() {
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
-                                      // let object_key = format!("{}{}", PUT_OBJECT_PREFIX, "10MB_delay");
+    let num_uploads = 10;
     let (bucket_name, express_bucket_name) = get_bucket_names();
-    let object_keys: Vec<String> = (0..3)
-        .map(|i| format!("{}-{}", PUT_OBJECT_PREFIX, i))
-        .collect();
     for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
-        let mut handles = vec![];
+        let object_keys: Vec<String> = (0..num_uploads)
+            .map(|i| generate_key(i.to_string().as_str()))
+            .collect();
 
-        for i in 0..3 {
+        let mut handles = vec![];
+        for i in 0..num_uploads {
             let stream = TestStream::new_delay(file_size);
-            handles.push(perform_upload(
-                &tm,
-                bucket,
-                &object_keys[i],
-                None,
-                InputStream::from_part_stream(stream),
-            ));
+
+            let upload = tm
+                .upload()
+                .bucket(bucket)
+                .key(object_keys[i].as_str())
+                .body(InputStream::from_part_stream(stream));
+
+            handles.push(upload.initiate().unwrap());
         }
         for handle in handles {
-            handle.await
+            handle.join().await.unwrap();
         }
-        //
-        // let mut download_handle = tm
-        //     .download()
-        //     .bucket(bucket)
-        //     .key(object_key.as_str())
-        //     .initiate()
-        //     .unwrap();
-        //
-        // let body = drain(&mut download_handle).await.unwrap();
-        //
-        // assert_eq!(body.len(), file_size);
     }
 }
