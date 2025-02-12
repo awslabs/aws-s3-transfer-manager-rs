@@ -10,9 +10,7 @@ use uuid::Uuid;
 
 pub fn global_uuid_str() -> &'static str {
     static UUID_STR: OnceLock<String> = OnceLock::new();
-    UUID_STR.get_or_init(|| {
-        Uuid::new_v4().to_string()
-    })
+    UUID_STR.get_or_init(|| Uuid::new_v4().to_string())
 }
 
 /// Create a directory structure rooted at `recursion_root`, containing files with sizes
