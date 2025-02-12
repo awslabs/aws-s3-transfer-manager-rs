@@ -4,6 +4,7 @@
  */
 
 use aws_s3_transfer_manager::{error::Error, operation::download::DownloadHandle};
+use aws_smithy_mocks_experimental::mock_client;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::OnceLock;
 use uuid::Uuid;
