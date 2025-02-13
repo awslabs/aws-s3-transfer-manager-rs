@@ -7,7 +7,7 @@
 // Tests here requires AWS account with pre-configured S3 bucket to run the tests.
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
-// By default, it uses s3-tm-rs-test-bucket
+// By default, it uses aws-s3-transfer-manager-rs-test-bucket
 
 use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
@@ -27,7 +27,7 @@ const PUT_OBJECT_PREFIX: &str = "upload/";
 
 fn get_bucket_names() -> (String, String) {
     let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")
-        .unwrap_or("s3-tm-rs-test-bucket")
+        .unwrap_or("aws-s3-transfer-manager-rs-test-bucket")
         .to_owned();
     let express_bucket_name = format!("{}--usw2-az1--x-s3", bucket_name.as_str());
     (bucket_name, express_bucket_name)
