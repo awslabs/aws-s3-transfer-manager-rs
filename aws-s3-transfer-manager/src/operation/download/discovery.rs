@@ -196,7 +196,7 @@ mod tests {
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
-    use aws_smithy_mocks_experimental::mock;
+    use aws_smithy_mocks_experimental::{mock, mock_client};
     use aws_smithy_types::byte_stream::ByteStream;
     use bytes::Buf;
     use test_common::mock_client_with_stubbed_http_client;

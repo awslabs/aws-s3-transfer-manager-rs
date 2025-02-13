@@ -205,7 +205,7 @@ mod tests {
         operation::list_objects_v2::ListObjectsV2Output,
         types::{CommonPrefix, Object},
     };
-    use aws_smithy_mocks_experimental::mock;
+    use aws_smithy_mocks_experimental::{mock, mock_client};
     use test_common::mock_client_with_stubbed_http_client;
 
     use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};

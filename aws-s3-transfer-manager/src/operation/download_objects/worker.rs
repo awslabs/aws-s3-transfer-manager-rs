@@ -289,7 +289,7 @@ mod tests {
     use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};
 
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
-    use aws_smithy_mocks_experimental::mock;
+    use aws_smithy_mocks_experimental::{mock, mock_client};
     use test_common::mock_client_with_stubbed_http_client;
 
     use std::path::PathBuf;
