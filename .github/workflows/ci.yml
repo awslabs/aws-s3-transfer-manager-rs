@@ -18,8 +18,8 @@ env:
   rust_clippy: '1.81'
   # When updating this, also update relevant docs
   rust_min: '1.81'
-  CRT_CI_ROLE: ${{ secrets.CRT_CI_ROLE_ARN }}
-  AWS_DEFAULT_REGION: us-west-2
+  CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
+  AWS_REGION: us-west-2
 
 
 defaults:
@@ -73,8 +73,8 @@ jobs:
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.CRT_CI_ROLE }}
-          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-to-assume: ${{ env.CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
