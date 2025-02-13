@@ -18,6 +18,8 @@ env:
   rust_clippy: '1.81'
   # When updating this, also update relevant docs
   rust_min: '1.81'
+  CRT_CI_ROLE: ${{ secrets.CRT_CI_ROLE_ARN }}
+  AWS_DEFAULT_REGION: us-east-1
 
 
 defaults:
@@ -84,6 +86,15 @@ jobs:
         run: |
           cargo nextest run --workspace --all-features
           cargo test --doc --workspace --all-features
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.CRT_CI_ROLE }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: test s3-transfer-manager e2e
+        run: |
+          RUSTFLAGS="--cfg e2e_test" cargo test e2e_transfer_test --workspace --all-features
 
   fmt:
     name: fmt
