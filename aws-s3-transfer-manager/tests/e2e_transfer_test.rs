@@ -6,7 +6,7 @@
 
 // Tests here requires AWS account with pre-configured S3 bucket to run the tests.
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
-// Set CRT_S3_TEST_BUCKET_NAME environment variables to the bucket created.
+// Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
 // By default, it uses s3-tm-rs-test-bucket
 
 use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
@@ -26,7 +26,7 @@ use aws_s3_transfer_manager::types::PartSize;
 const PUT_OBJECT_PREFIX: &str = "upload/";
 
 fn get_bucket_names() -> (String, String) {
-    let bucket_name = option_env!("CRT_S3_TEST_BUCKET_NAME")
+    let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")
         .unwrap_or("s3-tm-rs-test-bucket")
         .to_owned();
     let express_bucket_name = format!("{}--usw2-az1--x-s3", bucket_name.as_str());
@@ -258,7 +258,7 @@ impl PartStream for TestStream {
             self.idx += 1;
             self.remaining -= part_data_size;
             // Schedule delay for NEXT part
-            self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_secs(3))));
+            self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_secs(5))));
             Poll::Ready(Some(Ok(part)))
         }
     }
@@ -268,11 +268,11 @@ impl PartStream for TestStream {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_upload_with_long_running_stream() {
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
-    let num_uploads = 10;
+    let num_uploads = 50;
     let (bucket_name, express_bucket_name) = get_bucket_names();
     for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
         let object_keys: Vec<String> = (0..num_uploads)

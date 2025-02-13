@@ -98,11 +98,11 @@ Sample commands:
 pip3 install boto3
 
 # Configure test environment
-export CRT_S3_TEST_BUCKET_NAME=<your-bucket-name>
-export AWS_DEFAULT_REGION=us-west-2  # Note: Currently only us-west-2 is supported
+export S3_TEST_BUCKET_NAME_RS=<your-bucket-name> # e2e tests takes bucket name from environment variable
+export AWS_REGION=us-west-2  # Note: Currently only us-west-2 is supported
 
 # Initialize test buckets
-python3 path/to/test_helper.py init
+python3 path/to/test_helper.py init <your-bucket-name>
 
 # Run the end-to-end tests
 RUSTFLAGS="--cfg e2e_test" cargo test --all-features --test e2e_transfer_test
