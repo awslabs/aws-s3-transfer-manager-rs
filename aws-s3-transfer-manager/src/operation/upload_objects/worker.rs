@@ -323,7 +323,7 @@ fn handle_failed_upload(
 #[cfg(test)]
 mod tests {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
-    use aws_smithy_mocks_experimental::{mock_client,mock, RuleMode};
+    use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
     use bytes::Bytes;
     use test_common::mock_client_with_stubbed_http_client;
 
