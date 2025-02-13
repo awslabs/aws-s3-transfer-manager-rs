@@ -27,7 +27,7 @@ const PUT_OBJECT_PREFIX: &str = "upload/";
 
 fn get_bucket_names() -> (String, String) {
     let bucket_name = option_env!("CRT_S3_TEST_BUCKET_NAME")
-        .unwrap_or("aws-c-s3-test-bucket-099565")
+        .unwrap_or("s3-tm-rs-test-bucket")
         .to_owned();
     let express_bucket_name = format!("{}--usw2-az1--x-s3", bucket_name.as_str());
     (bucket_name, express_bucket_name)
