@@ -28,6 +28,7 @@ defaults:
 
 permissions:
   contents: read
+  id-token: write # This is required for requesting the JWT
 
 jobs:
   # depends on all actions required for a "successful" CI run
