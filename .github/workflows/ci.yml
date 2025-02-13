@@ -70,6 +70,11 @@ jobs:
           - macos-14
     needs: basics
     steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.CRT_CI_ROLE }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
         uses: dtolnay/rust-toolchain@stable
@@ -86,11 +91,6 @@ jobs:
         run: |
           cargo nextest run --workspace --all-features
           cargo test --doc --workspace --all-features
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.CRT_CI_ROLE }}
-          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
       - name: test s3-transfer-manager e2e
         run: |
