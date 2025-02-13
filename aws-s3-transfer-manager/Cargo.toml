@@ -34,7 +34,7 @@ tokio-util = "0.7.13"
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.72.0", features = ["behavior-version-latest", "test-util"] }
 aws-smithy-checksums = "0.62.0"
-aws-smithy-mocks-experimental = "0.2.2"
+aws-smithy-mocks-experimental = "0.2.1"
 aws-smithy-runtime = { version = "1.7.7", features = ["client", "connector-hyper-0-14-x", "test-util", "wire-mock"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.4.0"
