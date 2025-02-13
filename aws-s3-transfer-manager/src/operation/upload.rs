@@ -195,7 +195,7 @@ async fn try_start_mpu_upload(
 ) -> Result<UploadType, crate::error::Error> {
     let part_size = cmp::max(
         ctx.handle.upload_part_size_bytes(),
-        content_length / MAX_PARTS,
+        content_length.div_ceil(MAX_PARTS),
     );
     tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
 

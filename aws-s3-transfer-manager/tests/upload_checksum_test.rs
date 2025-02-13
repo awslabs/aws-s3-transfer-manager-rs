@@ -521,8 +521,6 @@ impl TestConfig {
 }
 
 async fn run_test(config: TestConfig) -> UploadOutput {
-    let (_guard, _rx) = capture_test_logs();
-
     // This is the ChecksumStrategy we expect the Transfer Manager to use while sending requests
     let request_checksum_strategy = config.user_checksum_strategy.clone().or(
         // If user didn't set a strategy, Transfer Manager should fall back to default strategy,

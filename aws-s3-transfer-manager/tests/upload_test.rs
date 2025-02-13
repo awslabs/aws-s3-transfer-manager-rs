@@ -8,6 +8,7 @@ use std::task::ready;
 use std::{task::Poll, time::Duration};
 
 use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -33,15 +34,17 @@ pin_project! {
         next_part_num: u64,
         rx: mpsc::Receiver<Bytes>,
         content_len: usize,
+        size_hint: u64,
     }
 }
 
 impl TestStream {
-    fn new(rx: mpsc::Receiver<Bytes>, content_len: usize) -> Self {
+    fn new(rx: mpsc::Receiver<Bytes>, content_len: usize, size_hint: u64) -> Self {
         Self {
             next_part_num: 1,
             rx,
             content_len,
+            size_hint,
         }
     }
 }
@@ -63,7 +66,7 @@ impl PartStream for TestStream {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::exact(self.content_len as u64)
+        SizeHint::exact(self.size_hint)
     }
 }
 
@@ -124,7 +127,11 @@ async fn test_many_uploads_no_deadlock() {
     let mut transfers = Vec::with_capacity(MANY_ASYNC_UPLOADS_CNT);
     for i in 0..MANY_ASYNC_UPLOADS_CNT {
         let (tx, rx) = mpsc::channel(1);
-        let stream = TestStream::new(rx, MANY_ASYNC_UPLOADS_OBJECT_SIZE);
+        let stream = TestStream::new(
+            rx,
+            MANY_ASYNC_UPLOADS_OBJECT_SIZE,
+            MANY_ASYNC_UPLOADS_OBJECT_SIZE as u64,
+        );
 
         let handle = tm
             .upload()
@@ -170,4 +177,36 @@ async fn test_many_uploads_no_deadlock() {
     while let Some(handle) = handles.pop() {
         handle.join().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_large_upload_part_size_bump() {
+    let (_guard, logs_rx) = capture_test_logs();
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+
+    let tm = aws_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let size_hint = 100 * ByteUnit::Gibibyte.as_bytes_u64();
+    let stream = TestStream::new(rx, 0, size_hint);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-large-upload-part-size".to_string())
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    // actual object is empty but we should have bumped the part_size from size_hint
+    drop(tx);
+    handle.join().await.unwrap();
+
+    let expected_part_size = 10737419;
+    let logs: String = logs_rx.contents();
+
+    assert!(logs.contains(&format!("part size: {} bytes", expected_part_size)));
 }
