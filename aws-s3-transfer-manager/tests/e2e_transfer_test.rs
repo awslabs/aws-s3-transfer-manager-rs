@@ -268,7 +268,7 @@ impl PartStream for TestStream {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn test_upload_with_long_running_stream() {
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
