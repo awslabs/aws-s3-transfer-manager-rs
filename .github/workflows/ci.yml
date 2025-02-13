@@ -19,7 +19,7 @@ env:
   # When updating this, also update relevant docs
   rust_min: '1.81'
   CRT_CI_ROLE: ${{ secrets.CRT_CI_ROLE_ARN }}
-  AWS_DEFAULT_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-west-2
 
 
 defaults:
