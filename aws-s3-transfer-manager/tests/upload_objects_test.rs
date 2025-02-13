@@ -25,7 +25,7 @@ use aws_sdk_s3::{
     },
     Client,
 };
-use aws_smithy_mocks_experimental::{mock, RuleMode};
+use aws_smithy_mocks_experimental::{mock_client,mock, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;

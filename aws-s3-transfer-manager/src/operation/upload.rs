@@ -293,7 +293,7 @@ mod test {
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-    use aws_smithy_mocks_experimental::{mock, RuleMode};
+    use aws_smithy_mocks_experimental::{mock_client,mock, RuleMode};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use bytes::Bytes;
     use std::ops::Deref;

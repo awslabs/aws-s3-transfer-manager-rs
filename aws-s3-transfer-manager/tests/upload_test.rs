@@ -11,7 +11,7 @@ use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, S
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-use aws_smithy_mocks_experimental::{mock, RuleMode};
+use aws_smithy_mocks_experimental::{mock, mock_client, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use bytes::Bytes;
 use pin_project_lite::pin_project;

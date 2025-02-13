@@ -19,7 +19,7 @@ use aws_sdk_s3::{
     },
     types::{ChecksumAlgorithm, ChecksumType},
 };
-use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
+use aws_smithy_mocks_experimental::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
