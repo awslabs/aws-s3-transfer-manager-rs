@@ -201,7 +201,7 @@ async fn test_large_upload_part_size_bump() {
         .initiate()
         .unwrap();
 
-    // actual object is empty but we should have bumped the part_size from size_hint
+    // actual object is empty, but we will bump the part_size based on size_hint
     drop(tx);
     handle.join().await.unwrap();
 
