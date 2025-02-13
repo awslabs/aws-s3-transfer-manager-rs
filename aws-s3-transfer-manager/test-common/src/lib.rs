@@ -66,6 +66,7 @@ macro_rules! mock_client_with_stubbed_http_client {
     };
     ($aws_crate: ident, $rule_mode: expr, $rules: expr) => {{
         let client = aws_smithy_mocks_experimental::mock_client!($aws_crate, $rule_mode, $rules);
+        use aws_smithy_mocks_experimental::mock_client;
         $aws_crate::client::Client::from_conf(
             client
                 .config()
