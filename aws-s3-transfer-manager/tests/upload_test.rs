@@ -204,7 +204,7 @@ async fn test_large_upload_part_size_bump() {
     // actual object is empty, but we will bump the part_size based on size_hint
     drop(tx);
     handle.join().await.unwrap();
-
+    // part_size must be bumped using size_hint.div_ceil(MAX_PARTS) to fit the MAX_PARTS limit.
     let expected_part_size = 10737419;
     let logs: String = logs_rx.contents();
 
