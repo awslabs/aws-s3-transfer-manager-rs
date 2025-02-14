@@ -89,7 +89,7 @@ pub(crate) mod middleware;
 /// HTTP related components and utils
 pub(crate) mod http;
 
-/// Internal runtime componenents
+/// Internal runtime components
 pub(crate) mod runtime;
 
 /// Metrics

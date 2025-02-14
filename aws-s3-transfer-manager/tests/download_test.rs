@@ -5,9 +5,8 @@
 
 use aws_config::Region;
 use aws_s3_transfer_manager::{
-    error::{BoxError, Error},
+    error::BoxError,
     metrics::unit::ByteUnit,
-    operation::download::DownloadHandle,
     types::{ConcurrencyMode, PartSize},
 };
 use pin_project_lite::pin_project;
@@ -19,7 +18,8 @@ use std::{
 
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
+use test_common::drain;
 
 // NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
 // As an example we generally assume object discovery goes through `GetObject` with a ranged get
@@ -41,26 +41,6 @@ fn dummy_expected_request() -> http_02x::Request<SdkBody> {
         .uri("https://not-used")
         .body(SdkBody::from(&b""[..]))
         .unwrap()
-}
-
-/// drain/consume the body
-async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
-    let body = handle.body_mut();
-    let mut data = BytesMut::new();
-    let mut error: Option<Error> = None;
-    while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(chunk) => data.put(chunk.data.into_bytes()),
-            Err(err) => {
-                error.get_or_insert(err);
-            }
-        }
-    }
-
-    if let Some(error) = error {
-        return Err(error);
-    }
-    Ok(data.into())
 }
 
 /// Create a static replay client (http connector) for an object of the given size.

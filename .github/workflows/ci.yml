@@ -18,6 +18,8 @@ env:
   rust_clippy: '1.81'
   # When updating this, also update relevant docs
   rust_min: '1.81'
+  CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
+  AWS_REGION: us-west-2
 
 
 defaults:
@@ -26,6 +28,7 @@ defaults:
 
 permissions:
   contents: read
+  id-token: write # This is required for requesting the JWT
 
 jobs:
   # depends on all actions required for a "successful" CI run
@@ -68,6 +71,11 @@ jobs:
           - macos-14
     needs: basics
     steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
         uses: dtolnay/rust-toolchain@stable
@@ -84,6 +92,10 @@ jobs:
         run: |
           cargo nextest run --workspace --all-features
           cargo test --doc --workspace --all-features
+
+      - name: test s3-transfer-manager e2e
+        run: |
+          RUSTFLAGS="--cfg e2e_test" cargo test --all-features --test e2e_transfer_test
 
   fmt:
     name: fmt
