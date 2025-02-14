@@ -270,11 +270,18 @@ impl PartStream for DelayStream {
     }
 }
 
+// This test is intended to reproduce the error we seen in https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/77
+// https://github.com/awslabs/aws-s3-transfer-manager-rs/actions/runs/13317812974/job/37196043327?pr=102 is the failed run
+// But it's not guaranteed to reproduce the error yet.
+// Also, it sometimes triggers S3 to response 400 and ClientUploadSpeedTooSlow
+// https://github.com/awslabs/aws-s3-transfer-manager-rs/actions/runs/13333953491/job/37244814880
+// ignore this test as default.
+#[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn test_upload_with_long_running_stream() {
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
-    let num_uploads = 50;
+    let num_uploads = 10;
     let (bucket_name, express_bucket_name) = get_bucket_names();
     for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
         let object_keys: Vec<String> = (0..num_uploads)
