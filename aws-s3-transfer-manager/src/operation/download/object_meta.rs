@@ -127,7 +127,7 @@ impl ObjectMetadata {
     }
 
     /// <p>Parse the content-range header to the inclusive range..</p>
-    pub(crate) fn range(&self) -> Option<RangeInclusive<u64>> {
+    pub(crate) fn range_from_content_range(&self) -> Option<RangeInclusive<u64>> {
         match self.content_length().checked_sub(1) {
             Some(object_end) => match self.content_range.as_ref() {
                 Some(range) => {
