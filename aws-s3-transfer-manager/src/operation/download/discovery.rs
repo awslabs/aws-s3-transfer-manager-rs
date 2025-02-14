@@ -192,7 +192,7 @@ fn first_chunk_response_handler(
                 .unwrap_or((chunk_content_len, object_end));
 
             // Only return a range if it's non-empty
-            (start <= end).then(|| start..=end)
+            (start <= end).then_some(start..=end)
         });
 
     let initial_chunk = match chunk_content_len == 0 {
