@@ -3,12 +3,10 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
 // Tests here requires AWS account with pre-configured S3 bucket to run the tests.
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
 // By default, it uses aws-s3-transfer-manager-rs-test-bucket
-
 use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::operation::upload::ChecksumStrategy;
@@ -23,7 +21,7 @@ use tokio::time::Sleep;
 
 use aws_s3_transfer_manager::types::PartSize;
 
-const PUT_OBJECT_PREFIX: &str = "upload/";
+const PUT_OBJECT_PREFIX: &str = "upload";
 
 fn get_bucket_names() -> (String, String) {
     let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")
@@ -35,7 +33,7 @@ fn get_bucket_names() -> (String, String) {
 
 fn generate_key(readable_key: &str) -> String {
     format!(
-        "{}{}/{}",
+        "{}/{}/{}",
         PUT_OBJECT_PREFIX,
         global_uuid_str(),
         readable_key
@@ -77,7 +75,7 @@ async fn perform_upload(
     upload.initiate().unwrap().join().await.unwrap();
 }
 
-async fn test_round_trip_helper(file_size: usize, bucket_name: &str, object_key: &str) {
+async fn round_trip_helper(file_size: usize, bucket_name: &str, object_key: &str) {
     let (tm, _) = test_tm().await;
     perform_upload(
         &tm,
@@ -104,8 +102,8 @@ async fn test_single_part_file_round_trip() {
     let file_size = 1024 * 1024; // 1MB
     let object_key = generate_key("1MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
-    test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
-    test_round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
+    round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
+    round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
 }
 
 #[tokio::test]
@@ -113,11 +111,15 @@ async fn test_multi_part_file_round_trip() {
     let file_size = 20 * 1024 * 1024; // 20MB
     let object_key = generate_key("20MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
-    test_round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
-    test_round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
+    round_trip_helper(file_size, bucket_name.as_str(), &object_key).await;
+    round_trip_helper(file_size, express_bucket_name.as_str(), &object_key).await;
 }
 
-async fn get_checksum(s3_client: &aws_sdk_s3::Client, bucket_name: &str, key: &str) -> String {
+async fn get_object_checksum(
+    s3_client: &aws_sdk_s3::Client,
+    bucket_name: &str,
+    key: &str,
+) -> String {
     s3_client
         .head_object()
         .bucket(bucket_name)
@@ -131,7 +133,7 @@ async fn get_checksum(s3_client: &aws_sdk_s3::Client, bucket_name: &str, key: &s
         .to_owned()
 }
 
-async fn upload_and_get_checksum(
+async fn upload_and_get_object_checksum(
     tm: &aws_s3_transfer_manager::Client,
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -140,10 +142,10 @@ async fn upload_and_get_checksum(
     size: usize,
 ) -> String {
     perform_upload(tm, bucket, key, Some(strategy), create_input_stream(size)).await;
-    get_checksum(s3_client, bucket, key).await
+    get_object_checksum(s3_client, bucket, key).await
 }
 
-async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool) {
+async fn checksum_test_helper(size_mb: usize, key_suffix: &str, is_multi_part: bool) {
     let file_size = size_mb * 1024 * 1024;
     let object_key = generate_key(key_suffix);
     let (tm, s3_client) = test_tm().await;
@@ -152,7 +154,7 @@ async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool
     // Test both regular S3 and S3 express
     for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
         // First upload: calculated CRC32
-        let checksum = upload_and_get_checksum(
+        let checksum = upload_and_get_object_checksum(
             &tm,
             &s3_client,
             bucket,
@@ -163,7 +165,7 @@ async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool
         .await;
 
         // Second upload: precomputed CRC32
-        upload_and_get_checksum(
+        upload_and_get_object_checksum(
             &tm,
             &s3_client,
             bucket,
@@ -175,7 +177,7 @@ async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool
 
         // Third upload: composite CRC32
         let composite_key = format!("{}-composite", object_key);
-        let composite_checksum = upload_and_get_checksum(
+        let composite_checksum = upload_and_get_object_checksum(
             &tm,
             &s3_client,
             bucket,
@@ -199,25 +201,25 @@ async fn run_checksum_test(size_mb: usize, key_suffix: &str, is_multi_part: bool
 
 #[tokio::test]
 async fn test_multi_part_file_checksum_upload() {
-    run_checksum_test(20, "20MB-crc32", true).await;
+    checksum_test_helper(20, "20MB-crc32", true).await;
 }
 
 #[tokio::test]
 async fn test_single_part_file_checksum_upload() {
-    run_checksum_test(1, "1MB-crc32", false).await;
+    checksum_test_helper(1, "1MB-crc32", false).await;
 }
 
 // TODO: add checksum validation tests for get object
 
 #[derive(Debug)]
-struct TestStream {
+struct DelayStream {
     idx: usize,
     remaining: usize,
     delay: Option<Pin<Box<Sleep>>>,
 }
 
-impl TestStream {
-    fn new_delay(total_size: usize) -> Self {
+impl DelayStream {
+    fn new(total_size: usize) -> Self {
         let delay = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
         Self {
             idx: 0,
@@ -227,7 +229,7 @@ impl TestStream {
     }
 }
 
-impl PartStream for TestStream {
+impl PartStream for DelayStream {
     fn poll_part(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -281,7 +283,7 @@ async fn test_upload_with_long_running_stream() {
 
         let mut handles = vec![];
         for i in 0..num_uploads {
-            let stream = TestStream::new_delay(file_size);
+            let stream = DelayStream::new(file_size);
 
             let upload = tm
                 .upload()
