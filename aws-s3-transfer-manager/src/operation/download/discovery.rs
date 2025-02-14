@@ -7,7 +7,6 @@ use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use std::cmp::min;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::{cmp, mem};
@@ -186,15 +185,16 @@ fn first_chunk_response_handler(
     let remaining = object_meta
         .content_length()
         .checked_sub(1)
-        .map(|object_end| match range_from_user {
-            Some(range_from_user) => {
-                (*range_from_user.start() + chunk_content_len)
-                    ..=min(object_end, *range_from_user.end())
-            }
-            // If no range is provided, the range is from the end of the chunk to the end of the object.
-            // When the chunk is the last part of the object, this result in empty range.
-            None => chunk_content_len..=object_end,
+        .and_then(|object_end| {
+            // Calculate start and end based on user range (if any)
+            let (start, end) = range_from_user
+                .map(|r| (*r.start() + chunk_content_len, (*r.end()).min(object_end)))
+                .unwrap_or((chunk_content_len, object_end));
+
+            // Only return a range if it's non-empty
+            (start <= end).then(|| start..=end)
         });
+
     let initial_chunk = match chunk_content_len == 0 {
         true => None,
         false => Some(body),
@@ -210,7 +210,6 @@ fn first_chunk_response_handler(
 
 #[cfg(test)]
 mod tests {
-    use crate::http::header::ByteRange;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
@@ -227,8 +226,6 @@ mod tests {
     use bytes::Buf;
     use std::sync::Arc;
     use test_common::mock_client_with_stubbed_http_client;
-
-    use super::ObjectDiscovery;
 
     fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
@@ -263,18 +260,24 @@ mod tests {
             strategy_from_range(Some("bytes=100-200"))
         );
         assert_eq!(
-            ObjectDiscoveryStrategy::HeadObject(Some(ByteRange::AllFrom(100))),
+            ObjectDiscoveryStrategy::HeadObject,
             strategy_from_range(Some("bytes=100-"))
         );
         assert_eq!(
-            ObjectDiscoveryStrategy::HeadObject(Some(ByteRange::Last(500))),
+            ObjectDiscoveryStrategy::HeadObject,
             strategy_from_range(Some("bytes=-500"))
         );
     }
 
-    async fn get_discovery_from_head(range: Option<ByteRange>) -> ObjectDiscovery {
-        let head_obj_rule = mock!(Client::head_object)
-            .then_output(|| HeadObjectOutput::builder().content_length(500).build());
+    #[tokio::test]
+    async fn test_discover_obj_with_head() {
+        // Returns the first 500 bytes from a 10MB object
+        let head_obj_rule = mock!(Client::head_object).then_output(|| {
+            HeadObjectOutput::builder()
+                .content_length(500)
+                .content_range("bytes 0-499/10485760")
+                .build()
+        });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&head_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()));
@@ -285,11 +288,11 @@ mod tests {
             .build()
             .unwrap();
 
-        discover_obj_with_head(&ctx, &input).await.unwrap()
+        let discovery = discover_obj_with_head(&ctx, &input).await.unwrap();
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(500, remaining.clone().count());
+        assert_eq!(0..=499, remaining);
     }
-
-    #[tokio::test]
-    async fn test_discover_obj_with_head() {}
 
     #[tokio::test]
     async fn test_discover_obj_with_get_full_range() {
@@ -352,9 +355,7 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-
-        let remaining = discovery.remaining.unwrap();
-        assert_eq!(0, remaining.clone().count());
+        assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
             .initial_chunk
