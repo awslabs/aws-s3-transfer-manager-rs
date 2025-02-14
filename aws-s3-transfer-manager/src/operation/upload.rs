@@ -5,6 +5,7 @@
 
 /// Operation builders
 pub mod builders;
+mod checksum_strategy;
 mod input;
 mod output;
 
@@ -12,11 +13,15 @@ mod context;
 mod handle;
 mod service;
 
+pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
+
 use crate::error;
+use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
-use aws_smithy_types::byte_stream::ByteStream;
+use crate::runtime::scheduler::PermitType;
 use context::UploadContext;
 pub use handle::UploadHandle;
+use handle::{MultipartUploadData, UploadType};
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
 /// Response type for uploads to Amazon S3
@@ -36,61 +41,83 @@ pub(crate) struct Upload;
 
 impl Upload {
     /// Execute a single `Upload` transfer operation
-    pub(crate) async fn orchestrate(
+    pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
-        let min_mpu_threshold = handle.mpu_threshold_bytes();
+        if input.checksum_strategy.is_none() {
+            // User didn't explicitly set checksum strategy.
+            // If SDK is configured to send checksums: use default checksum strategy.
+            // Else: continue with no checksums
+            if handle
+                .config
+                .client()
+                .config()
+                .request_checksum_calculation()
+                .cloned()
+                .unwrap_or_default()
+                == aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported
+            {
+                input.checksum_strategy = Some(ChecksumStrategy::default());
+            }
+        }
 
         let stream = input.take_body();
-        let ctx = new_context(handle, input);
-
-        // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
-        // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
-        let content_length = stream
-            .size_hint()
-            .upper()
-            .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
-
-        // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
-        let handle = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
-            tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
-            try_start_put_object(ctx, stream, content_length).await?
-        } else {
-            // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
-            //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
-            try_start_mpu_upload(ctx, stream, content_length).await?
-        };
-
-        Ok(handle)
+        let ctx = new_context(handle.clone(), input);
+        Ok(UploadHandle::new(
+            ctx.clone(),
+            tokio::spawn(try_start_upload(handle.clone(), stream, ctx)),
+        ))
     }
 }
 
-async fn try_start_put_object(
-    ctx: UploadContext,
+async fn try_start_upload(
+    handle: Arc<crate::client::Handle>,
     stream: InputStream,
-    content_length: u64,
-) -> Result<UploadHandle, crate::error::Error> {
-    let byte_stream = stream.into_byte_stream().await?;
-    let content_length: i64 = content_length.try_into().map_err(|_| {
-        error::invalid_input(format!("content_length:{} is invalid.", content_length))
-    })?;
+    ctx: UploadContext,
+) -> Result<UploadType, crate::error::Error> {
+    let min_mpu_threshold = handle.mpu_threshold_bytes();
 
-    Ok(UploadHandle::new_put_object(
-        ctx.clone(),
-        tokio::spawn(put_object(ctx.clone(), byte_stream, content_length)),
-    ))
+    // MPU has max of 10K parts which requires us to know the upper bound on the content length (today anyway)
+    // While true for file-based workloads, the upper `size_hint` might not be equal to the actual bytes transferred.
+    let content_length = stream
+        .size_hint()
+        .upper()
+        .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
+
+    let upload_type = if content_length < min_mpu_threshold && !stream.is_mpu_only() {
+        tracing::trace!("upload request content size hint ({content_length}) less than min part size threshold ({min_mpu_threshold}); sending as single PutObject request");
+        UploadType::PutObject(tokio::spawn(put_object(
+            ctx.clone(),
+            stream,
+            content_length,
+        )))
+    } else {
+        // TODO - to upload a 0 byte object via MPU you have to send [CreateMultipartUpload, UploadPart(part=1, 0 bytes), CompleteMultipartUpload]
+        //        we should add tests for this and hide this edge case from the user (e.g. send an empty part when a custom PartStream returns `None` immediately)
+        // FIXME - investigate what it would take to allow non mpu uploads for `PartStream` implementations
+        try_start_mpu_upload(ctx, stream, content_length).await?
+    };
+    Ok(upload_type)
 }
 
 async fn put_object(
     ctx: UploadContext,
-    body: ByteStream,
-    content_length: i64,
+    stream: InputStream,
+    content_length: u64,
 ) -> Result<UploadOutput, error::Error> {
-    // FIXME - This affects performance in cases with a lot of small files workloads. We need a way to schedule
-    // more work for a lot of small files.
-    let _permit = ctx.handle.scheduler.acquire_permit().await?;
-    let resp = ctx
+    let body = stream.into_byte_stream().await?;
+    let content_length: i64 = content_length.try_into().map_err(|_| {
+        error::invalid_input(format!("content_length:{} is invalid.", content_length))
+    })?;
+
+    let _permit = ctx
+        .handle
+        .scheduler
+        .acquire_permit(PermitType::Network(content_length as u64))
+        .await?;
+
+    let mut req = ctx
         .client()
         .put_object()
         .set_acl(ctx.request.acl.clone())
@@ -124,8 +151,26 @@ async fn put_object(
         .set_object_lock_mode(ctx.request.object_lock_mode.clone())
         .set_object_lock_retain_until_date(ctx.request.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
-        .set_checksum_algorithm(ctx.request.checksum_algorithm.clone())
+        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        if let Some(value) = checksum_strategy.full_object_checksum() {
+            // We have the full-object checksum value, so set it
+            req = match checksum_strategy.algorithm() {
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
+                aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(value),
+                algo => unreachable!("unexpected algorithm `{algo}` for full object checksum"),
+            };
+        } else {
+            // Set checksum algorithm, which tells SDK to calculate and add checksum value
+            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
+        }
+    }
+
+    let resp = req
+        .customize()
+        .disable_payload_signing()
         .send()
         .instrument(tracing::info_span!(
             "send-upload-part",
@@ -147,7 +192,7 @@ async fn try_start_mpu_upload(
     ctx: UploadContext,
     stream: InputStream,
     content_length: u64,
-) -> Result<UploadHandle, crate::error::Error> {
+) -> Result<UploadType, crate::error::Error> {
     let part_size = cmp::max(
         ctx.handle.upload_part_size_bytes(),
         content_length / MAX_PARTS,
@@ -159,18 +204,29 @@ async fn try_start_mpu_upload(
         "multipart upload started with upload id: {:?}",
         mpu.upload_id
     );
+    let upload_id = mpu.upload_id.clone().expect("upload_id is present");
+    let part_reader = Arc::new(
+        PartReaderBuilder::new()
+            .stream(stream)
+            .part_size(part_size.try_into().expect("valid part size"))
+            .build(),
+    );
+    let mut mpu_data = MultipartUploadData {
+        upload_part_tasks: Default::default(),
+        read_body_tasks: Default::default(),
+        response: Some(mpu),
+        upload_id,
+        part_reader,
+    };
 
-    let mut handle = UploadHandle::new_multipart(ctx);
-    handle.set_response(mpu);
-    distribute_work(&mut handle, stream, part_size)?;
-    Ok(handle)
+    distribute_work(&mut mpu_data, ctx)?;
+    Ok(UploadType::MultipartUpload(mpu_data))
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
     UploadContext {
         handle,
         request: Arc::new(req),
-        upload_id: None,
     }
 }
 
@@ -179,7 +235,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
     let req = ctx.request();
     let client = ctx.client();
 
-    let resp = client
+    let mut req = client
         .create_multipart_upload()
         .set_acl(req.acl.clone())
         .set_bucket(req.bucket.clone())
@@ -209,8 +265,15 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
         .set_object_lock_mode(req.object_lock_mode.clone())
         .set_object_lock_retain_until_date(req.object_lock_retain_until_date)
         .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(req.expected_bucket_owner.clone())
-        .set_checksum_algorithm(req.checksum_algorithm.clone())
+        .set_expected_bucket_owner(req.expected_bucket_owner.clone());
+
+    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
+        req = req
+            .checksum_algorithm(checksum_strategy.algorithm().clone())
+            .checksum_type(checksum_strategy.type_if_multipart().clone());
+    }
+
+    let resp = req
         .send()
         .instrument(tracing::debug_span!("send-create-multipart-upload"))
         .await?;
@@ -221,20 +284,26 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
 #[cfg(test)]
 mod test {
     use crate::io::InputStream;
+    use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencySetting, PartSize};
+    use crate::types::ConcurrencyMode;
+    use crate::types::PartSize;
+    use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks_experimental::{mock, RuleMode};
+    use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use bytes::Bytes;
     use std::ops::Deref;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use test_common::mock_client_with_stubbed_http_client;
 
     #[tokio::test]
     async fn test_basic_mpu() {
+        let _logs = show_test_logs();
         let expected_upload_id = Arc::new("test-upload".to_owned());
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
         let stream = InputStream::from(body);
@@ -282,7 +351,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
+            .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(30))
             .client(client)
@@ -295,7 +364,7 @@ mod test {
             .key("test-key")
             .body(stream);
 
-        let handle = request.send_with(&tm).await.unwrap();
+        let handle = request.initiate_with(&tm).unwrap();
 
         let resp = handle.join().await.unwrap();
         assert_eq!(expected_upload_id.deref(), resp.upload_id.unwrap().deref());
@@ -319,8 +388,8 @@ mod test {
             mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencySetting::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10 * 1024 * 1024))
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10 * ByteUnit::Mebibyte.as_bytes_u64()))
             .client(client)
             .build();
         let tm = crate::Client::new(tm_config);
@@ -329,9 +398,70 @@ mod test {
             .bucket("test-bucket")
             .key("test-key")
             .body(stream);
-        let handle = request.send_with(&tm).await.unwrap();
+        let handle = request.initiate_with(&tm).unwrap();
         let resp = handle.join().await.unwrap();
         assert_eq!(resp.upload_id(), None);
         assert_eq!(expected_e_tag.deref(), resp.e_tag().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_abort_multipart_upload() {
+        let expected_upload_id = Arc::new("test-upload".to_owned());
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let wait_till_create_mpu = Arc::new(Barrier::new(2));
+
+        let upload_id = expected_upload_id.clone();
+        let create_mpu =
+            mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(move || {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id(upload_id.as_ref().to_owned())
+                    .build()
+            });
+
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part).then_output({
+            let wait_till_create_mpu = wait_till_create_mpu.clone();
+            move || {
+                wait_till_create_mpu.wait();
+                UploadPartOutput::builder().build()
+            }
+        });
+
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests({
+                let upload_id: Arc<String> = expected_upload_id.clone();
+                move |input| {
+                    input.upload_id.as_ref() == Some(&upload_id)
+                        && input.bucket() == Some(bucket)
+                        && input.key() == Some(key)
+                }
+            })
+            .then_output(|| AbortMultipartUploadOutput::builder().build());
+
+        let client = mock_client_with_stubbed_http_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[create_mpu, upload_part, abort_mpu]
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let request = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream);
+        let handle = request.initiate_with(&tm).unwrap();
+        wait_till_create_mpu.wait();
+        let abort = handle.abort().await.unwrap();
+        assert_eq!(abort.upload_id().unwrap(), expected_upload_id.deref());
     }
 }

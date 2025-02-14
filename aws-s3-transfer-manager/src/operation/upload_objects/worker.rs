@@ -253,8 +253,7 @@ async fn upload_single_obj(
         .build()
         .expect("valid input");
 
-    let mut handle =
-        crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input).await?;
+    let handle = crate::operation::upload::Upload::orchestrate(ctx.handle.clone(), input)?;
 
     // The cancellation process would work fine without this if statement.
     // It's here so we can save a single upload operation that would otherwise
@@ -323,27 +322,20 @@ fn handle_failed_upload(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-
-    use aws_sdk_s3::operation::{
-        abort_multipart_upload::AbortMultipartUploadOutput,
-        create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
-        upload_part::UploadPartOutput,
-    };
+    use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks_experimental::{mock, RuleMode};
     use bytes::Bytes;
     use test_common::mock_client_with_stubbed_http_client;
 
     use crate::{
         client::Handle,
-        config::MIN_MULTIPART_PART_SIZE_BYTES,
         io::InputStream,
         operation::upload_objects::{
             worker::{upload_single_obj, UploadObjectJob},
             UploadObjectsContext, UploadObjectsInputBuilder,
         },
         runtime::scheduler::Scheduler,
-        types::PartSize,
+        types::ConcurrencyMode,
         DEFAULT_CONCURRENCY,
     };
 
@@ -718,7 +710,7 @@ mod tests {
             mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let scheduler = Scheduler::new(DEFAULT_CONCURRENCY);
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY));
 
         let handle = std::sync::Arc::new(Handle { config, scheduler });
         let input = UploadObjectsInputBuilder::default()
@@ -733,92 +725,6 @@ mod tests {
         };
 
         ctx.state.cancel_tx.send(true).unwrap();
-
-        let err = upload_single_obj(&ctx, job).await.unwrap_err();
-
-        assert_eq!(&crate::error::ErrorKind::OperationCancelled, err.kind());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancel_single_upload_via_multipart_upload() {
-        let bucket = "test-bucket";
-        let key = "test-key";
-        let upload_id: String = "test-upload-id".to_owned();
-
-        let wait_till_create_mpu = Arc::new(Barrier::new(2));
-        let (resume_upload_single_obj_tx, resume_upload_single_obj_rx) =
-            tokio::sync::watch::channel(());
-        let resume_upload_single_obj_tx = Arc::new(resume_upload_single_obj_tx);
-
-        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-            let wait_till_create_mpu = wait_till_create_mpu.clone();
-            let upload_id = upload_id.clone();
-            move || {
-                // This ensures that a cancellation signal won't be sent until `create_multipart_upload`.
-                wait_till_create_mpu.wait();
-
-                // This increases the reliability of the test, ensuring that the cancellation signal has been sent
-                // and that `upload_single_obj` can now resume.
-                while !resume_upload_single_obj_rx.has_changed().unwrap() {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                CreateMultipartUploadOutput::builder()
-                    .upload_id(upload_id.clone())
-                    .build()
-            }
-        });
-        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-            .then_output(|| UploadPartOutput::builder().build());
-        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
-            .match_requests({
-                let upload_id = upload_id.clone();
-                move |input| {
-                    input.upload_id.as_ref() == Some(&upload_id)
-                        && input.bucket() == Some(bucket)
-                        && input.key() == Some(key)
-                }
-            })
-            .then_output(|| AbortMultipartUploadOutput::builder().build());
-        let s3_client = mock_client_with_stubbed_http_client!(
-            aws_sdk_s3,
-            RuleMode::MatchAny,
-            &[create_mpu, upload_part, abort_mpu]
-        );
-        let config = crate::Config::builder()
-            .set_multipart_threshold(PartSize::Target(MIN_MULTIPART_PART_SIZE_BYTES))
-            .client(s3_client)
-            .build();
-
-        let scheduler = Scheduler::new(DEFAULT_CONCURRENCY);
-
-        let handle = std::sync::Arc::new(Handle { config, scheduler });
-        let input = UploadObjectsInputBuilder::default()
-            .source("doesnotmatter")
-            .bucket(bucket)
-            .build()
-            .unwrap();
-
-        // specify the size of the contents so it triggers multipart upload
-        let contents = vec![0; MIN_MULTIPART_PART_SIZE_BYTES as usize];
-        let ctx = UploadObjectsContext::new(handle, input);
-        let job = UploadObjectJob {
-            object: InputStream::from(Bytes::copy_from_slice(contents.as_slice())),
-            key: key.to_owned(),
-        };
-
-        tokio::task::spawn({
-            let ctx = ctx.clone();
-            let resume_upload_single_obj_tx = resume_upload_single_obj_tx.clone();
-            async move {
-                wait_till_create_mpu.wait();
-                // The upload operation has reached a point where a `CreateMultipartUploadOutput` is being prepared,
-                // which means that cancellation can now be triggered.
-                ctx.state.cancel_tx.send(true).unwrap();
-                // Tell `upload_single_obj` that it can now proceed.
-                resume_upload_single_obj_tx.send(()).unwrap();
-            }
-        });
 
         let err = upload_single_obj(&ctx, job).await.unwrap_err();
 

@@ -171,6 +171,7 @@ pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
+    pub(crate) checksum: Option<String>,
 }
 
 impl PartData {
@@ -183,7 +184,20 @@ impl PartData {
         Self {
             part_number,
             data: data.into(),
+            checksum: None,
         }
+    }
+
+    /// Set this part's checksum, if you've calculated it yourself
+    /// (base64 encoding of the big-endian checksum value for this part's data
+    /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    ///
+    /// If you don't set this, the Transfer Manager will calculate one
+    /// automatically, unless you've explicitly disabled checksum calculation
+    /// (see [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
+        self.checksum = Some(checksum.into());
+        self
     }
 }
 
@@ -208,6 +222,23 @@ pub trait PartStream {
 
     /// Returns the bounds on the total size of the stream
     fn size_hint(&self) -> crate::io::SizeHint;
+
+    /// If you calculated the full object checksum while streaming, return it.
+    /// This will be sent to S3 for validation against the checksum it calculated server side.
+    ///
+    /// If None is returned (the default implementation), S3 will not do this additional validation.
+    ///
+    /// This function is called once, after [`PartStream::poll_part()`] yields the final part,
+    /// if and only if you used a [ChecksumStrategy](crate::operation::upload::ChecksumStrategy) with
+    /// [ChecksumType::FullObject](aws_sdk_s3::types::ChecksumType) and didn't set its
+    /// [full_object_checksum](crate::operation::upload::ChecksumStrategy::full_object_checksum)
+    /// value up front.
+    ///
+    /// Return the base64 encoding of the big-endian checksum value of the full object's data,
+    /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    fn full_object_checksum(&self) -> Option<String> {
+        None
+    }
 }
 
 pub(crate) struct BoxStream {
@@ -226,6 +257,10 @@ impl BoxStream {
         stream_cx: &StreamContext,
     ) -> Option<std::io::Result<PartData>> {
         poll_fn(|cx| self.inner.as_mut().poll_part(cx, stream_cx)).await
+    }
+
+    pub(crate) fn full_object_checksum(&self) -> Option<String> {
+        self.inner.full_object_checksum()
     }
 }
 

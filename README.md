@@ -83,6 +83,30 @@ RUSTFLAGS="--cfg tokio_unstable" AWS_PROFILE=<profile-name> RUST_LOG=debug cargo
 Follow installation instructions for [tokio-console](https://github.com/tokio-rs/console) and then run the
 example with `tokio-console` running.
 
+#### End to end tests
+
+End-to-end tests are available in tests/e2e_transfer_test.rs to validate functionality against a real S3 server.
+To run these tests:
+
+1. Enable end-to-end testing by setting `RUSTFLAGS="--cfg e2e_test"`
+2. Set up a test bucket by following the aws-c-s3 test helper instructions [here](https://github.com/awslabs/aws-c-s3/blob/main/tests/test_helper/README.md)
+
+Sample commands:
+
+```sh
+# Install required Python dependency
+pip3 install boto3
+
+# Configure test environment
+export S3_TEST_BUCKET_NAME_RS=<your-bucket-name> # e2e tests takes bucket name from environment variable
+export AWS_REGION=us-west-2  # Note: Currently only us-west-2 is supported
+
+# Initialize test buckets
+python3 path/to/test_helper.py init <your-bucket-name>
+
+# Run the end-to-end tests
+RUSTFLAGS="--cfg e2e_test" cargo test --all-features --test e2e_transfer_test
+```
 
 ## Security
 

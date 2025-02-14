@@ -53,6 +53,11 @@ pub mod unit {
 
         /// The number of bits represented by this unit
         pub const fn as_bits_u64(&self) -> u64 {
+            self.as_bits_usize() as u64
+        }
+
+        /// The number of bits represented by this unit
+        pub const fn as_bits_usize(&self) -> usize {
             match self {
                 ByteUnit::Byte => 8,
                 ByteUnit::Kilobit => 1_000,
@@ -66,7 +71,12 @@ pub mod unit {
 
         /// The number of bytes represented by this unit
         pub const fn as_bytes_u64(&self) -> u64 {
-            self.as_bits_u64() >> 3
+            self.as_bytes_usize() as u64
+        }
+
+        /// The number of bytes represented by this unit
+        pub const fn as_bytes_usize(&self) -> usize {
+            self.as_bits_usize() >> 3
         }
 
         pub(crate) const fn as_str(&self) -> &'static str {
@@ -155,7 +165,7 @@ pub struct Throughput {
 
 impl Throughput {
     /// Create a new throughput measurement with the given bytes read and time elapsed
-    pub fn new(bytes_transferred: u64, elapsed: Duration) -> Throughput {
+    pub const fn new(bytes_transferred: u64, elapsed: Duration) -> Throughput {
         Throughput {
             bytes_transferred,
             elapsed,
@@ -175,7 +185,7 @@ impl Throughput {
     ///     Throughput::new_bytes_per_sec(bytes_transferred)
     /// );
     /// ```
-    pub fn new_bytes_per_sec(bytes_transferred: u64) -> Throughput {
+    pub const fn new_bytes_per_sec(bytes_transferred: u64) -> Throughput {
         Self::new(bytes_transferred, Duration::from_secs(1))
     }
 
@@ -190,7 +200,7 @@ impl Throughput {
     }
 
     /// Total bytes transferred
-    pub fn bytes_transferred(&self) -> u64 {
+    pub const fn bytes_transferred(&self) -> u64 {
         self.bytes_transferred
     }
 
@@ -274,7 +284,7 @@ pub struct ThroughputDisplayContext<'a> {
     pub unit: unit::ByteUnit,
 }
 
-impl<'a> fmt::Display for ThroughputDisplayContext<'a> {
+impl fmt::Display for ThroughputDisplayContext<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(precision) = f.precision() {
             write!(

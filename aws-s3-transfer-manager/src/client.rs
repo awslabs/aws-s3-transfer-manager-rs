@@ -4,12 +4,9 @@
  */
 
 use crate::runtime::scheduler::Scheduler;
+use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
-use crate::{
-    metrics::unit::ByteUnit,
-    types::{ConcurrencySetting, PartSize},
-    DEFAULT_CONCURRENCY,
-};
+use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
 use std::sync::Arc;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -28,10 +25,12 @@ pub(crate) struct Handle {
 impl Handle {
     /// Get the concrete number of workers to use based on the concurrency setting.
     pub(crate) fn num_workers(&self) -> usize {
+        // FIXME - update logic for auto/target throughput or delegate to scheduler?
+        // FIXME - this applies per/transfer!! the concurrency setting probably shouldn't map 1-1
+        // like this as it's meant to be concurrency across operations
         match self.config.concurrency() {
-            // TODO(aws-sdk-rust#1159): add logic for determining this
-            ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
-            ConcurrencySetting::Explicit(explicit) => *explicit,
+            ConcurrencyMode::Explicit(concurrency) => *concurrency,
+            _ => DEFAULT_CONCURRENCY,
         }
     }
 
@@ -64,12 +63,7 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        let permits = match config.concurrency() {
-            ConcurrencySetting::Auto => DEFAULT_CONCURRENCY,
-            ConcurrencySetting::Explicit(explicit) => *explicit,
-        };
-        let scheduler = Scheduler::new(permits);
-
+        let scheduler = Scheduler::new(config.concurrency().clone());
         let handle = Arc::new(Handle { config, scheduler });
         Client { handle }
     }
@@ -100,10 +94,9 @@ impl Client {
     ///         .bucket("my-bucket")
     ///         .key("my-key")
     ///         .body(stream)
-    ///         .send()
-    ///         .await?;
+    ///         .initiate()?;
     ///
-    ///     // send() may return before the transfer is complete.
+    ///     // initiate() will return before the transfer is complete.
     ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
     ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
     ///     let response = handle.join().await?;

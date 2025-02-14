@@ -5,26 +5,34 @@
 
 use std::sync::Arc;
 
+use crate::io::part_reader::PartReader;
 use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 use aws_sdk_s3::error::DisplayErrorContext;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{ChecksumType, CompletedMultipartUpload, CompletedPart};
 use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
 use tracing::Instrument;
 
 #[derive(Debug)]
 pub(crate) enum UploadType {
-    MultipartUpload {
-        /// All child multipart upload tasks spawned for this upload
-        upload_part_tasks: Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-        /// All child read body tasks spawned for this upload
-        read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
-    },
-    PutObject {
-        put_object_task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
-    },
+    MultipartUpload(MultipartUploadData),
+    PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
+}
+
+#[derive(Debug)]
+pub(crate) struct MultipartUploadData {
+    /// All child multipart upload tasks spawned for this upload
+    pub(crate) upload_part_tasks:
+        Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
+    /// All child read body tasks spawned for this upload
+    pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
+    /// The response that will eventually be yielded to the caller.
+    pub(crate) response: Option<UploadOutputBuilder>,
+    /// the multipart upload ID
+    pub(crate) upload_id: String,
+    pub(crate) part_reader: Arc<PartReader>,
 }
 
 /// Response type for a single upload object request.
@@ -50,137 +58,111 @@ pub(crate) enum UploadType {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
-    pub(crate) upload_type: UploadType,
+    /// Initial task which determines the upload type
+    initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
     /// The context used to drive an upload to completion
     pub(crate) ctx: UploadContext,
-    /// The response that will eventually be yielded to the caller.
-    response: Option<UploadOutputBuilder>,
 }
 
 impl UploadHandle {
-    /// Create a new multipart upload handle with the given request context
-    pub(crate) fn new_multipart(ctx: UploadContext) -> Self {
-        Self {
-            upload_type: UploadType::MultipartUpload {
-                upload_part_tasks: Arc::new(Mutex::new(task::JoinSet::new())),
-                read_body_tasks: task::JoinSet::new(),
-            },
-            ctx,
-            response: None,
-        }
-    }
-
-    /// Create a new put_object upload handle with the given request context
-    pub(crate) fn new_put_object(
+    pub(crate) fn new(
         ctx: UploadContext,
-        put_object_task: JoinHandle<Result<UploadOutput, crate::error::Error>>,
+        initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
     ) -> Self {
-        Self {
-            upload_type: UploadType::PutObject { put_object_task },
-            ctx,
-            response: None,
-        }
-    }
-
-    /// Set the initial response builder once available
-    ///
-    /// This is usually after `CreateMultipartUpload` is initiated (or
-    /// `PutObject` is invoked for uploads less than the required MPU threshold).
-    pub(crate) fn set_response(&mut self, builder: UploadOutputBuilder) {
-        if builder.upload_id.is_some() {
-            let upload_id = builder.upload_id.clone().expect("upload ID present");
-            self.ctx.set_upload_id(upload_id);
-        }
-
-        self.response = Some(builder);
+        Self { initiate_task, ctx }
     }
 
     /// Consume the handle and wait for upload to complete
     #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
     pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
+        // TODO: We won't send completeMPU until customers join the future. This can create a
+        // bottleneck where we have many uploads not making the completeMPU call, waiting for the join
+        // to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
+        // this without waiting for join to happen.
         complete_upload(self).await
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
     #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
-    pub async fn abort(&mut self) -> Result<AbortedUpload, crate::error::Error> {
+    pub async fn abort(self) -> Result<AbortedUpload, crate::error::Error> {
         // TODO(aws-sdk-rust#1159) - handle already completed upload
-        match &mut self.upload_type {
-            UploadType::PutObject { put_object_task } => {
-                put_object_task.abort();
-                let _ = put_object_task.await?;
+        self.initiate_task.abort();
+        if let Ok(Ok(upload_type)) = self.initiate_task.await {
+            match upload_type {
+                UploadType::PutObject(put_object_task) => {
+                    put_object_task.abort();
+                    let _ = put_object_task.await?;
+                    Ok(AbortedUpload::default())
+                }
+                UploadType::MultipartUpload(mpu_ctx) => {
+                    abort_multipart_upload(self.ctx.clone(), mpu_ctx).await
+                }
             }
-            UploadType::MultipartUpload {
-                upload_part_tasks,
-                read_body_tasks,
-            } => {
-                // cancel in-progress read_body tasks
-                read_body_tasks.abort_all();
-                while (read_body_tasks.join_next().await).is_some() {}
-
-                // cancel in-progress upload tasks
-                let mut tasks = upload_part_tasks.lock().await;
-                tasks.abort_all();
-
-                // join all tasks
-                while (tasks.join_next().await).is_some() {}
-            }
-        };
-
-        if !self.ctx.is_multipart_upload() {
-            return Ok(AbortedUpload::default());
-        }
-
-        let abort_policy = self
-            .ctx
-            .request
-            .failed_multipart_upload_policy
-            .clone()
-            .unwrap_or_default();
-
-        match abort_policy {
-            FailedMultipartUploadPolicy::AbortUpload => abort_upload(self).await,
-            FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+        } else {
+            // Nothing to abort since initiate task was not successful.
+            Ok(AbortedUpload::default())
         }
     }
 }
 
-async fn abort_upload(handle: &UploadHandle) -> Result<AbortedUpload, crate::error::Error> {
-    let abort_mpu_resp = handle
-        .ctx
-        .client()
-        .abort_multipart_upload()
-        .set_bucket(handle.ctx.request.bucket.clone())
-        .set_key(handle.ctx.request.key.clone())
-        .set_upload_id(handle.ctx.upload_id.clone())
-        .set_request_payer(handle.ctx.request.request_payer.clone())
-        .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
-        .send()
-        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-        .await?;
+/// Abort the multipart upload and cancel any in-progress part uploads.
+async fn abort_multipart_upload(
+    ctx: UploadContext,
+    mut mpu_data: MultipartUploadData,
+) -> Result<AbortedUpload, crate::error::Error> {
+    // cancel in-progress read_body tasks
+    mpu_data.read_body_tasks.abort_all();
+    while (mpu_data.read_body_tasks.join_next().await).is_some() {}
 
-    let aborted_upload = AbortedUpload {
-        upload_id: handle.ctx.upload_id.clone(),
-        request_charged: abort_mpu_resp.request_charged,
-    };
+    // cancel in-progress upload tasks
+    let mut tasks = mpu_data.upload_part_tasks.lock().await;
+    tasks.abort_all();
 
-    Ok(aborted_upload)
+    // join all tasks
+    while (tasks.join_next().await).is_some() {}
+
+    let abort_policy = ctx
+        .request
+        .failed_multipart_upload_policy
+        .clone()
+        .unwrap_or_default();
+    match abort_policy {
+        FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+        FailedMultipartUploadPolicy::AbortUpload => {
+            let abort_mpu_resp = ctx
+                .client()
+                .abort_multipart_upload()
+                .set_bucket(ctx.request.bucket.clone())
+                .set_key(ctx.request.key.clone())
+                .set_upload_id(Some(mpu_data.upload_id.clone()))
+                .set_request_payer(ctx.request.request_payer.clone())
+                .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
+                .send()
+                .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                .await?;
+
+            let aborted_upload = AbortedUpload {
+                upload_id: Some(mpu_data.upload_id),
+                request_charged: abort_mpu_resp.request_charged,
+            };
+
+            Ok(aborted_upload)
+        }
+    }
 }
 
-async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
-    match &mut handle.upload_type {
-        UploadType::PutObject { put_object_task } => put_object_task.await?,
-        UploadType::MultipartUpload {
-            upload_part_tasks,
-            read_body_tasks,
-        } => {
-            while let Some(join_result) = read_body_tasks.join_next().await {
+async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
+    let upload_type = handle.initiate_task.await??;
+    match upload_type {
+        UploadType::PutObject(put_object_task) => put_object_task.await?,
+        UploadType::MultipartUpload(mut mpu_data) => {
+            while let Some(join_result) = mpu_data.read_body_tasks.join_next().await {
                 if let Err(err) = join_result.expect("task completed") {
                     tracing::error!(
                         "multipart upload failed while trying to read the body, aborting"
                     );
                     // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                    if let Err(err) = handle.abort().await {
+                    if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
                         tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                     };
                     return Err(err);
@@ -189,7 +171,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
 
             let mut all_parts = Vec::new();
             // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
-            let mut tasks = upload_part_tasks.lock().await;
+            let mut tasks = mpu_data.upload_part_tasks.lock().await;
             while let Some(join_result) = tasks.join_next().await {
                 let result = join_result.expect("task completed");
                 match result {
@@ -199,7 +181,7 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
                         tracing::error!("multipart upload failed, aborting");
                         // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
                         drop(tasks);
-                        if let Err(err) = handle.abort().await {
+                        if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
                             tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
                         };
                         return Err(err);
@@ -213,39 +195,74 @@ async fn complete_upload(mut handle: UploadHandle) -> Result<UploadOutput, crate
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
 
             // complete the multipart upload
-            let complete_mpu_resp = handle
+            let mut req = handle
                 .ctx
                 .client()
                 .complete_multipart_upload()
                 .set_bucket(handle.ctx.request.bucket.clone())
                 .set_key(handle.ctx.request.key.clone())
-                .set_upload_id(handle.ctx.upload_id.clone())
+                .set_upload_id(Some(mpu_data.upload_id))
                 .multipart_upload(
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(all_parts))
                         .build(),
                 )
-                // TODO(aws-sdk-rust#1159) - implement checksums
-                // .set_checksum_crc32()
-                // .set_checksum_crc32_c()
-                // .set_checksum_sha1()
-                // .set_checksum_sha256()
                 .set_request_payer(handle.ctx.request.request_payer.clone())
                 .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
                 .set_sse_customer_algorithm(handle.ctx.request.sse_customer_algorithm.clone())
                 .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
-                .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone())
+                .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
+
+            if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
+                req = req.checksum_type(checksum_strategy.type_if_multipart().clone());
+
+                // check for user-provided full-object checksum...
+                if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
+                    // it might have been passed via ChecksumStrategy or PartStream
+                    let full_object_checksum = match checksum_strategy.full_object_checksum() {
+                        Some(checksum) => Some(checksum.into()),
+                        None => mpu_data.part_reader.full_object_checksum().await,
+                    };
+
+                    // if we got one, set the proper request field
+                    if let Some(value) = full_object_checksum {
+                        req = match checksum_strategy.algorithm() {
+                            aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => {
+                                req.checksum_crc32(value)
+                            }
+                            aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => {
+                                req.checksum_crc32_c(value)
+                            }
+                            aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
+                                req.checksum_crc64_nvme(value)
+                            }
+                            algo => {
+                                unreachable!(
+                                    "unexpected algorithm `{algo}` for full object checksum"
+                                )
+                            }
+                        };
+                    }
+                }
+            }
+
+            let complete_mpu_resp = req
                 .send()
                 .instrument(tracing::debug_span!("send-complete-multipart-upload"))
                 .await?;
 
             // set remaining fields from completing the multipart upload
-            let resp = handle
+            let resp = mpu_data
                 .response
                 .take()
                 .expect("response set")
                 .set_e_tag(complete_mpu_resp.e_tag.clone())
                 .set_expiration(complete_mpu_resp.expiration.clone())
+                .set_checksum_crc32(complete_mpu_resp.checksum_crc32.clone())
+                .set_checksum_crc32_c(complete_mpu_resp.checksum_crc32_c.clone())
+                .set_checksum_crc64_nvme(complete_mpu_resp.checksum_crc64_nvme.clone())
+                .set_checksum_sha1(complete_mpu_resp.checksum_sha1.clone())
+                .set_checksum_sha256(complete_mpu_resp.checksum_sha256.clone())
                 .set_version_id(complete_mpu_resp.version_id.clone());
 
             tracing::trace!("upload completed successfully");
