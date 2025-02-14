@@ -172,7 +172,9 @@ async fn send_discovery(
         discovery.chunk_meta,
     );
 
-    if let Some(remaining) = discovery.remaining {
+    if let Some(remaining) = discovery.remaining
+        && !remaining.is_empty()
+    {
         distribute_work(
             &mut tasks,
             ctx.clone(),

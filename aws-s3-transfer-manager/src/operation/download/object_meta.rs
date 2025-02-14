@@ -320,13 +320,13 @@ mod tests {
                 content_length: Some(1234),
                 ..Default::default()
             };
-            assert_eq!(meta.range(), expected);
+            assert_eq!(meta.range_from_content_range(), expected);
         }
         let meta = ObjectMetadata {
             content_range: None,
             content_length: Some(0),
             ..Default::default()
         };
-        assert_eq!(meta.range(), None);
+        assert_eq!(meta.range_from_content_range(), None);
     }
 }

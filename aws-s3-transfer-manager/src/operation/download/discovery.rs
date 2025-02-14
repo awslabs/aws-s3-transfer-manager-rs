@@ -128,7 +128,7 @@ async fn discover_obj_with_head(
     let object_meta: ObjectMetadata = resp.into();
 
     Ok(ObjectDiscovery {
-        remaining: object_meta.range(),
+        remaining: object_meta.range_from_content_range(),
         chunk_meta: None,
         object_meta,
         initial_chunk: None,
