@@ -20,7 +20,6 @@ use aws_sdk_s3::{
     types::{ChecksumAlgorithm, ChecksumType},
 };
 use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
-use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use test_common::mock_client_with_stubbed_http_client;
@@ -521,8 +520,6 @@ impl TestConfig {
 }
 
 async fn run_test(config: TestConfig) -> UploadOutput {
-    let (_guard, _rx) = capture_test_logs();
-
     // This is the ChecksumStrategy we expect the Transfer Manager to use while sending requests
     let request_checksum_strategy = config.user_checksum_strategy.clone().or(
         // If user didn't set a strategy, Transfer Manager should fall back to default strategy,
