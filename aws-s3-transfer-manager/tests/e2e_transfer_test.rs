@@ -1,4 +1,4 @@
-#![cfg(e2e_test)]
+// #![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -304,4 +304,43 @@ async fn test_upload_with_long_running_stream() {
             handle.join().await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn test_empty_object_download() {
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+
+    let object_key = "pre-existing-empty";
+
+    let mut download_handle = tm
+        .download()
+        .bucket(bucket_name)
+        .key(object_key)
+        .initiate()
+        .unwrap();
+
+    let body = drain(&mut download_handle).await.unwrap();
+
+    assert_eq!(body.len(), 0);
+}
+
+#[tokio::test]
+async fn test_object_download_range() {
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+
+    let object_key = "pre-existing-10MB";
+
+    let mut download_handle = tm
+        .download()
+        .bucket(bucket_name)
+        .key(object_key)
+        .range("bytes=-104857600")
+        .initiate()
+        .unwrap();
+
+    let body = drain(&mut download_handle).await.unwrap();
+
+    assert_eq!(body.len(), 10485760);
 }
