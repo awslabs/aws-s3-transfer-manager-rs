@@ -72,7 +72,7 @@ pub(crate) enum ByteRange {
     /// Get all bytes starting from x ("bytes=x-")
     AllFrom(u64),
 
-    /// Get the last n bytes ("bytes=-n")
+    /// Get the last n bytes ("bltes=-n")
     Last(u64),
 }
 
