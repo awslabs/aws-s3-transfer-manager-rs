@@ -1,4 +1,4 @@
-#![cfg(e2e_test)]
+// #![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -357,10 +357,11 @@ async fn test_object_download_range() {
         "bytes=-10485760",  // without start means the length to fetch. fetch the whole object
         "bytes=-10485759",  // without start means the length to fetch. fetch the whole object - 1
         "bytes=10485759-",  // start from exact end of the object without end (only 1 byte)
+        "bytes=1-",  // start from 1, which will ignore the first byte (index 0).
         "bytes=10485759-10485759", // exact end of the object (only 1 byte)
     ];
 
-    let success_expected_length = [10485760, 10485760, 10485760, 10485759, 1, 1];
+    let success_expected_length = [10485760, 10485760, 10485760, 10485759, 1, 10485759, 1];
 
     let expect_fail_ranges = [
         "bytes=104857600-",         // start over the size of the object
