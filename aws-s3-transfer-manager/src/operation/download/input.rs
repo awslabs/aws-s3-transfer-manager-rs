@@ -787,20 +787,6 @@ impl DownloadInputBuilder {
     pub fn get_request_payer(&self) -> &Option<aws_sdk_s3::types::RequestPayer> {
         &self.request_payer
     }
-    /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
-    pub fn part_number(mut self, input: i32) -> Self {
-        self.part_number = Option::Some(input);
-        self
-    }
-    /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
-    pub fn set_part_number(mut self, input: Option<i32>) -> Self {
-        self.part_number = input;
-        self
-    }
-    /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
-    pub fn get_part_number(&self) -> &Option<i32> {
-        &self.part_number
-    }
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
     pub fn expected_bucket_owner(mut self, input: impl Into<String>) -> Self {
         self.expected_bucket_owner = Option::Some(input.into());
@@ -909,7 +895,6 @@ impl From<DownloadInput> for GetObjectInputBuilder {
             .set_sse_customer_key(value.sse_customer_key)
             .set_sse_customer_key_md5(value.sse_customer_key_md5)
             .set_request_payer(value.request_payer)
-            .set_part_number(value.part_number)
             .set_expected_bucket_owner(value.expected_bucket_owner)
             .set_checksum_mode(value.checksum_mode)
     }
@@ -970,7 +955,6 @@ impl DownloadInputBuilder {
             .set_sse_customer_key(self.sse_customer_key)
             .set_sse_customer_key_md5(self.sse_customer_key_md5)
             .set_request_payer(self.request_payer)
-            .set_part_number(self.part_number)
             .set_expected_bucket_owner(self.expected_bucket_owner)
             .set_checksum_mode(self.checksum_mode)
     }

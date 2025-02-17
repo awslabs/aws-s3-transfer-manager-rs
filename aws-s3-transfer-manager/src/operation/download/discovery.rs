@@ -3,13 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::byte_stream::ByteStream;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::{cmp, mem};
-
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
-use aws_smithy_types::body::SdkBody;
-use aws_smithy_types::byte_stream::ByteStream;
 use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
@@ -23,7 +23,7 @@ use crate::http::header::{self, ByteRange};
 enum ObjectDiscoveryStrategy {
     // Send a `HeadObject` request.
     // The overall transfer is optionally constrained to the given range.
-    HeadObject(Option<ByteRange>),
+    HeadObject,
     // Send `GetObject` request using a ranged get.
     // The overall transfer is optionally constrained to the given range.
     RangedGet(Option<RangeInclusive<u64>>),
@@ -33,7 +33,7 @@ enum ObjectDiscoveryStrategy {
 #[derive(Debug)]
 pub(super) struct ObjectDiscovery {
     /// range of data remaining to be fetched
-    pub(super) remaining: RangeInclusive<u64>,
+    pub(super) remaining: Option<RangeInclusive<u64>>,
 
     /// the discovered metadata
     pub(super) chunk_meta: Option<ChunkMetadata>,
@@ -54,7 +54,7 @@ impl ObjectDiscoveryStrategy {
                     }
                     // TODO(aws-sdk-rust#1159): explore when given a start range what it would like to just start
                     // sending requests from [start, start+part_size]
-                    _ => ObjectDiscoveryStrategy::HeadObject(Some(byte_range)),
+                    _ => ObjectDiscoveryStrategy::HeadObject,
                 }
             }
             None => ObjectDiscoveryStrategy::RangedGet(None),
@@ -66,7 +66,7 @@ impl ObjectDiscoveryStrategy {
 
 /// Discover metadata about an object.
 ///
-///Returns object metadata, the remaining range of data
+/// Returns object metadata, the remaining range of data
 /// to be fetched, and _(if available)_ the first chunk of data.
 pub(super) async fn discover_obj(
     ctx: &DownloadContext,
@@ -75,25 +75,13 @@ pub(super) async fn discover_obj(
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     tracing::trace!("discovering object with strategy {:?}", strategy);
     let discovery = match strategy {
-        ObjectDiscoveryStrategy::HeadObject(byte_range) => {
-            discover_obj_with_head(ctx, input, byte_range)
+        ObjectDiscoveryStrategy::HeadObject => {
+            discover_obj_with_head(ctx, input)
                 .instrument(tracing::debug_span!("send-head-object-for-discovery"))
                 .await
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
-            let byte_range = match range.as_ref() {
-                Some(r) => ByteRange::Inclusive(
-                    *r.start(),
-                    cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
-                ),
-                None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
-            };
-            let builder: GetObjectInputBuilder = input.clone().into();
-            let r = builder
-                .set_part_number(None)
-                .range(header::Range::bytes(byte_range));
-
-            discover_obj_with_get(ctx, r, range)
+            discover_obj_with_get(ctx, input, range)
                 .instrument(tracing::debug_span!("send-ranged-get-for-discovery"))
                 .await
         }
@@ -108,14 +96,30 @@ pub(super) async fn discover_obj(
     Ok(discovery)
 }
 
+async fn discover_obj_with_get_first_part(
+    ctx: &DownloadContext,
+    input: &DownloadInput,
+) -> Result<ObjectDiscovery, error::Error> {
+    // Get object first part.
+    let builder: GetObjectInputBuilder = input.clone().into();
+    // S3 index starts with 1
+    let resp = builder
+        .set_range(None)
+        .set_part_number(Some(1))
+        .send_with(ctx.client())
+        .await
+        .map_err(error::discovery_failed)?;
+    first_chunk_response_handler(resp, None)
+}
+
 async fn discover_obj_with_head(
     ctx: &DownloadContext,
     input: &DownloadInput,
-    byte_range: Option<ByteRange>,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = ctx
         .client()
         .head_object()
+        .set_range(input.range.clone())
         .set_bucket(input.bucket().map(str::to_string))
         .set_key(input.key().map(str::to_string))
         .send()
@@ -123,19 +127,8 @@ async fn discover_obj_with_head(
         .map_err(error::discovery_failed)?;
     let object_meta: ObjectMetadata = resp.into();
 
-    let remaining = match byte_range {
-        Some(range) => match range {
-            ByteRange::Inclusive(start, end) => start..=end,
-            ByteRange::AllFrom(start) => start..=object_meta.content_length(),
-            ByteRange::Last(n) => {
-                (object_meta.content_length() - n + 1)..=object_meta.content_length()
-            }
-        },
-        None => 0..=object_meta.content_length(),
-    };
-
     Ok(ObjectDiscovery {
-        remaining,
+        remaining: object_meta.range_from_content_range(),
         chunk_meta: None,
         object_meta,
         initial_chunk: None,
@@ -144,31 +137,65 @@ async fn discover_obj_with_head(
 
 async fn discover_obj_with_get(
     ctx: &DownloadContext,
-    input: GetObjectInputBuilder,
-    range: Option<RangeInclusive<u64>>,
+    input: &DownloadInput,
+    range_from_user: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
-    let resp = input.send_with(ctx.client()).await;
-
-    if resp.is_err() {
-        // TODO(aws-sdk-rust#1159) - deal with empty file errors, see https://github.com/awslabs/aws-c-s3/blob/v0.5.7/source/s3_auto_ranged_get.c#L147-L153
+    // Convert input to builder and set the range properly as the first range get.
+    let byte_range = match range_from_user.as_ref() {
+        Some(r) => ByteRange::Inclusive(
+            *r.start(),
+            cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
+        ),
+        None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
+    };
+    let builder: GetObjectInputBuilder = input.clone().into();
+    let resp = builder
+        .range(header::Range::bytes(byte_range))
+        .send_with(ctx.client())
+        .await;
+    match resp {
+        Err(error) => {
+            match error.as_service_error() {
+                Some(service_error)
+                    if service_error.meta().code() == Some("InvalidRange")
+                        && range_from_user.is_none() =>
+                {
+                    // Invalid Range Error found and no Range passed in it's an empty object.
+                    // discover the object with the first part instead for empty object.
+                    discover_obj_with_get_first_part(ctx, input).await
+                }
+                _ => Err(error::discovery_failed(error)),
+            }
+        }
+        Ok(response) => first_chunk_response_handler(response, range_from_user),
     }
+}
 
-    let mut resp = resp.map_err(error::discovery_failed)?;
-
-    // take the body so we can convert the metadata
+fn first_chunk_response_handler(
+    mut resp: GetObjectOutput,
+    range_from_user: Option<RangeInclusive<u64>>,
+) -> Result<ObjectDiscovery, error::Error> {
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
-
     let object_meta: ObjectMetadata = (&resp).into();
     let chunk_meta: ChunkMetadata = resp.into();
-    let content_len = chunk_meta.content_length.expect("expected content_length") as u64;
+    let chunk_content_len = chunk_meta
+        .content_length
+        .expect("expected content_length in chunk") as u64;
+    let remaining = object_meta
+        .content_length()
+        .checked_sub(1)
+        .and_then(|object_end| {
+            // Calculate start and end based on user range (if any)
+            let (start, end) = range_from_user
+                .map(|r| (*r.start() + chunk_content_len, (*r.end()).min(object_end)))
+                .unwrap_or((chunk_content_len, object_end));
 
-    let remaining = match range {
-        Some(range) => (*range.start() + content_len)..=*range.end(),
-        None => content_len..=object_meta.content_length() - 1,
-    };
+            // Only return a range if it's non-empty
+            (start <= end).then_some(start..=end)
+        });
 
-    let initial_chunk = match content_len == 0 {
+    let initial_chunk = match chunk_content_len == 0 {
         true => None,
         false => Some(body),
     };
@@ -183,9 +210,6 @@ async fn discover_obj_with_get(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::http::header::ByteRange;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
@@ -193,15 +217,15 @@ mod tests {
     use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
     use crate::types::PartSize;
-    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
     use aws_smithy_mocks_experimental::mock;
     use aws_smithy_types::byte_stream::ByteStream;
+    use aws_smithy_types::error::ErrorMetadata;
     use bytes::Buf;
+    use std::sync::Arc;
     use test_common::mock_client_with_stubbed_http_client;
-
-    use super::ObjectDiscovery;
 
     fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
@@ -236,18 +260,24 @@ mod tests {
             strategy_from_range(Some("bytes=100-200"))
         );
         assert_eq!(
-            ObjectDiscoveryStrategy::HeadObject(Some(ByteRange::AllFrom(100))),
+            ObjectDiscoveryStrategy::HeadObject,
             strategy_from_range(Some("bytes=100-"))
         );
         assert_eq!(
-            ObjectDiscoveryStrategy::HeadObject(Some(ByteRange::Last(500))),
+            ObjectDiscoveryStrategy::HeadObject,
             strategy_from_range(Some("bytes=-500"))
         );
     }
 
-    async fn get_discovery_from_head(range: Option<ByteRange>) -> ObjectDiscovery {
-        let head_obj_rule = mock!(Client::head_object)
-            .then_output(|| HeadObjectOutput::builder().content_length(500).build());
+    #[tokio::test]
+    async fn test_discover_obj_with_head() {
+        // Returns the first 500 bytes from a 10MB object
+        let head_obj_rule = mock!(Client::head_object).then_output(|| {
+            HeadObjectOutput::builder()
+                .content_length(500)
+                .content_range("bytes 0-499/10485760")
+                .build()
+        });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&head_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()));
@@ -258,30 +288,10 @@ mod tests {
             .build()
             .unwrap();
 
-        discover_obj_with_head(&ctx, &input, range).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_discover_obj_with_head() {
-        assert_eq!(0..=500, get_discovery_from_head(None).await.remaining);
-        assert_eq!(
-            10..=100,
-            get_discovery_from_head(Some(ByteRange::Inclusive(10, 100)))
-                .await
-                .remaining
-        );
-        assert_eq!(
-            100..=500,
-            get_discovery_from_head(Some(ByteRange::AllFrom(100)))
-                .await
-                .remaining
-        );
-        assert_eq!(
-            401..=500,
-            get_discovery_from_head(Some(ByteRange::Last(100)))
-                .await
-                .remaining
-        );
+        let discovery = discover_obj_with_head(&ctx, &input).await.unwrap();
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(500, remaining.clone().count());
+        assert_eq!(0..=499, remaining);
     }
 
     #[tokio::test]
@@ -308,8 +318,9 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(200, discovery.remaining.clone().count());
-        assert_eq!(500..=699, discovery.remaining);
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(200, remaining.clone().count());
+        assert_eq!(500..=699, remaining);
 
         let initial_chunk = discovery
             .initial_chunk
@@ -344,7 +355,7 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(0, discovery.remaining.clone().count());
+        assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
             .initial_chunk
@@ -380,8 +391,9 @@ mod tests {
             .unwrap();
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
-        assert_eq!(200, discovery.remaining.clone().count());
-        assert_eq!(300..=499, discovery.remaining);
+        let remaining = discovery.remaining.unwrap();
+        assert_eq!(200, remaining.clone().count());
+        assert_eq!(300..=499, remaining);
 
         let initial_chunk = discovery
             .initial_chunk
@@ -390,5 +402,70 @@ mod tests {
             .await
             .expect("valid body");
         assert_eq!(100, initial_chunk.remaining());
+    }
+
+    #[tokio::test]
+    async fn test_discover_obj_with_get_over_range() {
+        let target_part_size = 100;
+        let bytes = &[0u8; 50];
+        let get_obj_rule = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=200-299"))
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(50)
+                    .content_range("200-249/250")
+                    .body(ByteStream::from_static(bytes))
+                    .build()
+            });
+        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
+
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .range("bytes=200-123456")
+            .build()
+            .unwrap();
+
+        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        assert!(discovery.remaining.is_none());
+
+        let initial_chunk = discovery
+            .initial_chunk
+            .expect("initial chunk")
+            .collect()
+            .await
+            .expect("valid body");
+        assert_eq!(50, initial_chunk.remaining());
+    }
+
+    #[tokio::test]
+    async fn test_discover_obj_with_empty_object() {
+        let target_part_size = 500;
+        let get_range_rule = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=0-499"))
+            .then_error(|| {
+                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
+            });
+        let get_first_part_rule = mock!(Client::get_object)
+            .match_requests(|r| r.part_number() == Some(1))
+            .then_output(|| GetObjectOutput::builder().content_length(0).build());
+        let client = mock_client_with_stubbed_http_client!(
+            aws_sdk_s3,
+            &[&get_range_rule, &get_first_part_rule]
+        );
+
+        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        assert!(discovery.remaining.is_none());
+        assert!(discovery.initial_chunk.is_none());
     }
 }
