@@ -17,9 +17,8 @@ use std::task::Poll;
 use std::time::Duration;
 use test_common::{drain, global_uuid_str};
 
-use tokio::time::Sleep;
-
 use aws_s3_transfer_manager::types::PartSize;
+use tokio::time::Sleep;
 
 const PUT_OBJECT_PREFIX: &str = "upload";
 
@@ -325,6 +324,26 @@ async fn test_empty_object_download() {
     assert_eq!(body.len(), 0);
 }
 
+async fn range_download_helper(
+    tm: &aws_s3_transfer_manager::Client,
+    bucket: &str,
+    key: &str,
+    range: &str,
+    expected_length: usize,
+) -> Result<(), aws_s3_transfer_manager::error::Error> {
+    let mut download_handle = tm
+        .download()
+        .bucket(bucket)
+        .key(key)
+        .range(range)
+        .initiate()?;
+
+    let body = drain(&mut download_handle).await?;
+
+    assert_eq!(body.len(), expected_length);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_object_download_range() {
     let (tm, _) = test_tm().await;
@@ -332,15 +351,40 @@ async fn test_object_download_range() {
 
     let object_key = "pre-existing-10MB";
 
-    let mut download_handle = tm
-        .download()
-        .bucket(bucket_name)
-        .key(object_key)
-        .range("bytes=-104857600")
-        .initiate()
+    let success_ranges = [
+        "bytes=0-104857600",       // Over the size of the object
+        "bytes=-104857600", // without start means the length to fetch. fetch more than the size of object
+        "bytes=-10485760",  // without start means the length to fetch. fetch the whole object
+        "bytes=-10485759",  // without start means the length to fetch. fetch the whole object - 1
+        "bytes=10485759-",  // start from exact end of the object without end (only 1 byte)
+        "bytes=10485759-10485759", // exact end of the object (only 1 byte)
+    ];
+
+    let success_expected_length = [10485760, 10485760, 10485760, 10485759, 1, 1];
+
+    let expect_fail_ranges = [
+        "bytes=104857600-",         // start over the size of the object
+        "bytes=10485760-", // start over the size of the object, 10MiB -> 10485760, but range starts from 0
+        "bytes=10485760-104857600", // start over the size of the object, 10MiB -> 10485760, but range starts from 0
+        "bytes=0-499, -499",        // multiple range is not supported.
+    ];
+    // Test success case:
+    for i in 0..success_ranges.len() {
+        range_download_helper(
+            &tm,
+            &bucket_name,
+            object_key,
+            success_ranges[i],
+            success_expected_length[i],
+        )
+        .await
         .unwrap();
+    }
 
-    let body = drain(&mut download_handle).await.unwrap();
-
-    assert_eq!(body.len(), 10485760);
+    for i in expect_fail_ranges {
+        // The fail case should error out.
+        range_download_helper(&tm, &bucket_name, object_key, i, 0)
+            .await
+            .unwrap_err();
+    }
 }
