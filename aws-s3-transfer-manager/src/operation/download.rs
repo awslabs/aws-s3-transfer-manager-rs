@@ -33,7 +33,7 @@ mod service;
 
 use crate::error;
 use crate::io::AggregatedBytes;
-use crate::runtime::scheduler::{OwnedWorkPermit, PermitType};
+use crate::runtime::scheduler::{NetworkPermitContext, OwnedWorkPermit, PermitType, RequestType};
 use aws_smithy_types::byte_stream::ByteStream;
 use discovery::discover_obj;
 use service::distribute_work;
@@ -70,7 +70,13 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let ctx = DownloadContext::new(handle);
+        let request_type = if input.bucket().unwrap_or("").ends_with("--x-s3") {
+            RequestType::S3ExpressDownload
+        } else {
+            RequestType::S3Download
+        };
+
+        let ctx = DownloadContext::new(handle, request_type);
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
         let (object_meta_tx, object_meta_rx) = oneshot::channel();
@@ -120,7 +126,10 @@ async fn send_discovery(
     let permit = ctx
         .handle
         .scheduler
-        .acquire_permit(PermitType::Network(0))
+        .acquire_permit(PermitType::Network(NetworkPermitContext {
+            payload_size_estimate: 0,
+            request_type: ctx.request_type(),
+        }))
         .await;
     let permit = match permit {
         Ok(permit) => permit,
@@ -239,17 +248,19 @@ pub(crate) struct DownloadState {
     current_seq: AtomicU64,
     cancel_tx: CancelNotificationSender,
     cancel_rx: CancelNotificationReceiver,
+    request_type: RequestType,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
 
 impl DownloadContext {
-    fn new(handle: Arc<crate::client::Handle>) -> Self {
+    fn new(handle: Arc<crate::client::Handle>, request_type: RequestType) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             current_seq: AtomicU64::new(0),
             cancel_tx,
             cancel_rx,
+            request_type,
         });
         TransferContext { handle, state }
     }
@@ -267,5 +278,9 @@ impl DownloadContext {
     /// Returns the current seq
     fn current_seq(&self) -> u64 {
         self.state.current_seq.load(Ordering::SeqCst)
+    }
+
+    fn request_type(&self) -> RequestType {
+        self.state.request_type.clone()
     }
 }

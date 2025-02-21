@@ -4,6 +4,7 @@
  */
 
 use crate::operation::upload::UploadInput;
+use crate::runtime::scheduler::RequestType;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -14,6 +15,8 @@ pub(crate) struct UploadContext {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
+
+    pub(crate) request_type: RequestType,
 }
 
 impl UploadContext {
@@ -25,5 +28,10 @@ impl UploadContext {
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()
+    }
+
+    /// The original request (sans the body as it will have been taken for processing)
+    pub(crate) fn request_type(&self) -> RequestType {
+        self.request_type.clone()
     }
 }

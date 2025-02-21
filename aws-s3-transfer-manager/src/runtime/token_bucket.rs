@@ -15,6 +15,8 @@ use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::scheduler::PermitType;
 use crate::types::ConcurrencyMode;
 
+use super::scheduler::{NetworkPermitContext, RequestType};
+
 /// Default throughput target for auto mode (10 Gbps)
 ///
 /// Source: CRT default for target throughput: https://github.com/awslabs/aws-c-s3/blob/6eb8be530b100fed5c6d24ca48a57ee2e6098fbf/source/s3_client.c#L79
@@ -34,7 +36,17 @@ const S3_P50_REQUEST_LATENCY: Duration = Duration::from_millis(30);
 /// > Make one concurrent request for each 85-90 MB/s of desired network throughput
 ///
 /// Applies to: ConcurrencyMode::TargetThroughput
-const S3_MAX_PER_REQUEST_THROUGHPUT: Throughput = Throughput::new_bytes_per_sec(90 * 1000 * 1000);
+const S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(90 * 1000 * 1000);
+
+const S3_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(45 * 1000 * 1000);
+
+const S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(150 * 1000 * 1000);
+
+const S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(90 * 1000 * 1000);
 
 /// Minimum concurrent requests at full throughput we want to support
 ///
@@ -51,8 +63,10 @@ const MIN_CONCURRENT_REQUESTS: u64 = 8;
 ///
 /// Source: None, reasonable default
 /// Applies to: ConcurrencyMode::TargetThroughput
-const MIN_BUCKET_TOKENS: u64 =
-    (S3_MAX_PER_REQUEST_THROUGHPUT.bytes_transferred() / 1_000_000) * 8 * MIN_CONCURRENT_REQUESTS;
+const MIN_BUCKET_TOKENS: u64 = (S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT.bytes_transferred()
+    / 1_000_000)
+    * 8
+    * MIN_CONCURRENT_REQUESTS;
 
 /// Minimum token cost regardless of payload size
 ///
@@ -63,10 +77,21 @@ const MIN_PAYLOAD_COST_TOKENS: u64 = 5;
 impl PermitType {
     /// The token cost for the permit type in Mbps
     fn token_cost_megabit_per_sec(&self) -> u32 {
-        let cost = match *self {
+        let cost = match self {
             PermitType::Network(payload_size) => tokens_for_payload(payload_size),
         };
         cost.try_into().unwrap()
+    }
+}
+
+impl RequestType {
+    fn max_per_request_throughput(&self) -> Throughput {
+        match self {
+            RequestType::S3Download => S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT,
+            RequestType::S3Upload => S3_MAX_PER_REQUEST_UPLOAD_THROUGHPUT,
+            RequestType::S3ExpressDownload => S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT,
+            RequestType::S3ExpressUpload => S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT,
+        }
     }
 }
 
@@ -188,11 +213,11 @@ fn token_bucket_size(throughput: Throughput) -> u64 {
 }
 
 /// Tokens for payload size
-fn tokens_for_payload(payload_size: u64) -> u64 {
+fn tokens_for_payload(network_context: &NetworkPermitContext) -> u64 {
     let estimated_mbps = estimated_throughput(
-        payload_size,
+        network_context.payload_size_estimate,
         S3_P50_REQUEST_LATENCY,
-        S3_MAX_PER_REQUEST_THROUGHPUT,
+        network_context.request_type.max_per_request_throughput(),
     )
     .as_unit_per_sec(ByteUnit::Megabit)
     .round()
@@ -221,6 +246,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::unit::ByteUnit;
+    use crate::runtime::scheduler::{NetworkPermitContext, RequestType};
     use crate::runtime::token_bucket::{estimated_throughput, tokens_for_payload};
     use crate::{
         metrics::Throughput,
@@ -267,11 +293,47 @@ mod tests {
 
     #[test]
     fn test_tokens_for_payload() {
-        assert_eq!(5, tokens_for_payload(1024));
-        assert_eq!(27, tokens_for_payload(100 * 1024));
-        assert_eq!(267, tokens_for_payload(MEGABYTE));
-        assert_eq!(720, tokens_for_payload(5 * MEGABYTE));
-        assert_eq!(720, tokens_for_payload(8 * MEGABYTE));
-        assert_eq!(720, tokens_for_payload(1000 * MEGABYTE));
+        assert_eq!(
+            5,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 1024,
+                request_type: RequestType::S3Download,
+            })
+        );
+        assert_eq!(
+            27,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                request_type: RequestType::S3Download,
+            })
+        );
+        assert_eq!(
+            267,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                request_type: RequestType::S3Download,
+            })
+        );
+        assert_eq!(
+            720,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 5 * MEGABYTE,
+                request_type: RequestType::S3Download,
+            })
+        );
+        assert_eq!(
+            720,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 8 * MEGABYTE,
+                request_type: RequestType::S3Download,
+            })
+        );
+        assert_eq!(
+            720,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 1000 * MEGABYTE,
+                request_type: RequestType::S3Download,
+            })
+        );
     }
 }

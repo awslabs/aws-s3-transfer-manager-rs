@@ -18,7 +18,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
-use crate::runtime::scheduler::PermitType;
+use crate::runtime::scheduler::{NetworkPermitContext, PermitType, RequestType};
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadData, UploadType};
@@ -111,10 +111,14 @@ async fn put_object(
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
 
+    // waahm7: fix
     let _permit = ctx
         .handle
         .scheduler
-        .acquire_permit(PermitType::Network(content_length as u64))
+        .acquire_permit(PermitType::Network(NetworkPermitContext {
+            payload_size_estimate: content_length as u64,
+            request_type: ctx.request_type(),
+        }))
         .await?;
 
     let mut req = ctx
@@ -224,9 +228,15 @@ async fn try_start_mpu_upload(
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
+    let request_type = if req.bucket().unwrap_or("").starts_with("--x-s3") {
+        RequestType::S3ExpressUpload
+    } else {
+        RequestType::S3Upload
+    };
     UploadContext {
         handle,
         request: Arc::new(req),
+        request_type,
     }
 }
 

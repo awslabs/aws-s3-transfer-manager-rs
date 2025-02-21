@@ -58,7 +58,19 @@ impl Scheduler {
     }
 }
 
-pub(crate) type PayloadEstimate = u64;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestType {
+    S3Upload,
+    S3Download,
+    S3ExpressUpload,
+    S3ExpressDownload,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkPermitContext {
+    pub(crate) payload_size_estimate: u64,
+    pub(crate) request_type: RequestType,
+}
 
 // TODO - when we support configuring throughput indepently we'll need to distinguish the permit
 // type and track it separately in the token bucket(s).
@@ -67,7 +79,7 @@ pub(crate) type PayloadEstimate = u64;
 #[derive(Debug, Clone)]
 pub(crate) enum PermitType {
     /// A network request to transmit or receive to or from an API with the given payload size estimate
-    Network(PayloadEstimate),
+    Network(NetworkPermitContext),
 }
 
 /// An owned permit from the scheduler to perform some unit of work.
@@ -154,18 +166,27 @@ impl SchedulerMetrics {
 #[cfg(test)]
 mod tests {
     use super::{PermitType, Scheduler};
-    use crate::types::ConcurrencyMode;
+    use crate::{
+        runtime::scheduler::{NetworkPermitContext, RequestType},
+        types::ConcurrencyMode,
+    };
 
     #[tokio::test]
     async fn test_acquire_mode_explicit() {
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
+        let network_permit_context = NetworkPermitContext {
+            payload_size_estimate: 0,
+            request_type: RequestType::S3Download,
+        };
         let p1 = scheduler
-            .acquire_permit(PermitType::Network(0))
+            .acquire_permit(PermitType::Network(network_permit_context.clone()))
             .await
             .unwrap();
         let scheduler2 = scheduler.clone();
         let jh = tokio::spawn(async move {
-            let _p2 = scheduler2.acquire_permit(PermitType::Network(0)).await;
+            let _p2 = scheduler2
+                .acquire_permit(PermitType::Network(network_permit_context))
+                .await;
         });
         assert!(!jh.is_finished());
         drop(p1);

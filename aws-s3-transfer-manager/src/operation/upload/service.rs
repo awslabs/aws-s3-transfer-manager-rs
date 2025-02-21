@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use super::MultipartUploadData;
+use super::{MultipartUploadData, RequestType};
 use crate::{
     error,
     io::{part_reader::PartReader, PartData},
     middleware::{
         hedge,
-        limit::concurrency::{ConcurrencyLimitLayer, ProvidePayloadSize},
+        limit::concurrency::{ConcurrencyLimitLayer, ProvideNetworkPermitContext},
     },
     operation::upload::UploadContext,
+    runtime::scheduler::NetworkPermitContext,
 };
 use aws_sdk_s3::{
     primitives::ByteStream,
@@ -38,9 +39,12 @@ pub(super) struct UploadPartRequest {
     pub(super) upload_id: String,
 }
 
-impl ProvidePayloadSize for UploadPartRequest {
-    fn payload_size_estimate(&self) -> u64 {
-        self.part_data.data.len() as u64
+impl ProvideNetworkPermitContext for UploadPartRequest {
+    fn network_permit_context(&self) -> NetworkPermitContext {
+        NetworkPermitContext {
+            payload_size_estimate: self.part_data.data.len() as u64,
+            request_type: self.ctx.request_type(),
+        }
     }
 }
 
@@ -49,10 +53,10 @@ pub(crate) struct UploadHedgePolicy;
 
 impl Policy<UploadPartRequest> for UploadHedgePolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
-        if req.ctx.request.bucket().unwrap_or("").ends_with("--x-s3") {
-            None
-        } else {
+        if req.ctx.request_type() == RequestType::S3Upload {
             Some(req.clone())
+        } else {
+            None
         }
     }
     fn can_retry(&self, _req: &UploadPartRequest) -> bool {
@@ -234,7 +238,7 @@ pub(super) async fn read_body(
 mod tests {
     use super::*;
     use crate::client::Handle;
-    use crate::operation::upload::UploadInput;
+    use crate::operation::upload::{RequestType, UploadInput};
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
     use crate::Config;
@@ -250,6 +254,7 @@ mod tests {
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
+                request_type: RequestType::S3Upload,
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),
