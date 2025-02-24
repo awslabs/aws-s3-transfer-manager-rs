@@ -228,7 +228,7 @@ async fn try_start_mpu_upload(
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
-    let request_type = if req.bucket().unwrap_or("").starts_with("--x-s3") {
+    let request_type = if req.bucket().unwrap_or("").ends_with("--x-s3") {
         RequestType::S3ExpressUpload
     } else {
         RequestType::S3Upload
