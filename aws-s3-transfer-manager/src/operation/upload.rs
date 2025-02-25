@@ -111,7 +111,6 @@ async fn put_object(
         error::invalid_input(format!("content_length:{} is invalid.", content_length))
     })?;
 
-    // waahm7: fix
     let _permit = ctx
         .handle
         .scheduler

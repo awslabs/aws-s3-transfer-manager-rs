@@ -46,7 +46,7 @@ const S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
     Throughput::new_bytes_per_sec(150 * 1000 * 1000);
 
 const S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
-    Throughput::new_bytes_per_sec(90 * 1000 * 1000);
+    Throughput::new_bytes_per_sec(125 * 1000 * 1000);
 
 /// Minimum concurrent requests at full throughput we want to support
 ///
