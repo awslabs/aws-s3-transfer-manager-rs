@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{MultipartUploadData, RequestType};
+use super::{BucketType, MultipartUploadData, TransferDirection};
 use crate::{
     error,
     io::{part_reader::PartReader, PartData},
@@ -43,7 +43,8 @@ impl ProvideNetworkPermitContext for UploadPartRequest {
     fn network_permit_context(&self) -> NetworkPermitContext {
         NetworkPermitContext {
             payload_size_estimate: self.part_data.data.len() as u64,
-            request_type: self.ctx.request_type(),
+            bucket_type: self.ctx.bucket_type(),
+            direction: TransferDirection::Upload,
         }
     }
 }
@@ -53,12 +54,13 @@ pub(crate) struct UploadHedgePolicy;
 
 impl Policy<UploadPartRequest> for UploadHedgePolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
-        if req.ctx.request_type() == RequestType::S3Upload {
+        if req.ctx.bucket_type() == BucketType::Standard {
             Some(req.clone())
         } else {
             None
         }
     }
+
     fn can_retry(&self, _req: &UploadPartRequest) -> bool {
         true
     }
@@ -238,7 +240,7 @@ pub(super) async fn read_body(
 mod tests {
     use super::*;
     use crate::client::Handle;
-    use crate::operation::upload::{RequestType, UploadInput};
+    use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
     use crate::Config;
@@ -247,7 +249,7 @@ mod tests {
 
     fn _mock_upload_part_request_with_bucket_name(
         bucket_name: &str,
-        request_type: RequestType,
+        bucket_type: BucketType,
     ) -> UploadPartRequest {
         let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, []);
         UploadPartRequest {
@@ -257,7 +259,7 @@ mod tests {
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
-                request_type,
+                bucket_type,
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),
@@ -270,11 +272,11 @@ mod tests {
 
         // Test S3 Express bucket
         let express_req =
-            _mock_upload_part_request_with_bucket_name("test--x-s3", RequestType::S3ExpressUpload);
+            _mock_upload_part_request_with_bucket_name("test--x-s3", BucketType::Express);
         assert!(policy.clone_request(&express_req).is_none());
 
         // Test regular bucket
-        let regular_req = _mock_upload_part_request_with_bucket_name("test", RequestType::S3Upload);
+        let regular_req = _mock_upload_part_request_with_bucket_name("test", BucketType::Standard);
         assert!(policy.clone_request(&regular_req).is_some());
     }
 }

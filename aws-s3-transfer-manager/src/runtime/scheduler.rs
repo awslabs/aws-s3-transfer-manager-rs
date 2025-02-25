@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::error;
+use crate::operation::BucketType;
 use crate::runtime::token_bucket::{OwnedToken, TokenBucket};
 use crate::types::ConcurrencyMode;
 
@@ -58,18 +59,17 @@ impl Scheduler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RequestType {
-    S3Upload,
-    S3Download,
-    S3ExpressUpload,
-    S3ExpressDownload,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TransferDirection {
+    Upload,
+    Download,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct NetworkPermitContext {
     pub(crate) payload_size_estimate: u64,
-    pub(crate) request_type: RequestType,
+    pub(crate) bucket_type: BucketType,
+    pub(crate) direction: TransferDirection,
 }
 
 // TODO - when we support configuring throughput indepently we'll need to distinguish the permit
@@ -167,7 +167,8 @@ impl SchedulerMetrics {
 mod tests {
     use super::{PermitType, Scheduler};
     use crate::{
-        runtime::scheduler::{NetworkPermitContext, RequestType},
+        operation::BucketType,
+        runtime::scheduler::{NetworkPermitContext, TransferDirection},
         types::ConcurrencyMode,
     };
 
@@ -176,7 +177,8 @@ mod tests {
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
         let network_permit_context = NetworkPermitContext {
             payload_size_estimate: 0,
-            request_type: RequestType::S3Download,
+            bucket_type: BucketType::Standard,
+            direction: TransferDirection::Download,
         };
         let p1 = scheduler
             .acquire_permit(PermitType::Network(network_permit_context.clone()))

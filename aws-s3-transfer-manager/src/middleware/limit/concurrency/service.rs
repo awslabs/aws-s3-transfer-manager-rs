@@ -76,7 +76,8 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
 mod tests {
 
     use crate::metrics::unit::ByteUnit;
-    use crate::runtime::scheduler::{RequestType, Scheduler};
+    use crate::operation::BucketType;
+    use crate::runtime::scheduler::{Scheduler, TransferDirection};
     use crate::types::TargetThroughput;
     use crate::{middleware::limit::concurrency::ConcurrencyLimitLayer, types::ConcurrencyMode};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
@@ -92,7 +93,8 @@ mod tests {
         fn network_permit_context(&self) -> super::NetworkPermitContext {
             super::NetworkPermitContext {
                 payload_size_estimate: self.0.len() as u64,
-                request_type: RequestType::S3Download,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
             }
         }
     }
@@ -174,7 +176,8 @@ mod tests {
         fn network_permit_context(&self) -> super::NetworkPermitContext {
             super::NetworkPermitContext {
                 payload_size_estimate: self.0,
-                request_type: RequestType::S3Download,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
             }
         }
     }

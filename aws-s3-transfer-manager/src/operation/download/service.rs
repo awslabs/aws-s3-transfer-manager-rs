@@ -22,6 +22,7 @@ use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
 use super::body::ChunkOutput;
+use super::TransferDirection;
 use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
@@ -45,7 +46,8 @@ impl ProvideNetworkPermitContext for DownloadChunkRequest {
 
         NetworkPermitContext {
             payload_size_estimate: payload_estimate,
-            request_type: self.ctx.request_type(),
+            bucket_type: self.ctx.bucket_type(),
+            direction: TransferDirection::Download,
         }
     }
 }

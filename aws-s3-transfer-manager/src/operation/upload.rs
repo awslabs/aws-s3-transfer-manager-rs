@@ -18,7 +18,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
-use crate::runtime::scheduler::{NetworkPermitContext, PermitType, RequestType};
+use crate::runtime::scheduler::{NetworkPermitContext, PermitType, TransferDirection};
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadData, UploadType};
@@ -31,6 +31,8 @@ use tracing::Instrument;
 
 use std::cmp;
 use std::sync::Arc;
+
+use super::BucketType;
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
@@ -116,7 +118,8 @@ async fn put_object(
         .scheduler
         .acquire_permit(PermitType::Network(NetworkPermitContext {
             payload_size_estimate: content_length as u64,
-            request_type: ctx.request_type(),
+            bucket_type: ctx.bucket_type(),
+            direction: TransferDirection::Upload,
         }))
         .await?;
 
@@ -227,15 +230,15 @@ async fn try_start_mpu_upload(
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
-    let request_type = if req.bucket().unwrap_or("").ends_with("--x-s3") {
-        RequestType::S3ExpressUpload
+    let bucket_type = if req.bucket().unwrap_or("").ends_with("--x-s3") {
+        BucketType::Express
     } else {
-        RequestType::S3Upload
+        BucketType::Standard
     };
     UploadContext {
         handle,
         request: Arc::new(req),
-        request_type,
+        bucket_type,
     }
 }
 

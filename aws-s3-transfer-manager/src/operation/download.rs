@@ -33,7 +33,9 @@ mod service;
 
 use crate::error;
 use crate::io::AggregatedBytes;
-use crate::runtime::scheduler::{NetworkPermitContext, OwnedWorkPermit, PermitType, RequestType};
+use crate::runtime::scheduler::{
+    NetworkPermitContext, OwnedWorkPermit, PermitType, TransferDirection,
+};
 use aws_smithy_types::byte_stream::ByteStream;
 use discovery::discover_obj;
 use service::distribute_work;
@@ -42,7 +44,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
 
-use super::{CancelNotificationReceiver, CancelNotificationSender, TransferContext};
+use super::{BucketType, CancelNotificationReceiver, CancelNotificationSender, TransferContext};
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -70,13 +72,13 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let request_type = if input.bucket().unwrap_or("").ends_with("--x-s3") {
-            RequestType::S3ExpressDownload
+        let bucket_type = if input.bucket().unwrap_or("").ends_with("--x-s3") {
+            BucketType::Express
         } else {
-            RequestType::S3Download
+            BucketType::Standard
         };
 
-        let ctx = DownloadContext::new(handle, request_type);
+        let ctx = DownloadContext::new(handle, bucket_type);
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
         let (object_meta_tx, object_meta_rx) = oneshot::channel();
@@ -128,7 +130,8 @@ async fn send_discovery(
         .scheduler
         .acquire_permit(PermitType::Network(NetworkPermitContext {
             payload_size_estimate: 0,
-            request_type: ctx.request_type(),
+            bucket_type: ctx.bucket_type(),
+            direction: TransferDirection::Download,
         }))
         .await;
     let permit = match permit {
@@ -248,19 +251,19 @@ pub(crate) struct DownloadState {
     current_seq: AtomicU64,
     cancel_tx: CancelNotificationSender,
     cancel_rx: CancelNotificationReceiver,
-    request_type: RequestType,
+    bucket_type: BucketType,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
 
 impl DownloadContext {
-    fn new(handle: Arc<crate::client::Handle>, request_type: RequestType) -> Self {
+    fn new(handle: Arc<crate::client::Handle>, bucket_type: BucketType) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             current_seq: AtomicU64::new(0),
             cancel_tx,
             cancel_rx,
-            request_type,
+            bucket_type,
         });
         TransferContext { handle, state }
     }
@@ -280,7 +283,8 @@ impl DownloadContext {
         self.state.current_seq.load(Ordering::SeqCst)
     }
 
-    fn request_type(&self) -> RequestType {
-        self.state.request_type.clone()
+    /// Returns the type of bucket
+    fn bucket_type(&self) -> BucketType {
+        self.state.bucket_type.clone()
     }
 }
