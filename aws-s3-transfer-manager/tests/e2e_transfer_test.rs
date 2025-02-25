@@ -1,4 +1,4 @@
-#![cfg(e2e_test)]
+// #![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -330,6 +330,7 @@ async fn range_download_helper(
     key: &str,
     range: &str,
     expected_length: usize,
+    description: &str,
 ) -> Result<(), aws_s3_transfer_manager::error::Error> {
     let mut download_handle = tm
         .download()
@@ -340,7 +341,13 @@ async fn range_download_helper(
 
     let body = drain(&mut download_handle).await?;
 
-    assert_eq!(body.len(), expected_length);
+    assert_eq!(
+        body.len(),
+        expected_length,
+        "desc: {}; range: {}",
+        description,
+        range
+    );
     Ok(())
 }
 
@@ -352,40 +359,71 @@ async fn test_object_download_range() {
     let object_key = "pre-existing-10MB";
 
     let success_ranges = [
-        "bytes=0-10",              // Range is inclusive
-        "bytes=0-104857600",       // Over the size of the object
-        "bytes=-104857600", // without start means the length to fetch. fetch more than the size of object
-        "bytes=-10485760",  // without start means the length to fetch. fetch the whole object
-        "bytes=-10485759",  // without start means the length to fetch. fetch the whole object - 1
-        "bytes=10485759-",  // start from exact end of the object without end (only 1 byte)
-        "bytes=1-",         // start from 1, which will ignore the first byte (index 0).
-        "bytes=10485759-10485759", // exact end of the object (only 1 byte)
+        ("bytes=0-10", "Range is inclusive"),
+        ("bytes=0-104857600", "Over the size of the object"),
+        (
+            "bytes=-104857600",
+            "without start means the length to fetch. fetch more than the size of object",
+        ),
+        (
+            "bytes=-10485760",
+            "without start means the length to fetch. fetch the whole object",
+        ),
+        (
+            "bytes=-10485759",
+            "without start means the length to fetch. fetch the whole object - 1",
+        ),
+        (
+            "bytes=10485759-",
+            "start from exact end of the object without end (only 1 byte)",
+        ),
+        (
+            "bytes=1-",
+            "start from 1, which will ignore the first byte (index 0).",
+        ),
+        (
+            "bytes=10485759-10485759",
+            "exact end of the object (only 1 byte)",
+        ),
     ];
 
     let success_expected_length = [11, 10485760, 10485760, 10485760, 10485759, 1, 10485759, 1];
-
-    let expect_fail_ranges = [
-        "bytes=104857600-",         // start over the size of the object
-        "bytes=10485760-", // start over the size of the object, 10MiB -> 10485760, but range starts from 0
-        "bytes=10485760-104857600", // start over the size of the object, 10MiB -> 10485760, but range starts from 0
-        "bytes=0-499, -499",        // multiple range is not supported.
-    ];
     // Test success case:
     for i in 0..success_ranges.len() {
         range_download_helper(
             &tm,
             &bucket_name,
             object_key,
-            success_ranges[i],
+            success_ranges[i].0,
             success_expected_length[i],
+            success_ranges[i].1,
         )
         .await
         .unwrap();
     }
+}
 
+#[tokio::test]
+async fn test_object_download_range_failures() {
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+
+    let object_key = "pre-existing-10MB";
+    let expect_fail_ranges = [
+        ("bytes=104857600-", "start over the size of the object"),
+        (
+            "bytes=10485760-",
+            "start over the size of the object, 10MiB -> 10485760, but range starts from 0",
+        ),
+        (
+            "bytes=10485760-104857600",
+            "start over the size of the object, 10MiB -> 10485760, but range starts from 0",
+        ),
+        ("bytes=0-499, -499", "multiple range is not supported."),
+    ];
     for i in expect_fail_ranges {
         // The fail case should error out.
-        range_download_helper(&tm, &bucket_name, object_key, i, 0)
+        range_download_helper(&tm, &bucket_name, object_key, i.0, 0, i.1)
             .await
             .unwrap_err();
     }
