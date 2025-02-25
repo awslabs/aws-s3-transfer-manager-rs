@@ -16,7 +16,7 @@ pub(crate) struct UploadContext {
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
 
-    /// 
+    /// Type of S3 bucket
     pub(crate) bucket_type: BucketType,
 }
 
@@ -31,7 +31,7 @@ impl UploadContext {
         self.request.deref()
     }
 
-    /// The original request (sans the body as it will have been taken for processing)
+    /// Type of S3 bucket
     pub(crate) fn bucket_type(&self) -> BucketType {
         self.bucket_type.clone()
     }
