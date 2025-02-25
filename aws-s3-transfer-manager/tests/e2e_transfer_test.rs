@@ -288,13 +288,13 @@ async fn test_upload_with_long_running_stream() {
             .collect();
 
         let mut handles = vec![];
-        for i in 0..num_uploads {
+        for key in object_keys {
             let stream = DelayStream::new(file_size);
 
             let upload = tm
                 .upload()
                 .bucket(bucket)
-                .key(object_keys[i].as_str())
+                .key(key.as_str())
                 .body(InputStream::from_part_stream(stream));
 
             handles.push(upload.initiate().unwrap());
