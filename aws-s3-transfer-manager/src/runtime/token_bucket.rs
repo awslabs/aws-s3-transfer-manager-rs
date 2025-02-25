@@ -27,26 +27,54 @@ const AUTO_TARGET_THROUGHPUT: Throughput =
 /// Estimated P50 latency for S3
 ///
 /// Source: S3 team
+/// This is internal implementation detail and subject to change in future.
 /// Applies to: ConcurrencyMode::TargetThroughput
 const S3_P50_REQUEST_LATENCY: Duration = Duration::from_millis(30);
 
-/// Estimated per/request max throughput S3 is capable of
+/// Estimated P50 latency for S3Express
+///
+/// Source: S3 team
+/// This is internal implementation detail and subject to change in future.
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_EXPRESS_P50_REQUEST_LATENCY: Duration = Duration::from_millis(4);
+
+/// Estimated per/request max download throughput S3 is capable of
 ///
 /// Source: S3 team and S3 docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html#optimizing-performance-parallelization
 /// > Make one concurrent request for each 85-90 MB/s of desired network throughput
+/// This is internal implementation detail and subject to change in future.
 ///
 /// Applies to: ConcurrencyMode::TargetThroughput
 const S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
     Throughput::new_bytes_per_sec(90 * 1000 * 1000);
 
+/// Estimated per/request max upload throughput S3 is capable of
+///
+/// Source: S3 team.
+/// This is internal implementation detail and subject to change in future.
+///
+/// Applies to: ConcurrencyMode::TargetThroughput
 const S3_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
-    Throughput::new_bytes_per_sec(45 * 1000 * 1000);
+    Throughput::new_bytes_per_sec(20 * 1000 * 1000);
 
+/// Estimated per/request max download throughput S3Express is capable of
+///
+/// Source: S3Express team.
+/// This is internal implementation detail and subject to change in future.
+///
+/// Applies to: ConcurrencyMode::TargetThroughput
 const S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
     Throughput::new_bytes_per_sec(150 * 1000 * 1000);
 
+/// Estimated per/request max upload throughput S3Express is capable of
+///
+/// Source: S3Express team. The actual upload per connection speed is 125Mbps but our testing
+/// showed that having more connections has better throughput.
+/// This is internal implementation detail and subject to change in future.
+///
+/// Applies to: ConcurrencyMode::TargetThroughput
 const S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
-    Throughput::new_bytes_per_sec(125 * 1000 * 1000);
+    Throughput::new_bytes_per_sec(110 * 1000 * 1000);
 
 /// Minimum concurrent requests at full throughput we want to support
 ///
@@ -91,6 +119,15 @@ impl RequestType {
             RequestType::S3Upload => S3_MAX_PER_REQUEST_UPLOAD_THROUGHPUT,
             RequestType::S3ExpressDownload => S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT,
             RequestType::S3ExpressUpload => S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT,
+        }
+    }
+
+    fn p50_request_latency(&self) -> Duration {
+        match self {
+            RequestType::S3Download | RequestType::S3Upload => S3_P50_REQUEST_LATENCY,
+            RequestType::S3ExpressDownload | RequestType::S3ExpressUpload => {
+                S3_EXPRESS_P50_REQUEST_LATENCY
+            }
         }
     }
 }
@@ -216,7 +253,7 @@ fn token_bucket_size(throughput: Throughput) -> u64 {
 fn tokens_for_payload(network_context: &NetworkPermitContext) -> u64 {
     let estimated_mbps = estimated_throughput(
         network_context.payload_size_estimate,
-        S3_P50_REQUEST_LATENCY,
+        network_context.request_type.p50_request_latency(),
         network_context.request_type.max_per_request_throughput(),
     )
     .as_unit_per_sec(ByteUnit::Megabit)
