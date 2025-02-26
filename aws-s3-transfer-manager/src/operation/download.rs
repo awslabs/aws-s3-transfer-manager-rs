@@ -36,6 +36,7 @@ use crate::io::AggregatedBytes;
 use crate::runtime::scheduler::{
     NetworkPermitContext, OwnedWorkPermit, PermitType, TransferDirection,
 };
+use crate::types::BucketType;
 use aws_smithy_types::byte_stream::ByteStream;
 use discovery::discover_obj;
 use service::distribute_work;
@@ -44,7 +45,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OnceCell};
 use tokio::task::{self, JoinSet};
 
-use super::{BucketType, CancelNotificationReceiver, CancelNotificationSender, TransferContext};
+use super::{CancelNotificationReceiver, CancelNotificationSender, TransferContext};
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -283,8 +284,8 @@ impl DownloadContext {
         self.state.current_seq.load(Ordering::SeqCst)
     }
 
-    /// Returns the type of bucket
+    /// Returns the type of bucket targeted by this operation
     fn bucket_type(&self) -> BucketType {
-        self.state.bucket_type.clone()
+        self.state.bucket_type
     }
 }

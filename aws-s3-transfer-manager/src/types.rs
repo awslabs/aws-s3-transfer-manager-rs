@@ -321,3 +321,11 @@ impl FailedUpload {
         &self.error
     }
 }
+
+/// Type of the bucket for the transfer
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub(crate) enum BucketType {
+    Standard,
+    Express,
+}

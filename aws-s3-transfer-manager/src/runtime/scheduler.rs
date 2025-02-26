@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::error;
-use crate::operation::BucketType;
 use crate::runtime::token_bucket::{OwnedToken, TokenBucket};
+use crate::types::BucketType;
 use crate::types::ConcurrencyMode;
 
 // TODO - measure actual throughput and track high water mark
@@ -167,8 +167,8 @@ impl SchedulerMetrics {
 mod tests {
     use super::{PermitType, Scheduler};
     use crate::{
-        operation::BucketType,
         runtime::scheduler::{NetworkPermitContext, TransferDirection},
+        types::BucketType,
         types::ConcurrencyMode,
     };
 

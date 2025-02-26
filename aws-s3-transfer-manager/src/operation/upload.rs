@@ -19,6 +19,7 @@ use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
 use crate::runtime::scheduler::{NetworkPermitContext, PermitType, TransferDirection};
+use crate::types::BucketType;
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadData, UploadType};
@@ -31,8 +32,6 @@ use tracing::Instrument;
 
 use std::cmp;
 use std::sync::Arc;
-
-use super::BucketType;
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;

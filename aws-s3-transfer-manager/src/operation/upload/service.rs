@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{BucketType, MultipartUploadData, TransferDirection};
+use super::{MultipartUploadData, TransferDirection};
 use crate::{
     error,
     io::{part_reader::PartReader, PartData},
@@ -10,6 +10,7 @@ use crate::{
     },
     operation::upload::UploadContext,
     runtime::scheduler::NetworkPermitContext,
+    types::BucketType,
 };
 use aws_sdk_s3::{
     primitives::ByteStream,

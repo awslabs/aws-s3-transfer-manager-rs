@@ -76,7 +76,7 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
 mod tests {
 
     use crate::metrics::unit::ByteUnit;
-    use crate::operation::BucketType;
+    use crate::types::BucketType;
     use crate::runtime::scheduler::{Scheduler, TransferDirection};
     use crate::types::TargetThroughput;
     use crate::{middleware::limit::concurrency::ConcurrencyLimitLayer, types::ConcurrencyMode};

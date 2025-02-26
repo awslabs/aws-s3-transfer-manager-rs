@@ -12,8 +12,8 @@ use tokio_util::sync::PollSemaphore;
 
 use crate::error;
 use crate::metrics::{unit::ByteUnit, Throughput};
-use crate::operation::BucketType;
 use crate::runtime::scheduler::PermitType;
+use crate::types::BucketType;
 use crate::types::ConcurrencyMode;
 
 use super::scheduler::{NetworkPermitContext, TransferDirection};
@@ -291,9 +291,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::unit::ByteUnit;
-    use crate::operation::BucketType;
     use crate::runtime::scheduler::{NetworkPermitContext, TransferDirection};
     use crate::runtime::token_bucket::{estimated_throughput, tokens_for_payload};
+    use crate::types::BucketType;
     use crate::{
         metrics::Throughput,
         runtime::token_bucket::{token_bucket_size, MIN_BUCKET_TOKENS},

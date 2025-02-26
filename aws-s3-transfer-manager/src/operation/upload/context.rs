@@ -4,7 +4,7 @@
  */
 
 use crate::operation::upload::UploadInput;
-use crate::operation::BucketType;
+use crate::types::BucketType;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -31,8 +31,8 @@ impl UploadContext {
         self.request.deref()
     }
 
-    /// Type of S3 bucket
+    /// Type of S3 bucket targeted by this operation
     pub(crate) fn bucket_type(&self) -> BucketType {
-        self.bucket_type.clone()
+        self.bucket_type
     }
 }

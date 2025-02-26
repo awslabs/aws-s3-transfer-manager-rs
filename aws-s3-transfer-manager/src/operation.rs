@@ -67,11 +67,3 @@ pub(crate) fn validate_target_is_dir(metadata: &Metadata, path: &Path) -> Result
         )))
     }
 }
-
-/// Type of the bucket for the transfer
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub(crate) enum BucketType {
-    Standard,
-    Express,
-}
