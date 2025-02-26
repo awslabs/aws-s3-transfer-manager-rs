@@ -43,6 +43,7 @@ const S3_EXPRESS_P50_REQUEST_LATENCY: Duration = Duration::from_millis(4);
 ///
 /// Source: S3 team and S3 docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html#optimizing-performance-parallelization
 /// > Make one concurrent request for each 85-90 MB/s of desired network throughput
+///
 /// This is internal implementation detail and subject to change in future.
 ///
 /// Applies to: ConcurrencyMode::TargetThroughput
