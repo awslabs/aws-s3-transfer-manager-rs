@@ -4,6 +4,7 @@
  */
 
 use crate::operation::upload::UploadInput;
+use crate::types::BucketType;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -14,6 +15,9 @@ pub(crate) struct UploadContext {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
+
+    /// Type of S3 bucket targeted by this operation
+    pub(crate) bucket_type: BucketType,
 }
 
 impl UploadContext {
@@ -25,5 +29,10 @@ impl UploadContext {
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()
+    }
+
+    /// Type of S3 bucket targeted by this operation
+    pub(crate) fn bucket_type(&self) -> BucketType {
+        self.bucket_type
     }
 }
