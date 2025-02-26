@@ -257,7 +257,7 @@ fn token_bucket_size(throughput: Throughput) -> u64 {
     cmp::max(MIN_BUCKET_TOKENS, megabit_per_sec)
 }
 
-/// Tokens for network context 
+/// Tokens for network context
 fn tokens_for_network_context(network_context: &NetworkPermitContext) -> u64 {
     let estimated_mbps = estimated_throughput(
         network_context.payload_size_estimate,
