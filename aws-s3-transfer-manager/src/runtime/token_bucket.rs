@@ -92,7 +92,7 @@ const MIN_CONCURRENT_REQUESTS: u64 = 8;
 ///
 /// Source: None, reasonable default
 /// Applies to: ConcurrencyMode::TargetThroughput
-const MIN_BUCKET_TOKENS: u64 = (S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT.bytes_transferred()
+const MIN_BUCKET_TOKENS: u64 = (S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT.bytes_transferred()
     / 1_000_000)
     * 8
     * MIN_CONCURRENT_REQUESTS;
