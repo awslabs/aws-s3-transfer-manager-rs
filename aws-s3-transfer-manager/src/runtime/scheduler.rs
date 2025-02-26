@@ -80,7 +80,7 @@ pub(crate) struct NetworkPermitContext {
 /// The type of work to be done
 #[derive(Debug, Clone)]
 pub(crate) enum PermitType {
-    /// A network request to transmit or receive to or from an API with the given payload size estimate
+    /// A network request to transmit or receive data from an API.
     Network(NetworkPermitContext),
 }
 

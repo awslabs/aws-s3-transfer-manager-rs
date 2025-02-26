@@ -248,9 +248,7 @@ mod tests {
     use bytes::Bytes;
     use test_common::mock_client_with_stubbed_http_client;
 
-    fn _mock_upload_part_request_with_bucket_name(
-        bucket_name: &str,
-    ) -> UploadPartRequest {
+    fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
         let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, []);
         UploadPartRequest {
             ctx: UploadContext {
@@ -271,8 +269,7 @@ mod tests {
         let policy = UploadHedgePolicy;
 
         // Test S3 Express bucket
-        let express_req =
-            _mock_upload_part_request_with_bucket_name("test--x-s3");
+        let express_req = _mock_upload_part_request_with_bucket_name("test--x-s3");
         assert!(policy.clone_request(&express_req).is_none());
 
         // Test regular bucket
