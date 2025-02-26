@@ -16,6 +16,10 @@ pub mod builders;
 mod body;
 pub use body::{Body, ChunkOutput};
 
+/// Abstractions for checksum validation
+mod checksums;
+pub use checksums::ChecksumValidationLevel;
+
 mod discovery;
 
 mod handle;
@@ -30,6 +34,10 @@ mod object_meta;
 pub use object_meta::ObjectMetadata;
 
 mod service;
+
+/// Provides metadata that isn't known until the download completes
+mod trailing_meta;
+pub use trailing_meta::TrailingMetadata;
 
 use crate::error;
 use crate::io::AggregatedBytes;
@@ -74,6 +82,7 @@ impl Download {
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
         let (object_meta_tx, object_meta_rx) = oneshot::channel();
+        let trailing_meta_oncelock = TrailingMetadata::new_oncelock();
 
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
         let discovery = tokio::spawn(send_discovery(
@@ -86,11 +95,12 @@ impl Download {
         ));
 
         Ok(DownloadHandle {
-            body: Body::new(chunk_rx),
+            body: Body::new(chunk_rx, trailing_meta_oncelock.clone()),
             tasks,
             discovery,
-            object_meta_rx: Mutex::new(Some(object_meta_rx)),
+            object_meta_receiver: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
+            trailing_meta: trailing_meta_oncelock,
         })
     }
 }
