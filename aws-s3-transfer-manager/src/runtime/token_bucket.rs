@@ -386,5 +386,53 @@ mod tests {
                 direction: TransferDirection::Download,
             })
         );
+        assert_eq!(
+            27,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Upload,
+            })
+        );
+        assert_eq!(
+            160,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Upload,
+            })
+        );
+        assert_eq!(
+            205,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            1200,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            205,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Upload,
+            })
+        );
+        assert_eq!(
+            880,
+            tokens_for_payload(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Upload,
+            })
+        );
     }
 }
