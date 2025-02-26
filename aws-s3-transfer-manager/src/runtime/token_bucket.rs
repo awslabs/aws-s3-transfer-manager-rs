@@ -108,7 +108,7 @@ impl PermitType {
     /// The token cost for the permit type in Mbps
     fn token_cost_megabit_per_sec(&self) -> u32 {
         let cost = match self {
-            PermitType::Network(payload_size) => tokens_for_payload(payload_size),
+            PermitType::Network(network_ctx) => tokens_for_network_context(network_ctx),
         };
         cost.try_into().unwrap()
     }
@@ -257,8 +257,8 @@ fn token_bucket_size(throughput: Throughput) -> u64 {
     cmp::max(MIN_BUCKET_TOKENS, megabit_per_sec)
 }
 
-/// Tokens for payload size
-fn tokens_for_payload(network_context: &NetworkPermitContext) -> u64 {
+/// Tokens for network context 
+fn tokens_for_network_context(network_context: &NetworkPermitContext) -> u64 {
     let estimated_mbps = estimated_throughput(
         network_context.payload_size_estimate,
         network_context.p50_request_latency(),
@@ -292,7 +292,7 @@ mod tests {
 
     use crate::metrics::unit::ByteUnit;
     use crate::runtime::scheduler::{NetworkPermitContext, TransferDirection};
-    use crate::runtime::token_bucket::{estimated_throughput, tokens_for_payload};
+    use crate::runtime::token_bucket::{estimated_throughput, tokens_for_network_context};
     use crate::types::BucketType;
     use crate::{
         metrics::Throughput,
@@ -341,7 +341,7 @@ mod tests {
     fn test_tokens_for_payload() {
         assert_eq!(
             5,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 1024,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Download,
@@ -349,7 +349,7 @@ mod tests {
         );
         assert_eq!(
             27,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 100 * 1024,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Download,
@@ -357,7 +357,7 @@ mod tests {
         );
         assert_eq!(
             267,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: MEGABYTE,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Download,
@@ -365,7 +365,7 @@ mod tests {
         );
         assert_eq!(
             720,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 5 * MEGABYTE,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Download,
@@ -373,7 +373,7 @@ mod tests {
         );
         assert_eq!(
             720,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 8 * MEGABYTE,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Download,
@@ -381,7 +381,7 @@ mod tests {
         );
         assert_eq!(
             720,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 1000 * MEGABYTE,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Download,
@@ -389,7 +389,7 @@ mod tests {
         );
         assert_eq!(
             27,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 100 * 1024,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Upload,
@@ -397,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             160,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: MEGABYTE,
                 bucket_type: BucketType::Standard,
                 direction: TransferDirection::Upload,
@@ -405,7 +405,7 @@ mod tests {
         );
         assert_eq!(
             205,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 100 * 1024,
                 bucket_type: BucketType::Express,
                 direction: TransferDirection::Download,
@@ -413,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             1200,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: MEGABYTE,
                 bucket_type: BucketType::Express,
                 direction: TransferDirection::Download,
@@ -421,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             205,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: 100 * 1024,
                 bucket_type: BucketType::Express,
                 direction: TransferDirection::Upload,
@@ -429,7 +429,7 @@ mod tests {
         );
         assert_eq!(
             880,
-            tokens_for_payload(&NetworkPermitContext {
+            tokens_for_network_context(&NetworkPermitContext {
                 payload_size_estimate: MEGABYTE,
                 bucket_type: BucketType::Express,
                 direction: TransferDirection::Upload,
