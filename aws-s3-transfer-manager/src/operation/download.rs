@@ -73,12 +73,7 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let bucket_type = if input.bucket().unwrap_or("").ends_with("--x-s3") {
-            BucketType::Express
-        } else {
-            BucketType::Standard
-        };
-
+        let bucket_type = BucketType::from_bucket(input.bucket().unwrap_or(""));
         let ctx = DownloadContext::new(handle, bucket_type);
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);

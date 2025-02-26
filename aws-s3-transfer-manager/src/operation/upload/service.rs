@@ -250,7 +250,6 @@ mod tests {
 
     fn _mock_upload_part_request_with_bucket_name(
         bucket_name: &str,
-        bucket_type: BucketType,
     ) -> UploadPartRequest {
         let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, []);
         UploadPartRequest {
@@ -260,7 +259,7 @@ mod tests {
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
-                bucket_type,
+                bucket_type: BucketType::from_bucket(bucket_name),
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),
@@ -273,11 +272,11 @@ mod tests {
 
         // Test S3 Express bucket
         let express_req =
-            _mock_upload_part_request_with_bucket_name("test--x-s3", BucketType::Express);
+            _mock_upload_part_request_with_bucket_name("test--x-s3");
         assert!(policy.clone_request(&express_req).is_none());
 
         // Test regular bucket
-        let regular_req = _mock_upload_part_request_with_bucket_name("test", BucketType::Standard);
+        let regular_req = _mock_upload_part_request_with_bucket_name("test");
         assert!(policy.clone_request(&regular_req).is_some());
     }
 }

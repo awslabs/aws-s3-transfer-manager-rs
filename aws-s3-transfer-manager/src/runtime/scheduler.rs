@@ -59,12 +59,14 @@ impl Scheduler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Direction of the transfer
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TransferDirection {
     Upload,
     Download,
 }
 
+/// Context needed to determine number of tokens needed for Network Permit.
 #[derive(Debug, Clone)]
 pub(crate) struct NetworkPermitContext {
     pub(crate) payload_size_estimate: u64,

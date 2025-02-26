@@ -329,3 +329,13 @@ pub(crate) enum BucketType {
     Standard,
     Express,
 }
+
+impl BucketType {
+    pub(crate) fn from_bucket(bucket_name: &str) -> Self {
+        if bucket_name.ends_with("--x-s3") { 
+             BucketType::Express
+        } else {
+             BucketType::Standard
+        }
+    }
+}
