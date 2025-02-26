@@ -28,7 +28,7 @@ impl<T> ConcurrencyLimit<T> {
 
 /// Provide the [`NetworkPermitContext`] for the request
 pub(crate) trait ProvideNetworkPermitContext {
-    /// [`NetworkPermitContext`] for the request 
+    /// [`NetworkPermitContext`] for the request
     fn network_permit_context(&self) -> NetworkPermitContext;
 }
 
