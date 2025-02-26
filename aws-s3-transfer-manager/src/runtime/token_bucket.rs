@@ -108,7 +108,7 @@ impl PermitType {
     /// The token cost for the permit type in Mbps
     fn token_cost_megabit_per_sec(&self) -> u32 {
         let cost = match self {
-            PermitType::Network(network_ctx) => tokens_for_network_context(network_ctx),
+            PermitType::Network(network_context) => tokens_for_network_context(network_context),
         };
         cost.try_into().unwrap()
     }
