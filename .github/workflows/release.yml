@@ -1,0 +1,52 @@
+name: Publish to crates.io
+
+# on:
+#   push:
+#     tags:
+#       - 'v*'
+
+on:
+  pull_request: # for test
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+  # Change to specific Rust release to pin
+  rust_stable: stable
+  rust_nightly: nightly-2024-07-07
+  rust_clippy: '1.81'
+  # When updating this, also update relevant docs
+  rust_min: '1.81'
+  RELEASE_ROLE_ARN: ${{ secrets.RELEASE_ROLE_ARN }}
+  TOKEN_KEY_NAME: ${{ secrets.TOKEN_KEY_NAME }}
+  AWS_REGION: us-west-2
+
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Cargo registry token
+        id: cargo-registry-token
+        run: CARGO_REGISTRY_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${{ secrets.TOKEN_KEY_NAME }} --region ${{ env.AWS_REGION }}  | jq -r ".SecretString")
+
+      # - name: Publish
+      #   uses: katyo/publish-crates@v2
+      #   with:
+      #     registry-token: \${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #     dry-run: true # for test
+      #     # Optional arguments:
+      #     # ignore-unpublished-changes: true
