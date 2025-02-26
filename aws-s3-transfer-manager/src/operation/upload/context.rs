@@ -16,7 +16,7 @@ pub(crate) struct UploadContext {
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
 
-    /// Type of S3 bucket
+    /// Type of S3 bucket targeted by this operation
     pub(crate) bucket_type: BucketType,
 }
 

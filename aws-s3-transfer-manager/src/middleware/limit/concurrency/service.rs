@@ -26,9 +26,9 @@ impl<T> ConcurrencyLimit<T> {
     }
 }
 
-/// Provide the request/response payload size estimate
+/// Provide the request network permit context 
 pub(crate) trait ProvideNetworkPermitContext {
-    /// Payload size estimate in bytes
+    /// `NetworkPermitContext` for the request 
     fn network_permit_context(&self) -> NetworkPermitContext;
 }
 

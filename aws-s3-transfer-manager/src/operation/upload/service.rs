@@ -257,7 +257,7 @@ mod tests {
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
                 request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
-                bucket_type: BucketType::from_bucket(bucket_name),
+                bucket_type: BucketType::from_bucket_name(bucket_name),
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),

@@ -73,7 +73,7 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let bucket_type = BucketType::from_bucket(input.bucket().unwrap_or(""));
+        let bucket_type = BucketType::from_bucket_name(input.bucket().unwrap_or(""));
         let ctx = DownloadContext::new(handle, bucket_type);
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);

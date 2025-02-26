@@ -231,7 +231,7 @@ async fn try_start_mpu_upload(
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
     UploadContext {
         handle,
-        bucket_type: BucketType::from_bucket(req.bucket().unwrap_or("")),
+        bucket_type: BucketType::from_bucket_name(req.bucket().unwrap_or("")),
         request: Arc::new(req),
     }
 }
