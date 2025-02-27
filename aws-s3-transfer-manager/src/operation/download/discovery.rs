@@ -230,6 +230,7 @@ mod tests {
 
     fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
+            .bucket("test-bucket")
             .set_range(range.map(|r| r.to_string()))
             .build()
             .unwrap();

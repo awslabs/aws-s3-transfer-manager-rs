@@ -6,6 +6,7 @@
 use std::fmt;
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_smithy_types::error::operation::BuildError;
 
 /// Input type for downloading a single object
 #[allow(missing_docs)] // documentation missing in model
@@ -817,6 +818,10 @@ impl DownloadInputBuilder {
     }
     /// Consumes the builder and constructs a [`DownloadInput`].
     pub fn build(self) -> Result<DownloadInput, ::aws_smithy_types::error::operation::BuildError> {
+        if self.bucket.is_none() {
+            return Err(BuildError::missing_field("bucket", "A bucket is required"));
+        }
+
         Result::Ok(DownloadInput {
             bucket: self.bucket,
             if_match: self.if_match,

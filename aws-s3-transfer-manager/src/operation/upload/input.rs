@@ -5,6 +5,7 @@
 
 use crate::io::InputStream;
 use crate::types::FailedMultipartUploadPolicy;
+use aws_smithy_types::error::operation::BuildError;
 
 use std::fmt::Debug;
 use std::mem;
@@ -1277,6 +1278,10 @@ impl UploadInputBuilder {
 
     /// Consumes the builder and constructs a [`UploadInput`]
     pub fn build(self) -> Result<UploadInput, ::aws_smithy_types::error::operation::BuildError> {
+        if self.bucket.is_none() {
+            return Err(BuildError::missing_field("bucket", "A bucket is required"));
+        }
+
         Ok(UploadInput {
             body: self.body.unwrap_or_default(),
             acl: self.acl,
