@@ -231,6 +231,7 @@ mod tests {
     fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
+            .key("test-key")
             .set_range(range.map(|r| r.to_string()))
             .build()
             .unwrap();

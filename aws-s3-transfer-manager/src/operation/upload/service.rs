@@ -256,7 +256,7 @@ mod tests {
                     config: Config::builder().client(s3_client).build(),
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
-                request: Arc::new(UploadInput::builder().bucket(bucket_name).build().unwrap()),
+                request: Arc::new(UploadInput::builder().bucket(bucket_name).key("test-key").build().unwrap()),
                 bucket_type: BucketType::from_bucket_name(bucket_name),
             },
             part_data: PartData::new(1, Bytes::default()),

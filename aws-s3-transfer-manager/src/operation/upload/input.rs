@@ -1282,6 +1282,10 @@ impl UploadInputBuilder {
             return Err(BuildError::missing_field("bucket", "A bucket is required"));
         }
 
+        if self.key.is_none() {
+            return Err(BuildError::missing_field("key", "A key is required"));
+        }
+
         Ok(UploadInput {
             body: self.body.unwrap_or_default(),
             acl: self.acl,
