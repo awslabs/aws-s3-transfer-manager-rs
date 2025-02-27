@@ -48,9 +48,9 @@ jobs:
 
       - name: Get Cargo registry token
         id: cargo-registry-token
+        # echo "::add-mask::$CARGO_REGISTRY_TOKEN"
         run: |
           CARGO_REGISTRY_TOKEN="MyTest"
-          echo "::add-mask::$CARGO_REGISTRY_TOKEN"
           echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
 
       - name: Publish
