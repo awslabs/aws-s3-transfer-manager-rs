@@ -46,16 +46,17 @@ jobs:
           role-to-assume: ${{ env.RELEASE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # - name: Get Cargo registry token
-      #   id: cargo-registry-token
-      #   run: |
-      #     CARGO_REGISTRY_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${{ secrets.TOKEN_KEY_NAME }} --region ${{ env.AWS_REGION }}  | jq -r ".SecretString")
-      #     echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
+      - name: Get Cargo registry token
+        id: cargo-registry-token
+        run: |
+          export CARGO_REGISTRY_TOKEN="MyTest"
+          echo "::add-mask::$CARGO_REGISTRY_TOKEN"
+          echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
 
-      # - name: Publish
-      #   uses: katyo/publish-crates@v2
-      #   with:
-      #     registry-token: ${{ steps.cargo-registry-token.outputs.token }}
-      #     dry-run: true # for test
-      #     # Optional arguments:
-      #     # ignore-unpublished-changes: true
+      - name: Publish
+        uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ steps.cargo-registry-token.outputs.token }}
+          dry-run: true # for test
+          # Optional arguments:
+          # ignore-unpublished-changes: true
