@@ -1,22 +1,25 @@
-name: Publish to crates.io
+name: Publish to crates.io (Test Mode)
+
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       version:
+#         description: 'Version to publish (without v prefix, e.g. 1.2.3)'
+#         required: true
+#         type: string
+#       release_notes:
+#         description: 'Release notes (Markdown supported)'
+#         required: false
+#         type: string
+#         default: 'See repository for changes in this release.'
+#       dry_run:
+#         description: 'Dry run mode (create branch but skip tag creation and use cargo publish --dry-run)'
+#         required: false
+#         type: boolean
+#         default: false
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to publish (without v prefix, e.g. 1.2.3)'
-        required: true
-        type: string
-      release_notes:
-        description: 'Release notes (Markdown supported)'
-        required: false
-        type: string
-        default: 'See repository for changes in this release.'
-      dry_run:
-        description: 'Dry run mode (create branch but skip tag creation and use cargo publish --dry-run)'
-        required: false
-        type: boolean
-        default: false
+  pull_request: # Test trigger
 
 env:
   RUSTFLAGS: -Dwarnings
@@ -29,6 +32,10 @@ env:
   RELEASE_ROLE_ARN: ${{ secrets.RELEASE_ROLE_ARN }}
   TOKEN_KEY_NAME: ${{ secrets.TOKEN_KEY_NAME }}
   AWS_REGION: us-west-2
+  # Test values
+  TEST_VERSION: '1.0.0'
+  TEST_RELEASE_NOTES: 'Test release notes for version 1.0.0'
+  TEST_DRY_RUN: 'true'
 
 permissions:
   contents: write  # Write permission to allow pushing to the repository
@@ -57,8 +64,8 @@ jobs:
 
       - name: Display version to be published
         run: |
-          echo "Publishing version ${{ github.event.inputs.version }}"
-          echo "Dry run: ${{ github.event.inputs.dry_run }}"
+          echo "Publishing version ${{ env.TEST_VERSION }}"
+          echo "Dry run: ${{ env.TEST_DRY_RUN }}"
 
       - name: Configure Git
         run: |
@@ -68,39 +75,38 @@ jobs:
       - name: Update version in Cargo.toml
         run: |
           # Using sed to update the version in Cargo.toml
-          sed -i "s/^version = \".*\"/version = \"${{ github.event.inputs.version }}\"/" Cargo.toml
-          echo "Updated Cargo.toml to version ${{ github.event.inputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"${{ env.TEST_VERSION }}\"/" Cargo.toml
+          echo "Updated Cargo.toml to version ${{ env.TEST_VERSION }}"
           # Display the updated version line for verification
           grep "^version =" Cargo.toml
 
       - name: Create release branch and push changes
         run: |
           # Create and checkout release branch
-          git checkout -b release-${{ github.event.inputs.version }}
+          git checkout -b release-${{ env.TEST_VERSION }}
 
           # Add, commit, and push changes to the new branch
           git add Cargo.toml
-          git commit -m "Bump version to ${{ github.event.inputs.version }}"
-          git push origin release-${{ github.event.inputs.version }}
+          git commit -m "Bump version to ${{ env.TEST_VERSION }}"
+          git push origin release-${{ env.TEST_VERSION }}
 
           # Only create version tag when not in dry-run mode
-          if [ "${{ github.event.inputs.dry_run }}" != "true" ]; then
-            git tag -a "v${{ github.event.inputs.version }}" -m "Release v${{ github.event.inputs.version }}"
-            git push origin "v${{ github.event.inputs.version }}"
-            echo "Created and pushed tag v${{ github.event.inputs.version }}"
+          if [ "${{ env.TEST_DRY_RUN }}" != "true" ]; then
+            git tag -a "v${{ env.TEST_VERSION }}" -m "Release v${{ env.TEST_VERSION }}"
+            git push origin "v${{ env.TEST_VERSION }}"
+            echo "Created and pushed tag v${{ env.TEST_VERSION }}"
           else
             echo "Skipping tag creation in dry-run mode"
           fi
 
       - name: Create GitHub Release
-      # TODO: how to properly cut the release?
-        if: ${{ !github.event.inputs.dry_run }}
+        if: ${{ env.TEST_DRY_RUN != 'true' }}
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ github.event.inputs.version }}
-          name: "Release v${{ github.event.inputs.version }}"
+          tag_name: v${{ env.TEST_VERSION }}
+          name: "Release v${{ env.TEST_VERSION }}"
           body: |
-            ${{ github.event.inputs.release_notes }}
+            ${{ env.TEST_RELEASE_NOTES }}
           draft: false
           prerelease: false
 
@@ -118,6 +124,7 @@ jobs:
           echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
 
       - name: Yank previous version (for testing token)
+        if: ${{ env.TEST_DRY_RUN != 'true' }}
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
@@ -126,7 +133,7 @@ jobs:
           cargo yank aws-sigv4 --version 0.55.0
 
       - name: Publish (dry-run)
-        if: ${{ github.event.inputs.dry_run }}
+        if: ${{ env.TEST_DRY_RUN == 'true' }}
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
@@ -134,25 +141,25 @@ jobs:
           echo "Running cargo publish in dry-run mode"
           cargo publish --dry-run
 
-      - name: Publish (actual)
-        if: ${{ !github.event.inputs.dry_run }}
-        shell: bash
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
-        run: |
-          echo "Publishing to crates.io"
-          cargo publish
+      # - name: Publish (actual)
+      #   if: ${{ env.TEST_DRY_RUN != 'true' }}
+      #   shell: bash
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
+      #   run: |
+      #     echo "Publishing to crates.io"
+      #     cargo publish
 
       - name: Workflow summary
         run: |
           echo "## Workflow Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Version: ${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Branch created: release-${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+          echo "- Version: ${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch created: release-${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ env.TEST_DRY_RUN }}" == "true" ]; then
             echo "- Mode: DRY RUN (no tag created, no release created, cargo publish run with --dry-run)" >> $GITHUB_STEP_SUMMARY
           else
             echo "- Mode: PRODUCTION" >> $GITHUB_STEP_SUMMARY
-            echo "- Tag created: v${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
-            echo "- GitHub Release created: [Release v${{ github.event.inputs.version }}](https://github.com/${{ github.repository }}/releases/tag/v${{ github.event.inputs.version }})" >> $GITHUB_STEP_SUMMARY
+            echo "- Tag created: v${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
+            echo "- GitHub Release created: [Release v${{ env.TEST_VERSION }}](https://github.com/${{ github.repository }}/releases/tag/v${{ env.TEST_VERSION }})" >> $GITHUB_STEP_SUMMARY
             echo "- Package published to crates.io" >> $GITHUB_STEP_SUMMARY
           fi
