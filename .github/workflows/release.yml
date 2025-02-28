@@ -73,6 +73,7 @@ jobs:
           git config --global user.email "actions@github.com"
 
       - name: Update version in Cargo.toml
+        working-directory: ./aws-s3-transfer-manager/
         run: |
           # Using sed to update the version in Cargo.toml
           sed -i "s/^version = \".*\"/version = \"${{ env.TEST_VERSION }}\"/" Cargo.toml
@@ -86,7 +87,7 @@ jobs:
           git checkout -b release-${{ env.TEST_VERSION }}
 
           # Add, commit, and push changes to the new branch
-          git add Cargo.toml
+          git add ./aws-s3-transfer-manager/Cargo.toml
           git commit -m "Bump version to ${{ env.TEST_VERSION }}"
           git push origin release-${{ env.TEST_VERSION }}
 
@@ -135,6 +136,7 @@ jobs:
       - name: Publish (dry-run)
         if: ${{ env.TEST_DRY_RUN == 'true' }}
         shell: bash
+        working-directory: ./aws-s3-transfer-manager/
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
         run: |
