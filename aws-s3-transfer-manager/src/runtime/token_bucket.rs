@@ -13,7 +13,10 @@ use tokio_util::sync::PollSemaphore;
 use crate::error;
 use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::scheduler::PermitType;
+use crate::types::BucketType;
 use crate::types::ConcurrencyMode;
+
+use super::scheduler::{NetworkPermitContext, TransferDirection};
 
 /// Default throughput target for auto mode (10 Gbps)
 ///
@@ -25,16 +28,55 @@ const AUTO_TARGET_THROUGHPUT: Throughput =
 /// Estimated P50 latency for S3
 ///
 /// Source: S3 team
+/// This is internal implementation detail and subject to change in future.
 /// Applies to: ConcurrencyMode::TargetThroughput
 const S3_P50_REQUEST_LATENCY: Duration = Duration::from_millis(30);
 
-/// Estimated per/request max throughput S3 is capable of
+/// Estimated P50 latency for S3Express
+///
+/// Source: S3 team
+/// This is internal implementation detail and subject to change in future.
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_EXPRESS_P50_REQUEST_LATENCY: Duration = Duration::from_millis(4);
+
+/// Estimated per/request max download throughput S3 is capable of
 ///
 /// Source: S3 team and S3 docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html#optimizing-performance-parallelization
 /// > Make one concurrent request for each 85-90 MB/s of desired network throughput
 ///
+/// This is internal implementation detail and subject to change in future.
+///
 /// Applies to: ConcurrencyMode::TargetThroughput
-const S3_MAX_PER_REQUEST_THROUGHPUT: Throughput = Throughput::new_bytes_per_sec(90 * 1000 * 1000);
+const S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(90 * 1000 * 1000);
+
+/// Estimated per/request max upload throughput S3 is capable of
+///
+/// Source: S3 team.
+/// This is internal implementation detail and subject to change in future.
+///
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(20 * 1000 * 1000);
+
+/// Estimated per/request max download throughput S3Express is capable of
+///
+/// Source: S3Express team.
+/// This is internal implementation detail and subject to change in future.
+///
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(150 * 1000 * 1000);
+
+/// Estimated per/request max upload throughput S3Express is capable of
+///
+/// Source: S3Express team. The actual upload per connection speed is 125Mbps but our testing
+/// showed that having more connections has better throughput.
+/// This is internal implementation detail and subject to change in future.
+///
+/// Applies to: ConcurrencyMode::TargetThroughput
+const S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT: Throughput =
+    Throughput::new_bytes_per_sec(110 * 1000 * 1000);
 
 /// Minimum concurrent requests at full throughput we want to support
 ///
@@ -51,8 +93,10 @@ const MIN_CONCURRENT_REQUESTS: u64 = 8;
 ///
 /// Source: None, reasonable default
 /// Applies to: ConcurrencyMode::TargetThroughput
-const MIN_BUCKET_TOKENS: u64 =
-    (S3_MAX_PER_REQUEST_THROUGHPUT.bytes_transferred() / 1_000_000) * 8 * MIN_CONCURRENT_REQUESTS;
+const MIN_BUCKET_TOKENS: u64 = (S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT.bytes_transferred()
+    / 1_000_000)
+    * 8
+    * MIN_CONCURRENT_REQUESTS;
 
 /// Minimum token cost regardless of payload size
 ///
@@ -63,10 +107,36 @@ const MIN_PAYLOAD_COST_TOKENS: u64 = 5;
 impl PermitType {
     /// The token cost for the permit type in Mbps
     fn token_cost_megabit_per_sec(&self) -> u32 {
-        let cost = match *self {
-            PermitType::Network(payload_size) => tokens_for_payload(payload_size),
+        let cost = match self {
+            PermitType::Network(network_context) => tokens_for_network_context(network_context),
         };
         cost.try_into().unwrap()
+    }
+}
+
+impl NetworkPermitContext {
+    fn max_per_request_throughput(&self) -> Throughput {
+        match (&self.bucket_type, &self.direction) {
+            (BucketType::Standard, TransferDirection::Download) => {
+                S3_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT
+            }
+            (BucketType::Standard, TransferDirection::Upload) => {
+                S3_MAX_PER_REQUEST_UPLOAD_THROUGHPUT
+            }
+            (BucketType::Express, TransferDirection::Download) => {
+                S3_EXPRESS_MAX_PER_REQUEST_DOWNLOAD_THROUGHPUT
+            }
+            (BucketType::Express, TransferDirection::Upload) => {
+                S3_EXPRESS_MAX_PER_REQUEST_UPLOAD_THROUGHPUT
+            }
+        }
+    }
+
+    fn p50_request_latency(&self) -> Duration {
+        match &self.bucket_type {
+            BucketType::Standard => S3_P50_REQUEST_LATENCY,
+            BucketType::Express => S3_EXPRESS_P50_REQUEST_LATENCY,
+        }
     }
 }
 
@@ -187,12 +257,12 @@ fn token_bucket_size(throughput: Throughput) -> u64 {
     cmp::max(MIN_BUCKET_TOKENS, megabit_per_sec)
 }
 
-/// Tokens for payload size
-fn tokens_for_payload(payload_size: u64) -> u64 {
+/// Tokens for network context
+fn tokens_for_network_context(network_context: &NetworkPermitContext) -> u64 {
     let estimated_mbps = estimated_throughput(
-        payload_size,
-        S3_P50_REQUEST_LATENCY,
-        S3_MAX_PER_REQUEST_THROUGHPUT,
+        network_context.payload_size_estimate,
+        network_context.p50_request_latency(),
+        network_context.max_per_request_throughput(),
     )
     .as_unit_per_sec(ByteUnit::Megabit)
     .round()
@@ -221,7 +291,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::unit::ByteUnit;
-    use crate::runtime::token_bucket::{estimated_throughput, tokens_for_payload};
+    use crate::runtime::scheduler::{NetworkPermitContext, TransferDirection};
+    use crate::runtime::token_bucket::{estimated_throughput, tokens_for_network_context};
+    use crate::types::BucketType;
     use crate::{
         metrics::Throughput,
         runtime::token_bucket::{token_bucket_size, MIN_BUCKET_TOKENS},
@@ -267,11 +339,101 @@ mod tests {
 
     #[test]
     fn test_tokens_for_payload() {
-        assert_eq!(5, tokens_for_payload(1024));
-        assert_eq!(27, tokens_for_payload(100 * 1024));
-        assert_eq!(267, tokens_for_payload(MEGABYTE));
-        assert_eq!(720, tokens_for_payload(5 * MEGABYTE));
-        assert_eq!(720, tokens_for_payload(8 * MEGABYTE));
-        assert_eq!(720, tokens_for_payload(1000 * MEGABYTE));
+        assert_eq!(
+            5,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 1024,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            27,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            267,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            720,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 5 * MEGABYTE,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            720,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 8 * MEGABYTE,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            720,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 1000 * MEGABYTE,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            27,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Upload,
+            })
+        );
+        assert_eq!(
+            160,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Upload,
+            })
+        );
+        assert_eq!(
+            205,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            1200,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Download,
+            })
+        );
+        assert_eq!(
+            205,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: 100 * 1024,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Upload,
+            })
+        );
+        assert_eq!(
+            880,
+            tokens_for_network_context(&NetworkPermitContext {
+                payload_size_estimate: MEGABYTE,
+                bucket_type: BucketType::Express,
+                direction: TransferDirection::Upload,
+            })
+        );
     }
 }

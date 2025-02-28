@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::error;
 use crate::runtime::token_bucket::{OwnedToken, TokenBucket};
+use crate::types::BucketType;
 use crate::types::ConcurrencyMode;
 
 // TODO - measure actual throughput and track high water mark
@@ -58,7 +59,20 @@ impl Scheduler {
     }
 }
 
-pub(crate) type PayloadEstimate = u64;
+/// Direction of the transfer
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TransferDirection {
+    Upload,
+    Download,
+}
+
+/// Context needed to determine number of tokens needed for Network Permit.
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkPermitContext {
+    pub(crate) payload_size_estimate: u64,
+    pub(crate) bucket_type: BucketType,
+    pub(crate) direction: TransferDirection,
+}
 
 // TODO - when we support configuring throughput indepently we'll need to distinguish the permit
 // type and track it separately in the token bucket(s).
@@ -66,8 +80,8 @@ pub(crate) type PayloadEstimate = u64;
 /// The type of work to be done
 #[derive(Debug, Clone)]
 pub(crate) enum PermitType {
-    /// A network request to transmit or receive to or from an API with the given payload size estimate
-    Network(PayloadEstimate),
+    /// A network request to transmit or receive data from an API.
+    Network(NetworkPermitContext),
 }
 
 /// An owned permit from the scheduler to perform some unit of work.
@@ -154,18 +168,29 @@ impl SchedulerMetrics {
 #[cfg(test)]
 mod tests {
     use super::{PermitType, Scheduler};
-    use crate::types::ConcurrencyMode;
+    use crate::{
+        runtime::scheduler::{NetworkPermitContext, TransferDirection},
+        types::BucketType,
+        types::ConcurrencyMode,
+    };
 
     #[tokio::test]
     async fn test_acquire_mode_explicit() {
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(1));
+        let network_permit_context = NetworkPermitContext {
+            payload_size_estimate: 0,
+            bucket_type: BucketType::Standard,
+            direction: TransferDirection::Download,
+        };
         let p1 = scheduler
-            .acquire_permit(PermitType::Network(0))
+            .acquire_permit(PermitType::Network(network_permit_context.clone()))
             .await
             .unwrap();
         let scheduler2 = scheduler.clone();
         let jh = tokio::spawn(async move {
-            let _p2 = scheduler2.acquire_permit(PermitType::Network(0)).await;
+            let _p2 = scheduler2
+                .acquire_permit(PermitType::Network(network_permit_context))
+                .await;
         });
         assert!(!jh.is_finished());
         drop(p1);

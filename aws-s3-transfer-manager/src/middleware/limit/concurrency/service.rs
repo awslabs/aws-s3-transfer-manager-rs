@@ -9,7 +9,7 @@ use tower::Service;
 
 use super::future::ResponseFuture;
 use crate::error;
-use crate::runtime::scheduler::{PermitType, Scheduler};
+use crate::runtime::scheduler::{NetworkPermitContext, PermitType, Scheduler};
 
 /// Enforces a limit on the concurrent requests an underlying service receives
 /// using the given [`Scheduler`].
@@ -26,17 +26,17 @@ impl<T> ConcurrencyLimit<T> {
     }
 }
 
-/// Provide the request/response payload size estimate
-pub(crate) trait ProvidePayloadSize {
-    /// Payload size estimate in bytes
-    fn payload_size_estimate(&self) -> u64;
+/// Provide the [`NetworkPermitContext`] for the request
+pub(crate) trait ProvideNetworkPermitContext {
+    /// [`NetworkPermitContext`] for the request
+    fn network_permit_context(&self) -> NetworkPermitContext;
 }
 
 impl<S, Request> Service<Request> for ConcurrencyLimit<S>
 where
     S: Service<Request> + Clone,
     S::Error: From<error::Error>,
-    Request: ProvidePayloadSize,
+    Request: ProvideNetworkPermitContext,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -57,7 +57,7 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         // NOTE: We assume this is a dataplane request as that is the only place
         // we make use of tower is for upload/download. If this changes this logic needs updated.
-        let ptype = PermitType::Network(req.payload_size_estimate());
+        let ptype = PermitType::Network(req.network_permit_context());
         let permit_fut = self.scheduler.acquire_permit(ptype);
         ResponseFuture::new(self.inner.clone(), req, permit_fut, self.scheduler.clone())
     }
@@ -76,21 +76,26 @@ impl<T: Clone> Clone for ConcurrencyLimit<T> {
 mod tests {
 
     use crate::metrics::unit::ByteUnit;
-    use crate::runtime::scheduler::Scheduler;
+    use crate::runtime::scheduler::{Scheduler, TransferDirection};
+    use crate::types::BucketType;
     use crate::types::TargetThroughput;
     use crate::{middleware::limit::concurrency::ConcurrencyLimitLayer, types::ConcurrencyMode};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use tokio_test::{assert_pending, assert_ready_ok, task};
     use tower_test::{assert_request_eq, mock};
 
-    use super::ProvidePayloadSize;
+    use super::ProvideNetworkPermitContext;
 
     #[derive(Debug)]
     struct TestInput(&'static str);
 
-    impl ProvidePayloadSize for TestInput {
-        fn payload_size_estimate(&self) -> u64 {
-            self.0.len() as u64
+    impl ProvideNetworkPermitContext for TestInput {
+        fn network_permit_context(&self) -> super::NetworkPermitContext {
+            super::NetworkPermitContext {
+                payload_size_estimate: self.0.len() as u64,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            }
         }
     }
 
@@ -167,9 +172,13 @@ mod tests {
     #[derive(Debug)]
     struct MockPayload(u64);
 
-    impl ProvidePayloadSize for MockPayload {
-        fn payload_size_estimate(&self) -> u64 {
-            self.0
+    impl ProvideNetworkPermitContext for MockPayload {
+        fn network_permit_context(&self) -> super::NetworkPermitContext {
+            super::NetworkPermitContext {
+                payload_size_estimate: self.0,
+                bucket_type: BucketType::Standard,
+                direction: TransferDirection::Download,
+            }
         }
     }
 
