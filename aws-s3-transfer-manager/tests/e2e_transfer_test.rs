@@ -1,4 +1,4 @@
-#![cfg(e2e_test)]
+// #![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -15,9 +15,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
-use test_common::{drain, global_uuid_str};
+use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
+use test_common::{create_test_dir, drain, global_uuid_str};
 
-use aws_s3_transfer_manager::types::PartSize;
+use aws_s3_transfer_manager::types::{DownloadFilter, PartSize};
 use tokio::time::Sleep;
 
 const PUT_OBJECT_PREFIX: &str = "upload";
@@ -427,4 +428,41 @@ async fn test_object_download_range_failures() {
             .await
             .unwrap_err();
     }
+}
+
+#[tokio::test]
+async fn test_objects_transfer() {
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let _logs = show_test_logs();
+
+    // SSE-C objects require the key to download, skipping it.
+    fn sse_c_filter(obj: &aws_sdk_s3::types::Object) -> bool {
+        let key = obj.key().unwrap_or("");
+        let is_sse_c = key.ends_with("aes256-c");
+        !is_sse_c
+    }
+
+    let temp_dir = create_test_dir(Some("e2e_downloads"), vec![], &[]);
+
+    let download_handle = tm
+        .download_objects()
+        .bucket(bucket_name.as_str())
+        .key_prefix("pre-")
+        .set_filter(Some(DownloadFilter::from(sse_c_filter)))
+        .destination(temp_dir.path())
+        .send()
+        .await
+        .unwrap();
+    download_handle.join().await.unwrap();
+
+    let upload_handle = tm
+        .upload_objects()
+        .bucket(bucket_name.as_str())
+        .set_key_prefix(Some(generate_key("test")))
+        .source(temp_dir.path())
+        .send()
+        .await
+        .unwrap();
+    upload_handle.join().await.unwrap();
 }
