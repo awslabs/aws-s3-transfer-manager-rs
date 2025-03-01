@@ -89,7 +89,7 @@ jobs:
           # Add, commit, and push changes to the new branch
           git add ./aws-s3-transfer-manager/Cargo.toml
           git commit -m "Bump version to ${{ env.TEST_VERSION }}"
-          git push origin release-${{ env.TEST_VERSION }}
+          git push origin release-${{ env.TEST_VERSION }} --force
 
           # Push changes to main branch when not in dry-run mode
           if [ "${{ env.TEST_DRY_RUN }}" != "true" ]; then
