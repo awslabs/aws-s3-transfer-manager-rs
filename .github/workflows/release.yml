@@ -1,4 +1,4 @@
-name: Publish to crates.io (Test Mode)
+name: Publish to crates.io
 
 # on:
 #   workflow_dispatch:
@@ -91,13 +91,22 @@ jobs:
           git commit -m "Bump version to ${{ env.TEST_VERSION }}"
           git push origin release-${{ env.TEST_VERSION }}
 
-          # Only create version tag when not in dry-run mode
+          # Push changes to main branch when not in dry-run mode
           if [ "${{ env.TEST_DRY_RUN }}" != "true" ]; then
+            echo "Pushing version changes to main branch as well"
+            git checkout main
+            git cherry-pick release-${{ env.TEST_VERSION }}
+            git push origin main
+
+            # Switch back to release branch
+            git checkout release-${{ env.TEST_VERSION }}
+
+            # Create and push tag
             git tag -a "v${{ env.TEST_VERSION }}" -m "Release v${{ env.TEST_VERSION }}"
             git push origin "v${{ env.TEST_VERSION }}"
             echo "Created and pushed tag v${{ env.TEST_VERSION }}"
           else
-            echo "Skipping tag creation in dry-run mode"
+            echo "Skipping main branch update and tag creation in dry-run mode"
           fi
 
       - name: Create GitHub Release
@@ -125,7 +134,6 @@ jobs:
           echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
 
       - name: Yank previous version (for testing token)
-        if: ${{ env.TEST_DRY_RUN != 'true' }}
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
@@ -137,8 +145,6 @@ jobs:
         if: ${{ env.TEST_DRY_RUN == 'true' }}
         shell: bash
         working-directory: ./aws-s3-transfer-manager/
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
         run: |
           echo "Running cargo publish in dry-run mode"
           cargo publish --dry-run
@@ -146,6 +152,7 @@ jobs:
       # - name: Publish (actual)
       #   if: ${{ env.TEST_DRY_RUN != 'true' }}
       #   shell: bash
+      #   working-directory: ./aws-s3-transfer-manager/
       #   env:
       #     CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
       #   run: |
@@ -162,6 +169,7 @@ jobs:
           else
             echo "- Mode: PRODUCTION" >> $GITHUB_STEP_SUMMARY
             echo "- Tag created: v${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Changes pushed to main branch" >> $GITHUB_STEP_SUMMARY
             echo "- GitHub Release created: [Release v${{ env.TEST_VERSION }}](https://github.com/${{ github.repository }}/releases/tag/v${{ env.TEST_VERSION }})" >> $GITHUB_STEP_SUMMARY
             echo "- Package published to crates.io" >> $GITHUB_STEP_SUMMARY
           fi
