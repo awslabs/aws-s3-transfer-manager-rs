@@ -98,9 +98,6 @@ jobs:
             git cherry-pick release-${{ env.TEST_VERSION }}
             git push origin main
 
-            # Switch back to release branch
-            git checkout release-${{ env.TEST_VERSION }}
-
             # Create and push tag
             git tag -a "v${{ env.TEST_VERSION }}" -m "Release v${{ env.TEST_VERSION }}"
             git push origin "v${{ env.TEST_VERSION }}"
