@@ -1,22 +1,9 @@
 name: Publish to crates.io
 
 # on:
-#   workflow_dispatch:
-#     inputs:
-#       version:
-#         description: 'Version to publish (without v prefix, e.g. 1.2.3)'
-#         required: true
-#         type: string
-#       release_notes:
-#         description: 'Release notes (Markdown supported)'
-#         required: false
-#         type: string
-#         default: 'See repository for changes in this release.'
-#       dry_run:
-#         description: 'Dry run mode (create branch but skip tag creation and use cargo publish --dry-run)'
-#         required: false
-#         type: boolean
-#         default: false
+#   push:
+#     tags:
+#       - 'v*'
 
 on:
   pull_request: # Test trigger
@@ -33,12 +20,9 @@ env:
   TOKEN_KEY_NAME: ${{ secrets.TOKEN_KEY_NAME }}
   AWS_REGION: us-west-2
   # Test values
-  TEST_VERSION: '1.0.0'
-  TEST_RELEASE_NOTES: 'Test release notes for version 1.0.0'
   TEST_DRY_RUN: 'true'
 
 permissions:
-  contents: write  # Write permission to allow pushing to the repository
   id-token: write  # This is required for requesting the JWT
 
 jobs:
@@ -61,61 +45,6 @@ jobs:
           tool: cargo-nextest
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Display version to be published
-        run: |
-          echo "Publishing version ${{ env.TEST_VERSION }}"
-          echo "Dry run: ${{ env.TEST_DRY_RUN }}"
-
-      - name: Configure Git
-        run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-
-      - name: Update version in Cargo.toml
-        working-directory: ./aws-s3-transfer-manager/
-        run: |
-          # Using sed to update the version in Cargo.toml
-          sed -i "s/^version = \".*\"/version = \"${{ env.TEST_VERSION }}\"/" Cargo.toml
-          echo "Updated Cargo.toml to version ${{ env.TEST_VERSION }}"
-          # Display the updated version line for verification
-          grep "^version =" Cargo.toml
-
-      - name: Create release branch and push changes
-        run: |
-          # Create and checkout release branch
-          git checkout -b release-${{ env.TEST_VERSION }}
-
-          # Add, commit, and push changes to the new branch
-          git add ./aws-s3-transfer-manager/Cargo.toml
-          git commit -m "Bump version to ${{ env.TEST_VERSION }}"
-          git push origin release-${{ env.TEST_VERSION }} --force
-
-          # Push changes to main branch when not in dry-run mode
-          if [ "${{ env.TEST_DRY_RUN }}" != "true" ]; then
-            echo "Pushing version changes to main branch as well"
-            git checkout main
-            git cherry-pick release-${{ env.TEST_VERSION }}
-            git push origin main
-
-            # Create and push tag
-            git tag -a "v${{ env.TEST_VERSION }}" -m "Release v${{ env.TEST_VERSION }}"
-            git push origin "v${{ env.TEST_VERSION }}"
-            echo "Created and pushed tag v${{ env.TEST_VERSION }}"
-          else
-            echo "Skipping main branch update and tag creation in dry-run mode"
-          fi
-
-      - name: Create GitHub Release
-        if: ${{ env.TEST_DRY_RUN != 'true' }}
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ env.TEST_VERSION }}
-          name: "Release v${{ env.TEST_VERSION }}"
-          body: |
-            ${{ env.TEST_RELEASE_NOTES }}
-          draft: false
-          prerelease: false
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -155,18 +84,3 @@ jobs:
       #   run: |
       #     echo "Publishing to crates.io"
       #     cargo publish
-
-      - name: Workflow summary
-        run: |
-          echo "## Workflow Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Version: ${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Branch created: release-${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ env.TEST_DRY_RUN }}" == "true" ]; then
-            echo "- Mode: DRY RUN (no tag created, no release created, cargo publish run with --dry-run)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Mode: PRODUCTION" >> $GITHUB_STEP_SUMMARY
-            echo "- Tag created: v${{ env.TEST_VERSION }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Changes pushed to main branch" >> $GITHUB_STEP_SUMMARY
-            echo "- GitHub Release created: [Release v${{ env.TEST_VERSION }}](https://github.com/${{ github.repository }}/releases/tag/v${{ env.TEST_VERSION }})" >> $GITHUB_STEP_SUMMARY
-            echo "- Package published to crates.io" >> $GITHUB_STEP_SUMMARY
-          fi
