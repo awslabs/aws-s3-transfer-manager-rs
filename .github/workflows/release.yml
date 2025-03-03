@@ -46,6 +46,37 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        working-directory: ./aws-s3-transfer-manager/
+        run: |
+          # Determine the tag - use actual tag or a test tag
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
+            # Extract tag from GitHub ref (e.g. refs/tags/v1.2.3 -> v1.2.3)
+            TAG="${{ github.ref_name }}"
+          else
+            # If not triggered by a tag push, use a test tag for testing
+            TAG="v0.1.0"
+            echo "Using test tag: $TAG"
+          fi
+
+          # Extract version from tag (remove 'v' prefix)
+          TAG_VERSION="${TAG#v}"
+
+          # Extract version from Cargo.toml
+          CARGO_VERSION=$(grep -m 1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          # Verify versions match
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Version mismatch! Git tag ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          else
+            echo "✅ Version check passed: Git tag matches Cargo.toml version ($TAG_VERSION)"
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.RELEASE_ROLE_ARN }}
