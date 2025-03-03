@@ -33,9 +33,16 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
 fi
 
+# Fetch the latest tags
+echo "Fetching latest tags..."
+git fetch --tags --quiet
+
+# Get the most recent tag
+LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
+
 # Check if the new tag already exists
 if git show-ref --tags | grep -q "refs/tags/$NEW_TAG"; then
-    echo "Error: Tag '$NEW_TAG' already exists. Choose a different tag name."
+    echo "Error: Tag '$NEW_TAG' already exists. Choose a different tag name. Latest tag: $LAST_TAG"
     exit 1
 fi
 
@@ -53,13 +60,6 @@ if [ $? -ne 0 ]; then
 fi
 # Remove the backup file created by sed
 rm -f "$CARGO_TOML_PATH.bak"
-
-# Fetch the latest tags
-echo "Fetching latest tags..."
-git fetch --tags --quiet
-
-# Get the most recent tag
-LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
 
 if [ -z "$LAST_TAG" ]; then
     COMMIT_RANGE="HEAD"
@@ -95,7 +95,6 @@ echo "==============================================="
 echo "Release markdown generated: $MD_FILENAME"
 echo "New tag version: $NEW_TAG"
 echo "Previous tag: $([[ -z "$LAST_TAG" ]] && echo "None (initial release)" || echo "$LAST_TAG")"
-echo "Commit count: $COMMIT_COUNT"
 echo "==============================================="
 echo "To create the tag and push to GitHub, run:"
 echo "git tag $NEW_TAG"
