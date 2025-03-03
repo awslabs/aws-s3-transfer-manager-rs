@@ -56,7 +56,7 @@ jobs:
             TAG="${{ github.ref_name }}"
           else
             # If not triggered by a tag push, use a test tag for testing
-            TAG="v0.1.0"
+            TAG="v0.1.1"
             echo "Using test tag: $TAG"
           fi
 
