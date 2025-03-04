@@ -71,7 +71,6 @@ fn make_directory_inaccessible(dir_path: &std::path::Path) {
     // Note: This provides limited inaccessibility on Windows compared to Unix
 }
 
-
 /// A macro to generate a mock S3 client with the underlying HTTP client stubbed out
 ///
 /// This macro wraps [`mock_client`](aws_smithy_mocks_experimental::mock_client) to work around the issue
