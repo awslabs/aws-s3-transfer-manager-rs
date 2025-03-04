@@ -1,4 +1,4 @@
-// #![cfg(e2e_test)]
+#![cfg(e2e_test)]
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -15,7 +15,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
-use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use test_common::{create_test_dir, drain, global_uuid_str};
 
 use aws_s3_transfer_manager::types::{DownloadFilter, PartSize};
@@ -434,7 +433,6 @@ async fn test_object_download_range_failures() {
 async fn test_objects_transfer() {
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
-    let _logs = show_test_logs();
 
     // SSE-C objects require the key to download, skipping it.
     fn sse_c_filter(obj: &aws_sdk_s3::types::Object) -> bool {
