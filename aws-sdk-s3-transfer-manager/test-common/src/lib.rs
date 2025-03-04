@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_s3_transfer_manager::{error::Error, operation::download::DownloadHandle};
+use aws_sdk_s3_transfer_manager::{error::Error, operation::download::DownloadHandle};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::OnceLock;
 use uuid::Uuid;

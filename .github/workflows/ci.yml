@@ -190,7 +190,7 @@ jobs:
           tool: cargo-check-external-types@0.1.13
       - name: check-external-types
         run: cargo check-external-types --all-features --config external-types.toml
-        working-directory: aws-s3-transfer-manager
+        working-directory: aws-sdk-s3-transfer-manager
 
   check-deny:
     name: check deps with cargo-deny

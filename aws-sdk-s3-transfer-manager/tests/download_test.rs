@@ -4,7 +4,7 @@
  */
 
 use aws_config::Region;
-use aws_s3_transfer_manager::{
+use aws_sdk_s3_transfer_manager::{
     error::BoxError,
     metrics::unit::ByteUnit,
     types::{ConcurrencyMode, PartSize},
@@ -82,13 +82,13 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
 fn simple_test_tm(
     data: &Bytes,
     part_size: usize,
-) -> (aws_s3_transfer_manager::Client, StaticReplayClient) {
+) -> (aws_sdk_s3_transfer_manager::Client, StaticReplayClient) {
     let http_client = simple_object_connector(data, part_size);
     let tm = test_tm(http_client.clone(), part_size);
     (tm, http_client)
 }
 
-fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer_manager::Client {
+fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_sdk_s3_transfer_manager::Client {
     let s3_client = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Config::builder()
             .http_client(http_client)
@@ -97,13 +97,13 @@ fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer
             .build(),
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build();
 
-    aws_s3_transfer_manager::Client::new(config)
+    aws_sdk_s3_transfer_manager::Client::new(config)
 }
 
 /// Test the object ranges are expected and we get all the data

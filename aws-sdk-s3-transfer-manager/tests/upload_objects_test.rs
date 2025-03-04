@@ -10,11 +10,6 @@ use std::sync::{
     Arc,
 };
 
-use aws_s3_transfer_manager::{
-    error::ErrorKind,
-    metrics::unit::ByteUnit,
-    types::{FailedTransferPolicy, PartSize},
-};
 use aws_sdk_s3::{
     config::http::HttpResponse,
     error::DisplayErrorContext,
@@ -24,6 +19,11 @@ use aws_sdk_s3::{
         upload_part::UploadPartOutput,
     },
     Client,
+};
+use aws_sdk_s3_transfer_manager::{
+    error::ErrorKind,
+    metrics::unit::ByteUnit,
+    types::{FailedTransferPolicy, PartSize},
 };
 use aws_smithy_mocks_experimental::{mock, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
@@ -94,10 +94,10 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
     let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = sut
         .upload_objects()
@@ -117,7 +117,7 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
 #[tokio::test]
 async fn test_successful_multiple_objects_upload_via_multipart_upload() {
     let recursion_root = "test";
-    // should be in sync with `aws-s3-transfer-manager::config::MIN_MULTIPART_PART_SIZE_BYTES`
+    // should be in sync with `aws-sdk-s3-transfer-manager::config::MIN_MULTIPART_PART_SIZE_BYTES`
     const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
     let files = vec![
         ("sample.jpg", MIN_MULTIPART_PART_SIZE_BYTES as usize),
@@ -129,11 +129,11 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
     let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_multipart_upload(bucket_name.to_owned()))
         .multipart_threshold(PartSize::Target(5))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = sut
         .upload_objects()
@@ -184,10 +184,10 @@ async fn test_successful_multiple_objects_upload_with_symlinks() {
     .unwrap();
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     // Test with following symbolic links while uploading recursively
     {
@@ -235,10 +235,10 @@ async fn test_source_dir_is_symlink() {
     symlink(&temp_dir2, &symlink_path).await.unwrap();
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     // should fail when the source is a symbolic link to a directory but the operation does not follow symbolic links
     {
@@ -291,10 +291,10 @@ async fn test_failed_upload_policy_continue() {
     );
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = sut
         .upload_objects()
@@ -325,10 +325,10 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
         });
     let s3_client =
         mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = sut
         .upload_objects()
@@ -355,10 +355,10 @@ async fn test_source_dir_not_valid() {
     let source = tempfile::NamedTempFile::new().unwrap();
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let err = sut
         .upload_objects()
@@ -385,10 +385,10 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
     let test_dir = create_test_dir(Some(recursion_root), files.clone(), &[]);
 
     let bucket_name = "test-bucket";
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     // Getting `handle` is ok, i.e., tasks should be spawned from `UploadObjects::orchestrate`
     let handle = sut
@@ -438,10 +438,10 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
 
     let s3_client =
         mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let mut handle = sut
         .upload_objects()
@@ -490,10 +490,10 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
 
     let s3_client =
         mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = sut
         .upload_objects()
@@ -544,10 +544,10 @@ async fn test_drop_upload_objects_handle() {
         });
     let s3_client =
         mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
-    let sut = aws_s3_transfer_manager::Client::new(config);
+    let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = sut
         .upload_objects()

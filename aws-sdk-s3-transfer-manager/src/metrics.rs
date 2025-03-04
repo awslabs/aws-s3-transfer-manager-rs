@@ -178,7 +178,7 @@ impl Throughput {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use aws_s3_transfer_manager::metrics::{unit, Throughput};
+    /// use aws_sdk_s3_transfer_manager::metrics::{unit, Throughput};
     /// let bytes_transferred = 5 * unit::ByteUnit::Mebibyte.as_bytes_u64();
     /// assert_eq!(
     ///     Throughput::new(bytes_transferred, Duration::from_secs(1)),

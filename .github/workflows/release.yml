@@ -43,7 +43,7 @@ jobs:
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
-        working-directory: ./aws-s3-transfer-manager/
+        working-directory: ./aws-sdk-s3-transfer-manager/
         run: |
           # Determine the tag - use actual tag or a test tag
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
@@ -95,7 +95,7 @@ jobs:
 
       - name: Publish to crate.io
         shell: bash
-        working-directory: ./aws-s3-transfer-manager/
+        working-directory: ./aws-sdk-s3-transfer-manager/
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
         run: |

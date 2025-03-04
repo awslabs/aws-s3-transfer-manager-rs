@@ -49,7 +49,7 @@ fi
 # Extract version without the 'v' prefix for Cargo.toml
 CARGO_VERSION="${NEW_TAG#v}"
 # Path to Cargo.toml
-CARGO_TOML_PATH="$SCRIPT_DIR/aws-s3-transfer-manager/Cargo.toml"
+CARGO_TOML_PATH="$SCRIPT_DIR/aws-sdk-s3-transfer-manager/Cargo.toml"
 
 # Update version in Cargo.toml
 echo "Updating version in Cargo.toml to $CARGO_VERSION..."

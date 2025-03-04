@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time;
 
-use aws_s3_transfer_manager::io::InputStream;
-use aws_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_s3_transfer_manager::metrics::Throughput;
-use aws_s3_transfer_manager::operation::download::Body;
-use aws_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_sdk_s3_transfer_manager::io::InputStream;
+use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::metrics::Throughput;
+use aws_sdk_s3_transfer_manager::operation::download::Body;
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
 use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -146,7 +146,7 @@ fn invalid_arg(message: &str) -> ! {
 
 async fn do_recursive_download(
     args: Args,
-    tm: aws_s3_transfer_manager::Client,
+    tm: aws_sdk_s3_transfer_manager::Client,
 ) -> Result<(), BoxError> {
     let (bucket, key_prefix) = args.source.expect_s3().parts();
     let dest = args.dest.expect_local();
@@ -179,7 +179,7 @@ async fn do_recursive_download(
 async fn do_download(args: Args) -> Result<(), BoxError> {
     let (bucket, _) = args.source.expect_s3().parts();
 
-    let tm_config = aws_s3_transfer_manager::from_env()
+    let tm_config = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size))
         .load()
@@ -187,7 +187,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
     warmup(&tm_config, bucket).await?;
 
-    let tm = aws_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 
     if args.recursive {
         return do_recursive_download(args, tm).await;
@@ -222,7 +222,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
 
 async fn do_recursive_upload(
     args: Args,
-    tm: aws_s3_transfer_manager::Client,
+    tm: aws_sdk_s3_transfer_manager::Client,
 ) -> Result<(), BoxError> {
     let Args { source, dest, .. } = args;
     let source_dir = source.expect_local();
@@ -256,7 +256,7 @@ async fn do_recursive_upload(
 async fn do_upload(args: Args) -> Result<(), BoxError> {
     let (bucket, key) = args.dest.expect_s3().parts();
 
-    let tm_config = aws_s3_transfer_manager::from_env()
+    let tm_config = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size))
         .load()
@@ -264,7 +264,7 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
 
     warmup(&tm_config, bucket).await?;
 
-    let tm = aws_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 
     if args.recursive {
         return do_recursive_upload(args, tm).await;
@@ -343,7 +343,7 @@ async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError>
     Ok(())
 }
 
-async fn warmup(config: &aws_s3_transfer_manager::Config, bucket: &str) -> Result<(), BoxError> {
+async fn warmup(config: &aws_sdk_s3_transfer_manager::Config, bucket: &str) -> Result<(), BoxError> {
     println!("warming up client...");
     let s3 = config.client();
 

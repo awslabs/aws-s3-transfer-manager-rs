@@ -5,7 +5,7 @@
 
 use std::{str::FromStr, task::Poll};
 
-use aws_s3_transfer_manager::{
+use aws_sdk_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
     metrics::unit::ByteUnit,
     operation::upload::{ChecksumStrategy, UploadOutput},
@@ -185,7 +185,7 @@ impl PartStream for TestStream {
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-        _stream_cx: &aws_s3_transfer_manager::io::StreamContext,
+        _stream_cx: &aws_sdk_s3_transfer_manager::io::StreamContext,
     ) -> Poll<Option<std::io::Result<PartData>>> {
         let this = self.project();
         let part_index = *this.next_part_num as usize - 1;
@@ -584,13 +584,13 @@ async fn run_test(config: TestConfig) -> UploadOutput {
         config.parts[0].clone().into()
     };
 
-    let tm_config = aws_s3_transfer_manager::Config::builder()
+    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .part_size(PartSize::Target(PART_SIZE as u64))
         .multipart_threshold(PartSize::Target(PART_SIZE as u64))
         .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 
     // Do upload
     let upload_handle = tm
