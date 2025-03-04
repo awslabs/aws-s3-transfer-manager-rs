@@ -443,10 +443,12 @@ async fn test_objects_transfer() {
 
     let temp_dir = create_test_dir(Some("e2e_downloads"), vec![], &[]);
 
+    // Download all pre-existing objects except the ones with `aes256-c` suffix
+    // The objects details can be found https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper
     let download_handle = tm
         .download_objects()
         .bucket(bucket_name.as_str())
-        .key_prefix("pre-")
+        .key_prefix("pre-existing")
         .set_filter(Some(DownloadFilter::from(sse_c_filter)))
         .destination(temp_dir.path())
         .send()
