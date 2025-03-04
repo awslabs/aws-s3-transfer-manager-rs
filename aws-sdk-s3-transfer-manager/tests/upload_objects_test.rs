@@ -117,7 +117,7 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
 #[tokio::test]
 async fn test_successful_multiple_objects_upload_via_multipart_upload() {
     let recursion_root = "test";
-    // should be in sync with `aws-sdk-s3-transfer-manager::config::MIN_MULTIPART_PART_SIZE_BYTES`
+    // should be in sync with `aws_sdk_s3_transfer_manager::config::MIN_MULTIPART_PART_SIZE_BYTES`
     const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
     let files = vec![
         ("sample.jpg", MIN_MULTIPART_PART_SIZE_BYTES as usize),
