@@ -1,12 +1,9 @@
 name: Publish to crates.io
 
-# on:
-#   push:
-#     tags:
-#       - 'v*'
-
 on:
-  pull_request: # Test trigger
+  push:
+    tags:
+      - 'v*'
 
 env:
   RUSTFLAGS: -Dwarnings
@@ -19,8 +16,6 @@ env:
   RELEASE_ROLE_ARN: ${{ secrets.RELEASE_ROLE_ARN }}
   TOKEN_KEY_NAME: ${{ secrets.TOKEN_KEY_NAME }}
   AWS_REGION: us-west-2
-  # Test values
-  TEST_DRY_RUN: 'true'
 
 permissions:
   id-token: write  # This is required for requesting the JWT
@@ -98,20 +93,11 @@ jobs:
           # This version has already been yanked. This command succeeds if we have a token with permission to yank the crate.
           cargo yank aws-sigv4 --version 0.55.0
 
-      - name: Publish (dry-run)
-        if: ${{ env.TEST_DRY_RUN == 'true' }}
+      - name: Publish to crate.io
         shell: bash
         working-directory: ./aws-s3-transfer-manager/
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
         run: |
-          echo "Running cargo publish in dry-run mode"
-          cargo publish --dry-run
-
-      # - name: Publish (actual)
-      #   if: ${{ env.TEST_DRY_RUN != 'true' }}
-      #   shell: bash
-      #   working-directory: ./aws-s3-transfer-manager/
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
-      #   run: |
-      #     echo "Publishing to crates.io"
-      #     cargo publish
+          echo "Publishing to crates.io"
+          cargo publish
