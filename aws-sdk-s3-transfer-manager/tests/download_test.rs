@@ -88,7 +88,10 @@ fn simple_test_tm(
     (tm, http_client)
 }
 
-fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_sdk_s3_transfer_manager::Client {
+fn test_tm(
+    http_client: StaticReplayClient,
+    part_size: usize,
+) -> aws_sdk_s3_transfer_manager::Client {
     let s3_client = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Config::builder()
             .http_client(http_client)

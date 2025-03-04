@@ -4,7 +4,6 @@
  */
 #![cfg(target_family = "unix")]
 
-use aws_sdk_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
 use aws_sdk_s3::{
     error::{DisplayErrorContext, SdkError},
     operation::{
@@ -13,6 +12,7 @@ use aws_sdk_s3::{
     },
     primitives::ByteStream,
 };
+use aws_sdk_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
 use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::{

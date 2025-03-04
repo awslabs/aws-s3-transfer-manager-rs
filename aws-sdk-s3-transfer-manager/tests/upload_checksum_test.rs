@@ -5,12 +5,6 @@
 
 use std::{str::FromStr, task::Poll};
 
-use aws_sdk_s3_transfer_manager::{
-    io::{InputStream, PartData, PartStream, SizeHint},
-    metrics::unit::ByteUnit,
-    operation::upload::{ChecksumStrategy, UploadOutput},
-    types::{ConcurrencyMode, PartSize},
-};
 use aws_sdk_s3::{
     operation::{
         complete_multipart_upload::CompleteMultipartUploadOutput,
@@ -18,6 +12,12 @@ use aws_sdk_s3::{
         upload_part::UploadPartOutput,
     },
     types::{ChecksumAlgorithm, ChecksumType},
+};
+use aws_sdk_s3_transfer_manager::{
+    io::{InputStream, PartData, PartStream, SizeHint},
+    metrics::unit::ByteUnit,
+    operation::upload::{ChecksumStrategy, UploadOutput},
+    types::{ConcurrencyMode, PartSize},
 };
 use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
 use bytes::Bytes;

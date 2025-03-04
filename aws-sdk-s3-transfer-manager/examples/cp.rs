@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time;
 
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
-use aws_sdk_s3::error::DisplayErrorContext;
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use tokio::fs;
@@ -343,7 +343,10 @@ async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError>
     Ok(())
 }
 
-async fn warmup(config: &aws_sdk_s3_transfer_manager::Config, bucket: &str) -> Result<(), BoxError> {
+async fn warmup(
+    config: &aws_sdk_s3_transfer_manager::Config,
+    bucket: &str,
+) -> Result<(), BoxError> {
     println!("warming up client...");
     let s3 = config.client();
 
