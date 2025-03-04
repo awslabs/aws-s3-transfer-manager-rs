@@ -7,9 +7,10 @@ use crate::error::ErrorKind;
 use crate::http::header;
 use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
-use crate::middleware::limit::concurrency::ProvidePayloadSize;
+use crate::middleware::limit::concurrency::ProvideNetworkPermitContext;
 use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
+use crate::runtime::scheduler::NetworkPermitContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use std::cmp;
@@ -21,6 +22,7 @@ use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
 use tracing::Instrument;
 
 use super::body::ChunkOutput;
+use super::TransferDirection;
 use super::{DownloadInput, DownloadInputBuilder};
 
 /// Request/input type for our "chunk" service.
@@ -32,15 +34,21 @@ pub(super) struct DownloadChunkRequest {
     pub(super) start_seq: u64,
 }
 
-impl ProvidePayloadSize for DownloadChunkRequest {
-    fn payload_size_estimate(&self) -> u64 {
+impl ProvideNetworkPermitContext for DownloadChunkRequest {
+    fn network_permit_context(&self) -> NetworkPermitContext {
         // we can't know the actual size by calling next_seq() as that would modify the
         // state. Instead we give an estimate based on the current sequence.
         let seq = self.ctx.current_seq();
         let remaining = self.remaining.clone();
         let part_size = self.ctx.handle.download_part_size_bytes();
         let range = next_range(seq, remaining, part_size, self.start_seq);
-        range.end() - range.start() + 1
+        let payload_estimate = range.end() - range.start() + 1;
+
+        NetworkPermitContext {
+            payload_size_estimate: payload_estimate,
+            bucket_type: self.ctx.bucket_type(),
+            direction: TransferDirection::Download,
+        }
     }
 }
 

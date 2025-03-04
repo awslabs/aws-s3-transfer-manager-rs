@@ -33,7 +33,10 @@ mod service;
 
 use crate::error;
 use crate::io::AggregatedBytes;
-use crate::runtime::scheduler::{OwnedWorkPermit, PermitType};
+use crate::runtime::scheduler::{
+    NetworkPermitContext, OwnedWorkPermit, PermitType, TransferDirection,
+};
+use crate::types::BucketType;
 use aws_smithy_types::byte_stream::ByteStream;
 use discovery::discover_obj;
 use service::distribute_work;
@@ -70,7 +73,9 @@ impl Download {
             todo!("single part download not implemented")
         }
 
-        let ctx = DownloadContext::new(handle);
+        let bucket_type =
+            BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
+        let ctx = DownloadContext::new(handle, bucket_type);
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
         let (object_meta_tx, object_meta_rx) = oneshot::channel();
@@ -120,7 +125,11 @@ async fn send_discovery(
     let permit = ctx
         .handle
         .scheduler
-        .acquire_permit(PermitType::Network(0))
+        .acquire_permit(PermitType::Network(NetworkPermitContext {
+            payload_size_estimate: 0,
+            bucket_type: ctx.bucket_type(),
+            direction: TransferDirection::Download,
+        }))
         .await;
     let permit = match permit {
         Ok(permit) => permit,
@@ -239,17 +248,19 @@ pub(crate) struct DownloadState {
     current_seq: AtomicU64,
     cancel_tx: CancelNotificationSender,
     cancel_rx: CancelNotificationReceiver,
+    bucket_type: BucketType,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
 
 impl DownloadContext {
-    fn new(handle: Arc<crate::client::Handle>) -> Self {
+    fn new(handle: Arc<crate::client::Handle>, bucket_type: BucketType) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             current_seq: AtomicU64::new(0),
             cancel_tx,
             cancel_rx,
+            bucket_type,
         });
         TransferContext { handle, state }
     }
@@ -267,5 +278,10 @@ impl DownloadContext {
     /// Returns the current seq
     fn current_seq(&self) -> u64 {
         self.state.current_seq.load(Ordering::SeqCst)
+    }
+
+    /// Returns the type of bucket targeted by this operation
+    fn bucket_type(&self) -> BucketType {
+        self.state.bucket_type
     }
 }

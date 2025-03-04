@@ -18,7 +18,8 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
-use crate::runtime::scheduler::PermitType;
+use crate::runtime::scheduler::{NetworkPermitContext, PermitType, TransferDirection};
+use crate::types::BucketType;
 use context::UploadContext;
 pub use handle::UploadHandle;
 use handle::{MultipartUploadData, UploadType};
@@ -114,7 +115,11 @@ async fn put_object(
     let _permit = ctx
         .handle
         .scheduler
-        .acquire_permit(PermitType::Network(content_length as u64))
+        .acquire_permit(PermitType::Network(NetworkPermitContext {
+            payload_size_estimate: content_length as u64,
+            bucket_type: ctx.bucket_type(),
+            direction: TransferDirection::Upload,
+        }))
         .await?;
 
     let mut req = ctx
@@ -226,6 +231,7 @@ async fn try_start_mpu_upload(
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
     UploadContext {
         handle,
+        bucket_type: BucketType::from_bucket_name(req.bucket().expect("bucket is availabe")),
         request: Arc::new(req),
     }
 }

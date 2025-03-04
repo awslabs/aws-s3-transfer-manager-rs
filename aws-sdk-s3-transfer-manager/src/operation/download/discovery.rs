@@ -216,6 +216,7 @@ mod tests {
     };
     use crate::operation::download::DownloadContext;
     use crate::operation::download::DownloadInput;
+    use crate::types::BucketType;
     use crate::types::PartSize;
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -229,6 +230,8 @@ mod tests {
 
     fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
             .set_range(range.map(|r| r.to_string()))
             .build()
             .unwrap();
@@ -280,7 +283,10 @@ mod tests {
         });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()));
+        let ctx = DownloadContext::new(
+            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
+            BucketType::Standard,
+        );
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -309,7 +315,7 @@ mod tests {
             });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
@@ -346,7 +352,7 @@ mod tests {
             });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
@@ -381,7 +387,7 @@ mod tests {
             });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
@@ -419,7 +425,7 @@ mod tests {
             });
         let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
@@ -456,7 +462,7 @@ mod tests {
             &[&get_range_rule, &get_first_part_rule]
         );
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size));
+        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
