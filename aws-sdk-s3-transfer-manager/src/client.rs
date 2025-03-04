@@ -83,10 +83,10 @@ impl Client {
     /// ```no_run
     /// use std::error::Error;
     /// use std::path::Path;
-    /// use aws_s3_transfer_manager::io::InputStream;
+    /// use aws_sdk_s3_transfer_manager::io::InputStream;
     ///
     /// async fn upload_file(
-    ///     client: &aws_s3_transfer_manager::Client,
+    ///     client: &aws_sdk_s3_transfer_manager::Client,
     ///     path: impl AsRef<Path>
     /// ) -> Result<(), Box<dyn Error>> {
     ///     let stream = InputStream::from_path(path)?;
@@ -123,7 +123,7 @@ impl Client {
     /// ```no_run
     /// use std::error::Error;
     ///
-    /// async fn get_object(client: &aws_s3_transfer_manager::Client) -> Result<(), Box<dyn Error>> {
+    /// async fn get_object(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), Box<dyn Error>> {
     ///
     ///     let handle = client
     ///         .download()
@@ -148,10 +148,10 @@ impl Client {
     /// # Examples
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use aws_s3_transfer_manager::error::Error;
+    /// use aws_sdk_s3_transfer_manager::error::Error;
     ///
     /// async fn download_bucket(
-    ///     client: &aws_s3_transfer_manager::Client,
+    ///     client: &aws_sdk_s3_transfer_manager::Client,
     ///     dest: PathBuf
     /// ) -> Result<(), Error> {
     ///
@@ -185,10 +185,10 @@ impl Client {
     /// Examples
     /// ```no_run
     /// use std::path::Path;
-    /// use aws_s3_transfer_manager::error::Error;
+    /// use aws_sdk_s3_transfer_manager::error::Error;
     ///
     /// async fn upload_directory(
-    ///     client: &aws_s3_transfer_manager::Client,
+    ///     client: &aws_sdk_s3_transfer_manager::Client,
     ///     source: &Path,
     /// ) -> Result<(), Error> {
     ///

@@ -7,11 +7,11 @@ use std::cmp;
 use std::task::ready;
 use std::{task::Poll, time::Duration};
 
-use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_smithy_mocks_experimental::{mock, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use bytes::Bytes;
@@ -118,11 +118,11 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
 async fn test_many_uploads_no_deadlock() {
     let (_guard, _rx) = capture_test_logs();
     let client = mock_s3_client_for_multipart_upload();
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
 
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let mut transfers = Vec::with_capacity(MANY_ASYNC_UPLOADS_CNT);
     for i in 0..MANY_ASYNC_UPLOADS_CNT {
@@ -183,11 +183,11 @@ async fn test_many_uploads_no_deadlock() {
 async fn test_large_upload_part_size_bump() {
     let (_guard, logs_rx) = capture_test_logs();
     let client = mock_s3_client_for_multipart_upload();
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
 
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let (tx, rx) = mpsc::channel(1);
     let size_hint = 100 * ByteUnit::Gibibyte.as_bytes_u64();

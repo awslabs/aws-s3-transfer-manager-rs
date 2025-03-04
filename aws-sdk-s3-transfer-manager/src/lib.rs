@@ -28,17 +28,17 @@
 //!
 //! ```no_run
 //! # async fn example() {
-//! let config = aws_s3_transfer_manager::from_env().load().await;
-//! let client = aws_s3_transfer_manager::Client::new(config);
+//! let config = aws_sdk_s3_transfer_manager::from_env().load().await;
+//! let client = aws_sdk_s3_transfer_manager::Client::new(config);
 //! # }
 //! ```
 //!
 //! Download a bucket to a local directory:
 //!
 //! ```no_run
-//! # async fn example() -> Result<(), aws_s3_transfer_manager::error::Error> {
-//! let config = aws_s3_transfer_manager::from_env().load().await;
-//! let client = aws_s3_transfer_manager::Client::new(config);
+//! # async fn example() -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+//! let config = aws_sdk_s3_transfer_manager::from_env().load().await;
+//! let client = aws_sdk_s3_transfer_manager::Client::new(config);
 //!
 //! let handle = client
 //!     .download_objects()
@@ -65,10 +65,10 @@
 /// Default in-flight concurrency
 pub(crate) const DEFAULT_CONCURRENCY: usize = 128;
 
-/// Error types emitted by `aws-s3-transfer-manager`
+/// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
 
-/// Common types used by `aws-s3-transfer-manager`
+/// Common types used by `aws-sdk-s3-transfer-manager`
 pub mod types;
 
 /// Types and helpers for I/O
