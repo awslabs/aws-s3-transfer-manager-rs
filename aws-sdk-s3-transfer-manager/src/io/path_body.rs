@@ -23,7 +23,7 @@ pub(super) struct PathBody {
 ///
 /// ```no_run
 /// # {
-/// use aws_s3_transfer_manager::io::InputStream;
+/// use aws_sdk_s3_transfer_manager::io::InputStream;
 /// use std::path::Path;
 ///
 /// async fn input_stream_from_file() -> InputStream {
