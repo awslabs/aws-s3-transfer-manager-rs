@@ -108,7 +108,10 @@ pub(super) async fn list_directory_contents(
                                         );
                                         Ok(UploadObjectJob::new(object_key.into_owned(), object))
                                     }
-                                    Err(e) => Err(e.into()),
+                                    Err(e) => {
+                                         tracing::error!("failed to prepare to upload {relative_filename}: {}", DisplayErrorContext(&e));
+                                        Err(e.into())
+                                    },
                                 }
                             }
                             Err(walkdir_error) => {
