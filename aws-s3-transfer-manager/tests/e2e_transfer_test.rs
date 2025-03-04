@@ -431,7 +431,6 @@ async fn test_object_download_range_failures() {
 }
 
 #[tokio::test]
-#[cfg(target_family = "unix")]
 async fn test_objects_transfer() {
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
