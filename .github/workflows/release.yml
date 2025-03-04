@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run mode (create branch but skip tag creation and use cargo publish --dry-run)'
+        description: 'Dry run mode (cargo publish --dry-run)'
         required: false
         type: boolean
         default: true
