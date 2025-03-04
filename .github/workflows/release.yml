@@ -56,7 +56,7 @@ jobs:
           TAG_VERSION="${LATEST_TAG#v}"
 
           # Extract version from Cargo.toml
-          CARGO_VERSION=$(grep -m 1 '^version = ' ./aws-s3-transfer-manager/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          CARGO_VERSION=$(grep -m 1 '^version = ' ./aws-sdk-s3-transfer-manager/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 
           echo "Tag version: $TAG_VERSION"
           echo "Cargo.toml version: $CARGO_VERSION"
@@ -79,6 +79,7 @@ jobs:
         id: cargo-registry-token
         run: |
           CARGO_REGISTRY_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${{ secrets.TOKEN_KEY_NAME }} --region ${{ env.AWS_REGION }} | jq -r ".SecretString")
+          # Make sure the token is masked in the logs
           echo "::add-mask::$CARGO_REGISTRY_TOKEN"
           echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
 
