@@ -11,6 +11,7 @@ use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, S
 use aws_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3::types::ChecksumMode;
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
@@ -455,6 +456,26 @@ async fn test_objects_transfer() {
         .await
         .unwrap();
     download_handle.join().await.unwrap();
+
+    let file_count = std::fs::read_dir(temp_dir.path())
+        .expect("Failed to read directory")
+        .map(|entry| {
+            let entry = entry.expect("Failed to access directory entry");
+            let file_type = entry.file_type().expect("Failed to determine file type");
+            assert!(
+                file_type.is_file(),
+                "Expected only files in directory, but found non-file: {:?}",
+                entry.path()
+            );
+            entry
+        })
+        .count();
+
+    assert_eq!(
+        file_count, 7,
+        "Expected exactly 7 files to be downloaded, but found {}",
+        file_count
+    );
 
     let upload_handle = tm
         .upload_objects()
