@@ -4,7 +4,7 @@ CHANGELOG
 v0.1.1
 ======
 
-* Fix releases
+* Fixed publishing on crate.io
     - Add README for the crate
     - Fix the repository URL
     - Add description, categories, keywords
