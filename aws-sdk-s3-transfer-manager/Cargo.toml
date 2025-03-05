@@ -11,7 +11,7 @@ description = """
 A high performance Amazon S3 transfer manager for Rust.
 """
 categories = ["asynchronous", "concurrency"]
-keywords = ["AWS", "Amazon", "S3", "high-performance", "SDK", "transfer-manager"]
+keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
 async-channel = "2.3.1"
