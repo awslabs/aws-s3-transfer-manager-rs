@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify tag matches Cargo.toml version
-        if: ${{ inputs.dry_run }} == false
+        if: inputs.dry_run == false
         run: |
           # Get latest tag from all tags
           LATEST_TAG=$(git describe --tags --abbrev=0)
