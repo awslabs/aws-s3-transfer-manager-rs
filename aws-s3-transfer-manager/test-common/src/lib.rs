@@ -57,18 +57,7 @@ fn make_directory_inaccessible(dir_path: &std::path::Path) {
 
 #[cfg(target_family = "windows")]
 fn make_directory_inaccessible(dir_path: &std::path::Path) {
-    use std::os::windows::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(dir_path).unwrap().permissions();
-
-    // On Windows, we can deny access by making the directory read-only
-    // and removing all other attributes
-    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-    permissions.set_readonly(true);
-    permissions.set_mode(FILE_ATTRIBUTE_READONLY);
-
-    std::fs::set_permissions(dir_path, permissions).unwrap();
-
-    // Note: This provides limited inaccessibility on Windows compared to Unix
+    panic!("make_directory_inaccessible is not implemented for Windows");
 }
 
 /// A macro to generate a mock S3 client with the underlying HTTP client stubbed out
