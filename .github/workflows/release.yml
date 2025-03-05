@@ -1,0 +1,96 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (cargo publish --dry-run)'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+  # Change to specific Rust release to pin
+  rust_stable: stable
+  rust_nightly: nightly-2024-07-07
+  # When updating this, also update relevant docs
+  rust_min: '1.81'
+  RELEASE_ROLE_ARN: ${{ secrets.RELEASE_ROLE_ARN }}
+  TOKEN_KEY_NAME: ${{ secrets.TOKEN_KEY_NAME }}
+  AWS_REGION: us-west-2
+
+permissions:
+  id-token: write  # This is required for requesting the JWT
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+            toolchain: ${{ env.rust_stable }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        if: ${{ inputs.dry_run }} == false
+        run: |
+          # Get latest tag from all tags
+          LATEST_TAG=$(git describe --tags --abbrev=0)
+          echo "Latest tag: $LATEST_TAG"
+
+          # Extract version from tag (remove 'v' prefix)
+          TAG_VERSION="${LATEST_TAG#v}"
+
+          # Extract version from Cargo.toml
+          CARGO_VERSION=$(grep -m 1 '^version = ' ./aws-sdk-s3-transfer-manager/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          # Verify versions match
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Version mismatch! Latest Git tag ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          else
+            echo "✅ Version check passed: Latest Git tag matches Cargo.toml version ($TAG_VERSION)"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Cargo registry token
+        shell: bash
+        id: cargo-registry-token
+        run: |
+          CARGO_REGISTRY_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${{ secrets.TOKEN_KEY_NAME }} --region ${{ env.AWS_REGION }} | jq -r ".SecretString")
+          # Make sure the token is masked in the logs
+          echo "::add-mask::$CARGO_REGISTRY_TOKEN"
+          echo "token=$CARGO_REGISTRY_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Publish to crate.io
+        shell: bash
+        working-directory: ./aws-sdk-s3-transfer-manager/
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.cargo-registry-token.outputs.token }}
+        run: |
+          if ${{ inputs.dry_run }}; then
+            cargo publish --token $CARGO_REGISTRY_TOKEN --dry-run
+          else
+            cargo publish --token $CARGO_REGISTRY_TOKEN
+          fi

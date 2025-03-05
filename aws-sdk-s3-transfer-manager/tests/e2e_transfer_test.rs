@@ -7,17 +7,16 @@
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
 // By default, it uses aws-s3-transfer-manager-rs-test-bucket
-use aws_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3::types::ChecksumMode;
+use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::{DownloadFilter, PartSize};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 use test_common::{create_test_dir, drain, global_uuid_str};
-
-use aws_s3_transfer_manager::types::{DownloadFilter, PartSize};
 use tokio::time::Sleep;
 
 const PUT_OBJECT_PREFIX: &str = "upload";
@@ -39,13 +38,13 @@ fn generate_key(readable_key: &str) -> String {
     )
 }
 
-async fn test_tm() -> (aws_s3_transfer_manager::Client, aws_sdk_s3::Client) {
-    let tm_config = aws_s3_transfer_manager::from_env()
+async fn test_tm() -> (aws_sdk_s3_transfer_manager::Client, aws_sdk_s3::Client) {
+    let tm_config = aws_sdk_s3_transfer_manager::from_env()
         .part_size(PartSize::Target(8 * ByteUnit::Mebibyte.as_bytes_u64()))
         .load()
         .await;
     let client = tm_config.client().clone();
-    let tm = aws_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
     (tm, client)
 }
 
@@ -59,7 +58,7 @@ fn create_input_stream(size: usize) -> InputStream {
 }
 
 async fn perform_upload(
-    tm: &aws_s3_transfer_manager::Client,
+    tm: &aws_sdk_s3_transfer_manager::Client,
     bucket_name: &str,
     key: &str,
     strategy: Option<ChecksumStrategy>,
@@ -133,7 +132,7 @@ async fn get_object_checksum(
 }
 
 async fn upload_and_get_object_checksum(
-    tm: &aws_s3_transfer_manager::Client,
+    tm: &aws_sdk_s3_transfer_manager::Client,
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
@@ -325,13 +324,13 @@ async fn test_empty_object_download() {
 }
 
 async fn range_download_helper(
-    tm: &aws_s3_transfer_manager::Client,
+    tm: &aws_sdk_s3_transfer_manager::Client,
     bucket: &str,
     key: &str,
     range: &str,
     expected_length: usize,
     description: &str,
-) -> Result<(), aws_s3_transfer_manager::error::Error> {
+) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
     let mut download_handle = tm
         .download()
         .bucket(bucket)

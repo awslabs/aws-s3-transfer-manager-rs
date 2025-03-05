@@ -4,7 +4,6 @@
  */
 #![cfg(target_family = "unix")]
 
-use aws_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
 use aws_sdk_s3::{
     error::{DisplayErrorContext, SdkError},
     operation::{
@@ -13,6 +12,7 @@ use aws_sdk_s3::{
     },
     primitives::ByteStream,
 };
+use aws_sdk_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
 use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::{
@@ -199,10 +199,10 @@ async fn test_strip_prefix_in_destination_path() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -242,10 +242,10 @@ async fn test_object_with_prefix_included() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -285,10 +285,10 @@ async fn test_failed_download_policy_continue() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -347,10 +347,10 @@ async fn test_recursively_downloads() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -387,10 +387,10 @@ async fn test_delimiter() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -429,10 +429,10 @@ async fn test_destination_dir_not_valid() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::NamedTempFile::new().unwrap();
 
@@ -464,10 +464,10 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -499,10 +499,10 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
     let client =
         mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -549,10 +549,10 @@ async fn test_failed_get_object_should_cancel_the_operation() {
         bucket.rules().as_slice()
     );
 
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -594,10 +594,10 @@ async fn test_drop_download_objects_handle() {
         RuleMode::MatchAny,
         vec![rule, bucket.list_objects_rule()].as_slice()
     );
-    let config = aws_s3_transfer_manager::Config::builder()
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
-    let tm = aws_s3_transfer_manager::Client::new(config);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
