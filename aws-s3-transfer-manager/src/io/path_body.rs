@@ -99,7 +99,7 @@ impl PathBodyBuilder {
                 let metadata = self.metadata.unwrap_or(fs::metadata(path.clone())?);
                 let file_size = metadata.len();
 
-                if offset >= file_size {
+                if offset > file_size {
                     return Err(ErrorKind::OffsetGreaterThanFileSize.into());
                 }
 
