@@ -1,11 +1,16 @@
 [package]
 name = "aws-sdk-s3-transfer-manager"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
-description = "S3 Transfer Manager"
 license = "Apache-2.0"
-repository = "https://github.com/smithy-lang/smithy-rs"
+readme = "README.md"
+repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
+description = """
+A high performance Amazon S3 client for Rust.
+"""
+categories = ["asynchronous", "concurrency"]
+keywords = ["aws", "S3", "high-performance"]
 
 [dependencies]
 async-channel = "2.3.1"
