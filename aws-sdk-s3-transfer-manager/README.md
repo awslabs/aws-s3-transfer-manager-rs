@@ -1,6 +1,7 @@
 # AWS SDK S3 Transfer Manager
 
-A high performance Amazon S3 transfer manager for Rust.
+A high performance Amazon S3 transfer manager, a high-level transfer utility, for Rust.
+It provides a simple API to allow you to transfer files and directories between your application and Amazon S3.
 
 [![Crates.io][crates-badge]][crates-url]
 [![API docs][docs-badge]][docs-url]
