@@ -11,13 +11,12 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::{DownloadFilter, PartSize};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
-use test_common::{drain, global_uuid_str};
-
-use aws_sdk_s3_transfer_manager::types::PartSize;
+use test_common::{create_test_dir, drain, global_uuid_str};
 use tokio::time::Sleep;
 
 const PUT_OBJECT_PREFIX: &str = "upload";
@@ -427,4 +426,62 @@ async fn test_object_download_range_failures() {
             .await
             .unwrap_err();
     }
+}
+
+#[tokio::test]
+async fn test_objects_transfer() {
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+
+    // SSE-C objects require the key to download, skipping it.
+    fn sse_c_filter(obj: &aws_sdk_s3::types::Object) -> bool {
+        let key = obj.key().unwrap_or("");
+        let is_sse_c = key.ends_with("aes256-c");
+        !is_sse_c
+    }
+
+    let temp_dir = create_test_dir(Some("e2e_downloads"), vec![], &[]);
+
+    // Download all pre-existing objects except the ones with `aes256-c` suffix
+    // The objects details can be found https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper
+    let download_handle = tm
+        .download_objects()
+        .bucket(bucket_name.as_str())
+        .key_prefix("pre-existing")
+        .set_filter(Some(DownloadFilter::from(sse_c_filter)))
+        .destination(temp_dir.path())
+        .send()
+        .await
+        .unwrap();
+    download_handle.join().await.unwrap();
+
+    let file_count = std::fs::read_dir(temp_dir.path())
+        .expect("Failed to read directory")
+        .map(|entry| {
+            let entry = entry.expect("Failed to access directory entry");
+            let file_type = entry.file_type().expect("Failed to determine file type");
+            assert!(
+                file_type.is_file(),
+                "Expected only files in directory, but found non-file: {:?}",
+                entry.path()
+            );
+            entry
+        })
+        .count();
+
+    assert_eq!(
+        file_count, 7,
+        "Expected exactly 7 files to be downloaded, but found {}",
+        file_count
+    );
+
+    let upload_handle = tm
+        .upload_objects()
+        .bucket(bucket_name.as_str())
+        .set_key_prefix(Some(generate_key("test")))
+        .source(temp_dir.path())
+        .send()
+        .await
+        .unwrap();
+    upload_handle.join().await.unwrap();
 }
