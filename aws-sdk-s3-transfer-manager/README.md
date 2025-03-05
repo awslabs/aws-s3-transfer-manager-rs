@@ -34,7 +34,7 @@ To begin using the Transfer Manager, follow these examples:
 **Create Transfer-Manager:**
 Create a transfer manager with the default recommended settings:
 
-```
+```rs
 let config = aws_sdk_s3_transfer_manager::from_env()
     .load()
     .await;
@@ -45,7 +45,7 @@ let transfer_manager = aws_sdk_s3_transfer_manager::Client::new(config);
 This will upload the file by automatically splitting the request into `part_size` chunks and uploading them in parallel.
 
 ```rs
-// Upload a single file to S3`
+// Upload a single file to S3
 let bucket = "<BUCKET-NAME>";
 let key = "<OBJECT-KEY>";
 let path = "<OBJECT-PATH>";
