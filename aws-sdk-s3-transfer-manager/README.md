@@ -19,7 +19,7 @@ To begin using the Transfer Manager, follow these examples:
 First, you need to add the dependency in your Cargo.toml file.
 
 ```
-aws-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git" }
+aws_sdk_s3_transfer_manager = "0.1.1"
 ```
 
 **Create Transfer-Manager:**
