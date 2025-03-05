@@ -1,6 +1,6 @@
 # AWS S3 Transfer Manager
 
-A high performance Amazon S3 client for Rust.
+A high performance Amazon S3 transfer manager for Rust.
 
 ## :warning: Developer Preview
 

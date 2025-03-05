@@ -1,6 +1,17 @@
 # AWS SDK S3 Transfer Manager
 
-A high performance Amazon S3 client for Rust.
+A high performance Amazon S3 transfer manager for Rust.
+
+[![Crates.io][crates-badge]][crates-url]
+[![API docs][docs-badge]][docs-url]
+[![Apache 2.0 licensed][apache-badge]][apache-url]
+
+[crates-badge]: https://img.shields.io/crates/v/aws-sdk-s3-transfer-manager.svg
+[crates-url]: https://crates.io/crates/aws-sdk-s3-transfer-manager
+[apache-badge]: https://img.shields.io/badge/License-Apache_2.0-blue.svg
+[apache-url]:https://opensource.org/licenses/Apache-2.0
+[docs-badge]: https://img.shields.io/docsrs/aws-sdk-s3-transfer-manager
+[docs-url]: https://docs.rs/crate/aws-sdk-s3-transfer-manager/latest
 
 ## :warning: Developer Preview
 
@@ -11,16 +22,17 @@ It is meant for early access and feedback purposes at this time. We'd love to he
 See the AWS SDK and Tools [maintenance policy](https://docs.aws.amazon.com/sdkref/latest/guide/maint-policy.html#version-life-cycle)
 descriptions for more information.
 
+## Key features and benefits
+
+* **Automatic Request Splitting:** Improves throughput by automatically splitting large requests into part-sized chunks and processing them in parallel across multiple connections. This overcomes single-connection bandwidth limitations.
+* **Automatic Retries:** Enhances reliability by automatically retrying failed chunks independently, eliminating the need to restart entire transfers when intermittent errors occur.
+* **Optimized Parallel Reads:** Implements parallel read operations across different sections of large files during uploads, providing superior performance compared to sequential reading.
+* **Simplified Directory Operations:** Transfer entire directories or objects sharing a common prefix with a single API call, streamlining bulk transfer operations.
+* **Advanced Load Balancing:** Automatically optimizes throughput by dynamically adjusting parallelism based on current workload and network bandwidth.
+
 ## Getting started
 
 To begin using the Transfer Manager, follow these examples:
-
-**Add dependency:**
-First, you need to add the dependency in your Cargo.toml file.
-
-```
-aws_sdk_s3_transfer_manager = "0.1.1"
-```
 
 **Create Transfer-Manager:**
 Create a transfer manager with the default recommended settings:
@@ -33,10 +45,10 @@ let transfer_manager = aws_sdk_s3_transfer_manager::Client::new(config);
 ```
 
 **Upload file example:**
-This will upload the file by automatically splitting the request into part_size chunks and uploading them in parallel.
+This will upload the file by automatically splitting the request into `part_size` chunks and uploading them in parallel.
 
-```
-`// Upload a single file to S3`
+```rs
+// Upload a single file to S3`
 let bucket = "<BUCKET-NAME>";
 let key = "<OBJECT-KEY>";
 let path = "<OBJECT-PATH>";
@@ -55,7 +67,7 @@ let response = transfer_manager
 **Download file example:**
 This will split the download into part-size chunks, download them in parallel, and then deliver them in-order.
 
-```
+```rs
 // Download a single object from S3
 let bucket = "<BUCKET-NAME>";
 let key = "<OBJECT-KEY>";
@@ -76,9 +88,10 @@ while let Some(chunk_result) = handle
 ```
 
 **Upload directory example:**
-This will recursively upload all files in the directory, combining the given prefix with each file's path from the filesystem. For example, if your prefix is "prefix" and the file path is "test/docs/key.json", it will be uploaded with the key "prefix/test/docs/key.json".
+This will recursively upload all files in the directory, combining the given prefix with each file's path from the filesystem.
+For example, if your prefix is `"prefix"` and the file path is `"test/docs/key.json"` , it will be uploaded with the key `"prefix/test/docs/key.json"` .
 
-```
+```rs
 // Upload a directory to S3
 let bucket = "<BUCKET-NAME>";
 let source_dir = "<SOURCE-DIRECTORY-PATH>";
@@ -99,7 +112,7 @@ let response = handle.join().await?;
 **Download directory example:**
 This will download every object under the prefix and will create a local directory with similar hierarchy.
 
-```
+```rs
 // Download objects with a common prefix to a local directory
 let bucket = "<BUCKET-NAME>";
 let destination_dir = "<DESTINATION-DIRECTORY-PATH>";
@@ -115,12 +128,6 @@ let handle = transfer_manager
 
 let response = handle.join().await?;
 ```
-
-## Using the SDK
-
-Until the SDK is released, we will be adding information about using the SDK to the
-[Developer Guide](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/welcome.html). Feel free to suggest
-additional sections for the guide by opening an issue and describing what you are trying to do.
 
 ## Getting Help
 

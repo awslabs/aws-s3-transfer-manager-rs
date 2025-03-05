@@ -5,12 +5,13 @@ edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
 license = "Apache-2.0"
 readme = "README.md"
+rust-version = "1.81.0"
 repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
 description = """
-A high performance Amazon S3 client for Rust.
+A high performance Amazon S3 transfer manager for Rust.
 """
 categories = ["asynchronous", "concurrency"]
-keywords = ["aws", "S3", "high-performance"]
+keywords = ["AWS", "Amazon", "S3", "high-performance", "SDK", "transfer-manager"]
 
 [dependencies]
 async-channel = "2.3.1"
