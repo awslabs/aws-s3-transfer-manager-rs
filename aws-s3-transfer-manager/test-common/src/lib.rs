@@ -38,6 +38,7 @@ pub fn create_test_dir(
     }
 
     // Set the directories in `inaccessible_dir_relative_paths` to be inaccessible
+    // which will in turn render the files within those directories inaccessible
     for dir_relative_path in inaccessible_dir_relative_paths {
         let dir_path = temp_dir.path().join(*dir_relative_path);
         make_directory_inaccessible(&dir_path);
