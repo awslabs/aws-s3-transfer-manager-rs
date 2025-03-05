@@ -56,7 +56,7 @@ fn make_directory_inaccessible(dir_path: &std::path::Path) {
 }
 
 #[cfg(target_family = "windows")]
-fn make_directory_inaccessible(dir_path: &std::path::Path) {
+fn make_directory_inaccessible(_dir_path: &std::path::Path) {
     panic!("make_directory_inaccessible is not implemented for Windows");
 }
 
