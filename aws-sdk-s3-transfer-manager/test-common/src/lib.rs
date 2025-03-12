@@ -81,11 +81,9 @@ macro_rules! mock_client_with_stubbed_http_client {
             client
                 .config()
                 .to_builder()
-                .http_client(
-                    aws_smithy_runtime::client::http::test_util::infallible_client_fn(|_req| {
-                        http_02x::Response::builder().status(200).body("").unwrap()
-                    }),
-                )
+                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
+                    |_req| http::Response::builder().status(200).body("").unwrap(),
+                ))
                 .build(),
         )
     }};

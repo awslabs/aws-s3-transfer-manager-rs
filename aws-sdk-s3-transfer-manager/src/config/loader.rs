@@ -9,9 +9,8 @@ use aws_runtime::user_agent::{ApiMetadata, AwsUserAgent, FrameworkMetadata};
 use aws_sdk_s3::config::{Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
-use crate::config::Builder;
-use crate::types::ConcurrencyMode;
-use crate::{http, types::PartSize, Config};
+use crate::config::{Builder, Config};
+use crate::types::{ConcurrencyMode, PartSize};
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
@@ -103,10 +102,7 @@ impl ConfigLoader {
     /// If fields have been overridden during builder construction, the override values will be
     /// used. Otherwise, the default values for each field will be provided.
     pub async fn load(self) -> Config {
-        let shared_config = aws_config::defaults(BehaviorVersion::latest())
-            .http_client(http::default_client())
-            .load()
-            .await;
+        let shared_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
         let mut sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
 

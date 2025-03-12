@@ -16,7 +16,7 @@ use std::{
     task::Poll,
 };
 
-use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use test_common::drain;
@@ -36,8 +36,8 @@ fn rand_data(size: usize) -> Bytes {
 /// create a dummy placeholder request for StaticReplayClient. This is used when we don't
 /// want to use `assert_requests()` and make our own assertions about the actually captured
 /// requests. Useful when you don't want to mock up the entire http request that is expected.
-fn dummy_expected_request() -> http_02x::Request<SdkBody> {
-    http_02x::Request::builder()
+fn dummy_expected_request() -> http::Request<SdkBody> {
+    http::Request::builder()
         .uri("https://not-used")
         .body(SdkBody::from(&b""[..]))
         .unwrap()
@@ -62,7 +62,7 @@ fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient
                 // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
                 // make our own assertions against the captured requests.
                 dummy_expected_request(),
-                http_02x::Response::builder()
+                http::Response::builder()
                     .status(200)
                     .header("Content-Length", format!("{}", end - start + 1))
                     .header(
@@ -234,7 +234,7 @@ async fn test_retry_failed_chunk() {
     let http_client = StaticReplayClient::new(vec![
         ReplayEvent::new(
             dummy_expected_request(),
-            http_02x::Response::builder()
+            http::Response::builder()
                 .status(200)
                 .header("Content-Length", format!("{}", part_size))
                 .header(
@@ -247,7 +247,7 @@ async fn test_retry_failed_chunk() {
         // fail the second chunk after reading some of it
         ReplayEvent::new(
             dummy_expected_request(),
-            http_02x::Response::builder()
+            http::Response::builder()
                 .status(200)
                 .header("Content-Length", format!("{}", data.len() - part_size))
                 .header(
@@ -264,7 +264,7 @@ async fn test_retry_failed_chunk() {
         // request for second chunk should be retried
         ReplayEvent::new(
             dummy_expected_request(),
-            http_02x::Response::builder()
+            http::Response::builder()
                 .status(200)
                 .header("Content-Length", format!("{}", data.len() - part_size))
                 .header(
@@ -310,7 +310,7 @@ async fn test_non_retryable_error() {
     let http_client = StaticReplayClient::new(vec![
         ReplayEvent::new(
             dummy_expected_request(),
-            http_02x::Response::builder()
+            http::Response::builder()
                 .status(200)
                 .header("Content-Length", format!("{}", part_size))
                 .header(
@@ -323,7 +323,7 @@ async fn test_non_retryable_error() {
         // fail chunk with non-retryable error
         ReplayEvent::new(
             dummy_expected_request(),
-            http_02x::Response::builder()
+            http::Response::builder()
                 .status(400)
                 .body(SdkBody::from(ERROR_RESPONSE))
                 .unwrap(),
@@ -356,7 +356,7 @@ async fn test_retry_max_attempts() {
     let mut failures = repeat_with(|| {
         ReplayEvent::new(
             dummy_expected_request(),
-            http_02x::Response::builder()
+            http::Response::builder()
                 .status(200)
                 .header("Content-Length", format!("{}", part_size))
                 .header(
@@ -376,7 +376,7 @@ async fn test_retry_max_attempts() {
 
     let mut events = vec![ReplayEvent::new(
         dummy_expected_request(),
-        http_02x::Response::builder()
+        http::Response::builder()
             .status(200)
             .header("Content-Length", format!("{}", part_size))
             .header(
@@ -456,7 +456,7 @@ async fn test_download_object_modified() {
         .map(|(idx, chunk)| {
             let start = idx * part_size;
             let end = std::cmp::min(start + part_size, data.len()) - 1;
-            let mut response = http_02x::Response::builder()
+            let mut response = http::Response::builder()
                 .status(206)
                 .header("Content-Length", format!("{}", end - start + 1))
                 .header(
@@ -467,7 +467,7 @@ async fn test_download_object_modified() {
                 .body(SdkBody::from(chunk))
                 .unwrap();
             if idx > 0 {
-                response = http_02x::Response::builder()
+                response = http::Response::builder()
                     .status(412)
                     .header("Date", "Thu, 12 Jan 2023 00:04:21 GMT")
                     .body(SdkBody::from(OBJECT_MODIFIED_RESPONSE))

@@ -7,7 +7,8 @@ publish = false
 
 [dependencies]
 aws-smithy-mocks-experimental = "0.2.1"
-http-02x = { package = "http", version = "0.2.9" }
+aws-smithy-http-client = { version = "1.0.0", features = ["test-util"] }
+http = "1"
 tempfile = "3.12.0"
 bytes = "1.9.0"
 aws-sdk-s3-transfer-manager = { path = "../../aws-sdk-s3-transfer-manager", version = "0.1.0" }
