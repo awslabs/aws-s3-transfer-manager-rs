@@ -1,6 +1,11 @@
 CHANGELOG
 =========
 
+vNext
+======
+
+* Use the default HTTPS client from SDK crate which is now based on `aws-lc`.
+
 v0.1.1
 ======
 
