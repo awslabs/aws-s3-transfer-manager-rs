@@ -13,6 +13,8 @@ use aws_smithy_runtime_api::http::Response;
 use std::mem;
 use tracing::Instrument;
 
+use crate::operation::DEFAULT_DELIMITER;
+
 use super::DownloadObjectsContext;
 
 /// Custom paginator for `ListObjectsV2` operation that handles
@@ -101,7 +103,14 @@ impl State {
 
 impl ListObjectsPaginator {
     fn new(context: DownloadObjectsContext) -> Self {
-        let prefix = context.state.input.key_prefix.to_owned();
+        let mut prefix = context.state.input.key_prefix.to_owned();
+        let delimeter = context.state.input.delimiter().unwrap_or(DEFAULT_DELIMITER);
+        // S3Express requires that prefix must end with delimiter
+        if let Some(prefix) = prefix.as_mut() {
+            if !prefix.ends_with(delimeter) {
+                prefix.push_str(delimeter);
+            }
+        }
         Self {
             context,
             state: Some(State::paginating(prefix)),
@@ -208,7 +217,10 @@ mod tests {
     use aws_smithy_mocks_experimental::mock;
     use test_common::mock_client_with_stubbed_http_client;
 
-    use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};
+    use crate::operation::{
+        download_objects::{DownloadObjectsContext, DownloadObjectsInput},
+        DEFAULT_DELIMITER,
+    };
 
     use super::{ListObjectsStream, State};
 
@@ -317,14 +329,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_object_stream() {
-        let resp1 = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
-            list_resp(
-                Some("token1"),
-                "initial-prefix",
-                Some(vec!["pre1", "pre2"]),
-                vec!["k1", "k2"],
-            )
-        });
+        let resp1 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(move |r| {
+                let prefix = r.prefix.clone().unwrap();
+                let delim = r.delimiter.clone().unwrap_or(DEFAULT_DELIMITER.to_string());
+                prefix.ends_with(&delim)
+            })
+            .then_output(|| {
+                list_resp(
+                    Some("token1"),
+                    "initial-prefix",
+                    Some(vec!["pre1", "pre2"]),
+                    vec!["k1", "k2"],
+                )
+            });
         let resp2 = mock!(aws_sdk_s3::Client::list_objects_v2)
             .then_output(|| list_resp(None, "initial-prefix", None, vec!["k3", "k4"]));
         let resp3 = mock!(aws_sdk_s3::Client::list_objects_v2)
@@ -342,6 +360,7 @@ mod tests {
         let client = crate::Client::new(config);
         let input = DownloadObjectsInput::builder()
             .bucket("test-bucket")
+            .key_prefix("test-prefix")
             .destination("/tmp/test")
             .build()
             .unwrap();
