@@ -104,11 +104,11 @@ impl State {
 impl ListObjectsPaginator {
     fn new(context: DownloadObjectsContext) -> Self {
         let mut prefix = context.state.input.key_prefix.to_owned();
-        let delimeter = context.state.input.delimiter().unwrap_or(DEFAULT_DELIMITER);
+        let delimiter = context.state.input.delimiter().unwrap_or(DEFAULT_DELIMITER);
         // S3Express requires that prefix must end with delimiter
         if let Some(prefix) = prefix.as_mut() {
-            if !prefix.ends_with(delimeter) {
-                prefix.push_str(delimeter);
+            if !prefix.ends_with(delimiter) {
+                prefix.push_str(delimiter);
             }
         }
         Self {
@@ -332,8 +332,8 @@ mod tests {
         let resp1 = mock!(aws_sdk_s3::Client::list_objects_v2)
             .match_requests(move |r| {
                 let prefix = r.prefix.clone().unwrap();
-                let delim = r.delimiter.clone().unwrap_or(DEFAULT_DELIMITER.to_string());
-                prefix.ends_with(&delim)
+                let delimiter = r.delimiter.clone().unwrap_or(DEFAULT_DELIMITER.to_string());
+                prefix.ends_with(&delimiter)
             })
             .then_output(|| {
                 list_resp(
