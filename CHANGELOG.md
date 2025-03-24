@@ -4,6 +4,7 @@ CHANGELOG
 vNext
 ======
 
+* **BugFix:** Fix DownloadObjects for S3Express (#112)
 * Use the default HTTPS client from SDK crate which is now based on `aws-lc`.
 
 v0.1.1
