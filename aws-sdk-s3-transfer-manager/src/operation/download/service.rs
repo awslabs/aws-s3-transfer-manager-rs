@@ -206,7 +206,7 @@ pub(super) fn distribute_work(
                 }
             }
         };
-        let monitor = ctx.handle.register_task("download_part_{i}");
+        let monitor = ctx.handle.register_task(&format!("download_part"));
         tasks.spawn(monitor.instrument(task));
     }
 

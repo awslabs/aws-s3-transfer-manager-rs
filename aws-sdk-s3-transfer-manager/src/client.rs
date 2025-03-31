@@ -84,7 +84,7 @@ impl Client {
     }
 
     pub fn flush_buffer_to_file(&self, path: &str) -> std::io::Result<usize> {
-        self.handle.metrics.flush_buffer_to_file(path)
+        self.handle.metrics.flush_buffer_to_csv(path)
     }
 
     /// Returns the client's configuration
