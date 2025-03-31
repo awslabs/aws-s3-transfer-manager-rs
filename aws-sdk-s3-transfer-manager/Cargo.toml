@@ -30,6 +30,7 @@ futures-util = "0.3.31"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
+tokio-metrics = "0.4.0"
 tower = { version = "0.5.2", features = ["limit", "retry", "util", "hedge", "buffer"] }
 tracing = "0.1"
 walkdir = "2"

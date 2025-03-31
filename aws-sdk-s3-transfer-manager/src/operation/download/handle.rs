@@ -12,7 +12,7 @@ use tokio::{
  */
 use crate::operation::download::body::Body;
 
-use super::object_meta::ObjectMetadata;
+use super::{object_meta::ObjectMetadata, tokio_metrics::TokioMetricsCollector};
 
 /// Response type for a single download object request.
 #[derive(Debug)]
@@ -31,6 +31,8 @@ pub struct DownloadHandle {
 
     /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
+
+    pub(crate) metrics: TokioMetricsCollector,
 }
 
 impl DownloadHandle {
@@ -73,6 +75,10 @@ impl DownloadHandle {
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while (tasks.join_next().await).is_some() {}
+    }
+
+    pub fn flush_buffer_to_file(&self, path: &str) -> std::io::Result<usize> {
+        self.metrics.flush_buffer_to_file(path)
     }
 }
 

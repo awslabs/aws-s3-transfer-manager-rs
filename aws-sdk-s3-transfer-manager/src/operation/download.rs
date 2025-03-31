@@ -19,7 +19,9 @@ pub use body::{Body, ChunkOutput};
 mod discovery;
 
 mod handle;
+pub mod tokio_metrics;
 pub use handle::DownloadHandle;
+use tokio_metrics::TokioMetricsCollector;
 use tracing::Instrument;
 
 /// Provides metadata for each chunk during an object download.
@@ -89,13 +91,15 @@ impl Download {
             input,
             use_current_span_as_parent_for_tasks,
         ));
-
+        let metrics = TokioMetricsCollector::new();
+        metrics.start_collecting(500);
         Ok(DownloadHandle {
             body: Body::new(chunk_rx),
             tasks,
             discovery,
             object_meta_rx: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
+            metrics,
         })
     }
 }
