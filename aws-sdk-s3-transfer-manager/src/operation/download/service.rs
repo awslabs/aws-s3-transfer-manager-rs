@@ -19,7 +19,6 @@ use std::ops::RangeInclusive;
 use tokio::sync::mpsc;
 use tokio::task;
 use tower::{service_fn, Service, ServiceBuilder, ServiceExt};
-use tracing::Instrument;
 
 use super::body::ChunkOutput;
 use super::TransferDirection;
@@ -84,7 +83,7 @@ async fn download_chunk_handler(
 
     // the rest of the work is in its own fn, so we can log `seq` in the tracing span
     download_specific_chunk(request, seq)
-        .instrument(tracing::debug_span!("download-chunk", seq))
+        //.instrument(tracing::debug_span!("download-chunk", seq))
         .await
 }
 
@@ -115,10 +114,10 @@ async fn download_specific_chunk(
                 Ok(mut resp) => {
                     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
                     let body = AggregatedBytes::from_byte_stream(body)
-                        .instrument(tracing::debug_span!(
-                            "collect-body-from-download-chunk",
-                            seq
-                        ))
+                        // .instrument(tracing::debug_span!(
+                        //     "collect-body-from-download-chunk",
+                        //     seq
+                        // ))
                         .await?;
 
                     Ok(ChunkOutput {
@@ -171,7 +170,7 @@ pub(super) fn distribute_work(
 
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
-    for _ in 0..num_parts {
+    for i in 0..num_parts {
         let req = DownloadChunkRequest {
             ctx: ctx.clone(),
             remaining: remaining.clone(),
@@ -207,7 +206,8 @@ pub(super) fn distribute_work(
                 }
             }
         };
-        tasks.spawn(task.instrument(parent_span_for_tasks.clone()));
+        let monitor = ctx.handle.register_task("download_part_{i}");
+        tasks.spawn(monitor.instrument(task));
     }
 
     tracing::trace!("work fully distributed");

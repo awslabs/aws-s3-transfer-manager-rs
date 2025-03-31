@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use tokio_metrics::TaskMonitor;
+
 use crate::operation::download::tokio_metrics::TokioMetricsCollector;
 use crate::runtime::scheduler::Scheduler;
 use crate::types::{ConcurrencyMode, PartSize};
@@ -59,6 +61,10 @@ impl Handle {
             PartSize::Auto => 5 * ByteUnit::Mebibyte.as_bytes_u64(),
             PartSize::Target(explicit) => *explicit,
         }
+    }
+
+    pub(crate) fn register_task(&self, name: &str) -> TaskMonitor {
+        self.metrics.register_task(name)
     }
 }
 
