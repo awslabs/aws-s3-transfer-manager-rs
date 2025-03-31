@@ -60,10 +60,6 @@ impl Handle {
             PartSize::Target(explicit) => *explicit,
         }
     }
-
-    pub fn flush_buffer_to_file(&self, path: &str) -> std::io::Result<usize> {
-        self.metrics.flush_buffer_to_file(path)
-    }
 }
 
 impl Client {
@@ -73,8 +69,16 @@ impl Client {
         let metrics = TokioMetricsCollector::new();
         metrics.start_collecting(500);
 
-        let handle = Arc::new(Handle { config, scheduler, metrics });
+        let handle = Arc::new(Handle {
+            config,
+            scheduler,
+            metrics,
+        });
         Client { handle }
+    }
+
+    pub fn flush_buffer_to_file(&self, path: &str) -> std::io::Result<usize> {
+        self.handle.metrics.flush_buffer_to_file(path)
     }
 
     /// Returns the client's configuration
