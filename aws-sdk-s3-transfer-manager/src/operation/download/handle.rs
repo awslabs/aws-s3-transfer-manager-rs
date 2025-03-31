@@ -32,7 +32,6 @@ pub struct DownloadHandle {
     /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
 
-    pub(crate) metrics: TokioMetricsCollector,
 }
 
 impl DownloadHandle {
@@ -77,9 +76,6 @@ impl DownloadHandle {
         while (tasks.join_next().await).is_some() {}
     }
 
-    pub fn flush_buffer_to_file(&self, path: &str) -> std::io::Result<usize> {
-        self.metrics.flush_buffer_to_file(path)
-    }
 }
 
 #[cfg(test)]
