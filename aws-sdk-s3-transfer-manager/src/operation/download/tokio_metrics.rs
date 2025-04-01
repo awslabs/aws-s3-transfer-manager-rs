@@ -74,7 +74,6 @@ impl TokioMetricsCollector {
 
                 // Get task metrics - we need a separate HashMap for interval iterators
                 // since we can't store iterators in a field
-                let mut got_any_task_metrics = false;
                 let task_monitors = task_monitors.lock().unwrap();
                 for (name, monitor) in task_monitors.iter() {
                     // We'll add all monitors' intervals to a local HashMap
@@ -84,7 +83,6 @@ impl TokioMetricsCollector {
                     if let Some(metrics) = monitor_intervals.next() {
                         //   println!("{:?}", metrics);
                         snapshot.task_metrics.insert(name.clone(), metrics);
-                        got_any_task_metrics = true;
                     }
                 }
                 drop(task_monitors);
@@ -95,234 +93,523 @@ impl TokioMetricsCollector {
         });
     }
 
-    /// Get the current size of the metrics buffer
-    pub fn buffer_size(&self) -> usize {
-        self.metrics_buffer.lock().unwrap().len()
-    }
-
     /// Flush buffered metrics to file in Prometheus format and clear buffer
     /// Returns the number of snapshots written
     pub fn flush_buffer_to_file(&self, path: &str) -> std::io::Result<usize> {
-    let mut buffer = self.metrics_buffer.lock().unwrap();
+        let mut buffer = self.metrics_buffer.lock().unwrap();
 
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-
-    let snapshot_count = buffer.len();
-    let mut output = String::new();
-
-    // === RUNTIME METRICS ===
-    output.push_str("# HELP tokio_worker_threads Number of worker threads\n");
-    output.push_str("# TYPE tokio_worker_threads gauge\n");
-    for snapshot in buffer.iter() {
-        output.push_str(&format!(
-            "tokio_worker_threads {} {}\n",
-            snapshot.runtime_metrics.num_workers(),
-            snapshot.timestamp_ms
-        ));
-    }
-
-    // === TASK METRICS ===
-    let mut all_task_names = HashSet::new();
-    for snapshot in buffer.iter() {
-        for name in snapshot.task_metrics.keys() {
-            all_task_names.insert(name.clone());
+        if buffer.is_empty() {
+            return Ok(0);
         }
-    }
 
-    // For each task, add its metrics
-    for task_name in all_task_names {
-        // Normalize name for Prometheus
-        let norm_name = task_name.replace(['-', '.', ' '], "_");
+        let snapshot_count = buffer.len();
+        let mut output = String::new();
 
-        // Instrumentation count
-        output.push_str(&format!(
-            "# HELP tokio_task_instrumented_{} Number of tasks instrumented\n",
-            norm_name
-        ));
-        output.push_str(&format!(
-            "# TYPE tokio_task_instrumented_{} counter\n",
-            norm_name
-        ));
-
+        // === RUNTIME METRICS ===
+        output.push_str("# HELP tokio_worker_threads Number of worker threads\n");
+        output.push_str("# TYPE tokio_worker_threads gauge\n");
         for snapshot in buffer.iter() {
-            if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
-                output.push_str(&format!(
-                    "tokio_task_instrumented_{} {} {}\n",
-                    norm_name, metrics.instrumented_count, snapshot.timestamp_ms
-                ));
+            output.push_str(&format!(
+                "tokio_worker_threads {} {}\n",
+                snapshot.runtime_metrics.num_workers(),
+                snapshot.timestamp_ms
+            ));
+        }
+
+        // === TASK METRICS ===
+        let mut all_task_names = HashSet::new();
+        for snapshot in buffer.iter() {
+            for name in snapshot.task_metrics.keys() {
+                all_task_names.insert(name.clone());
             }
         }
 
-        // Poll count
-        output.push_str(&format!(
-            "# HELP tokio_task_polls_{} Total number of task polls\n",
-            norm_name
-        ));
-        output.push_str(&format!(
-            "# TYPE tokio_task_polls_{} counter\n",
-            norm_name
-        ));
+        // For each task, add its metrics
+        for task_name in all_task_names {
+            // Normalize name for Prometheus
+            let norm_name = task_name.replace(['-', '.', ' '], "_");
 
-        for snapshot in buffer.iter() {
-            if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
-                output.push_str(&format!(
-                    "tokio_task_polls_{} {} {}\n",
-                    norm_name, metrics.total_poll_count, snapshot.timestamp_ms
-                ));
+            // Instrumentation count
+            output.push_str(&format!(
+                "# HELP tokio_task_instrumented_{} Number of tasks instrumented\n",
+                norm_name
+            ));
+            output.push_str(&format!(
+                "# TYPE tokio_task_instrumented_{} counter\n",
+                norm_name
+            ));
+
+            for snapshot in buffer.iter() {
+                if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
+                    output.push_str(&format!(
+                        "tokio_task_instrumented_{} {} {}\n",
+                        norm_name, metrics.instrumented_count, snapshot.timestamp_ms
+                    ));
+                }
+            }
+
+            // Poll count
+            output.push_str(&format!(
+                "# HELP tokio_task_polls_{} Total number of task polls\n",
+                norm_name
+            ));
+            output.push_str(&format!("# TYPE tokio_task_polls_{} counter\n", norm_name));
+
+            for snapshot in buffer.iter() {
+                if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
+                    output.push_str(&format!(
+                        "tokio_task_polls_{} {} {}\n",
+                        norm_name, metrics.total_poll_count, snapshot.timestamp_ms
+                    ));
+                }
+            }
+
+            // Poll duration
+            output.push_str(&format!(
+                "# HELP tokio_task_poll_duration_{}_seconds Total duration spent polling tasks\n",
+                norm_name
+            ));
+            output.push_str(&format!(
+                "# TYPE tokio_task_poll_duration_{}_seconds counter\n",
+                norm_name
+            ));
+
+            for snapshot in buffer.iter() {
+                if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
+                    output.push_str(&format!(
+                        "tokio_task_poll_duration_{}_seconds {:.6} {}\n",
+                        norm_name,
+                        metrics.total_poll_duration.as_secs_f64(),
+                        snapshot.timestamp_ms
+                    ));
+                }
+            }
+
+            // Scheduled count
+            output.push_str(&format!(
+                "# HELP tokio_task_scheduled_{} Number of times tasks were scheduled\n",
+                norm_name
+            ));
+            output.push_str(&format!(
+                "# TYPE tokio_task_scheduled_{} counter\n",
+                norm_name
+            ));
+
+            for snapshot in buffer.iter() {
+                if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
+                    output.push_str(&format!(
+                        "tokio_task_scheduled_{} {} {}\n",
+                        norm_name, metrics.total_scheduled_count, snapshot.timestamp_ms
+                    ));
+                }
             }
         }
 
-        // Poll duration
-        output.push_str(&format!(
-            "# HELP tokio_task_poll_duration_{}_seconds Total duration spent polling tasks\n",
-            norm_name
-        ));
-        output.push_str(&format!(
-            "# TYPE tokio_task_poll_duration_{}_seconds counter\n",
-            norm_name
-        ));
+        // Write atomically using a temporary file
+        let temp_path = format!("{}.tmp", path);
+        std::fs::write(&temp_path, output)?;
+        std::fs::rename(&temp_path, path)?;
 
-        for snapshot in buffer.iter() {
-            if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
-                output.push_str(&format!(
-                    "tokio_task_poll_duration_{}_seconds {:.6} {}\n",
-                    norm_name,
-                    metrics.total_poll_duration.as_secs_f64(),
-                    snapshot.timestamp_ms
-                ));
-            }
+        // Clear the buffer after successful write
+        buffer.clear();
+
+        Ok(snapshot_count)
+    }
+    pub fn flush_buffer_to_csv(&self, base_path: &str) -> std::io::Result<usize> {
+        let mut buffer = self.metrics_buffer.lock().unwrap();
+
+        if buffer.is_empty() {
+            return Ok(0);
         }
 
-        // Scheduled count
-        output.push_str(&format!(
-            "# HELP tokio_task_scheduled_{} Number of times tasks were scheduled\n",
-            norm_name
-        ));
-        output.push_str(&format!(
-            "# TYPE tokio_task_scheduled_{} counter\n",
-            norm_name
-        ));
+        let snapshot_count = buffer.len();
 
-        for snapshot in buffer.iter() {
-            if let Some(metrics) = snapshot.task_metrics.get(&task_name) {
-                output.push_str(&format!(
-                    "tokio_task_scheduled_{} {} {}\n",
-                    norm_name, metrics.total_scheduled_count, snapshot.timestamp_ms
-                ));
-            }
+        // Create paths for both CSV files
+        let runtime_csv_path = format!("{}_runtime.csv", base_path);
+        let tasks_csv_path = format!("{}_tasks.csv", base_path);
+
+        // Ensure parent directory exists
+        if let Some(dir) = std::path::Path::new(base_path).parent() {
+            std::fs::create_dir_all(dir)?;
         }
+
+        // Write runtime metrics to CSV
+        self.write_runtime_metrics_to_csv(&runtime_csv_path, &buffer)?;
+
+        // Write task metrics to CSV (wide format)
+        self.write_task_metrics_to_csv_wide_format(&tasks_csv_path, &buffer)?;
+
+        // Clear the buffer after successful writes
+        buffer.clear();
+
+        Ok(snapshot_count)
     }
 
-    // Write atomically using a temporary file
-    let temp_path = format!("{}.tmp", path);
-    std::fs::write(&temp_path, output)?;
-    std::fs::rename(&temp_path, path)?;
+    fn write_runtime_metrics_to_csv(
+        &self,
+        csv_path: &str,
+        buffer: &Vec<MetricsSnapshot>,
+    ) -> std::io::Result<()> {
+        // Create a set of runtime metric names - start with timestamp as the first column
+        let mut metric_names = vec!["timestamp".to_string()];
 
-    // Clear the buffer after successful write
-    buffer.clear();
+        // Add standard runtime metrics
+        metric_names.push("num_workers".to_string());
+        metric_names.push("num_alive_tasks".to_string());
+        metric_names.push("global_queue_depth".to_string());
+        metric_names.push("num_blocking_threads".to_string());
+        metric_names.push("num_idle_blocking_threads".to_string());
+        metric_names.push("blocking_queue_depth".to_string());
+        metric_names.push("remote_schedule_count".to_string());
+        metric_names.push("budget_forced_yield_count".to_string());
+        metric_names.push("spawned_tasks_count".to_string());
+        metric_names.push("io_driver_fd_registered_count".to_string());
+        metric_names.push("io_driver_fd_deregistered_count".to_string());
+        metric_names.push("io_driver_ready_count".to_string());
 
-    Ok(snapshot_count)
-}
+        // Get the maximum worker count across all snapshots for worker-specific metrics
+        let max_worker_count = buffer
+            .iter()
+            .map(|s| s.runtime_metrics.num_workers())
+            .max()
+            .unwrap_or(0);
 
-pub fn flush_buffer_to_csv(&self, csv_path: &str) -> std::io::Result<usize> {
-    let mut buffer = self.metrics_buffer.lock().unwrap();
-
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-
-    let snapshot_count = buffer.len();
-    
-    // Build a list of all timestamps and metrics
-    let mut all_timestamps = Vec::new();
-    let mut all_metrics = HashMap::new();
-    let mut metric_names = HashSet::new();
-
-    // First, collect all timestamps and metric names
-    for snapshot in buffer.iter() {
-        all_timestamps.push(snapshot.timestamp_ms);
-        
-        // Add runtime metrics
-        let worker_metric_name = "worker_threads".to_string();
-        metric_names.insert(worker_metric_name.clone());
-        all_metrics.insert(
-            (snapshot.timestamp_ms, worker_metric_name),
-            snapshot.runtime_metrics.num_workers().to_string()
-        );
-
-        // Add task metrics
-        for (task_name, metrics) in &snapshot.task_metrics {
-            let norm_name = task_name.replace(['-', '.', ' ', '/'], "_");
-            
-            let instrumented_name = format!("{}_instrumented", norm_name);
-            let polls_name = format!("{}_polls", norm_name);
-            let poll_duration_name = format!("{}_poll_duration", norm_name);
-            let scheduled_name = format!("{}_scheduled", norm_name);
-            
-            metric_names.insert(instrumented_name.clone());
-            metric_names.insert(polls_name.clone());
-            metric_names.insert(poll_duration_name.clone());
-            metric_names.insert(scheduled_name.clone());
-            
-            all_metrics.insert(
-                (snapshot.timestamp_ms, instrumented_name),
-                metrics.instrumented_count.to_string()
-            );
-            all_metrics.insert(
-                (snapshot.timestamp_ms, polls_name),
-                metrics.total_poll_count.to_string()
-            );
-            all_metrics.insert(
-                (snapshot.timestamp_ms, poll_duration_name),
-                format!("{:.6}", metrics.total_poll_duration.as_secs_f64())
-            );
-            all_metrics.insert(
-                (snapshot.timestamp_ms, scheduled_name),
-                metrics.total_scheduled_count.to_string()
-            );
+        // Add worker-specific metrics for each possible worker
+        for worker_id in 0..max_worker_count {
+            metric_names.push(format!("worker_{}_steal_count", worker_id));
+            metric_names.push(format!("worker_{}_steal_operations", worker_id));
+            metric_names.push(format!("worker_{}_local_queue_depth", worker_id));
+            metric_names.push(format!("worker_{}_local_schedule_count", worker_id));
+            metric_names.push(format!("worker_{}_overflow_count", worker_id));
+            metric_names.push(format!("worker_{}_poll_count", worker_id));
+            metric_names.push(format!("worker_{}_park_count", worker_id));
+            metric_names.push(format!("worker_{}_park_unpark_count", worker_id));
+            metric_names.push(format!("worker_{}_noop_count", worker_id));
+            metric_names.push(format!("worker_{}_total_busy_duration", worker_id));
+            metric_names.push(format!("worker_{}_mean_poll_time", worker_id));
         }
-    }
 
-    // Sort timestamps and metric names
-    all_timestamps.sort();
-    let mut sorted_metric_names: Vec<String> = metric_names.into_iter().collect();
-    sorted_metric_names.sort();
-    
-    // Create the CSV header
-    let mut csv_content = String::from("timestamp");
-    for metric_name in &sorted_metric_names {
-        csv_content.push_str(&format!(",{}", metric_name));
-    }
-    csv_content.push('\n');
-    
-    // Add data rows
-    for timestamp in all_timestamps {
-        csv_content.push_str(&timestamp.to_string());
-        
-        for metric_name in &sorted_metric_names {
-            let value = all_metrics.get(&(timestamp, metric_name.clone()))
-                             .unwrap_or(&String::from("")).clone();
-            csv_content.push_str(&format!(",{}", value));
-        }
-        
+        // Create CSV content
+        let mut csv_content = String::new();
+
+        // Write header
+        csv_content.push_str(&metric_names.join(","));
         csv_content.push('\n');
-    }
-    
-    // Write the CSV file
-    let parent_dir = std::path::Path::new(csv_path).parent();
-    if let Some(dir) = parent_dir {
-        std::fs::create_dir_all(dir)?;
-    }
-    
-    std::fs::write(csv_path, csv_content)?;
-    
-    // Clear the buffer after successful write
-    buffer.clear();
-    
-    Ok(snapshot_count)
-}
 
+        // Write values for each snapshot
+        for snapshot in buffer {
+            let mut row = Vec::with_capacity(metric_names.len());
 
+            for metric_name in &metric_names {
+                let value = match metric_name.as_str() {
+                    "timestamp" => snapshot.timestamp_ms.to_string(),
+                    "num_workers" => snapshot.runtime_metrics.num_workers().to_string(),
+                    "num_alive_tasks" => snapshot.runtime_metrics.num_alive_tasks().to_string(),
+                    "global_queue_depth" => {
+                        snapshot.runtime_metrics.global_queue_depth().to_string()
+                    }
+                    "num_blocking_threads" => {
+                        snapshot.runtime_metrics.num_blocking_threads().to_string()
+                    }
+                    "num_idle_blocking_threads" => snapshot
+                        .runtime_metrics
+                        .num_idle_blocking_threads()
+                        .to_string(),
+                    "blocking_queue_depth" => {
+                        snapshot.runtime_metrics.blocking_queue_depth().to_string()
+                    }
+                    "remote_schedule_count" => {
+                        snapshot.runtime_metrics.remote_schedule_count().to_string()
+                    }
+                    "budget_forced_yield_count" => snapshot
+                        .runtime_metrics
+                        .budget_forced_yield_count()
+                        .to_string(),
+                    "spawned_tasks_count" => {
+                        snapshot.runtime_metrics.spawned_tasks_count().to_string()
+                    }
+                    "io_driver_fd_registered_count" => snapshot
+                        .runtime_metrics
+                        .io_driver_fd_registered_count()
+                        .to_string(),
+                    "io_driver_fd_deregistered_count" => snapshot
+                        .runtime_metrics
+                        .io_driver_fd_deregistered_count()
+                        .to_string(),
+                    "io_driver_ready_count" => {
+                        snapshot.runtime_metrics.io_driver_ready_count().to_string()
+                    }
+                    _ => {
+                        if let Some(worker_metric) = metric_name.strip_prefix("worker_") {
+                            if let Some(parts) = worker_metric.split_once('_') {
+                                if let Ok(worker_id) = parts.0.parse::<usize>() {
+                                    if worker_id < snapshot.runtime_metrics.num_workers() {
+                                        match parts.1 {
+                                            "steal_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_steal_count(worker_id)
+                                                .to_string(),
+                                            "steal_operations" => snapshot
+                                                .runtime_metrics
+                                                .worker_steal_operations(worker_id)
+                                                .to_string(),
+                                            "local_queue_depth" => snapshot
+                                                .runtime_metrics
+                                                .worker_local_queue_depth(worker_id)
+                                                .to_string(),
+                                            "local_schedule_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_local_schedule_count(worker_id)
+                                                .to_string(),
+                                            "overflow_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_overflow_count(worker_id)
+                                                .to_string(),
+                                            "poll_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_poll_count(worker_id)
+                                                .to_string(),
+                                            "park_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_park_count(worker_id)
+                                                .to_string(),
+                                            "park_unpark_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_park_unpark_count(worker_id)
+                                                .to_string(),
+                                            "noop_count" => snapshot
+                                                .runtime_metrics
+                                                .worker_noop_count(worker_id)
+                                                .to_string(),
+                                            "total_busy_duration" => format!(
+                                                "{:.6}",
+                                                snapshot
+                                                    .runtime_metrics
+                                                    .worker_total_busy_duration(worker_id)
+                                                    .as_secs_f64()
+                                            ),
+                                            "mean_poll_time" => format!(
+                                                "{:.6}",
+                                                snapshot
+                                                    .runtime_metrics
+                                                    .worker_mean_poll_time(worker_id)
+                                                    .as_secs_f64()
+                                            ),
+                                            _ => String::new(),
+                                        }
+                                    } else {
+                                        String::new() // This worker doesn't exist in this snapshot
+                                    }
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    }
+                };
+
+                row.push(value);
+            }
+
+            csv_content.push_str(&row.join(","));
+            csv_content.push('\n');
+        }
+
+        // Write the runtime CSV file
+        std::fs::write(csv_path, csv_content)
+    }
+
+    fn write_task_metrics_to_csv_wide_format(
+        &self,
+        csv_path: &str,
+        buffer: &Vec<MetricsSnapshot>,
+    ) -> std::io::Result<()> {
+        // First, collect all unique task names and metrics
+        let mut task_metric_columns = HashSet::new();
+
+        // Define all possible metric names
+        let metric_names = vec![
+            "instrumented_count",
+            "dropped_count",
+            "first_poll_count",
+            "total_first_poll_delay",
+            "total_idled_count",
+            "total_idle_duration",
+            "total_scheduled_count",
+            "total_scheduled_duration",
+            "total_poll_count",
+            "total_poll_duration",
+            "total_fast_poll_count",
+            "total_fast_poll_duration",
+            "total_slow_poll_count",
+            "total_slow_poll_duration",
+            "total_short_delay_count",
+            "total_long_delay_count",
+            "total_short_delay_duration",
+            "total_long_delay_duration",
+            "mean_first_poll_delay",
+            "mean_idle_duration",
+            "mean_scheduled_duration",
+            "mean_poll_duration",
+            "slow_poll_ratio",
+            "long_delay_ratio",
+            "mean_fast_poll_duration",
+            "mean_short_delay_duration",
+            "mean_slow_poll_duration",
+            "mean_long_delay_duration",
+        ];
+
+        // Collect all task names across all snapshots
+        let mut task_names = HashSet::new();
+        for snapshot in buffer {
+            for (task_name, _) in &snapshot.task_metrics {
+                let norm_name = task_name.replace(['-', '.', ' ', '/'], "_");
+                task_names.insert(norm_name);
+            }
+        }
+
+        // Generate all task-metric column combinations
+        for task_name in &task_names {
+            for metric_name in &metric_names {
+                task_metric_columns.insert(format!("{}_{}", task_name, metric_name));
+            }
+        }
+
+        // Sort the columns for consistent output
+        let mut sorted_columns: Vec<String> = task_metric_columns.into_iter().collect();
+        sorted_columns.sort();
+
+        // Prepare the CSV content
+        let mut csv_content = String::new();
+
+        // Write header: timestamp + all task metrics
+        csv_content.push_str("timestamp");
+        for column in &sorted_columns {
+            csv_content.push_str(&format!(",{}", column));
+        }
+        csv_content.push('\n');
+
+        // Write data for each snapshot
+        for snapshot in buffer {
+            // Start with timestamp
+            csv_content.push_str(&snapshot.timestamp_ms.to_string());
+
+            // Add values for each task-metric combination
+            for column in &sorted_columns {
+                // Split the column name to get task name and metric name
+                let parts: Vec<&str> = column.split('_').collect();
+                if parts.len() >= 2 {
+                    // Task name could contain underscores, so join all parts except the last one
+                    let metric_name = parts.last().unwrap();
+                    let task_name_parts = &parts[0..parts.len() - 1];
+                    let task_name = task_name_parts.join("_");
+
+                    // Find the corresponding task metrics
+                    let mut value = String::new();
+                    for (t_name, metrics) in &snapshot.task_metrics {
+                        let norm_name = t_name.replace(['-', '.', ' ', '/'], "_");
+                        if norm_name == task_name {
+                            value = match *metric_name {
+                                // Direct fields
+                                "instrumented_count" => metrics.instrumented_count.to_string(),
+                                "dropped_count" => metrics.dropped_count.to_string(),
+                                "first_poll_count" => metrics.first_poll_count.to_string(),
+                                "total_first_poll_delay" => {
+                                    format!("{:.6}", metrics.total_first_poll_delay.as_secs_f64())
+                                }
+                                "total_idled_count" => metrics.total_idled_count.to_string(),
+                                "total_idle_duration" => {
+                                    format!("{:.6}", metrics.total_idle_duration.as_secs_f64())
+                                }
+                                "total_scheduled_count" => {
+                                    metrics.total_scheduled_count.to_string()
+                                }
+                                "total_scheduled_duration" => {
+                                    format!("{:.6}", metrics.total_scheduled_duration.as_secs_f64())
+                                }
+                                "total_poll_count" => metrics.total_poll_count.to_string(),
+                                "total_poll_duration" => {
+                                    format!("{:.6}", metrics.total_poll_duration.as_secs_f64())
+                                }
+                                "total_fast_poll_count" => {
+                                    metrics.total_fast_poll_count.to_string()
+                                }
+                                "total_fast_poll_duration" => {
+                                    format!("{:.6}", metrics.total_fast_poll_duration.as_secs_f64())
+                                }
+                                "total_slow_poll_count" => {
+                                    metrics.total_slow_poll_count.to_string()
+                                }
+                                "total_slow_poll_duration" => {
+                                    format!("{:.6}", metrics.total_slow_poll_duration.as_secs_f64())
+                                }
+                                "total_short_delay_count" => {
+                                    metrics.total_short_delay_count.to_string()
+                                }
+                                "total_long_delay_count" => {
+                                    metrics.total_long_delay_count.to_string()
+                                }
+                                "total_short_delay_duration" => format!(
+                                    "{:.6}",
+                                    metrics.total_short_delay_duration.as_secs_f64()
+                                ),
+                                "total_long_delay_duration" => format!(
+                                    "{:.6}",
+                                    metrics.total_long_delay_duration.as_secs_f64()
+                                ),
+
+                                // Calculated metrics
+                                "mean_first_poll_delay" => {
+                                    format!("{:.6}", metrics.mean_first_poll_delay().as_secs_f64())
+                                }
+                                "mean_idle_duration" => {
+                                    format!("{:.6}", metrics.mean_idle_duration().as_secs_f64())
+                                }
+                                "mean_scheduled_duration" => format!(
+                                    "{:.6}",
+                                    metrics.mean_scheduled_duration().as_secs_f64()
+                                ),
+                                "mean_poll_duration" => {
+                                    format!("{:.6}", metrics.mean_poll_duration().as_secs_f64())
+                                }
+                                "slow_poll_ratio" => format!("{:.6}", metrics.slow_poll_ratio()),
+                                "long_delay_ratio" => format!("{:.6}", metrics.long_delay_ratio()),
+                                "mean_fast_poll_duration" => format!(
+                                    "{:.6}",
+                                    metrics.mean_fast_poll_duration().as_secs_f64()
+                                ),
+                                "mean_short_delay_duration" => format!(
+                                    "{:.6}",
+                                    metrics.mean_short_delay_duration().as_secs_f64()
+                                ),
+                                "mean_slow_poll_duration" => format!(
+                                    "{:.6}",
+                                    metrics.mean_slow_poll_duration().as_secs_f64()
+                                ),
+                                "mean_long_delay_duration" => format!(
+                                    "{:.6}",
+                                    metrics.mean_long_delay_duration().as_secs_f64()
+                                ),
+
+                                _ => String::new(),
+                            };
+                            break;
+                        }
+                    }
+                    csv_content.push_str(&format!(",{}", value));
+                } else {
+                    csv_content.push_str(",");
+                }
+            }
+
+            csv_content.push('\n');
+        }
+
+        // Write the tasks CSV file
+        std::fs::write(csv_path, csv_content)
+    }
 }
