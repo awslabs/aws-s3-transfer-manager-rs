@@ -4,6 +4,8 @@
  */
 use std::cmp;
 use std::ops::DerefMut;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use bytes::{Buf, Bytes};
@@ -98,26 +100,26 @@ impl PartReader {
 #[derive(Debug)]
 struct PartReaderState {
     // current start offset
-    offset: u64,
+    //offset: u64,
     // current part number
-    part_number: u64,
+    part_number: AtomicU64,
     // total number of bytes remaining to be read
-    remaining: u64,
+    content_length: u64,
 }
 
 impl PartReaderState {
     /// Create a new `PartReaderState`
     fn new(content_length: u64) -> Self {
         Self {
-            offset: 0,
-            part_number: 1,
-            remaining: content_length,
+            //offset: 0,
+            part_number: AtomicU64::new(1),
+            content_length,
         }
     }
 
     /// Set the initial offset to start reading from
     fn with_offset(self, offset: u64) -> Self {
-        Self { offset, ..self }
+        Self { ..self }
     }
 }
 
@@ -125,7 +127,7 @@ impl PartReaderState {
 #[derive(Debug)]
 struct BytesPartReader {
     buf: Bytes,
-    state: Mutex<PartReaderState>,
+    state: PartReaderState,
 }
 
 impl BytesPartReader {
@@ -133,25 +135,22 @@ impl BytesPartReader {
         let content_length = buf.remaining() as u64;
         Self {
             buf,
-            state: Mutex::new(PartReaderState::new(content_length)), // std Mutex
+            state: PartReaderState::new(content_length), // std Mutex
         }
     }
 }
 
 impl BytesPartReader {
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
-        let mut state = self.state.lock().expect("lock valid");
-        if state.remaining == 0 {
+        //let mut state = self.state.lock().expect("lock valid");
+        let part_number = self.state.part_number.fetch_add(1, Ordering::SeqCst);
+        let start = (part_number - 1) as usize * stream_cx.part_size();
+        if start as u64 > self.state.content_length {
             return Ok(None);
         }
 
-        let start = state.offset as usize;
         let end = cmp::min(start + stream_cx.part_size(), self.buf.len());
         let data = self.buf.slice(start..end);
-        let part_number = state.part_number;
-        state.part_number += 1;
-        state.offset += data.len() as u64;
-        state.remaining -= data.len() as u64;
         let part = PartData::new(part_number, data);
         Ok(Some(part))
     }
@@ -177,38 +176,40 @@ impl PathBodyPartReader {
 
 impl PathBodyPartReader {
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
-        let (offset, part_number, part_size) = {
-            let mut state = self.state.lock().expect("lock valid");
-            if state.remaining == 0 {
-                return Ok(None);
-            }
-            let offset = state.offset;
-            let part_number = state.part_number;
+        return Ok(None);
 
-            let part_size = cmp::min(stream_cx.part_size() as u64, state.remaining);
-            state.offset += part_size;
-            state.part_number += 1;
-            state.remaining -= part_size;
+        // let (offset, part_number, part_size) = {
+        //     let mut state = self.state.lock().expect("lock valid");
+        //     if state.remaining == 0 {
+        //         return Ok(None);
+        //     }
+        //     let offset = state.offset;
+        //     let part_number = state.part_number;
 
-            (offset, part_number, part_size)
-        };
-        let path = self.body.path.clone();
-        // grab a buffer to fill from the context
-        let mut dst = stream_cx.new_buffer(part_size as usize);
-        let handle = tokio::task::spawn_blocking(move || {
-            // SAFETY:  std::io::Read and FileExt traits take `&mut [u8]` buffer arguments (i.e.
-            // initialized). The `Deref` and `DerefMut` implementations of `Buffer`
-            // only return a slice of the _initialized_ portion of the buffer though.
-            // We need to set the length so that the raw `&[u8]` slice has the correct
-            // size. We are guaranteed to read exactly part_size data from file on success so
-            // any read of that slice after `read_file_chunk_sync` returns successfully will have
-            // been initialized.
-            unsafe { dst.set_len(dst.capacity()) }
-            file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
-            Ok::<PartData, Error>(PartData::new(part_number, dst))
-        });
+        //     let part_size = cmp::min(stream_cx.part_size() as u64, state.remaining);
+        //     state.offset += part_size;
+        //     state.part_number += 1;
+        //     state.remaining -= part_size;
 
-        handle.await?.map(Some)
+        //     (offset, part_number, part_size)
+        // };
+        // let path = self.body.path.clone();
+        // // grab a buffer to fill from the context
+        // let mut dst = stream_cx.new_buffer(part_size as usize);
+        // let handle = tokio::task::spawn_blocking(move || {
+        //     // SAFETY:  std::io::Read and FileExt traits take `&mut [u8]` buffer arguments (i.e.
+        //     // initialized). The `Deref` and `DerefMut` implementations of `Buffer`
+        //     // only return a slice of the _initialized_ portion of the buffer though.
+        //     // We need to set the length so that the raw `&[u8]` slice has the correct
+        //     // size. We are guaranteed to read exactly part_size data from file on success so
+        //     // any read of that slice after `read_file_chunk_sync` returns successfully will have
+        //     // been initialized.
+        //     unsafe { dst.set_len(dst.capacity()) }
+        //     file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
+        //     Ok::<PartData, Error>(PartData::new(part_number, dst))
+        // });
+
+        // handle.await?.map(Some)
     }
 }
 
