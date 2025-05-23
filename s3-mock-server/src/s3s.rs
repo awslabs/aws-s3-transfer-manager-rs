@@ -8,14 +8,16 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream;
-use s3s::dto::StreamingBlob;
-use s3s::dto::Timestamp;
+use futures_util::StreamExt;
 use s3s::{S3Request, S3Response, S3Result};
+use s3s::dto::Timestamp;
+use s3s::dto::StreamingBlob;
 
 use crate::error::Error;
-use crate::storage::models::ObjectMetadata;
 use crate::storage::StorageBackend;
+use crate::storage::models::ObjectMetadata;
 
 /// Inner implementation of the s3s::S3 trait.
 ///
@@ -24,7 +26,7 @@ use crate::storage::StorageBackend;
 pub(crate) struct Inner<S: StorageBackend + 'static> {
     /// The storage backend.
     storage: S,
-
+    
     /// Object metadata, keyed by object key.
     metadata: tokio::sync::RwLock<HashMap<String, ObjectMetadata>>,
 }
@@ -94,5 +96,84 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // FIXME - add checksum support/storage
 
         Ok(S3Response::new(output))
+    }
+    
+    async fn put_object(
+        &self,
+        req: S3Request<s3s::dto::PutObjectInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
+        let input = req.input;
+        let key = input.key;
+        
+        let body = match input.body {
+            Some(body) => body,
+            None => return Err(s3s::s3_error!(InvalidRequest, "Missing request body")),
+        };
+        
+        let mut content = Bytes::new();
+        let mut stream = body;
+
+        // FIXME - optimize this - we're pulling everything into memory
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    // Append the chunk to our content
+                    let mut new_content = BytesMut::with_capacity(content.len() + chunk.len());
+                    new_content.extend_from_slice(&content);
+                    new_content.extend_from_slice(&chunk);
+                    content = new_content.freeze();
+                },
+                Err(_) => return Err(s3s::s3_error!(InternalError, "Failed to read body")),
+            }
+        }
+        
+        let content_type = input.content_type.map(|mime| mime.to_string());
+        let user_metadata = input.metadata.unwrap_or_default();
+        
+        // Calculate ETag (MD5 hash)
+        let etag = format!("\"{:x}\"", md5::compute(&content));
+        
+        if let Err(err) = self.storage.put_object_data(&key, content.clone()).await {
+            return Err(err.into());
+        }
+        
+        let metadata = ObjectMetadata {
+            content_type,
+            content_length: content.len() as u64,
+            etag: etag.clone(),
+            last_modified: std::time::SystemTime::now(),
+            user_metadata,
+        };
+        
+        {
+            let mut metadata_map = self.metadata.write().await;
+            metadata_map.insert(key, metadata);
+        }
+        
+        // Build response
+        let mut output = s3s::dto::PutObjectOutput::default();
+        output.e_tag = Some(etag);
+        
+        // FIXME - add checksum support
+        
+        Ok(S3Response::new(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_range_handling() {
+        // Test valid range
+        let range = s3s::dto::Range::Int { first: 0, last: Some(9) };
+        assert!(range.check(100).is_ok());
+        
+        // Test range that exceeds content length
+        let range = s3s::dto::Range::Int { first: 100, last: Some(110) };
+        assert!(range.check(100).is_err());
+        
+        // Test invalid range (first > last)
+        let range = s3s::dto::Range::Int { first: 10, last: Some(5) };
+        assert!(range.check(100).is_err());
     }
 }
