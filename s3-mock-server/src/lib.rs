@@ -11,7 +11,7 @@
 //! concurrent operations, error handling, and performance characteristics.
 
 mod error;
-mod s3_impl;
+mod s3s;
 mod server;
 mod storage;
 
