@@ -19,6 +19,7 @@ use crate::storage::StorageBackend;
 ///
 /// This implementation stores all objects and multipart uploads in memory,
 /// making it suitable for testing and benchmarking.
+#[derive(Debug)]
 pub(crate) struct InMemoryStorage {
     // key -> content
     objects: RwLock<HashMap<String, Bytes>>,
