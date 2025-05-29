@@ -5,8 +5,6 @@
 
 //! s3s integration layer.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::stream;
@@ -14,6 +12,9 @@ use futures_util::StreamExt;
 use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
 use s3s::{S3Request, S3Response, S3Result};
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 use crate::error::Error;
 use crate::storage::models::ObjectMetadata;
@@ -23,20 +24,21 @@ use crate::storage::StorageBackend;
 ///
 /// This struct implements the s3s::S3 trait, delegating to the storage backend
 /// for data operations and managing metadata.
+#[derive(Debug, Clone)]
 pub(crate) struct Inner<S: StorageBackend + 'static> {
     /// The storage backend.
     storage: S,
 
     /// Object metadata, keyed by object key.
-    metadata: tokio::sync::RwLock<HashMap<String, ObjectMetadata>>,
+    metadata: Arc<tokio::sync::RwLock<HashMap<String, ObjectMetadata>>>,
 
     /// Multipart uploads in progress, keyed by upload ID.
     /// The value is a tuple of (object key, metadata).
-    multipart_uploads: tokio::sync::RwLock<HashMap<String, (String, ObjectMetadata)>>,
+    multipart_uploads: Arc<tokio::sync::RwLock<HashMap<String, (String, ObjectMetadata)>>>,
 
     /// Parts for multipart uploads, keyed by upload ID.
     /// The value is a map of part number to (ETag, data).
-    parts: tokio::sync::RwLock<HashMap<String, HashMap<i32, (String, Bytes)>>>,
+    parts: Arc<tokio::sync::RwLock<HashMap<String, HashMap<i32, (String, Bytes)>>>>,
 }
 
 impl<S: StorageBackend + 'static> Inner<S> {
@@ -44,15 +46,16 @@ impl<S: StorageBackend + 'static> Inner<S> {
     pub(crate) fn new(storage: S) -> Self {
         Self {
             storage,
-            metadata: tokio::sync::RwLock::new(HashMap::new()),
-            multipart_uploads: tokio::sync::RwLock::new(HashMap::new()),
-            parts: tokio::sync::RwLock::new(HashMap::new()),
+            metadata: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            multipart_uploads: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            parts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 }
 
 #[async_trait]
 impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
+    #[tracing::instrument(level = "debug")]
     async fn get_object(
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
@@ -108,6 +111,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    #[tracing::instrument(level = "debug")]
     async fn head_object(
         &self,
         req: S3Request<s3s::dto::HeadObjectInput>,
@@ -144,6 +148,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    #[tracing::instrument(level = "debug")]
     async fn put_object(
         &self,
         req: S3Request<s3s::dto::PutObjectInput>,
@@ -205,6 +210,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    #[tracing::instrument(level = "debug")]
     async fn create_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CreateMultipartUploadInput>,
@@ -249,6 +255,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    #[tracing::instrument(level = "debug")]
     async fn upload_part(
         &self,
         req: S3Request<s3s::dto::UploadPartInput>,
@@ -332,6 +339,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    #[tracing::instrument(level = "debug")]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
@@ -485,6 +493,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    #[tracing::instrument(level = "debug")]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<s3s::dto::AbortMultipartUploadInput>,
@@ -532,7 +541,47 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // Tests will be added as needed
+#[async_trait]
+impl StorageBackend for Arc<dyn StorageBackend + '_> {
+    async fn get_object_data(&self, key: &str, range: Option<Range<u64>>) -> crate::Result<Bytes> {
+        (**self).get_object_data(key, range).await
+    }
+
+    async fn put_object_data(&self, key: &str, content: Bytes) -> crate::Result<()> {
+        (**self).put_object_data(key, content).await
+    }
+
+    async fn delete_object_data(&self, key: &str) -> crate::Result<()> {
+        (**self).delete_object_data(key).await
+    }
+
+    async fn store_part_data(
+        &self,
+        upload_id: &str,
+        part_number: i32,
+        content: Bytes,
+    ) -> crate::Result<()> {
+        (**self)
+            .store_part_data(upload_id, part_number, content)
+            .await
+    }
+
+    async fn get_part_data(&self, upload_id: &str, part_number: i32) -> crate::Result<Bytes> {
+        (**self).get_part_data(upload_id, part_number).await
+    }
+
+    async fn complete_multipart_data(
+        &self,
+        upload_id: &str,
+        key: &str,
+        part_numbers: &[i32],
+    ) -> crate::Result<()> {
+        (**self)
+            .complete_multipart_data(upload_id, key, part_numbers)
+            .await
+    }
+
+    async fn abort_multipart_data(&self, upload_id: &str) -> crate::Result<()> {
+        (**self).abort_multipart_data(upload_id).await
+    }
 }

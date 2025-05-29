@@ -21,6 +21,7 @@ use crate::storage::StorageBackend;
 ///
 /// This implementation stores objects and multipart uploads on the local filesystem,
 /// making it suitable for testing and benchmarking with larger datasets.
+#[derive(Debug)]
 pub(crate) struct FilesystemStorage {
     root_dir: PathBuf,
     objects_dir: PathBuf,

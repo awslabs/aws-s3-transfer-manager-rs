@@ -52,6 +52,10 @@ pub enum Error {
     /// An internal error occurred.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An internal error occurred.
+    #[error("invalid server configuration: {0}")]
+    InvalidConfiguration(String),
 }
 
 impl From<Error> for s3s::S3Error {

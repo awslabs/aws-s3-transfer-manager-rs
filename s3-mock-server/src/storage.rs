@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::fmt::Debug;
 use std::ops::Range;
 
 use crate::Result;
@@ -24,7 +25,7 @@ pub(crate) mod models;
 /// and multipart upload parts. It is focused solely on data storage operations,
 /// with metadata management and S3 API logic handled separately.
 #[async_trait]
-pub(crate) trait StorageBackend: Send + Sync {
+pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Get object data for the specified key and optional range.
     ///
     /// # Arguments
