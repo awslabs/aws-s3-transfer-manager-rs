@@ -11,8 +11,10 @@ description = "A mock S3 server for testing and benchmarking the AWS S3 Transfer
 async-trait = "0.1.83"
 aws-config = "1.6.3"
 aws-sdk-s3 = "1.86.0"
+base64 = "0.22.1"
 bytes = "1"
 futures-util = "0.3.31"
+hex = "0.4.3"
 hyper-util = {  version = "0.1.13", features = ["server-graceful", "server-auto", "server", "http1", "http2", "tokio"]}
 md5 = "0.7.0"
 s3s = { version = "0.11.0", features = ["tower"] }
