@@ -106,7 +106,6 @@ async fn test_head_object() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "ListObjectsV2 is not implemented yet"]
 async fn test_list_objects_v2() -> Result<()> {
     let server = S3MockServer::builder()
         .with_in_memory_store()
