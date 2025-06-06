@@ -73,11 +73,17 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             }
         };
 
-        // For now, we don't support range requests in the s3s integration
-        // This would require more work to properly parse the Range header from the s3s::dto::Range type
-        let range = None;
+        let range = input
+            .range
+            .as_ref()
+            .map(|range_dto| {
+                range_dto
+                    .check(metadata.content_length)
+                    .map_err(|_| Error::InvalidRange)
+            })
+            .transpose()?;
 
-        let data = match self.storage.get_object_data(&key, range).await {
+        let data = match self.storage.get_object_data(&key, range.clone()).await {
             Ok(data) => data,
             Err(err) => return Err(err.into()),
         };
@@ -85,10 +91,26 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let mut output = s3s::dto::GetObjectOutput::default();
 
         // Create a streaming blob from the bytes
-        let stream = stream::once(async move { Ok::<_, std::io::Error>(data) });
+        let data_for_stream = data.clone();
+        let stream = stream::once(async move { Ok::<_, std::io::Error>(data_for_stream) });
         output.body = Some(StreamingBlob::wrap(stream));
 
-        output.content_length = Some(metadata.content_length as i64);
+        // Set content length based on whether this is a range request
+        if let Some(range) = range {
+            // For range requests, content_length is the size of the range
+            output.content_length = Some(data.len() as i64);
+            // Set content_range header to indicate what range is being returned
+            output.content_range = Some(format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end - 1,
+                metadata.content_length
+            ));
+        } else {
+            // For full object requests, content_length is the full object size
+            output.content_length = Some(metadata.content_length as i64);
+        }
+
         output.e_tag = Some(metadata.etag);
 
         let timestamp = Timestamp::from(metadata.last_modified);
@@ -740,7 +762,10 @@ mod tests {
     use crate::s3s::Inner;
     use crate::storage::in_memory::InMemoryStorage;
     use crate::storage::models::ObjectMetadata;
-    use s3s::{S3Request, S3};
+    use bytes::{BufMut, Bytes, BytesMut};
+    use futures_util::{stream, StreamExt};
+    use s3s::dto::{BucketName, ContentLength, ObjectKey, PutObjectOutput, StreamingBlob};
+    use s3s::{S3Request, S3Response, S3};
     use std::collections::HashMap;
     use std::time::SystemTime;
 
@@ -1137,5 +1162,116 @@ mod tests {
             last_modified: SystemTime::now(),
             user_metadata: HashMap::new(),
         }
+    }
+
+    fn create_get_object_input(bucket: &str, key: &str) -> s3s::dto::GetObjectInput {
+        s3s::dto::GetObjectInput::builder()
+            .bucket(BucketName::from(bucket))
+            .key(ObjectKey::from(key))
+            .build()
+            .unwrap()
+    }
+
+    // helper function to create an object
+    async fn create_object(
+        inner: &Inner<InMemoryStorage>,
+        key: &str,
+        content: impl Into<Bytes>,
+        _metadata_opt: Option<ObjectMetadata>,
+    ) -> S3Response<PutObjectOutput> {
+        let content_bytes = content.into();
+        let content_length = content_bytes.len() as i64;
+
+        let stream = stream::once(async move { Ok::<_, std::io::Error>(content_bytes) });
+        let input = s3s::dto::PutObjectInput::builder()
+            .bucket(BucketName::from("XXXXXXXXXXX"))
+            .body(Some(StreamingBlob::wrap(stream)))
+            .key(ObjectKey::from(key))
+            .content_length(Some(ContentLength::from(content_length)))
+            .build()
+            .unwrap();
+
+        let req = S3Request::new(input);
+        inner.put_object(req).await.expect("Failed to put object")
+    }
+
+    #[tokio::test]
+    async fn test_get_object_range() {
+        // Create a test instance
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+        let content = "This is a test content that is exactly 100 bytes long to make our range test work properly..........";
+        let _ = create_object(&inner, "test-key", content, None).await;
+
+        let mut input = create_get_object_input("test-bucket", "test-key");
+        input.range = Some(s3s::dto::Range::parse("bytes=0-49").unwrap());
+
+        let req = S3Request::new(input);
+
+        // Call the method
+        let result = inner.get_object(req).await.expect("Get object failed");
+        let output = result.output;
+
+        // For range request "bytes=0-49", we expect:
+        // - content_length to be 50 (the size of the range)
+        // - content_range to indicate the range being returned
+        assert_eq!(output.content_length, Some(50));
+        assert_eq!(output.content_range, Some("bytes 0-49/100".to_string()));
+
+        // The etag should be the MD5 hash of the content (calculated during put_object)
+        let expected_etag = format!("\"{}\"", hex::encode(md5::compute(content).0));
+        assert_eq!(output.e_tag.unwrap().as_str(), &expected_etag);
+
+        let mut body = output.body.unwrap();
+
+        let mut buf = BytesMut::with_capacity(output.content_length.unwrap() as usize);
+        while let Some(result) = body.next().await {
+            let bytes = result.expect("Failed to read body");
+            buf.put(bytes);
+        }
+        let range_contents = buf.freeze();
+
+        // Verify we got exactly the requested range (bytes 0-49, which is 50 bytes)
+        assert_eq!(range_contents.len(), 50);
+        assert_eq!(&range_contents[..], &content.as_bytes()[0..50]);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_range_edge_cases() {
+        // Create a test instance
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+        let content = "0123456789"; // 10 bytes
+        let _ = create_object(&inner, "test-key", content, None).await;
+
+        // Test case 1: Range at the beginning
+        let mut input = create_get_object_input("test-bucket", "test-key");
+        input.range = Some(s3s::dto::Range::parse("bytes=0-4").unwrap());
+        let req = S3Request::new(input);
+        let result = inner.get_object(req).await.expect("Get object failed");
+        let output = result.output;
+
+        assert_eq!(output.content_length, Some(5));
+        assert_eq!(output.content_range, Some("bytes 0-4/10".to_string()));
+
+        // Test case 2: Range at the end
+        let mut input = create_get_object_input("test-bucket", "test-key");
+        input.range = Some(s3s::dto::Range::parse("bytes=5-9").unwrap());
+        let req = S3Request::new(input);
+        let result = inner.get_object(req).await.expect("Get object failed");
+        let output = result.output;
+
+        assert_eq!(output.content_length, Some(5));
+        assert_eq!(output.content_range, Some("bytes 5-9/10".to_string()));
+
+        // Test case 3: Single byte range
+        let mut input = create_get_object_input("test-bucket", "test-key");
+        input.range = Some(s3s::dto::Range::parse("bytes=3-3").unwrap());
+        let req = S3Request::new(input);
+        let result = inner.get_object(req).await.expect("Get object failed");
+        let output = result.output;
+
+        assert_eq!(output.content_length, Some(1));
+        assert_eq!(output.content_range, Some("bytes 3-3/10".to_string()));
     }
 }
