@@ -375,7 +375,6 @@ async fn test_put_object_with_metadata() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Range requests not fully implemented yet"]
 async fn test_get_object_range() -> Result<()> {
     let server = S3MockServer::builder()
         .with_in_memory_store()
