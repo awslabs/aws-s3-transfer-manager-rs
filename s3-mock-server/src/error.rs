@@ -29,6 +29,10 @@ pub enum Error {
     #[error("no such part")]
     NoSuchPart,
 
+    /// The part is invalid (e.g., ETag mismatch).
+    #[error("invalid part")]
+    InvalidPart,
+
     /// The parts are not in the correct order.
     #[error("invalid part order")]
     InvalidPartOrder,
@@ -64,7 +68,7 @@ impl From<Error> for s3s::S3Error {
             Error::NoSuchKey => s3s::S3ErrorCode::NoSuchKey,
             Error::NoSuchBucket => s3s::S3ErrorCode::NoSuchBucket,
             Error::NoSuchUpload => s3s::S3ErrorCode::NoSuchUpload,
-            Error::NoSuchPart => s3s::S3ErrorCode::InvalidPart,
+            Error::NoSuchPart | Error::InvalidPart => s3s::S3ErrorCode::InvalidPart,
             Error::InvalidPartOrder => s3s::S3ErrorCode::InvalidPartOrder,
             Error::InvalidRange => s3s::S3ErrorCode::InvalidRange,
             _ => s3s::S3ErrorCode::InternalError,

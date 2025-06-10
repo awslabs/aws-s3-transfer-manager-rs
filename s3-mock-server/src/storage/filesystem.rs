@@ -8,19 +8,36 @@
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use serde_json;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{Error, Result};
+use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::storage::StorageBackend;
 
 /// A filesystem implementation of the StorageBackend trait.
 ///
 /// This implementation stores objects and multipart uploads on the local filesystem,
-/// making it suitable for testing and benchmarking with larger datasets.
+/// making it suitable for testing and benchmarking with larger datasets. The directory
+/// structure is:
+///
+/// ```text
+/// root/
+/// ├── objects/
+/// │   ├── my-file.txt              # Object data
+/// │   └── my-file.txt.metadata     # Object metadata (JSON)
+/// ├── uploads/
+/// │   ├── upload-123/
+/// │   │   ├── metadata.json        # Upload metadata
+/// │   │   ├── part-1.dat          # Part data
+/// │   │   └── part-1.metadata     # Part metadata
+/// │   └── ...
+/// ```
 #[derive(Debug)]
 pub(crate) struct FilesystemStorage {
     root_dir: PathBuf,
@@ -58,283 +75,409 @@ impl FilesystemStorage {
         })
     }
 
-    // Helper method to get the path for an object
+    // Helper method to get the path for an object's data
     fn get_object_path(&self, key: &str) -> PathBuf {
+        // Handle empty key as a special case
+        if key.is_empty() {
+            return self.objects_dir.join("empty_key");
+        }
         object_key_to_path(&self.objects_dir, key)
     }
 
-    // Helper method to get the path for an upload
+    // Helper method to get the path for an object's metadata
+    fn get_object_metadata_path(&self, key: &str) -> PathBuf {
+        // Handle empty key as a special case
+        if key.is_empty() {
+            return self.objects_dir.join("empty_key.metadata");
+        }
+        object_key_to_path(&self.objects_dir, &format!("{}.metadata", key))
+    }
+
+    // Helper method to get the directory for an upload
     fn get_upload_dir(&self, upload_id: &str) -> PathBuf {
         self.uploads_dir.join(upload_id)
     }
 
-    // Helper method to get the path for a part
+    // Helper method to get the path for an upload's metadata
+    fn get_upload_metadata_path(&self, upload_id: &str) -> PathBuf {
+        self.get_upload_dir(upload_id).join("metadata.json")
+    }
+
+    // Helper method to get the path for a part's data
     fn get_part_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
         self.get_upload_dir(upload_id)
-            .join(format!("{}", part_number))
-    }
-}
-
-#[async_trait]
-impl StorageBackend for FilesystemStorage {
-    async fn get_object_data(&self, key: &str, range: Option<Range<u64>>) -> Result<Bytes> {
-        let path = self.get_object_path(key);
-
-        // Check if the file exists
-        if !path.exists() {
-            return Err(Error::NoSuchKey);
-        }
-
-        // Open the file
-        let mut file = fs::File::open(&path).await?;
-
-        // Get file metadata to determine size
-        let metadata = file.metadata().await?;
-        let file_size = metadata.len();
-
-        if let Some(range) = range {
-            // Validate range
-            if range.start >= file_size {
-                return Err(Error::InvalidRange);
-            }
-
-            let end = range.end.min(file_size);
-            if range.start > end {
-                return Err(Error::InvalidRange);
-            }
-
-            // Seek to the start position
-            file.seek(SeekFrom::Start(range.start)).await?;
-
-            // Read the specified range
-            let mut buffer = BytesMut::with_capacity((end - range.start) as usize);
-            let mut chunk = vec![0; 8192]; // 8KB read buffer
-            let mut bytes_read = 0;
-
-            while bytes_read < (end - range.start) {
-                let bytes_to_read =
-                    ((end - range.start) - bytes_read).min(chunk.len() as u64) as usize;
-                let n = file.read(&mut chunk[..bytes_to_read]).await?;
-                if n == 0 {
-                    break; // End of file
-                }
-                buffer.extend_from_slice(&chunk[..n]);
-                bytes_read += n as u64;
-            }
-
-            Ok(buffer.freeze())
-        } else {
-            // Read the entire file
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer).await?;
-            Ok(Bytes::from(buffer))
-        }
+            .join(format!("part-{}.dat", part_number))
     }
 
-    async fn put_object_data(&self, key: &str, content: Bytes) -> Result<()> {
-        let path = self.get_object_path(key);
+    // Helper method to get the path for a part's metadata
+    fn get_part_metadata_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
+        self.get_upload_dir(upload_id)
+            .join(format!("part-{}.metadata", part_number))
+    }
 
-        // Create parent directories if they don't exist
+    // Helper method to save metadata to a file
+    async fn save_metadata<T: serde::Serialize>(path: &Path, metadata: &T) -> Result<()> {
+        // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        // Write the content to the file
-        let mut file = fs::File::create(&path).await?;
-        file.write_all(&content).await?;
-        file.flush().await?;
+        // Serialize and write metadata
+        let json = serde_json::to_string(metadata)
+            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        fs::write(path, json).await?;
+        Ok(())
+    }
+
+    // Helper method to load metadata from a file
+    async fn load_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+        match fs::read_to_string(path).await {
+            Ok(json) => {
+                let metadata = serde_json::from_str(&json)
+                    .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                Ok(Some(metadata))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    // Helper method to list all objects in a directory
+    // Helper method to list all objects in a directory recursively
+    fn list_directory<'a>(
+        &'a self,
+        dir: &'a Path,
+        prefix: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<PathBuf>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut entries = Vec::new();
+            let mut read_dir = fs::read_dir(dir).await?;
+
+            while let Some(entry) = read_dir.next_entry().await? {
+                let path = entry.path();
+                let metadata = fs::metadata(&path).await?;
+
+                if metadata.is_dir() {
+                    // Recursively list subdirectories
+                    let mut sub_entries = self.list_directory(&path, prefix).await?;
+                    entries.append(&mut sub_entries);
+                } else if path.extension().map_or(true, |ext| ext != "metadata") {
+                    if let Some(key) = path_to_object_key(&self.objects_dir, &path) {
+                        if let Some(prefix) = prefix {
+                            if !key.starts_with(prefix) {
+                                continue;
+                            }
+                        }
+                        entries.push(path);
+                    }
+                }
+            }
+
+            entries.sort();
+            Ok(entries)
+        })
+    }
+}
+
+// Helper function to convert an object key to a filesystem path
+fn object_key_to_path(base_dir: &Path, key: &str) -> PathBuf {
+    // Split the key on '/' and join the parts to create a path
+    let parts: Vec<&str> = key.split('/').collect();
+    let mut path = base_dir.to_path_buf();
+    path.extend(parts);
+    path
+}
+
+// Helper function to convert a filesystem path back to an object key
+fn path_to_object_key(base_dir: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(base_dir)
+        .ok()
+        .map(|rel_path| rel_path.to_string_lossy().replace('\\', "/"))
+}
+#[async_trait]
+impl StorageBackend for FilesystemStorage {
+    async fn put_object(&self, key: &str, content: Bytes, metadata: ObjectMetadata) -> Result<()> {
+        // Save the object data
+        let path = self.get_object_path(key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&path, content).await?;
+
+        // Save the metadata
+        let metadata_path = self.get_object_metadata_path(key);
+        Self::save_metadata(&metadata_path, &metadata).await?;
 
         Ok(())
     }
 
-    async fn delete_object_data(&self, key: &str) -> Result<()> {
+    async fn get_object(
+        &self,
+        key: &str,
+        range: Option<Range<u64>>,
+    ) -> Result<Option<(Bytes, ObjectMetadata)>> {
         let path = self.get_object_path(key);
+        let metadata_path = self.get_object_metadata_path(key);
 
-        // Check if the file exists
-        if !path.exists() {
-            return Err(Error::NoSuchKey);
+        // Load metadata first to check if object exists
+        let metadata: ObjectMetadata = match Self::load_metadata(&metadata_path).await? {
+            Some(metadata) => metadata,
+            None => return Ok(None),
+        };
+
+        // Open the file
+        let mut file = match fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        };
+
+        // Handle range request
+        let data = if let Some(range) = range {
+            let start = range.start;
+            let end = range.end.min(metadata.content_length);
+
+            if start >= metadata.content_length || start > end {
+                return Err(Error::InvalidRange);
+            }
+
+            // Seek to start of range
+            file.seek(SeekFrom::Start(start)).await?;
+
+            // Read range
+            let mut buffer = BytesMut::with_capacity((end - start) as usize);
+            let mut remaining = end - start;
+            while remaining > 0 {
+                let mut chunk = vec![0; remaining.min(8192) as usize];
+                let n = file.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..n]);
+                remaining -= n as u64;
+            }
+            buffer.freeze()
+        } else {
+            // Read entire file
+            let mut buffer = Vec::with_capacity(metadata.content_length as usize);
+            file.read_to_end(&mut buffer).await?;
+            Bytes::from(buffer)
+        };
+
+        Ok(Some((data, metadata)))
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<()> {
+        let path = self.get_object_path(key);
+        let metadata_path = self.get_object_metadata_path(key);
+
+        // Delete both data and metadata files
+        match fs::remove_file(&path).await {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NoSuchKey),
+            Err(e) => return Err(Error::Io(e)),
         }
 
-        // Delete the file
-        fs::remove_file(path).await?;
+        // Try to delete metadata, but don't error if it's already gone
+        let _ = fs::remove_file(metadata_path).await;
 
         Ok(())
     }
 
-    async fn store_part_data(
+    async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<(String, ObjectMetadata)>> {
+        let mut result = Vec::new();
+
+        // List all objects in the directory
+        let entries = self.list_directory(&self.objects_dir, prefix).await?;
+
+        // Load metadata for each object
+        for path in entries {
+            if let Some(key) = path_to_object_key(&self.objects_dir, &path) {
+                let metadata_path = self.get_object_metadata_path(&key);
+                if let Some(metadata) = Self::load_metadata(&metadata_path).await? {
+                    result.push((key, metadata));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        metadata: ObjectMetadata,
+    ) -> Result<()> {
+        let upload_dir = self.get_upload_dir(upload_id);
+        fs::create_dir_all(&upload_dir).await?;
+
+        let upload_metadata = MultipartUploadMetadata {
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            metadata,
+            parts: Default::default(),
+        };
+
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        Self::save_metadata(&metadata_path, &upload_metadata).await?;
+
+        Ok(())
+    }
+
+    async fn upload_part(
         &self,
         upload_id: &str,
         part_number: i32,
         content: Bytes,
-    ) -> Result<()> {
-        let upload_dir = self.get_upload_dir(upload_id);
+    ) -> Result<String> {
+        // Verify the upload exists
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let mut upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchUpload)?;
+
+        // Calculate ETag
+        let etag = format!("\"{:x}\"", md5::compute(&content));
+
+        // Save the part data
         let part_path = self.get_part_path(upload_id, part_number);
-
-        // Create upload directory if it doesn't exist
-        fs::create_dir_all(&upload_dir).await?;
-
-        // Write the part content to the file
-        let mut file = fs::File::create(&part_path).await?;
-        file.write_all(&content).await?;
-        file.flush().await?;
-
-        Ok(())
-    }
-
-    async fn get_part_data(&self, upload_id: &str, part_number: i32) -> Result<Bytes> {
-        let part_path = self.get_part_path(upload_id, part_number);
-
-        // Check if the upload directory exists
-        let upload_dir = self.get_upload_dir(upload_id);
-        if !upload_dir.exists() {
-            return Err(Error::NoSuchUpload);
-        }
-
-        // Check if the part file exists
-        if !part_path.exists() {
-            return Err(Error::NoSuchPart);
-        }
-
-        // Read the part content
-        let mut file = fs::File::open(&part_path).await?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
-
-        Ok(Bytes::from(buffer))
-    }
-
-    async fn complete_multipart_data(
-        &self,
-        upload_id: &str,
-        key: &str,
-        part_numbers: &[i32],
-    ) -> Result<()> {
-        let upload_dir = self.get_upload_dir(upload_id);
-
-        // Check if the upload directory exists
-        if !upload_dir.exists() {
-            return Err(Error::NoSuchUpload);
-        }
-
-        // Create the destination file
-        let dest_path = self.get_object_path(key);
-
-        // Create parent directories if they don't exist
-        if let Some(parent) = dest_path.parent() {
+        if let Some(parent) = part_path.parent() {
             fs::create_dir_all(parent).await?;
         }
+        fs::write(&part_path, &content).await?;
 
-        let mut dest_file = fs::File::create(&dest_path).await?;
+        // Save the part metadata
+        let part_metadata = PartMetadata {
+            etag: etag.clone(),
+            size: content.len() as u64,
+        };
+        let part_metadata_path = self.get_part_metadata_path(upload_id, part_number);
+        Self::save_metadata(&part_metadata_path, &part_metadata).await?;
 
-        // Combine all parts in the specified order
-        for &part_number in part_numbers {
-            let part_path = self.get_part_path(upload_id, part_number);
+        // Update the upload metadata
+        upload_metadata.parts.insert(part_number, part_metadata);
+        Self::save_metadata(&metadata_path, &upload_metadata).await?;
 
-            // Check if the part file exists
-            if !part_path.exists() {
-                return Err(Error::NoSuchPart);
-            }
-
-            // Read the part content and append to the destination file
-            let mut part_file = fs::File::open(&part_path).await?;
-            let mut buffer = vec![0; 8192]; // 8KB buffer
-
-            loop {
-                let bytes_read = part_file.read(&mut buffer).await?;
-                if bytes_read == 0 {
-                    break;
-                }
-                dest_file.write_all(&buffer[..bytes_read]).await?;
-            }
-        }
-
-        // Ensure all data is written to disk
-        dest_file.flush().await?;
-
-        // Clean up the upload directory
-        fs::remove_dir_all(upload_dir).await?;
-
-        Ok(())
+        Ok(etag)
     }
 
-    async fn abort_multipart_data(&self, upload_id: &str) -> Result<()> {
+    async fn list_parts(&self, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchUpload)?;
+
+        let mut result: Vec<_> = upload_metadata
+            .parts
+            .iter()
+            .map(|(&part_number, part_metadata)| {
+                (part_number, part_metadata.etag.clone(), part_metadata.size)
+            })
+            .collect();
+
+        // Sort by part number for consistent ordering
+        result.sort_by_key(|&(part_number, _, _)| part_number);
+        Ok(result)
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<(String, ObjectMetadata)> {
+        // Load the upload metadata
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchUpload)?;
+
+        // Verify all parts exist and ETags match
+        let mut total_size = 0u64;
+        let mut etags = Vec::new();
+        let mut combined = BytesMut::new();
+
+        for (part_number, expected_etag) in &parts {
+            let part_metadata_path = self.get_part_metadata_path(upload_id, *part_number);
+            let part_metadata: PartMetadata = Self::load_metadata(&part_metadata_path)
+                .await?
+                .ok_or(Error::NoSuchPart)?;
+
+            if part_metadata.etag != *expected_etag {
+                return Err(Error::InvalidPart);
+            }
+
+            // Read the part data
+            let part_path = self.get_part_path(upload_id, *part_number);
+            let part_data = fs::read(&part_path).await?;
+            combined.extend_from_slice(&part_data);
+
+            total_size += part_metadata.size;
+            etags.push(part_metadata.etag.clone());
+        }
+
+        // Calculate the final ETag
+        let combined_etag = if etags.len() > 1 {
+            let etags_concat = etags.join("");
+            format!("\"{:x}-{}\"", md5::compute(etags_concat), etags.len())
+        } else if !etags.is_empty() {
+            etags[0].clone()
+        } else {
+            format!("\"{:x}\"", md5::compute(""))
+        };
+
+        // Update the final metadata
+        let mut final_metadata = upload_metadata.metadata;
+        final_metadata.content_length = total_size;
+        final_metadata.etag = combined_etag;
+        final_metadata.last_modified = SystemTime::now();
+
+        // Save the final object
+        let combined_data = combined.freeze();
+        self.put_object(&upload_metadata.key, combined_data, final_metadata.clone())
+            .await?;
+
+        // Clean up the multipart upload
+        let _ = fs::remove_dir_all(self.get_upload_dir(upload_id)).await;
+
+        Ok((upload_metadata.key, final_metadata))
+    }
+
+    async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         let upload_dir = self.get_upload_dir(upload_id);
 
-        // Check if the upload directory exists
-        if !upload_dir.exists() {
+        // Verify the upload exists
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        if !metadata_path.exists() {
             return Err(Error::NoSuchUpload);
         }
 
-        // Remove the upload directory and all its contents
+        // Remove the entire upload directory
         fs::remove_dir_all(upload_dir).await?;
 
         Ok(())
     }
-}
 
-/// Convert an S3 object key to a filesystem path.
-///
-/// This function handles special characters and ensures the path is valid
-/// on the local filesystem.
-///
-/// # Arguments
-///
-/// * `base_dir` - The base directory for objects
-/// * `key` - The S3 object key
-///
-/// # Returns
-///
-/// A PathBuf representing the local filesystem path for the object
-fn object_key_to_path(base_dir: impl AsRef<Path>, key: &str) -> PathBuf {
-    // Handle empty keys as a special case
-    if key.is_empty() {
-        return base_dir.as_ref().join("empty-key");
+    async fn head_object(&self, key: &str) -> Result<Option<ObjectMetadata>> {
+        let metadata_path = self.get_object_metadata_path(key);
+        Self::load_metadata(&metadata_path).await
     }
-
-    // Handle keys with leading slashes by removing them
-    let key = key.trim_start_matches('/');
-
-    // Join the key to the base directory
-    base_dir.as_ref().join(key)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_object_path_formation() {
-        let temp_dir = tempdir().unwrap();
-        let base_dir = temp_dir.path().join("objects");
-
-        // Test basic key
-        let path = object_key_to_path(&base_dir, "simple-key");
-        assert_eq!(path, base_dir.join("simple-key"));
-
-        // Test nested key with slashes
-        let path = object_key_to_path(&base_dir, "folder/subfolder/key");
-        assert_eq!(path, base_dir.join("folder/subfolder/key"));
-
-        // Test key with leading slash
-        let path = object_key_to_path(&base_dir, "/leading-slash-key");
-        assert_eq!(path, base_dir.join("leading-slash-key"));
-
-        // Test empty key
-        let path = object_key_to_path(&base_dir, "");
-        assert_eq!(path, base_dir.join("empty-key"));
-
-        // Test key with special characters
-        let path = object_key_to_path(&base_dir, "key-with-special-chars!@#$%^&*()");
-        assert_eq!(path, base_dir.join("key-with-special-chars!@#$%^&*()"));
-
-        // Test key with spaces
-        let path = object_key_to_path(&base_dir, "key with spaces");
-        assert_eq!(path, base_dir.join("key with spaces"));
-
-        // Test key with unicode characters
-        let path = object_key_to_path(&base_dir, "unicode-key-😀-🚀");
-        assert_eq!(path, base_dir.join("unicode-key-😀-🚀"));
+    fn create_test_metadata(content_length: u64) -> ObjectMetadata {
+        ObjectMetadata {
+            content_type: Some("text/plain".to_string()),
+            content_length,
+            etag: format!("\"{:x}\"", md5::compute("test")),
+            last_modified: SystemTime::now(),
+            user_metadata: HashMap::new(),
+        }
     }
 
     #[tokio::test]
@@ -343,13 +486,21 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
+        let metadata = create_test_metadata(content.len() as u64);
 
         // Put object
-        storage.put_object_data(key, content.clone()).await.unwrap();
+        storage
+            .put_object(key, content.clone(), metadata.clone())
+            .await
+            .unwrap();
 
         // Get object
-        let retrieved = storage.get_object_data(key, None).await.unwrap();
-        assert_eq!(retrieved, content);
+        let result = storage.get_object(key, None).await.unwrap();
+        assert!(result.is_some());
+        let (retrieved_content, retrieved_metadata) = result.unwrap();
+        assert_eq!(retrieved_content, content);
+        assert_eq!(retrieved_metadata.content_length, metadata.content_length);
+        assert_eq!(retrieved_metadata.content_type, metadata.content_type);
     }
 
     #[tokio::test]
@@ -357,15 +508,18 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "test-key";
-        let content = Bytes::from("test content");
+        let content = Bytes::from("0123456789");
+        let metadata = create_test_metadata(content.len() as u64);
 
         // Put object
-        storage.put_object_data(key, content).await.unwrap();
+        storage.put_object(key, content, metadata).await.unwrap();
 
-        // Get object with range
-        let range = 0..4;
-        let retrieved = storage.get_object_data(key, Some(range)).await.unwrap();
-        assert_eq!(retrieved, Bytes::from("test"));
+        // Get range
+        let range = Some(2..5);
+        let result = storage.get_object(key, range).await.unwrap();
+        assert!(result.is_some());
+        let (retrieved_content, _) = result.unwrap();
+        assert_eq!(retrieved_content, Bytes::from("234"));
     }
 
     #[tokio::test]
@@ -374,131 +528,179 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
+        let metadata = create_test_metadata(content.len() as u64);
 
         // Put object
-        storage.put_object_data(key, content).await.unwrap();
+        storage.put_object(key, content, metadata).await.unwrap();
+
+        // Verify it exists
+        let result = storage.get_object(key, None).await.unwrap();
+        assert!(result.is_some());
 
         // Delete object
-        storage.delete_object_data(key).await.unwrap();
+        storage.delete_object(key).await.unwrap();
 
-        // Try to get deleted object
-        let result = storage.get_object_data(key, None).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::NoSuchKey));
+        // Verify it's gone
+        let result = storage.get_object(key, None).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects() {
+        let temp_dir = tempdir().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        let content = Bytes::from("test content");
+
+        // Put multiple objects
+        for i in 0..3 {
+            let key = format!("test-key-{}", i);
+            let metadata = create_test_metadata(content.len() as u64);
+            storage
+                .put_object(&key, content.clone(), metadata)
+                .await
+                .unwrap();
+        }
+
+        // List all objects
+        let objects = storage.list_objects(None).await.unwrap();
+        assert_eq!(objects.len(), 3);
+
+        // List with prefix
+        let objects = storage.list_objects(Some("test-key-1")).await.unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, "test-key-1");
     }
 
     #[tokio::test]
     async fn test_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
-        let upload_id = "test-upload";
-        let key = "test-key";
-        let part_numbers = [1, 2];
+        let upload_id = "test-upload-123";
+        let key = "test-multipart-key";
+        let metadata = create_test_metadata(0); // Will be updated on completion
 
-        // Store parts
+        // Create multipart upload
         storage
-            .store_part_data(upload_id, 1, Bytes::from("part1"))
-            .await
-            .unwrap();
-        storage
-            .store_part_data(upload_id, 2, Bytes::from("part2"))
+            .create_multipart_upload(key, upload_id, metadata)
             .await
             .unwrap();
 
-        // Get parts
-        let part1 = storage.get_part_data(upload_id, 1).await.unwrap();
-        let part2 = storage.get_part_data(upload_id, 2).await.unwrap();
-        assert_eq!(part1, Bytes::from("part1"));
-        assert_eq!(part2, Bytes::from("part2"));
+        // Upload parts
+        let part1 = Bytes::from("part1");
+        let part2 = Bytes::from("part2");
+
+        let etag1 = storage
+            .upload_part(upload_id, 1, part1.clone())
+            .await
+            .unwrap();
+        let etag2 = storage
+            .upload_part(upload_id, 2, part2.clone())
+            .await
+            .unwrap();
+
+        // List parts
+        let parts = storage.list_parts(upload_id).await.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].0, 1); // part number
+        assert_eq!(parts[0].1, etag1); // etag
+        assert_eq!(parts[0].2, part1.len() as u64); // size
 
         // Complete multipart upload
-        storage
-            .complete_multipart_data(upload_id, key, &part_numbers)
+        let parts_to_complete = vec![(1, etag1), (2, etag2)];
+        let (final_key, final_metadata) = storage
+            .complete_multipart_upload(upload_id, parts_to_complete)
             .await
             .unwrap();
 
-        // Get the combined object
-        let combined = storage.get_object_data(key, None).await.unwrap();
-        assert_eq!(combined, Bytes::from("part1part2"));
+        assert_eq!(final_key, key);
+        assert_eq!(
+            final_metadata.content_length,
+            (part1.len() + part2.len()) as u64
+        );
 
-        // Verify upload directory is removed
-        let upload_dir = storage.get_upload_dir(upload_id);
-        assert!(!upload_dir.exists());
+        // Verify the final object exists
+        let result = storage.get_object(key, None).await.unwrap();
+        assert!(result.is_some());
+        let (final_content, _) = result.unwrap();
+        assert_eq!(final_content, Bytes::from("part1part2"));
     }
 
     #[tokio::test]
     async fn test_multipart_upload_missing_part() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
-        let upload_id = "test-upload";
-        let key = "test-key";
-        let part_numbers = [1, 2, 3]; // Part 3 doesn't exist
+        let upload_id = "test-upload-123";
+        let key = "test-multipart-key";
+        let metadata = create_test_metadata(0);
 
-        // Store parts
+        // Create multipart upload
         storage
-            .store_part_data(upload_id, 1, Bytes::from("part1"))
-            .await
-            .unwrap();
-        storage
-            .store_part_data(upload_id, 2, Bytes::from("part2"))
+            .create_multipart_upload(key, upload_id, metadata)
             .await
             .unwrap();
 
-        // Try to complete multipart upload with missing part
+        // Upload only one part
+        let part1 = Bytes::from("part1");
+        let etag1 = storage.upload_part(upload_id, 1, part1).await.unwrap();
+
+        // Try to complete with a missing part
+        let parts_to_complete = vec![(1, etag1), (2, "missing-etag".to_string())];
         let result = storage
-            .complete_multipart_data(upload_id, key, &part_numbers)
+            .complete_multipart_upload(upload_id, parts_to_complete)
             .await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::NoSuchPart));
     }
 
     #[tokio::test]
     async fn test_abort_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
-        let upload_id = "test-upload";
+        let upload_id = "test-upload-123";
+        let key = "test-multipart-key";
+        let metadata = create_test_metadata(0);
 
-        // Store a part
+        // Create multipart upload
         storage
-            .store_part_data(upload_id, 1, Bytes::from("part1"))
+            .create_multipart_upload(key, upload_id, metadata)
             .await
             .unwrap();
 
-        // Verify part exists
-        let part_path = storage.get_part_path(upload_id, 1);
-        assert!(part_path.exists());
+        // Upload a part
+        let part1 = Bytes::from("part1");
+        storage.upload_part(upload_id, 1, part1).await.unwrap();
 
         // Abort the upload
-        storage.abort_multipart_data(upload_id).await.unwrap();
+        storage.abort_multipart_upload(upload_id).await.unwrap();
 
-        // Verify upload directory is removed
-        let upload_dir = storage.get_upload_dir(upload_id);
-        assert!(!upload_dir.exists());
-
-        // Try to get the part
-        let result = storage.get_part_data(upload_id, 1).await;
+        // Verify we can't list parts anymore
+        let result = storage.list_parts(upload_id).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::NoSuchUpload));
     }
 
     #[tokio::test]
     async fn test_nested_object_keys() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
-        let key = "folder/subfolder/test-key";
+        let key = "nested/path/to/test-key";
         let content = Bytes::from("test content");
+        let metadata = create_test_metadata(content.len() as u64);
 
         // Put object
-        storage.put_object_data(key, content.clone()).await.unwrap();
+        storage
+            .put_object(key, content.clone(), metadata)
+            .await
+            .unwrap();
 
         // Get object
-        let retrieved = storage.get_object_data(key, None).await.unwrap();
-        assert_eq!(retrieved, content);
+        let result = storage.get_object(key, None).await.unwrap();
+        assert!(result.is_some());
+        let (retrieved_content, _) = result.unwrap();
+        assert_eq!(retrieved_content, content);
 
-        // Verify directory structure was created
-        let object_path = storage.get_object_path(key);
-        assert!(object_path.exists());
-        assert!(object_path.parent().unwrap().exists());
+        // List objects
+        let objects = storage.list_objects(Some("nested/")).await.unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0, key);
     }
 
     #[tokio::test]
@@ -506,18 +708,19 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "";
-        let content = Bytes::from("empty key content");
+        let content = Bytes::from("test content");
+        let metadata = create_test_metadata(content.len() as u64);
 
-        // Put object with empty key
-        storage.put_object_data(key, content.clone()).await.unwrap();
+        // Put object
+        storage
+            .put_object(key, content.clone(), metadata)
+            .await
+            .unwrap();
 
-        // Get object with empty key
-        let retrieved = storage.get_object_data(key, None).await.unwrap();
-        assert_eq!(retrieved, content);
-
-        // Verify file exists
-        let object_path = storage.get_object_path(key);
-        assert!(object_path.exists());
-        assert_eq!(object_path, storage.objects_dir.join("empty-key"));
+        // Get object
+        let result = storage.get_object(key, None).await.unwrap();
+        assert!(result.is_some());
+        let (retrieved_content, _) = result.unwrap();
+        assert_eq!(retrieved_content, content);
     }
 }

@@ -5,11 +5,12 @@
 
 //! Data models for storage operations.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 /// Metadata for an S3 object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ObjectMetadata {
     /// Content type of the object.
     pub content_type: Option<String>,
@@ -28,7 +29,7 @@ pub(crate) struct ObjectMetadata {
 }
 
 /// Metadata for a part in a multipart upload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PartMetadata {
     /// ETag of the part.
     pub etag: String,
@@ -38,7 +39,7 @@ pub(crate) struct PartMetadata {
 }
 
 /// Metadata for a multipart upload.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MultipartUploadMetadata {
     /// Key of the object being uploaded.
     pub key: String,
