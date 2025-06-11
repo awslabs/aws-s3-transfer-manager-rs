@@ -8,17 +8,72 @@
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures::Stream;
+use pin_project::pin_project;
 use serde_json;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncSeekExt;
+use tokio_util::io::ReaderStream;
 
 use crate::error::{Error, Result};
 use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::storage::StorageBackend;
+
+/// A stream wrapper that limits the total number of bytes read from the underlying stream.
+#[pin_project]
+struct LimitedStream<S> {
+    #[pin]
+    inner: S,
+    remaining: u64,
+}
+
+impl<S> LimitedStream<S> {
+    fn new(inner: S, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl<S> Stream for LimitedStream<S>
+where
+    S: Stream<Item = std::result::Result<Bytes, std::io::Error>>,
+{
+    type Item = std::result::Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+
+        if *this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        match this.inner.poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let bytes_len = bytes.len() as u64;
+                if bytes_len <= *this.remaining {
+                    *this.remaining -= bytes_len;
+                    Poll::Ready(Some(Ok(bytes)))
+                } else {
+                    // Truncate the bytes to the remaining limit
+                    let truncated = bytes.slice(0..*this.remaining as usize);
+                    *this.remaining = 0;
+                    Poll::Ready(Some(Ok(truncated)))
+                }
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 /// A filesystem implementation of the StorageBackend trait.
 ///
@@ -216,7 +271,14 @@ impl StorageBackend for FilesystemStorage {
         &self,
         key: &str,
         range: Option<Range<u64>>,
-    ) -> Result<Option<(Bytes, ObjectMetadata)>> {
+    ) -> Result<
+        Option<(
+            Box<
+                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+            >,
+            ObjectMetadata,
+        )>,
+    > {
         let path = self.get_object_path(key);
         let metadata_path = self.get_object_metadata_path(key);
 
@@ -234,7 +296,7 @@ impl StorageBackend for FilesystemStorage {
         };
 
         // Handle range request
-        let data = if let Some(range) = range {
+        let (content_length, _seek_position) = if let Some(ref range) = range {
             let start = range.start;
             let end = range.end.min(metadata.content_length);
 
@@ -244,28 +306,25 @@ impl StorageBackend for FilesystemStorage {
 
             // Seek to start of range
             file.seek(SeekFrom::Start(start)).await?;
-
-            // Read range
-            let mut buffer = BytesMut::with_capacity((end - start) as usize);
-            let mut remaining = end - start;
-            while remaining > 0 {
-                let mut chunk = vec![0; remaining.min(8192) as usize];
-                let n = file.read(&mut chunk).await?;
-                if n == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..n]);
-                remaining -= n as u64;
-            }
-            buffer.freeze()
+            (end - start, start)
         } else {
-            // Read entire file
-            let mut buffer = Vec::with_capacity(metadata.content_length as usize);
-            file.read_to_end(&mut buffer).await?;
-            Bytes::from(buffer)
+            (metadata.content_length, 0)
         };
 
-        Ok(Some((data, metadata)))
+        // Create a reader stream with a reasonable buffer size
+        let reader_stream = ReaderStream::with_capacity(file, 8192);
+
+        // If we have a range, we need to limit the stream to only read the specified amount
+        let limited_stream: Box<
+            dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+        > = if range.is_some() {
+            // Create a stream that limits the total bytes read
+            Box::new(LimitedStream::new(reader_stream, content_length))
+        } else {
+            Box::new(reader_stream)
+        };
+
+        Ok(Some((limited_stream, metadata)))
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
@@ -467,8 +526,23 @@ impl StorageBackend for FilesystemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    // Helper function to collect stream data into bytes
+    async fn collect_stream_data(
+        mut stream: Box<
+            dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+        >,
+    ) -> Bytes {
+        let mut collected_data = Vec::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            collected_data.extend_from_slice(&chunk);
+        }
+        Bytes::from(collected_data)
+    }
 
     fn create_test_metadata(content_length: u64) -> ObjectMetadata {
         ObjectMetadata {
@@ -497,7 +571,8 @@ mod tests {
         // Get object
         let result = storage.get_object(key, None).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_content, retrieved_metadata) = result.unwrap();
+        let (retrieved_stream, retrieved_metadata) = result.unwrap();
+        let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
         assert_eq!(retrieved_metadata.content_length, metadata.content_length);
         assert_eq!(retrieved_metadata.content_type, metadata.content_type);
@@ -518,7 +593,8 @@ mod tests {
         let range = Some(2..5);
         let result = storage.get_object(key, range).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_content, _) = result.unwrap();
+        let (retrieved_stream, _) = result.unwrap();
+        let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, Bytes::from("234"));
     }
 
@@ -621,7 +697,8 @@ mod tests {
         // Verify the final object exists
         let result = storage.get_object(key, None).await.unwrap();
         assert!(result.is_some());
-        let (final_content, _) = result.unwrap();
+        let (final_stream, _) = result.unwrap();
+        let final_content = collect_stream_data(final_stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
     }
 
@@ -694,7 +771,8 @@ mod tests {
         // Get object
         let result = storage.get_object(key, None).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_content, _) = result.unwrap();
+        let (retrieved_stream, _) = result.unwrap();
+        let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
 
         // List objects
@@ -720,7 +798,8 @@ mod tests {
         // Get object
         let result = storage.get_object(key, None).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_content, _) = result.unwrap();
+        let (retrieved_stream, _) = result.unwrap();
+        let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
     }
 }
