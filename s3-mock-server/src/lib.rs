@@ -14,6 +14,7 @@ mod error;
 mod s3s;
 mod server;
 mod storage;
+mod streaming;
 
 pub use error::Error;
 pub use error::Result;

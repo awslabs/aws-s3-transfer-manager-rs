@@ -11,11 +11,13 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures::Stream;
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::storage::StorageBackend;
+use crate::streaming::{apply_range, VecByteStream};
 
 /// An in-memory implementation of the StorageBackend trait.
 ///
@@ -57,7 +59,14 @@ impl StorageBackend for InMemoryStorage {
         &self,
         key: &str,
         range: Option<Range<u64>>,
-    ) -> Result<Option<(Bytes, ObjectMetadata)>> {
+    ) -> Result<
+        Option<(
+            Box<
+                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+            >,
+            ObjectMetadata,
+        )>,
+    > {
         let objects = self.objects.read().await;
         let (data, metadata) = match objects.get(key) {
             Some((data, metadata)) => (data, metadata),
@@ -65,19 +74,17 @@ impl StorageBackend for InMemoryStorage {
         };
 
         let data = if let Some(range) = range {
-            let start = range.start as usize;
-            let end = range.end.min(data.len() as u64) as usize;
-
-            if start >= data.len() || start > end {
-                return Err(Error::InvalidRange);
-            }
-
-            data.slice(start..end)
+            apply_range(data, range)
         } else {
             data.clone()
         };
 
-        Ok(Some((data, metadata.clone())))
+        let stream = VecByteStream::new(data);
+        let boxed_stream: Box<
+            dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+        > = Box::new(stream);
+
+        Ok(Some((boxed_stream, metadata.clone())))
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
@@ -276,7 +283,22 @@ impl StorageBackend for InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::collections::HashMap;
+
+    // Helper function to collect stream data into bytes
+    async fn collect_stream_data(
+        mut stream: Box<
+            dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+        >,
+    ) -> Bytes {
+        let mut collected_data = Vec::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            collected_data.extend_from_slice(&chunk);
+        }
+        Bytes::from(collected_data)
+    }
 
     fn create_test_metadata(content_length: u64) -> ObjectMetadata {
         ObjectMetadata {
@@ -304,7 +326,8 @@ mod tests {
         // Get object
         let result = storage.get_object(key, None).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_content, retrieved_metadata) = result.unwrap();
+        let (retrieved_stream, retrieved_metadata) = result.unwrap();
+        let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
         assert_eq!(retrieved_metadata.content_length, metadata.content_length);
         assert_eq!(retrieved_metadata.content_type, metadata.content_type);
@@ -327,7 +350,8 @@ mod tests {
         let range = Some(2..5);
         let result = storage.get_object(key, range).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_content, _) = result.unwrap();
+        let (retrieved_stream, _) = result.unwrap();
+        let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, Bytes::from("234"));
     }
 
@@ -427,7 +451,8 @@ mod tests {
         // Verify the final object exists
         let result = storage.get_object(key, None).await.unwrap();
         assert!(result.is_some());
-        let (final_content, _) = result.unwrap();
+        let (final_stream, _) = result.unwrap();
+        let final_content = collect_stream_data(final_stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
     }
 

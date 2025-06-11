@@ -8,11 +8,10 @@
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::BytesMut;
-use futures_util::stream;
 use futures_util::StreamExt;
 use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
-use s3s::{S3Request, S3Response, S3Result, S3};
+use s3s::{S3Request, S3Response, S3Result};
 use uuid;
 
 use crate::error::Error;
@@ -63,9 +62,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             })
             .transpose()?;
 
-        // Get object data with validated range
-        let (data, _metadata) = match self.storage.get_object(key, range.clone()).await? {
-            Some((data, metadata)) => (data, metadata),
+        // Get object stream with validated range
+        let (stream, stream_metadata) = match self.storage.get_object(key, range.clone()).await? {
+            Some((stream, metadata)) => (stream, metadata),
             None => return Err(Error::NoSuchKey.into()),
         };
 
@@ -74,7 +73,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Set content length and range headers
         if let Some(range) = range {
             // For range requests, content_length is the size of the range
-            output.content_length = Some(data.len() as i64);
+            let range_size = range.end - range.start;
+            output.content_length = Some(range_size as i64);
             // Set content_range header to indicate what range is being returned
             output.content_range = Some(format!(
                 "bytes {}-{}/{}",
@@ -87,22 +87,21 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             output.content_length = Some(metadata.content_length as i64);
         }
 
-        // Create a streaming blob from the bytes
-        let stream = stream::once(async move { Ok::<_, std::io::Error>(data) });
+        // Use the stream directly
         output.body = Some(StreamingBlob::wrap(stream));
 
-        output.e_tag = Some(metadata.etag);
+        output.e_tag = Some(stream_metadata.etag);
 
-        let timestamp = Timestamp::from(metadata.last_modified);
+        let timestamp = Timestamp::from(stream_metadata.last_modified);
         output.last_modified = Some(timestamp);
 
-        if let Some(content_type) = metadata.content_type {
+        if let Some(content_type) = stream_metadata.content_type {
             if let Ok(mime) = content_type.parse() {
                 output.content_type = Some(mime);
             }
         }
 
-        output.metadata = Some(metadata.user_metadata);
+        output.metadata = Some(stream_metadata.user_metadata);
         // FIXME - add checksum support/storage
 
         Ok(S3Response::new(output))
@@ -426,6 +425,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 mod tests {
     use super::*;
     use crate::storage::in_memory::InMemoryStorage;
+    use futures::stream;
+    use s3s::S3;
     use std::collections::HashMap;
 
     fn create_test_metadata(size: u64) -> ObjectMetadata {

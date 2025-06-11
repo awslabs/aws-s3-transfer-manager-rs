@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::Stream;
 use std::fmt::Debug;
 use std::ops::Range;
 
@@ -66,7 +67,11 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Success or an error if the operation fails
     async fn put_object(&self, key: &str, content: Bytes, metadata: ObjectMetadata) -> Result<()>;
 
-    /// Retrieve an object's data and metadata, optionally with a byte range.
+    /// Retrieve an object as a stream with metadata, optionally with a byte range.
+    ///
+    /// This method is preferred for large objects as it avoids loading the entire
+    /// object into memory. The stream yields chunks of bytes that can be processed
+    /// incrementally.
     ///
     /// # Arguments
     ///
@@ -75,12 +80,19 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     ///
     /// # Returns
     ///
-    /// The object data and metadata, or None if the object doesn't exist
+    /// A stream of bytes and the object metadata, or None if the object doesn't exist
     async fn get_object(
         &self,
         key: &str,
         range: Option<Range<u64>>,
-    ) -> Result<Option<(Bytes, ObjectMetadata)>>;
+    ) -> Result<
+        Option<(
+            Box<
+                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+            >,
+            ObjectMetadata,
+        )>,
+    >;
 
     /// Delete an object and its metadata.
     ///
@@ -203,7 +215,14 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
         &self,
         key: &str,
         range: Option<Range<u64>>,
-    ) -> Result<Option<(Bytes, ObjectMetadata)>> {
+    ) -> Result<
+        Option<(
+            Box<
+                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+            >,
+            ObjectMetadata,
+        )>,
+    > {
         (**self).get_object(key, range).await
     }
 
