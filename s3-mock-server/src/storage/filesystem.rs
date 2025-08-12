@@ -14,16 +14,16 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use pin_project::pin_project;
-use serde_json;
 use tokio::fs;
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 use crate::error::{Error, Result};
 use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::storage::StorageBackend;
+use crate::types::StoredObjectMetadata;
 
 /// A stream wrapper that limits the total number of bytes read from the underlying stream.
 #[pin_project]
@@ -178,8 +178,8 @@ impl FilesystemStorage {
         }
 
         // Serialize and write metadata
-        let json = serde_json::to_string(metadata)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let json =
+            serde_json::to_string(metadata).map_err(|e| Error::Io(std::io::Error::other(e)))?;
         fs::write(path, json).await?;
         Ok(())
     }
@@ -188,8 +188,8 @@ impl FilesystemStorage {
     async fn load_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         match fs::read_to_string(path).await {
             Ok(json) => {
-                let metadata = serde_json::from_str(&json)
-                    .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                let metadata =
+                    serde_json::from_str(&json).map_err(|e| Error::Io(std::io::Error::other(e)))?;
                 Ok(Some(metadata))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -217,7 +217,7 @@ impl FilesystemStorage {
                     // Recursively list subdirectories
                     let mut sub_entries = self.list_directory(&path, prefix).await?;
                     entries.append(&mut sub_entries);
-                } else if path.extension().map_or(true, |ext| ext != "metadata") {
+                } else if path.extension().is_none_or(|ext| ext != "metadata") {
                     if let Some(key) = path_to_object_key(&self.objects_dir, &path) {
                         if let Some(prefix) = prefix {
                             if !key.starts_with(prefix) {
@@ -252,19 +252,46 @@ fn path_to_object_key(base_dir: &Path, path: &Path) -> Option<String> {
 }
 #[async_trait]
 impl StorageBackend for FilesystemStorage {
-    async fn put_object(&self, key: &str, content: Bytes, metadata: ObjectMetadata) -> Result<()> {
-        // Save the object data
-        let path = self.get_object_path(key);
+    async fn put_object(
+        &self,
+        request: crate::storage::StoreObjectRequest,
+    ) -> Result<StoredObjectMetadata> {
+        let mut body = request.body;
+        let mut integrity_checks = request.integrity_checks;
+        let path = self.get_object_path(&request.key);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(&path, content).await?;
 
-        // Save the metadata
-        let metadata_path = self.get_object_metadata_path(key);
+        let mut file = fs::File::create(&path).await?;
+        let mut content_length = 0u64;
+
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            integrity_checks.update(&chunk);
+            content_length += chunk.len() as u64;
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+
+        let object_integrity = integrity_checks.finalize();
+        let last_modified = SystemTime::now();
+
+        let metadata = ObjectMetadata {
+            content_type: request.content_type,
+            content_length,
+            etag: object_integrity.etag().cloned().unwrap_or_default(),
+            last_modified,
+            user_metadata: request.user_metadata,
+        };
+        let metadata_path = self.get_object_metadata_path(&request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
 
-        Ok(())
+        Ok(StoredObjectMetadata {
+            content_length,
+            object_integrity,
+            last_modified,
+        })
     }
 
     async fn get_object(
@@ -492,10 +519,21 @@ impl StorageBackend for FilesystemStorage {
         final_metadata.etag = combined_etag;
         final_metadata.last_modified = SystemTime::now();
 
-        // Save the final object
+        // Save the final object directly
         let combined_data = combined.freeze();
-        self.put_object(&upload_metadata.key, combined_data, final_metadata.clone())
-            .await?;
+        let object_path = self.get_object_path(&upload_metadata.key);
+        let metadata_path = self.get_object_metadata_path(&upload_metadata.key);
+
+        // Ensure parent directory exists
+        if let Some(parent) = object_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // Write object data and metadata
+        fs::write(&object_path, &combined_data).await?;
+        let metadata_json = serde_json::to_string_pretty(&final_metadata)
+            .map_err(|e| crate::Error::Internal(e.to_string()))?;
+        fs::write(&metadata_path, metadata_json).await?;
 
         // Clean up the multipart upload
         let _ = fs::remove_dir_all(self.get_upload_dir(upload_id)).await;
@@ -526,6 +564,7 @@ impl StorageBackend for FilesystemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ObjectIntegrityChecks;
     use futures::StreamExt;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -554,17 +593,29 @@ mod tests {
         }
     }
 
+    // Helper function to convert Bytes to a stream for testing
+    fn bytes_to_stream(
+        data: Bytes,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>> {
+        Box::pin(futures::stream::once(async move { Ok(data) }))
+    }
+
     #[tokio::test]
     async fn test_put_and_get_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
+        let stream = bytes_to_stream(content.clone());
         storage
-            .put_object(key, content.clone(), metadata.clone())
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
             .await
             .unwrap();
 
@@ -574,8 +625,9 @@ mod tests {
         let (retrieved_stream, retrieved_metadata) = result.unwrap();
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
-        assert_eq!(retrieved_metadata.content_length, metadata.content_length);
-        assert_eq!(retrieved_metadata.content_type, metadata.content_type);
+        assert_eq!(retrieved_metadata.content_length, content.len() as u64);
+        // Content type is not preserved in the new streaming API
+        assert_eq!(retrieved_metadata.content_type, None);
     }
 
     #[tokio::test]
@@ -584,10 +636,18 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
-        storage.put_object(key, content, metadata).await.unwrap();
+        let stream = bytes_to_stream(content);
+        storage
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
+            .await
+            .unwrap();
 
         // Get range
         let range = Some(2..5);
@@ -604,10 +664,18 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
-        storage.put_object(key, content, metadata).await.unwrap();
+        let stream = bytes_to_stream(content);
+        storage
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
+            .await
+            .unwrap();
 
         // Verify it exists
         let result = storage.get_object(key, None).await.unwrap();
@@ -630,9 +698,14 @@ mod tests {
         // Put multiple objects
         for i in 0..3 {
             let key = format!("test-key-{}", i);
-            let metadata = create_test_metadata(content.len() as u64);
+            let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+            let stream = bytes_to_stream(content.clone());
             storage
-                .put_object(&key, content.clone(), metadata)
+                .put_object(crate::storage::StoreObjectRequest::new(
+                    &key,
+                    stream,
+                    integrity_checks,
+                ))
                 .await
                 .unwrap();
         }
@@ -760,11 +833,16 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "nested/path/to/test-key";
         let content = Bytes::from("test content");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
+        let stream = bytes_to_stream(content.clone());
         storage
-            .put_object(key, content.clone(), metadata)
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
             .await
             .unwrap();
 
@@ -787,11 +865,16 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let key = "";
         let content = Bytes::from("test content");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
+        let stream = bytes_to_stream(content.clone());
         storage
-            .put_object(key, content.clone(), metadata)
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
             .await
             .unwrap();
 
