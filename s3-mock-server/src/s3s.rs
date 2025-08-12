@@ -148,44 +148,17 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
         let input = req.input;
-        let key = &input.key;
-
-        // Read the body content
-        let mut content = BytesMut::new();
-        if let Some(mut body) = input.body {
-            while let Some(chunk) = body.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        content.extend_from_slice(&chunk);
-                    }
-                    Err(_) => return Err(s3s::s3_error!(InternalError, "Failed to read body")),
-                }
-            }
+        if input.key.is_empty() {
+            return Err(s3s::s3_error!(InvalidRequest));
         }
-        let content = content.freeze();
 
-        let content_type = input.content_type.map(|mime| mime.to_string());
-        let user_metadata = input.metadata.unwrap_or_default();
+        let request = crate::storage::StoreObjectRequest::from(input);
+        let stored_meta = self.storage.put_object(request).await?;
 
-        // Calculate ETag (MD5 hash)
-        let etag = format!("\"{:x}\"", md5::compute(&content));
-
-        let metadata = ObjectMetadata {
-            content_type,
-            content_length: content.len() as u64,
-            etag: etag.clone(),
-            last_modified: std::time::SystemTime::now(),
-            user_metadata,
+        let output = s3s::dto::PutObjectOutput {
+            e_tag: stored_meta.object_integrity.etag().cloned(),
+            ..Default::default()
         };
-
-        // Store object in storage backend
-        self.storage.put_object(key, content, metadata).await?;
-
-        // Build response
-        let mut output = s3s::dto::PutObjectOutput::default();
-        output.e_tag = Some(etag);
-
-        // FIXME - add checksum support
 
         Ok(S3Response::new(output))
     }
@@ -427,20 +400,6 @@ mod tests {
     use crate::storage::in_memory::InMemoryStorage;
     use futures::stream;
     use s3s::S3;
-    use std::collections::HashMap;
-
-    fn create_test_metadata(size: u64) -> ObjectMetadata {
-        ObjectMetadata {
-            content_type: Some("text/plain".to_string()),
-            content_length: size,
-            etag: format!(
-                "\"{}\"",
-                hex::encode(md5::compute(format!("test-content-{}", size)).0)
-            ),
-            last_modified: std::time::SystemTime::now(),
-            user_metadata: HashMap::new(),
-        }
-    }
 
     fn create_get_object_input(bucket: &str, key: &str) -> s3s::dto::GetObjectInput {
         s3s::dto::GetObjectInput::builder()

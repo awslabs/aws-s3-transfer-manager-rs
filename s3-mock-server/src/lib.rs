@@ -15,6 +15,7 @@ mod s3s;
 mod server;
 mod storage;
 mod streaming;
+mod types;
 
 pub use error::Error;
 pub use error::Result;

@@ -98,6 +98,7 @@ pub(crate) fn apply_range(data: &Bytes, range: std::ops::Range<u64>) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ObjectIntegrityChecks;
     use futures::StreamExt;
 
     #[tokio::test]
@@ -164,7 +165,7 @@ mod tests {
 
         let storage = InMemoryStorage::new();
         let test_data = Bytes::from("This is test data for streaming");
-        let metadata = ObjectMetadata {
+        let _metadata = ObjectMetadata {
             content_type: Some("text/plain".to_string()),
             content_length: test_data.len() as u64,
             etag: "test-etag".to_string(),
@@ -173,10 +174,11 @@ mod tests {
         };
 
         // Store the object
-        storage
-            .put_object("test-key", test_data.clone(), metadata.clone())
-            .await
-            .unwrap();
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+        let test_data_clone = test_data.clone();
+        let stream = Box::pin(futures::stream::once(async move { Ok(test_data_clone) }));
+        let request = crate::storage::StoreObjectRequest::new("test-key", stream, integrity_checks);
+        storage.put_object(request).await.unwrap();
 
         // Get the object as a stream
         let (mut stream, returned_metadata) =
@@ -184,7 +186,9 @@ mod tests {
 
         // Verify metadata
         assert_eq!(returned_metadata.content_length, test_data.len() as u64);
-        assert_eq!(returned_metadata.etag, "test-etag");
+        // The etag should be the MD5 hash of the content
+        let expected_etag = format!("\"{}\"", hex::encode(md5::compute(&test_data).0));
+        assert_eq!(returned_metadata.etag, expected_etag);
 
         // Collect all chunks from the stream
         let mut collected_data = Vec::new();

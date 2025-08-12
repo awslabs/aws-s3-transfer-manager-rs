@@ -11,10 +11,71 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+use futures_util::TryStreamExt;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
+use std::pin::Pin;
 
+use crate::types::{ObjectIntegrityChecks, StoredObjectMetadata};
 use crate::Result;
+
+/// Request for storing an object with all necessary metadata and options.
+pub struct StoreObjectRequest {
+    pub key: String,
+    pub body: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>,
+    pub integrity_checks: ObjectIntegrityChecks,
+    pub content_type: Option<String>,
+    pub user_metadata: HashMap<String, String>,
+}
+
+impl StoreObjectRequest {
+    pub fn new(
+        key: impl Into<String>,
+        body: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>,
+        integrity_checks: ObjectIntegrityChecks,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            body,
+            integrity_checks,
+            content_type: None,
+            user_metadata: HashMap::new(),
+        }
+    }
+
+    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
+        self.content_type = content_type;
+        self
+    }
+
+    pub fn with_user_metadata(mut self, user_metadata: HashMap<String, String>) -> Self {
+        self.user_metadata = user_metadata;
+        self
+    }
+}
+
+impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
+    fn from(input: s3s::dto::PutObjectInput) -> Self {
+        let stream = input
+            .body
+            .unwrap_or_else(|| {
+                let empty_stream = futures_util::stream::empty::<
+                    std::result::Result<bytes::Bytes, std::io::Error>,
+                >();
+                s3s::dto::StreamingBlob::wrap(empty_stream)
+            })
+            .map_err(std::io::Error::other);
+
+        Self {
+            key: input.key,
+            body: Box::pin(stream),
+            integrity_checks: ObjectIntegrityChecks::new().with_md5(),
+            content_type: input.content_type.map(|mime| mime.to_string()),
+            user_metadata: input.metadata.unwrap_or_default(),
+        }
+    }
+}
 
 pub(crate) mod filesystem;
 pub(crate) mod in_memory;
@@ -54,18 +115,8 @@ use models::ObjectMetadata;
 pub(crate) trait StorageBackend: Send + Sync + Debug {
     // Object operations - combine data and metadata
 
-    /// Store an object with its data and metadata.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The object key
-    /// * `content` - The object data
-    /// * `metadata` - The object metadata
-    ///
-    /// # Returns
-    ///
-    /// Success or an error if the operation fails
-    async fn put_object(&self, key: &str, content: Bytes, metadata: ObjectMetadata) -> Result<()>;
+    /// Store an object with integrity checking.
+    async fn put_object(&self, request: StoreObjectRequest) -> Result<StoredObjectMetadata>;
 
     /// Retrieve an object as a stream with metadata, optionally with a byte range.
     ///
@@ -207,8 +258,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
 // Implement the trait for Arc<dyn StorageBackend> to allow for dynamic dispatch
 #[async_trait]
 impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
-    async fn put_object(&self, key: &str, content: Bytes, metadata: ObjectMetadata) -> Result<()> {
-        (**self).put_object(key, content, metadata).await
+    async fn put_object(&self, request: StoreObjectRequest) -> Result<StoredObjectMetadata> {
+        (**self).put_object(request).await
     }
 
     async fn get_object(

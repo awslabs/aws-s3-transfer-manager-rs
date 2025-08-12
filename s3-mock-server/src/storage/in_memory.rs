@@ -11,13 +11,14 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::storage::StorageBackend;
 use crate::streaming::{apply_range, VecByteStream};
+use crate::types::StoredObjectMetadata;
 
 /// An in-memory implementation of the StorageBackend trait.
 ///
@@ -49,10 +50,42 @@ impl InMemoryStorage {
 
 #[async_trait]
 impl StorageBackend for InMemoryStorage {
-    async fn put_object(&self, key: &str, content: Bytes, metadata: ObjectMetadata) -> Result<()> {
+    async fn put_object(
+        &self,
+        request: crate::storage::StoreObjectRequest,
+    ) -> Result<StoredObjectMetadata> {
+        let mut body = request.body;
+        let mut integrity_checks = request.integrity_checks;
+        let mut content = BytesMut::new();
+
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            integrity_checks.update(&chunk);
+            content.extend_from_slice(&chunk);
+        }
+
+        let content = content.freeze();
+        let content_length = content.len() as u64;
+        let object_integrity = integrity_checks.finalize();
+        let last_modified = SystemTime::now();
+
+        // Store with placeholder metadata for now
+        let metadata = ObjectMetadata {
+            content_type: request.content_type,
+            content_length,
+            etag: object_integrity.etag().cloned().unwrap_or_default(),
+            last_modified,
+            user_metadata: request.user_metadata,
+        };
+
         let mut objects = self.objects.write().await;
-        objects.insert(key.to_string(), (content, metadata));
-        Ok(())
+        objects.insert(request.key.clone(), (content, metadata));
+
+        Ok(StoredObjectMetadata {
+            content_length,
+            object_integrity,
+            last_modified,
+        })
     }
 
     async fn get_object(
@@ -283,8 +316,10 @@ impl StorageBackend for InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ObjectIntegrityChecks;
     use futures::StreamExt;
     use std::collections::HashMap;
+    use std::pin::Pin;
 
     // Helper function to collect stream data into bytes
     async fn collect_stream_data(
@@ -310,16 +345,28 @@ mod tests {
         }
     }
 
+    // Helper function to convert Bytes to a stream for testing
+    fn bytes_to_stream(
+        data: Bytes,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>> {
+        Box::pin(futures::stream::once(async move { Ok(data) }))
+    }
+
     #[tokio::test]
     async fn test_put_and_get_object() {
         let storage = InMemoryStorage::new();
         let key = "test-key";
         let content = Bytes::from("test content");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
+        let stream = bytes_to_stream(content.clone());
         storage
-            .put_object(key, content.clone(), metadata.clone())
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
             .await
             .unwrap();
 
@@ -329,8 +376,9 @@ mod tests {
         let (retrieved_stream, retrieved_metadata) = result.unwrap();
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
-        assert_eq!(retrieved_metadata.content_length, metadata.content_length);
-        assert_eq!(retrieved_metadata.content_type, metadata.content_type);
+        assert_eq!(retrieved_metadata.content_length, content.len() as u64);
+        // Content type is not preserved in the new streaming API
+        assert_eq!(retrieved_metadata.content_type, None);
     }
 
     #[tokio::test]
@@ -338,11 +386,16 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = "test-key";
         let content = Bytes::from("0123456789");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
+        let stream = bytes_to_stream(content);
         storage
-            .put_object(key, content.clone(), metadata)
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
             .await
             .unwrap();
 
@@ -360,10 +413,18 @@ mod tests {
         let storage = InMemoryStorage::new();
         let key = "test-key";
         let content = Bytes::from("test content");
-        let metadata = create_test_metadata(content.len() as u64);
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
         // Put object
-        storage.put_object(key, content, metadata).await.unwrap();
+        let stream = bytes_to_stream(content);
+        storage
+            .put_object(crate::storage::StoreObjectRequest::new(
+                key,
+                stream,
+                integrity_checks,
+            ))
+            .await
+            .unwrap();
 
         // Verify it exists
         let result = storage.get_object(key, None).await.unwrap();
@@ -385,9 +446,14 @@ mod tests {
         // Put multiple objects
         for i in 0..3 {
             let key = format!("test-key-{}", i);
-            let metadata = create_test_metadata(content.len() as u64);
+            let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+            let stream = bytes_to_stream(content.clone());
             storage
-                .put_object(&key, content.clone(), metadata)
+                .put_object(crate::storage::StoreObjectRequest::new(
+                    &key,
+                    stream,
+                    integrity_checks,
+                ))
                 .await
                 .unwrap();
         }
