@@ -366,23 +366,32 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<(String, ObjectMetadata)>> {
-        let mut result = Vec::new();
+    async fn list_objects(
+        &self,
+        request: crate::storage::ListObjectsRequest<'_>,
+    ) -> Result<crate::storage::ListObjectsResponse> {
+        let mut matching_objects = Vec::new();
 
         // List all objects in the directory
-        let entries = self.list_directory(&self.objects_dir, prefix).await?;
+        let entries = self
+            .list_directory(&self.objects_dir, request.prefix)
+            .await?;
 
         // Load metadata for each object
         for path in entries {
             if let Some(key) = path_to_object_key(&self.objects_dir, &path) {
                 let metadata_path = self.get_object_metadata_path(&key);
                 if let Some(metadata) = Self::load_metadata(&metadata_path).await? {
-                    result.push((key, metadata));
+                    matching_objects.push(crate::storage::ObjectInfo { key, metadata });
                 }
             }
         }
 
-        Ok(result)
+        Ok(crate::storage::ListObjectsResponse {
+            objects: matching_objects,
+            next_continuation_token: None,
+            is_truncated: false,
+        })
     }
 
     async fn create_multipart_upload(
@@ -713,13 +722,23 @@ mod tests {
         }
 
         // List all objects
-        let objects = storage.list_objects(None).await.unwrap();
-        assert_eq!(objects.len(), 3);
+        let request = crate::storage::ListObjectsRequest {
+            prefix: None,
+            max_keys: None,
+            continuation_token: None,
+        };
+        let objects = storage.list_objects(request).await.unwrap();
+        assert_eq!(objects.objects.len(), 3);
 
         // List with prefix
-        let objects = storage.list_objects(Some("test-key-1")).await.unwrap();
-        assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].0, "test-key-1");
+        let request = crate::storage::ListObjectsRequest {
+            prefix: Some("test-key-1"),
+            max_keys: None,
+            continuation_token: None,
+        };
+        let objects = storage.list_objects(request).await.unwrap();
+        assert_eq!(objects.objects.len(), 1);
+        assert_eq!(objects.objects[0].key, "test-key-1");
     }
 
     #[tokio::test]
@@ -860,9 +879,14 @@ mod tests {
         assert_eq!(retrieved_content, content);
 
         // List objects
-        let objects = storage.list_objects(Some("nested/")).await.unwrap();
-        assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].0, key);
+        let request = crate::storage::ListObjectsRequest {
+            prefix: Some("nested/"),
+            max_keys: None,
+            continuation_token: None,
+        };
+        let objects = storage.list_objects(request).await.unwrap();
+        assert_eq!(objects.objects.len(), 1);
+        assert_eq!(objects.objects[0].key, key);
     }
 
     #[tokio::test]
