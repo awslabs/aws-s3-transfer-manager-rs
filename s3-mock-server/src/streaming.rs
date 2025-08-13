@@ -181,8 +181,13 @@ mod tests {
         storage.put_object(request).await.unwrap();
 
         // Get the object as a stream
-        let (mut stream, returned_metadata) =
-            storage.get_object("test-key", None).await.unwrap().unwrap();
+        let request = crate::storage::GetObjectRequest {
+            key: "test-key",
+            range: None,
+        };
+        let response = storage.get_object(request).await.unwrap().unwrap();
+        let mut stream = response.stream;
+        let returned_metadata = response.metadata;
 
         // Verify metadata
         assert_eq!(returned_metadata.content_length, test_data.len() as u64);

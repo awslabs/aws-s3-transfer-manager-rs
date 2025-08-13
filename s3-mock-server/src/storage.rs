@@ -17,6 +17,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 
+use crate::storage::models::ObjectMetadata;
 use crate::types::{ObjectIntegrityChecks, StoredObjectMetadata};
 use crate::Result;
 
@@ -27,6 +28,19 @@ pub struct StoreObjectRequest {
     pub integrity_checks: ObjectIntegrityChecks,
     pub content_type: Option<String>,
     pub user_metadata: HashMap<String, String>,
+}
+
+/// Request for retrieving an object.
+pub(crate) struct GetObjectRequest<'a> {
+    pub key: &'a str,
+    pub range: Option<Range<u64>>,
+}
+
+/// Response for retrieving an object.
+pub(crate) struct GetObjectResponse {
+    pub stream:
+        Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin>,
+    pub metadata: ObjectMetadata,
 }
 
 impl StoreObjectRequest {
@@ -81,8 +95,6 @@ pub(crate) mod filesystem;
 pub(crate) mod in_memory;
 pub(crate) mod models;
 
-use models::ObjectMetadata;
-
 /// A storage backend for the S3 Mock Server.
 ///
 /// This trait defines the interface for storing and retrieving both object data
@@ -132,18 +144,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// # Returns
     ///
     /// A stream of bytes and the object metadata, or None if the object doesn't exist
-    async fn get_object(
-        &self,
-        key: &str,
-        range: Option<Range<u64>>,
-    ) -> Result<
-        Option<(
-            Box<
-                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
-            >,
-            ObjectMetadata,
-        )>,
-    >;
+    async fn get_object(&self, request: GetObjectRequest<'_>) -> Result<Option<GetObjectResponse>>;
 
     /// Delete an object and its metadata.
     ///
@@ -262,19 +263,8 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
         (**self).put_object(request).await
     }
 
-    async fn get_object(
-        &self,
-        key: &str,
-        range: Option<Range<u64>>,
-    ) -> Result<
-        Option<(
-            Box<
-                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
-            >,
-            ObjectMetadata,
-        )>,
-    > {
-        (**self).get_object(key, range).await
+    async fn get_object(&self, request: GetObjectRequest<'_>) -> Result<Option<GetObjectResponse>> {
+        (**self).get_object(request).await
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {

@@ -6,7 +6,7 @@
 //! Filesystem implementation of the StorageBackend trait.
 
 use std::io::SeekFrom;
-use std::ops::Range;
+
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -296,18 +296,10 @@ impl StorageBackend for FilesystemStorage {
 
     async fn get_object(
         &self,
-        key: &str,
-        range: Option<Range<u64>>,
-    ) -> Result<
-        Option<(
-            Box<
-                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
-            >,
-            ObjectMetadata,
-        )>,
-    > {
-        let path = self.get_object_path(key);
-        let metadata_path = self.get_object_metadata_path(key);
+        request: crate::storage::GetObjectRequest<'_>,
+    ) -> Result<Option<crate::storage::GetObjectResponse>> {
+        let path = self.get_object_path(request.key);
+        let metadata_path = self.get_object_metadata_path(request.key);
 
         // Load metadata first to check if object exists
         let metadata: ObjectMetadata = match Self::load_metadata(&metadata_path).await? {
@@ -323,7 +315,7 @@ impl StorageBackend for FilesystemStorage {
         };
 
         // Handle range request
-        let (content_length, _seek_position) = if let Some(ref range) = range {
+        let (content_length, _seek_position) = if let Some(ref range) = request.range {
             let start = range.start;
             let end = range.end.min(metadata.content_length);
 
@@ -344,14 +336,17 @@ impl StorageBackend for FilesystemStorage {
         // If we have a range, we need to limit the stream to only read the specified amount
         let limited_stream: Box<
             dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
-        > = if range.is_some() {
+        > = if request.range.is_some() {
             // Create a stream that limits the total bytes read
             Box::new(LimitedStream::new(reader_stream, content_length))
         } else {
             Box::new(reader_stream)
         };
 
-        Ok(Some((limited_stream, metadata)))
+        Ok(Some(crate::storage::GetObjectResponse {
+            stream: limited_stream,
+            metadata,
+        }))
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
@@ -620,9 +615,12 @@ mod tests {
             .unwrap();
 
         // Get object
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_stream, retrieved_metadata) = result.unwrap();
+        let response = result.unwrap();
+        let retrieved_stream = response.stream;
+        let retrieved_metadata = response.metadata;
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
         assert_eq!(retrieved_metadata.content_length, content.len() as u64);
@@ -651,9 +649,11 @@ mod tests {
 
         // Get range
         let range = Some(2..5);
-        let result = storage.get_object(key, range).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_stream, _) = result.unwrap();
+        let response = result.unwrap();
+        let retrieved_stream = response.stream;
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, Bytes::from("234"));
     }
@@ -678,14 +678,16 @@ mod tests {
             .unwrap();
 
         // Verify it exists
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
 
         // Delete object
         storage.delete_object(key).await.unwrap();
 
         // Verify it's gone
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -768,9 +770,11 @@ mod tests {
         );
 
         // Verify the final object exists
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (final_stream, _) = result.unwrap();
+        let response = result.unwrap();
+        let final_stream = response.stream;
         let final_content = collect_stream_data(final_stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
     }
@@ -847,9 +851,11 @@ mod tests {
             .unwrap();
 
         // Get object
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_stream, _) = result.unwrap();
+        let response = result.unwrap();
+        let retrieved_stream = response.stream;
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
 
@@ -879,9 +885,11 @@ mod tests {
             .unwrap();
 
         // Get object
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_stream, _) = result.unwrap();
+        let response = result.unwrap();
+        let retrieved_stream = response.stream;
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
     }

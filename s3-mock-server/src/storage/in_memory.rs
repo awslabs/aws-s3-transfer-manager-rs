@@ -6,7 +6,7 @@
 //! In-memory implementation of the StorageBackend trait.
 
 use std::collections::HashMap;
-use std::ops::Range;
+
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -90,23 +90,15 @@ impl StorageBackend for InMemoryStorage {
 
     async fn get_object(
         &self,
-        key: &str,
-        range: Option<Range<u64>>,
-    ) -> Result<
-        Option<(
-            Box<
-                dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
-            >,
-            ObjectMetadata,
-        )>,
-    > {
+        request: crate::storage::GetObjectRequest<'_>,
+    ) -> Result<Option<crate::storage::GetObjectResponse>> {
         let objects = self.objects.read().await;
-        let (data, metadata) = match objects.get(key) {
+        let (data, metadata) = match objects.get(request.key) {
             Some((data, metadata)) => (data, metadata),
             None => return Ok(None),
         };
 
-        let data = if let Some(range) = range {
+        let data = if let Some(range) = request.range {
             apply_range(data, range)
         } else {
             data.clone()
@@ -117,7 +109,10 @@ impl StorageBackend for InMemoryStorage {
             dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
         > = Box::new(stream);
 
-        Ok(Some((boxed_stream, metadata.clone())))
+        Ok(Some(crate::storage::GetObjectResponse {
+            stream: boxed_stream,
+            metadata: metadata.clone(),
+        }))
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
@@ -371,9 +366,12 @@ mod tests {
             .unwrap();
 
         // Get object
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_stream, retrieved_metadata) = result.unwrap();
+        let response = result.unwrap();
+        let retrieved_stream = response.stream;
+        let retrieved_metadata = response.metadata;
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, content);
         assert_eq!(retrieved_metadata.content_length, content.len() as u64);
@@ -401,9 +399,11 @@ mod tests {
 
         // Get range
         let range = Some(2..5);
-        let result = storage.get_object(key, range).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (retrieved_stream, _) = result.unwrap();
+        let response = result.unwrap();
+        let retrieved_stream = response.stream;
         let retrieved_content = collect_stream_data(retrieved_stream).await;
         assert_eq!(retrieved_content, Bytes::from("234"));
     }
@@ -427,14 +427,16 @@ mod tests {
             .unwrap();
 
         // Verify it exists
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
 
         // Delete object
         storage.delete_object(key).await.unwrap();
 
         // Verify it's gone
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -515,9 +517,11 @@ mod tests {
         );
 
         // Verify the final object exists
-        let result = storage.get_object(key, None).await.unwrap();
+        let request = crate::storage::GetObjectRequest { key, range: None };
+        let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
-        let (final_stream, _) = result.unwrap();
+        let response = result.unwrap();
+        let final_stream = response.stream;
         let final_content = collect_stream_data(final_stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
     }

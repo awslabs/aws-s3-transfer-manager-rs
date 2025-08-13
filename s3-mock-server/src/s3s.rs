@@ -63,10 +63,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .transpose()?;
 
         // Get object stream with validated range
-        let (stream, stream_metadata) = match self.storage.get_object(key, range.clone()).await? {
-            Some((stream, metadata)) => (stream, metadata),
+        let request = crate::storage::GetObjectRequest {
+            key,
+            range: range.clone(),
+        };
+        let response = match self.storage.get_object(request).await? {
+            Some(response) => response,
             None => return Err(Error::NoSuchKey.into()),
         };
+
+        let (stream, stream_metadata) = (response.stream, response.metadata);
 
         let mut output = s3s::dto::GetObjectOutput::default();
 
