@@ -234,14 +234,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let content = content.freeze();
 
         // Store the part and get its ETag
-        let etag = self
-            .storage
-            .upload_part(upload_id, part_number, content)
-            .await?;
+        let request = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number,
+            content,
+        };
+        let response = self.storage.upload_part(request).await?;
 
         // Build response
         let mut output = s3s::dto::UploadPartOutput::default();
-        output.e_tag = Some(etag);
+        output.e_tag = Some(response.etag);
 
         Ok(S3Response::new(output))
     }
