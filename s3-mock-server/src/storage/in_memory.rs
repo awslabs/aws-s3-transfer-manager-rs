@@ -174,41 +174,44 @@ impl StorageBackend for InMemoryStorage {
 
     async fn upload_part(
         &self,
-        upload_id: &str,
-        part_number: i32,
-        content: Bytes,
-    ) -> Result<String> {
+        request: crate::storage::UploadPartRequest<'_>,
+    ) -> Result<crate::storage::UploadPartResponse> {
         // Verify the upload exists
         {
             let uploads = self.multipart_uploads.read().await;
-            if !uploads.contains_key(upload_id) {
+            if !uploads.contains_key(request.upload_id) {
                 return Err(Error::NoSuchUpload);
             }
         }
 
         // Calculate ETag (MD5 hash)
-        let etag = format!("\"{:x}\"", md5::compute(&content));
+        let etag = format!("\"{:x}\"", md5::compute(&request.content));
 
         // Store the part data
         let mut parts = self.parts.write().await;
-        let upload_parts = parts.get_mut(upload_id).ok_or(Error::NoSuchUpload)?;
+        let upload_parts = parts
+            .get_mut(request.upload_id)
+            .ok_or(Error::NoSuchUpload)?;
 
         let part_metadata = PartMetadata {
             etag: etag.clone(),
-            size: content.len() as u64,
+            size: request.content.len() as u64,
         };
 
-        upload_parts.insert(part_number, (content, part_metadata.clone()));
+        upload_parts.insert(
+            request.part_number,
+            (request.content.clone(), part_metadata.clone()),
+        );
 
         // Update the upload metadata with part info
         {
             let mut uploads = self.multipart_uploads.write().await;
-            if let Some(upload) = uploads.get_mut(upload_id) {
-                upload.parts.insert(part_number, part_metadata);
+            if let Some(upload) = uploads.get_mut(request.upload_id) {
+                upload.parts.insert(request.part_number, part_metadata);
             }
         }
 
-        Ok(etag)
+        Ok(crate::storage::UploadPartResponse { etag })
     }
 
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
@@ -508,24 +511,28 @@ mod tests {
         let part1 = Bytes::from("part1");
         let part2 = Bytes::from("part2");
 
-        let etag1 = storage
-            .upload_part(upload_id, 1, part1.clone())
-            .await
-            .unwrap();
-        let etag2 = storage
-            .upload_part(upload_id, 2, part2.clone())
-            .await
-            .unwrap();
+        let request1 = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 1,
+            content: part1.clone(),
+        };
+        let etag1 = storage.upload_part(request1).await.unwrap();
+        let request2 = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 2,
+            content: part2.clone(),
+        };
+        let etag2 = storage.upload_part(request2).await.unwrap();
 
         // List parts
         let parts = storage.list_parts(upload_id).await.unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].0, 1); // part number
-        assert_eq!(parts[0].1, etag1); // etag
+        assert_eq!(parts[0].1, etag1.etag); // etag
         assert_eq!(parts[0].2, part1.len() as u64); // size
 
         // Complete multipart upload
-        let parts_to_complete = vec![(1, etag1), (2, etag2)];
+        let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
         let (final_key, final_metadata) = storage
             .complete_multipart_upload(upload_id, parts_to_complete)
             .await
@@ -564,10 +571,15 @@ mod tests {
 
         // Upload only one part
         let part1 = Bytes::from("part1");
-        let etag1 = storage.upload_part(upload_id, 1, part1).await.unwrap();
+        let request = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 1,
+            content: part1,
+        };
+        let etag1 = storage.upload_part(request).await.unwrap();
 
         // Try to complete with a missing part
-        let parts_to_complete = vec![(1, etag1), (2, "missing-etag".to_string())];
+        let parts_to_complete = vec![(1, etag1.etag), (2, "missing-etag".to_string())];
         let result = storage
             .complete_multipart_upload(upload_id, parts_to_complete)
             .await;
@@ -591,7 +603,12 @@ mod tests {
 
         // Upload a part
         let part1 = Bytes::from("part1");
-        storage.upload_part(upload_id, 1, part1).await.unwrap();
+        let request = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 1,
+            content: part1,
+        };
+        storage.upload_part(request).await.unwrap();
 
         // Abort the upload
         storage.abort_multipart_upload(upload_id).await.unwrap();

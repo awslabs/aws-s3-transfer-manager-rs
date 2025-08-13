@@ -70,6 +70,19 @@ pub(crate) struct CreateMultipartUploadRequest<'a> {
     pub metadata: ObjectMetadata,
 }
 
+/// Request for uploading a part.
+pub(crate) struct UploadPartRequest<'a> {
+    pub upload_id: &'a str,
+    pub part_number: i32,
+    pub content: Bytes,
+}
+
+/// Response for uploading a part.
+#[derive(Debug)]
+pub(crate) struct UploadPartResponse {
+    pub etag: String,
+}
+
 impl StoreObjectRequest {
     pub fn new(
         key: impl Into<String>,
@@ -235,12 +248,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// # Returns
     ///
     /// The ETag for the uploaded part
-    async fn upload_part(
-        &self,
-        upload_id: &str,
-        part_number: i32,
-        content: Bytes,
-    ) -> Result<String>;
+    async fn upload_part(&self, request: UploadPartRequest<'_>) -> Result<UploadPartResponse>;
 
     /// List all parts for a multipart upload.
     ///
@@ -307,13 +315,8 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
         (**self).create_multipart_upload(request).await
     }
 
-    async fn upload_part(
-        &self,
-        upload_id: &str,
-        part_number: i32,
-        content: Bytes,
-    ) -> Result<String> {
-        (**self).upload_part(upload_id, part_number, content).await
+    async fn upload_part(&self, request: UploadPartRequest<'_>) -> Result<UploadPartResponse> {
+        (**self).upload_part(request).await
     }
 
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
