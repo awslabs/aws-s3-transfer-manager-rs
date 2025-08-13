@@ -194,9 +194,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         // Create the multipart upload in storage
-        self.storage
-            .create_multipart_upload(key, &upload_id, metadata)
-            .await?;
+        let request = crate::storage::CreateMultipartUploadRequest {
+            key,
+            upload_id: &upload_id,
+            metadata,
+        };
+        self.storage.create_multipart_upload(request).await?;
 
         // Build response
         let mut output = s3s::dto::CreateMultipartUploadOutput::default();

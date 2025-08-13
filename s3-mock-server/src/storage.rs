@@ -63,6 +63,13 @@ pub(crate) struct ObjectInfo {
     pub metadata: ObjectMetadata,
 }
 
+/// Request for creating a multipart upload.
+pub(crate) struct CreateMultipartUploadRequest<'a> {
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub metadata: ObjectMetadata,
+}
+
 impl StoreObjectRequest {
     pub fn new(
         key: impl Into<String>,
@@ -214,9 +221,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Success or an error if the operation fails
     async fn create_multipart_upload(
         &self,
-        key: &str,
-        upload_id: &str,
-        metadata: ObjectMetadata,
+        request: CreateMultipartUploadRequest<'_>,
     ) -> Result<()>;
 
     /// Upload a part for a multipart upload.
@@ -297,13 +302,9 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn create_multipart_upload(
         &self,
-        key: &str,
-        upload_id: &str,
-        metadata: ObjectMetadata,
+        request: CreateMultipartUploadRequest<'_>,
     ) -> Result<()> {
-        (**self)
-            .create_multipart_upload(key, upload_id, metadata)
-            .await
+        (**self).create_multipart_upload(request).await
     }
 
     async fn upload_part(

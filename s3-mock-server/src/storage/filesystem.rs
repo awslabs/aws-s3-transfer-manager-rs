@@ -396,21 +396,19 @@ impl StorageBackend for FilesystemStorage {
 
     async fn create_multipart_upload(
         &self,
-        key: &str,
-        upload_id: &str,
-        metadata: ObjectMetadata,
+        request: crate::storage::CreateMultipartUploadRequest<'_>,
     ) -> Result<()> {
-        let upload_dir = self.get_upload_dir(upload_id);
+        let upload_dir = self.get_upload_dir(request.upload_id);
         fs::create_dir_all(&upload_dir).await?;
 
         let upload_metadata = MultipartUploadMetadata {
-            key: key.to_string(),
-            upload_id: upload_id.to_string(),
-            metadata,
+            key: request.key.to_string(),
+            upload_id: request.upload_id.to_string(),
+            metadata: request.metadata,
             parts: Default::default(),
         };
 
-        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let metadata_path = self.get_upload_metadata_path(request.upload_id);
         Self::save_metadata(&metadata_path, &upload_metadata).await?;
 
         Ok(())
@@ -750,10 +748,12 @@ mod tests {
         let metadata = create_test_metadata(0); // Will be updated on completion
 
         // Create multipart upload
-        storage
-            .create_multipart_upload(key, upload_id, metadata)
-            .await
-            .unwrap();
+        let request = crate::storage::CreateMultipartUploadRequest {
+            key,
+            upload_id,
+            metadata,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
 
         // Upload parts
         let part1 = Bytes::from("part1");
@@ -807,10 +807,12 @@ mod tests {
         let metadata = create_test_metadata(0);
 
         // Create multipart upload
-        storage
-            .create_multipart_upload(key, upload_id, metadata)
-            .await
-            .unwrap();
+        let request = crate::storage::CreateMultipartUploadRequest {
+            key,
+            upload_id,
+            metadata,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
 
         // Upload only one part
         let part1 = Bytes::from("part1");
@@ -833,10 +835,12 @@ mod tests {
         let metadata = create_test_metadata(0);
 
         // Create multipart upload
-        storage
-            .create_multipart_upload(key, upload_id, metadata)
-            .await
-            .unwrap();
+        let request = crate::storage::CreateMultipartUploadRequest {
+            key,
+            upload_id,
+            metadata,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
 
         // Upload a part
         let part1 = Bytes::from("part1");
