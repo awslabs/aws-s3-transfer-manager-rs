@@ -316,15 +316,22 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let start_after = input.start_after.as_deref();
 
         // List objects from storage
-        let mut objects = self.storage.list_objects(prefix).await?;
+        let request = crate::storage::ListObjectsRequest {
+            prefix,
+            max_keys: Some(max_keys as i32),
+            continuation_token: None,
+        };
+        let mut response = self.storage.list_objects(request).await?;
 
         // Apply start_after if specified
         if let Some(start_after) = start_after {
-            objects.retain(|(key, _)| key.as_str() > start_after);
+            response
+                .objects
+                .retain(|obj| obj.key.as_str() > start_after);
         }
 
         // Sort by key for consistent ordering
-        objects.sort_by(|a, b| a.0.cmp(&b.0));
+        response.objects.sort_by(|a, b| a.key.cmp(&b.key));
 
         // Process delimiter if specified
         let mut contents = Vec::new();
@@ -333,8 +340,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if let Some(delimiter) = delimiter {
             let mut seen_prefixes = std::collections::HashSet::new();
 
-            for (key, metadata) in objects {
-                if let Some(rest) = key.strip_prefix(prefix.unwrap_or("")) {
+            for obj in response.objects {
+                if let Some(rest) = obj.key.strip_prefix(prefix.unwrap_or("")) {
                     if let Some(index) = rest.find(delimiter) {
                         // This is a common prefix
                         let common_prefix = format!("{}{}", prefix.unwrap_or(""), &rest[..=index]);
@@ -349,21 +356,21 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
                 // This is a regular object
                 let mut object = s3s::dto::Object::default();
-                object.key = Some(key);
-                object.size = Some(metadata.content_length as i64);
-                object.e_tag = Some(metadata.etag);
-                object.last_modified = Some(Timestamp::from(metadata.last_modified));
+                object.key = Some(obj.key);
+                object.size = Some(obj.metadata.content_length as i64);
+                object.e_tag = Some(obj.metadata.etag);
+                object.last_modified = Some(Timestamp::from(obj.metadata.last_modified));
 
                 contents.push(object);
             }
         } else {
             // No delimiter - just convert all objects
-            for (key, metadata) in objects {
+            for obj in response.objects {
                 let mut object = s3s::dto::Object::default();
-                object.key = Some(key);
-                object.size = Some(metadata.content_length as i64);
-                object.e_tag = Some(metadata.etag);
-                object.last_modified = Some(Timestamp::from(metadata.last_modified));
+                object.key = Some(obj.key);
+                object.size = Some(obj.metadata.content_length as i64);
+                object.e_tag = Some(obj.metadata.etag);
+                object.last_modified = Some(Timestamp::from(obj.metadata.last_modified));
 
                 contents.push(object);
             }

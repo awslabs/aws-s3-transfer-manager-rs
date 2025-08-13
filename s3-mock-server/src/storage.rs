@@ -43,6 +43,26 @@ pub(crate) struct GetObjectResponse {
     pub metadata: ObjectMetadata,
 }
 
+/// Request for listing objects.
+pub(crate) struct ListObjectsRequest<'a> {
+    pub prefix: Option<&'a str>,
+    pub max_keys: Option<i32>,
+    pub continuation_token: Option<&'a str>,
+}
+
+/// Response for listing objects.
+pub(crate) struct ListObjectsResponse {
+    pub objects: Vec<ObjectInfo>,
+    pub next_continuation_token: Option<String>,
+    pub is_truncated: bool,
+}
+
+/// Information about an object.
+pub(crate) struct ObjectInfo {
+    pub key: String,
+    pub metadata: ObjectMetadata,
+}
+
 impl StoreObjectRequest {
     pub fn new(
         key: impl Into<String>,
@@ -166,7 +186,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// # Returns
     ///
     /// A vector of (key, metadata) pairs for matching objects
-    async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<(String, ObjectMetadata)>>;
+    async fn list_objects(&self, request: ListObjectsRequest<'_>) -> Result<ListObjectsResponse>;
 
     /// Get object metadata without fetching the data.
     ///
@@ -271,8 +291,8 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
         (**self).delete_object(key).await
     }
 
-    async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<(String, ObjectMetadata)>> {
-        (**self).list_objects(prefix).await
+    async fn list_objects(&self, request: ListObjectsRequest<'_>) -> Result<ListObjectsResponse> {
+        (**self).list_objects(request).await
     }
 
     async fn create_multipart_upload(
