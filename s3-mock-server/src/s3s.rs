@@ -279,15 +279,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         // Complete the multipart upload
-        let (key, metadata) = self
-            .storage
-            .complete_multipart_upload(upload_id, parts)
-            .await?;
+        let request = crate::storage::CompleteMultipartUploadRequest { upload_id, parts };
+        let response = self.storage.complete_multipart_upload(request).await?;
 
         // Build response
         let mut output = s3s::dto::CompleteMultipartUploadOutput::default();
-        output.key = Some(key);
-        output.e_tag = Some(metadata.etag);
+        output.key = Some(response.key);
+        output.e_tag = Some(response.etag);
         output.bucket = Some("mock-bucket".to_string());
 
         Ok(S3Response::new(output))

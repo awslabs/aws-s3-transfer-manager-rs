@@ -91,6 +91,20 @@ pub(crate) struct PartInfo {
     pub size: u64,
 }
 
+/// Request for completing a multipart upload.
+pub(crate) struct CompleteMultipartUploadRequest<'a> {
+    pub upload_id: &'a str,
+    pub parts: Vec<(i32, String)>,
+}
+
+/// Response for completing a multipart upload.
+#[derive(Debug)]
+pub(crate) struct CompleteMultipartUploadResponse {
+    pub key: String,
+    pub etag: String,
+    pub metadata: ObjectMetadata,
+}
+
 impl StoreObjectRequest {
     pub fn new(
         key: impl Into<String>,
@@ -281,9 +295,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// A tuple of (final_object_key, final_object_metadata) for the completed object
     async fn complete_multipart_upload(
         &self,
-        upload_id: &str,
-        parts: Vec<(i32, String)>,
-    ) -> Result<(String, ObjectMetadata)>;
+        request: CompleteMultipartUploadRequest<'_>,
+    ) -> Result<CompleteMultipartUploadResponse>;
 
     /// Abort a multipart upload and clean up all associated data.
     ///
@@ -333,10 +346,9 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn complete_multipart_upload(
         &self,
-        upload_id: &str,
-        parts: Vec<(i32, String)>,
-    ) -> Result<(String, ObjectMetadata)> {
-        (**self).complete_multipart_upload(upload_id, parts).await
+        request: CompleteMultipartUploadRequest<'_>,
+    ) -> Result<CompleteMultipartUploadResponse> {
+        (**self).complete_multipart_upload(request).await
     }
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {

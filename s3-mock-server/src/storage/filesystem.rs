@@ -475,11 +475,10 @@ impl StorageBackend for FilesystemStorage {
 
     async fn complete_multipart_upload(
         &self,
-        upload_id: &str,
-        parts: Vec<(i32, String)>,
-    ) -> Result<(String, ObjectMetadata)> {
+        request: crate::storage::CompleteMultipartUploadRequest<'_>,
+    ) -> Result<crate::storage::CompleteMultipartUploadResponse> {
         // Load the upload metadata
-        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let metadata_path = self.get_upload_metadata_path(request.upload_id);
         let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
             .await?
             .ok_or(Error::NoSuchUpload)?;
@@ -489,8 +488,8 @@ impl StorageBackend for FilesystemStorage {
         let mut etags = Vec::new();
         let mut combined = BytesMut::new();
 
-        for (part_number, expected_etag) in &parts {
-            let part_metadata_path = self.get_part_metadata_path(upload_id, *part_number);
+        for (part_number, expected_etag) in &request.parts {
+            let part_metadata_path = self.get_part_metadata_path(request.upload_id, *part_number);
             let part_metadata: PartMetadata = Self::load_metadata(&part_metadata_path)
                 .await?
                 .ok_or(Error::NoSuchPart)?;
@@ -500,7 +499,7 @@ impl StorageBackend for FilesystemStorage {
             }
 
             // Read the part data
-            let part_path = self.get_part_path(upload_id, *part_number);
+            let part_path = self.get_part_path(request.upload_id, *part_number);
             let part_data = fs::read(&part_path).await?;
             combined.extend_from_slice(&part_data);
 
@@ -521,7 +520,7 @@ impl StorageBackend for FilesystemStorage {
         // Update the final metadata
         let mut final_metadata = upload_metadata.metadata;
         final_metadata.content_length = total_size;
-        final_metadata.etag = combined_etag;
+        final_metadata.etag = combined_etag.clone();
         final_metadata.last_modified = SystemTime::now();
 
         // Save the final object directly
@@ -541,9 +540,13 @@ impl StorageBackend for FilesystemStorage {
         fs::write(&metadata_path, metadata_json).await?;
 
         // Clean up the multipart upload
-        let _ = fs::remove_dir_all(self.get_upload_dir(upload_id)).await;
+        let _ = fs::remove_dir_all(self.get_upload_dir(request.upload_id)).await;
 
-        Ok((upload_metadata.key, final_metadata))
+        Ok(crate::storage::CompleteMultipartUploadResponse {
+            key: upload_metadata.key.clone(),
+            etag: combined_etag,
+            metadata: final_metadata,
+        })
     }
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
@@ -784,14 +787,15 @@ mod tests {
 
         // Complete multipart upload
         let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
-        let (final_key, final_metadata) = storage
-            .complete_multipart_upload(upload_id, parts_to_complete)
-            .await
-            .unwrap();
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            upload_id,
+            parts: parts_to_complete,
+        };
+        let response = storage.complete_multipart_upload(request).await.unwrap();
 
-        assert_eq!(final_key, key);
+        assert_eq!(response.key, key);
         assert_eq!(
-            final_metadata.content_length,
+            response.metadata.content_length,
             (part1.len() + part2.len()) as u64
         );
 
@@ -832,9 +836,11 @@ mod tests {
 
         // Try to complete with a missing part
         let parts_to_complete = vec![(1, etag1.etag), (2, "missing-etag".to_string())];
-        let result = storage
-            .complete_multipart_upload(upload_id, parts_to_complete)
-            .await;
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            upload_id,
+            parts: parts_to_complete,
+        };
+        let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());
     }
 
