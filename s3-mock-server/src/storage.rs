@@ -83,6 +83,14 @@ pub(crate) struct UploadPartResponse {
     pub etag: String,
 }
 
+/// Information about a part.
+#[derive(Debug)]
+pub(crate) struct PartInfo {
+    pub part_number: i32,
+    pub etag: String,
+    pub size: u64,
+}
+
 impl StoreObjectRequest {
     pub fn new(
         key: impl Into<String>,
@@ -259,7 +267,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// # Returns
     ///
     /// A vector of (part_number, etag, size) tuples for all uploaded parts
-    async fn list_parts(&self, upload_id: &str) -> Result<Vec<(i32, String, u64)>>;
+    async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>>;
 
     /// Complete a multipart upload by combining parts into a final object.
     ///
@@ -319,7 +327,7 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
         (**self).upload_part(request).await
     }
 
-    async fn list_parts(&self, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
+    async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>> {
         (**self).list_parts(upload_id).await
     }
 
