@@ -452,7 +452,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(crate::storage::UploadPartResponse { etag })
     }
 
-    async fn list_parts(&self, upload_id: &str) -> Result<Vec<(i32, String, u64)>> {
+    async fn list_parts(&self, upload_id: &str) -> Result<Vec<crate::storage::PartInfo>> {
         let metadata_path = self.get_upload_metadata_path(upload_id);
         let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
             .await?
@@ -461,13 +461,15 @@ impl StorageBackend for FilesystemStorage {
         let mut result: Vec<_> = upload_metadata
             .parts
             .iter()
-            .map(|(&part_number, part_metadata)| {
-                (part_number, part_metadata.etag.clone(), part_metadata.size)
+            .map(|(&part_number, part_metadata)| crate::storage::PartInfo {
+                part_number,
+                etag: part_metadata.etag.clone(),
+                size: part_metadata.size,
             })
             .collect();
 
         // Sort by part number for consistent ordering
-        result.sort_by_key(|&(part_number, _, _)| part_number);
+        result.sort_by_key(|part| part.part_number);
         Ok(result)
     }
 
@@ -776,9 +778,9 @@ mod tests {
         // List parts
         let parts = storage.list_parts(upload_id).await.unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].0, 1); // part number
-        assert_eq!(parts[0].1, etag1.etag); // etag
-        assert_eq!(parts[0].2, part1.len() as u64); // size
+        assert_eq!(parts[0].part_number, 1); // part number
+        assert_eq!(parts[0].etag, etag1.etag); // etag
+        assert_eq!(parts[0].size, part1.len() as u64); // size
 
         // Complete multipart upload
         let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
