@@ -234,24 +234,27 @@ impl StorageBackend for InMemoryStorage {
 
     async fn complete_multipart_upload(
         &self,
-        upload_id: &str,
-        parts: Vec<(i32, String)>,
-    ) -> Result<(String, ObjectMetadata)> {
+        request: crate::storage::CompleteMultipartUploadRequest<'_>,
+    ) -> Result<crate::storage::CompleteMultipartUploadResponse> {
         // Get the upload metadata
         let (key, mut final_metadata) = {
             let mut uploads = self.multipart_uploads.write().await;
-            let upload = uploads.remove(upload_id).ok_or(Error::NoSuchUpload)?;
+            let upload = uploads
+                .remove(request.upload_id)
+                .ok_or(Error::NoSuchUpload)?;
             (upload.key, upload.metadata)
         };
 
         // Get the parts data
         let upload_parts = {
             let mut parts_storage = self.parts.write().await;
-            parts_storage.remove(upload_id).ok_or(Error::NoSuchUpload)?
+            parts_storage
+                .remove(request.upload_id)
+                .ok_or(Error::NoSuchUpload)?
         };
 
         // Verify all parts exist and ETags match
-        for (part_number, expected_etag) in &parts {
+        for (part_number, expected_etag) in &request.parts {
             match upload_parts.get(part_number) {
                 Some((_, part_metadata)) => {
                     if part_metadata.etag != *expected_etag {
@@ -267,7 +270,7 @@ impl StorageBackend for InMemoryStorage {
         let mut etags = Vec::new();
         let mut total_size = 0u64;
 
-        for (part_number, _) in &parts {
+        for (part_number, _) in &request.parts {
             if let Some((part_data, part_metadata)) = upload_parts.get(part_number) {
                 combined.extend_from_slice(part_data);
                 etags.push(part_metadata.etag.clone());
@@ -289,7 +292,7 @@ impl StorageBackend for InMemoryStorage {
 
         // Update the final metadata
         final_metadata.content_length = total_size;
-        final_metadata.etag = combined_etag;
+        final_metadata.etag = combined_etag.clone();
         final_metadata.last_modified = SystemTime::now();
 
         // Store the final object
@@ -297,7 +300,11 @@ impl StorageBackend for InMemoryStorage {
         let mut objects = self.objects.write().await;
         objects.insert(key.clone(), (combined_data, final_metadata.clone()));
 
-        Ok((key, final_metadata))
+        Ok(crate::storage::CompleteMultipartUploadResponse {
+            key: key.clone(),
+            etag: combined_etag,
+            metadata: final_metadata,
+        })
     }
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
@@ -537,14 +544,15 @@ mod tests {
 
         // Complete multipart upload
         let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
-        let (final_key, final_metadata) = storage
-            .complete_multipart_upload(upload_id, parts_to_complete)
-            .await
-            .unwrap();
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            upload_id,
+            parts: parts_to_complete,
+        };
+        let response = storage.complete_multipart_upload(request).await.unwrap();
 
-        assert_eq!(final_key, key);
+        assert_eq!(response.key, key);
         assert_eq!(
-            final_metadata.content_length,
+            response.metadata.content_length,
             (part1.len() + part2.len()) as u64
         );
 
@@ -584,9 +592,11 @@ mod tests {
 
         // Try to complete with a missing part
         let parts_to_complete = vec![(1, etag1.etag), (2, "missing-etag".to_string())];
-        let result = storage
-            .complete_multipart_upload(upload_id, parts_to_complete)
-            .await;
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            upload_id,
+            parts: parts_to_complete,
+        };
+        let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());
     }
 
