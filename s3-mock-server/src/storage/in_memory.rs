@@ -20,6 +20,9 @@ use crate::storage::StorageBackend;
 use crate::streaming::{apply_range, VecByteStream};
 use crate::types::StoredObjectMetadata;
 
+/// Type alias for complex part storage structure
+type PartStorage = HashMap<i32, (Bytes, PartMetadata)>;
+
 /// An in-memory implementation of the StorageBackend trait.
 ///
 /// This implementation stores all objects, metadata, and multipart uploads in memory,
@@ -34,7 +37,7 @@ pub(crate) struct InMemoryStorage {
     multipart_uploads: RwLock<HashMap<String, MultipartUploadMetadata>>,
 
     /// Parts for multipart uploads stored as (upload_id -> (part_number -> (data, metadata)))
-    parts: RwLock<HashMap<String, HashMap<i32, (Bytes, PartMetadata)>>>,
+    parts: RwLock<HashMap<String, PartStorage>>,
 }
 
 impl InMemoryStorage {
