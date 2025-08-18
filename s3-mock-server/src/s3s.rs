@@ -12,7 +12,6 @@ use futures_util::StreamExt;
 use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
 use s3s::{S3Request, S3Response, S3Result};
-use uuid;
 
 use crate::error::Error;
 use crate::storage::models::ObjectMetadata;
@@ -128,21 +127,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         // Build response
-        let mut output = s3s::dto::HeadObjectOutput::default();
-
-        output.content_length = Some(metadata.content_length as i64);
-        output.e_tag = Some(metadata.etag);
-
-        let timestamp = Timestamp::from(metadata.last_modified);
-        output.last_modified = Some(timestamp);
-
-        if let Some(content_type) = metadata.content_type {
-            if let Ok(mime) = content_type.parse() {
-                output.content_type = Some(mime);
-            }
-        }
-
-        output.metadata = Some(metadata.user_metadata);
+        let content_type = metadata.content_type.and_then(|ct| ct.parse().ok());
+        let output = s3s::dto::HeadObjectOutput {
+            content_length: Some(metadata.content_length as i64),
+            e_tag: Some(metadata.etag),
+            last_modified: Some(Timestamp::from(metadata.last_modified)),
+            content_type,
+            metadata: Some(metadata.user_metadata),
+            ..Default::default()
+        };
         // FIXME - add checksum support
 
         Ok(S3Response::new(output))
@@ -202,10 +195,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         self.storage.create_multipart_upload(request).await?;
 
         // Build response
-        let mut output = s3s::dto::CreateMultipartUploadOutput::default();
-        output.upload_id = Some(upload_id);
-        output.key = Some(key.to_string());
-        output.bucket = Some("mock-bucket".to_string());
+        let output = s3s::dto::CreateMultipartUploadOutput {
+            upload_id: Some(upload_id),
+            key: Some(key.to_string()),
+            bucket: Some("mock-bucket".to_string()),
+            ..Default::default()
+        };
 
         Ok(S3Response::new(output))
     }
@@ -242,8 +237,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let response = self.storage.upload_part(request).await?;
 
         // Build response
-        let mut output = s3s::dto::UploadPartOutput::default();
-        output.e_tag = Some(response.etag);
+        let output = s3s::dto::UploadPartOutput {
+            e_tag: Some(response.etag),
+            ..Default::default()
+        };
 
         Ok(S3Response::new(output))
     }
@@ -283,10 +280,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let response = self.storage.complete_multipart_upload(request).await?;
 
         // Build response
-        let mut output = s3s::dto::CompleteMultipartUploadOutput::default();
-        output.key = Some(response.key);
-        output.e_tag = Some(response.etag);
-        output.bucket = Some("mock-bucket".to_string());
+        let output = s3s::dto::CompleteMultipartUploadOutput {
+            key: Some(response.key),
+            e_tag: Some(response.etag),
+            bucket: Some("mock-bucket".to_string()),
+            ..Default::default()
+        };
 
         Ok(S3Response::new(output))
     }
@@ -349,8 +348,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                         // This is a common prefix
                         let common_prefix = format!("{}{}", prefix.unwrap_or(""), &rest[..=index]);
                         if seen_prefixes.insert(common_prefix.clone()) {
-                            let mut prefix_obj = s3s::dto::CommonPrefix::default();
-                            prefix_obj.prefix = Some(common_prefix);
+                            let prefix_obj = s3s::dto::CommonPrefix {
+                                prefix: Some(common_prefix),
+                            };
                             common_prefixes.push(prefix_obj);
                         }
                         continue;
@@ -358,22 +358,26 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 }
 
                 // This is a regular object
-                let mut object = s3s::dto::Object::default();
-                object.key = Some(obj.key);
-                object.size = Some(obj.metadata.content_length as i64);
-                object.e_tag = Some(obj.metadata.etag);
-                object.last_modified = Some(Timestamp::from(obj.metadata.last_modified));
+                let object = s3s::dto::Object {
+                    key: Some(obj.key),
+                    size: Some(obj.metadata.content_length as i64),
+                    e_tag: Some(obj.metadata.etag),
+                    last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
+                    ..Default::default()
+                };
 
                 contents.push(object);
             }
         } else {
             // No delimiter - just convert all objects
             for obj in response.objects {
-                let mut object = s3s::dto::Object::default();
-                object.key = Some(obj.key);
-                object.size = Some(obj.metadata.content_length as i64);
-                object.e_tag = Some(obj.metadata.etag);
-                object.last_modified = Some(Timestamp::from(obj.metadata.last_modified));
+                let object = s3s::dto::Object {
+                    key: Some(obj.key),
+                    size: Some(obj.metadata.content_length as i64),
+                    e_tag: Some(obj.metadata.etag),
+                    last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
+                    ..Default::default()
+                };
 
                 contents.push(object);
             }
