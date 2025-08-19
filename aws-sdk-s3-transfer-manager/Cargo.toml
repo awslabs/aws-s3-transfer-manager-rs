@@ -1,11 +1,11 @@
 [package]
 name = "aws-sdk-s3-transfer-manager"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
 license = "Apache-2.0"
 readme = "README.md"
-rust-version = "1.81.0"
+rust-version = "1.86.0"
 repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
 description = """
 A high performance Amazon S3 transfer manager for Rust.
@@ -15,14 +15,14 @@ keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
 async-channel = "2.3.1"
-async-trait = "0.1.83"
-aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.79.0", features = ["behavior-version-latest"] }
+async-trait = "0.1.88"
+aws-config = { version = "1.8.2", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.97.0", features = ["behavior-version-latest"] }
 aws-smithy-async = "1.2.5"
-aws-smithy-runtime-api = "1.7.4"
-aws-runtime = "1.5.6"
-aws-smithy-types = "1.3.0"
-aws-types = "1.3.6"
+aws-smithy-runtime-api = "1.8.3"
+aws-runtime = "1.5.9"
+aws-smithy-types = "1.3.2"
+aws-types = "1.3.7"
 blocking = "1.6.1"
 bytes = "1"
 bytes-utils = "0.1.4"
@@ -36,11 +36,11 @@ walkdir = "2"
 tokio-util = "0.7.13"
 
 [dev-dependencies]
-aws-sdk-s3 = { version = "1.79.0", features = ["behavior-version-latest", "test-util"] }
-aws-smithy-checksums = "0.63.1"
+aws-sdk-s3 = { version = "1.97.0", features = ["behavior-version-latest", "test-util"] }
+aws-smithy-checksums = "0.63.4"
 aws-smithy-mocks-experimental = "0.2.3"
-aws-smithy-runtime = { version = "1.8.0", features = ["client", "test-util"] }
-aws-smithy-http-client = { version = "1.0.0", features = ["test-util", "wire-mock"] }
+aws-smithy-runtime = { version = "1.8.4", features = ["client", "test-util"] }
+aws-smithy-http-client = { version = "1.0.6", features = ["test-util", "wire-mock"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.4.0"
 http = "1"
