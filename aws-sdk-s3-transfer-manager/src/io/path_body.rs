@@ -148,7 +148,7 @@ mod test {
         let stream = PathBodyBuilder::new().path(tmp.path()).build().unwrap();
         let body = path_body(&stream);
         assert_eq!(0, body.offset);
-        assert_eq!(content.as_bytes().len() as u64, body.length);
+        assert_eq!(content.len() as u64, body.length);
     }
 
     #[test]
