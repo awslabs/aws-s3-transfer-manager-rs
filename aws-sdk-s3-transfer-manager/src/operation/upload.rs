@@ -299,13 +299,12 @@ mod test {
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-    use aws_smithy_mocks_experimental::{mock, RuleMode};
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use bytes::Bytes;
     use std::ops::Deref;
     use std::sync::Arc;
     use std::sync::Barrier;
-    use test_common::mock_client_with_stubbed_http_client;
 
     #[tokio::test]
     async fn test_basic_mpu() {
@@ -350,7 +349,7 @@ mod test {
                     .build()
             });
 
-        let client = mock_client_with_stubbed_http_client!(
+        let client = mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
             &[&create_mpu, &upload_1, &upload_2, &complete_mpu]
@@ -390,8 +389,7 @@ mod test {
                 .build()
         });
 
-        let client =
-            mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
@@ -446,7 +444,7 @@ mod test {
             })
             .then_output(|| AbortMultipartUploadOutput::builder().build());
 
-        let client = mock_client_with_stubbed_http_client!(
+        let client = mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
             &[create_mpu, upload_part, abort_mpu]

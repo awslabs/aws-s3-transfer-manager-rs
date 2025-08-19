@@ -245,11 +245,11 @@ mod tests {
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
     use crate::Config;
+    use aws_smithy_mocks::mock_client;
     use bytes::Bytes;
-    use test_common::mock_client_with_stubbed_http_client;
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
-        let s3_client = mock_client_with_stubbed_http_client!(aws_sdk_s3, []);
+        let s3_client = mock_client!(aws_sdk_s3, []);
         UploadPartRequest {
             ctx: UploadContext {
                 handle: Arc::new(Handle {

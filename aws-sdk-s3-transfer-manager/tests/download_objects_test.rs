@@ -13,7 +13,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
 };
 use aws_sdk_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
-use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
+use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::{
     client::orchestrator::HttpResponse,
@@ -21,7 +21,6 @@ use aws_smithy_runtime_api::{
 };
 use bytes::Bytes;
 use std::{error::Error as _, io, iter, path::Path, sync::Arc};
-use test_common::mock_client_with_stubbed_http_client;
 use tokio::sync::watch;
 use walkdir::WalkDir;
 
@@ -124,13 +123,13 @@ impl MockBucket {
     }
 
     /// Configure the mock behavior of `GetObject` for `objects` stored in this `MockBucket`.
-    fn get_object_rules(&self) -> Vec<aws_smithy_mocks_experimental::Rule> {
+    fn get_object_rules(&self) -> Vec<aws_smithy_mocks::Rule> {
         self.objects.iter().map(get_object_rule).collect()
     }
 
     /// Return the mock rules representing this bucket. This includes
     /// the `ListObjectsV2` call as well as all of the `GetObject` calls.
-    fn rules(&self) -> Vec<aws_smithy_mocks_experimental::Rule> {
+    fn rules(&self) -> Vec<aws_smithy_mocks::Rule> {
         let mut rules = self.get_object_rules();
         rules.push(self.list_objects_rule());
         rules
@@ -193,11 +192,7 @@ async fn test_strip_prefix_in_destination_path() {
         .key_with_size("abc/def/ghi/xyz.txt", 5)
         .build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -236,11 +231,7 @@ async fn test_object_with_prefix_included() {
         .key_with_size("abcd", 5)
         .build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -279,11 +270,7 @@ async fn test_failed_download_policy_continue() {
         .key_with_error("key3")
         .build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -341,11 +328,7 @@ async fn test_recursively_downloads() {
         builder.build()
     };
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -381,11 +364,7 @@ async fn test_delimiter() {
         .key_with_size("2023|1|1.png", 5)
         .build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -423,11 +402,7 @@ async fn test_delimiter() {
 async fn test_destination_dir_not_valid() {
     let bucket = MockBucket::builder().key_with_size("image.png", 12).build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -458,11 +433,7 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
         .key_with_size("key3", 7)
         .build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -496,8 +467,7 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
 
     let mut rules = bucket.get_object_rules();
     rules.push(mock!(aws_sdk_s3::Client::list_objects_v2).then_http_response(error_http_resp));
-    let client =
-        mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -543,11 +513,7 @@ async fn test_failed_get_object_should_cancel_the_operation() {
         .key_with_size("key3", 7)
         .build();
 
-    let client = mock_client_with_stubbed_http_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        bucket.rules().as_slice()
-    );
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(client)
@@ -589,7 +555,7 @@ async fn test_drop_download_objects_handle() {
         move || GetObjectOutput::builder().build()
     });
 
-    let s3_client = mock_client_with_stubbed_http_client!(
+    let s3_client = mock_client!(
         aws_sdk_s3,
         RuleMode::MatchAny,
         vec![rule, bucket.list_objects_rule()].as_slice()
