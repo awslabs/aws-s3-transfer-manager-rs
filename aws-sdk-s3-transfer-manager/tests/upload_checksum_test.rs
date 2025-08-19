@@ -19,10 +19,9 @@ use aws_sdk_s3_transfer_manager::{
     operation::upload::{ChecksumStrategy, UploadOutput},
     types::{ConcurrencyMode, PartSize},
 };
-use aws_smithy_mocks_experimental::{mock, Rule, RuleMode};
+use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use bytes::Bytes;
 use pin_project_lite::pin_project;
-use test_common::mock_client_with_stubbed_http_client;
 
 const PART_SIZE: usize = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
@@ -402,7 +401,7 @@ fn mock_s3_client_for_multipart_upload(
             }),
     );
 
-    mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
+    mock_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
 }
 
 fn mock_s3_client_for_put_object(
@@ -462,7 +461,7 @@ fn mock_s3_client_for_put_object(
             }),
     );
 
-    mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
+    mock_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
 }
 
 async fn test_mpu(

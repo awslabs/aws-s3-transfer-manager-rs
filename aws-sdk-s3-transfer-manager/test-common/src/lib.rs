@@ -61,34 +61,6 @@ fn make_directory_inaccessible(_dir_path: &std::path::Path) {
     panic!("make_directory_inaccessible is not implemented for Windows");
 }
 
-/// A macro to generate a mock S3 client with the underlying HTTP client stubbed out
-///
-/// This macro wraps [`mock_client`](aws_smithy_mocks_experimental::mock_client) to work around the issue
-/// where the inner macro, when used alone, does not stub the HTTP client, causing real HTTP requests to be sent.
-// TODO(https://github.com/smithy-lang/smithy-rs/issues/3926): Once resolved, remove this macro and have the callers use the upstream version instead.
-#[macro_export]
-macro_rules! mock_client_with_stubbed_http_client {
-    ($aws_crate: ident, $rules: expr) => {
-        mock_client_with_stubbed_http_client!(
-            $aws_crate,
-            aws_smithy_mocks_experimental::RuleMode::Sequential,
-            $rules
-        )
-    };
-    ($aws_crate: ident, $rule_mode: expr, $rules: expr) => {{
-        let client = aws_smithy_mocks_experimental::mock_client!($aws_crate, $rule_mode, $rules);
-        $aws_crate::client::Client::from_conf(
-            client
-                .config()
-                .to_builder()
-                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                    |_req| http::Response::builder().status(200).body("").unwrap(),
-                ))
-                .build(),
-        )
-    }};
-}
-
 /// drain/consume the body
 pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
     let body = handle.body_mut();

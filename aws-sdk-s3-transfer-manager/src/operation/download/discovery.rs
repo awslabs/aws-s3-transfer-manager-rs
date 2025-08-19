@@ -221,12 +221,11 @@ mod tests {
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
-    use aws_smithy_mocks_experimental::mock;
+    use aws_smithy_mocks::{mock, mock_client};
     use aws_smithy_types::byte_stream::ByteStream;
     use aws_smithy_types::error::ErrorMetadata;
     use bytes::Buf;
     use std::sync::Arc;
-    use test_common::mock_client_with_stubbed_http_client;
 
     fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
@@ -281,7 +280,7 @@ mod tests {
                 .content_range("bytes 0-499/10485760")
                 .build()
         });
-        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&head_obj_rule]);
+        let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
         let ctx = DownloadContext::new(
             test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
@@ -313,7 +312,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
@@ -350,7 +349,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
@@ -385,7 +384,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
@@ -423,7 +422,7 @@ mod tests {
                     .body(ByteStream::from_static(bytes))
                     .build()
             });
-        let client = mock_client_with_stubbed_http_client!(aws_sdk_s3, &[&get_obj_rule]);
+        let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 
@@ -457,10 +456,7 @@ mod tests {
         let get_first_part_rule = mock!(Client::get_object)
             .match_requests(|r| r.part_number() == Some(1))
             .then_output(|| GetObjectOutput::builder().content_length(0).build());
-        let client = mock_client_with_stubbed_http_client!(
-            aws_sdk_s3,
-            &[&get_range_rule, &get_first_part_rule]
-        );
+        let client = mock_client!(aws_sdk_s3, &[&get_range_rule, &get_first_part_rule]);
 
         let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
 

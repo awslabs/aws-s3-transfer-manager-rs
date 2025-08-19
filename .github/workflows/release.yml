@@ -14,9 +14,9 @@ env:
   RUST_BACKTRACE: 1
   # Change to specific Rust release to pin
   rust_stable: stable
-  rust_nightly: nightly-2024-07-07
+  rust_nightly: nightly-2025-08-06
   # When updating this, also update relevant docs
-  rust_min: '1.81'
+  rust_min: '1.86'
   RELEASE_ROLE_ARN: ${{ secrets.RELEASE_ROLE_ARN }}
   TOKEN_KEY_NAME: ${{ secrets.TOKEN_KEY_NAME }}
   AWS_REGION: us-west-2
