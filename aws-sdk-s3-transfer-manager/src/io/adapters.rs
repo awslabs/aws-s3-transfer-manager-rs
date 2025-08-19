@@ -118,6 +118,8 @@ where
                             let data: Bytes = inner_buf.into();
                             let part_number = *this.next_part;
                             *this.next_part += 1;
+                            // We don't know whether this is the last part data, since determining that
+                            // would require an additional `poll_read`.
                             let part = PartData::new(part_number, data);
                             return Poll::Ready(Some(Ok(part)));
                         } else if n == 0 {
