@@ -48,6 +48,10 @@ pub enum ErrorKind {
     /// The operation is being canceled because the user explicitly called `.abort` on the handle,
     /// or a child operation failed with the abort policy.
     OperationCancelled,
+
+    /// Request/response validation failed (e.g., the total number of UploadPart requests sent
+    /// did not match the expected number of parts)
+    ValidationFailed,
 }
 
 impl Error {
@@ -80,6 +84,7 @@ impl fmt::Display for Error {
             ErrorKind::NotFound => write!(f, "resource not found"),
             ErrorKind::ChildOperationFailed => write!(f, "child operation failed"),
             ErrorKind::OperationCancelled => write!(f, "operation cancelled"),
+            ErrorKind::ValidationFailed => write!(f, "validation failed"),
         }
     }
 }
