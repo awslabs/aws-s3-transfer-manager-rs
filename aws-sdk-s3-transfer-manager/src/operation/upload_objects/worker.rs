@@ -326,9 +326,8 @@ fn handle_failed_upload(
 #[cfg(test)]
 mod tests {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
-    use aws_smithy_mocks_experimental::{mock, RuleMode};
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use bytes::Bytes;
-    use test_common::mock_client_with_stubbed_http_client;
 
     use crate::{
         client::Handle,
@@ -709,8 +708,7 @@ mod tests {
             .match_requests(move |input| input.bucket() == Some(bucket))
             .then_output(|| PutObjectOutput::builder().build());
 
-        let s3_client =
-            mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY));

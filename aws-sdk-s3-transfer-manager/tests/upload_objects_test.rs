@@ -25,11 +25,11 @@ use aws_sdk_s3_transfer_manager::{
     metrics::unit::ByteUnit,
     types::{FailedTransferPolicy, PartSize},
 };
-use aws_smithy_mocks_experimental::{mock, RuleMode};
+use aws_smithy_mocks::{mock, mock_client, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
-use test_common::{create_test_dir, mock_client_with_stubbed_http_client};
+use test_common::create_test_dir;
 use tokio::{fs::symlink, sync::watch};
 
 // Create an S3 client with mock behavior configured for `PutObject`
@@ -38,7 +38,7 @@ fn mock_s3_client_for_put_object(bucket_name: String) -> Client {
         .match_requests(move |input| input.bucket() == Some(&bucket_name))
         .then_output(|| PutObjectOutput::builder().build());
 
-    mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object])
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object])
 }
 
 // Create an S3 client with mock behavior configured for `MultipartUpload`
@@ -74,7 +74,7 @@ fn mock_s3_client_for_multipart_upload(bucket_name: String) -> Client {
         })
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
 
-    mock_client_with_stubbed_http_client!(
+    mock_client!(
         aws_sdk_s3,
         RuleMode::MatchAny,
         &[create_mpu, upload_part, complete_mpu]
@@ -323,8 +323,7 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
         .then_http_response(|| {
             HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
         });
-    let s3_client =
-        mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
@@ -436,8 +435,7 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             }
         });
 
-    let s3_client =
-        mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
@@ -488,8 +486,7 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
             }
         });
 
-    let s3_client =
-        mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();
@@ -542,8 +539,7 @@ async fn test_drop_upload_objects_handle() {
                 PutObjectOutput::builder().build()
             }
         });
-    let s3_client =
-        mock_client_with_stubbed_http_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .build();

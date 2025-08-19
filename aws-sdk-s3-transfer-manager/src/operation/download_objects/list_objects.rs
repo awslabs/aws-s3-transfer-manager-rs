@@ -205,8 +205,7 @@ mod tests {
         operation::list_objects_v2::ListObjectsV2Output,
         types::{CommonPrefix, Object},
     };
-    use aws_smithy_mocks_experimental::mock;
-    use test_common::mock_client_with_stubbed_http_client;
+    use aws_smithy_mocks::{mock, mock_client};
 
     use crate::operation::download_objects::{DownloadObjectsContext, DownloadObjectsInput};
 
@@ -333,10 +332,7 @@ mod tests {
             .then_output(|| list_resp(None, "pre1", None, vec!["pre1/k7", "pre1/k8"]));
         let resp5 = mock!(aws_sdk_s3::Client::list_objects_v2)
             .then_output(|| list_resp(None, "pre2", None, vec!["pre2/k9", "pre2/k10"]));
-        let client = mock_client_with_stubbed_http_client!(
-            aws_sdk_s3,
-            &[&resp1, &resp2, &resp3, &resp4, &resp5]
-        );
+        let client = mock_client!(aws_sdk_s3, &[&resp1, &resp2, &resp3, &resp4, &resp5]);
 
         let config = crate::Config::builder().client(client).build();
         let client = crate::Client::new(config);
