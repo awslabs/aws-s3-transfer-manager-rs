@@ -21,6 +21,12 @@ use crate::storage::models::ObjectMetadata;
 use crate::types::{ObjectIntegrityChecks, StoredObjectMetadata};
 use crate::Result;
 
+pub(crate) mod filesystem;
+pub(crate) mod in_memory;
+pub(crate) mod models;
+#[cfg(test)]
+mod tests;
+
 /// Request for storing an object with all necessary metadata and options.
 pub struct StoreObjectRequest {
     pub key: String,
@@ -153,10 +159,6 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
     }
 }
 
-pub(crate) mod filesystem;
-pub(crate) mod in_memory;
-pub(crate) mod models;
-
 /// A storage backend for the S3 Mock Server.
 ///
 /// This trait defines the interface for storing and retrieving both object data
@@ -170,7 +172,6 @@ pub(crate) mod models;
 /// enable storage backends to manage their own persistence strategy. For example:
 /// - In-memory storage can keep everything in RAM
 /// - File-based storage can persist metadata alongside data files
-/// - Database storage could store metadata in tables and data as BLOBs
 ///
 /// # Object Operations
 ///
