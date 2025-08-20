@@ -176,11 +176,11 @@ pub struct PartData {
 }
 
 impl PartData {
-    /// Check if this is the last part
-    ///
-    /// It is `Option` because it's not always possible to determine
-    /// whether the just-yielded part is the last one, e.g., streaming cases.
-    pub fn is_last(&self) -> Option<bool> {
+    // Check if this is the last part
+    //
+    // It is `Option` because it's not always possible to determine
+    // whether the just-yielded part is the last one, e.g., streaming cases.
+    pub(crate) fn is_last(&self) -> Option<bool> {
         self.is_last
     }
 
