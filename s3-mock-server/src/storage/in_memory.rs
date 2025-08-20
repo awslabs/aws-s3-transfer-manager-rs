@@ -76,7 +76,7 @@ impl StorageBackend for InMemoryStorage {
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().cloned().unwrap_or_default(),
+            etag: object_integrity.etag().unwrap_or_default(),
             last_modified,
             user_metadata: request.user_metadata,
         };
