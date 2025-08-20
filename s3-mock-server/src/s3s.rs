@@ -184,6 +184,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             etag: String::new(), // Will be updated when the upload is completed
             last_modified: std::time::SystemTime::now(),
             user_metadata,
+            ..Default::default()
         };
 
         // Create the multipart upload in storage
@@ -387,28 +388,28 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let total_objects = contents.len() + common_prefixes.len();
         let is_truncated = total_objects > max_keys;
 
-        let mut output = s3s::dto::ListObjectsV2Output::default();
-        output.contents = Some(contents);
-        output.common_prefixes = Some(common_prefixes);
-        output.is_truncated = Some(is_truncated);
-        output.key_count = Some(total_objects as i32);
-        output.max_keys = Some(max_keys as i32);
-        output.prefix = prefix.map(|s| s.to_string());
-        output.delimiter = delimiter.map(|s| s.to_string());
-        output.name = Some("mock-bucket".to_string());
-
-        // Set continuation token if truncated
-        if is_truncated {
-            if let Some(last_key) = output
-                .contents
-                .as_ref()
-                .and_then(|c| c.last())
+        // Calculate continuation token if truncated
+        let next_continuation_token = if is_truncated {
+            contents
+                .last()
                 .and_then(|obj| obj.key.as_ref())
-            {
-                let token = base64::engine::general_purpose::STANDARD.encode(last_key);
-                output.next_continuation_token = Some(token);
-            }
-        }
+                .map(|last_key| base64::engine::general_purpose::STANDARD.encode(last_key))
+        } else {
+            None
+        };
+
+        let output = s3s::dto::ListObjectsV2Output {
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+            is_truncated: Some(is_truncated),
+            key_count: Some(total_objects as i32),
+            max_keys: Some(max_keys as i32),
+            prefix: prefix.map(|s| s.to_string()),
+            delimiter: delimiter.map(|s| s.to_string()),
+            name: Some("mock-bucket".to_string()),
+            next_continuation_token,
+            ..Default::default()
+        };
 
         Ok(S3Response::new(output))
     }

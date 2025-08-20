@@ -26,16 +26,47 @@ pub(crate) struct ObjectMetadata {
 
     /// User-defined metadata.
     pub user_metadata: HashMap<String, String>,
+
+    /// Checksum values for the object.
+    pub crc32: Option<String>,
+    pub crc32c: Option<String>,
+    pub crc64nvme: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
+}
+
+impl Default for ObjectMetadata {
+    fn default() -> Self {
+        Self {
+            content_type: None,
+            content_length: 0,
+            etag: String::new(),
+            last_modified: SystemTime::UNIX_EPOCH,
+            user_metadata: HashMap::new(),
+            crc32: None,
+            crc32c: None,
+            crc64nvme: None,
+            sha1: None,
+            sha256: None,
+        }
+    }
 }
 
 /// Metadata for a part in a multipart upload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct PartMetadata {
     /// ETag of the part.
     pub etag: String,
 
     /// Size of the part in bytes.
     pub size: u64,
+
+    /// Checksum values for the part.
+    pub crc32: Option<String>,
+    pub crc32c: Option<String>,
+    pub crc64nvme: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
 }
 
 /// Metadata for a multipart upload.

@@ -43,6 +43,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         etag: "streaming-etag".to_string(),
         last_modified: SystemTime::now(),
         user_metadata: HashMap::new(),
+        ..Default::default()
     };
 
     // Create multipart upload
@@ -249,4 +250,48 @@ async fn test_storage_backend_consistency() {
         // Clean up
         storage.delete_object(key).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_checksum_storage_and_retrieval() {
+    let in_memory = InMemoryStorage::new();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let filesystem = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+
+    for storage in [&in_memory as &dyn StorageBackend, &filesystem] {
+        test_checksum_storage_backend(storage).await;
+    }
+}
+
+async fn test_checksum_storage_backend<S: StorageBackend + ?Sized>(storage: &S) {
+    let key = "test-checksum-object";
+    let test_data = Bytes::from("Hello, checksum world!");
+
+    // Create integrity checks with multiple algorithms
+    let integrity_checks = ObjectIntegrityChecks::new()
+        .with_md5()
+        .with_crc32()
+        .with_sha256();
+
+    let stream = Box::pin(futures::stream::once(async move { Ok(test_data) }));
+    let request = StoreObjectRequest::new(key, stream, integrity_checks);
+
+    // Store the object
+    let stored_meta = storage.put_object(request).await.unwrap();
+
+    // Verify checksums were calculated
+    assert!(stored_meta.object_integrity.etag().is_some());
+    assert!(stored_meta.object_integrity.crc32.is_some());
+    assert!(stored_meta.object_integrity.sha256.is_some());
+
+    // Retrieve object metadata
+    let retrieved_meta = storage.head_object(key).await.unwrap().unwrap();
+
+    // Verify checksums are stored in metadata
+    assert!(retrieved_meta.crc32.is_some());
+    assert!(retrieved_meta.sha256.is_some());
+    assert_eq!(
+        retrieved_meta.etag,
+        stored_meta.object_integrity.etag().unwrap()
+    );
 }

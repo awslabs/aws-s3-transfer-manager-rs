@@ -171,6 +171,7 @@ mod tests {
             etag: "test-etag".to_string(),
             last_modified: std::time::SystemTime::now(),
             user_metadata: HashMap::new(),
+            ..Default::default()
         };
 
         // Store the object

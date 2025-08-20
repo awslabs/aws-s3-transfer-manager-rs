@@ -283,6 +283,11 @@ impl StorageBackend for FilesystemStorage {
             etag: object_integrity.etag().unwrap_or_default(),
             last_modified,
             user_metadata: request.user_metadata,
+            crc32: object_integrity.crc32.clone(),
+            crc32c: object_integrity.crc32c.clone(),
+            crc64nvme: object_integrity.crc64nvme.clone(),
+            sha1: object_integrity.sha1.clone(),
+            sha256: object_integrity.sha256.clone(),
         };
         let metadata_path = self.get_object_metadata_path(&request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
@@ -438,6 +443,7 @@ impl StorageBackend for FilesystemStorage {
         let part_metadata = PartMetadata {
             etag: etag.clone(),
             size: request.content.len() as u64,
+            ..Default::default()
         };
         let part_metadata_path =
             self.get_part_metadata_path(request.upload_id, request.part_number);
@@ -598,6 +604,7 @@ mod tests {
             etag: format!("\"{:x}\"", md5::compute("test")),
             last_modified: SystemTime::now(),
             user_metadata: HashMap::new(),
+            ..Default::default()
         }
     }
 
