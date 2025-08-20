@@ -11,6 +11,7 @@ description = "A mock S3 server for testing and benchmarking the AWS S3 Transfer
 async-trait = "0.1.83"
 aws-config = "1.6.3"
 aws-sdk-s3 = "1.86.0"
+aws-smithy-checksums = "0.63.7"
 base64 = "0.22.1"
 bytes = "1"
 futures = "0.3.31"

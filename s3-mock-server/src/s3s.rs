@@ -155,7 +155,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let stored_meta = self.storage.put_object(request).await?;
 
         let output = s3s::dto::PutObjectOutput {
-            e_tag: stored_meta.object_integrity.etag().cloned(),
+            e_tag: stored_meta.object_integrity.etag(),
             ..Default::default()
         };
 
