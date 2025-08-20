@@ -222,6 +222,20 @@ pub(super) async fn read_body(
         .instrument(tracing::debug_span!("read-upload-body"))
         .await?
     {
+        // The content length of each UploadPart request matches the expected part size
+        if part_reader.part_size() != part_data.data.remaining()
+            && part_data.is_last() == Some(false)
+        {
+            return Err(error::Error::new(
+                error::ErrorKind::ChunkFailed,
+                format!(
+                    "upload part size mismatch for non-last part {}: configured part size {}, got data size {}",
+                    part_data.part_number,
+                    part_reader.part_size(),
+                    part_data.data.remaining()
+                ),
+            ));
+        }
         let req = UploadPartRequest {
             ctx: ctx.clone(),
             part_data,

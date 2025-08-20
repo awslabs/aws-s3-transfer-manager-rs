@@ -172,9 +172,18 @@ pub struct PartData {
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
     pub(crate) checksum: Option<String>,
+    pub(crate) is_last: Option<bool>,
 }
 
 impl PartData {
+    // Check if this is the last part
+    //
+    // It is `Option` because it's not always possible to determine
+    // whether the just-yielded part is the last one, e.g., streaming cases.
+    pub(crate) fn is_last(&self) -> Option<bool> {
+        self.is_last
+    }
+
     /// Create a new part
     pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
         debug_assert!(
@@ -185,6 +194,7 @@ impl PartData {
             part_number,
             data: data.into(),
             checksum: None,
+            is_last: None,
         }
     }
 
@@ -197,6 +207,12 @@ impl PartData {
     /// (see [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
+        self
+    }
+
+    /// Mark this part as the last part
+    pub fn mark_last(mut self, is_last: bool) -> Self {
+        self.is_last = Some(is_last);
         self
     }
 }

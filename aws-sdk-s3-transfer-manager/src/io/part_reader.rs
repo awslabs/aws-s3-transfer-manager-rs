@@ -69,6 +69,10 @@ impl PartReader {
         let stream_cx = StreamContext::new(part_size);
         Self { inner, stream_cx }
     }
+
+    pub(crate) fn part_size(&self) -> usize {
+        self.stream_cx.part_size()
+    }
 }
 
 #[derive(Debug)]
@@ -119,6 +123,10 @@ impl PartReaderState {
     fn with_offset(self, offset: u64) -> Self {
         Self { offset, ..self }
     }
+
+    pub(crate) fn is_end(&self) -> bool {
+        self.remaining == 0
+    }
 }
 
 /// Implementation for in-memory input streams.
@@ -141,8 +149,16 @@ impl BytesPartReader {
 impl BytesPartReader {
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
-        if state.remaining == 0 {
+        if state.is_end() {
             return Ok(None);
+        }
+
+        let expected_offset = (state.part_number - 1) * stream_cx.part_size() as u64;
+        if state.offset != expected_offset {
+            return Err(Error::offset_not_aligned_with_part_number(
+                state.offset,
+                state.part_number,
+            ));
         }
 
         let start = state.offset as usize;
@@ -152,7 +168,7 @@ impl BytesPartReader {
         state.part_number += 1;
         state.offset += data.len() as u64;
         state.remaining -= data.len() as u64;
-        let part = PartData::new(part_number, data);
+        let part = PartData::new(part_number, data).mark_last(state.is_end());
         Ok(Some(part))
     }
 }
@@ -177,20 +193,14 @@ impl PathBodyPartReader {
 
 impl PathBodyPartReader {
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
-        let (offset, part_number, part_size) = {
-            let mut state = self.state.lock().expect("lock valid");
-            if state.remaining == 0 {
-                return Ok(None);
-            }
-            let offset = state.offset;
-            let part_number = state.part_number;
-
-            let part_size = cmp::min(stream_cx.part_size() as u64, state.remaining);
-            state.offset += part_size;
-            state.part_number += 1;
-            state.remaining -= part_size;
-
-            (offset, part_number, part_size)
+        let (offset, part_number, part_size, is_last) = match self.advance(stream_cx)? {
+            Some(PathBodyReadCursor {
+                offset,
+                part_number,
+                part_size,
+                is_last,
+            }) => (offset, part_number, part_size, is_last),
+            None => return Ok(None),
         };
         let path = self.body.path.clone();
         // grab a buffer to fill from the context
@@ -205,11 +215,50 @@ impl PathBodyPartReader {
             // been initialized.
             unsafe { dst.set_len(dst.capacity()) }
             file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
-            Ok::<PartData, Error>(PartData::new(part_number, dst))
+            Ok::<PartData, Error>(PartData::new(part_number, dst).mark_last(is_last))
         });
 
         handle.await?.map(Some)
     }
+
+    // Advances the `PartReaderState` to the next state and returns `PathBodyReadCursor`
+    // (offset, part_number, part_size, is_last), which will be used in the upcoming
+    // `read_file_chunk_sync` execution.
+    fn advance(&self, stream_cx: &StreamContext) -> Result<Option<PathBodyReadCursor>, Error> {
+        let mut state = self.state.lock().expect("lock valid");
+        if state.is_end() {
+            return Ok(None);
+        }
+        let offset = state.offset;
+        let part_number = state.part_number;
+
+        let expected_offset = self.body.offset + (part_number - 1) * stream_cx.part_size() as u64;
+        if offset != expected_offset {
+            return Err(Error::offset_not_aligned_with_part_number(
+                offset,
+                part_number,
+            ));
+        }
+        let part_size = cmp::min(stream_cx.part_size() as u64, state.remaining);
+        state.offset += part_size;
+        state.part_number += 1;
+        state.remaining -= part_size;
+
+        Ok(Some(PathBodyReadCursor {
+            offset,
+            part_number,
+            part_size,
+            is_last: state.is_end(),
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathBodyReadCursor {
+    offset: u64,
+    part_number: u64,
+    part_size: u64,
+    is_last: bool,
 }
 
 mod file_util {
@@ -284,12 +333,16 @@ impl DynPartReader {
 #[cfg(test)]
 mod test {
     use std::io::Write;
+    use std::path::PathBuf;
     use std::task::Poll;
 
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
-    use crate::io::part_reader::{Builder, PartData, PartReader};
+    use crate::io::part_reader::{
+        Builder, BytesPartReader, PartData, PartReader, PathBodyPartReader,
+    };
+    use crate::io::path_body::PathBody;
     use crate::io::stream::{PartStream, StreamContext};
     use crate::io::InputStream;
 
@@ -411,5 +464,85 @@ mod test {
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_bytes_part_reader_offset_not_aligned_error() {
+        let data = Bytes::from("test data for alignment error");
+        let reader = BytesPartReader::new(data);
+        let stream_cx = StreamContext::new(5);
+
+        // First call should succeed
+        let result = reader.next_part(&stream_cx).await;
+        assert!(result.is_ok());
+
+        // Manually corrupt the offset to create misalignment
+        {
+            let mut state = reader.state.lock().unwrap();
+            state.offset = 99; // Invalid offset that doesn't align with part_number
+        }
+
+        // Second call should fail with offset_not_aligned_with_part_number error
+        let result = reader.next_part(&stream_cx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bytes_part_reader_detects_last_true() {
+        let data = Bytes::from("test");
+        let reader = BytesPartReader::new(data);
+        let stream_cx = StreamContext::new(10);
+
+        let result = reader.next_part(&stream_cx).await.unwrap().unwrap();
+        assert!(result.is_last.unwrap());
+    }
+
+    #[test]
+    fn test_path_body_part_reader_advance() {
+        let path_body = PathBody {
+            path: PathBuf::from("test"),
+            offset: 10,
+            length: 20,
+        };
+        let reader = PathBodyPartReader::new(path_body);
+        let stream_cx = StreamContext::new(5);
+
+        // First advance should succeed
+        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        assert_eq!(result.offset, 10);
+        assert_eq!(result.part_number, 1);
+        assert_eq!(result.part_size, 5);
+        assert!(!result.is_last);
+
+        // Second advance should succeed
+        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        assert_eq!(result.offset, 15);
+        assert_eq!(result.part_number, 2);
+        assert_eq!(result.part_size, 5);
+        assert!(!result.is_last);
+
+        // Manually corrupt the offset to test validation
+        {
+            let mut state = reader.state.lock().unwrap();
+            state.offset = 99; // Invalid offset
+        }
+
+        // Third advance should fail due to misaligned offset
+        let result = reader.advance(&stream_cx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_path_body_part_reader_advance_detects_last_part() {
+        let path_body = PathBody {
+            path: PathBuf::from("test"),
+            offset: 0,
+            length: 3,
+        };
+        let reader = PathBodyPartReader::new(path_body);
+        let stream_cx = StreamContext::new(10);
+
+        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        assert!(result.is_last);
     }
 }

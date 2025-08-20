@@ -172,6 +172,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             let mut all_parts = Vec::new();
             // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
             let mut tasks = mpu_data.upload_part_tasks.lock().await;
+            let number_of_upload_requests = tasks.len();
             while let Some(join_result) = tasks.join_next().await {
                 let result = join_result.expect("task completed");
                 match result {
@@ -190,6 +191,17 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             }
 
             tracing::trace!("completing multipart upload");
+
+            if number_of_upload_requests != all_parts.len() {
+                return Err(crate::error::Error::new(
+                    crate::error::ErrorKind::ChunkFailed,
+                    format!(
+                        "The total number of UploadPart requests must match the expected number of parts: request count {}, number of parts {}",
+                        number_of_upload_requests,
+                        all_parts.len()
+                    ),
+                ));
+            }
 
             // parts must be sorted
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
