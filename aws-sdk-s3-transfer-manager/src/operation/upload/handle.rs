@@ -194,7 +194,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
 
             if number_of_upload_requests != all_parts.len() {
                 return Err(crate::error::Error::new(
-                    crate::error::ErrorKind::ValidationFailed,
+                    crate::error::ErrorKind::ChunkFailed,
                     format!(
                         "The total number of UploadPart requests must match the expected number of parts: request count {}, number of parts {}",
                         number_of_upload_requests,

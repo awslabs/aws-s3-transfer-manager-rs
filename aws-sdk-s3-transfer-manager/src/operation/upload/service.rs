@@ -227,7 +227,7 @@ pub(super) async fn read_body(
             && part_data.is_last() == Some(false)
         {
             return Err(error::Error::new(
-                error::ErrorKind::ValidationFailed,
+                error::ErrorKind::ChunkFailed,
                 format!(
                     "upload part size mismatch for non-last part {}: configured part size {}, got data size {}",
                     part_data.part_number,
