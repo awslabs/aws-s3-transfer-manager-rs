@@ -218,6 +218,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// # Returns
     ///
     /// Success or an error if the operation fails
+    #[allow(dead_code)]
     async fn delete_object(&self, key: &str) -> Result<()>;
 
     /// List all objects with a given prefix.
@@ -282,6 +283,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// # Returns
     ///
     /// A vector of (part_number, etag, size) tuples for all uploaded parts
+    #[allow(dead_code)]
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>>;
 
     /// Complete a multipart upload by combining parts into a final object.

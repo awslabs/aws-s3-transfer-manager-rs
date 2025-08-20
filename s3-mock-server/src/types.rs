@@ -119,6 +119,7 @@ impl ObjectIntegrity {
     }
 
     /// Returns the checksum for a specific algorithm if calculated.
+    #[allow(dead_code)]
     pub fn checksum(&self, algorithm: ChecksumAlgorithm) -> Option<&String> {
         match algorithm {
             ChecksumAlgorithm::Crc32 => self.crc32.as_ref(),

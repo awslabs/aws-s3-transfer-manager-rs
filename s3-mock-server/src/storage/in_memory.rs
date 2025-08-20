@@ -72,13 +72,18 @@ impl StorageBackend for InMemoryStorage {
         let object_integrity = integrity_checks.finalize();
         let last_modified = SystemTime::now();
 
-        // Store with placeholder metadata for now
+        // Store with checksum metadata
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
             etag: object_integrity.etag().unwrap_or_default(),
             last_modified,
             user_metadata: request.user_metadata,
+            crc32: object_integrity.crc32.clone(),
+            crc32c: object_integrity.crc32c.clone(),
+            crc64nvme: object_integrity.crc64nvme.clone(),
+            sha1: object_integrity.sha1.clone(),
+            sha256: object_integrity.sha256.clone(),
         };
 
         let mut objects = self.objects.write().await;
@@ -199,6 +204,7 @@ impl StorageBackend for InMemoryStorage {
         let part_metadata = PartMetadata {
             etag: etag.clone(),
             size: request.content.len() as u64,
+            ..Default::default()
         };
 
         upload_parts.insert(
@@ -363,6 +369,7 @@ mod tests {
             etag: format!("\"{:x}\"", md5::compute("test")),
             last_modified: SystemTime::now(),
             user_metadata: HashMap::new(),
+            ..Default::default()
         }
     }
 
