@@ -283,6 +283,7 @@ impl StorageBackend for FilesystemStorage {
             etag: object_integrity.etag().unwrap_or_default(),
             last_modified,
             user_metadata: request.user_metadata,
+            checksum_algorithm: None,
             crc32: object_integrity.crc32.clone(),
             crc32c: object_integrity.crc32c.clone(),
             crc64nvme: object_integrity.crc64nvme.clone(),

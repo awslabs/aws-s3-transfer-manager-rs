@@ -27,6 +27,9 @@ pub(crate) struct ObjectMetadata {
     /// User-defined metadata.
     pub user_metadata: HashMap<String, String>,
 
+    /// Checksum algorithm specified for multipart uploads.
+    pub checksum_algorithm: Option<String>,
+
     /// Checksum values for the object.
     pub crc32: Option<String>,
     pub crc32c: Option<String>,
@@ -43,6 +46,7 @@ impl Default for ObjectMetadata {
             etag: String::new(),
             last_modified: SystemTime::UNIX_EPOCH,
             user_metadata: HashMap::new(),
+            checksum_algorithm: None,
             crc32: None,
             crc32c: None,
             crc64nvme: None,
