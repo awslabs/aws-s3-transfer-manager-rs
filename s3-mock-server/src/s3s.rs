@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use bytes::BytesMut;
 use futures_util::StreamExt;
-use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
+use s3s::dto::{ChecksumAlgorithm, StreamingBlob};
 use s3s::{S3Request, S3Response, S3Result};
 
 use crate::error::Error;
@@ -186,6 +186,28 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         let key = &input.key;
 
+        // Extract checksum algorithm if provided
+        let checksum_algorithm = input.checksum_algorithm.as_ref().map(|alg| alg.as_str());
+
+        // Validate algorithm restrictions for multipart uploads
+        if let Some(algorithm) = checksum_algorithm {
+            match algorithm {
+                "MD5" => {
+                    // MD5 doesn't support full object checksums in multipart uploads
+                    // This is only enforced when a full object checksum is provided in CompleteMultipartUpload
+                }
+                "CRC64NVME" | "CRC32" | "CRC32C" | "SHA1" | "SHA256" => {
+                    // These are all valid for multipart uploads
+                }
+                _ => {
+                    return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "Unsupported checksum algorithm"
+                    ));
+                }
+            }
+        }
+
         // Generate a unique upload ID
         let upload_id = format!("{}", uuid::Uuid::new_v4());
 
@@ -200,6 +222,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             etag: String::new(), // Will be updated when the upload is completed
             last_modified: std::time::SystemTime::now(),
             user_metadata,
+            checksum_algorithm: checksum_algorithm.map(|s| s.to_string()),
             ..Default::default()
         };
 
@@ -216,6 +239,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             upload_id: Some(upload_id),
             key: Some(key.to_string()),
             bucket: Some("mock-bucket".to_string()),
+            checksum_algorithm: input.checksum_algorithm,
             ..Default::default()
         };
 
@@ -708,5 +732,119 @@ mod tests {
 
         let result_wrong = inner.upload_part(S3Request::new(input_wrong)).await;
         assert!(result_wrong.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_part_number_validation() {
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        // Create multipart upload
+        let create_input = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .build()
+            .unwrap();
+
+        let create_result = inner
+            .create_multipart_upload(S3Request::new(create_input))
+            .await
+            .expect("Create multipart upload failed");
+        let upload_id = create_result.output.upload_id.unwrap();
+
+        // Upload parts 1 and 2 and collect their ETags
+        let mut part_etags = Vec::new();
+        for part_num in 1..=2 {
+            let content = format!("Part {} content", part_num);
+            let input = s3s::dto::UploadPartInput::builder()
+                .bucket(s3s::dto::BucketName::from("test-bucket"))
+                .key(s3s::dto::ObjectKey::from("test-key"))
+                .upload_id(upload_id.clone())
+                .part_number(part_num)
+                .body(Some(s3s::dto::StreamingBlob::wrap(
+                    futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(content))
+                    }),
+                )))
+                .build()
+                .unwrap();
+
+            let result = inner
+                .upload_part(S3Request::new(input))
+                .await
+                .expect("Upload part failed");
+            part_etags.push(result.output.e_tag.unwrap());
+        }
+
+        // Test valid consecutive parts [1,2] - should succeed
+        let valid_parts = vec![
+            s3s::dto::CompletedPart {
+                part_number: Some(1),
+                e_tag: Some(part_etags[0].clone()),
+                ..Default::default()
+            },
+            s3s::dto::CompletedPart {
+                part_number: Some(2),
+                e_tag: Some(part_etags[1].clone()),
+                ..Default::default()
+            },
+        ];
+        let valid_input = s3s::dto::CompleteMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .upload_id(upload_id.clone())
+            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(valid_parts),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let valid_result = inner
+            .complete_multipart_upload(S3Request::new(valid_input))
+            .await;
+        assert!(valid_result.is_ok());
+
+        // Create new upload for invalid test
+        let create_input2 = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key-2"))
+            .build()
+            .unwrap();
+
+        let create_result2 = inner
+            .create_multipart_upload(S3Request::new(create_input2))
+            .await
+            .expect("Create multipart upload failed");
+        let upload_id2 = create_result2.output.upload_id.unwrap();
+
+        // Test invalid non-consecutive parts [1,3] - should fail
+        let invalid_parts = vec![
+            s3s::dto::CompletedPart {
+                part_number: Some(1),
+                e_tag: Some("etag1".to_string()),
+                ..Default::default()
+            },
+            s3s::dto::CompletedPart {
+                part_number: Some(3),
+                e_tag: Some("etag3".to_string()),
+                ..Default::default()
+            },
+        ];
+        let invalid_input = s3s::dto::CompleteMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key-2"))
+            .upload_id(upload_id2)
+            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(invalid_parts),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let invalid_result = inner
+            .complete_multipart_upload(S3Request::new(invalid_input))
+            .await;
+        assert!(invalid_result.is_err());
     }
 }
