@@ -231,12 +231,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
 
-        // Read the part content
+        let client_checksums = crate::types::ClientChecksums::from(&input);
+        let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
+
+        // Read the part content and calculate checksums
         let mut content = BytesMut::new();
         if let Some(mut body) = input.body {
             while let Some(chunk) = body.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        integrity_checks.update(&chunk);
                         content.extend_from_slice(&chunk);
                     }
                     Err(_) => return Err(s3s::s3_error!(InternalError, "Failed to read body")),
@@ -244,6 +248,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             }
         }
         let content = content.freeze();
+        let calculated_integrity = integrity_checks.finalize();
+
+        // Validate client-provided checksums
+        if let Err(msg) = calculated_integrity.validate(&client_checksums) {
+            return Err(s3s::s3_error!(BadDigest, "{}", msg));
+        }
 
         // Store the part and get its ETag
         let request = crate::storage::UploadPartRequest {
@@ -253,9 +263,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
         let response = self.storage.upload_part(request).await?;
 
-        // Build response
+        // Build response with checksums
         let output = s3s::dto::UploadPartOutput {
             e_tag: Some(response.etag),
+            checksum_crc32: calculated_integrity.crc32,
+            checksum_crc32c: calculated_integrity.crc32c,
+            checksum_sha1: calculated_integrity.sha1,
+            checksum_sha256: calculated_integrity.sha256,
+            checksum_crc64nvme: calculated_integrity.crc64nvme,
             ..Default::default()
         };
 
@@ -627,5 +642,71 @@ mod tests {
         // Should not have other checksums
         assert!(result.output.checksum_crc32.is_none());
         assert!(result.output.checksum_sha1.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upload_part_checksum_validation() {
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        // First create a multipart upload
+        let create_input = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .build()
+            .unwrap();
+
+        let create_result = inner
+            .create_multipart_upload(S3Request::new(create_input))
+            .await
+            .expect("Create multipart upload failed");
+        let upload_id = create_result.output.upload_id.unwrap();
+
+        let content = b"Part content for checksum test";
+
+        // Calculate expected CRC32 using our ObjectIntegrityChecks
+        let mut checks = crate::types::ObjectIntegrityChecks::new().with_crc32();
+        checks.update(content);
+        let integrity = checks.finalize();
+        let expected_crc32 = integrity.crc32.unwrap();
+
+        // Test with correct checksum - should succeed
+        let input = s3s::dto::UploadPartInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .upload_id(upload_id.clone())
+            .part_number(1)
+            .body(Some(s3s::dto::StreamingBlob::wrap(
+                futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
+                }),
+            )))
+            .checksum_crc32(Some(expected_crc32.clone()))
+            .build()
+            .unwrap();
+
+        let result = inner
+            .upload_part(S3Request::new(input))
+            .await
+            .expect("Upload part should succeed");
+        assert_eq!(result.output.checksum_crc32, Some(expected_crc32));
+
+        // Test with wrong checksum - should fail
+        let input_wrong = s3s::dto::UploadPartInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .upload_id(upload_id)
+            .part_number(2)
+            .body(Some(s3s::dto::StreamingBlob::wrap(
+                futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
+                }),
+            )))
+            .checksum_crc32(Some("wrong-checksum".to_string()))
+            .build()
+            .unwrap();
+
+        let result_wrong = inner.upload_part(S3Request::new(input_wrong)).await;
+        assert!(result_wrong.is_err());
     }
 }
