@@ -151,11 +151,27 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             return Err(s3s::s3_error!(InvalidRequest));
         }
 
-        let request = crate::storage::StoreObjectRequest::from(input);
+        let client_checksums = crate::types::ClientChecksums::from(&input);
+        let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
+
+        // Create storage request with configured checksums
+        let mut request = crate::storage::StoreObjectRequest::from(input);
+        request.integrity_checks = integrity_checks;
+
         let stored_meta = self.storage.put_object(request).await?;
+
+        // Validate client-provided checksums
+        if let Err(msg) = stored_meta.object_integrity.validate(&client_checksums) {
+            return Err(s3s::s3_error!(BadDigest, "{}", msg));
+        }
 
         let output = s3s::dto::PutObjectOutput {
             e_tag: stored_meta.object_integrity.etag(),
+            checksum_crc32: stored_meta.object_integrity.crc32,
+            checksum_crc32c: stored_meta.object_integrity.crc32c,
+            checksum_sha1: stored_meta.object_integrity.sha1,
+            checksum_sha256: stored_meta.object_integrity.sha256,
+            checksum_crc64nvme: stored_meta.object_integrity.crc64nvme,
             ..Default::default()
         };
 
@@ -531,5 +547,85 @@ mod tests {
 
         assert_eq!(output.content_length, Some(1));
         assert_eq!(output.content_range, Some("bytes 3-3/10".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_checksum_validation() {
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        let content = b"Hello, checksum world!";
+
+        // Calculate expected CRC32 using our ObjectIntegrityChecks
+        let mut checks = crate::types::ObjectIntegrityChecks::new().with_crc32();
+        checks.update(content);
+        let integrity = checks.finalize();
+        let expected_crc32 = integrity.crc32.unwrap();
+
+        // Test with correct checksum - should succeed
+        let input = s3s::dto::PutObjectInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .body(Some(s3s::dto::StreamingBlob::wrap(
+                futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
+                }),
+            )))
+            .checksum_crc32(Some(expected_crc32.clone()))
+            .build()
+            .unwrap();
+
+        let result = inner
+            .put_object(S3Request::new(input))
+            .await
+            .expect("Put should succeed");
+        assert_eq!(result.output.checksum_crc32, Some(expected_crc32));
+
+        // Test with wrong checksum - should fail
+        let input_wrong = s3s::dto::PutObjectInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key-wrong"))
+            .body(Some(s3s::dto::StreamingBlob::wrap(
+                futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
+                }),
+            )))
+            .checksum_crc32(Some("wrong-checksum".to_string()))
+            .build()
+            .unwrap();
+
+        let result_wrong = inner.put_object(S3Request::new(input_wrong)).await;
+        assert!(result_wrong.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_default_crc64nvme() {
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        let content = b"Test default checksum";
+
+        // Test without any client checksums - should default to CRC64NVME
+        let input = s3s::dto::PutObjectInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .body(Some(s3s::dto::StreamingBlob::wrap(
+                futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
+                }),
+            )))
+            .build()
+            .unwrap();
+
+        let result = inner
+            .put_object(S3Request::new(input))
+            .await
+            .expect("Put should succeed");
+
+        // Should have CRC64NVME checksum by default
+        assert!(result.output.checksum_crc64nvme.is_some());
+        // Should not have other checksums
+        assert!(result.output.checksum_crc32.is_none());
+        assert!(result.output.checksum_sha1.is_none());
     }
 }
