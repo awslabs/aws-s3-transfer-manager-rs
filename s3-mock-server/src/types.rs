@@ -8,6 +8,50 @@
 use aws_smithy_checksums::ChecksumAlgorithm;
 use std::collections::HashMap;
 
+/// Client-provided checksums from S3 API requests
+#[derive(Debug, Clone)]
+pub struct ClientChecksums {
+    pub crc32: Option<String>,
+    pub crc32c: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
+    pub crc64nvme: Option<String>,
+}
+
+impl ClientChecksums {
+    pub fn has_any(&self) -> bool {
+        self.crc32.is_some()
+            || self.crc32c.is_some()
+            || self.sha1.is_some()
+            || self.sha256.is_some()
+            || self.crc64nvme.is_some()
+    }
+}
+
+impl From<&s3s::dto::PutObjectInput> for ClientChecksums {
+    fn from(input: &s3s::dto::PutObjectInput) -> Self {
+        Self {
+            crc32: input.checksum_crc32.clone(),
+            crc32c: input.checksum_crc32c.clone(),
+            sha1: input.checksum_sha1.clone(),
+            sha256: input.checksum_sha256.clone(),
+            crc64nvme: input.checksum_crc64nvme.clone(),
+        }
+    }
+}
+
+impl From<&s3s::dto::UploadPartInput> for ClientChecksums {
+    fn from(input: &s3s::dto::UploadPartInput) -> Self {
+        Self {
+            crc32: input.checksum_crc32.clone(),
+            crc32c: input.checksum_crc32c.clone(),
+            sha1: input.checksum_sha1.clone(),
+            sha256: input.checksum_sha256.clone(),
+            crc64nvme: input.checksum_crc64nvme.clone(),
+        }
+    }
+}
+
 /// Configures what integrity checks to perform on streaming data.
 #[derive(Default)]
 pub struct ObjectIntegrityChecks {
@@ -52,6 +96,34 @@ impl ObjectIntegrityChecks {
 
     pub fn with_sha256(self) -> Self {
         self.with_checksum_algorithm(ChecksumAlgorithm::Sha256)
+    }
+
+    /// Configure checksums based on client-provided checksums
+    pub fn from_client_checksums(client: &ClientChecksums) -> Self {
+        let mut checks = Self::new().with_md5();
+
+        if client.crc32.is_some() {
+            checks = checks.with_crc32();
+        }
+        if client.crc32c.is_some() {
+            checks = checks.with_crc32c();
+        }
+        if client.sha1.is_some() {
+            checks = checks.with_sha1();
+        }
+        if client.sha256.is_some() {
+            checks = checks.with_sha256();
+        }
+        if client.crc64nvme.is_some() {
+            checks = checks.with_crc64nvme();
+        }
+
+        // Default to CRC64NVME if no client checksums
+        if !client.has_any() {
+            checks = checks.with_crc64nvme();
+        }
+
+        checks
     }
 
     /// Update all configured hash calculations with new data.
@@ -112,6 +184,12 @@ pub struct ObjectIntegrity {
     pub sha256: Option<String>,
 }
 
+impl From<&ClientChecksums> for ObjectIntegrityChecks {
+    fn from(client: &ClientChecksums) -> Self {
+        Self::from_client_checksums(client)
+    }
+}
+
 impl ObjectIntegrity {
     /// Returns the ETag (MD5 hash with quotes) if calculated.
     pub fn etag(&self) -> Option<String> {
@@ -129,6 +207,36 @@ impl ObjectIntegrity {
             ChecksumAlgorithm::Sha256 => self.sha256.as_ref(),
             _ => None,
         }
+    }
+
+    /// Validate against client-provided checksums
+    pub fn validate(&self, client: &ClientChecksums) -> Result<(), &'static str> {
+        if let Some(expected) = &client.crc32 {
+            if self.crc32.as_ref() != Some(expected) {
+                return Err("checksum_crc32 mismatch");
+            }
+        }
+        if let Some(expected) = &client.crc32c {
+            if self.crc32c.as_ref() != Some(expected) {
+                return Err("checksum_crc32c mismatch");
+            }
+        }
+        if let Some(expected) = &client.sha1 {
+            if self.sha1.as_ref() != Some(expected) {
+                return Err("checksum_sha1 mismatch");
+            }
+        }
+        if let Some(expected) = &client.sha256 {
+            if self.sha256.as_ref() != Some(expected) {
+                return Err("checksum_sha256 mismatch");
+            }
+        }
+        if let Some(expected) = &client.crc64nvme {
+            if self.crc64nvme.as_ref() != Some(expected) {
+                return Err("checksum_crc64nvme mismatch");
+            }
+        }
+        Ok(())
     }
 }
 
