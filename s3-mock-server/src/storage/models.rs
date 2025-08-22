@@ -5,9 +5,40 @@
 
 //! Data models for storage operations.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::SystemTime;
+
+// Custom serialization for ChecksumAlgorithm
+fn serialize_checksum_algorithm<S>(
+    algorithm: &Option<aws_smithy_checksums::ChecksumAlgorithm>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match algorithm {
+        Some(alg) => serializer.serialize_some(alg.as_str()),
+        None => serializer.serialize_none(),
+    }
+}
+
+// Custom deserialization for ChecksumAlgorithm
+fn deserialize_checksum_algorithm<'de, D>(
+    deserializer: D,
+) -> Result<Option<aws_smithy_checksums::ChecksumAlgorithm>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt_str: Option<String> = Option::deserialize(deserializer)?;
+    match opt_str {
+        Some(s) => aws_smithy_checksums::ChecksumAlgorithm::from_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
 
 /// Metadata for an S3 object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,7 +59,11 @@ pub(crate) struct ObjectMetadata {
     pub user_metadata: HashMap<String, String>,
 
     /// Checksum algorithm specified for multipart uploads.
-    pub checksum_algorithm: Option<String>,
+    #[serde(
+        serialize_with = "serialize_checksum_algorithm",
+        deserialize_with = "deserialize_checksum_algorithm"
+    )]
+    pub checksum_algorithm: Option<aws_smithy_checksums::ChecksumAlgorithm>,
 
     /// Checksum values for the object.
     pub crc32: Option<String>,

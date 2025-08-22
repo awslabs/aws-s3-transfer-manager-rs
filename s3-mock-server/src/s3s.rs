@@ -5,17 +5,19 @@
 
 //! s3s integration layer.
 
-use async_trait::async_trait;
-use base64::Engine;
-use bytes::BytesMut;
-use futures_util::StreamExt;
-use s3s::dto::Timestamp;
-use s3s::dto::{ChecksumAlgorithm, StreamingBlob};
-use s3s::{S3Request, S3Response, S3Result};
-
 use crate::error::Error;
 use crate::storage::models::ObjectMetadata;
 use crate::storage::StorageBackend;
+use async_trait::async_trait;
+use aws_sdk_s3::types::ChecksumType;
+use aws_smithy_checksums::ChecksumAlgorithm;
+use base64::Engine;
+use bytes::BytesMut;
+use futures_util::StreamExt;
+use s3s::dto::StreamingBlob;
+use s3s::dto::Timestamp;
+use s3s::{S3Request, S3Response, S3Result};
+use std::str::FromStr;
 
 /// Inner implementation of the s3s::S3 trait.
 ///
@@ -186,27 +188,34 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         let key = &input.key;
 
-        // Extract checksum algorithm if provided
-        let checksum_algorithm = input.checksum_algorithm.as_ref().map(|alg| alg.as_str());
+        // Extract checksum algorithm if provided, default to CRC64NVME
+        let checksum_algorithm = input
+            .checksum_algorithm
+            .as_ref()
+            .map(|alg| {
+                if alg
+                    .as_str()
+                    .eq_ignore_ascii_case(aws_smithy_checksums::MD5_NAME)
+                {
+                    // Handle MD5 specially since it might not parse correctly due to deprecation
+                    #[allow(deprecated)]
+                    Ok(ChecksumAlgorithm::Md5)
+                } else {
+                    ChecksumAlgorithm::from_str(alg.as_str())
+                }
+            })
+            .transpose()
+            .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum algorithm"))?
+            .unwrap_or(ChecksumAlgorithm::Crc64Nvme);
 
-        // Validate algorithm restrictions for multipart uploads
-        if let Some(algorithm) = checksum_algorithm {
-            match algorithm {
-                "MD5" => {
-                    // MD5 doesn't support full object checksums in multipart uploads
-                    // This is only enforced when a full object checksum is provided in CompleteMultipartUpload
-                }
-                "CRC64NVME" | "CRC32" | "CRC32C" | "SHA1" | "SHA256" => {
-                    // These are all valid for multipart uploads
-                }
-                _ => {
-                    return Err(s3s::s3_error!(
-                        InvalidRequest,
-                        "Unsupported checksum algorithm"
-                    ));
-                }
-            }
-        }
+        let checksum_type = input
+            .checksum_type
+            .map(|ct| ChecksumType::from_str(ct.as_str()))
+            .transpose()
+            .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum type"))?;
+
+        // Extract checksum type (full object vs composite) and validate requested checksum
+        validate_checksum_and_type(&checksum_algorithm, checksum_type.as_ref())?;
 
         // Generate a unique upload ID
         let upload_id = format!("{}", uuid::Uuid::new_v4());
@@ -222,11 +231,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             etag: String::new(), // Will be updated when the upload is completed
             last_modified: std::time::SystemTime::now(),
             user_metadata,
-            checksum_algorithm: checksum_algorithm.map(|s| s.to_string()),
+            checksum_algorithm: Some(checksum_algorithm),
             ..Default::default()
         };
-
-        // Create the multipart upload in storage
         let request = crate::storage::CreateMultipartUploadRequest {
             key,
             upload_id: &upload_id,
@@ -234,12 +241,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
         self.storage.create_multipart_upload(request).await?;
 
-        // Build response
         let output = s3s::dto::CreateMultipartUploadOutput {
             upload_id: Some(upload_id),
             key: Some(key.to_string()),
-            bucket: Some("mock-bucket".to_string()),
-            checksum_algorithm: input.checksum_algorithm,
+            bucket: Some(input.bucket.to_string()),
+            checksum_algorithm: Some(s3s::dto::ChecksumAlgorithm::from(
+                checksum_algorithm.as_str().to_string(),
+            )),
+            checksum_type: checksum_type
+                .map(|ct| s3s::dto::ChecksumType::from(ct.as_str().to_string())),
             ..Default::default()
         };
 
@@ -468,6 +478,48 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         Ok(S3Response::new(output))
     }
+}
+
+fn validate_checksum_and_type(
+    checksum_algorithm: &ChecksumAlgorithm,
+    checksum_type: Option<&aws_sdk_s3::types::ChecksumType>,
+) -> Result<(), s3s::S3Error> {
+    // Validate algorithm restrictions for multipart uploads
+    match checksum_algorithm {
+        #[allow(deprecated)]
+        ChecksumAlgorithm::Md5 => {
+            // MD5 doesn't support full object checksums in multipart uploads
+            if checksum_type == Some(&ChecksumType::FullObject) {
+                return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "MD5 algorithm does not support full object checksum type for multipart uploads"
+                    ));
+            }
+        }
+        ChecksumAlgorithm::Crc64Nvme => {
+            // CRC64NVME only supports full object checksums
+            if checksum_type == Some(&ChecksumType::Composite) {
+                return Err(s3s::s3_error!(
+                    InvalidRequest,
+                    "CRC64NVME algorithm only supports full object checksum type"
+                ));
+            }
+        }
+        ChecksumAlgorithm::Crc32
+        | ChecksumAlgorithm::Crc32c
+        | ChecksumAlgorithm::Sha1
+        | ChecksumAlgorithm::Sha256 => {
+            // These support both full object and composite checksums
+        }
+        _ => {
+            // Handle any future algorithms or unknown variants
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "Unsupported checksum algorithm"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -846,5 +898,90 @@ mod tests {
             .complete_multipart_upload(S3Request::new(invalid_input))
             .await;
         assert!(invalid_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_default_crc64nvme_multipart() {
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        // Test CreateMultipartUpload without specifying algorithm - should default to CRC64NVME
+        let input = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .build()
+            .unwrap();
+
+        let result = inner.create_multipart_upload(S3Request::new(input)).await;
+        assert!(result.is_ok());
+
+        // The response should include the default CRC64NVME algorithm
+        let output = result.unwrap().output;
+        assert_eq!(
+            output.checksum_algorithm,
+            Some(s3s::dto::ChecksumAlgorithm::from("crc64nvme".to_string()))
+        );
+        assert!(output.checksum_type.is_none()); // No checksum_type specified
+    }
+
+    #[tokio::test]
+    async fn test_checksum_type_validation() {
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        // Test invalid combination: MD5 with FULL_OBJECT should fail
+        let invalid_input = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key"))
+            .checksum_algorithm(Some(s3s::dto::ChecksumAlgorithm::from("MD5".to_string())))
+            .checksum_type(Some(s3s::dto::ChecksumType::from(
+                "FULL_OBJECT".to_string(),
+            )))
+            .build()
+            .unwrap();
+
+        let result = inner
+            .create_multipart_upload(S3Request::new(invalid_input))
+            .await;
+        assert!(result.is_err());
+
+        // Test invalid combination: CRC64NVME with COMPOSITE should fail
+        let invalid_input2 = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key-2"))
+            .checksum_algorithm(Some(s3s::dto::ChecksumAlgorithm::from(
+                "CRC64NVME".to_string(),
+            )))
+            .checksum_type(Some(s3s::dto::ChecksumType::from("COMPOSITE".to_string())))
+            .build()
+            .unwrap();
+
+        let result2 = inner
+            .create_multipart_upload(S3Request::new(invalid_input2))
+            .await;
+        assert!(result2.is_err());
+
+        // Test valid combination: CRC32 with COMPOSITE should succeed
+        let valid_input = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from("test-key-3"))
+            .checksum_algorithm(Some(s3s::dto::ChecksumAlgorithm::from("CRC32".to_string())))
+            .checksum_type(Some(s3s::dto::ChecksumType::from("COMPOSITE".to_string())))
+            .build()
+            .unwrap();
+
+        let result3 = inner
+            .create_multipart_upload(S3Request::new(valid_input))
+            .await;
+        assert!(result3.is_ok());
+        let output = result3.unwrap().output;
+        assert_eq!(
+            output.checksum_algorithm,
+            Some(s3s::dto::ChecksumAlgorithm::from("crc32".to_string()))
+        );
+        assert_eq!(
+            output.checksum_type,
+            Some(s3s::dto::ChecksumType::from("COMPOSITE".to_string()))
+        );
     }
 }
