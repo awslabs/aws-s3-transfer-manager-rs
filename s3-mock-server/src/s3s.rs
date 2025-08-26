@@ -212,10 +212,17 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .checksum_type
             .map(|ct| ChecksumType::from_str(ct.as_str()))
             .transpose()
-            .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum type"))?;
+            .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum type"))?
+            .unwrap_or_else(|| {
+                // Default checksum type based on algorithm
+                match checksum_algorithm {
+                    ChecksumAlgorithm::Crc64Nvme => ChecksumType::FullObject,
+                    _ => ChecksumType::Composite,
+                }
+            });
 
         // Extract checksum type (full object vs composite) and validate requested checksum
-        validate_checksum_and_type(&checksum_algorithm, checksum_type.as_ref())?;
+        validate_checksum_and_type(&checksum_algorithm, Some(&checksum_type))?;
 
         // Generate a unique upload ID
         let upload_id = format!("{}", uuid::Uuid::new_v4());
@@ -238,6 +245,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             key,
             upload_id: &upload_id,
             metadata,
+            checksum_type: checksum_type.clone(),
         };
         self.storage.create_multipart_upload(request).await?;
 
@@ -248,8 +256,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             checksum_algorithm: Some(s3s::dto::ChecksumAlgorithm::from(
                 checksum_algorithm.as_str().to_string(),
             )),
-            checksum_type: checksum_type
-                .map(|ct| s3s::dto::ChecksumType::from(ct.as_str().to_string())),
+            checksum_type: Some(s3s::dto::ChecksumType::from(
+                checksum_type.as_str().to_string(),
+            )),
             ..Default::default()
         };
 
@@ -921,7 +930,10 @@ mod tests {
             output.checksum_algorithm,
             Some(s3s::dto::ChecksumAlgorithm::from("crc64nvme".to_string()))
         );
-        assert!(output.checksum_type.is_none()); // No checksum_type specified
+        assert_eq!(
+            output.checksum_type,
+            Some(s3s::dto::ChecksumType::from("FULL_OBJECT".to_string()))
+        ); // Default checksum_type for CRC64NVME
     }
 
     #[tokio::test]

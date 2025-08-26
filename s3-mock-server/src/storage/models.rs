@@ -40,6 +40,36 @@ where
     }
 }
 
+// Custom serialization for ChecksumType
+fn serialize_checksum_type<S>(
+    checksum_type: &Option<aws_sdk_s3::types::ChecksumType>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match checksum_type {
+        Some(ct) => serializer.serialize_some(ct.as_str()),
+        None => serializer.serialize_none(),
+    }
+}
+
+// Custom deserialization for ChecksumType
+fn deserialize_checksum_type<'de, D>(
+    deserializer: D,
+) -> Result<Option<aws_sdk_s3::types::ChecksumType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt_str: Option<String> = Option::deserialize(deserializer)?;
+    match opt_str {
+        Some(s) => aws_sdk_s3::types::ChecksumType::from_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
 /// Metadata for an S3 object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ObjectMetadata {
@@ -122,4 +152,11 @@ pub(crate) struct MultipartUploadMetadata {
 
     /// Parts that have been uploaded.
     pub parts: HashMap<i32, PartMetadata>,
+
+    /// Checksum type specified during upload creation (FULL_OBJECT vs COMPOSITE).
+    #[serde(
+        serialize_with = "serialize_checksum_type",
+        deserialize_with = "deserialize_checksum_type"
+    )]
+    pub checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
 }

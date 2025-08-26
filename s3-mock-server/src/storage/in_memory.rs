@@ -171,6 +171,7 @@ impl StorageBackend for InMemoryStorage {
             upload_id: request.upload_id.to_string(),
             metadata: request.metadata,
             parts: HashMap::new(),
+            checksum_type: Some(request.checksum_type),
         };
         uploads.insert(request.upload_id.to_string(), upload_metadata);
 
@@ -526,6 +527,7 @@ mod tests {
             key,
             upload_id,
             metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
         };
         storage.create_multipart_upload(request).await.unwrap();
 
@@ -589,6 +591,7 @@ mod tests {
             key,
             upload_id,
             metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
         };
         storage.create_multipart_upload(request).await.unwrap();
 
@@ -623,6 +626,7 @@ mod tests {
             key,
             upload_id,
             metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
         };
         storage.create_multipart_upload(request).await.unwrap();
 
