@@ -412,6 +412,7 @@ impl StorageBackend for FilesystemStorage {
             upload_id: request.upload_id.to_string(),
             metadata: request.metadata,
             parts: Default::default(),
+            checksum_type: Some(request.checksum_type),
         };
 
         let metadata_path = self.get_upload_metadata_path(request.upload_id);
@@ -766,6 +767,7 @@ mod tests {
             key,
             upload_id,
             metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
         };
         storage.create_multipart_upload(request).await.unwrap();
 
@@ -830,6 +832,7 @@ mod tests {
             key,
             upload_id,
             metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
         };
         storage.create_multipart_upload(request).await.unwrap();
 
@@ -865,6 +868,7 @@ mod tests {
             key,
             upload_id,
             metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
         };
         storage.create_multipart_upload(request).await.unwrap();
 

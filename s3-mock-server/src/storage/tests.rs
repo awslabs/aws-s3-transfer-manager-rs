@@ -51,6 +51,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         key,
         upload_id,
         metadata,
+        checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
     };
     storage.create_multipart_upload(request).await.unwrap();
 

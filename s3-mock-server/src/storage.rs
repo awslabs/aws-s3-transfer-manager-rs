@@ -74,6 +74,7 @@ pub(crate) struct CreateMultipartUploadRequest<'a> {
     pub key: &'a str,
     pub upload_id: &'a str,
     pub metadata: ObjectMetadata,
+    pub checksum_type: aws_sdk_s3::types::ChecksumType,
 }
 
 /// Request for uploading a part.
