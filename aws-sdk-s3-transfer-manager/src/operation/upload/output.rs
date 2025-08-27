@@ -4,6 +4,7 @@
  */
 
 use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadOutput,
     create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
 };
 use std::fmt::{Debug, Formatter};
@@ -567,22 +568,22 @@ impl UploadOutputBuilder {
 impl From<PutObjectOutput> for UploadOutputBuilder {
     fn from(value: PutObjectOutput) -> Self {
         UploadOutputBuilder {
-            upload_id: None,
-            server_side_encryption: value.server_side_encryption,
-            sse_customer_algorithm: value.sse_customer_algorithm,
-            sse_customer_key_md5: value.sse_customer_key_md5,
-            sse_kms_key_id: value.ssekms_key_id,
-            sse_kms_encryption_context: value.ssekms_encryption_context,
             bucket_key_enabled: value.bucket_key_enabled,
-            request_charged: value.request_charged,
-            expiration: value.expiration,
-            e_tag: value.e_tag,
             checksum_crc32: value.checksum_crc32,
             checksum_crc32_c: value.checksum_crc32_c,
             checksum_crc64_nvme: value.checksum_crc64_nvme,
             checksum_sha1: value.checksum_sha1,
             checksum_sha256: value.checksum_sha256,
             checksum_type: value.checksum_type,
+            e_tag: value.e_tag,
+            expiration: value.expiration,
+            request_charged: value.request_charged,
+            server_side_encryption: value.server_side_encryption,
+            sse_customer_algorithm: value.sse_customer_algorithm,
+            sse_customer_key_md5: value.sse_customer_key_md5,
+            sse_kms_encryption_context: value.ssekms_encryption_context,
+            sse_kms_key_id: value.ssekms_key_id,
+            upload_id: None,
             version_id: value.version_id,
         }
     }
@@ -615,6 +616,29 @@ impl Debug for UploadOutputBuilder {
     }
 }
 
+impl UploadOutputBuilder {
+    /// Updates the builder with fields from `CompleteMultipartUploadOutput
+    pub fn update_from_complete_mpu(
+        mut self,
+        complete_mpu_resp: &CompleteMultipartUploadOutput,
+    ) -> Self {
+        self.bucket_key_enabled = complete_mpu_resp.bucket_key_enabled;
+        self.checksum_crc32 = complete_mpu_resp.checksum_crc32.clone();
+        self.checksum_crc32_c = complete_mpu_resp.checksum_crc32_c.clone();
+        self.checksum_crc64_nvme = complete_mpu_resp.checksum_crc64_nvme.clone();
+        self.checksum_sha1 = complete_mpu_resp.checksum_sha1.clone();
+        self.checksum_sha256 = complete_mpu_resp.checksum_sha256.clone();
+        self.checksum_type = complete_mpu_resp.checksum_type.clone();
+        self.e_tag = complete_mpu_resp.e_tag.clone();
+        self.expiration = complete_mpu_resp.expiration.clone();
+        self.request_charged = complete_mpu_resp.request_charged.clone();
+        self.sse_kms_key_id = complete_mpu_resp.ssekms_key_id.clone();
+        self.server_side_encryption = complete_mpu_resp.server_side_encryption.clone();
+        self.version_id = complete_mpu_resp.version_id.clone();
+        self
+    }
+}
+
 impl From<CreateMultipartUploadOutput> for UploadOutputBuilder {
     fn from(value: CreateMultipartUploadOutput) -> Self {
         UploadOutputBuilder {
@@ -638,5 +662,102 @@ impl From<CreateMultipartUploadOutput> for UploadOutputBuilder {
             version_id: None,
             // TODO(aws-sdk-rust#1159): abort_rule_id and abort_date seem unique to CreateMultipartUploadOutput
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+    use aws_sdk_s3::operation::put_object::PutObjectOutput;
+    use aws_sdk_s3::types::{ChecksumType, RequestCharged, ServerSideEncryption};
+
+    #[test]
+    fn test_update_from_complete_mpu() {
+        let complete_mpu_resp = CompleteMultipartUploadOutput::builder()
+            .bucket_key_enabled(true)
+            .checksum_crc32("AAAAAA==")
+            .checksum_type(ChecksumType::FullObject)
+            .e_tag("test-etag")
+            .expiration("test-expiration")
+            .request_charged(RequestCharged::Requester)
+            .ssekms_key_id("test-kms-key")
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .version_id("test-version")
+            .build();
+
+        let sut = UploadOutputBuilder::default().update_from_complete_mpu(&complete_mpu_resp);
+
+        assert_eq!(complete_mpu_resp.bucket_key_enabled, sut.bucket_key_enabled);
+        assert_eq!(complete_mpu_resp.checksum_crc32, sut.checksum_crc32);
+        assert_eq!(complete_mpu_resp.checksum_crc32_c, sut.checksum_crc32_c);
+        assert_eq!(
+            complete_mpu_resp.checksum_crc64_nvme,
+            sut.checksum_crc64_nvme
+        );
+        assert_eq!(complete_mpu_resp.checksum_sha1, sut.checksum_sha1);
+        assert_eq!(complete_mpu_resp.checksum_sha256, sut.checksum_sha256);
+        assert_eq!(complete_mpu_resp.checksum_type, sut.checksum_type);
+        assert_eq!(complete_mpu_resp.e_tag, sut.e_tag);
+        assert_eq!(complete_mpu_resp.expiration, sut.expiration);
+        assert_eq!(complete_mpu_resp.request_charged, sut.request_charged);
+        assert_eq!(complete_mpu_resp.ssekms_key_id, sut.sse_kms_key_id);
+        assert_eq!(
+            complete_mpu_resp.server_side_encryption,
+            sut.server_side_encryption
+        );
+        assert_eq!(complete_mpu_resp.version_id, sut.version_id);
+    }
+
+    #[test]
+    fn test_from_put_object_output() {
+        let put_object_output = PutObjectOutput::builder()
+            .bucket_key_enabled(true)
+            .checksum_crc32("AAAAAA==")
+            .checksum_type(ChecksumType::FullObject)
+            .e_tag("test-etag")
+            .expiration("test-expiration")
+            .request_charged(RequestCharged::Requester)
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key_md5("test-md5")
+            .ssekms_encryption_context("test-context")
+            .ssekms_key_id("test-kms-key")
+            .version_id("test-version")
+            .build();
+
+        let sut = UploadOutputBuilder::from(put_object_output.clone());
+
+        assert_eq!(put_object_output.bucket_key_enabled, sut.bucket_key_enabled);
+        assert_eq!(put_object_output.checksum_crc32, sut.checksum_crc32);
+        assert_eq!(put_object_output.checksum_crc32_c, sut.checksum_crc32_c);
+        assert_eq!(
+            put_object_output.checksum_crc64_nvme,
+            sut.checksum_crc64_nvme
+        );
+        assert_eq!(put_object_output.checksum_sha1, sut.checksum_sha1);
+        assert_eq!(put_object_output.checksum_sha256, sut.checksum_sha256);
+        assert_eq!(put_object_output.checksum_type, sut.checksum_type);
+        assert_eq!(put_object_output.e_tag, sut.e_tag);
+        assert_eq!(put_object_output.expiration, sut.expiration);
+        assert_eq!(put_object_output.request_charged, sut.request_charged);
+        assert_eq!(
+            put_object_output.server_side_encryption,
+            sut.server_side_encryption
+        );
+        assert_eq!(
+            put_object_output.sse_customer_algorithm,
+            sut.sse_customer_algorithm
+        );
+        assert_eq!(
+            put_object_output.sse_customer_key_md5,
+            sut.sse_customer_key_md5
+        );
+        assert_eq!(
+            put_object_output.ssekms_encryption_context,
+            sut.sse_kms_encryption_context
+        );
+        assert_eq!(put_object_output.ssekms_key_id, sut.sse_kms_key_id);
+        assert_eq!(None, sut.upload_id);
+        assert_eq!(put_object_output.version_id, sut.version_id);
     }
 }

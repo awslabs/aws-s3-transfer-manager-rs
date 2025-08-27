@@ -225,14 +225,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
                 .response
                 .take()
                 .expect("response set")
-                .set_e_tag(complete_mpu_resp.e_tag.clone())
-                .set_expiration(complete_mpu_resp.expiration.clone())
-                .set_checksum_crc32(complete_mpu_resp.checksum_crc32.clone())
-                .set_checksum_crc32_c(complete_mpu_resp.checksum_crc32_c.clone())
-                .set_checksum_crc64_nvme(complete_mpu_resp.checksum_crc64_nvme.clone())
-                .set_checksum_sha1(complete_mpu_resp.checksum_sha1.clone())
-                .set_checksum_sha256(complete_mpu_resp.checksum_sha256.clone())
-                .set_version_id(complete_mpu_resp.version_id.clone());
+                .update_from_complete_mpu(&complete_mpu_resp);
 
             tracing::trace!("upload completed successfully");
 
