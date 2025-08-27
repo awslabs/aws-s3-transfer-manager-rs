@@ -131,43 +131,43 @@ impl From<GetObjectOutput> for ChunkMetadata {
         Self {
             _request_id: value.request_id().map(|s| s.to_string()),
             _extended_request_id: value.extended_request_id().map(|s| s.to_string()),
-            delete_marker: value.delete_marker,
             accept_ranges: value.accept_ranges,
-            expiration: value.expiration,
-            restore: value.restore,
-            last_modified: value.last_modified,
-            content_length: value.content_length,
-            e_tag: value.e_tag,
+            bucket_key_enabled: value.bucket_key_enabled,
+            cache_control: value.cache_control,
             checksum_crc32: value.checksum_crc32,
             checksum_crc32_c: value.checksum_crc32_c,
             checksum_crc64_nvme: value.checksum_crc64_nvme,
             checksum_sha1: value.checksum_sha1,
             checksum_sha256: value.checksum_sha256,
             checksum_type: value.checksum_type,
-            missing_meta: value.missing_meta,
-            version_id: value.version_id,
-            cache_control: value.cache_control,
             content_disposition: value.content_disposition,
             content_encoding: value.content_encoding,
             content_language: value.content_language,
+            content_length: value.content_length,
             content_range: value.content_range,
             content_type: value.content_type,
-            website_redirect_location: value.website_redirect_location,
-            server_side_encryption: value.server_side_encryption,
+            delete_marker: value.delete_marker,
+            e_tag: value.e_tag,
+            expiration: value.expiration,
+            expires_string: value.expires_string,
+            last_modified: value.last_modified,
             metadata: value.metadata,
+            missing_meta: value.missing_meta,
+            object_lock_legal_hold_status: value.object_lock_legal_hold_status,
+            object_lock_mode: value.object_lock_mode,
+            object_lock_retain_until_date: value.object_lock_retain_until_date,
+            parts_count: value.parts_count,
+            replication_status: value.replication_status,
+            request_charged: value.request_charged,
+            restore: value.restore,
+            server_side_encryption: value.server_side_encryption,
             sse_customer_algorithm: value.sse_customer_algorithm,
             sse_customer_key_md5: value.sse_customer_key_md5,
             ssekms_key_id: value.ssekms_key_id,
-            bucket_key_enabled: value.bucket_key_enabled,
             storage_class: value.storage_class,
-            request_charged: value.request_charged,
-            replication_status: value.replication_status,
-            parts_count: value.parts_count,
             tag_count: value.tag_count,
-            object_lock_mode: value.object_lock_mode,
-            object_lock_retain_until_date: value.object_lock_retain_until_date,
-            object_lock_legal_hold_status: value.object_lock_legal_hold_status,
-            expires_string: value.expires_string,
+            version_id: value.version_id,
+            website_redirect_location: value.website_redirect_location,
         }
     }
 }
@@ -232,5 +232,145 @@ impl ::std::fmt::Debug for ChunkMetadata {
         formatter.field("_extended_request_id", &self._extended_request_id);
         formatter.field("_request_id", &self._request_id);
         formatter.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::types::{
+        ChecksumType, ObjectLockLegalHoldStatus, ObjectLockMode, ReplicationStatus, RequestCharged,
+        ServerSideEncryption, StorageClass,
+    };
+    use aws_smithy_types::DateTime;
+
+    #[test]
+    fn test_from_get_object_output() {
+        let get_object_output = GetObjectOutput::builder()
+            .accept_ranges("bytes=0-999")
+            .bucket_key_enabled(true)
+            .cache_control("no-cache")
+            .checksum_crc32("AAAAAA==")
+            .checksum_type(ChecksumType::FullObject)
+            .content_disposition("attachment")
+            .content_encoding("gzip")
+            .content_language("en")
+            .content_length(1024)
+            .content_range("bytes 0-1023/1024")
+            .content_type("application/octet-stream")
+            .delete_marker(false)
+            .e_tag("test-etag")
+            .expiration("test-expiration")
+            .expires_string("test-expires")
+            .last_modified(aws_smithy_types::DateTime::from_secs(1234567890))
+            .missing_meta(0)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(1234567890))
+            .parts_count(1)
+            .replication_status(ReplicationStatus::Complete)
+            .request_charged(RequestCharged::Requester)
+            .restore("test-restore")
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key_md5("test-md5")
+            .ssekms_key_id("test-kms-key")
+            .storage_class(StorageClass::Standard)
+            .tag_count(2)
+            .version_id("test-version")
+            .website_redirect_location("https://example.com")
+            .build();
+
+        let chunk_metadata = ChunkMetadata::from(get_object_output);
+
+        // Repeat expected values because `get_object_output` has been consumed above
+        assert_eq!(
+            Some("bytes=0-999".to_string()),
+            chunk_metadata.accept_ranges
+        );
+        assert_eq!(Some(true), chunk_metadata.bucket_key_enabled);
+        assert_eq!(Some("no-cache".to_string()), chunk_metadata.cache_control);
+        assert_eq!(Some("AAAAAA==".to_string()), chunk_metadata.checksum_crc32);
+        assert_eq!(None, chunk_metadata.checksum_crc32_c);
+        assert_eq!(None, chunk_metadata.checksum_crc64_nvme);
+        assert_eq!(None, chunk_metadata.checksum_sha1);
+        assert_eq!(None, chunk_metadata.checksum_sha256);
+        assert_eq!(Some(ChecksumType::FullObject), chunk_metadata.checksum_type);
+        assert_eq!(
+            Some("attachment".to_string()),
+            chunk_metadata.content_disposition
+        );
+        assert_eq!(Some("gzip".to_string()), chunk_metadata.content_encoding);
+        assert_eq!(Some("en".to_string()), chunk_metadata.content_language);
+        assert_eq!(Some(1024), chunk_metadata.content_length);
+        assert_eq!(
+            Some("bytes 0-1023/1024".to_string()),
+            chunk_metadata.content_range
+        );
+        assert_eq!(
+            Some("application/octet-stream".to_string()),
+            chunk_metadata.content_type
+        );
+        assert_eq!(Some(false), chunk_metadata.delete_marker);
+        assert_eq!(Some("test-etag".to_string()), chunk_metadata.e_tag);
+        assert_eq!(
+            Some("test-expiration".to_string()),
+            chunk_metadata.expiration
+        );
+        assert_eq!(
+            Some("test-expires".to_string()),
+            chunk_metadata.expires_string
+        );
+        assert_eq!(
+            Some(DateTime::from_secs(1234567890)),
+            chunk_metadata.last_modified
+        );
+        assert_eq!(Some(0), chunk_metadata.missing_meta);
+        assert_eq!(
+            Some(ObjectLockLegalHoldStatus::On),
+            chunk_metadata.object_lock_legal_hold_status
+        );
+        assert_eq!(
+            Some(ObjectLockMode::Governance),
+            chunk_metadata.object_lock_mode
+        );
+        assert_eq!(
+            Some(DateTime::from_secs(1234567890)),
+            chunk_metadata.object_lock_retain_until_date
+        );
+        assert_eq!(Some(1), chunk_metadata.parts_count);
+        assert_eq!(
+            Some(ReplicationStatus::Complete),
+            chunk_metadata.replication_status
+        );
+        assert_eq!(
+            Some(RequestCharged::Requester),
+            chunk_metadata.request_charged
+        );
+        assert_eq!(Some("test-restore".to_string()), chunk_metadata.restore);
+        assert_eq!(
+            Some(ServerSideEncryption::Aes256),
+            chunk_metadata.server_side_encryption
+        );
+        assert_eq!(
+            Some("AES256".to_string()),
+            chunk_metadata.sse_customer_algorithm
+        );
+        assert_eq!(
+            Some("test-md5".to_string()),
+            chunk_metadata.sse_customer_key_md5
+        );
+        assert_eq!(
+            Some("test-kms-key".to_string()),
+            chunk_metadata.ssekms_key_id
+        );
+        assert_eq!(Some(StorageClass::Standard), chunk_metadata.storage_class);
+        assert_eq!(Some(2), chunk_metadata.tag_count);
+        assert_eq!(Some("test-version".to_string()), chunk_metadata.version_id);
+        assert_eq!(
+            Some("https://example.com".to_string()),
+            chunk_metadata.website_redirect_location
+        );
     }
 }
