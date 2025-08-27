@@ -18,6 +18,9 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
+use crate::operation::upload::input::convert::{
+    copy_fields_to_mpu_request, copy_fields_to_put_object_request,
+};
 use crate::runtime::scheduler::{NetworkPermitContext, PermitType, TransferDirection};
 use crate::types::BucketType;
 use context::UploadContext;
@@ -122,56 +125,13 @@ async fn put_object(
         }))
         .await?;
 
-    let mut req = ctx
-        .client()
-        .put_object()
-        .set_acl(ctx.request.acl.clone())
-        .body(body)
-        .set_bucket(ctx.request.bucket.clone())
-        .set_cache_control(ctx.request.cache_control.clone())
-        .set_content_disposition(ctx.request.content_disposition.clone())
-        .set_content_encoding(ctx.request.content_encoding.clone())
-        .set_content_language(ctx.request.content_language.clone())
-        .content_length(content_length)
-        .set_content_md5(ctx.request.content_md5.clone())
-        .set_content_type(ctx.request.content_type.clone())
-        .set_expires(ctx.request.expires)
-        .set_grant_full_control(ctx.request.grant_full_control.clone())
-        .set_grant_read(ctx.request.grant_read.clone())
-        .set_grant_read_acp(ctx.request.grant_read_acp.clone())
-        .set_grant_write_acp(ctx.request.grant_write_acp.clone())
-        .set_key(ctx.request.key.clone())
-        .set_metadata(ctx.request.metadata.clone())
-        .set_server_side_encryption(ctx.request.server_side_encryption.clone())
-        .set_storage_class(ctx.request.storage_class.clone())
-        .set_website_redirect_location(ctx.request.website_redirect_location.clone())
-        .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())
-        .set_sse_customer_key(ctx.request.sse_customer_key.clone())
-        .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
-        .set_ssekms_key_id(ctx.request.sse_kms_key_id.clone())
-        .set_ssekms_encryption_context(ctx.request.sse_kms_encryption_context.clone())
-        .set_bucket_key_enabled(ctx.request.bucket_key_enabled)
-        .set_request_payer(ctx.request.request_payer.clone())
-        .set_tagging(ctx.request.tagging.clone())
-        .set_object_lock_mode(ctx.request.object_lock_mode.clone())
-        .set_object_lock_retain_until_date(ctx.request.object_lock_retain_until_date)
-        .set_object_lock_legal_hold_status(ctx.request.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
-
-    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
-        if let Some(value) = checksum_strategy.full_object_checksum() {
-            // We have the full-object checksum value, so set it
-            req = match checksum_strategy.algorithm() {
-                aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => req.checksum_crc32(value),
-                aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(value),
-                aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(value),
-                algo => unreachable!("unexpected algorithm `{algo}` for full object checksum"),
-            };
-        } else {
-            // Set checksum algorithm, which tells SDK to calculate and add checksum value
-            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
-        }
-    }
+    let req = copy_fields_to_put_object_request(
+        &ctx.request,
+        ctx.client()
+            .put_object()
+            .body(body)
+            .content_length(content_length),
+    );
 
     let resp = req
         .customize()
@@ -241,43 +201,7 @@ async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::er
     let req = ctx.request();
     let client = ctx.client();
 
-    let mut req = client
-        .create_multipart_upload()
-        .set_acl(req.acl.clone())
-        .set_bucket(req.bucket.clone())
-        .set_cache_control(req.cache_control.clone())
-        .set_content_disposition(req.content_disposition.clone())
-        .set_content_encoding(req.content_encoding.clone())
-        .set_content_language(req.content_language.clone())
-        .set_content_type(req.content_type.clone())
-        .set_expires(req.expires)
-        .set_grant_full_control(req.grant_full_control.clone())
-        .set_grant_read(req.grant_read.clone())
-        .set_grant_read_acp(req.grant_read_acp.clone())
-        .set_grant_write_acp(req.grant_write_acp.clone())
-        .set_key(req.key.clone())
-        .set_metadata(req.metadata.clone())
-        .set_server_side_encryption(req.server_side_encryption.clone())
-        .set_storage_class(req.storage_class.clone())
-        .set_website_redirect_location(req.website_redirect_location.clone())
-        .set_sse_customer_algorithm(req.sse_customer_algorithm.clone())
-        .set_sse_customer_key(req.sse_customer_key.clone())
-        .set_sse_customer_key_md5(req.sse_customer_key_md5.clone())
-        .set_ssekms_key_id(req.sse_kms_key_id.clone())
-        .set_ssekms_encryption_context(req.sse_kms_encryption_context.clone())
-        .set_bucket_key_enabled(req.bucket_key_enabled)
-        .set_request_payer(req.request_payer.clone())
-        .set_tagging(req.tagging.clone())
-        .set_object_lock_mode(req.object_lock_mode.clone())
-        .set_object_lock_retain_until_date(req.object_lock_retain_until_date)
-        .set_object_lock_legal_hold_status(req.object_lock_legal_hold_status.clone())
-        .set_expected_bucket_owner(req.expected_bucket_owner.clone());
-
-    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
-        req = req
-            .checksum_algorithm(checksum_strategy.algorithm().clone())
-            .checksum_type(checksum_strategy.type_if_multipart().clone());
-    }
+    let req = copy_fields_to_mpu_request(req, client.create_multipart_upload());
 
     let resp = req
         .send()

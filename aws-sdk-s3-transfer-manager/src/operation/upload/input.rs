@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+pub(crate) mod convert;
+
 use crate::io::InputStream;
 use crate::types::FailedMultipartUploadPolicy;
 use aws_smithy_types::error::operation::BuildError;

@@ -7,10 +7,13 @@ use std::sync::Arc;
 
 use crate::io::part_reader::PartReader;
 use crate::operation::upload::context::UploadContext;
+use crate::operation::upload::input::convert::{
+    copy_fields_to_abort_mpu_request, copy_fields_to_complete_mpu_request,
+};
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 use aws_sdk_s3::error::DisplayErrorContext;
-use aws_sdk_s3::types::{ChecksumType, CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
 use tracing::Instrument;
@@ -129,17 +132,15 @@ async fn abort_multipart_upload(
     match abort_policy {
         FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
         FailedMultipartUploadPolicy::AbortUpload => {
-            let abort_mpu_resp = ctx
-                .client()
-                .abort_multipart_upload()
-                .set_bucket(ctx.request.bucket.clone())
-                .set_key(ctx.request.key.clone())
-                .set_upload_id(Some(mpu_data.upload_id.clone()))
-                .set_request_payer(ctx.request.request_payer.clone())
-                .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone())
-                .send()
-                .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-                .await?;
+            let abort_mpu_resp = copy_fields_to_abort_mpu_request(
+                &ctx.request,
+                ctx.client()
+                    .abort_multipart_upload()
+                    .set_upload_id(Some(mpu_data.upload_id.clone())),
+            )
+            .send()
+            .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+            .await?;
 
             let aborted_upload = AbortedUpload {
                 upload_id: Some(mpu_data.upload_id),
@@ -195,56 +196,24 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
 
             // complete the multipart upload
-            let mut req = handle
-                .ctx
-                .client()
-                .complete_multipart_upload()
-                .set_bucket(handle.ctx.request.bucket.clone())
-                .set_key(handle.ctx.request.key.clone())
-                .set_upload_id(Some(mpu_data.upload_id))
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(all_parts))
-                        .build(),
-                )
-                .set_request_payer(handle.ctx.request.request_payer.clone())
-                .set_expected_bucket_owner(handle.ctx.request.expected_bucket_owner.clone())
-                .set_sse_customer_algorithm(handle.ctx.request.sse_customer_algorithm.clone())
-                .set_sse_customer_key(handle.ctx.request.sse_customer_key.clone())
-                .set_sse_customer_key_md5(handle.ctx.request.sse_customer_key_md5.clone());
-
-            if let Some(checksum_strategy) = &handle.ctx.request.checksum_strategy {
-                req = req.checksum_type(checksum_strategy.type_if_multipart().clone());
-
-                // check for user-provided full-object checksum...
-                if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
-                    // it might have been passed via ChecksumStrategy or PartStream
-                    let full_object_checksum = match checksum_strategy.full_object_checksum() {
-                        Some(checksum) => Some(checksum.into()),
-                        None => mpu_data.part_reader.full_object_checksum().await,
-                    };
-
-                    // if we got one, set the proper request field
-                    if let Some(value) = full_object_checksum {
-                        req = match checksum_strategy.algorithm() {
-                            aws_sdk_s3::types::ChecksumAlgorithm::Crc32 => {
-                                req.checksum_crc32(value)
-                            }
-                            aws_sdk_s3::types::ChecksumAlgorithm::Crc32C => {
-                                req.checksum_crc32_c(value)
-                            }
-                            aws_sdk_s3::types::ChecksumAlgorithm::Crc64Nvme => {
-                                req.checksum_crc64_nvme(value)
-                            }
-                            algo => {
-                                unreachable!(
-                                    "unexpected algorithm `{algo}` for full object checksum"
-                                )
-                            }
-                        };
-                    }
-                }
-            }
+            let req = copy_fields_to_complete_mpu_request(
+                &handle.ctx.request,
+                handle
+                    .ctx
+                    .client()
+                    .complete_multipart_upload()
+                    .set_upload_id(Some(mpu_data.upload_id))
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(all_parts))
+                            .build(),
+                    ),
+                || {
+                    let part_reader = mpu_data.part_reader.clone();
+                    async move { part_reader.full_object_checksum().await }
+                },
+            )
+            .await;
 
             let complete_mpu_resp = req
                 .send()
