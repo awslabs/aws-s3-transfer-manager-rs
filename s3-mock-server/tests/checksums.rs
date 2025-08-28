@@ -1214,25 +1214,21 @@ async fn test_multipart_non_consecutive_parts_filesystem() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Gap 5: GetObject checksum headers - Task CHECKSUM-005"]
 async fn test_get_object_crc32_checksum_in_memory() -> Result<()> {
     run_get_object_checksum_retrieval(StorageType::InMemory, ChecksumAlgorithm::Crc32).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 5: GetObject checksum headers - Task CHECKSUM-005"]
 async fn test_get_object_sha256_checksum_filesystem() -> Result<()> {
     run_get_object_checksum_retrieval(StorageType::Filesystem, ChecksumAlgorithm::Sha256).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 6: HeadObject checksum headers - Task CHECKSUM-006"]
 async fn test_head_object_crc64nvme_checksum_in_memory() -> Result<()> {
     run_head_object_checksum_retrieval(StorageType::InMemory, ChecksumAlgorithm::Crc64Nvme).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 6: HeadObject checksum headers - Task CHECKSUM-006"]
 async fn test_head_object_sha1_checksum_filesystem() -> Result<()> {
     run_head_object_checksum_retrieval(StorageType::Filesystem, ChecksumAlgorithm::Sha1).await
 }
@@ -1299,28 +1295,24 @@ async fn test_complete_multipart_incorrect_composite_sha1_in_memory() -> Result<
 }
 
 #[tokio::test]
-#[ignore = "Gap 5: GetObject checksum headers - Task CHECKSUM-005"]
 async fn test_get_object_multipart_crc32_in_memory() -> Result<()> {
     run_get_object_multipart_checksum_retrieval(StorageType::InMemory, ChecksumAlgorithm::Crc32)
         .await
 }
 
 #[tokio::test]
-#[ignore = "Gap 5: GetObject checksum headers - Task CHECKSUM-005"]
 async fn test_get_object_multipart_sha256_filesystem() -> Result<()> {
     run_get_object_multipart_checksum_retrieval(StorageType::Filesystem, ChecksumAlgorithm::Sha256)
         .await
 }
 
 #[tokio::test]
-#[ignore = "Gap 6: HeadObject checksum headers - Task CHECKSUM-006"]
 async fn test_head_object_multipart_crc32_in_memory() -> Result<()> {
     run_head_object_multipart_checksum_retrieval(StorageType::InMemory, ChecksumAlgorithm::Crc32)
         .await
 }
 
 #[tokio::test]
-#[ignore = "Gap 6: HeadObject checksum headers - Task CHECKSUM-006"]
 async fn test_head_object_multipart_sha256_filesystem() -> Result<()> {
     run_head_object_multipart_checksum_retrieval(StorageType::Filesystem, ChecksumAlgorithm::Sha256)
         .await

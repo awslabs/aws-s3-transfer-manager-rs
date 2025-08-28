@@ -363,9 +363,15 @@ impl StorageBackend for FilesystemStorage {
             Box::new(reader_stream)
         };
 
+        // Clear checksums for range requests since they apply to full object
+        let mut response_metadata = metadata;
+        if request.range.is_some() {
+            response_metadata.clear_checksums();
+        }
+
         Ok(Some(crate::storage::GetObjectResponse {
             stream: limited_stream,
-            metadata,
+            metadata: response_metadata,
         }))
     }
 
@@ -628,6 +634,13 @@ impl StorageBackend for FilesystemStorage {
         final_metadata.content_length = total_size;
         final_metadata.etag = combined_etag.clone();
         final_metadata.last_modified = SystemTime::now();
+
+        // Store calculated checksums in metadata
+        final_metadata.crc32 = object_integrity.crc32.clone();
+        final_metadata.crc32c = object_integrity.crc32c.clone();
+        final_metadata.sha1 = object_integrity.sha1.clone();
+        final_metadata.sha256 = object_integrity.sha256.clone();
+        final_metadata.crc64nvme = object_integrity.crc64nvme.clone();
 
         // Save the final object
         let combined_data = combined.freeze();

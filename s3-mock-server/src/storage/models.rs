@@ -103,6 +103,17 @@ pub(crate) struct ObjectMetadata {
     pub sha256: Option<String>,
 }
 
+impl ObjectMetadata {
+    /// Clear all checksum fields (used for range requests where checksums don't apply)
+    pub(crate) fn clear_checksums(&mut self) {
+        self.crc32 = None;
+        self.crc32c = None;
+        self.crc64nvme = None;
+        self.sha1 = None;
+        self.sha256 = None;
+    }
+}
+
 impl Default for ObjectMetadata {
     fn default() -> Self {
         Self {

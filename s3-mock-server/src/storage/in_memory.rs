@@ -107,6 +107,7 @@ impl StorageBackend for InMemoryStorage {
             None => return Ok(None),
         };
 
+        let is_range_request = request.range.is_some();
         let data = if let Some(range) = request.range {
             apply_range(data, range)
         } else {
@@ -118,9 +119,15 @@ impl StorageBackend for InMemoryStorage {
             dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
         > = Box::new(stream);
 
+        // Clear checksums for range requests since they apply to full object
+        let mut response_metadata = metadata.clone();
+        if is_range_request {
+            response_metadata.clear_checksums();
+        }
+
         Ok(Some(crate::storage::GetObjectResponse {
             stream: boxed_stream,
-            metadata: metadata.clone(),
+            metadata: response_metadata,
         }))
     }
 
@@ -420,6 +427,13 @@ impl StorageBackend for InMemoryStorage {
         final_metadata.content_length = total_size;
         final_metadata.etag = combined_etag.clone();
         final_metadata.last_modified = SystemTime::now();
+
+        // Store calculated checksums in metadata
+        final_metadata.crc32 = object_integrity.crc32.clone();
+        final_metadata.crc32c = object_integrity.crc32c.clone();
+        final_metadata.sha1 = object_integrity.sha1.clone();
+        final_metadata.sha256 = object_integrity.sha256.clone();
+        final_metadata.crc64nvme = object_integrity.crc64nvme.clone();
 
         // Store the final object
         let combined_data = combined.freeze();
