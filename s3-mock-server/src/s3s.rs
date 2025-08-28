@@ -109,7 +109,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         output.metadata = Some(stream_metadata.user_metadata);
-        // FIXME - add checksum support/storage
+
+        // Add checksum headers from stored metadata
+        output.checksum_crc32 = stream_metadata.crc32;
+        output.checksum_crc32c = stream_metadata.crc32c;
+        output.checksum_sha1 = stream_metadata.sha1;
+        output.checksum_sha256 = stream_metadata.sha256;
+        output.checksum_crc64nvme = stream_metadata.crc64nvme;
 
         Ok(S3Response::new(output))
     }
@@ -130,7 +136,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Build response
         let content_type = metadata.content_type.and_then(|ct| ct.parse().ok());
-        let output = s3s::dto::HeadObjectOutput {
+        let mut output = s3s::dto::HeadObjectOutput {
             content_length: Some(metadata.content_length as i64),
             e_tag: Some(metadata.etag),
             last_modified: Some(Timestamp::from(metadata.last_modified)),
@@ -138,7 +144,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             metadata: Some(metadata.user_metadata),
             ..Default::default()
         };
-        // FIXME - add checksum support
+
+        // Add checksum headers from stored metadata
+        output.checksum_crc32 = metadata.crc32;
+        output.checksum_crc32c = metadata.crc32c;
+        output.checksum_sha1 = metadata.sha1;
+        output.checksum_sha256 = metadata.sha256;
+        output.checksum_crc64nvme = metadata.crc64nvme;
 
         Ok(S3Response::new(output))
     }
