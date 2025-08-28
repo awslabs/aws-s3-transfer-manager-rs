@@ -52,6 +52,18 @@ impl From<&s3s::dto::UploadPartInput> for ClientChecksums {
     }
 }
 
+impl From<&s3s::dto::CompleteMultipartUploadInput> for ClientChecksums {
+    fn from(input: &s3s::dto::CompleteMultipartUploadInput) -> Self {
+        Self {
+            crc32: input.checksum_crc32.clone(),
+            crc32c: input.checksum_crc32c.clone(),
+            sha1: input.checksum_sha1.clone(),
+            sha256: input.checksum_sha256.clone(),
+            crc64nvme: input.checksum_crc64nvme.clone(),
+        }
+    }
+}
+
 /// Configures what integrity checks to perform on streaming data.
 #[derive(Default)]
 pub struct ObjectIntegrityChecks {
@@ -191,6 +203,18 @@ impl From<&ClientChecksums> for ObjectIntegrityChecks {
 }
 
 impl ObjectIntegrity {
+    /// Create an empty ObjectIntegrity with no checksums calculated.
+    pub fn empty() -> Self {
+        Self {
+            md5_hash: None,
+            crc32: None,
+            crc32c: None,
+            crc64nvme: None,
+            sha1: None,
+            sha256: None,
+        }
+    }
+
     /// Returns the ETag (MD5 hash with quotes) if calculated.
     pub fn etag(&self) -> Option<String> {
         self.md5_hash.clone()
