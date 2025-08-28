@@ -213,12 +213,13 @@ async fn run_multipart_full_object_checksum(
     let part1_data = b"First part of multipart upload ";
     let part2_data = b"Second part of multipart upload";
 
-    // Create multipart upload with checksum algorithm
+    // Create multipart upload with checksum algorithm and full object type
     let create_response = s3
         .create_multipart_upload()
         .bucket(&bucket)
         .key(key)
         .checksum_algorithm(algorithm.clone())
+        .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject)
         .send()
         .await?;
 
@@ -1168,19 +1169,16 @@ async fn test_multipart_non_consecutive_parts_in_memory() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: Multipart checksum calculation in CompleteMultipartUpload - Task CHECKSUM-004"]
 async fn test_multipart_full_object_crc32_in_memory() -> Result<()> {
     run_multipart_full_object_checksum(StorageType::InMemory, ChecksumAlgorithm::Crc32).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: Multipart checksum calculation in CompleteMultipartUpload - Task CHECKSUM-004"]
 async fn test_multipart_full_object_sha256_in_memory() -> Result<()> {
     run_multipart_full_object_checksum(StorageType::InMemory, ChecksumAlgorithm::Sha256).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: Multipart checksum calculation in CompleteMultipartUpload - Task CHECKSUM-004"]
 async fn test_multipart_full_object_crc32_filesystem() -> Result<()> {
     run_multipart_full_object_checksum(StorageType::Filesystem, ChecksumAlgorithm::Crc32).await
 }
@@ -1250,7 +1248,6 @@ async fn test_upload_part_incorrect_sha256_filesystem() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_complete_multipart_incorrect_full_object_crc32_in_memory() -> Result<()> {
     run_complete_multipart_incorrect_full_object_checksum(
         StorageType::InMemory,
@@ -1260,7 +1257,6 @@ async fn test_complete_multipart_incorrect_full_object_crc32_in_memory() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_complete_multipart_incorrect_full_object_sha256_filesystem() -> Result<()> {
     run_complete_multipart_incorrect_full_object_checksum(
         StorageType::Filesystem,
@@ -1270,25 +1266,21 @@ async fn test_complete_multipart_incorrect_full_object_sha256_filesystem() -> Re
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_multipart_composite_crc32_in_memory() -> Result<()> {
     run_multipart_composite_checksum(StorageType::InMemory, ChecksumAlgorithm::Crc32).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_multipart_composite_sha1_filesystem() -> Result<()> {
     run_multipart_composite_checksum(StorageType::Filesystem, ChecksumAlgorithm::Sha1).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_multipart_composite_sha256_in_memory() -> Result<()> {
     run_multipart_composite_checksum(StorageType::InMemory, ChecksumAlgorithm::Sha256).await
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_complete_multipart_incorrect_composite_crc32_filesystem() -> Result<()> {
     run_complete_multipart_incorrect_composite_checksum(
         StorageType::Filesystem,
@@ -1298,7 +1290,6 @@ async fn test_complete_multipart_incorrect_composite_crc32_filesystem() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "Gap 4: CompleteMultipartUpload checksum validation - Task CHECKSUM-004"]
 async fn test_complete_multipart_incorrect_composite_sha1_in_memory() -> Result<()> {
     run_complete_multipart_incorrect_composite_checksum(
         StorageType::InMemory,

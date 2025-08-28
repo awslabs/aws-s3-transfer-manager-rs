@@ -186,28 +186,58 @@ impl StorageBackend for InMemoryStorage {
         &self,
         request: crate::storage::UploadPartRequest<'_>,
     ) -> Result<crate::storage::UploadPartResponse> {
-        // Verify the upload exists
-        {
+        // Get upload metadata to determine checksum algorithm
+        let checksum_algorithm = {
             let uploads = self.multipart_uploads.read().await;
-            if !uploads.contains_key(request.upload_id) {
-                return Err(Error::NoSuchUpload);
-            }
-        }
+            let upload = uploads.get(request.upload_id).ok_or(Error::NoSuchUpload)?;
+            upload.metadata.checksum_algorithm.clone()
+        };
 
         // Calculate ETag (MD5 hash)
         let etag = format!("\"{:x}\"", md5::compute(&request.content));
+
+        // Calculate part checksums if algorithm is specified
+        let mut part_metadata = PartMetadata {
+            etag: etag.clone(),
+            size: request.content.len() as u64,
+            ..Default::default()
+        };
+
+        if let Some(algorithm) = checksum_algorithm {
+            use crate::types::ObjectIntegrityChecks;
+
+            // Calculate checksum for the specified algorithm
+            let mut integrity_checks =
+                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm.into());
+            integrity_checks.update(&request.content);
+            let calculated_integrity = integrity_checks.finalize();
+
+            // Store the calculated checksum in part metadata
+            match algorithm {
+                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                    part_metadata.crc32 = calculated_integrity.crc32;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                    part_metadata.crc32c = calculated_integrity.crc32c;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme => {
+                    part_metadata.crc64nvme = calculated_integrity.crc64nvme;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                    part_metadata.sha1 = calculated_integrity.sha1;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                    part_metadata.sha256 = calculated_integrity.sha256;
+                }
+                _ => {} // Ignore unsupported algorithms
+            }
+        }
 
         // Store the part data
         let mut parts = self.parts.write().await;
         let upload_parts = parts
             .get_mut(request.upload_id)
             .ok_or(Error::NoSuchUpload)?;
-
-        let part_metadata = PartMetadata {
-            etag: etag.clone(),
-            size: request.content.len() as u64,
-            ..Default::default()
-        };
 
         upload_parts.insert(
             request.part_number,
@@ -248,12 +278,17 @@ impl StorageBackend for InMemoryStorage {
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
     ) -> Result<crate::storage::CompleteMultipartUploadResponse> {
         // Get the upload metadata
-        let (key, mut final_metadata) = {
+        let (key, mut final_metadata, checksum_algorithm, checksum_type) = {
             let mut uploads = self.multipart_uploads.write().await;
             let upload = uploads
                 .remove(request.upload_id)
                 .ok_or(Error::NoSuchUpload)?;
-            (upload.key, upload.metadata)
+            (
+                upload.key,
+                upload.metadata.clone(),
+                upload.metadata.checksum_algorithm.clone(),
+                upload.checksum_type,
+            )
         };
 
         // Get the parts data
@@ -290,16 +325,96 @@ impl StorageBackend for InMemoryStorage {
         }
 
         // Calculate the final ETag for multipart upload
-        // For multipart uploads, S3 uses a special format: "{md5-of-etags}-{part-count}"
         let combined_etag = if etags.len() > 1 {
             let etags_concat = etags.join("");
             format!("\"{:x}-{}\"", md5::compute(etags_concat), etags.len())
         } else if !etags.is_empty() {
-            // For single part uploads, just use the ETag of the part
             etags[0].clone()
         } else {
             format!("\"{:x}\"", md5::compute(""))
         };
+
+        // Calculate checksums if algorithm is specified
+        let mut integrity_checks = checksum_algorithm
+            .as_ref()
+            .map(|algorithm| {
+                crate::types::ObjectIntegrityChecks::new()
+                    .with_checksum_algorithm((*algorithm).into())
+            })
+            .unwrap_or_else(|| crate::types::ObjectIntegrityChecks::new());
+
+        match checksum_type {
+            Some(aws_sdk_s3::types::ChecksumType::FullObject) => {
+                // Update with complete object data
+                integrity_checks.update(&combined);
+            }
+            Some(aws_sdk_s3::types::ChecksumType::Composite) => {
+                // Update with part checksum bytes for composite calculation
+                if let Some(algorithm) = checksum_algorithm.as_ref() {
+                    for (part_number, _) in &request.parts {
+                        if let Some((_, part_metadata)) = upload_parts.get(part_number) {
+                            let part_checksum = match algorithm {
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                                    &part_metadata.crc32
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                                    &part_metadata.crc32c
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                                    &part_metadata.sha1
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                                    &part_metadata.sha256
+                                }
+                                _ => &None,
+                            };
+
+                            if let Some(checksum) = part_checksum {
+                                integrity_checks.update(checksum.as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+            None => {} // No checksum calculation
+            Some(_) => {
+                // Future checksum types - default to composite behavior
+                if let Some(algorithm) = checksum_algorithm.as_ref() {
+                    for (part_number, _) in &request.parts {
+                        if let Some((_, part_metadata)) = upload_parts.get(part_number) {
+                            let part_checksum = match algorithm {
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                                    &part_metadata.crc32
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                                    &part_metadata.crc32c
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                                    &part_metadata.sha1
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                                    &part_metadata.sha256
+                                }
+                                _ => &None,
+                            };
+
+                            if let Some(checksum) = part_checksum {
+                                integrity_checks.update(checksum.as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let object_integrity = integrity_checks.finalize();
+
+        // Validate against client-provided checksum if present
+        if let Some(client_checksums) = request.client_checksums {
+            if let Err(error_msg) = object_integrity.validate(client_checksums) {
+                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            }
+        }
 
         // Update the final metadata
         final_metadata.content_length = total_size;
@@ -315,6 +430,7 @@ impl StorageBackend for InMemoryStorage {
             key: key.clone(),
             etag: combined_etag,
             metadata: final_metadata,
+            object_integrity,
         })
     }
 
@@ -560,6 +676,7 @@ mod tests {
         let request = crate::storage::CompleteMultipartUploadRequest {
             upload_id,
             parts: parts_to_complete,
+            client_checksums: None,
         };
         let response = storage.complete_multipart_upload(request).await.unwrap();
 
@@ -609,6 +726,7 @@ mod tests {
         let request = crate::storage::CompleteMultipartUploadRequest {
             upload_id,
             parts: parts_to_complete,
+            client_checksums: None,
         };
         let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());

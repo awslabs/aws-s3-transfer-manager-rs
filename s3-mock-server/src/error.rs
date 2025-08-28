@@ -37,6 +37,10 @@ pub enum Error {
     #[error("invalid part order")]
     InvalidPartOrder,
 
+    /// Checksum validation failed.
+    #[error("checksum mismatch: {0}")]
+    ChecksumMismatch(String),
+
     /// The range specified is invalid
     #[error("invalid range")]
     InvalidRange,
@@ -70,6 +74,7 @@ impl From<Error> for s3s::S3Error {
             Error::NoSuchUpload => s3s::S3ErrorCode::NoSuchUpload,
             Error::NoSuchPart | Error::InvalidPart => s3s::S3ErrorCode::InvalidPart,
             Error::InvalidPartOrder => s3s::S3ErrorCode::InvalidPartOrder,
+            Error::ChecksumMismatch(_) => s3s::S3ErrorCode::BadDigest,
             Error::InvalidRange => s3s::S3ErrorCode::InvalidRange,
             _ => s3s::S3ErrorCode::InternalError,
         };

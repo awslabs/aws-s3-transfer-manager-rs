@@ -25,6 +25,20 @@ use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetada
 use crate::storage::StorageBackend;
 use crate::types::StoredObjectMetadata;
 
+// Helper function to extract part checksum based on algorithm
+fn get_part_checksum<'a>(
+    part_metadata: &'a PartMetadata,
+    algorithm: &aws_smithy_checksums::ChecksumAlgorithm,
+) -> Option<&'a String> {
+    match algorithm {
+        aws_smithy_checksums::ChecksumAlgorithm::Crc32 => part_metadata.crc32.as_ref(),
+        aws_smithy_checksums::ChecksumAlgorithm::Crc32c => part_metadata.crc32c.as_ref(),
+        aws_smithy_checksums::ChecksumAlgorithm::Sha1 => part_metadata.sha1.as_ref(),
+        aws_smithy_checksums::ChecksumAlgorithm::Sha256 => part_metadata.sha256.as_ref(),
+        _ => None,
+    }
+}
+
 /// A stream wrapper that limits the total number of bytes read from the underlying stream.
 #[pin_project]
 struct LimitedStream<S> {
@@ -425,14 +439,53 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::UploadPartRequest<'_>,
     ) -> Result<crate::storage::UploadPartResponse> {
-        // Verify the upload exists
+        // Verify the upload exists and get checksum algorithm
         let metadata_path = self.get_upload_metadata_path(request.upload_id);
         let mut upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
             .await?
             .ok_or(Error::NoSuchUpload)?;
 
+        let checksum_algorithm = upload_metadata.metadata.checksum_algorithm.clone();
+
         // Calculate ETag
         let etag = format!("\"{:x}\"", md5::compute(&request.content));
+
+        // Calculate part checksums if algorithm is specified
+        let mut part_metadata = PartMetadata {
+            etag: etag.clone(),
+            size: request.content.len() as u64,
+            ..Default::default()
+        };
+
+        if let Some(algorithm) = checksum_algorithm {
+            use crate::types::ObjectIntegrityChecks;
+
+            // Calculate checksum for the specified algorithm
+            let mut integrity_checks =
+                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm.into());
+            integrity_checks.update(&request.content);
+            let calculated_integrity = integrity_checks.finalize();
+
+            // Store the calculated checksum in part metadata
+            match algorithm {
+                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                    part_metadata.crc32 = calculated_integrity.crc32;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                    part_metadata.crc32c = calculated_integrity.crc32c;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme => {
+                    part_metadata.crc64nvme = calculated_integrity.crc64nvme;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                    part_metadata.sha1 = calculated_integrity.sha1;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                    part_metadata.sha256 = calculated_integrity.sha256;
+                }
+                _ => {} // Ignore unsupported algorithms
+            }
+        }
 
         // Save the part data
         let part_path = self.get_part_path(request.upload_id, request.part_number);
@@ -442,11 +495,6 @@ impl StorageBackend for FilesystemStorage {
         fs::write(&part_path, &request.content).await?;
 
         // Save the part metadata
-        let part_metadata = PartMetadata {
-            etag: etag.clone(),
-            size: request.content.len() as u64,
-            ..Default::default()
-        };
         let part_metadata_path =
             self.get_part_metadata_path(request.upload_id, request.part_number);
         Self::save_metadata(&part_metadata_path, &part_metadata).await?;
@@ -491,10 +539,13 @@ impl StorageBackend for FilesystemStorage {
             .await?
             .ok_or(Error::NoSuchUpload)?;
 
-        // Verify all parts exist and ETags match
+        let checksum_algorithm = upload_metadata.metadata.checksum_algorithm.clone();
+        let checksum_type = upload_metadata.checksum_type;
+
+        // Verify all parts exist and ETags match, collect metadata
         let mut total_size = 0u64;
         let mut etags = Vec::new();
-        let mut combined = BytesMut::new();
+        let mut part_metadata_list = Vec::new();
 
         for (part_number, expected_etag) in &request.parts {
             let part_metadata_path = self.get_part_metadata_path(request.upload_id, *part_number);
@@ -506,13 +557,9 @@ impl StorageBackend for FilesystemStorage {
                 return Err(Error::InvalidPart);
             }
 
-            // Read the part data
-            let part_path = self.get_part_path(request.upload_id, *part_number);
-            let part_data = fs::read(&part_path).await?;
-            combined.extend_from_slice(&part_data);
-
             total_size += part_metadata.size;
             etags.push(part_metadata.etag.clone());
+            part_metadata_list.push((*part_number, part_metadata));
         }
 
         // Calculate the final ETag
@@ -525,13 +572,64 @@ impl StorageBackend for FilesystemStorage {
             format!("\"{:x}\"", md5::compute(""))
         };
 
+        // Calculate checksums if algorithm is specified
+        let mut combined = BytesMut::new();
+        let mut integrity_checks = checksum_algorithm
+            .as_ref()
+            .map(|algorithm| {
+                crate::types::ObjectIntegrityChecks::new()
+                    .with_checksum_algorithm((*algorithm).into())
+            })
+            .unwrap_or_else(|| crate::types::ObjectIntegrityChecks::new());
+
+        for (part_number, part_metadata) in &part_metadata_list {
+            let part_path = self.get_part_path(request.upload_id, *part_number);
+            let part_data = fs::read(&part_path).await?;
+
+            // Always assemble the final object
+            combined.extend_from_slice(&part_data);
+
+            // Update checksums based on type
+            match checksum_type {
+                Some(aws_sdk_s3::types::ChecksumType::FullObject) => {
+                    integrity_checks.update(&part_data);
+                }
+                Some(aws_sdk_s3::types::ChecksumType::Composite) => {
+                    if let Some(algorithm) = checksum_algorithm.as_ref() {
+                        if let Some(part_checksum) = get_part_checksum(part_metadata, algorithm) {
+                            integrity_checks.update(part_checksum.as_bytes());
+                        }
+                    }
+                }
+                None => {} // No checksum calculation
+                Some(_) => {
+                    // Future checksum types - default to composite behavior
+                    if let Some(algorithm) = checksum_algorithm.as_ref() {
+                        if let Some(part_checksum) = get_part_checksum(part_metadata, algorithm) {
+                            integrity_checks.update(part_checksum.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Finalize checksum calculation
+        let object_integrity = integrity_checks.finalize();
+
+        // Validate against client-provided checksum if present
+        if let Some(client_checksums) = request.client_checksums {
+            if let Err(error_msg) = object_integrity.validate(client_checksums) {
+                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            }
+        }
+
         // Update the final metadata
         let mut final_metadata = upload_metadata.metadata;
         final_metadata.content_length = total_size;
         final_metadata.etag = combined_etag.clone();
         final_metadata.last_modified = SystemTime::now();
 
-        // Save the final object directly
+        // Save the final object
         let combined_data = combined.freeze();
         let object_path = self.get_object_path(&upload_metadata.key);
         let metadata_path = self.get_object_metadata_path(&upload_metadata.key);
@@ -544,7 +642,7 @@ impl StorageBackend for FilesystemStorage {
         // Write object data and metadata
         fs::write(&object_path, &combined_data).await?;
         let metadata_json = serde_json::to_string_pretty(&final_metadata)
-            .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            .map_err(|e| Error::Internal(format!("Failed to serialize metadata: {}", e)))?;
         fs::write(&metadata_path, metadata_json).await?;
 
         // Clean up the multipart upload
@@ -554,7 +652,13 @@ impl StorageBackend for FilesystemStorage {
             key: upload_metadata.key.clone(),
             etag: combined_etag,
             metadata: final_metadata,
+            object_integrity,
         })
+    }
+
+    async fn head_object(&self, key: &str) -> Result<Option<ObjectMetadata>> {
+        let metadata_path = self.get_object_metadata_path(key);
+        Self::load_metadata(&metadata_path).await
     }
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
@@ -571,12 +675,8 @@ impl StorageBackend for FilesystemStorage {
 
         Ok(())
     }
-
-    async fn head_object(&self, key: &str) -> Result<Option<ObjectMetadata>> {
-        let metadata_path = self.get_object_metadata_path(key);
-        Self::load_metadata(&metadata_path).await
-    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +900,7 @@ mod tests {
         let request = crate::storage::CompleteMultipartUploadRequest {
             upload_id,
             parts: parts_to_complete,
+            client_checksums: None,
         };
         let response = storage.complete_multipart_upload(request).await.unwrap();
 
@@ -850,6 +951,7 @@ mod tests {
         let request = crate::storage::CompleteMultipartUploadRequest {
             upload_id,
             parts: parts_to_complete,
+            client_checksums: None,
         };
         let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());

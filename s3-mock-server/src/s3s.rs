@@ -328,6 +328,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         let upload_id = &input.upload_id;
 
+        // Extract client checksums before consuming input
+        let client_checksums = crate::types::ClientChecksums::from(&input);
+
         // Extract part information
         let mut parts = Vec::new();
         if let Some(completed_parts) = input.multipart_upload.and_then(|u| u.parts) {
@@ -351,7 +354,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         // Complete the multipart upload
-        let request = crate::storage::CompleteMultipartUploadRequest { upload_id, parts };
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            upload_id,
+            parts,
+            client_checksums: if client_checksums.has_any() {
+                Some(&client_checksums)
+            } else {
+                None
+            },
+        };
         let response = self.storage.complete_multipart_upload(request).await?;
 
         // Build response
@@ -359,6 +370,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             key: Some(response.key),
             e_tag: Some(response.etag),
             bucket: Some("mock-bucket".to_string()),
+            checksum_crc32: response.object_integrity.crc32,
+            checksum_crc32c: response.object_integrity.crc32c,
+            checksum_sha1: response.object_integrity.sha1,
+            checksum_sha256: response.object_integrity.sha256,
+            checksum_crc64nvme: response.object_integrity.crc64nvme,
             ..Default::default()
         };
 

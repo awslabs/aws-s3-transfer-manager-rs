@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::pin::Pin;
 
 use crate::storage::models::ObjectMetadata;
-use crate::types::{ObjectIntegrityChecks, StoredObjectMetadata};
+use crate::types::{ClientChecksums, ObjectIntegrity, ObjectIntegrityChecks, StoredObjectMetadata};
 use crate::Result;
 
 pub(crate) mod filesystem;
@@ -102,6 +102,7 @@ pub(crate) struct PartInfo {
 pub(crate) struct CompleteMultipartUploadRequest<'a> {
     pub upload_id: &'a str,
     pub parts: Vec<(i32, String)>,
+    pub client_checksums: Option<&'a ClientChecksums>,
 }
 
 /// Response for completing a multipart upload.
@@ -110,6 +111,7 @@ pub(crate) struct CompleteMultipartUploadResponse {
     pub key: String,
     pub etag: String,
     pub metadata: ObjectMetadata,
+    pub object_integrity: ObjectIntegrity,
 }
 
 impl StoreObjectRequest {

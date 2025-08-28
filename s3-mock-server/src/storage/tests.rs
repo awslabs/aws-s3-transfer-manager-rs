@@ -85,6 +85,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
     let complete_request = CompleteMultipartUploadRequest {
         upload_id,
         parts: vec![(1, etag1), (2, etag2), (3, etag3)],
+        client_checksums: None,
     };
     storage
         .complete_multipart_upload(complete_request)
