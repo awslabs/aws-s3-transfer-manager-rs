@@ -32,6 +32,7 @@ pub(super) struct DownloadChunkRequest {
     pub(super) remaining: RangeInclusive<u64>,
     pub(super) input: DownloadInputBuilder,
     pub(super) start_seq: u64,
+    pub(super) current_seq: u64,
 }
 
 impl ProvideNetworkPermitContext for DownloadChunkRequest {
@@ -80,22 +81,21 @@ fn next_chunk(
 async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkOutput, error::Error> {
-    let seq: u64 = request.ctx.next_seq();
-
+    let current_seq = request.current_seq;
     // the rest of the work is in its own fn, so we can log `seq` in the tracing span
-    download_specific_chunk(request, seq)
-        .instrument(tracing::debug_span!("download-chunk", seq))
+    download_specific_chunk(request)
+        .instrument(tracing::debug_span!("download-chunk", current_seq))
         .await
 }
 
 async fn download_specific_chunk(
     request: DownloadChunkRequest,
-    seq: u64,
 ) -> Result<ChunkOutput, error::Error> {
     let ctx = request.ctx;
     let part_size = ctx.handle.download_part_size_bytes();
+    let current_seq = request.current_seq;
     let input = next_chunk(
-        seq,
+        current_seq,
         request.remaining,
         part_size,
         request.start_seq,
@@ -103,26 +103,28 @@ async fn download_specific_chunk(
     );
 
     let op = input.into_sdk_operation(ctx.client());
+    let requested_byte_range = op.get_range().clone().expect("range set in `next_chunk");
     let mut cancel_rx = ctx.state.cancel_rx.clone();
     tokio::select! {
         _ = cancel_rx.changed() => {
-            tracing::debug!("Received cancellating signal, exiting and not downloading chunk#{seq}");
+            tracing::debug!("Received cancellating signal, exiting and not downloading chunk#{current_seq}");
             Err(error::operation_cancelled())
         },
         resp = op.send() => {
             match resp {
                 Err(err) => Err(error::from_kind(error::ErrorKind::ChunkFailed)(err)),
                 Ok(mut resp) => {
+                    validate_content_range(&requested_byte_range, resp.content_range())?;
                     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
                     let body = AggregatedBytes::from_byte_stream(body)
                         .instrument(tracing::debug_span!(
                             "collect-body-from-download-chunk",
-                            seq
+                            current_seq
                         ))
                         .await?;
 
                     Ok(ChunkOutput {
-                        seq,
+                        seq: current_seq,
                         data: body,
                         metadata: resp.into(),
                     })
@@ -172,18 +174,23 @@ pub(super) fn distribute_work(
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
     for _ in 0..num_parts {
-        let req = DownloadChunkRequest {
-            ctx: ctx.clone(),
-            remaining: remaining.clone(),
-            input: input.clone(),
-            start_seq,
-        };
-
         let svc = svc.clone();
+        let ctx = ctx.clone();
+        let remaining = remaining.clone();
+        let input = input.clone();
         let chunk_tx = chunk_tx.clone();
         let cancel_tx = ctx.state.cancel_tx.clone();
 
         let task = async move {
+            let current_seq = ctx.next_seq();
+            let req = DownloadChunkRequest {
+                ctx,
+                remaining,
+                input,
+                start_seq,
+                current_seq,
+            };
+
             let resp = svc.oneshot(req).await;
             // If any chunk fails, send cancel notification, to kill any other in-flight chunks
             if let Err(err) = &resp {
@@ -211,4 +218,57 @@ pub(super) fn distribute_work(
     }
 
     tracing::trace!("work fully distributed");
+}
+
+/// Validates that the response content range matches the requested range.
+///
+/// Handles both "1024-2047" and "bytes=1024-2047" formats for the requested content range.
+/// The response_content_range is of the form Some("bytes 1024-2047/4096").
+fn validate_content_range(
+    requested_content_range: &str,
+    response_content_range: Option<&str>,
+) -> Result<(), error::Error> {
+    // Strip "bytes=" prefix if present to normalize the requested range
+    let content_range = requested_content_range
+        .strip_prefix("bytes=")
+        .unwrap_or(requested_content_range);
+
+    if response_content_range
+        .map(|range| range.contains(content_range))
+        .unwrap_or_default()
+    {
+        Ok(())
+    } else {
+        Err(crate::error::Error::new(
+            crate::error::ErrorKind::ChunkFailed,
+            format!(
+                "Content range in response must match the requested range: requested range {}, content-range in response {:?}",
+                requested_content_range,
+                response_content_range,
+            ),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_content_range_success() {
+        assert!(validate_content_range("1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range("bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_mismatch() {
+        assert!(validate_content_range("1024-2047", Some("bytes 2048-3071/4096")).is_err());
+        assert!(validate_content_range("bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_none_response() {
+        assert!(validate_content_range("1024-2047", None).is_err());
+        assert!(validate_content_range("bytes=1024-2047", None).is_err());
+    }
 }
