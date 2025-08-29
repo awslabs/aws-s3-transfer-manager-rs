@@ -17,3 +17,4 @@ aws-config = "1"
 s3-mock-server = { path = "../s3-mock-server" }
 aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
 bytes = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
