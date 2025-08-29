@@ -40,7 +40,7 @@ impl ProvideNetworkPermitContext for DownloadChunkRequest {
     fn network_permit_context(&self) -> NetworkPermitContext {
         // we can't know the actual size by calling next_seq() as that would modify the
         // state. Instead we give an estimate based on the current sequence.
-        let seq = self.ctx.current_seq();
+        let seq = self.current_seq;
         let remaining = self.remaining.clone();
         let part_size = self.ctx.handle.download_part_size_bytes();
         let range = next_range(seq, remaining, part_size, self.start_seq);
