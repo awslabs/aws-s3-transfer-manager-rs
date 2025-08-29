@@ -2,6 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
 use crate::error;
 use crate::error::ErrorKind;
 use crate::http::header;
@@ -170,6 +171,8 @@ pub(super) fn distribute_work(
     let svc = chunk_service(&ctx);
     let part_size = ctx.target_part_size_bytes();
     let input: DownloadInputBuilder = input.into();
+    // Set aside the number of tasks before distributing work
+    let num_tasks_before = tasks.len() as u64;
 
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
@@ -198,23 +201,31 @@ pub(super) fn distribute_work(
                     // Ignore any OperationCancelled errors.
                     return;
                 }
-                if cancel_tx.send(true).is_err() {
-                    tracing::debug!(
-                        "all receiver ends have dropped, unable to send a cancellation signal"
-                    );
+                if let Err(e) = cancel_tx.send(true) {
+                    tracing::debug!(error = ?e, "all receiver ends have dropped, unable to send a cancellation signal");
                 }
             }
 
             if let Err(err) = chunk_tx.send(resp).await {
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
-                if cancel_tx.send(true).is_err() {
-                    tracing::debug!(
-                        "all receiver ends have dropped, unable to send a cancellation signal"
-                    );
+                if let Err(e) = cancel_tx.send(true) {
+                    tracing::debug!(error = ?e, "all receiver ends have dropped, unable to send a cancellation signal");
                 }
             }
         };
         tasks.spawn(task.instrument(parent_span_for_tasks.clone()));
+    }
+
+    let num_requests = tasks.len() as u64 - num_tasks_before;
+    if num_parts != num_requests {
+        tracing::error!(
+            "The total number of GetObject requests must match the expected number of parts: request count {}, number of parts {}",
+            num_requests,
+            num_parts,
+        );
+        if let Err(e) = ctx.state.cancel_tx.send(true) {
+            tracing::debug!(error = ?e, "all receiver ends have dropped, unable to send a cancellation signal");
+        }
     }
 
     tracing::trace!("work fully distributed");
