@@ -8,14 +8,11 @@ use crate::{
         hedge,
         limit::concurrency::{ConcurrencyLimitLayer, ProvideNetworkPermitContext},
     },
-    operation::upload::UploadContext,
+    operation::upload::{input::convert::copy_fields_to_upload_part_request, UploadContext},
     runtime::scheduler::NetworkPermitContext,
     types::BucketType,
 };
-use aws_sdk_s3::{
-    primitives::ByteStream,
-    types::{ChecksumAlgorithm, CompletedPart},
-};
+use aws_sdk_s3::{primitives::ByteStream, types::CompletedPart};
 use bytes::Buf;
 use tokio::{sync::Mutex, task};
 use tower::{hedge::Policy, service_fn, Service, ServiceBuilder, ServiceExt};
@@ -73,43 +70,16 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
 
-    let mut req = ctx
-        .client()
-        .upload_part()
-        .set_bucket(ctx.request.bucket.clone())
-        .set_key(ctx.request.key.clone())
-        .set_upload_id(Some(request.upload_id))
-        .part_number(part_number)
-        .content_length(part_data.data.remaining() as i64)
-        .body(ByteStream::from(part_data.data))
-        .set_sse_customer_algorithm(ctx.request.sse_customer_algorithm.clone())
-        .set_sse_customer_key(ctx.request.sse_customer_key.clone())
-        .set_sse_customer_key_md5(ctx.request.sse_customer_key_md5.clone())
-        .set_request_payer(ctx.request.request_payer.clone())
-        .set_expected_bucket_owner(ctx.request.expected_bucket_owner.clone());
-
-    if let Some(checksum_strategy) = &ctx.request.checksum_strategy {
-        // If user passed checksum value via PartStream, add it to request
-        if let Some(checksum_value) = &part_data.checksum {
-            req = match checksum_strategy.algorithm() {
-                ChecksumAlgorithm::Crc32 => req.checksum_crc32(checksum_value),
-                ChecksumAlgorithm::Crc32C => req.checksum_crc32_c(checksum_value),
-                ChecksumAlgorithm::Crc64Nvme => req.checksum_crc64_nvme(checksum_value),
-                ChecksumAlgorithm::Sha1 => req.checksum_sha1(checksum_value),
-                ChecksumAlgorithm::Sha256 => req.checksum_sha256(checksum_value),
-                algo => unreachable!("unexpected checksum algorithm `{algo}`"),
-            }
-        } else {
-            // Otherwise, set checksum algorithm, which tells SDK to calculate and add checksum value
-            req = req.checksum_algorithm(checksum_strategy.algorithm().clone());
-        }
-    } else {
-        // Warn if user is passing a checksum value, but the upload isn't doing checksums.
-        // We can't just set a checksum header, because we don't know what algorithm to use.
-        if part_data.checksum.is_some() {
-            tracing::warn!("Ignoring part checksum provided during upload, because no ChecksumStrategy is specified");
-        }
-    }
+    let req = copy_fields_to_upload_part_request(
+        &ctx.request,
+        ctx.client()
+            .upload_part()
+            .set_upload_id(Some(request.upload_id))
+            .part_number(part_number)
+            .content_length(part_data.data.remaining() as i64)
+            .body(ByteStream::from(part_data.data)),
+        part_data.checksum.as_ref(),
+    );
 
     let resp = req
         .customize()
