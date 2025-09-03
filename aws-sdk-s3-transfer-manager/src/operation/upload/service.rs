@@ -226,8 +226,8 @@ pub(super) async fn read_body(
         if part_reader.part_size() != part_data.data.remaining()
             && part_data.is_last() == Some(false)
         {
-            return Err(error::Error::new(
-                error::ErrorKind::ChunkFailed,
+            return Err(error::chunk_failed(
+                error::ChunkId::Upload(upload_id),
                 format!(
                     "upload part size mismatch for non-last part {}: configured part size {}, got data size {}",
                     part_data.part_number,

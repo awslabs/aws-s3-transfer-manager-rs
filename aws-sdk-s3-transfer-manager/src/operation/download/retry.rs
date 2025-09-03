@@ -8,7 +8,12 @@ use futures_util::future;
 use std::sync::Arc;
 use tower::retry::budget::{Budget, TpsBudget};
 
-/// A `tower::retry::Policy` implementation for retrying requests
+use crate::{
+    error::ErrorKind,
+    operation::download::{service::DownloadChunkRequest, ChunkOutput},
+};
+
+/// A `tower::retry::Policy` implementation for retrying download chunk requests
 #[derive(Debug, Clone)]
 pub(crate) struct RetryPolicy {
     budget: Arc<TpsBudget>,
@@ -37,14 +42,14 @@ fn find_source<'a, E: std::error::Error + 'static>(
     None
 }
 
-impl<Req, Res, E> tower::retry::Policy<Req, Res, E> for RetryPolicy
-where
-    Req: Clone,
-    E: std::error::Error + 'static,
-{
+impl tower::retry::Policy<DownloadChunkRequest, ChunkOutput, crate::error::Error> for RetryPolicy {
     type Future = future::Ready<()>;
 
-    fn retry(&mut self, _req: &mut Req, result: &mut Result<Res, E>) -> Option<Self::Future> {
+    fn retry(
+        &mut self,
+        req: &mut DownloadChunkRequest,
+        result: &mut Result<ChunkOutput, crate::error::Error>,
+    ) -> Option<Self::Future> {
         match result {
             Ok(_) => {
                 self.budget.deposit();
@@ -59,12 +64,15 @@ where
                     return None;
                 }
                 self.remaining_attempts -= 1;
+                if let ErrorKind::ChunkFailed(chunk_failed) = err.kind() {
+                    req.seq = chunk_failed.download_seq();
+                }
                 Some(future::ready(()))
             }
         }
     }
 
-    fn clone_request(&mut self, req: &Req) -> Option<Req> {
+    fn clone_request(&mut self, req: &DownloadChunkRequest) -> Option<DownloadChunkRequest> {
         Some(req.clone())
     }
 }

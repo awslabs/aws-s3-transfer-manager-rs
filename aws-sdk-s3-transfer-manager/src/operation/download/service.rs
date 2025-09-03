@@ -4,13 +4,14 @@
  */
 
 use crate::error;
+use crate::error::ChunkId;
 use crate::error::ErrorKind;
 use crate::http::header;
 use crate::io::AggregatedBytes;
 use crate::middleware::limit::concurrency::ConcurrencyLimitLayer;
 use crate::middleware::limit::concurrency::ProvideNetworkPermitContext;
-use crate::middleware::retry;
 use crate::operation::download::DownloadContext;
+use crate::operation::download::RetryPolicy;
 use crate::runtime::scheduler::NetworkPermitContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
@@ -33,14 +34,17 @@ pub(super) struct DownloadChunkRequest {
     pub(super) remaining: RangeInclusive<u64>,
     pub(super) input: DownloadInputBuilder,
     pub(super) start_seq: u64,
-    pub(super) current_seq: u64,
+    // Initially set to `None`.
+    // It will be assigned the sequence when `download_chunk_handler` is invoked through retries
+    // to ensure the handler operates on the previously assigned number.
+    pub(super) seq: Option<u64>,
 }
 
 impl ProvideNetworkPermitContext for DownloadChunkRequest {
     fn network_permit_context(&self) -> NetworkPermitContext {
         // we can't know the actual size by calling next_seq() as that would modify the
         // state. Instead we give an estimate based on the current sequence.
-        let seq = self.current_seq;
+        let seq = self.ctx.current_seq();
         let remaining = self.remaining.clone();
         let part_size = self.ctx.handle.download_part_size_bytes();
         let range = next_range(seq, remaining, part_size, self.start_seq);
@@ -82,21 +86,26 @@ fn next_chunk(
 async fn download_chunk_handler(
     request: DownloadChunkRequest,
 ) -> Result<ChunkOutput, error::Error> {
-    let current_seq = request.current_seq;
+    // `seq` should be assigned at this point, i.e., after the handler begins execution.
+    // Assigning `seq` at the time of `tokio::spawn` could cause issues, as spawn order is not guaranteed.
+    // This could result in later `seq`s being processed before earlier ones, leading to inefficient memory usage.
+    // Related: https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/60
+    let seq: u64 = request.seq.unwrap_or_else(|| request.ctx.next_seq());
+
     // the rest of the work is in its own fn, so we can log `seq` in the tracing span
-    download_specific_chunk(request)
-        .instrument(tracing::debug_span!("download-chunk", current_seq))
+    download_specific_chunk(request, seq)
+        .instrument(tracing::debug_span!("download-chunk", seq))
         .await
 }
 
 async fn download_specific_chunk(
     request: DownloadChunkRequest,
+    seq: u64,
 ) -> Result<ChunkOutput, error::Error> {
     let ctx = request.ctx;
     let part_size = ctx.handle.download_part_size_bytes();
-    let current_seq = request.current_seq;
     let input = next_chunk(
-        current_seq,
+        seq,
         request.remaining,
         part_size,
         request.start_seq,
@@ -108,24 +117,27 @@ async fn download_specific_chunk(
     let mut cancel_rx = ctx.state.cancel_rx.clone();
     tokio::select! {
         _ = cancel_rx.changed() => {
-            tracing::debug!("Received cancellating signal, exiting and not downloading chunk#{current_seq}");
+            tracing::debug!("Received cancellating signal, exiting and not downloading chunk#{seq}");
             Err(error::operation_cancelled())
         },
         resp = op.send() => {
             match resp {
-                Err(err) => Err(error::from_kind(error::ErrorKind::ChunkFailed)(err)),
+                Err(err) => Err(error::chunk_failed(ChunkId::Download(seq), err)),
                 Ok(mut resp) => {
-                    validate_content_range(&requested_byte_range, resp.content_range())?;
+                    validate_content_range(seq, &requested_byte_range, resp.content_range())?;
                     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
                     let body = AggregatedBytes::from_byte_stream(body)
                         .instrument(tracing::debug_span!(
                             "collect-body-from-download-chunk",
-                            current_seq
+                            seq
                         ))
-                        .await?;
+                        .await
+                        .map_err(|err| {
+                           error::chunk_failed(ChunkId::Download(seq), err)
+                        })?;
 
                     Ok(ChunkOutput {
-                        seq: current_seq,
+                        seq,
                         data: body,
                         metadata: resp.into(),
                     })
@@ -146,7 +158,7 @@ pub(super) fn chunk_service(
 
     ServiceBuilder::new()
         .layer(concurrency_limit)
-        .retry(retry::RetryPolicy::default())
+        .retry(RetryPolicy::default())
         .service(svc)
 }
 
@@ -177,23 +189,19 @@ pub(super) fn distribute_work(
     let size = *remaining.end() - *remaining.start() + 1;
     let num_parts = size.div_ceil(part_size);
     for _ in 0..num_parts {
+        let req = DownloadChunkRequest {
+            ctx: ctx.clone(),
+            remaining: remaining.clone(),
+            input: input.clone(),
+            start_seq,
+            seq: None,
+        };
+
         let svc = svc.clone();
-        let ctx = ctx.clone();
-        let remaining = remaining.clone();
-        let input = input.clone();
         let chunk_tx = chunk_tx.clone();
         let cancel_tx = ctx.state.cancel_tx.clone();
 
         let task = async move {
-            let current_seq = ctx.next_seq();
-            let req = DownloadChunkRequest {
-                ctx,
-                remaining,
-                input,
-                start_seq,
-                current_seq,
-            };
-
             let resp = svc.oneshot(req).await;
             // If any chunk fails, send cancel notification, to kill any other in-flight chunks
             if let Err(err) = &resp {
@@ -236,6 +244,7 @@ pub(super) fn distribute_work(
 /// Handles both "1024-2047" and "bytes=1024-2047" formats for the requested content range.
 /// The response_content_range is of the form Some("bytes 1024-2047/4096").
 fn validate_content_range(
+    seq: u64,
     requested_content_range: &str,
     response_content_range: Option<&str>,
 ) -> Result<(), error::Error> {
@@ -250,8 +259,7 @@ fn validate_content_range(
     {
         Ok(())
     } else {
-        Err(crate::error::Error::new(
-            crate::error::ErrorKind::ChunkFailed,
+        Err(crate::error::chunk_failed(ChunkId::Download(seq),
             format!(
                 "Content range in response must match the requested range: requested range {}, content-range in response {:?}",
                 requested_content_range,
@@ -265,21 +273,33 @@ fn validate_content_range(
 mod tests {
     use super::*;
 
+    const DUMMY_SEQ: u64 = 1;
+
     #[test]
     fn test_validate_content_range_success() {
-        assert!(validate_content_range("1024-2047", Some("bytes 1024-2047/4096")).is_ok());
-        assert!(validate_content_range("bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(
+            validate_content_range(DUMMY_SEQ, "1024-2047", Some("bytes 1024-2047/4096")).is_ok()
+        );
+        assert!(
+            validate_content_range(DUMMY_SEQ, "bytes=1024-2047", Some("bytes 1024-2047/4096"))
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_validate_content_range_mismatch() {
-        assert!(validate_content_range("1024-2047", Some("bytes 2048-3071/4096")).is_err());
-        assert!(validate_content_range("bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err());
+        assert!(
+            validate_content_range(DUMMY_SEQ, "1024-2047", Some("bytes 2048-3071/4096")).is_err()
+        );
+        assert!(
+            validate_content_range(DUMMY_SEQ, "bytes=1024-2047", Some("bytes 2048-3071/4096"))
+                .is_err()
+        );
     }
 
     #[test]
     fn test_validate_content_range_none_response() {
-        assert!(validate_content_range("1024-2047", None).is_err());
-        assert!(validate_content_range("bytes=1024-2047", None).is_err());
+        assert!(validate_content_range(DUMMY_SEQ, "1024-2047", None).is_err());
+        assert!(validate_content_range(DUMMY_SEQ, "bytes=1024-2047", None).is_err());
     }
 }
