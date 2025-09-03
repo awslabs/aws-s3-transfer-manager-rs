@@ -5,4 +5,3 @@
 
 pub(crate) mod hedge;
 pub(crate) mod limit;
-pub(crate) mod retry;
