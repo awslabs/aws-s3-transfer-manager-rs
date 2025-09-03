@@ -4,11 +4,12 @@
  */
 
 use aws_sdk_s3_transfer_manager::error::Error;
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::operation::download::DownloadHandle;
+use aws_sdk_s3_transfer_manager::operation::download::{Body, DownloadHandle};
 use bytes::Bytes;
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use s3_mock_server::S3MockServer;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 /// drain/consume the body
 pub async fn drain(handle: &mut DownloadHandle) -> Result<(), Error> {
@@ -21,6 +22,50 @@ pub async fn drain(handle: &mut DownloadHandle) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// write body to file
+pub async fn write_body(
+    body: &mut Body,
+    mut dest: fs::File,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?.data;
+        for segment in chunk.into_segments() {
+            dest.write_all(segment.as_ref()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Setup shared test infrastructure
+async fn setup_test(
+    size: usize,
+) -> (
+    S3MockServer,
+    s3_mock_server::ServerHandle,
+    aws_sdk_s3_transfer_manager::Client,
+) {
+    let mock_server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .unwrap();
+
+    let data = Bytes::from(vec![0u8; size]);
+    mock_server
+        .add_object("test-key", data, None)
+        .await
+        .unwrap();
+
+    let handle = mock_server.start().await.unwrap();
+    let s3_client = handle.client().await;
+
+    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+
+    (mock_server, handle, tm)
 }
 
 fn download_throughput_benchmark(c: &mut Criterion) {
@@ -38,74 +83,44 @@ fn download_throughput_benchmark(c: &mut Criterion) {
     for (name, size) in sizes {
         group.throughput(Throughput::Bytes(size as u64));
 
-        // // Benchmark S3 client directly
-        // group.bench_with_input(BenchmarkId::new("s3_client", name), &size, |b, &size| {
-        //     b.iter_custom(|iters| {
-        //         rt.block_on(async {
-        //             // Setup: Create server and add object directly (no network call)
-        //             let mock_server = S3MockServer::builder()
-        //                 .with_in_memory_store()
-        //                 .build()
-        //                 .unwrap();
-        //
-        //             let data = Bytes::from(vec![0u8; size]);
-        //             mock_server.add_object("test-key", data, None).await.unwrap();
-        //
-        //             let handle = mock_server.start().await.unwrap();
-        //             let client = handle.client().await;
-        //
-        //             // Benchmark: Time only the downloads
-        //             let start = std::time::Instant::now();
-        //             for _ in 0..iters {
-        //                 let mut resp = client
-        //                     .get_object()
-        //                     .bucket("test-bucket")
-        //                     .key("test-key")
-        //                     .send()
-        //                     .await
-        //                     .unwrap();
-        //
-        //                 while let Some(chunk) = resp.body.next().await {
-        //                     let _ = chunk.unwrap();
-        //                 }
-        //             }
-        //             let elapsed = start.elapsed();
-        //
-        //             handle.shutdown().await.unwrap();
-        //             elapsed
-        //         })
-        //     });
-        // });
-
-        // Benchmark Transfer Manager
+        // Benchmark Transfer Manager - drain to memory
         group.bench_with_input(
-            BenchmarkId::new("transfer_manager", name),
+            BenchmarkId::new("transfer_manager_ram", name),
             &size,
             |b, &size| {
                 b.iter_custom(|iters| {
                     rt.block_on(async {
-                        // Setup: Create server and add object directly (no network call)
-                        let mock_server = S3MockServer::builder()
-                            .with_in_memory_store()
-                            .build()
-                            .unwrap();
+                        let (_mock_server, handle, tm) = setup_test(size).await;
 
-                        let data = Bytes::from(vec![0u8; size]);
-                        mock_server
-                            .add_object("test-key", data, None)
-                            .await
-                            .unwrap();
+                        let start = std::time::Instant::now();
+                        for _ in 0..iters {
+                            let mut dl_handle = tm
+                                .download()
+                                .bucket("test-bucket")
+                                .key("test-key")
+                                .initiate()
+                                .expect("successful transfer initiate");
+                            drain(&mut dl_handle).await.unwrap();
+                        }
+                        let elapsed = start.elapsed();
 
-                        let handle = mock_server.start().await.unwrap();
-                        let s3_client = handle.client().await;
+                        handle.shutdown().await.unwrap();
+                        elapsed
+                    })
+                });
+            },
+        );
 
-                        // Create Transfer Manager
-                        let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-                            .client(s3_client)
-                            .build();
-                        let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+        // Benchmark Transfer Manager - write to file
+        group.bench_with_input(
+            BenchmarkId::new("transfer_manager_tmpfs", name),
+            &size,
+            |b, &size| {
+                b.iter_custom(|iters| {
+                    rt.block_on(async {
+                        let (_mock_server, handle, tm) = setup_test(size).await;
 
-                        // Benchmark: Time only the downloads
+                        let mut tmp_files = Vec::new();
                         let start = std::time::Instant::now();
                         for i in 0..iters {
                             let mut dl_handle = tm
@@ -114,11 +129,18 @@ fn download_throughput_benchmark(c: &mut Criterion) {
                                 .key("test-key")
                                 .initiate()
                                 .expect("successful transfer initiate");
-                            drain(&mut dl_handle).await.unwrap();
-                            // println!("run {} throughput: {:.4}", i, aws_sdk_s3_transfer_manager::metrics::Throughput::new(size as u64, start.elapsed()).display_as(ByteUnit::Gibibyte) );
+
+                            let temp_file = format!("/tmp/benchmark_output_{}.dat", i);
+                            tmp_files.push(temp_file.clone());
+                            let file = fs::File::create(&temp_file).await.unwrap();
+                            write_body(dl_handle.body_mut(), file).await.unwrap();
                         }
                         let elapsed = start.elapsed();
 
+                        // cleanup
+                        for temp_file in tmp_files {
+                            let _ = fs::remove_file(&temp_file).await;
+                        }
                         handle.shutdown().await.unwrap();
                         elapsed
                     })
