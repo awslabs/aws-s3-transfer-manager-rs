@@ -66,16 +66,17 @@ pub(crate) enum ChunkId {
 }
 
 impl ChunkFailed {
-    /// The sequence number of the chunk for download operation
-    pub fn download_seq(&self) -> Option<u64> {
+    // The sequence number of the chunk for download operation
+    pub(crate) fn download_seq(&self) -> Option<u64> {
         match self.id {
             ChunkId::Download(seq) => Some(seq),
             _ => None,
         }
     }
 
-    /// The upload ID of the chunk for upload operation
-    pub fn upload_id(&self) -> Option<&str> {
+    #[allow(dead_code)]
+    // The upload ID of the chunk for upload operation
+    pub(crate) fn upload_id(&self) -> Option<&str> {
         match &self.id {
             ChunkId::Upload(id) => Some(id),
             _ => None,
