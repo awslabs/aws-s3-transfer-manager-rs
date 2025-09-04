@@ -76,3 +76,65 @@ impl tower::retry::Policy<DownloadChunkRequest, ChunkOutput, crate::error::Error
         Some(req.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{ChunkId, Error, ErrorKind};
+    use crate::operation::download::{DownloadContext, DownloadInputBuilder};
+    use crate::types::{BucketType, PartSize};
+    use std::io;
+    use std::sync::Arc;
+    use tower::retry::Policy;
+
+    fn test_handle(
+        client: aws_sdk_s3::Client,
+        target_part_size: u64,
+    ) -> Arc<crate::client::Handle> {
+        let tm_config = crate::Config::builder()
+            .client(client)
+            .set_target_part_size(PartSize::Target(target_part_size))
+            .build();
+        let tm = crate::Client::new(tm_config);
+        tm.handle.clone()
+    }
+
+    fn download_chunk_request_for_tests() -> DownloadChunkRequest {
+        let client = aws_sdk_s3::Client::from_conf(aws_sdk_s3::Config::builder().build());
+        let target_part_size = 50;
+        let handle = test_handle(client, target_part_size);
+        let ctx = DownloadContext::new(handle, BucketType::Standard);
+        DownloadChunkRequest {
+            ctx,
+            remaining: 0..=1023,
+            input: DownloadInputBuilder::default(),
+            start_seq: 0,
+            seq: None,
+        }
+    }
+
+    #[test]
+    fn test_retry_updates_seq_on_chunk_failed_error() {
+        let mut policy = RetryPolicy::default();
+        let mut req = download_chunk_request_for_tests();
+        let io_err = io::Error::new(io::ErrorKind::Other, "test error");
+        let bytestream_err = ByteStreamError::from(io_err);
+        let mut result = Err(crate::error::chunk_failed(
+            ChunkId::Download(5),
+            bytestream_err,
+        ));
+
+        policy.retry(&mut req, &mut result);
+        assert_eq!(Some(5), req.seq);
+    }
+
+    #[test]
+    fn test_retry_does_not_update_seq_on_non_chunk_failed_error() {
+        let mut policy = RetryPolicy::default();
+        let mut req = download_chunk_request_for_tests();
+        let mut result = Err(Error::new(ErrorKind::RuntimeError, "test error"));
+
+        policy.retry(&mut req, &mut result);
+        assert_eq!(None, req.seq);
+    }
+}
