@@ -29,6 +29,9 @@ pub use chunk_meta::ChunkMetadata;
 mod object_meta;
 pub use object_meta::ObjectMetadata;
 
+mod retry;
+pub(crate) use retry::RetryPolicy;
+
 mod service;
 
 use crate::error;

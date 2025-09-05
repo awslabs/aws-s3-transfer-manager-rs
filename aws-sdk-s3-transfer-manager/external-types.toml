@@ -1,12 +1,14 @@
 allowed_external_types = [
     "aws_sdk_s3::*",
-    "aws_types::sdk_config::SdkConfig",
     "aws_smithy_runtime_api::*",
     "aws_smithy_types::*",
-    "tokio::runtime::task::error::JoinError",
-    "tokio::io::async_read::AsyncRead",
-    "bytes::bytes::Bytes",
-    "bytes::buf::buf_impl::Buf",
     "aws_types::request_id::RequestId",
-    "aws_types::request_id::RequestIdExt",
+    "bytes::buf::buf_impl::Buf",
+    "bytes::bytes::Bytes",
+    "tokio::io::async_read::AsyncRead",
+    "tokio::runtime::task::error::JoinError",
+
+    # TODO(create an issue in cargo-check-external-types): false positives since `RetryPolicy` is `pub(crate)`
+    "futures_util::future::ready::Ready",
+    "tower::retry::policy::Policy",
 ]

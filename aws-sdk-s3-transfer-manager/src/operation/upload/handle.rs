@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::error::ChunkId;
 use crate::io::part_reader::PartReader;
 use crate::operation::upload::context::UploadContext;
 use crate::operation::upload::input::convert::{
@@ -194,8 +195,8 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
             tracing::trace!("completing multipart upload");
 
             if number_of_upload_requests != all_parts.len() {
-                return Err(crate::error::Error::new(
-                    crate::error::ErrorKind::ChunkFailed,
+                return Err(crate::error::chunk_failed(
+                    ChunkId::Upload(mpu_data.upload_id),
                     format!(
                         "The total number of UploadPart requests must match the expected number of parts: request count {}, number of parts {}",
                         number_of_upload_requests,

@@ -37,7 +37,7 @@ pub enum ErrorKind {
     ObjectNotDiscoverable,
 
     /// Failed to upload or download a chunk of an object
-    ChunkFailed,
+    ChunkFailed(ChunkFailed),
 
     /// Resource not found (e.g. bucket, key, multipart upload ID not found)
     NotFound,
@@ -48,6 +48,40 @@ pub enum ErrorKind {
     /// The operation is being canceled because the user explicitly called `.abort` on the handle,
     /// or a child operation failed with the abort policy.
     OperationCancelled,
+}
+
+/// Stores information about failed chunk
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChunkFailed {
+    /// The ID of the chunk that failed.
+    /// For downloads, this is the sequence number of the chunk,
+    /// and for uploads, it is the upload ID.
+    id: ChunkId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChunkId {
+    Download(u64),
+    Upload(String),
+}
+
+impl ChunkFailed {
+    // The sequence number of the chunk for download operation
+    pub(crate) fn download_seq(&self) -> Option<u64> {
+        match self.id {
+            ChunkId::Download(seq) => Some(seq),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    // The upload ID of the chunk for upload operation
+    pub(crate) fn upload_id(&self) -> Option<&str> {
+        match &self.id {
+            ChunkId::Upload(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 impl Error {
@@ -76,7 +110,9 @@ impl fmt::Display for Error {
             ErrorKind::IOError => write!(f, "I/O error"),
             ErrorKind::RuntimeError => write!(f, "runtime error"),
             ErrorKind::ObjectNotDiscoverable => write!(f, "object discovery failed"),
-            ErrorKind::ChunkFailed => write!(f, "failed to process chunk"),
+            ErrorKind::ChunkFailed(chunk_failed) => {
+                write!(f, "failed to process chunk {:?}", chunk_failed.id)
+            }
             ErrorKind::NotFound => write!(f, "resource not found"),
             ErrorKind::ChildOperationFailed => write!(f, "child operation failed"),
             ErrorKind::OperationCancelled => write!(f, "operation cancelled"),
@@ -135,6 +171,13 @@ where
     E: Into<BoxError>,
 {
     Error::new(ErrorKind::ObjectNotDiscoverable, err)
+}
+
+pub(crate) fn chunk_failed<E>(id: ChunkId, err: E) -> Error
+where
+    E: Into<BoxError>,
+{
+    Error::new(ErrorKind::ChunkFailed(ChunkFailed { id }), err)
 }
 
 pub(crate) fn from_kind<E>(kind: ErrorKind) -> impl FnOnce(E) -> Error

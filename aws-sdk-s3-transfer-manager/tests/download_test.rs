@@ -252,7 +252,7 @@ async fn test_retry_failed_chunk() {
                 .header("Content-Length", format!("{}", data.len() - part_size))
                 .header(
                     "Content-Range",
-                    format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
+                    format!("bytes {}-{}/{}", part_size, data.len() - 1, data.len()),
                 )
                 .body(SdkBody::from_body_1_x(FailingBody::new(
                     data.slice(part_size..),
@@ -269,7 +269,7 @@ async fn test_retry_failed_chunk() {
                 .header("Content-Length", format!("{}", data.len() - part_size))
                 .header(
                     "Content-Range",
-                    format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
+                    format!("bytes {}-{}/{}", part_size, data.len() - 1, data.len()),
                 )
                 .body(SdkBody::from(data.slice(part_size..)))
                 .unwrap(),
@@ -361,7 +361,7 @@ async fn test_retry_max_attempts() {
                 .header("Content-Length", format!("{}", part_size))
                 .header(
                     "Content-Range",
-                    format!("bytes {}-{}/{}", part_size, data.len(), data.len()),
+                    format!("bytes {}-{}/{}", part_size, data.len() - 1, data.len()),
                 )
                 .body(SdkBody::from_body_1_x(FailingBody::new(
                     data.slice(part_size..),
