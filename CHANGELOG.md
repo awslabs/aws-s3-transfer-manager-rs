@@ -1,6 +1,13 @@
 CHANGELOG
 =========
 
+v0.1.3
+======
+
+* Validate ranged GET requests content range and request count
+* Validate field mappings between Transfer Manager and S3 input/output types
+* Validate UploadPart requests content-length and part number alignment
+
 vNext
 ======
 

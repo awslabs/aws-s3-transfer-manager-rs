@@ -1,6 +1,6 @@
 [package]
 name = "aws-sdk-s3-transfer-manager"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
 license = "Apache-2.0"
