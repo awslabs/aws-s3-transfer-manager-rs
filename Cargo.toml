@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["aws-sdk-s3-transfer-manager"]
+members = [
+    "aws-sdk-s3-transfer-manager",
+    "s3-mock-server"
+]
