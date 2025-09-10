@@ -3,9 +3,363 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::ops;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A monotonically increasing numeric value.
+#[derive(Debug, Clone, Default)]
+pub struct IncreasingCounter {
+    value: Arc<AtomicU64>,
+}
+
+impl IncreasingCounter {
+    /// Create a new counter starting at zero.
+    pub fn new() -> Self {
+        Self {
+            value: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Increment the counter by the given amount and return the new value.
+    pub fn increment(&self, amount: u64) -> u64 {
+        self.value.fetch_add(amount, Ordering::Relaxed) + amount
+    }
+
+    /// Get the current value of the counter.
+    pub fn value(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
+/// A value that can increase or decrease over time.
+#[derive(Debug, Clone, Default)]
+pub struct Gauge {
+    value: Arc<AtomicU64>,
+}
+
+impl Gauge {
+    /// Create a new gauge starting at zero.
+    pub fn new() -> Self {
+        Self {
+            value: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Set the gauge to the given value and return the new value.
+    pub fn set(&self, value: u64) -> u64 {
+        self.value.store(value, Ordering::Relaxed);
+        value
+    }
+
+    /// Increment the gauge by the given amount and return the new value.
+    pub fn increment(&self, amount: u64) -> u64 {
+        self.value.fetch_add(amount, Ordering::Relaxed) + amount
+    }
+
+    /// Decrement the gauge by the given amount and return the new value.
+    pub fn decrement(&self, amount: u64) -> u64 {
+        self.value.fetch_sub(amount, Ordering::Relaxed) - amount
+    }
+
+    /// Get the current value of the gauge.
+    pub fn value(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
+/// A statistical distribution of values with configurable buckets.
+#[derive(Debug)]
+pub struct Histogram {
+    inner: Arc<Mutex<HistogramInner>>,
+}
+
+#[derive(Debug)]
+struct HistogramInner {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    bucket_bounds: Vec<f64>,
+    bucket_counts: Vec<u64>,
+}
+
+impl Histogram {
+    /// Create a new histogram with default buckets for latency measurements.
+    pub fn new() -> Self {
+        Self::with_buckets(default_latency_buckets())
+    }
+
+    /// Create a new histogram with custom bucket boundaries.
+    pub fn with_buckets(bucket_bounds: Vec<f64>) -> Self {
+        let bucket_counts = vec![0; bucket_bounds.len()];
+        Self {
+            inner: Arc::new(Mutex::new(HistogramInner {
+                count: 0,
+                sum: 0.0,
+                min: f64::INFINITY,
+                max: f64::NEG_INFINITY,
+                bucket_bounds,
+                bucket_counts,
+            })),
+        }
+    }
+
+    /// Record a value in the histogram.
+    pub fn record(&self, value: f64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.count += 1;
+            inner.sum += value;
+            inner.min = inner.min.min(value);
+            inner.max = inner.max.max(value);
+
+            // Find the appropriate bucket
+            for (i, &bound) in inner.bucket_bounds.iter().enumerate() {
+                if value <= bound {
+                    inner.bucket_counts[i] += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get the number of recorded values.
+    pub fn count(&self) -> u64 {
+        self.inner.lock().map(|inner| inner.count).unwrap_or(0)
+    }
+
+    /// Get the sum of all recorded values.
+    pub fn sum(&self) -> f64 {
+        self.inner.lock().map(|inner| inner.sum).unwrap_or(0.0)
+    }
+
+    /// Get the mean of all recorded values.
+    pub fn mean(&self) -> f64 {
+        if let Ok(inner) = self.inner.lock() {
+            if inner.count > 0 {
+                inner.sum / inner.count as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the minimum recorded value.
+    pub fn min(&self) -> f64 {
+        self.inner.lock().map(|inner| inner.min).unwrap_or(0.0)
+    }
+
+    /// Get the maximum recorded value.
+    pub fn max(&self) -> f64 {
+        self.inner.lock().map(|inner| inner.max).unwrap_or(0.0)
+    }
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//TODO: maybe this should be a try_clone and it should fail if the mutex is poisoned?
+impl Clone for Histogram {
+    fn clone(&self) -> Self {
+        if let Ok(inner) = self.inner.lock() {
+            Self::with_buckets(inner.bucket_bounds.clone())
+        } else {
+            Self::new()
+        }
+    }
+}
+
+/// Default bucket boundaries for latency measurements in seconds.
+fn default_latency_buckets() -> Vec<f64> {
+    vec![
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ]
+}
+
+/// Configuration for throughput sampling.
+#[derive(Debug, Clone)]
+pub struct SamplingConfig {
+    /// Interval between samples.
+    pub interval: Duration,
+    /// Maximum number of samples to retain.
+    pub max_samples: usize,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(100),
+            max_samples: 100,
+        }
+    }
+}
+
+/// Throughput metrics with min/max/average tracking and optional sampling.
+#[derive(Debug)]
+pub struct ThroughputMetrics {
+    // Statistics using scaled u64 for atomic operations (bytes per second * 1000)
+    min_throughput_bps: AtomicU64,
+    max_throughput_bps: AtomicU64,
+    avg_throughput_bps: AtomicU64,
+    total_bytes: AtomicU64,
+    start_time: std::time::Instant,
+
+    // Optional sampling
+    history: Option<Arc<Mutex<ThroughputHistory>>>,
+}
+
+#[derive(Debug)]
+struct ThroughputHistory {
+    pub(crate) samples: VecDeque<ThroughputSample>,
+    last_sample_time: Option<std::time::Instant>,
+    sample_interval: Duration,
+    max_samples: usize,
+}
+
+#[derive(Debug, Clone)]
+#[allow(unused)]
+struct ThroughputSample {
+    timestamp: std::time::Instant,
+    bytes_per_second: f64,
+}
+
+impl ThroughputMetrics {
+    /// Create new throughput metrics without sampling.
+    pub fn new() -> Self {
+        Self::with_sampling(None)
+    }
+
+    /// Create new throughput metrics with optional sampling configuration.
+    pub fn with_sampling(sampling_config: Option<SamplingConfig>) -> Self {
+        let history = sampling_config.map(|config| {
+            Arc::new(Mutex::new(ThroughputHistory {
+                samples: VecDeque::with_capacity(config.max_samples),
+                last_sample_time: None,
+                sample_interval: config.interval,
+                max_samples: config.max_samples,
+            }))
+        });
+
+        Self {
+            min_throughput_bps: AtomicU64::new(u64::MAX),
+            max_throughput_bps: AtomicU64::new(0),
+            avg_throughput_bps: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            start_time: std::time::Instant::now(),
+            history,
+        }
+    }
+
+    /// Record bytes transferred and update throughput statistics.
+    pub fn record_bytes(&self, bytes: u64) {
+        let total = self.total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let elapsed = self.start_time.elapsed();
+
+        if elapsed.as_secs_f64() > 0.0 {
+            let current_bps = (total as f64 / elapsed.as_secs_f64()) * 1000.0;
+            let current_bps_scaled = current_bps as u64;
+
+            // Update min (but not if it's the initial MAX value)
+            let mut current_min = self.min_throughput_bps.load(Ordering::Relaxed);
+            while current_bps_scaled < current_min {
+                match self.min_throughput_bps.compare_exchange_weak(
+                    current_min,
+                    current_bps_scaled,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => current_min = x,
+                }
+            }
+
+            // Update max
+            let mut current_max = self.max_throughput_bps.load(Ordering::Relaxed);
+            while current_bps_scaled > current_max {
+                match self.max_throughput_bps.compare_exchange_weak(
+                    current_max,
+                    current_bps_scaled,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => current_max = x,
+                }
+            }
+
+            // Update average (same as current for cumulative calculation)
+            self.avg_throughput_bps
+                .store(current_bps_scaled, Ordering::Relaxed);
+
+            // Update sampling history if enabled
+            if let Some(ref history) = self.history {
+                self.update_sample_history(history, current_bps / 1000.0);
+            }
+        }
+    }
+
+    fn update_sample_history(&self, history: &Arc<Mutex<ThroughputHistory>>, bps: f64) {
+        if let Ok(mut hist) = history.try_lock() {
+            let now = std::time::Instant::now();
+            if hist.last_sample_time.is_none()
+                || now.duration_since(hist.last_sample_time.unwrap_or(Instant::now()))
+                    >= hist.sample_interval
+            {
+                hist.samples.push_back(ThroughputSample {
+                    timestamp: now,
+                    bytes_per_second: bps,
+                });
+
+                if hist.samples.len() > hist.max_samples {
+                    hist.samples.pop_front();
+                }
+
+                hist.last_sample_time = Some(now);
+            }
+        }
+    }
+
+    /// Get the minimum throughput observed.
+    pub fn min(&self) -> Throughput {
+        let bps_scaled = self.min_throughput_bps.load(Ordering::Relaxed);
+        if bps_scaled == u64::MAX {
+            Throughput::new_bytes_per_sec(0)
+        } else {
+            Throughput::new_bytes_per_sec(bps_scaled / 1000)
+        }
+    }
+
+    /// Get the maximum throughput observed.
+    pub fn max(&self) -> Throughput {
+        let bps_scaled = self.max_throughput_bps.load(Ordering::Relaxed);
+        Throughput::new_bytes_per_sec(bps_scaled / 1000)
+    }
+
+    /// Get the average throughput.
+    pub fn avg(&self) -> Throughput {
+        let bps_scaled = self.avg_throughput_bps.load(Ordering::Relaxed);
+        Throughput::new_bytes_per_sec(bps_scaled / 1000)
+    }
+
+    /// Get the total bytes transferred.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for ThroughputMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Units of measurement
 pub mod unit {
@@ -311,7 +665,10 @@ mod tests {
 
     use crate::metrics::unit::ByteCountDisplayContext;
 
-    use super::{unit::ByteUnit, Throughput};
+    use super::{
+        unit::ByteUnit, Gauge, Histogram, IncreasingCounter, SamplingConfig, Throughput,
+        ThroughputMetrics,
+    };
 
     #[test]
     fn test_throughput_display() {
@@ -413,5 +770,104 @@ mod tests {
                 ByteCountDisplayContext::new(1091242563, ByteUnit::Mebibyte)
             )
         );
+    }
+
+    #[test]
+    fn test_counter() {
+        let counter = IncreasingCounter::new();
+        assert_eq!(counter.value(), 0);
+
+        assert_eq!(counter.increment(5), 5);
+        assert_eq!(counter.value(), 5);
+
+        assert_eq!(counter.increment(3), 8);
+        assert_eq!(counter.value(), 8);
+    }
+
+    #[test]
+    fn test_gauge() {
+        let gauge = Gauge::new();
+        assert_eq!(gauge.value(), 0);
+
+        assert_eq!(gauge.set(10), 10);
+        assert_eq!(gauge.value(), 10);
+
+        assert_eq!(gauge.increment(5), 15);
+        assert_eq!(gauge.value(), 15);
+
+        assert_eq!(gauge.decrement(3), 12);
+        assert_eq!(gauge.value(), 12);
+    }
+
+    #[test]
+    fn test_histogram() {
+        let histogram = Histogram::new();
+        assert_eq!(histogram.count(), 0);
+        assert_eq!(histogram.sum(), 0.0);
+
+        histogram.record(1.0);
+        histogram.record(2.0);
+        histogram.record(3.0);
+
+        assert_eq!(histogram.count(), 3);
+        assert_eq!(histogram.sum(), 6.0);
+        assert_eq!(histogram.mean(), 2.0);
+        assert_eq!(histogram.min(), 1.0);
+        assert_eq!(histogram.max(), 3.0);
+    }
+
+    #[test]
+    fn test_throughput_metrics() {
+        let metrics = ThroughputMetrics::new();
+
+        // Record some bytes
+        metrics.record_bytes(1000);
+        std::thread::sleep(Duration::from_millis(10));
+        metrics.record_bytes(2000);
+
+        assert_eq!(metrics.total_bytes(), 3000);
+        assert!(metrics.avg().bytes_transferred() > 0);
+        assert!(metrics.max().bytes_transferred() >= metrics.min().bytes_transferred());
+    }
+
+    #[test]
+    fn test_sampling_config() {
+        // Test that max_samples is respected
+        let one_sample_config = SamplingConfig {
+            interval: Duration::from_millis(5),
+            max_samples: 1,
+        };
+
+        let metrics = ThroughputMetrics::with_sampling(Some(one_sample_config));
+        metrics.record_bytes(1000);
+        std::thread::sleep(Duration::from_millis(10));
+        metrics.record_bytes(2000);
+        assert_eq!(metrics.history.unwrap().lock().unwrap().samples.len(), 1);
+
+        // Test that the interval is respected
+        let long_interval_config = SamplingConfig {
+            interval: Duration::from_millis(50),
+            max_samples: 10,
+        };
+
+        let metrics = ThroughputMetrics::with_sampling(Some(long_interval_config));
+        metrics.record_bytes(1000);
+        std::thread::sleep(Duration::from_millis(10));
+        metrics.record_bytes(2000);
+        assert_eq!(
+            metrics
+                .history
+                .clone()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .samples
+                .len(),
+            1
+        );
+
+        std::thread::sleep(Duration::from_millis(50));
+        metrics.record_bytes(2000);
+        assert_eq!(metrics.history.unwrap().lock().unwrap().samples.len(), 2);
     }
 }
