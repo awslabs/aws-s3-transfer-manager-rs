@@ -225,6 +225,7 @@ pub(super) async fn read_body(
 mod tests {
     use super::*;
     use crate::client::Handle;
+    use crate::metrics::aggregators::{ClientMetrics, TransferMetrics};
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
@@ -234,11 +235,13 @@ mod tests {
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
         let s3_client = mock_client!(aws_sdk_s3, []);
+        let metrics = Arc::new(TransferMetrics::new());
         UploadPartRequest {
             ctx: UploadContext {
                 handle: Arc::new(Handle {
                     config: Config::builder().client(s3_client).build(),
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
+                    metrics: ClientMetrics::new(),
                 }),
                 request: Arc::new(
                     UploadInput::builder()
@@ -248,6 +251,7 @@ mod tests {
                         .unwrap(),
                 ),
                 bucket_type: BucketType::from_bucket_name(bucket_name),
+                metrics,
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),

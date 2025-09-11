@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::aggregators::ClientMetrics;
 use crate::runtime::scheduler::Scheduler;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
@@ -20,6 +21,7 @@ pub struct Client {
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
     pub(crate) scheduler: Scheduler,
+    pub(crate) metrics: ClientMetrics,
 }
 
 impl Handle {
@@ -64,13 +66,23 @@ impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
         let scheduler = Scheduler::new(config.concurrency().clone());
-        let handle = Arc::new(Handle { config, scheduler });
+        let metrics = ClientMetrics::new();
+        let handle = Arc::new(Handle {
+            config,
+            scheduler,
+            metrics,
+        });
         Client { handle }
     }
 
     /// Returns the client's configuration
     pub fn config(&self) -> &Config {
         &self.handle.config
+    }
+
+    /// Returns the client's metrics
+    pub(crate) fn metrics(&self) -> &ClientMetrics {
+        &self.handle.metrics
     }
 
     /// Upload a single object from S3.

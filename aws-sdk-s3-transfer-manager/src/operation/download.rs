@@ -36,6 +36,7 @@ mod service;
 
 use crate::error;
 use crate::io::AggregatedBytes;
+use crate::metrics::aggregators::TransferMetrics;
 use crate::runtime::scheduler::{
     NetworkPermitContext, OwnedWorkPermit, PermitType, TransferDirection,
 };
@@ -252,6 +253,7 @@ pub(crate) struct DownloadState {
     cancel_tx: CancelNotificationSender,
     cancel_rx: CancelNotificationReceiver,
     bucket_type: BucketType,
+    metrics: Arc<TransferMetrics>,
 }
 
 type DownloadContext = TransferContext<DownloadState>;
@@ -259,11 +261,13 @@ type DownloadContext = TransferContext<DownloadState>;
 impl DownloadContext {
     fn new(handle: Arc<crate::client::Handle>, bucket_type: BucketType) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let metrics = Arc::new(TransferMetrics::new());
         let state = Arc::new(DownloadState {
             current_seq: AtomicU64::new(0),
             cancel_tx,
             cancel_rx,
             bucket_type,
+            metrics,
         });
         TransferContext { handle, state }
     }
@@ -286,5 +290,10 @@ impl DownloadContext {
     /// Returns the type of bucket targeted by this operation
     fn bucket_type(&self) -> BucketType {
         self.state.bucket_type
+    }
+
+    /// Returns the transfer metrics for this download
+    fn metrics(&self) -> &Arc<TransferMetrics> {
+        &self.state.metrics
     }
 }

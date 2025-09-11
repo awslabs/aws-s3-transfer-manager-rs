@@ -18,6 +18,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
+use crate::metrics::aggregators::TransferMetrics;
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_put_object_request,
 };
@@ -189,10 +190,12 @@ async fn try_start_mpu_upload(
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
+    let metrics = Arc::new(TransferMetrics::new());
     UploadContext {
         handle,
         bucket_type: BucketType::from_bucket_name(req.bucket().expect("bucket is availabe")),
         request: Arc::new(req),
+        metrics,
     }
 }
 
