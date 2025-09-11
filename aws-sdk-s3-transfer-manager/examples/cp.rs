@@ -9,8 +9,8 @@ use std::time;
 
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3_transfer_manager::io::InputStream;
+use aws_sdk_s3_transfer_manager::metrics::aggregators::Throughput;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
 use bytes::Buf;

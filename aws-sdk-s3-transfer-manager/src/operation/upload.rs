@@ -18,6 +18,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
+use crate::metrics::aggregators::TransferMetrics;
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_put_object_request,
 };
@@ -67,7 +68,7 @@ impl Upload {
         }
 
         let stream = input.take_body();
-        let ctx = new_context(handle.clone(), input);
+        let ctx = new_context(handle.clone(), input, TransferMetrics::new());
         Ok(UploadHandle::new(
             ctx.clone(),
             tokio::spawn(try_start_upload(handle.clone(), stream, ctx)),
@@ -188,11 +189,16 @@ async fn try_start_mpu_upload(
     Ok(UploadType::MultipartUpload(mpu_data))
 }
 
-fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
+fn new_context(
+    handle: Arc<crate::client::Handle>,
+    req: UploadInput,
+    metrics: TransferMetrics,
+) -> UploadContext {
     UploadContext::new(
         handle,
         BucketType::from_bucket_name(req.bucket().expect("bucket is availabe")),
         req,
+        metrics,
     )
 }
 
