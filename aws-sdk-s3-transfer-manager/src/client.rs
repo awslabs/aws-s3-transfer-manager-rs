@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics::aggregators::ClientMetrics;
 use crate::runtime::scheduler::Scheduler;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
+use crate::metrics::aggregators::ClientMetrics;
 use std::sync::Arc;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -62,6 +62,19 @@ impl Handle {
     }
 }
 
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Log final metrics summary when the client is dropped
+        tracing::debug!(
+            "Client metrics summary - Transfers initiated: {}, completed: {}, failed: {}, total bytes: {}",
+            self.metrics.transfers_initiated(),
+            self.metrics.transfers_completed(),
+            self.metrics.transfers_failed(),
+            self.metrics.total_bytes_transferred()
+        );
+    }
+}
+
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
@@ -81,7 +94,7 @@ impl Client {
     }
 
     /// Returns the client's metrics
-    pub(crate) fn metrics(&self) -> &ClientMetrics {
+    pub fn metrics(&self) -> &ClientMetrics {
         &self.handle.metrics
     }
 

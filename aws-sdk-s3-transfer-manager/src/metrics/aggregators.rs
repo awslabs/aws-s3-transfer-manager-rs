@@ -18,7 +18,7 @@ use crate::metrics::{
 
 /// Client-level metrics aggregating all transfers
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ClientMetrics {
+pub struct ClientMetrics {
     /// Total number of transfers initiated
     transfers_initiated: IncreasingCounter,
     /// Total number of transfers completed successfully
@@ -35,6 +35,26 @@ impl ClientMetrics {
     /// Create new client metrics
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Get the number of transfers initiated
+    pub fn transfers_initiated(&self) -> u64 {
+        self.transfers_initiated.value()
+    }
+
+    /// Get the number of transfers completed
+    pub fn transfers_completed(&self) -> u64 {
+        self.transfers_completed.value()
+    }
+
+    /// Get the number of transfers failed
+    pub fn transfers_failed(&self) -> u64 {
+        self.transfers_failed.value()
+    }
+
+    /// Get the total bytes transferred
+    pub fn total_bytes_transferred(&self) -> u64 {
+        self.total_bytes_transferred.value()
     }
 }
 
