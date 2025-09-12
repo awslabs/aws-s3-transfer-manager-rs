@@ -1,3 +1,4 @@
+//TODO: remove this when more of these are used (the warnings were annoying)
 #![allow(unused)]
 
 use std::{
@@ -574,25 +575,40 @@ mod tests {
             interval: Duration::from_millis(5),
             max_samples: 1,
         };
+        let max_sample_metrics = ThroughputMetrics::with_sampling(Some(one_sample_config));
 
-        let metrics = ThroughputMetrics::with_sampling(Some(one_sample_config));
-        metrics.record_bytes(1000);
-        std::thread::sleep(Duration::from_millis(10));
-        metrics.record_bytes(2000);
-        assert_eq!(metrics.history.unwrap().lock().unwrap().samples.len(), 1);
+        // Record one sample, wait much longer than the interval, record another sample
+        max_sample_metrics.record_bytes(1000);
+        std::thread::sleep(Duration::from_millis(100));
+        max_sample_metrics.record_bytes(2000);
+
+        // Ensure only one sample recorded
+        assert_eq!(
+            max_sample_metrics
+                .history
+                .unwrap()
+                .lock()
+                .unwrap()
+                .samples
+                .len(),
+            1
+        );
 
         // Test that the interval is respected
         let long_interval_config = SamplingConfig {
-            interval: Duration::from_millis(50),
+            interval: Duration::from_millis(500),
             max_samples: 10,
         };
+        let long_interval_metrics = ThroughputMetrics::with_sampling(Some(long_interval_config));
 
-        let metrics = ThroughputMetrics::with_sampling(Some(long_interval_config));
-        metrics.record_bytes(1000);
-        std::thread::sleep(Duration::from_millis(10));
-        metrics.record_bytes(2000);
+        // Record one sample, wait much less than the interval, record another sample
+        long_interval_metrics.record_bytes(1000);
+        std::thread::sleep(Duration::from_millis(5));
+        long_interval_metrics.record_bytes(2000);
+
+        // Ensure the second sample was not recorded
         assert_eq!(
-            metrics
+            long_interval_metrics
                 .history
                 .clone()
                 .unwrap()
@@ -603,8 +619,20 @@ mod tests {
             1
         );
 
-        std::thread::sleep(Duration::from_millis(50));
-        metrics.record_bytes(2000);
-        assert_eq!(metrics.history.unwrap().lock().unwrap().samples.len(), 2);
+        // Wait again much longer than the interval this time
+        std::thread::sleep(Duration::from_millis(600));
+        long_interval_metrics.record_bytes(2000);
+
+        // Ensure the new sample was recorded
+        assert_eq!(
+            long_interval_metrics
+                .history
+                .unwrap()
+                .lock()
+                .unwrap()
+                .samples
+                .len(),
+            2
+        );
     }
 }

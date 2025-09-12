@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::aggregators::ClientMetrics;
 use crate::runtime::scheduler::Scheduler;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
-use crate::metrics::aggregators::ClientMetrics;
 use std::sync::Arc;
 
 /// Transfer manager client for Amazon Simple Storage Service.

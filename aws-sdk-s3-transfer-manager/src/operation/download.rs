@@ -101,7 +101,7 @@ impl Download {
             discovery,
             object_meta_rx: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
-            handle: handle,
+            handle,
         })
     }
 }
@@ -232,7 +232,7 @@ fn handle_discovery_chunk(
                     // Track bytes transferred
                     let bytes_len = aggregated.remaining() as u64;
                     handle.metrics.add_bytes_transferred(bytes_len);
-                    
+
                     ChunkOutput {
                         seq,
                         data: aggregated,
@@ -262,6 +262,7 @@ pub(crate) struct DownloadState {
     cancel_tx: CancelNotificationSender,
     cancel_rx: CancelNotificationReceiver,
     bucket_type: BucketType,
+    #[allow(unused)]
     metrics: Arc<TransferMetrics>,
 }
 
@@ -302,7 +303,90 @@ impl DownloadContext {
     }
 
     /// Returns the transfer metrics for this download
+    #[allow(unused)]
     fn metrics(&self) -> &Arc<TransferMetrics> {
         &self.state.metrics
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::metrics::unit::ByteUnit;
+    use crate::types::{ConcurrencyMode, PartSize};
+    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use aws_smithy_types::byte_stream::ByteStream;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn test_download_metrics() {
+        // Create test data
+        let test_data = b"test data for download metrics";
+        let expected_data = Bytes::from_static(test_data);
+
+        // Create a mock S3 client
+        let get_object = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(Bytes::from_static(test_data)))
+                .content_length(test_data.len() as i64)
+                .e_tag("test-etag")
+                .build()
+        });
+
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get_object]);
+
+        // Create transfer manager
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(s3_client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+
+        // Check initial metrics
+        let initial_initiated = tm.metrics().transfers_initiated();
+        let initial_completed = tm.metrics().transfers_completed();
+        let initial_bytes = tm.metrics().total_bytes_transferred();
+        let initial_active = tm.metrics().active_transfers();
+
+        assert_eq!(initial_initiated, 0);
+        assert_eq!(initial_completed, 0);
+        assert_eq!(initial_bytes, 0);
+        assert_eq!(initial_active, 0);
+
+        // Create and execute download
+        let mut handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-key")
+            .initiate()
+            .unwrap();
+
+        // Check metrics after initiation
+        assert_eq!(tm.metrics().transfers_initiated(), 1);
+        assert_eq!(tm.metrics().active_transfers(), 1);
+
+        // Complete the download by consuming the body
+        let mut downloaded_data = Vec::new();
+        while let Some(chunk) = handle.body_mut().next().await {
+            let chunk = chunk.unwrap();
+            downloaded_data.extend_from_slice(&chunk.data.to_vec());
+        }
+
+        // Wait for the download to complete and track metrics
+        handle.join().await.unwrap();
+
+        // Verify downloaded data matches expected
+        assert_eq!(downloaded_data, expected_data.as_ref());
+
+        // Check final metrics
+        assert_eq!(tm.metrics().transfers_initiated(), 1);
+        assert_eq!(tm.metrics().transfers_completed(), 1);
+        assert_eq!(
+            tm.metrics().total_bytes_transferred(),
+            test_data.len() as u64
+        );
+        assert_eq!(tm.metrics().active_transfers(), 0);
+        assert_eq!(tm.metrics().transfers_failed(), 0);
     }
 }

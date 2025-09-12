@@ -19,6 +19,7 @@ pub(crate) struct UploadContext {
     /// Type of S3 bucket targeted by this operation
     pub(crate) bucket_type: BucketType,
     /// Transfer metrics for this upload
+    #[allow(unused)]
     pub(crate) metrics: Arc<TransferMetrics>,
 }
 
@@ -39,6 +40,7 @@ impl UploadContext {
     }
 
     /// Returns the transfer metrics for this upload
+    #[allow(unused)]
     pub(crate) fn metrics(&self) -> &Arc<TransferMetrics> {
         &self.metrics
     }

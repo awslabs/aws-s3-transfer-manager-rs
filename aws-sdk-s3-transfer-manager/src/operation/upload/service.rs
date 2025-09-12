@@ -69,6 +69,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let ctx = request.ctx;
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
+    let bytes_to_upload = part_data.data.remaining() as u64;
 
     let req = copy_fields_to_upload_part_request(
         &ctx.request,
@@ -87,6 +88,9 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .send()
         .instrument(tracing::debug_span!("send-upload-part", part_number))
         .await?;
+
+    // Track bytes transferred on successful upload
+    ctx.handle.metrics.add_bytes_transferred(bytes_to_upload);
 
     tracing::trace!("completed upload of part number {}", part_number);
     let completed = CompletedPart::builder()
