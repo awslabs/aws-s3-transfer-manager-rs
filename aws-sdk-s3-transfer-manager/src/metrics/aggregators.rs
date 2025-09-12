@@ -27,6 +27,8 @@ pub struct ClientMetrics {
     transfers_failed: IncreasingCounter,
     /// Total bytes transferred across all operations
     total_bytes_transferred: IncreasingCounter,
+    /// Number of currently active transfers
+    active_transfers: Gauge,
     /// Overall throughput metrics
     throughput: ThroughputMetrics,
 }
@@ -35,6 +37,29 @@ impl ClientMetrics {
     /// Create new client metrics
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Increment transfers initiated counter
+    pub(crate) fn increment_transfers_initiated(&self) {
+        self.transfers_initiated.increment(1);
+        self.active_transfers.increment(1);
+    }
+
+    /// Increment transfers completed counter
+    pub(crate) fn increment_transfers_completed(&self) {
+        self.transfers_completed.increment(1);
+        self.active_transfers.decrement(1);
+    }
+
+    /// Increment transfers failed counter
+    pub(crate) fn increment_transfers_failed(&self) {
+        self.transfers_failed.increment(1);
+        self.active_transfers.decrement(1);
+    }
+
+    /// Add bytes to total transferred
+    pub(crate) fn add_bytes_transferred(&self, bytes: u64) {
+        self.total_bytes_transferred.increment(bytes);
     }
 
     /// Get the number of transfers initiated
@@ -55,6 +80,11 @@ impl ClientMetrics {
     /// Get the total bytes transferred
     pub fn total_bytes_transferred(&self) -> u64 {
         self.total_bytes_transferred.value()
+    }
+
+    /// Get the number of currently active transfers
+    pub fn active_transfers(&self) -> u64 {
+        self.active_transfers.value()
     }
 }
 

@@ -6,6 +6,7 @@
 mod input;
 
 use aws_sdk_s3::error::DisplayErrorContext;
+use bytes::Buf;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
@@ -79,7 +80,7 @@ impl Download {
 
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
-        let ctx = DownloadContext::new(handle, bucket_type);
+        let ctx = DownloadContext::new(handle.clone(), bucket_type);
         let concurrency = ctx.handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
         let (object_meta_tx, object_meta_rx) = oneshot::channel();
@@ -100,6 +101,7 @@ impl Download {
             discovery,
             object_meta_rx: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
+            handle: handle,
         })
     }
 }
@@ -220,15 +222,22 @@ fn handle_discovery_chunk(
     if let Some(stream) = initial_chunk {
         let seq = ctx.next_seq();
         let completed = completed.clone();
+        let handle = ctx.handle.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
         tasks.spawn(async move {
             let chunk = AggregatedBytes::from_byte_stream(stream)
                 .await
-                .map(|aggregated| ChunkOutput {
-                    seq,
-                    data: aggregated,
-                    metadata: metadata.expect("chunk metadata is available"),
+                .map(|aggregated| {
+                    // Track bytes transferred
+                    let bytes_len = aggregated.remaining() as u64;
+                    handle.metrics.add_bytes_transferred(bytes_len);
+                    
+                    ChunkOutput {
+                        seq,
+                        data: aggregated,
+                        metadata: metadata.expect("chunk metadata is available"),
+                    }
                 })
                 .map_err(error::discovery_failed);
 
