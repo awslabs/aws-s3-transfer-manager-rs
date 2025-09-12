@@ -83,13 +83,16 @@ impl DownloadHandle {
         // Wait for discovery to complete
         if let Err(e) = self.discovery.await {
             self.handle.metrics.increment_transfers_failed();
-            return Err(error::from_kind(ErrorKind::RuntimeError)(format!("Discovery task failed: {}", e)));
+            return Err(error::from_kind(ErrorKind::RuntimeError)(format!(
+                "Discovery task failed: {}",
+                e
+            )));
         }
 
         // Wait for all download tasks to complete
         let mut tasks = self.tasks.lock().await;
         let mut has_error = false;
-        
+
         while let Some(result) = tasks.join_next().await {
             if result.is_err() {
                 has_error = true;
@@ -98,7 +101,9 @@ impl DownloadHandle {
 
         if has_error {
             self.handle.metrics.increment_transfers_failed();
-            Err(error::from_kind(ErrorKind::RuntimeError)("One or more download tasks failed"))
+            Err(error::from_kind(ErrorKind::RuntimeError)(
+                "One or more download tasks failed",
+            ))
         } else {
             self.handle.metrics.increment_transfers_completed();
             Ok(())

@@ -29,13 +29,14 @@ impl IncreasingCounter {
 }
 
 /// A value that can increase or decrease over time.
+/// Minimum value is 0.
 #[derive(Debug, Clone, Default)]
 pub struct Gauge {
     value: Arc<AtomicU64>,
 }
 
 impl Gauge {
-    /// Create a new gauge starting at zero.
+    /// Create a new gauge starting at 0.
     pub fn new() -> Self {
         Self {
             value: Arc::new(AtomicU64::new(0)),
@@ -54,8 +55,23 @@ impl Gauge {
     }
 
     /// Decrement the gauge by the given amount and return the new value.
+    /// If the decrement would cause underflow, the gauge is clamped at 0.
     pub fn decrement(&self, amount: u64) -> u64 {
-        self.value.fetch_sub(amount, Ordering::Relaxed) - amount
+        // TODO: This can be done more cleanly when the atomic `update` method stabilizes
+        loop {
+            let current = self.value.load(Ordering::Relaxed);
+            let new_value = current.saturating_sub(amount);
+
+            match self.value.compare_exchange_weak(
+                current,
+                new_value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return new_value,
+                Err(_) => continue,
+            }
+        }
     }
 
     /// Get the current value of the gauge.
