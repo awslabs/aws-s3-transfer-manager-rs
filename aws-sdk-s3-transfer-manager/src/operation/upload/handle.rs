@@ -83,7 +83,15 @@ impl UploadHandle {
         // bottleneck where we have many uploads not making the completeMPU call, waiting for the join
         // to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
         // this without waiting for join to happen.
-        complete_upload(self).await
+        let handle_metrics = self.ctx.handle.metrics.clone();
+        let result = complete_upload(self).await;
+
+        match &result {
+            Ok(_) => handle_metrics.increment_transfers_completed(),
+            Err(_) => handle_metrics.increment_transfers_failed(),
+        }
+
+        result
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
