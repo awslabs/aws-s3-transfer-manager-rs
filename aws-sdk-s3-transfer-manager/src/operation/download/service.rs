@@ -13,6 +13,7 @@ use crate::middleware::limit::concurrency::ProvideNetworkPermitContext;
 use crate::operation::download::DownloadContext;
 use crate::operation::download::RetryPolicy;
 use crate::runtime::scheduler::NetworkPermitContext;
+use bytes::Buf;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use std::cmp;
@@ -135,6 +136,10 @@ async fn download_specific_chunk(
                         .map_err(|err| {
                            error::chunk_failed(ChunkId::Download(seq), err)
                         })?;
+
+                    // Track bytes transferred
+                    let bytes_len = body.remaining() as u64;
+                    ctx.handle.metrics.add_bytes_transferred(bytes_len);
 
                     Ok(ChunkOutput {
                         seq,
