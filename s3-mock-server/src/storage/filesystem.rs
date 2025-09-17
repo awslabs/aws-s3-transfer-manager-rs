@@ -451,7 +451,7 @@ impl StorageBackend for FilesystemStorage {
             .await?
             .ok_or(Error::NoSuchUpload)?;
 
-        let checksum_algorithm = upload_metadata.metadata.checksum_algorithm.clone();
+        let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
 
         // Calculate ETag
         let etag = format!("\"{:x}\"", md5::compute(&request.content));
@@ -468,7 +468,7 @@ impl StorageBackend for FilesystemStorage {
 
             // Calculate checksum for the specified algorithm
             let mut integrity_checks =
-                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm.into());
+                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm);
             integrity_checks.update(&request.content);
             let calculated_integrity = integrity_checks.finalize();
 
@@ -545,7 +545,7 @@ impl StorageBackend for FilesystemStorage {
             .await?
             .ok_or(Error::NoSuchUpload)?;
 
-        let checksum_algorithm = upload_metadata.metadata.checksum_algorithm.clone();
+        let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
         let checksum_type = upload_metadata.checksum_type;
 
         // Verify all parts exist and ETags match, collect metadata
@@ -583,10 +583,9 @@ impl StorageBackend for FilesystemStorage {
         let mut integrity_checks = checksum_algorithm
             .as_ref()
             .map(|algorithm| {
-                crate::types::ObjectIntegrityChecks::new()
-                    .with_checksum_algorithm((*algorithm).into())
+                crate::types::ObjectIntegrityChecks::new().with_checksum_algorithm(*algorithm)
             })
-            .unwrap_or_else(|| crate::types::ObjectIntegrityChecks::new());
+            .unwrap_or_default();
 
         for (part_number, part_metadata) in &part_metadata_list {
             let part_path = self.get_part_path(request.upload_id, *part_number);

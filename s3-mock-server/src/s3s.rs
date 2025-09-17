@@ -225,7 +225,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .map(|ct| ChecksumType::from_str(ct.as_str()))
             .transpose()
             .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum type"))?
-            .unwrap_or_else(|| {
+            .unwrap_or({
                 // Default checksum type based on algorithm
                 match checksum_algorithm {
                     ChecksumAlgorithm::Crc64Nvme => ChecksumType::FullObject,
@@ -338,6 +338,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
         let input = req.input;
+        let bucket = input.bucket.clone();
         let upload_id = &input.upload_id;
 
         // Extract client checksums before consuming input
@@ -377,11 +378,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
         let response = self.storage.complete_multipart_upload(request).await?;
 
-        // Build response
         let output = s3s::dto::CompleteMultipartUploadOutput {
             key: Some(response.key),
             e_tag: Some(response.etag),
-            bucket: Some("mock-bucket".to_string()),
+            bucket: Some(bucket),
             checksum_crc32: response.object_integrity.crc32,
             checksum_crc32c: response.object_integrity.crc32c,
             checksum_sha1: response.object_integrity.sha1,

@@ -197,7 +197,7 @@ impl StorageBackend for InMemoryStorage {
         let checksum_algorithm = {
             let uploads = self.multipart_uploads.read().await;
             let upload = uploads.get(request.upload_id).ok_or(Error::NoSuchUpload)?;
-            upload.metadata.checksum_algorithm.clone()
+            upload.metadata.checksum_algorithm
         };
 
         // Calculate ETag (MD5 hash)
@@ -215,7 +215,7 @@ impl StorageBackend for InMemoryStorage {
 
             // Calculate checksum for the specified algorithm
             let mut integrity_checks =
-                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm.into());
+                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm);
             integrity_checks.update(&request.content);
             let calculated_integrity = integrity_checks.finalize();
 
@@ -293,7 +293,7 @@ impl StorageBackend for InMemoryStorage {
             (
                 upload.key,
                 upload.metadata.clone(),
-                upload.metadata.checksum_algorithm.clone(),
+                upload.metadata.checksum_algorithm,
                 upload.checksum_type,
             )
         };
@@ -345,10 +345,9 @@ impl StorageBackend for InMemoryStorage {
         let mut integrity_checks = checksum_algorithm
             .as_ref()
             .map(|algorithm| {
-                crate::types::ObjectIntegrityChecks::new()
-                    .with_checksum_algorithm((*algorithm).into())
+                crate::types::ObjectIntegrityChecks::new().with_checksum_algorithm(*algorithm)
             })
-            .unwrap_or_else(|| crate::types::ObjectIntegrityChecks::new());
+            .unwrap_or_else(crate::types::ObjectIntegrityChecks::new);
 
         match checksum_type {
             Some(aws_sdk_s3::types::ChecksumType::FullObject) => {
