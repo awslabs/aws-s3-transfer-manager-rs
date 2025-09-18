@@ -305,9 +305,7 @@ impl StorageBackend for FilesystemStorage {
         let metadata_path = self.get_object_metadata_path(&request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
 
-        Ok(StoredObjectMetadata {
-            object_integrity,
-        })
+        Ok(StoredObjectMetadata { object_integrity })
     }
 
     async fn get_object(
@@ -517,9 +515,7 @@ impl StorageBackend for FilesystemStorage {
         let mut result: Vec<_> = upload_metadata
             .parts
             .iter()
-            .map(|(&part_number, _part_metadata)| crate::storage::PartInfo {
-                part_number,
-            })
+            .map(|(&part_number, _part_metadata)| crate::storage::PartInfo { part_number })
             .collect();
 
         // Sort by part number for consistent ordering

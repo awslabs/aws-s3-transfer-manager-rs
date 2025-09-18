@@ -90,9 +90,7 @@ impl StorageBackend for InMemoryStorage {
         let mut objects = self.objects.write().await;
         objects.insert(request.key.clone(), (content, metadata));
 
-        Ok(StoredObjectMetadata {
-            object_integrity,
-        })
+        Ok(StoredObjectMetadata { object_integrity })
     }
 
     async fn get_object(

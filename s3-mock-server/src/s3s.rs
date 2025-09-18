@@ -898,7 +898,6 @@ mod tests {
             .upload_id(upload_id.clone())
             .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
                 parts: Some(valid_parts),
-                ..Default::default()
             }))
             .build()
             .unwrap();
@@ -940,7 +939,6 @@ mod tests {
             .upload_id(upload_id2)
             .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
                 parts: Some(invalid_parts),
-                ..Default::default()
             }))
             .build()
             .unwrap();
