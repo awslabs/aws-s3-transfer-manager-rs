@@ -88,6 +88,7 @@ pub(crate) struct UploadPartResponse {
 
 /// Information about a part.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct PartInfo {
     pub part_number: i32,
 }
