@@ -109,7 +109,6 @@ where
 /// ```
 #[derive(Debug)]
 pub(crate) struct FilesystemStorage {
-    root_dir: PathBuf,
     objects_dir: PathBuf,
     uploads_dir: PathBuf,
 }
@@ -138,7 +137,6 @@ impl FilesystemStorage {
         fs::create_dir_all(&uploads_dir).await?;
 
         Ok(Self {
-            root_dir,
             objects_dir,
             uploads_dir,
         })
@@ -308,9 +306,7 @@ impl StorageBackend for FilesystemStorage {
         Self::save_metadata(&metadata_path, &metadata).await?;
 
         Ok(StoredObjectMetadata {
-            content_length,
             object_integrity,
-            last_modified,
         })
     }
 
@@ -415,8 +411,6 @@ impl StorageBackend for FilesystemStorage {
 
         Ok(crate::storage::ListObjectsResponse {
             objects: matching_objects,
-            next_continuation_token: None,
-            is_truncated: false,
         })
     }
 
@@ -523,10 +517,8 @@ impl StorageBackend for FilesystemStorage {
         let mut result: Vec<_> = upload_metadata
             .parts
             .iter()
-            .map(|(&part_number, part_metadata)| crate::storage::PartInfo {
+            .map(|(&part_number, _part_metadata)| crate::storage::PartInfo {
                 part_number,
-                etag: part_metadata.etag.clone(),
-                size: part_metadata.size,
             })
             .collect();
 
@@ -663,7 +655,6 @@ impl StorageBackend for FilesystemStorage {
         Ok(crate::storage::CompleteMultipartUploadResponse {
             key: upload_metadata.key.clone(),
             etag: combined_etag,
-            metadata: final_metadata,
             object_integrity,
         })
     }
@@ -847,19 +838,13 @@ mod tests {
         }
 
         // List all objects
-        let request = crate::storage::ListObjectsRequest {
-            prefix: None,
-            max_keys: None,
-            continuation_token: None,
-        };
+        let request = crate::storage::ListObjectsRequest { prefix: None };
         let objects = storage.list_objects(request).await.unwrap();
         assert_eq!(objects.objects.len(), 3);
 
         // List with prefix
         let request = crate::storage::ListObjectsRequest {
             prefix: Some("test-key-1"),
-            max_keys: None,
-            continuation_token: None,
         };
         let objects = storage.list_objects(request).await.unwrap();
         assert_eq!(objects.objects.len(), 1);
@@ -904,8 +889,6 @@ mod tests {
         let parts = storage.list_parts(upload_id).await.unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].part_number, 1); // part number
-        assert_eq!(parts[0].etag, etag1.etag); // etag
-        assert_eq!(parts[0].size, part1.len() as u64); // size
 
         // Complete multipart upload
         let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
@@ -917,16 +900,16 @@ mod tests {
         let response = storage.complete_multipart_upload(request).await.unwrap();
 
         assert_eq!(response.key, key);
-        assert_eq!(
-            response.metadata.content_length,
-            (part1.len() + part2.len()) as u64
-        );
 
-        // Verify the final object exists
+        // Verify the final object exists and has correct content length
         let request = crate::storage::GetObjectRequest { key, range: None };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
+        assert_eq!(
+            response.metadata.content_length,
+            (part1.len() + part2.len()) as u64
+        );
         let final_stream = response.stream;
         let final_content = collect_stream_data(final_stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
@@ -1034,8 +1017,6 @@ mod tests {
         // List objects
         let request = crate::storage::ListObjectsRequest {
             prefix: Some("nested/"),
-            max_keys: None,
-            continuation_token: None,
         };
         let objects = storage.list_objects(request).await.unwrap();
         assert_eq!(objects.objects.len(), 1);

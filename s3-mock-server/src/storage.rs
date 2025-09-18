@@ -52,15 +52,11 @@ pub(crate) struct GetObjectResponse {
 /// Request for listing objects.
 pub(crate) struct ListObjectsRequest<'a> {
     pub prefix: Option<&'a str>,
-    pub max_keys: Option<i32>,
-    pub continuation_token: Option<&'a str>,
 }
 
 /// Response for listing objects.
 pub(crate) struct ListObjectsResponse {
     pub objects: Vec<ObjectInfo>,
-    pub next_continuation_token: Option<String>,
-    pub is_truncated: bool,
 }
 
 /// Information about an object.
@@ -94,8 +90,6 @@ pub(crate) struct UploadPartResponse {
 #[derive(Debug)]
 pub(crate) struct PartInfo {
     pub part_number: i32,
-    pub etag: String,
-    pub size: u64,
 }
 
 /// Request for completing a multipart upload.
@@ -110,12 +104,12 @@ pub(crate) struct CompleteMultipartUploadRequest<'a> {
 pub(crate) struct CompleteMultipartUploadResponse {
     pub key: String,
     pub etag: String,
-    pub metadata: ObjectMetadata,
     pub object_integrity: ObjectIntegrity,
 }
 
 impl StoreObjectRequest {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         key: impl Into<String>,
         body: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>,
         integrity_checks: ObjectIntegrityChecks,
@@ -127,16 +121,6 @@ impl StoreObjectRequest {
             content_type: None,
             user_metadata: HashMap::new(),
         }
-    }
-
-    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
-        self.content_type = content_type;
-        self
-    }
-
-    pub fn with_user_metadata(mut self, user_metadata: HashMap<String, String>) -> Self {
-        self.user_metadata = user_metadata;
-        self
     }
 }
 

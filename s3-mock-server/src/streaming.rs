@@ -42,6 +42,7 @@ impl VecByteStream {
     }
 
     /// Create a new VecByteStream from a Vec<Bytes>.
+    #[cfg(test)]
     pub fn from_vec(data: Vec<Bytes>) -> Self {
         let total = data
             .iter()
@@ -56,6 +57,7 @@ impl VecByteStream {
     }
 
     /// Get the exact remaining length in bytes.
+    #[cfg(test)]
     pub fn exact_remaining_length(&self) -> usize {
         self.remaining_bytes
     }
@@ -190,8 +192,8 @@ mod tests {
         let mut stream = response.stream;
         let returned_metadata = response.metadata;
 
-        // Verify metadata
-        assert_eq!(returned_metadata.content_length, test_data.len() as u64);
+        // Verify metadata - check that etag was calculated
+        assert!(!returned_metadata.etag.is_empty());
         // The etag should be the MD5 hash of the content
         let expected_etag = format!("\"{}\"", hex::encode(md5::compute(&test_data).0));
         assert_eq!(returned_metadata.etag, expected_etag);

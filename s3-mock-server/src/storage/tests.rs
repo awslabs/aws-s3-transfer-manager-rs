@@ -247,7 +247,8 @@ async fn test_storage_backend_consistency() {
         // Verify consistency
         assert_eq!(retrieved_content, content);
         assert_eq!(response.metadata.content_length, content.len() as u64);
-        assert_eq!(stored_metadata.content_length, content.len() as u64);
+        // Verify object integrity was calculated
+        assert!(stored_metadata.object_integrity.etag().is_some());
 
         // Clean up
         storage.delete_object(key).await.unwrap();

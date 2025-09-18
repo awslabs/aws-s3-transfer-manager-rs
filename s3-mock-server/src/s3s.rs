@@ -419,17 +419,25 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let delimiter = input.delimiter.as_deref();
         let max_keys = input.max_keys.unwrap_or(1000).min(1000) as usize;
         let start_after = input.start_after.as_deref();
+        let continuation_token = input.continuation_token.as_deref();
 
         // List objects from storage
-        let request = crate::storage::ListObjectsRequest {
-            prefix,
-            max_keys: Some(max_keys as i32),
-            continuation_token: None,
-        };
+        let request = crate::storage::ListObjectsRequest { prefix };
         let mut response = self.storage.list_objects(request).await?;
 
-        // Apply start_after if specified
-        if let Some(start_after) = start_after {
+        // Apply start_after or continuation token if specified
+        if let Some(continuation_token) = continuation_token {
+            // Decode the continuation token to get the last key
+            if let Ok(decoded) =
+                base64::engine::general_purpose::STANDARD.decode(continuation_token)
+            {
+                if let Ok(last_key) = String::from_utf8(decoded) {
+                    response
+                        .objects
+                        .retain(|obj| obj.key.as_str() > last_key.as_str());
+                }
+            }
+        } else if let Some(start_after) = start_after {
             response
                 .objects
                 .retain(|obj| obj.key.as_str() > start_after);
@@ -490,6 +498,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let total_objects = contents.len() + common_prefixes.len();
         let is_truncated = total_objects > max_keys;
 
+        // Truncate results if needed
+        if is_truncated {
+            let remaining_slots = max_keys.saturating_sub(common_prefixes.len());
+            contents.truncate(remaining_slots);
+        }
+
         // Calculate continuation token if truncated
         let next_continuation_token = if is_truncated {
             contents
@@ -501,10 +515,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         let output = s3s::dto::ListObjectsV2Output {
-            contents: Some(contents),
-            common_prefixes: Some(common_prefixes),
+            contents: Some(contents.clone()),
+            common_prefixes: Some(common_prefixes.clone()),
             is_truncated: Some(is_truncated),
-            key_count: Some(total_objects as i32),
+            key_count: Some((contents.len() + common_prefixes.len()) as i32),
             max_keys: Some(max_keys as i32),
             prefix: prefix.map(|s| s.to_string()),
             delimiter: delimiter.map(|s| s.to_string()),

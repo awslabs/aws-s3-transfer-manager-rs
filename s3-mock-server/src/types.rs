@@ -203,18 +203,6 @@ impl From<&ClientChecksums> for ObjectIntegrityChecks {
 }
 
 impl ObjectIntegrity {
-    /// Create an empty ObjectIntegrity with no checksums calculated.
-    pub fn empty() -> Self {
-        Self {
-            md5_hash: None,
-            crc32: None,
-            crc32c: None,
-            crc64nvme: None,
-            sha1: None,
-            sha256: None,
-        }
-    }
-
     /// Returns the ETag (MD5 hash with quotes) if calculated.
     pub fn etag(&self) -> Option<String> {
         self.md5_hash.clone()
@@ -267,9 +255,7 @@ impl ObjectIntegrity {
 /// Metadata for a stored object, including integrity information.
 #[derive(Debug, Clone)]
 pub struct StoredObjectMetadata {
-    pub content_length: u64,
     pub object_integrity: ObjectIntegrity,
-    pub last_modified: std::time::SystemTime,
 }
 
 #[cfg(test)]
