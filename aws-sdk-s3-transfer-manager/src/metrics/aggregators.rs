@@ -43,19 +43,19 @@ impl ClientMetrics {
     /// Increment transfers initiated counter
     pub(crate) fn increment_transfers_initiated(&self) {
         self.transfers_initiated.increment(1);
-        self.active_transfers.increment(1);
+        self.active_transfers.increment(1.0);
     }
 
     /// Increment transfers completed counter
     pub(crate) fn increment_transfers_completed(&self) {
         self.transfers_completed.increment(1);
-        self.active_transfers.decrement(1);
+        self.active_transfers.decrement(1.0);
     }
 
     /// Increment transfers failed counter
     pub(crate) fn increment_transfers_failed(&self) {
         self.transfers_failed.increment(1);
-        self.active_transfers.decrement(1);
+        self.active_transfers.decrement(1.0);
     }
 
     /// Add bytes to total transferred
@@ -84,7 +84,7 @@ impl ClientMetrics {
     }
 
     /// Get the number of currently active transfers
-    pub fn active_transfers(&self) -> u64 {
+    pub fn active_transfers(&self) -> f64 {
         self.active_transfers.value()
     }
 }
@@ -184,6 +184,8 @@ pub(crate) struct ThroughputMetrics {
     avg_throughput_bps: AtomicU64,
     total_bytes: AtomicU64,
     start_time: std::time::Instant,
+    // Number of times record_bytes called (for calculating cumulative avg)
+    count: AtomicU64,
 
     // Optional sampling
     history: Option<Arc<Mutex<ThroughputHistory>>>,
@@ -228,6 +230,7 @@ impl ThroughputMetrics {
             total_bytes: AtomicU64::new(0),
             start_time: std::time::Instant::now(),
             history,
+            count: AtomicU64::new(0),
         }
     }
 
@@ -268,18 +271,24 @@ impl ThroughputMetrics {
                 }
             }
 
-            // Update average (same as current for cumulative calculation)
-            self.avg_throughput_bps
-                .store(current_bps_scaled, Ordering::Relaxed);
+            // Update cumulative average
+            let old_count = self.count.load(Ordering::Relaxed);
+            let old_avg = self.avg_throughput_bps.load(Ordering::Relaxed);
+
+            let new_count = old_count + 1;
+            let new_avg = (current_bps_scaled + (old_count * old_avg)) / new_count;
+
+            self.count.store(new_count, Ordering::Relaxed);
+            self.avg_throughput_bps.store(new_avg, Ordering::Relaxed);
 
             // Update sampling history if enabled
             if let Some(ref history) = self.history {
-                self.update_sample_history(history, current_bps / 1000.0);
+                self.update_sample_history(history.clone(), current_bps / 1000.0);
             }
         }
     }
 
-    fn update_sample_history(&self, history: &Arc<Mutex<ThroughputHistory>>, bps: f64) {
+    fn update_sample_history(&self, history: Arc<Mutex<ThroughputHistory>>, bps: f64) {
         if let Ok(mut hist) = history.try_lock() {
             let now = std::time::Instant::now();
             if hist.last_sample_time.is_none()

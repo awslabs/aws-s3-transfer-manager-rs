@@ -28,55 +28,55 @@ impl IncreasingCounter {
     }
 }
 
+// Implementation note: there is no AtomicF64 so the bytes are stored as an AtomicU64 and
+// reinterpreted as an f64 at user exposed endpoints. Just wrapping it in a mutex might
+// be more performant, but need to benchmark.
 /// A value that can increase or decrease over time.
 /// Minimum value is 0.
 #[derive(Debug, Clone, Default)]
 pub struct Gauge {
-    value: Arc<AtomicU64>,
+    inner: Arc<AtomicU64>,
 }
 
 impl Gauge {
     /// Create a new gauge starting at 0.
     pub fn new() -> Self {
         Self {
-            value: Arc::new(AtomicU64::new(0)),
+            inner: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Set the gauge to the given value and return the new value.
-    pub fn set(&self, value: u64) -> u64 {
-        self.value.store(value, Ordering::Relaxed);
-        value
+    /// Set the gauge to the given value
+    pub fn set(&self, value: f64) {
+        self.inner
+            .store(u64::from_be_bytes(value.to_be_bytes()), Ordering::Relaxed);
     }
 
-    /// Increment the gauge by the given amount and return the new value.
-    pub fn increment(&self, amount: u64) -> u64 {
-        self.value.fetch_add(amount, Ordering::Relaxed) + amount
+    /// Increment the gauge by the given amount and return the previous value.
+    pub fn increment(&self, amount: f64) -> f64 {
+        let old = f64::from_be_bytes(self.inner.load(Ordering::Relaxed).to_be_bytes());
+        let new = old + amount;
+
+        self.inner
+            .store(u64::from_be_bytes(new.to_be_bytes()), Ordering::Relaxed);
+
+        old
     }
 
-    /// Decrement the gauge by the given amount and return the new value.
-    /// If the decrement would cause underflow, the gauge is clamped at 0.
-    pub fn decrement(&self, amount: u64) -> u64 {
-        // TODO: This can be done more cleanly when the atomic `update` method stabilizes
-        loop {
-            let current = self.value.load(Ordering::Relaxed);
-            let new_value = current.saturating_sub(amount);
+    /// Decrement the gauge by the given amount and return the previous value.
+    pub fn decrement(&self, amount: f64) -> f64 {
+        let old = f64::from_be_bytes(self.inner.load(Ordering::Relaxed).to_be_bytes());
+        let new = old - amount;
 
-            match self.value.compare_exchange_weak(
-                current,
-                new_value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return new_value,
-                Err(_) => continue,
-            }
-        }
+        self.inner
+            .store(u64::from_be_bytes(new.to_be_bytes()), Ordering::Relaxed);
+
+        old
     }
 
     /// Get the current value of the gauge.
-    pub fn value(&self) -> u64 {
-        self.value.load(Ordering::Relaxed)
+    pub fn value(&self) -> f64 {
+        f64::from_be_bytes(self.inner.load(Ordering::Relaxed).to_be_bytes())
     }
 }
 
@@ -186,11 +186,9 @@ impl Clone for Histogram {
     }
 }
 
-/// Default bucket boundaries for latency measurements in seconds.
+/// Default bucket boundaries for latency. Measurements in seconds.
 fn default_latency_buckets() -> Vec<f64> {
-    vec![
-        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-    ]
+    vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
 }
 
 #[cfg(test)]
@@ -212,16 +210,17 @@ mod tests {
     #[test]
     fn test_gauge() {
         let gauge = Gauge::new();
-        assert_eq!(gauge.value(), 0);
+        assert_eq!(gauge.value(), 0.0);
 
-        assert_eq!(gauge.set(10), 10);
-        assert_eq!(gauge.value(), 10);
+        gauge.set(10.25);
 
-        assert_eq!(gauge.increment(5), 15);
-        assert_eq!(gauge.value(), 15);
+        assert_eq!(gauge.value(), 10.25);
 
-        assert_eq!(gauge.decrement(3), 12);
-        assert_eq!(gauge.value(), 12);
+        assert_eq!(gauge.increment(5.0), 10.25);
+        assert_eq!(gauge.value(), 15.25);
+
+        assert_eq!(gauge.decrement(3.25), 15.25);
+        assert_eq!(gauge.value(), 12.0);
     }
 
     #[test]

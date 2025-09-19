@@ -438,7 +438,7 @@ mod test {
         assert_eq!(initial_initiated, 0);
         assert_eq!(initial_completed, 0);
         assert_eq!(initial_bytes, 0);
-        assert_eq!(initial_active, 0);
+        assert_eq!(initial_active, 0.0);
 
         // Create and execute upload
         let body = Bytes::from_static(b"test data for metrics");
@@ -454,7 +454,7 @@ mod test {
 
         // Check metrics after initiation
         assert_eq!(tm.metrics().transfers_initiated(), 1);
-        assert_eq!(tm.metrics().active_transfers(), 1);
+        assert_eq!(tm.metrics().active_transfers(), 1.0);
 
         // Complete the upload
         let _result = handle.join().await.unwrap();
@@ -463,7 +463,7 @@ mod test {
         assert_eq!(tm.metrics().transfers_initiated(), 1);
         assert_eq!(tm.metrics().transfers_completed(), 1);
         assert_eq!(tm.metrics().total_bytes_transferred(), body.len() as u64);
-        assert_eq!(tm.metrics().active_transfers(), 0);
+        assert_eq!(tm.metrics().active_transfers(), 0.0);
         assert_eq!(tm.metrics().transfers_failed(), 0);
     }
 }
