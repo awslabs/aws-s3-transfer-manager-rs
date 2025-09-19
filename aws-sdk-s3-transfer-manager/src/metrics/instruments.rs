@@ -94,6 +94,7 @@ struct HistogramInner {
     max: f64,
     bucket_bounds: Vec<f64>,
     bucket_counts: Vec<u64>,
+    values: Vec<f64>,
 }
 
 impl Histogram {
@@ -113,6 +114,7 @@ impl Histogram {
                 max: f64::NEG_INFINITY,
                 bucket_bounds,
                 bucket_counts,
+                values: Vec::new(),
             })),
         }
     }
@@ -124,6 +126,7 @@ impl Histogram {
             inner.sum += value;
             inner.min = inner.min.min(value);
             inner.max = inner.max.max(value);
+            inner.values.push(value);
 
             // Find the appropriate bucket
             for (i, &bound) in inner.bucket_bounds.iter().enumerate() {
@@ -167,6 +170,38 @@ impl Histogram {
     pub fn max(&self) -> f64 {
         self.inner.lock().map(|inner| inner.max).unwrap_or(0.0)
     }
+
+    /// Get a specific quantile (0.0 to 1.0).
+    pub fn quantile(&self, q: f64) -> f64 {
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.values.is_empty() || !(0.0..=1.0).contains(&q) {
+                return 0.0;
+            }
+            inner.values.sort_by(f64::total_cmp);
+            // Formula to find element representing quantile q in list of size N
+            // is: round_down(q * (N + 1)), subtract one more to get an index
+            // The as usize cast handles rounding down.
+            let index = ((q * (inner.values.len() + 1) as f64) as usize).saturating_sub(1);
+            inner.values[index.min(inner.values.len() - 1)]
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the 50th percentile (median).
+    pub fn p50(&self) -> f64 {
+        self.quantile(0.5)
+    }
+
+    /// Get the 90th percentile.
+    pub fn p90(&self) -> f64 {
+        self.quantile(0.9)
+    }
+
+    /// Get the 99th percentile.
+    pub fn p99(&self) -> f64 {
+        self.quantile(0.99)
+    }
 }
 
 impl Default for Histogram {
@@ -179,7 +214,16 @@ impl Default for Histogram {
 impl Clone for Histogram {
     fn clone(&self) -> Self {
         if let Ok(inner) = self.inner.lock() {
-            Self::with_buckets(inner.bucket_bounds.clone())
+            let new_histogram = Self::with_buckets(inner.bucket_bounds.clone());
+            if let Ok(mut new_inner) = new_histogram.inner.lock() {
+                new_inner.values = inner.values.clone();
+                new_inner.count = inner.count;
+                new_inner.sum = inner.sum;
+                new_inner.min = inner.min;
+                new_inner.max = inner.max;
+                new_inner.bucket_counts = inner.bucket_counts.clone();
+            }
+            new_histogram
         } else {
             Self::new()
         }
@@ -238,5 +282,25 @@ mod tests {
         assert_eq!(histogram.mean(), 2.0);
         assert_eq!(histogram.min(), 1.0);
         assert_eq!(histogram.max(), 3.0);
+    }
+
+    #[test]
+    fn test_histogram_quantiles() {
+        let histogram = Histogram::new();
+
+        // Record values 1-10
+        for i in 1..=10 {
+            histogram.record(i as f64);
+        }
+
+        // For values [1,2,3,4,5,6,7,8,9,10]:
+        // p50 (0.5 * (10 + 1) = 5.5 -> round to 5 -> index 4 = 5)
+        // p90 (0.9 * (10 + 1) = 9.9 -> round to 9 -> index 8 = 9)
+        // p99 (0.99 * (10 + 1) = 10.89 -> round to 10 -> index 9 = 10)
+        assert_eq!(histogram.p50(), 5.0);
+        assert_eq!(histogram.p90(), 9.0);
+        assert_eq!(histogram.p99(), 10.0);
+        assert_eq!(histogram.quantile(0.0), 1.0);
+        assert_eq!(histogram.quantile(1.0), 10.0);
     }
 }
