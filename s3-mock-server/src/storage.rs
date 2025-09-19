@@ -109,7 +109,6 @@ pub(crate) struct CompleteMultipartUploadResponse {
 }
 
 impl StoreObjectRequest {
-    #[cfg(test)]
     pub(crate) fn new(
         key: impl Into<String>,
         body: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>,
@@ -122,6 +121,11 @@ impl StoreObjectRequest {
             content_type: None,
             user_metadata: HashMap::new(),
         }
+    }
+
+    pub(crate) fn with_user_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.user_metadata = metadata;
+        self
     }
 }
 
