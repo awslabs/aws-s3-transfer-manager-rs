@@ -69,6 +69,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let ctx = request.ctx;
     let part_data = request.part_data;
     let part_number = part_data.part_number as i32;
+    let bytes_to_upload = part_data.data.remaining() as u64;
 
     let req = copy_fields_to_upload_part_request(
         &ctx.request,
@@ -87,6 +88,9 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
         .send()
         .instrument(tracing::debug_span!("send-upload-part", part_number))
         .await?;
+
+    // Track bytes transferred on successful upload
+    ctx.handle.metrics.add_bytes_transferred(bytes_to_upload);
 
     tracing::trace!("completed upload of part number {}", part_number);
     let completed = CompletedPart::builder()
@@ -225,6 +229,7 @@ pub(super) async fn read_body(
 mod tests {
     use super::*;
     use crate::client::Handle;
+    use crate::metrics::aggregators::{ClientMetrics, TransferMetrics};
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
@@ -234,11 +239,13 @@ mod tests {
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
         let s3_client = mock_client!(aws_sdk_s3, []);
+        let metrics = Arc::new(TransferMetrics::new());
         UploadPartRequest {
             ctx: UploadContext {
                 handle: Arc::new(Handle {
                     config: Config::builder().client(s3_client).build(),
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
+                    metrics: ClientMetrics::new(),
                 }),
                 request: Arc::new(
                     UploadInput::builder()
@@ -248,6 +255,7 @@ mod tests {
                         .unwrap(),
                 ),
                 bucket_type: BucketType::from_bucket_name(bucket_name),
+                metrics,
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),

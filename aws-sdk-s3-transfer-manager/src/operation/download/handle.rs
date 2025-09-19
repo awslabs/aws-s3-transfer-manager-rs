@@ -31,6 +31,9 @@ pub struct DownloadHandle {
 
     /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
+
+    /// Client handle for metrics access
+    pub(crate) handle: Arc<crate::client::Handle>,
 }
 
 impl DownloadHandle {
@@ -73,6 +76,38 @@ impl DownloadHandle {
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while (tasks.join_next().await).is_some() {}
+    }
+
+    /// Wait for the download to complete and track completion metrics.
+    pub async fn join(self) -> Result<(), error::Error> {
+        // Wait for discovery to complete
+        if let Err(e) = self.discovery.await {
+            self.handle.metrics.increment_transfers_failed();
+            return Err(error::from_kind(ErrorKind::RuntimeError)(format!(
+                "Discovery task failed: {}",
+                e
+            )));
+        }
+
+        // Wait for all download tasks to complete
+        let mut tasks = self.tasks.lock().await;
+        let mut has_error = false;
+
+        while let Some(result) = tasks.join_next().await {
+            if result.is_err() {
+                has_error = true;
+            }
+        }
+
+        if has_error {
+            self.handle.metrics.increment_transfers_failed();
+            Err(error::from_kind(ErrorKind::RuntimeError)(
+                "One or more download tasks failed",
+            ))
+        } else {
+            self.handle.metrics.increment_transfers_completed();
+            Ok(())
+        }
     }
 }
 

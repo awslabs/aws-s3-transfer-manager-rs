@@ -126,7 +126,7 @@ async fn download_specific_chunk(
                 Ok(mut resp) => {
                     validate_content_range(seq, &requested_byte_range, resp.content_range())?;
                     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
-                    let body = AggregatedBytes::from_byte_stream(body)
+                    let body = AggregatedBytes::from_byte_stream(body, Some(&ctx.handle.metrics))
                         .instrument(tracing::debug_span!(
                             "collect-body-from-download-chunk",
                             seq

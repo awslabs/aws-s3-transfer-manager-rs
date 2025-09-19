@@ -332,6 +332,7 @@ mod tests {
     use crate::{
         client::Handle,
         io::InputStream,
+        metrics::aggregators::ClientMetrics,
         operation::upload_objects::{
             worker::{upload_single_obj, UploadObjectJob},
             UploadObjectsContext, UploadObjectsInputBuilder,
@@ -713,7 +714,11 @@ mod tests {
 
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY));
 
-        let handle = std::sync::Arc::new(Handle { config, scheduler });
+        let handle = std::sync::Arc::new(Handle {
+            config,
+            scheduler,
+            metrics: ClientMetrics::new(),
+        });
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)
