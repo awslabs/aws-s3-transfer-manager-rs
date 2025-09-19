@@ -62,19 +62,6 @@ impl Handle {
     }
 }
 
-impl Drop for Handle {
-    fn drop(&mut self) {
-        // Log final metrics summary when the client is dropped
-        tracing::debug!(
-            "Client metrics summary - Transfers initiated: {}, completed: {}, failed: {}, total bytes: {}",
-            self.metrics.transfers_initiated(),
-            self.metrics.transfers_completed(),
-            self.metrics.transfers_failed(),
-            self.metrics.total_bytes_transferred()
-        );
-    }
-}
-
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {

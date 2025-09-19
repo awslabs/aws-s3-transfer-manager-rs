@@ -15,7 +15,6 @@ use crate::operation::download::RetryPolicy;
 use crate::runtime::scheduler::NetworkPermitContext;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use bytes::Buf;
 use std::cmp;
 use std::mem;
 use std::ops::RangeInclusive;
@@ -127,7 +126,7 @@ async fn download_specific_chunk(
                 Ok(mut resp) => {
                     validate_content_range(seq, &requested_byte_range, resp.content_range())?;
                     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
-                    let body = AggregatedBytes::from_byte_stream(body)
+                    let body = AggregatedBytes::from_byte_stream(body, Some(&ctx.handle.metrics))
                         .instrument(tracing::debug_span!(
                             "collect-body-from-download-chunk",
                             seq
@@ -136,10 +135,6 @@ async fn download_specific_chunk(
                         .map_err(|err| {
                            error::chunk_failed(ChunkId::Download(seq), err)
                         })?;
-
-                    // Track bytes transferred
-                    let bytes_len = body.remaining() as u64;
-                    ctx.handle.metrics.add_bytes_transferred(bytes_len);
 
                     Ok(ChunkOutput {
                         seq,

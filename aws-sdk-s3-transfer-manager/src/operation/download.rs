@@ -6,7 +6,6 @@
 mod input;
 
 use aws_sdk_s3::error::DisplayErrorContext;
-use bytes::Buf;
 /// Request type for dowloading a single object from Amazon S3
 pub use input::{DownloadInput, DownloadInputBuilder};
 
@@ -226,13 +225,9 @@ fn handle_discovery_chunk(
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
         tasks.spawn(async move {
-            let chunk = AggregatedBytes::from_byte_stream(stream)
+            let chunk = AggregatedBytes::from_byte_stream(stream, Some(&handle.metrics))
                 .await
                 .map(|aggregated| {
-                    // Track bytes transferred
-                    let bytes_len = aggregated.remaining() as u64;
-                    handle.metrics.add_bytes_transferred(bytes_len);
-
                     ChunkOutput {
                         seq,
                         data: aggregated,
@@ -304,8 +299,8 @@ impl DownloadContext {
 
     /// Returns the transfer metrics for this download
     #[allow(unused)]
-    fn metrics(&self) -> &Arc<TransferMetrics> {
-        &self.state.metrics
+    fn metrics(&self) -> Arc<TransferMetrics> {
+        self.state.metrics.clone()
     }
 }
 
@@ -352,7 +347,7 @@ mod test {
         assert_eq!(initial_initiated, 0);
         assert_eq!(initial_completed, 0);
         assert_eq!(initial_bytes, 0);
-        assert_eq!(initial_active, 0);
+        assert_eq!(initial_active, 0.0);
 
         // Create and execute download
         let mut handle = tm
@@ -364,7 +359,7 @@ mod test {
 
         // Check metrics after initiation
         assert_eq!(tm.metrics().transfers_initiated(), 1);
-        assert_eq!(tm.metrics().active_transfers(), 1);
+        assert_eq!(tm.metrics().active_transfers(), 1.0);
 
         // Complete the download by consuming the body
         let mut downloaded_data = Vec::new();
@@ -386,7 +381,7 @@ mod test {
             tm.metrics().total_bytes_transferred(),
             test_data.len() as u64
         );
-        assert_eq!(tm.metrics().active_transfers(), 0);
+        assert_eq!(tm.metrics().active_transfers(), 0.0);
         assert_eq!(tm.metrics().transfers_failed(), 0);
     }
 }

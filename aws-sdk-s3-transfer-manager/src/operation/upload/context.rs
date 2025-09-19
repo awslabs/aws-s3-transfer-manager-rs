@@ -41,7 +41,7 @@ impl UploadContext {
 
     /// Returns the transfer metrics for this upload
     #[allow(unused)]
-    pub(crate) fn metrics(&self) -> &Arc<TransferMetrics> {
-        &self.metrics
+    pub(crate) fn metrics(&self) -> Arc<TransferMetrics> {
+        self.metrics.clone()
     }
 }
