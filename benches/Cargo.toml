@@ -2,7 +2,10 @@
 name = "benches"
 version = "0.0.0"
 edition = "2021"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
 publish = false
+description = "Internal benchmarks for aws-sdk-s3-transfer-manager"
 
 [[bench]]
 name = "throughput"
