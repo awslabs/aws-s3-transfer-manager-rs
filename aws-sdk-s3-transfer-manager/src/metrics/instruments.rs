@@ -81,7 +81,7 @@ impl Gauge {
 }
 
 /// A statistical distribution of values with configurable buckets.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Histogram {
     inner: Arc<Mutex<HistogramInner>>,
 }
@@ -207,26 +207,6 @@ impl Histogram {
 impl Default for Histogram {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-//TODO: maybe this should be a try_clone and it should fail if the mutex is poisoned?
-impl Clone for Histogram {
-    fn clone(&self) -> Self {
-        if let Ok(inner) = self.inner.lock() {
-            let new_histogram = Self::with_buckets(inner.bucket_bounds.clone());
-            if let Ok(mut new_inner) = new_histogram.inner.lock() {
-                new_inner.values = inner.values.clone();
-                new_inner.count = inner.count;
-                new_inner.sum = inner.sum;
-                new_inner.min = inner.min;
-                new_inner.max = inner.max;
-                new_inner.bucket_counts = inner.bucket_counts.clone();
-            }
-            new_histogram
-        } else {
-            Self::new()
-        }
     }
 }
 
