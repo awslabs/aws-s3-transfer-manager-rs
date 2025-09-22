@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use crate::error::{self, ErrorKind};
+use crate::{
+    error::{self, ErrorKind},
+    metrics::aggregators::TransferMetrics,
+    operation::download::DownloadContext,
+};
 use tokio::{
     sync::{oneshot::Receiver, Mutex, OnceCell},
-    task,
+    task::{self},
 };
 
 /*
@@ -32,8 +36,8 @@ pub struct DownloadHandle {
     /// All child tasks (ranged GetObject) spawned for this download
     pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
 
-    /// Client handle for metrics access
-    pub(crate) handle: Arc<crate::client::Handle>,
+    /// Context object for this download
+    pub(crate) ctx: DownloadContext,
 }
 
 impl DownloadHandle {
@@ -66,11 +70,19 @@ impl DownloadHandle {
         &mut self.body
     }
 
+    /// Metrics for this download
+    pub fn transfer_metrics(&self) -> Arc<TransferMetrics> {
+        self.ctx.metrics().clone()
+    }
+
     /// Abort the download and cancel any in-progress work.
     pub async fn abort(mut self) {
         self.body.close();
         self.discovery.abort();
-        let _ = self.discovery.await;
+
+        let discovery = std::mem::replace(&mut self.discovery, tokio::spawn(async {}));
+        let _ = discovery.await;
+
         // It's safe to grab the lock here because discovery is already complete, and we will never
         // lock tasks again after discovery to spawn more tasks.
         let mut tasks = self.tasks.lock().await;
@@ -78,11 +90,12 @@ impl DownloadHandle {
         while (tasks.join_next().await).is_some() {}
     }
 
-    /// Wait for the download to complete and track completion metrics.
-    pub async fn join(self) -> Result<(), error::Error> {
+    /// Wait for the download to complete
+    pub async fn join(mut self) -> Result<(), error::Error> {
+        let discovery = std::mem::replace(&mut self.discovery, tokio::spawn(async {}));
+
         // Wait for discovery to complete
-        if let Err(e) = self.discovery.await {
-            self.handle.metrics.increment_transfers_failed();
+        if let Err(e) = discovery.await {
             return Err(error::from_kind(ErrorKind::RuntimeError)(format!(
                 "Discovery task failed: {}",
                 e
@@ -92,21 +105,32 @@ impl DownloadHandle {
         // Wait for all download tasks to complete
         let mut tasks = self.tasks.lock().await;
         let mut has_error = false;
+        let mut errors = vec![];
 
         while let Some(result) = tasks.join_next().await {
-            if result.is_err() {
+            if let Err(e) = result {
                 has_error = true;
+                errors.push(e);
             }
         }
 
         if has_error {
-            self.handle.metrics.increment_transfers_failed();
-            Err(error::from_kind(ErrorKind::RuntimeError)(
-                "One or more download tasks failed",
-            ))
+            Err(error::from_kind(ErrorKind::RuntimeError)(format!(
+                "One or more download tasks failed: {:#?}",
+                errors
+            )))
         } else {
-            self.handle.metrics.increment_transfers_completed();
             Ok(())
+        }
+    }
+}
+
+impl Drop for DownloadHandle {
+    fn drop(&mut self) {
+        if self.ctx.metrics().transfer_failed() {
+            self.ctx.handle.metrics.increment_transfers_failed();
+        } else {
+            self.ctx.handle.metrics.increment_transfers_completed();
         }
     }
 }

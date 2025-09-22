@@ -6,7 +6,7 @@ use std::{
     fmt::{self, Display},
     ops,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -90,8 +90,8 @@ impl ClientMetrics {
 }
 
 /// Metrics for individual transfer operations
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TransferMetrics {
+#[derive(Debug, Default)]
+pub struct TransferMetrics {
     /// Number of bytes transferred for this operation
     bytes_transferred: IncreasingCounter,
     /// Number of parts/chunks completed
@@ -102,12 +102,63 @@ pub(crate) struct TransferMetrics {
     throughput: ThroughputMetrics,
     /// Request latency histogram
     request_latency: Histogram,
+    /// Detect whether this transfer failed
+    pub(crate) transfer_failed: AtomicBool,
 }
 
 impl TransferMetrics {
     /// Create new transfer metrics
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Get bytes transferred
+    pub fn bytes_transferred(&self) -> u64 {
+        self.bytes_transferred.value()
+    }
+
+    /// Get parts completed
+    pub fn parts_completed(&self) -> u64 {
+        self.parts_completed.value()
+    }
+
+    /// Get parts failed
+    pub fn parts_failed(&self) -> u64 {
+        self.parts_failed.value()
+    }
+
+    /// Get throughput metrics
+    pub fn throughput(&self) -> &ThroughputMetrics {
+        &self.throughput
+    }
+
+    /// Get request latency histogram
+    pub fn request_latency(&self) -> &Histogram {
+        &self.request_latency
+    }
+
+    /// Determine if the transfer has failed
+    pub fn transfer_failed(&self) -> bool {
+        self.transfer_failed.load(Ordering::Relaxed)
+    }
+
+    /// Increment bytes transferred by the given amount
+    pub(crate) fn increment_bytes_transferred(&self, amount: u64) {
+        self.bytes_transferred.increment(amount);
+    }
+
+    /// Increment parts completed by the given amount
+    pub(crate) fn increment_parts_completed(&self, amount: u64) {
+        self.parts_completed.increment(amount);
+    }
+
+    /// Increment parts failed by the given amount
+    pub(crate) fn increment_parts_failed(&self, amount: u64) {
+        self.parts_failed.increment(amount);
+    }
+
+    pub(crate) fn mark_transfer_failed(&self) {
+        self.transfer_failed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -177,7 +228,7 @@ impl Default for SamplingConfig {
 
 /// Throughput metrics with min/max/average tracking and optional sampling.
 #[derive(Debug)]
-pub(crate) struct ThroughputMetrics {
+pub struct ThroughputMetrics {
     // Statistics using scaled u64 for atomic operations (bytes per second * 1000)
     min_throughput_bps: AtomicU64,
     max_throughput_bps: AtomicU64,

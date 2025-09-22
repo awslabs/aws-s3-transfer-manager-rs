@@ -100,7 +100,7 @@ impl Download {
             discovery,
             object_meta_rx: Mutex::new(Some(object_meta_rx)),
             object_meta: OnceCell::new(),
-            handle,
+            ctx,
         })
     }
 }
@@ -139,6 +139,7 @@ async fn send_discovery(
     let permit = match permit {
         Ok(permit) => permit,
         Err(err) => {
+            ctx.metrics().mark_transfer_failed();
             if chunk_tx.send(Err(err)).await.is_err() {
                 tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
             }
@@ -151,6 +152,7 @@ async fn send_discovery(
     let mut discovery = match discovery {
         Ok(discovery) => discovery,
         Err(err) => {
+            ctx.metrics().mark_transfer_failed();
             if chunk_tx.send(Err(err)).await.is_err() {
                 tracing::debug!("Download handle for key({:?}) has been dropped, aborting during the discovery phase", input.key);
             }
@@ -164,6 +166,7 @@ async fn send_discovery(
     input.if_match.clone_from(&discovery.object_meta.e_tag);
 
     if object_meta_tx.send(discovery.object_meta).is_err() {
+        ctx.metrics().mark_transfer_failed();
         tracing::debug!(
             "Download handle for key({:?}) has been dropped, aborting during the discovery phase",
             input.key
@@ -222,6 +225,7 @@ fn handle_discovery_chunk(
         let seq = ctx.next_seq();
         let completed = completed.clone();
         let handle = ctx.handle.clone();
+        let task_ctx = ctx.clone();
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
         tasks.spawn(async move {
@@ -240,6 +244,7 @@ fn handle_discovery_chunk(
             // can make progress
             drop(permit);
             if let Err(send_err) = completed.send(chunk).await {
+                task_ctx.metrics().mark_transfer_failed();
                 tracing::error!(
                     "channel closed, initial chunk from discovery not sent: {}",
                     &DisplayErrorContext(send_err)
