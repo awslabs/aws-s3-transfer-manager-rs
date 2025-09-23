@@ -97,14 +97,18 @@ struct HistogramInner {
     values: Vec<f64>,
 }
 
+/// Default bucket boundaries for latency. Measurements in seconds.
+const DEFAULT_LATENCY_BUCKETS: [f64; 10] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
 impl Histogram {
     /// Create a new histogram with default buckets for latency measurements.
     pub fn new() -> Self {
-        Self::with_buckets(default_latency_buckets())
+        Self::with_buckets(DEFAULT_LATENCY_BUCKETS)
     }
 
     /// Create a new histogram with custom bucket boundaries.
-    pub fn with_buckets(bucket_bounds: Vec<f64>) -> Self {
+    pub fn with_buckets(bucket_bounds: impl IntoIterator<Item = f64>) -> Self {
+        let bucket_bounds = bucket_bounds.into_iter().collect::<Vec<f64>>();
         let bucket_counts = vec![0; bucket_bounds.len()];
         Self {
             inner: Arc::new(Mutex::new(HistogramInner {
@@ -208,11 +212,6 @@ impl Default for Histogram {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Default bucket boundaries for latency. Measurements in seconds.
-fn default_latency_buckets() -> Vec<f64> {
-    vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
 }
 
 #[cfg(test)]
