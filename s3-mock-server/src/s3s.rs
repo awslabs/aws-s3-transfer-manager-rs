@@ -14,8 +14,8 @@ use aws_smithy_checksums::ChecksumAlgorithm;
 use base64::Engine;
 use bytes::BytesMut;
 use futures_util::StreamExt;
-use s3s::dto::StreamingBlob;
 use s3s::dto::Timestamp;
+use s3s::dto::{HeadBucketInput, HeadBucketOutput, StreamingBlob};
 use s3s::{S3Request, S3Response, S3Result};
 use std::str::FromStr;
 
@@ -528,6 +528,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         Ok(S3Response::new(output))
+    }
+
+    async fn head_bucket(
+        &self,
+        _req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        Ok(S3Response::new(HeadBucketOutput::default()))
     }
 }
 

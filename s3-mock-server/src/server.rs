@@ -169,6 +169,29 @@ impl S3MockServer {
         S3MockServerBuilder::new()
     }
 
+    /// Add an object to the mock server storage.
+    pub async fn add_object(
+        &self,
+        key: &str,
+        content: impl Into<bytes::Bytes>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<()> {
+        use crate::storage::StoreObjectRequest;
+        use crate::types::ObjectIntegrityChecks;
+        use futures::stream;
+
+        let bytes = content.into();
+        let stream = stream::once(async move { Ok(bytes) });
+        let boxed_stream = Box::pin(stream);
+
+        let request =
+            StoreObjectRequest::new(key.to_string(), boxed_stream, ObjectIntegrityChecks::new())
+                .with_user_metadata(metadata.unwrap_or_default());
+
+        self.storage.put_object(request).await?;
+        Ok(())
+    }
+
     /// Start the server.
     pub async fn start(&self) -> Result<ServerHandle> {
         // Create the address to bind to
