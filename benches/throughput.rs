@@ -2,12 +2,12 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
 use aws_sdk_s3_transfer_manager::error::Error;
 use aws_sdk_s3_transfer_manager::operation::download::{Body, DownloadHandle};
 use bytes::Bytes;
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use s3_mock_server::S3MockServer;
+use std::hint::black_box;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -100,7 +100,7 @@ fn download_throughput_benchmark(c: &mut Criterion) {
                                 .key("test-key")
                                 .initiate()
                                 .expect("successful transfer initiate");
-                            drain(&mut dl_handle).await.unwrap();
+                            black_box(drain(&mut dl_handle).await.unwrap());
                         }
                         let elapsed = start.elapsed();
 
