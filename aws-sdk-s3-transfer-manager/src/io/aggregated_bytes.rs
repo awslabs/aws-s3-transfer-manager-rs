@@ -59,11 +59,6 @@ impl AggregatedBytes {
         }
         Ok(AggregatedBytes(output))
     }
-
-    // /// Consumes self to create a [ChunkOutput]
-    // pub(crate) fn chunk_output(self, seq: u64, metadata: Option<ChunkMetadata>) -> ChunkOutput {
-
-    // }
 }
 
 impl Buf for AggregatedBytes {
