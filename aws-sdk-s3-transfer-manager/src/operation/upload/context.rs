@@ -4,15 +4,30 @@
  */
 
 use crate::operation::upload::UploadInput;
+use crate::operation::TransferContext;
 use crate::types::BucketType;
 use std::ops::Deref;
 use std::sync::Arc;
 
+pub(crate) type UploadContext = TransferContext<UploadState>;
+
+impl UploadContext {
+    pub(crate) fn new(
+        handle: Arc<crate::client::Handle>,
+        bucket_type: BucketType,
+        req: UploadInput,
+    ) -> Self {
+        let state = Arc::new(UploadState {
+            request: Arc::new(req),
+            bucket_type,
+        });
+        TransferContext { handle, state }
+    }
+}
+
 /// Internal context used to drive a single Upload operation
 #[derive(Debug, Clone)]
-pub(crate) struct UploadContext {
-    /// reference to client handle used to do actual work
-    pub(crate) handle: Arc<crate::client::Handle>,
+pub(crate) struct UploadState {
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
 
@@ -20,12 +35,7 @@ pub(crate) struct UploadContext {
     pub(crate) bucket_type: BucketType,
 }
 
-impl UploadContext {
-    /// The S3 client to use for SDK operations
-    pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
-        self.handle.config.client()
-    }
-
+impl UploadState {
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
         self.request.deref()

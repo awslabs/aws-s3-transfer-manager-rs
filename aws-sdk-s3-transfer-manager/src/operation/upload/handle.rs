@@ -126,6 +126,7 @@ async fn abort_multipart_upload(
     while (tasks.join_next().await).is_some() {}
 
     let abort_policy = ctx
+        .state
         .request
         .failed_multipart_upload_policy
         .clone()
@@ -134,7 +135,7 @@ async fn abort_multipart_upload(
         FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
         FailedMultipartUploadPolicy::AbortUpload => {
             let abort_mpu_resp = copy_fields_to_abort_mpu_request(
-                &ctx.request,
+                &ctx.state.request,
                 ctx.client()
                     .abort_multipart_upload()
                     .set_upload_id(Some(mpu_data.upload_id.clone())),
@@ -210,7 +211,7 @@ async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::er
 
             // complete the multipart upload
             let req = copy_fields_to_complete_mpu_request(
-                &handle.ctx.request,
+                &handle.ctx.state.request,
                 handle
                     .ctx
                     .client()

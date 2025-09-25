@@ -120,13 +120,13 @@ async fn put_object(
         .scheduler
         .acquire_permit(PermitType::Network(NetworkPermitContext {
             payload_size_estimate: content_length as u64,
-            bucket_type: ctx.bucket_type(),
+            bucket_type: ctx.state.bucket_type(),
             direction: TransferDirection::Upload,
         }))
         .await?;
 
     let req = copy_fields_to_put_object_request(
-        &ctx.request,
+        &ctx.state.request,
         ctx.client()
             .put_object()
             .body(body)
@@ -139,8 +139,8 @@ async fn put_object(
         .send()
         .instrument(tracing::info_span!(
             "send-upload-part",
-            bucket = ctx.request.bucket().unwrap_or_default(),
-            key = ctx.request.key().unwrap_or_default()
+            bucket = ctx.state.request.bucket().unwrap_or_default(),
+            key = ctx.state.request.key().unwrap_or_default()
         ))
         .await?;
     Ok(UploadOutputBuilder::from(resp).build()?)
@@ -189,16 +189,16 @@ async fn try_start_mpu_upload(
 }
 
 fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
-    UploadContext {
+    UploadContext::new(
         handle,
-        bucket_type: BucketType::from_bucket_name(req.bucket().expect("bucket is availabe")),
-        request: Arc::new(req),
-    }
+        BucketType::from_bucket_name(req.bucket().expect("bucket is availabe")),
+        req,
+    )
 }
 
 /// start a new multipart upload by invoking `CreateMultipartUpload`
 async fn start_mpu(ctx: &UploadContext) -> Result<UploadOutputBuilder, crate::error::Error> {
-    let req = ctx.request();
+    let req = ctx.state.request();
     let client = ctx.client();
 
     let req = copy_fields_to_mpu_request(req, client.create_multipart_upload());
