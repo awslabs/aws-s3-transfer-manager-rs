@@ -229,7 +229,7 @@ fn handle_discovery_chunk(
         // spawn a task to actually read the discovery chunk without waiting for it so we
         // can get started sooner on any remaining work (if any)
         tasks.spawn(async move {
-            let chunk = AggregatedBytes::from_byte_stream(stream, Some(&handle.metrics))
+            let chunk = AggregatedBytes::from_byte_stream(stream, &handle.metrics)
                 .await
                 .map(|aggregated| {
                     ChunkOutput {
@@ -345,7 +345,7 @@ mod test {
 
         // Check initial metrics
         let initial_initiated = tm.metrics().transfers_initiated();
-        let initial_completed = tm.metrics().transfers_completed();
+        let initial_completed = tm.metrics().transfers_successful();
         let initial_bytes = tm.metrics().total_bytes_transferred();
         let initial_active = tm.metrics().active_transfers();
 
@@ -381,7 +381,7 @@ mod test {
 
         // Check final metrics
         assert_eq!(tm.metrics().transfers_initiated(), 1);
-        assert_eq!(tm.metrics().transfers_completed(), 1);
+        assert_eq!(tm.metrics().transfers_successful(), 1);
         assert_eq!(
             tm.metrics().total_bytes_transferred(),
             test_data.len() as u64

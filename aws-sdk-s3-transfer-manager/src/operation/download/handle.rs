@@ -127,10 +127,10 @@ impl DownloadHandle {
 
 impl Drop for DownloadHandle {
     fn drop(&mut self) {
-        if self.ctx.metrics().transfer_failed() {
+        if self.ctx.metrics().is_failed() {
             self.ctx.handle.metrics.increment_transfers_failed();
         } else {
-            self.ctx.handle.metrics.increment_transfers_completed();
+            self.ctx.handle.metrics.increment_transfers_successful();
         }
     }
 }

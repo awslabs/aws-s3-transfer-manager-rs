@@ -87,7 +87,7 @@ impl UploadHandle {
         let result = complete_upload(self).await;
 
         match &result {
-            Ok(_) => handle_metrics.increment_transfers_completed(),
+            Ok(_) => handle_metrics.increment_transfers_successful(),
             Err(_) => handle_metrics.increment_transfers_failed(),
         }
 

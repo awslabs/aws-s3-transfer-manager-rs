@@ -46,16 +46,14 @@ impl AggregatedBytes {
     /// Make this buffer from a ByteStream
     pub(crate) async fn from_byte_stream(
         value: ByteStream,
-        metrics: Option<&ClientMetrics>,
+        metrics: &ClientMetrics,
     ) -> Result<Self, aws_smithy_types::byte_stream::error::Error> {
         let mut value = value;
         let mut output = SegmentedBuf::new();
         while let Some(buf) = value.next().await {
             let buf = buf?;
+            metrics.add_bytes_transferred(buf.len() as u64);
             output.push(buf);
-        }
-        if let Some(metrics) = metrics {
-            metrics.add_bytes_transferred(output.remaining() as u64);
         }
         Ok(AggregatedBytes(output))
     }

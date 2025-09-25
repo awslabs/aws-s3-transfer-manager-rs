@@ -431,7 +431,7 @@ mod test {
 
         // Check initial metrics
         let initial_initiated = tm.metrics().transfers_initiated();
-        let initial_completed = tm.metrics().transfers_completed();
+        let initial_completed = tm.metrics().transfers_successful();
         let initial_bytes = tm.metrics().total_bytes_transferred();
         let initial_active = tm.metrics().active_transfers();
 
@@ -461,7 +461,7 @@ mod test {
 
         // Check final metrics
         assert_eq!(tm.metrics().transfers_initiated(), 1);
-        assert_eq!(tm.metrics().transfers_completed(), 1);
+        assert_eq!(tm.metrics().transfers_successful(), 1);
         assert_eq!(tm.metrics().total_bytes_transferred(), body.len() as u64);
         assert_eq!(tm.metrics().active_transfers(), 0.0);
         assert_eq!(tm.metrics().transfers_failed(), 0);

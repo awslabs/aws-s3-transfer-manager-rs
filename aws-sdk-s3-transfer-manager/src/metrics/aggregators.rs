@@ -23,7 +23,7 @@ pub struct ClientMetrics {
     /// Total number of transfers initiated
     transfers_initiated: IncreasingCounter,
     /// Total number of transfers completed successfully
-    transfers_completed: IncreasingCounter,
+    transfers_successful: IncreasingCounter,
     /// Total number of transfers that failed
     transfers_failed: IncreasingCounter,
     /// Total bytes transferred across all operations
@@ -47,8 +47,8 @@ impl ClientMetrics {
     }
 
     /// Increment transfers completed counter
-    pub(crate) fn increment_transfers_completed(&self) {
-        self.transfers_completed.increment(1);
+    pub(crate) fn increment_transfers_successful(&self) {
+        self.transfers_successful.increment(1);
         self.active_transfers.decrement(1.0);
     }
 
@@ -69,8 +69,8 @@ impl ClientMetrics {
     }
 
     /// Get the number of transfers completed
-    pub fn transfers_completed(&self) -> u64 {
-        self.transfers_completed.value()
+    pub fn transfers_successful(&self) -> u64 {
+        self.transfers_successful.value()
     }
 
     /// Get the number of transfers failed
@@ -138,7 +138,7 @@ impl TransferMetrics {
     }
 
     /// Determine if the transfer has failed
-    pub fn transfer_failed(&self) -> bool {
+    pub fn is_failed(&self) -> bool {
         self.transfer_failed.load(Ordering::Relaxed)
     }
 
@@ -192,19 +192,19 @@ impl SchedulerMetrics {
     /// Increment the number of in-flight requests and returns the number currently in-flight after
     /// incrementing.
     pub(crate) fn increment_inflight(&self) -> usize {
-        (self.inflight.fetch_add(1, Ordering::SeqCst) + 1) as usize
+        (self.inflight.fetch_add(1, Ordering::Relaxed) + 1) as usize
     }
 
     /// Decrement the number of in-flight requests and returns the number currently in-flight after
     /// decrementing.
     pub(crate) fn decrement_inflight(&self) -> usize {
-        (self.inflight.fetch_sub(1, Ordering::SeqCst) - 1) as usize
+        (self.inflight.fetch_sub(1, Ordering::Relaxed) - 1) as usize
     }
 
     /// Get the current number of in-flight requests
     #[cfg(test)]
     pub(crate) fn inflight(&self) -> usize {
-        self.inflight.load(Ordering::SeqCst) as usize
+        self.inflight.load(Ordering::Relaxed) as usize
     }
 }
 
@@ -361,7 +361,7 @@ impl ThroughputMetrics {
     }
 
     /// Get the minimum throughput observed.
-    pub(crate) fn min(&self) -> Throughput {
+    pub fn min(&self) -> Throughput {
         let bps_scaled = self.min_throughput_bps.load(Ordering::Relaxed);
         if bps_scaled == u64::MAX {
             Throughput::new_bytes_per_sec(0)
@@ -371,19 +371,19 @@ impl ThroughputMetrics {
     }
 
     /// Get the maximum throughput observed.
-    pub(crate) fn max(&self) -> Throughput {
+    pub fn max(&self) -> Throughput {
         let bps_scaled = self.max_throughput_bps.load(Ordering::Relaxed);
         Throughput::new_bytes_per_sec(bps_scaled / 1000)
     }
 
-    /// Get the average throughput.
-    pub(crate) fn avg(&self) -> Throughput {
+    /// Get the cumulative average throughput.
+    pub fn avg(&self) -> Throughput {
         let bps_scaled = self.avg_throughput_bps.load(Ordering::Relaxed);
         Throughput::new_bytes_per_sec(bps_scaled / 1000)
     }
 
     /// Get the total bytes transferred.
-    pub(crate) fn total_bytes(&self) -> u64 {
+    pub fn total_bytes(&self) -> u64 {
         self.total_bytes.load(Ordering::Relaxed)
     }
 }
