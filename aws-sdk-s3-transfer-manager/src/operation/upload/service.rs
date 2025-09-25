@@ -41,7 +41,7 @@ impl ProvideNetworkPermitContext for UploadPartRequest {
     fn network_permit_context(&self) -> NetworkPermitContext {
         NetworkPermitContext {
             payload_size_estimate: self.part_data.data.len() as u64,
-            bucket_type: self.ctx.bucket_type(),
+            bucket_type: self.ctx.state.bucket_type(),
             direction: TransferDirection::Upload,
         }
     }
@@ -52,7 +52,7 @@ pub(crate) struct UploadHedgePolicy;
 
 impl Policy<UploadPartRequest> for UploadHedgePolicy {
     fn clone_request(&self, req: &UploadPartRequest) -> Option<UploadPartRequest> {
-        if req.ctx.bucket_type() == BucketType::Standard {
+        if req.ctx.state.bucket_type() == BucketType::Standard {
             Some(req.clone())
         } else {
             None
@@ -71,7 +71,7 @@ async fn upload_part_handler(request: UploadPartRequest) -> Result<CompletedPart
     let part_number = part_data.part_number as i32;
 
     let req = copy_fields_to_upload_part_request(
-        &ctx.request,
+        &ctx.state.request,
         ctx.client()
             .upload_part()
             .set_upload_id(Some(request.upload_id))
@@ -139,8 +139,8 @@ pub(super) fn distribute_work(
     // group all spawned tasks together
     let parent_span_for_all_tasks = tracing::debug_span!(
         parent: None, "upload-tasks", // TODO: for upload_objects, parent should be upload-objects-tasks
-        bucket = ctx.request.bucket().unwrap_or_default(),
-        key = ctx.request.key().unwrap_or_default(),
+        bucket = ctx.state.request.bucket().unwrap_or_default(),
+        key = ctx.state.request.key().unwrap_or_default(),
     );
     parent_span_for_all_tasks.follows_from(tracing::Span::current());
 
@@ -225,6 +225,7 @@ pub(super) async fn read_body(
 mod tests {
     use super::*;
     use crate::client::Handle;
+    use crate::operation::upload::context::UploadState;
     use crate::operation::upload::UploadInput;
     use crate::runtime::scheduler::Scheduler;
     use crate::types::ConcurrencyMode;
@@ -240,14 +241,16 @@ mod tests {
                     config: Config::builder().client(s3_client).build(),
                     scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
                 }),
-                request: Arc::new(
-                    UploadInput::builder()
-                        .bucket(bucket_name)
-                        .key("test-key")
-                        .build()
-                        .unwrap(),
-                ),
-                bucket_type: BucketType::from_bucket_name(bucket_name),
+                state: Arc::new(UploadState {
+                    request: Arc::new(
+                        UploadInput::builder()
+                            .bucket(bucket_name)
+                            .key("test-key")
+                            .build()
+                            .unwrap(),
+                    ),
+                    bucket_type: BucketType::from_bucket_name(bucket_name),
+                }),
             },
             part_data: PartData::new(1, Bytes::default()),
             upload_id: "test-id".to_string(),
