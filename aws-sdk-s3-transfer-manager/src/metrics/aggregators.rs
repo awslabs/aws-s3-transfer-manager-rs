@@ -376,7 +376,7 @@ impl ThroughputMetrics {
         Throughput::new_bytes_per_sec(bps_scaled / 1000)
     }
 
-    /// Get the cumulative average throughput.
+    /// Calculate the cumulative average throughput.
     pub fn avg(&self) -> Throughput {
         let bps_scaled = self.avg_throughput_bps.load(Ordering::Relaxed);
         Throughput::new_bytes_per_sec(bps_scaled / 1000)

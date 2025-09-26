@@ -127,10 +127,13 @@ impl DownloadHandle {
 
 impl Drop for DownloadHandle {
     fn drop(&mut self) {
-        if self.ctx.metrics().is_failed() {
-            self.ctx.handle.metrics.increment_transfers_failed();
-        } else {
+        // If the body is fully processed and we did not detect any errors in any
+        // of the individual tasks we record the transfer as successful. Otherwise
+        // it is a failure.
+        if self.body().is_processed() && !self.ctx.metrics().is_failed() {
             self.ctx.handle.metrics.increment_transfers_successful();
+        } else {
+            self.ctx.handle.metrics.increment_transfers_failed();
         }
     }
 }
