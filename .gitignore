@@ -48,9 +48,6 @@ gradle-app.setting
 # Rust build artifacts
 target/
 
-# Rust lock files
-Cargo.lock
-
 # IDEs
 .idea/
 .vscode/
