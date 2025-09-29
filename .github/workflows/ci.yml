@@ -8,19 +8,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
-
 env:
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
   # Change to specific Rust release to pin
   rust_stable: stable
   rust_nightly: nightly-2025-08-06
-  rust_clippy: '1.86'
+  rust_clippy: "1.86"
   # When updating this, also update relevant docs
-  rust_min: '1.86'
+  rust_min: "1.86"
   CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
   AWS_REGION: us-west-2
-
 
 defaults:
   run:
@@ -48,7 +46,7 @@ jobs:
     steps:
       - run: exit 0
 
- # Basic actions that must pass before we kick off more expensive tests.
+  # Basic actions that must pass before we kick off more expensive tests.
   basics:
     name: basic checks
     runs-on: ubuntu-24.04
@@ -80,7 +78,7 @@ jobs:
       - name: Install Rust ${{ env.rust_nightly }}
         uses: dtolnay/rust-toolchain@stable
         with:
-            toolchain: ${{ env.rust_stable }}
+          toolchain: ${{ env.rust_stable }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -145,7 +143,6 @@ jobs:
         run: |
           cargo doc --lib --no-deps --all-features --document-private-items
         env:
-          RUSTFLAGS: --cfg docsrs
           RUSTDOCFLAGS: --cfg docsrs
 
   minrust:
