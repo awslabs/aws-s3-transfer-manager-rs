@@ -80,6 +80,8 @@ impl DownloadHandle {
         self.body.close();
         self.discovery.abort();
 
+        // Note: the mem::replace is required because we manually impl Drop for DownloadHandle which changes the
+        // move semantics of fields in the struct.
         let discovery = std::mem::replace(&mut self.discovery, tokio::spawn(async {}));
         let _ = discovery.await;
 
@@ -92,6 +94,8 @@ impl DownloadHandle {
 
     /// Wait for the download to complete
     pub async fn join(mut self) -> Result<(), error::Error> {
+        // Note: the mem::replace is required because we manually impl Drop for DownloadHandle which changes the
+        // move semantics of fields in the struct.
         let discovery = std::mem::replace(&mut self.discovery, tokio::spawn(async {}));
 
         // Wait for discovery to complete
