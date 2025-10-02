@@ -28,6 +28,47 @@ impl IncreasingCounter {
     }
 }
 
+/// An integer value that can increase or decrease.
+#[derive(Debug, Clone, Default)]
+pub struct UpDownCounter {
+    value: Arc<AtomicU64>,
+}
+
+impl UpDownCounter {
+    /// Create a new counter starting at zero.
+    pub fn new() -> Self {
+        Self {
+            value: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Create a new counter starting at value.
+    pub fn new_value(value: u64) -> Self {
+        Self {
+            value: Arc::new(AtomicU64::new(value)),
+        }
+    }
+
+    /// Increment the counter by the given amount and return the new value.
+    pub fn increment(&self, amount: u64) -> u64 {
+        self.value.fetch_add(amount, Ordering::Relaxed) + amount
+    }
+
+    /// Decrement the counter by the given amount and return the new value. Clamped at 0.
+    pub fn decrement(&self, amount: u64) -> u64 {
+        self.value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(amount))
+            })
+            .unwrap()
+    }
+
+    /// Get the current value of the counter.
+    pub fn value(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
 // Implementation note: there is no AtomicF64 so the bytes are stored as an AtomicU64 and
 // reinterpreted as an f64 at user exposed endpoints. Just wrapping it in a mutex might
 // be more performant, but need to benchmark.

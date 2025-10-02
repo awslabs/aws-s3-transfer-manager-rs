@@ -6,6 +6,8 @@
 use futures_util::TryFutureExt;
 use pin_project_lite::pin_project;
 use std::future::Future;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error;
 use crate::metrics::aggregators::SchedulerMetrics;
@@ -21,30 +23,51 @@ use crate::types::ConcurrencyMode;
 #[derive(Debug, Clone)]
 pub(crate) struct Scheduler {
     token_bucket: TokenBucket,
-    pub(crate) metrics: SchedulerMetrics,
+    pub(crate) metrics: Arc<SchedulerMetrics>,
 }
 
 impl Scheduler {
     /// Create a new scheduler with the initial number of work permits.
     pub(crate) fn new(mode: ConcurrencyMode) -> Self {
+        let metrics = Arc::new(SchedulerMetrics::new());
+        let token_bucket = TokenBucket::new(mode, metrics.clone());
+
         Self {
-            token_bucket: TokenBucket::new(mode),
-            metrics: SchedulerMetrics::new(),
+            token_bucket,
+            metrics,
         }
+    }
+
+    /// Get the maximum number of tokens this scheduler can hold
+    pub(crate) fn max_tokens(&self) -> u64 {
+        self.token_bucket.max_tokens()
     }
 
     /// Acquire a permit to perform some unit of work
     pub(crate) fn acquire_permit(&self, ptype: PermitType) -> AcquirePermitFuture {
+        let start_time = Instant::now();
+
         match self.try_acquire_permit(ptype.clone()) {
-            Ok(Some(permit)) => AcquirePermitFuture::ready(Ok(permit)),
+            Ok(Some(permit)) => {
+                // Record immediate acquisition
+                self.metrics.record_permit_acquisition();
+                self.metrics.record_permit_wait_time(0.0);
+                AcquirePermitFuture::ready(Ok(permit))
+            }
             Ok(None) => {
-                let inner = self
-                    .token_bucket
-                    .acquire(ptype)
-                    .map_ok(OwnedWorkPermit::from);
+                let metrics = self.metrics.clone();
+                let inner = self.token_bucket.acquire(ptype).map_ok(move |token| {
+                    // Record wait time when permit is acquired
+                    metrics.record_permit_acquisition();
+                    metrics.record_permit_wait_time(start_time.elapsed().as_secs_f64());
+                    OwnedWorkPermit::from(token)
+                });
                 AcquirePermitFuture::new(inner)
             }
-            Err(err) => AcquirePermitFuture::ready(Err(err)),
+            Err(err) => {
+                self.metrics.record_permit_acquisition_failure();
+                AcquirePermitFuture::ready(Err(err))
+            }
         }
     }
 
@@ -89,11 +112,25 @@ pub(crate) enum PermitType {
 #[derive(Debug)]
 pub(crate) struct OwnedWorkPermit {
     _inner: OwnedToken,
+    metrics: Arc<SchedulerMetrics>,
 }
 
 impl From<OwnedToken> for OwnedWorkPermit {
     fn from(value: OwnedToken) -> Self {
-        Self { _inner: value }
+        //TODO: it might be more performant to just access the SchedulerMetrics through
+        // _inner instead of cloning it, but feels awkward for the scheduler metrics to
+        // live on the token rather than the permit
+        let metrics = value.scheduler_metrics.clone();
+        Self {
+            _inner: value,
+            metrics,
+        }
+    }
+}
+
+impl Drop for OwnedWorkPermit {
+    fn drop(&mut self) {
+        self.metrics.record_permit_release();
     }
 }
 
@@ -169,5 +206,79 @@ mod tests {
         assert!(!jh.is_finished());
         drop(p1);
         jh.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_metrics() {
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(2));
+        let permit_context = NetworkPermitContext {
+            payload_size_estimate: 1024,
+            bucket_type: BucketType::Standard,
+            direction: TransferDirection::Download,
+        };
+
+        assert_eq!(scheduler.metrics.permits_acquired().value(), 0);
+
+        let permit1 = scheduler
+            .acquire_permit(PermitType::Network(permit_context.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(scheduler.metrics.permits_acquired().value(), 1);
+        assert!(scheduler.metrics.permit_wait_time().count() > 0);
+
+        let permit2 = scheduler
+            .acquire_permit(PermitType::Network(permit_context))
+            .await
+            .unwrap();
+
+        assert_eq!(scheduler.metrics.permits_acquired().value(), 2);
+
+        // Make sure permit drops are recorded
+        drop(permit1);
+        assert_eq!(scheduler.metrics.permits_acquired().value(), 1);
+
+        drop(permit2);
+        assert_eq!(scheduler.metrics.permits_acquired().value(), 0);
+
+        // We never actually fire off a request so no failures or inflight
+        assert_eq!(scheduler.metrics.permit_acquisition_failures().value(), 0);
+        assert_eq!(scheduler.metrics.max_inflight().value(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_metrics() {
+        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(10));
+        let permit_context = NetworkPermitContext {
+            payload_size_estimate: 1024,
+            bucket_type: BucketType::Standard,
+            direction: TransferDirection::Download,
+        };
+
+        // Initial token metrics
+        assert_eq!(
+            scheduler.token_bucket.metrics().available_tokens().value(),
+            10
+        );
+        assert_eq!(scheduler.max_tokens(), 10);
+
+        let permit = scheduler
+            .acquire_permit(PermitType::Network(permit_context))
+            .await
+            .unwrap();
+
+        // Token acquisition should be recorded
+        assert_eq!(
+            scheduler.token_bucket.metrics().available_tokens().value(),
+            9
+        );
+
+        drop(permit);
+
+        // Token drop should be recorded
+        assert_eq!(
+            scheduler.token_bucket.metrics().available_tokens().value(),
+            10
+        );
     }
 }

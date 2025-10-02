@@ -6,12 +6,13 @@
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::task::Poll;
+use std::time::Instant;
 use std::{cmp, sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::PollSemaphore;
 
 use crate::error;
-use crate::metrics::aggregators::Throughput;
+use crate::metrics::aggregators::{SchedulerMetrics, Throughput, TokenBucketMetrics};
 use crate::metrics::unit::ByteUnit;
 use crate::runtime::scheduler::PermitType;
 use crate::types::BucketType;
@@ -149,30 +150,41 @@ pub(crate) struct TokenBucket {
     // NOTE: tokio semaphore is fair, permits are given out in the order requested
     semaphore: Arc<Semaphore>,
     mode: ConcurrencyMode,
+    tb_metrics: Arc<TokenBucketMetrics>,
+    scheduler_metrics: Arc<SchedulerMetrics>,
 }
 
 impl TokenBucket {
     /// Create a new token bucket using the given target throughput to set the maximum number of tokens
-    pub(crate) fn new(mode: ConcurrencyMode) -> Self {
+    pub(crate) fn new(mode: ConcurrencyMode, scheduler_metrics: Arc<SchedulerMetrics>) -> Self {
+        let max_tokens = Self::max_tokens_inner(&mode);
+        TokenBucket {
+            semaphore: Arc::new(Semaphore::new(max_tokens.try_into().unwrap())),
+            mode,
+            tb_metrics: Arc::new(TokenBucketMetrics::new(max_tokens)),
+            scheduler_metrics,
+        }
+    }
+
+    fn max_tokens_inner(mode: &ConcurrencyMode) -> u64 {
         // Permits/tokens are dependent on the concurrency mode:
         //
         // ConcurrencyMode::TargetThroughput -> 1 token = 1 Mbit of throughput
         // ConcurrencyMode::Explicit -> 1 token = 1 request
-        let max_tokens = match &mode {
+        match mode {
             ConcurrencyMode::Auto => token_bucket_size(AUTO_TARGET_THROUGHPUT),
             ConcurrencyMode::TargetThroughput(target_throughput) => {
                 // TODO - we don't (yet) publicly allow configuring upload/download independently so we
                 // just pick one for now as they must be the same at the moment.
-                let thrpt = target_throughput.download();
-                token_bucket_size(*thrpt)
+                token_bucket_size(*target_throughput.download())
             }
             ConcurrencyMode::Explicit(concurrency) => *concurrency as u64,
-        };
-
-        TokenBucket {
-            semaphore: Arc::new(Semaphore::new(max_tokens.try_into().unwrap())),
-            mode,
         }
+    }
+
+    /// Get the maximum number of tokens this bucket can hold
+    pub(crate) fn max_tokens(&self) -> u64 {
+        Self::max_tokens_inner(&self.mode)
     }
 
     /// Calculate the token cost for the given permit type (and current mode)
@@ -187,7 +199,15 @@ impl TokenBucket {
     /// Acquire a token for the given permit type. Tokens are returned to the bucket when the
     /// [OwnedToken] is dropped.
     pub(crate) fn acquire(&self, ptype: PermitType) -> AcquireTokenFuture {
-        AcquireTokenFuture::new(PollSemaphore::new(self.semaphore.clone()), self.cost(ptype))
+        self.tb_metrics.record_token_acquisition();
+
+        AcquireTokenFuture::new(
+            PollSemaphore::new(self.semaphore.clone()),
+            self.cost(ptype),
+            self.tb_metrics.clone(),
+            self.scheduler_metrics.clone(),
+            Instant::now(),
+        )
     }
 
     pub(crate) fn try_acquire(
@@ -195,13 +215,28 @@ impl TokenBucket {
         ptype: PermitType,
     ) -> Result<Option<OwnedToken>, error::Error> {
         let cost = self.cost(ptype);
+
         match self.semaphore.clone().try_acquire_many_owned(cost) {
-            Ok(permit) => Ok(Some(OwnedToken::new(permit))),
+            Ok(permit) => {
+                self.tb_metrics.record_token_acquisition();
+                self.tb_metrics.record_token_wait_time(0.0);
+                Ok(Some(OwnedToken::new(
+                    permit,
+                    self.tb_metrics.clone(),
+                    self.scheduler_metrics.clone(),
+                )))
+            }
             Err(TryAcquireError::NoPermits) => Ok(None),
             Err(err @ TryAcquireError::Closed) => {
                 Err(error::Error::new(error::ErrorKind::RuntimeError, err))
             }
         }
+    }
+
+    /// Get the metrics for this TokenBucket
+    #[allow(dead_code)]
+    pub(crate) fn metrics(&self) -> Arc<TokenBucketMetrics> {
+        self.tb_metrics.clone()
     }
 }
 
@@ -209,13 +244,28 @@ pin_project! {
     #[derive(Debug, Clone)]
     pub(crate) struct AcquireTokenFuture {
         sem: PollSemaphore,
-        tokens: u32
+        tokens: u32,
+        tb_metrics: Arc<TokenBucketMetrics>,
+        scheduler_metrics: Arc<SchedulerMetrics>,
+        start_time: Instant
     }
 }
 
 impl AcquireTokenFuture {
-    fn new(sem: PollSemaphore, tokens: u32) -> Self {
-        Self { sem, tokens }
+    fn new(
+        sem: PollSemaphore,
+        tokens: u32,
+        tb_metrics: Arc<TokenBucketMetrics>,
+        scheduler_metrics: Arc<SchedulerMetrics>,
+        start_time: Instant,
+    ) -> Self {
+        Self {
+            sem,
+            tokens,
+            tb_metrics,
+            scheduler_metrics,
+            start_time,
+        }
     }
 }
 
@@ -228,7 +278,15 @@ impl Future for AcquireTokenFuture {
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
         match this.sem.poll_acquire_many(cx, *this.tokens) {
-            Poll::Ready(Some(permit)) => Poll::Ready(Ok(OwnedToken::new(permit))),
+            Poll::Ready(Some(permit)) => {
+                this.tb_metrics
+                    .record_token_wait_time(this.start_time.elapsed().as_secs_f64());
+                Poll::Ready(Ok(OwnedToken::new(
+                    permit,
+                    this.tb_metrics.clone(),
+                    this.scheduler_metrics.clone(),
+                )))
+            }
             Poll::Ready(None) => Poll::Ready(Err(error::Error::new(
                 error::ErrorKind::RuntimeError,
                 "semaphore closed",
@@ -244,11 +302,27 @@ impl Future for AcquireTokenFuture {
 #[derive(Debug)]
 pub(crate) struct OwnedToken {
     _inner: OwnedSemaphorePermit,
+    tb_metrics: Arc<TokenBucketMetrics>,
+    pub(crate) scheduler_metrics: Arc<SchedulerMetrics>,
 }
 
 impl OwnedToken {
-    fn new(permit: OwnedSemaphorePermit) -> Self {
-        OwnedToken { _inner: permit }
+    fn new(
+        permit: OwnedSemaphorePermit,
+        tb_metrics: Arc<TokenBucketMetrics>,
+        scheduler_metrics: Arc<SchedulerMetrics>,
+    ) -> Self {
+        OwnedToken {
+            _inner: permit,
+            tb_metrics,
+            scheduler_metrics,
+        }
+    }
+}
+
+impl Drop for OwnedToken {
+    fn drop(&mut self) {
+        self.tb_metrics.record_token_release();
     }
 }
 

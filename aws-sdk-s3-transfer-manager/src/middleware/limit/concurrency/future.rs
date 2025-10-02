@@ -82,7 +82,13 @@ where
                         Ok(_permit) => {
                             let req = this.request.take().expect("request set");
                             let inflight = this.scheduler.metrics.increment_inflight();
+                            this.scheduler.metrics.update_max_inflight(inflight);
                             tracing::trace!("in-flight requests: {inflight}");
+
+                            this.scheduler
+                                .metrics
+                                .set_scheduler_saturation(inflight, this.scheduler.max_tokens());
+
                             let svc = this.svc.take().expect("service set");
                             // NOTE: because the service was (1) never polled for readiness
                             // originally and (2) also cloned, we need to ensure it's ready now before calling it.
