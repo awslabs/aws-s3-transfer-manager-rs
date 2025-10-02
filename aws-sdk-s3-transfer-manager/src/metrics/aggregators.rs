@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::metrics::{
-    instruments::{Gauge, Histogram, IncreasingCounter},
+    instruments::{Gauge, Histogram, IncreasingCounter, UpDownCounter},
     unit,
 };
 
@@ -157,6 +157,7 @@ impl TransferMetrics {
         self.parts_failed.increment(amount);
     }
 
+    /// Record that a transfer has failed
     pub(crate) fn mark_transfer_failed(&self) {
         self.transfer_failed.store(true, Ordering::Relaxed);
     }
@@ -165,46 +166,152 @@ impl TransferMetrics {
 /// Scheduler-level metrics for concurrency tracking
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchedulerMetrics {
-    /// Number of active permits in use
-    active_permits: Gauge,
-    /// Number of permits waiting to be acquired
-    permits_waiting: Gauge,
-    /// Total permits acquired
-    permits_acquired: IncreasingCounter,
-    /// Permit acquisition wait time
-    permit_wait_time: Histogram,
-    /// Current number of in-flight requests (for backward compatibility)
+    // Total tasks in flight
     inflight: Arc<AtomicU64>,
+    // High water mark for inflight tasks
+    max_inflight: Gauge,
+    // Count of permits acquired
+    permits_acquired: UpDownCounter,
+    // Count of failed permit acquisitions
+    permit_acquisition_failures: IncreasingCounter,
+    // Tracking the wait time of permits
+    permit_wait_time: Histogram,
+
+    // percentage of max concurrency in use
+    scheduler_saturation: Gauge,
 }
 
 impl SchedulerMetrics {
     /// Create new scheduler metrics
     pub(crate) fn new() -> Self {
         Self {
-            active_permits: Gauge::new(),
-            permits_waiting: Gauge::new(),
-            permits_acquired: IncreasingCounter::new(),
-            permit_wait_time: Histogram::new(),
             inflight: Arc::new(AtomicU64::new(0)),
+            max_inflight: Gauge::new(),
+            permits_acquired: UpDownCounter::new(),
+            permit_acquisition_failures: IncreasingCounter::new(),
+            permit_wait_time: Histogram::new(),
+            scheduler_saturation: Gauge::new(),
         }
     }
 
     /// Increment the number of in-flight requests and returns the number currently in-flight after
     /// incrementing.
-    pub(crate) fn increment_inflight(&self) -> usize {
-        (self.inflight.fetch_add(1, Ordering::Relaxed) + 1) as usize
+    pub(crate) fn increment_inflight(&self) -> u64 {
+        (self.inflight.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Decrement the number of in-flight requests and returns the number currently in-flight after
     /// decrementing.
-    pub(crate) fn decrement_inflight(&self) -> usize {
-        (self.inflight.fetch_sub(1, Ordering::Relaxed) - 1) as usize
+    pub(crate) fn decrement_inflight(&self) -> u64 {
+        (self.inflight.fetch_sub(1, Ordering::Relaxed) - 1)
     }
 
     /// Get the current number of in-flight requests
     #[cfg(test)]
-    pub(crate) fn inflight(&self) -> usize {
-        self.inflight.load(Ordering::Relaxed) as usize
+    pub(crate) fn inflight(&self) -> u64 {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// Update max inflight metric
+    pub(crate) fn update_max_inflight(&self, current_inflight: u64) {
+        let current_max = self.max_inflight.value();
+        let current_inflight = current_inflight as f64;
+        if current_inflight > current_max {
+            self.max_inflight.set(current_inflight);
+        }
+    }
+
+    /// Record permit acquisition
+    pub(crate) fn record_permit_acquisition(&self) {
+        self.permits_acquired.increment(1);
+    }
+
+    /// Record permit release
+    pub(crate) fn record_permit_release(&self) {
+        self.permits_acquired.decrement(1);
+    }
+
+    /// Record permit acquisition failure
+    pub(crate) fn record_permit_acquisition_failure(&self) {
+        self.permit_acquisition_failures.increment(1);
+    }
+
+    /// Record permit wait time
+    pub(crate) fn record_permit_wait_time(&self, duration_secs: f64) {
+        self.permit_wait_time.record(duration_secs);
+    }
+
+    /// Set scheduler saturation percentage
+    pub(crate) fn set_scheduler_saturation(&self, inflight: u64, max_capacity: u64) {
+        let saturation = if max_capacity == 0 {
+            0.0
+        } else {
+            (inflight as f64 / max_capacity as f64) * 100.0
+        };
+        self.scheduler_saturation.set(saturation);
+    }
+
+    /// Get permit acquisitions counter
+    pub(crate) fn permits_acquired(&self) -> &UpDownCounter {
+        &self.permits_acquired
+    }
+
+    /// Get permit wait time histogram
+    pub(crate) fn permit_wait_time(&self) -> &Histogram {
+        &self.permit_wait_time
+    }
+
+    /// Get permit acquisition failures counter
+    pub(crate) fn permit_acquisition_failures(&self) -> &IncreasingCounter {
+        &self.permit_acquisition_failures
+    }
+
+    /// Get max inflight gauge
+    pub(crate) fn max_inflight(&self) -> &Gauge {
+        &self.max_inflight
+    }
+
+    /// Get scheduler saturation gauge
+    pub(crate) fn scheduler_saturation(&self) -> &Gauge {
+        &self.scheduler_saturation
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TokenBucketMetrics {
+    max_tokens: u64,
+    available_tokens: UpDownCounter,
+    token_wait_time: Histogram,
+}
+
+impl TokenBucketMetrics {
+    // Create new TokenBucketMetrics with max_tokens
+    pub(crate) fn new(max_tokens: u64) -> Self {
+        Self {
+            max_tokens,
+            available_tokens: UpDownCounter::new_value(max_tokens),
+            token_wait_time: Histogram::new(),
+        }
+    }
+
+    /// Get available tokens gauge
+    pub(crate) fn available_tokens(&self) -> &UpDownCounter {
+        &self.available_tokens
+    }
+
+    /// Record token acquisition
+    pub(crate) fn record_token_acquisition(&self) {
+        self.available_tokens.decrement(1);
+    }
+
+    /// Record token release
+    pub(crate) fn record_token_release(&self) {
+        self.available_tokens.increment(1);
+    }
+
+    /// Record token wait time
+    pub(crate) fn record_token_wait_time(&self, wait_time_secs: f64) {
+        self.token_wait_time.record(wait_time_secs);
     }
 }
 
@@ -214,7 +321,7 @@ pub(crate) struct SamplingConfig {
     /// Interval between samples.
     pub interval: Duration,
     /// Maximum number of samples to retain.
-    pub max_samples: usize,
+    pub max_samples: u64,
 }
 
 impl Default for SamplingConfig {
@@ -247,7 +354,7 @@ struct ThroughputHistory {
     pub(crate) samples: VecDeque<ThroughputSample>,
     last_sample_time: Option<std::time::Instant>,
     sample_interval: Duration,
-    max_samples: usize,
+    max_samples: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -267,7 +374,7 @@ impl ThroughputMetrics {
     pub(crate) fn with_sampling(sampling_config: Option<SamplingConfig>) -> Self {
         let history = sampling_config.map(|config| {
             Arc::new(Mutex::new(ThroughputHistory {
-                samples: VecDeque::with_capacity(config.max_samples),
+                samples: VecDeque::with_capacity(config.max_samples as usize),
                 last_sample_time: None,
                 sample_interval: config.interval,
                 max_samples: config.max_samples,
@@ -351,7 +458,7 @@ impl ThroughputMetrics {
                     bytes_per_second: bps,
                 });
 
-                if hist.samples.len() > hist.max_samples {
+                if hist.samples.len() > hist.max_samples as usize {
                     hist.samples.pop_front();
                 }
 
@@ -694,5 +801,35 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn test_scheduler_metrics() {
+        use crate::metrics::aggregators::SchedulerMetrics;
+
+        let metrics = SchedulerMetrics::new();
+
+        assert_eq!(metrics.permits_acquired().value(), 0);
+        metrics.record_permit_acquisition();
+        assert_eq!(metrics.permits_acquired().value(), 1);
+
+        assert_eq!(metrics.permit_acquisition_failures().value(), 0);
+        metrics.record_permit_acquisition_failure();
+        assert_eq!(metrics.permit_acquisition_failures().value(), 1);
+
+        metrics.record_permit_wait_time(0.5);
+        assert!(metrics.permit_wait_time().count() > 0);
+
+        metrics.update_max_inflight(10);
+        assert_eq!(metrics.max_inflight().value(), 10.0);
+        // Should not update since it is lower
+        metrics.update_max_inflight(5);
+        assert_eq!(metrics.max_inflight().value(), 10.0);
+        // Should update since it is higher
+        metrics.update_max_inflight(15);
+        assert_eq!(metrics.max_inflight().value(), 15.0);
+
+        metrics.set_scheduler_saturation(10, 50);
+        assert_eq!(metrics.scheduler_saturation().value(), 20.0);
     }
 }
