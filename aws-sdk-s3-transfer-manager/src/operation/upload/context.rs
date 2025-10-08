@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::aggregators::TransferMetrics;
 use crate::operation::upload::UploadInput;
 use crate::operation::TransferContext;
 use crate::types::BucketType;
@@ -16,10 +17,12 @@ impl UploadContext {
         handle: Arc<crate::client::Handle>,
         bucket_type: BucketType,
         req: UploadInput,
+        metrics: TransferMetrics,
     ) -> Self {
         let state = Arc::new(UploadState {
             request: Arc::new(req),
             bucket_type,
+            metrics: Arc::new(metrics),
         });
         TransferContext { handle, state }
     }
@@ -30,9 +33,11 @@ impl UploadContext {
 pub(crate) struct UploadState {
     /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
     pub(crate) request: Arc<UploadInput>,
-
     /// Type of S3 bucket targeted by this operation
     pub(crate) bucket_type: BucketType,
+    /// Transfer metrics for this upload
+    #[allow(unused)]
+    pub(crate) metrics: Arc<TransferMetrics>,
 }
 
 impl UploadState {
@@ -44,5 +49,11 @@ impl UploadState {
     /// Type of S3 bucket targeted by this operation
     pub(crate) fn bucket_type(&self) -> BucketType {
         self.bucket_type
+    }
+
+    /// Returns the transfer metrics for this upload
+    #[allow(unused)]
+    pub(crate) fn metrics(&self) -> Arc<TransferMetrics> {
+        self.metrics.clone()
     }
 }

@@ -102,7 +102,8 @@ async fn download_specific_chunk(
     request: DownloadChunkRequest,
     seq: u64,
 ) -> Result<ChunkOutput, error::Error> {
-    let ctx = request.ctx;
+    let ctx: crate::operation::TransferContext<crate::operation::download::DownloadState> =
+        request.ctx;
     let part_size = ctx.handle.download_part_size_bytes();
     let input = next_chunk(
         seq,
@@ -117,23 +118,28 @@ async fn download_specific_chunk(
     let mut cancel_rx = ctx.state.cancel_rx.clone();
     tokio::select! {
         _ = cancel_rx.changed() => {
+            ctx.metrics().mark_transfer_failed();
             tracing::debug!("Received cancellating signal, exiting and not downloading chunk#{seq}");
             Err(error::operation_cancelled())
         },
         resp = op.send() => {
             match resp {
-                Err(err) => Err(error::chunk_failed(ChunkId::Download(seq), err)),
+                Err(err) => {
+                    ctx.metrics().mark_transfer_failed();
+                    Err(error::chunk_failed(ChunkId::Download(seq), err))
+                },
                 Ok(mut resp) => {
                     validate_content_range(seq, &requested_byte_range, resp.content_range())?;
                     let body = mem::replace(&mut resp.body, ByteStream::new(SdkBody::taken()));
-                    let body = AggregatedBytes::from_byte_stream(body)
+                    let body = AggregatedBytes::from_byte_stream(body, &ctx.handle.metrics)
                         .instrument(tracing::debug_span!(
                             "collect-body-from-download-chunk",
                             seq
                         ))
                         .await
                         .map_err(|err| {
-                           error::chunk_failed(ChunkId::Download(seq), err)
+                            ctx.metrics().mark_transfer_failed();
+                            error::chunk_failed(ChunkId::Download(seq), err)
                         })?;
 
                     Ok(ChunkOutput {
@@ -200,6 +206,7 @@ pub(super) fn distribute_work(
         let svc = svc.clone();
         let chunk_tx = chunk_tx.clone();
         let cancel_tx = ctx.state.cancel_tx.clone();
+        let task_ctx = ctx.clone();
 
         let task = async move {
             let resp = svc.oneshot(req).await;
@@ -210,17 +217,21 @@ pub(super) fn distribute_work(
                     return;
                 }
                 if let Err(e) = cancel_tx.send(true) {
+                    task_ctx.metrics().mark_transfer_failed();
                     tracing::debug!(error = ?e, "all receiver ends have dropped, unable to send a cancellation signal");
                 }
             }
 
             if let Err(err) = chunk_tx.send(resp).await {
+                task_ctx.metrics().mark_transfer_failed();
                 tracing::debug!(error = ?err, "chunk send failed, channel closed");
                 if let Err(e) = cancel_tx.send(true) {
+                    task_ctx.metrics().mark_transfer_failed();
                     tracing::debug!(error = ?e, "all receiver ends have dropped, unable to send a cancellation signal");
                 }
             }
         };
+
         tasks.spawn(task.instrument(parent_span_for_tasks.clone()));
     }
 

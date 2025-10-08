@@ -6,7 +6,8 @@
 use core::fmt;
 use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
 
-use crate::metrics::{unit::ByteUnit, Throughput};
+use crate::metrics::aggregators::Throughput;
+use crate::metrics::unit::ByteUnit;
 
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]

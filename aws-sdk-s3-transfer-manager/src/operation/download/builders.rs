@@ -27,6 +27,7 @@ impl DownloadFluentBuilder {
         key = self.inner.key.as_deref().unwrap_or_default(),
     ))]
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
+        self.handle.metrics.increment_transfers_initiated();
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input, false)
     }

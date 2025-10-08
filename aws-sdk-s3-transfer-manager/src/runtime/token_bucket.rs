@@ -11,7 +11,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::PollSemaphore;
 
 use crate::error;
-use crate::metrics::{unit::ByteUnit, Throughput};
+use crate::metrics::aggregators::Throughput;
+use crate::metrics::unit::ByteUnit;
 use crate::runtime::scheduler::PermitType;
 use crate::types::BucketType;
 use crate::types::ConcurrencyMode;
@@ -295,7 +296,7 @@ mod tests {
     use crate::runtime::token_bucket::{estimated_throughput, tokens_for_network_context};
     use crate::types::BucketType;
     use crate::{
-        metrics::Throughput,
+        metrics::aggregators::Throughput,
         runtime::token_bucket::{token_bucket_size, MIN_BUCKET_TOKENS},
     };
 

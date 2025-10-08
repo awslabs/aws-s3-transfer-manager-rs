@@ -18,6 +18,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
+use crate::metrics::aggregators::TransferMetrics;
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_put_object_request,
 };
@@ -67,7 +68,7 @@ impl Upload {
         }
 
         let stream = input.take_body();
-        let ctx = new_context(handle.clone(), input);
+        let ctx = new_context(handle.clone(), input, TransferMetrics::new());
         Ok(UploadHandle::new(
             ctx.clone(),
             tokio::spawn(try_start_upload(handle.clone(), stream, ctx)),
@@ -143,6 +144,12 @@ async fn put_object(
             key = ctx.state.request.key().unwrap_or_default()
         ))
         .await?;
+
+    // Track bytes transferred on successful upload
+    ctx.handle
+        .metrics
+        .add_bytes_transferred(content_length as u64);
+
     Ok(UploadOutputBuilder::from(resp).build()?)
 }
 
@@ -188,11 +195,16 @@ async fn try_start_mpu_upload(
     Ok(UploadType::MultipartUpload(mpu_data))
 }
 
-fn new_context(handle: Arc<crate::client::Handle>, req: UploadInput) -> UploadContext {
+fn new_context(
+    handle: Arc<crate::client::Handle>,
+    req: UploadInput,
+    metrics: TransferMetrics,
+) -> UploadContext {
     UploadContext::new(
         handle,
         BucketType::from_bucket_name(req.bucket().expect("bucket is availabe")),
         req,
+        metrics,
     )
 }
 
@@ -391,5 +403,67 @@ mod test {
         wait_till_create_mpu.wait();
         let abort = handle.abort().await.unwrap();
         assert_eq!(abort.upload_id().unwrap(), expected_upload_id.deref());
+    }
+
+    #[tokio::test]
+    async fn test_upload_metrics() {
+        use crate::io::InputStream;
+        use crate::metrics::unit::ByteUnit;
+        use crate::types::ConcurrencyMode;
+        use crate::types::PartSize;
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        use aws_smithy_mocks::{mock, mock_client, RuleMode};
+        use bytes::Bytes;
+
+        // Create a mock S3 client
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]);
+
+        // Create transfer manager
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(s3_client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+
+        // Check initial metrics
+        let initial_initiated = tm.metrics().transfers_initiated();
+        let initial_completed = tm.metrics().transfers_successful();
+        let initial_bytes = tm.metrics().total_bytes_transferred();
+        let initial_active = tm.metrics().active_transfers();
+
+        assert_eq!(initial_initiated, 0);
+        assert_eq!(initial_completed, 0);
+        assert_eq!(initial_bytes, 0);
+        assert_eq!(initial_active, 0.0);
+
+        // Create and execute upload
+        let body = Bytes::from_static(b"test data for metrics");
+        let stream = InputStream::from(body.clone());
+
+        let handle = tm
+            .upload()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream)
+            .initiate()
+            .unwrap();
+
+        // Check metrics after initiation
+        assert_eq!(tm.metrics().transfers_initiated(), 1);
+        assert_eq!(tm.metrics().active_transfers(), 1.0);
+
+        // Complete the upload
+        let _result = handle.join().await.unwrap();
+
+        // Check final metrics
+        assert_eq!(tm.metrics().transfers_initiated(), 1);
+        assert_eq!(tm.metrics().transfers_successful(), 1);
+        assert_eq!(tm.metrics().total_bytes_transferred(), body.len() as u64);
+        assert_eq!(tm.metrics().active_transfers(), 0.0);
+        assert_eq!(tm.metrics().transfers_failed(), 0);
     }
 }

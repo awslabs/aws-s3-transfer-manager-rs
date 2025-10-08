@@ -3,10 +3,10 @@ name: Pull Request Security Audit
 on:
   push:
     paths:
-      - '**/Cargo.toml'
+      - "**/Cargo.toml"
   pull_request:
     paths:
-      - '**/Cargo.toml'
+      - "**/Cargo.toml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -24,9 +24,6 @@ jobs:
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
-
-      - name: Generate lockfile
-        run: cargo generate-lockfile
 
       - name: Audit dependencies
         run: cargo audit

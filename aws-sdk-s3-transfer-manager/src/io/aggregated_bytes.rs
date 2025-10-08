@@ -9,6 +9,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 use bytes_utils::SegmentedBuf;
 
+use crate::metrics::aggregators::ClientMetrics;
 /// Non-contiguous Binary Data Storage
 ///
 /// When data is read from the network, it is read in a sequence of chunks that are not in
@@ -45,11 +46,13 @@ impl AggregatedBytes {
     /// Make this buffer from a ByteStream
     pub(crate) async fn from_byte_stream(
         value: ByteStream,
+        metrics: &ClientMetrics,
     ) -> Result<Self, aws_smithy_types::byte_stream::error::Error> {
         let mut value = value;
         let mut output = SegmentedBuf::new();
         while let Some(buf) = value.next().await {
             let buf = buf?;
+            metrics.add_bytes_transferred(buf.len() as u64);
             output.push(buf);
         }
         Ok(AggregatedBytes(output))

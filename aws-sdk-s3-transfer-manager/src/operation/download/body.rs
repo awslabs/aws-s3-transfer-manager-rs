@@ -20,6 +20,7 @@ use super::chunk_meta::ChunkMetadata;
 pub struct Body {
     inner: UnorderedBody,
     sequencer: Sequencer,
+    is_processed: bool,
 }
 
 type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
@@ -56,6 +57,7 @@ impl Body {
         Self {
             inner: UnorderedBody::new(chunks),
             sequencer: Sequencer::new(),
+            is_processed: false,
         }
     }
 
@@ -93,6 +95,8 @@ impl Body {
             self.sequencer.advance();
             Some(Ok(chunk))
         } else {
+            // Body data has been fully processed
+            self.is_processed = true;
             None
         }
     }
@@ -100,6 +104,11 @@ impl Body {
     /// Close the body, no more data will flow from it and all publishers will be notified.
     pub(crate) fn close(&mut self) {
         self.inner.close()
+    }
+
+    /// Determine if the body has been fully processed.
+    pub(crate) fn is_processed(&self) -> bool {
+        self.is_processed
     }
 }
 

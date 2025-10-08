@@ -31,6 +31,7 @@ impl UploadFluentBuilder {
     ))]
 
     pub fn initiate(self) -> Result<UploadHandle, crate::error::Error> {
+        self.handle.metrics.increment_transfers_initiated();
         let input = self.inner.build()?;
         crate::operation::upload::Upload::orchestrate(self.handle, input)
     }
