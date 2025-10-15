@@ -82,7 +82,6 @@ where
                         Ok(_permit) => {
                             let req = this.request.take().expect("request set");
                             let inflight = this.scheduler.metrics.increment_inflight();
-                            this.scheduler.metrics.update_max_inflight(inflight);
                             tracing::trace!("in-flight requests: {inflight}");
 
                             this.scheduler

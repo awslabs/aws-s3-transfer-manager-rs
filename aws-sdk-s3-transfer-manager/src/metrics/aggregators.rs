@@ -167,11 +167,9 @@ impl TransferMetrics {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchedulerMetrics {
     // Total tasks in flight
-    inflight: Arc<AtomicU64>,
+    inflight: UpDownCounter,
     // High water mark for inflight tasks
-    max_inflight: Gauge,
-    // Count of permits acquired
-    permits_acquired: UpDownCounter,
+    max_inflight: IncreasingCounter,
     // Count of failed permit acquisitions
     permit_acquisition_failures: IncreasingCounter,
     // Tracking the wait time of permits
@@ -185,9 +183,8 @@ impl SchedulerMetrics {
     /// Create new scheduler metrics
     pub(crate) fn new() -> Self {
         Self {
-            inflight: Arc::new(AtomicU64::new(0)),
-            max_inflight: Gauge::new(),
-            permits_acquired: UpDownCounter::new(),
+            inflight: UpDownCounter::new(),
+            max_inflight: IncreasingCounter::new(),
             permit_acquisition_failures: IncreasingCounter::new(),
             permit_wait_time: Histogram::new(),
             scheduler_saturation: Gauge::new(),
@@ -197,38 +194,24 @@ impl SchedulerMetrics {
     /// Increment the number of in-flight requests and returns the number currently in-flight after
     /// incrementing.
     pub(crate) fn increment_inflight(&self) -> u64 {
-        (self.inflight.fetch_add(1, Ordering::Relaxed) + 1)
+        let val = self.inflight.increment(1);
+        self.update_max_inflight();
+        val
     }
 
     /// Decrement the number of in-flight requests and returns the number currently in-flight after
     /// decrementing.
     pub(crate) fn decrement_inflight(&self) -> u64 {
-        (self.inflight.fetch_sub(1, Ordering::Relaxed) - 1)
-    }
-
-    /// Get the current number of in-flight requests
-    #[cfg(test)]
-    pub(crate) fn inflight(&self) -> u64 {
-        self.inflight.load(Ordering::Relaxed)
+        self.inflight.decrement(1)
     }
 
     /// Update max inflight metric
-    pub(crate) fn update_max_inflight(&self, current_inflight: u64) {
+    fn update_max_inflight(&self) {
         let current_max = self.max_inflight.value();
-        let current_inflight = current_inflight as f64;
+        let current_inflight = self.inflight();
         if current_inflight > current_max {
-            self.max_inflight.set(current_inflight);
+            self.max_inflight.increment(current_inflight - current_max);
         }
-    }
-
-    /// Record permit acquisition
-    pub(crate) fn record_permit_acquisition(&self) {
-        self.permits_acquired.increment(1);
-    }
-
-    /// Record permit release
-    pub(crate) fn record_permit_release(&self) {
-        self.permits_acquired.decrement(1);
     }
 
     /// Record permit acquisition failure
@@ -251,9 +234,9 @@ impl SchedulerMetrics {
         self.scheduler_saturation.set(saturation);
     }
 
-    /// Get permit acquisitions counter
-    pub(crate) fn permits_acquired(&self) -> &UpDownCounter {
-        &self.permits_acquired
+    /// Get the current number of in-flight requests
+    pub(crate) fn inflight(&self) -> u64 {
+        self.inflight.value()
     }
 
     /// Get permit wait time histogram
@@ -267,7 +250,7 @@ impl SchedulerMetrics {
     }
 
     /// Get max inflight gauge
-    pub(crate) fn max_inflight(&self) -> &Gauge {
+    pub(crate) fn max_inflight(&self) -> &IncreasingCounter {
         &self.max_inflight
     }
 
@@ -806,12 +789,7 @@ mod tests {
     #[test]
     fn test_scheduler_metrics() {
         use crate::metrics::aggregators::SchedulerMetrics;
-
         let metrics = SchedulerMetrics::new();
-
-        assert_eq!(metrics.permits_acquired().value(), 0);
-        metrics.record_permit_acquisition();
-        assert_eq!(metrics.permits_acquired().value(), 1);
 
         assert_eq!(metrics.permit_acquisition_failures().value(), 0);
         metrics.record_permit_acquisition_failure();
@@ -820,14 +798,17 @@ mod tests {
         metrics.record_permit_wait_time(0.5);
         assert!(metrics.permit_wait_time().count() > 0);
 
-        metrics.update_max_inflight(10);
-        assert_eq!(metrics.max_inflight().value(), 10.0);
+        for i in 0..10 {
+            metrics.increment_inflight();
+        }
+        assert_eq!(metrics.max_inflight().value(), 10);
         // Should not update since it is lower
-        metrics.update_max_inflight(5);
-        assert_eq!(metrics.max_inflight().value(), 10.0);
+        metrics.decrement_inflight();
+        assert_eq!(metrics.max_inflight().value(), 10);
         // Should update since it is higher
-        metrics.update_max_inflight(15);
-        assert_eq!(metrics.max_inflight().value(), 15.0);
+        metrics.increment_inflight();
+        metrics.increment_inflight();
+        assert_eq!(metrics.max_inflight().value(), 11);
 
         metrics.set_scheduler_saturation(10, 50);
         assert_eq!(metrics.scheduler_saturation().value(), 20.0);

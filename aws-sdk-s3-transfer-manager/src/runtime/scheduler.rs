@@ -50,7 +50,6 @@ impl Scheduler {
         match self.try_acquire_permit(ptype.clone()) {
             Ok(Some(permit)) => {
                 // Record immediate acquisition
-                self.metrics.record_permit_acquisition();
                 self.metrics.record_permit_wait_time(0.0);
                 AcquirePermitFuture::ready(Ok(permit))
             }
@@ -58,7 +57,6 @@ impl Scheduler {
                 let metrics = self.metrics.clone();
                 let inner = self.token_bucket.acquire(ptype).map_ok(move |token| {
                     // Record wait time when permit is acquired
-                    metrics.record_permit_acquisition();
                     metrics.record_permit_wait_time(start_time.elapsed().as_secs_f64());
                     OwnedWorkPermit::from(token)
                 });
@@ -112,25 +110,11 @@ pub(crate) enum PermitType {
 #[derive(Debug)]
 pub(crate) struct OwnedWorkPermit {
     _inner: OwnedToken,
-    metrics: Arc<SchedulerMetrics>,
 }
 
 impl From<OwnedToken> for OwnedWorkPermit {
     fn from(value: OwnedToken) -> Self {
-        //TODO: it might be more performant to just access the SchedulerMetrics through
-        // _inner instead of cloning it, but feels awkward for the scheduler metrics to
-        // live on the token rather than the permit
-        let metrics = value.scheduler_metrics.clone();
-        Self {
-            _inner: value,
-            metrics,
-        }
-    }
-}
-
-impl Drop for OwnedWorkPermit {
-    fn drop(&mut self) {
-        self.metrics.record_permit_release();
+        Self { _inner: value }
     }
 }
 
@@ -217,33 +201,16 @@ mod tests {
             direction: TransferDirection::Download,
         };
 
-        assert_eq!(scheduler.metrics.permits_acquired().value(), 0);
-
-        let permit1 = scheduler
+        let _permit1 = scheduler
             .acquire_permit(PermitType::Network(permit_context.clone()))
             .await
             .unwrap();
 
-        assert_eq!(scheduler.metrics.permits_acquired().value(), 1);
         assert!(scheduler.metrics.permit_wait_time().count() > 0);
-
-        let permit2 = scheduler
-            .acquire_permit(PermitType::Network(permit_context))
-            .await
-            .unwrap();
-
-        assert_eq!(scheduler.metrics.permits_acquired().value(), 2);
-
-        // Make sure permit drops are recorded
-        drop(permit1);
-        assert_eq!(scheduler.metrics.permits_acquired().value(), 1);
-
-        drop(permit2);
-        assert_eq!(scheduler.metrics.permits_acquired().value(), 0);
 
         // We never actually fire off a request so no failures or inflight
         assert_eq!(scheduler.metrics.permit_acquisition_failures().value(), 0);
-        assert_eq!(scheduler.metrics.max_inflight().value(), 0.0);
+        assert_eq!(scheduler.metrics.max_inflight().value(), 0);
     }
 
     #[tokio::test]

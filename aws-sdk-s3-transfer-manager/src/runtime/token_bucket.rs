@@ -220,11 +220,7 @@ impl TokenBucket {
             Ok(permit) => {
                 self.tb_metrics.record_token_acquisition();
                 self.tb_metrics.record_token_wait_time(0.0);
-                Ok(Some(OwnedToken::new(
-                    permit,
-                    self.tb_metrics.clone(),
-                    self.scheduler_metrics.clone(),
-                )))
+                Ok(Some(OwnedToken::new(permit, self.tb_metrics.clone())))
             }
             Err(TryAcquireError::NoPermits) => Ok(None),
             Err(err @ TryAcquireError::Closed) => {
@@ -281,11 +277,7 @@ impl Future for AcquireTokenFuture {
             Poll::Ready(Some(permit)) => {
                 this.tb_metrics
                     .record_token_wait_time(this.start_time.elapsed().as_secs_f64());
-                Poll::Ready(Ok(OwnedToken::new(
-                    permit,
-                    this.tb_metrics.clone(),
-                    this.scheduler_metrics.clone(),
-                )))
+                Poll::Ready(Ok(OwnedToken::new(permit, this.tb_metrics.clone())))
             }
             Poll::Ready(None) => Poll::Ready(Err(error::Error::new(
                 error::ErrorKind::RuntimeError,
@@ -303,19 +295,13 @@ impl Future for AcquireTokenFuture {
 pub(crate) struct OwnedToken {
     _inner: OwnedSemaphorePermit,
     tb_metrics: Arc<TokenBucketMetrics>,
-    pub(crate) scheduler_metrics: Arc<SchedulerMetrics>,
 }
 
 impl OwnedToken {
-    fn new(
-        permit: OwnedSemaphorePermit,
-        tb_metrics: Arc<TokenBucketMetrics>,
-        scheduler_metrics: Arc<SchedulerMetrics>,
-    ) -> Self {
+    fn new(permit: OwnedSemaphorePermit, tb_metrics: Arc<TokenBucketMetrics>) -> Self {
         OwnedToken {
             _inner: permit,
             tb_metrics,
-            scheduler_metrics,
         }
     }
 }
