@@ -10,5 +10,5 @@ mod work;
 
 pub(crate) use queue::WorkQueue;
 pub(crate) use scheduler::Scheduler;
-pub(crate) use transfer::{Transfer, UploadTransfer};
-pub(crate) use work::{TransferId, WorkItem, WorkOutcome, WorkPhase};
+pub(crate) use transfer::{DownloadTransfer, Transfer};
+pub(crate) use work::{TransferId, WorkData, WorkItem, WorkOutcome, WorkPhase};

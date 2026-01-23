@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::{Arc, Mutex};
+//! Transfer types for scheduler integration.
 
-use super::{TransferId, WorkItem, WorkOutcome, WorkPhase};
+use super::{TransferId, WorkItem, WorkOutcome};
+use crate::operation::upload::UploadTransfer;
 
 /// A transfer operation that generates and executes work.
 ///
@@ -38,7 +39,7 @@ impl Transfer {
         }
     }
 
-    pub(crate) async fn execute(&self, work: &WorkItem) -> WorkOutcome {
+    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
         match self {
             Transfer::Upload(u) => u.execute(work).await,
             Transfer::Download(_) => todo!("download not yet implemented"),
@@ -46,64 +47,8 @@ impl Transfer {
     }
 }
 
-/// Upload transfer stub for testing.
-///
-/// Real implementation will wrap `Arc<UploadState>` or similar.
-#[derive(Debug, Clone)]
-pub(crate) struct UploadTransfer {
-    inner: Arc<Mutex<UploadTransferInner>>,
-}
-
-#[derive(Debug)]
-struct UploadTransferInner {
-    id: TransferId,
-    remaining: usize,
-}
-
-impl UploadTransfer {
-    /// Create stub with N work items to generate
-    #[cfg(test)]
-    pub(crate) fn stub(id: TransferId, work_count: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(UploadTransferInner {
-                id,
-                remaining: work_count,
-            })),
-        }
-    }
-
-    fn id(&self) -> TransferId {
-        self.inner.lock().unwrap().id
-    }
-
-    fn next_work(&self) -> Option<WorkItem> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.remaining == 0 {
-            return None;
-        }
-        inner.remaining -= 1;
-        Some(WorkItem {
-            transfer_id: inner.id,
-            phase: WorkPhase::DataIO,
-        })
-    }
-
-    fn is_done(&self) -> bool {
-        self.inner.lock().unwrap().remaining == 0
-    }
-
-    async fn execute(&self, work: &WorkItem) -> WorkOutcome {
-        // Stub: return success with next phase
-        let next_phase = match work.phase {
-            WorkPhase::DataIO => Some(WorkPhase::Network),
-            WorkPhase::Network => None,
-        };
-        WorkOutcome::Success { next_phase }
-    }
-}
-
 /// Download transfer - not yet implemented
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadTransfer {
-    id: TransferId,
+    pub(crate) id: TransferId,
 }

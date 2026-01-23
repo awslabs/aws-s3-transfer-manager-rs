@@ -12,8 +12,10 @@ mod output;
 mod context;
 mod handle;
 mod service;
+mod transfer;
 
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
+pub(crate) use transfer::UploadTransfer;
 
 use crate::error;
 use crate::io::part_reader::Builder as PartReaderBuilder;

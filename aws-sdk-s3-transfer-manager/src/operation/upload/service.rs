@@ -234,6 +234,9 @@ mod tests {
     use bytes::Bytes;
 
     fn _mock_upload_part_request_with_bucket_name(bucket_name: &str) -> UploadPartRequest {
+        use crate::operation::upload::context::UploadWorkState;
+        use std::sync::Mutex;
+
         let s3_client = mock_client!(aws_sdk_s3, []);
         UploadPartRequest {
             ctx: UploadContext {
@@ -250,6 +253,7 @@ mod tests {
                             .unwrap(),
                     ),
                     bucket_type: BucketType::from_bucket_name(bucket_name),
+                    work: Mutex::new(UploadWorkState::default()),
                 }),
             },
             part_data: PartData::new(1, Bytes::default()),

@@ -236,10 +236,10 @@ impl Scheduler {
         }
 
         // Spawn tasks
-        for (work, transfer) in to_spawn {
+        for (mut work, transfer) in to_spawn {
             let scheduler = self.clone();
             tokio::spawn(async move {
-                let outcome = transfer.execute(&work).await;
+                let outcome = transfer.execute(&mut work).await;
                 scheduler.complete_work(work, outcome);
             });
         }
@@ -260,11 +260,12 @@ impl SchedulerInner {
     fn on_work_complete(&mut self, work: WorkItem, outcome: WorkOutcome) {
         self.mark_complete(work.phase);
         match outcome {
-            WorkOutcome::Success { next_phase } => {
+            WorkOutcome::Success { next_phase, data } => {
                 if let Some(phase) = next_phase {
                     let next_item = WorkItem {
                         transfer_id: work.transfer_id,
                         phase,
+                        data,
                     };
                     self.enqueue_to_phase(next_item);
                 }
@@ -340,7 +341,8 @@ impl SchedulerInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::{TransferId, UploadTransfer};
+    use crate::operation::upload::UploadTransfer;
+    use crate::scheduler::TransferId;
     use std::time::Duration;
 
     #[tokio::test]
