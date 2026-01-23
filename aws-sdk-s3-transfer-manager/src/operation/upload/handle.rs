@@ -3,41 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::Arc;
-
-use crate::error::ChunkId;
-use crate::io::part_reader::PartReader;
-use crate::operation::upload::context::UploadContext;
-use crate::operation::upload::input::convert::{
-    copy_fields_to_abort_mpu_request, copy_fields_to_complete_mpu_request,
-};
-use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
-use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
-use aws_sdk_s3::error::DisplayErrorContext;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use tokio::sync::Mutex;
-use tokio::task::{self, JoinHandle};
-use tracing::Instrument;
-
-#[derive(Debug)]
-pub(crate) enum UploadType {
-    MultipartUpload(MultipartUploadData),
-    PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
-}
-
-#[derive(Debug)]
-pub(crate) struct MultipartUploadData {
-    /// All child multipart upload tasks spawned for this upload
-    pub(crate) upload_part_tasks:
-        Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-    /// All child read body tasks spawned for this upload
-    pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
-    /// The response that will eventually be yielded to the caller.
-    pub(crate) response: Option<UploadOutputBuilder>,
-    /// the multipart upload ID
-    pub(crate) upload_id: String,
-    pub(crate) part_reader: Arc<PartReader>,
-}
+use crate::error::Error;
+use crate::operation::upload::transfer::UploadResultReceiver;
+use crate::operation::upload::UploadOutput;
+use crate::types::AbortedUpload;
 
 /// Response type for a single upload object request.
 ///
@@ -47,6 +16,11 @@ pub(crate) struct MultipartUploadData {
 /// [`Self::abort`]. In both cases, any ongoing tasks will stop processing future work
 /// and will not start processing anything new. However, there are subtle differences in
 /// how each method cancels ongoing tasks.
+///
+/// TODO(redux): Document cancellation behavior with new scheduler model.
+/// - When handle is dropped, what happens to in-flight work?
+/// - How does scheduler handle orphaned transfers?
+/// - Do we need explicit cleanup or does drop suffice?
 ///
 /// When the handle is dropped, in-progress tasks are cancelled at their await points,
 /// meaning read body tasks may be interrupted mid-processing, or upload parts may be
@@ -62,188 +36,61 @@ pub(crate) struct MultipartUploadData {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
-    /// Initial task which determines the upload type
-    initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
-    /// The context used to drive an upload to completion
-    pub(crate) ctx: UploadContext,
+    result_rx: UploadResultReceiver,
+    // TODO(redux): Do we need to hold ctx for abort/cancellation?
+    // Old impl held: ctx: UploadContext
+    // TODO(redux): Do we need transfer_id to signal cancellation to scheduler?
 }
 
 impl UploadHandle {
-    pub(crate) fn new(
-        ctx: UploadContext,
-        initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
-    ) -> Self {
-        Self { initiate_task, ctx }
+    pub(crate) fn new(result_rx: UploadResultReceiver) -> Self {
+        Self { result_rx }
     }
 
     /// Consume the handle and wait for upload to complete
-    #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
-    pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
-        // TODO: We won't send completeMPU until customers join the future. This can create a
-        // bottleneck where we have many uploads not making the completeMPU call, waiting for the join
-        // to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
-        // this without waiting for join to happen.
-        complete_upload(self).await
+    ///
+    /// TODO(redux): Re-add tracing span instrumentation
+    /// Old: #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
+    ///
+    /// TODO(redux): The old impl had this concern:
+    /// > We won't send completeMPU until customers join the future. This can create a
+    /// > bottleneck where we have many uploads not making the completeMPU call, waiting for the join
+    /// > to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
+    /// > this without waiting for join to happen.
+    /// With the new scheduler model, CompleteMPU is driven by scheduler, not by join().
+    /// Verify this is actually the case and document the new behavior.
+    pub async fn join(self) -> Result<UploadOutput, Error> {
+        self.result_rx
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::RuntimeError, "upload cancelled"))?
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
-    #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
-    pub async fn abort(self) -> Result<AbortedUpload, crate::error::Error> {
-        // TODO(aws-sdk-rust#1159) - handle already completed upload
-        self.initiate_task.abort();
-        if let Ok(Ok(upload_type)) = self.initiate_task.await {
-            match upload_type {
-                UploadType::PutObject(put_object_task) => {
-                    put_object_task.abort();
-                    let _ = put_object_task.await?;
-                    Ok(AbortedUpload::default())
-                }
-                UploadType::MultipartUpload(mpu_ctx) => {
-                    abort_multipart_upload(self.ctx.clone(), mpu_ctx).await
-                }
-            }
-        } else {
-            // Nothing to abort since initiate task was not successful.
-            Ok(AbortedUpload::default())
-        }
+    ///
+    /// TODO(redux): Re-add tracing span instrumentation
+    /// Old: #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
+    ///
+    /// TODO(redux): Implement abort with scheduler cancellation (Phase 5)
+    /// Old impl did:
+    /// 1. Abort initiate_task
+    /// 2. For PutObject: abort the task
+    /// 3. For MPU: abort read_body_tasks, abort upload_part_tasks, call AbortMultipartUpload
+    ///
+    /// New impl needs to:
+    /// 1. Signal scheduler to cancel this transfer
+    /// 2. Wait for in-flight work to complete or be cancelled
+    /// 3. Call AbortMultipartUpload if MPU was started
+    ///
+    /// TODO(aws-sdk-rust#1159): Handle already completed upload
+    pub async fn abort(self) -> Result<AbortedUpload, Error> {
+        todo!("abort not yet implemented with new scheduler model")
     }
 }
 
-/// Abort the multipart upload and cancel any in-progress part uploads.
-async fn abort_multipart_upload(
-    ctx: UploadContext,
-    mut mpu_data: MultipartUploadData,
-) -> Result<AbortedUpload, crate::error::Error> {
-    // cancel in-progress read_body tasks
-    mpu_data.read_body_tasks.abort_all();
-    while (mpu_data.read_body_tasks.join_next().await).is_some() {}
-
-    // cancel in-progress upload tasks
-    let mut tasks = mpu_data.upload_part_tasks.lock().await;
-    tasks.abort_all();
-
-    // join all tasks
-    while (tasks.join_next().await).is_some() {}
-
-    let abort_policy = ctx
-        .state
-        .request
-        .failed_multipart_upload_policy
-        .clone()
-        .unwrap_or_default();
-    match abort_policy {
-        FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
-        FailedMultipartUploadPolicy::AbortUpload => {
-            let abort_mpu_resp = copy_fields_to_abort_mpu_request(
-                &ctx.state.request,
-                ctx.client()
-                    .abort_multipart_upload()
-                    .set_upload_id(Some(mpu_data.upload_id.clone())),
-            )
-            .send()
-            .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-            .await?;
-
-            let aborted_upload = AbortedUpload {
-                upload_id: Some(mpu_data.upload_id),
-                request_charged: abort_mpu_resp.request_charged,
-            };
-
-            Ok(aborted_upload)
-        }
-    }
-}
-
-async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
-    let upload_type = handle.initiate_task.await??;
-    match upload_type {
-        UploadType::PutObject(put_object_task) => put_object_task.await?,
-        UploadType::MultipartUpload(mut mpu_data) => {
-            while let Some(join_result) = mpu_data.read_body_tasks.join_next().await {
-                if let Err(err) = join_result.expect("task completed") {
-                    tracing::error!(
-                        "multipart upload failed while trying to read the body, aborting"
-                    );
-                    // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                    if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
-                        tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
-                    };
-                    return Err(err);
-                }
-            }
-
-            let mut all_parts = Vec::new();
-            // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
-            let mut tasks = mpu_data.upload_part_tasks.lock().await;
-            let number_of_upload_requests = tasks.len();
-            while let Some(join_result) = tasks.join_next().await {
-                let result = join_result.expect("task completed");
-                match result {
-                    Ok(completed_part) => all_parts.push(completed_part),
-                    // TODO(aws-sdk-rust#1159, design) - do we want to return first error or collect all errors?
-                    Err(err) => {
-                        tracing::error!("multipart upload failed, aborting");
-                        // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                        drop(tasks);
-                        if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
-                            tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
-                        };
-                        return Err(err);
-                    }
-                }
-            }
-
-            tracing::trace!("completing multipart upload");
-
-            if number_of_upload_requests != all_parts.len() {
-                return Err(crate::error::chunk_failed(
-                    ChunkId::Upload(mpu_data.upload_id),
-                    format!(
-                        "The total number of UploadPart requests must match the expected number of parts: request count {}, number of parts {}",
-                        number_of_upload_requests,
-                        all_parts.len()
-                    ),
-                ));
-            }
-
-            // parts must be sorted
-            all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
-
-            // complete the multipart upload
-            let req = copy_fields_to_complete_mpu_request(
-                &handle.ctx.state.request,
-                handle
-                    .ctx
-                    .client()
-                    .complete_multipart_upload()
-                    .set_upload_id(Some(mpu_data.upload_id))
-                    .multipart_upload(
-                        CompletedMultipartUpload::builder()
-                            .set_parts(Some(all_parts))
-                            .build(),
-                    ),
-                || {
-                    let part_reader = mpu_data.part_reader.clone();
-                    async move { part_reader.full_object_checksum().await }
-                },
-            )
-            .await;
-
-            let complete_mpu_resp = req
-                .send()
-                .instrument(tracing::debug_span!("send-complete-multipart-upload"))
-                .await?;
-
-            // set remaining fields from completing the multipart upload
-            let resp = mpu_data
-                .response
-                .take()
-                .expect("response set")
-                .update_from_complete_mpu(&complete_mpu_resp);
-
-            tracing::trace!("upload completed successfully");
-
-            Ok(resp.build().expect("valid response"))
-        }
-    }
-}
+// TODO(redux): Consider Drop impl for cleanup
+// Old impl relied on JoinHandle drop behavior. New impl may need explicit cleanup.
+// impl Drop for UploadHandle {
+//     fn drop(&mut self) {
+//         // Signal cancellation to scheduler?
+//     }
+// }

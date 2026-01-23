@@ -16,11 +16,15 @@ impl UploadContext {
         handle: Arc<crate::client::Handle>,
         bucket_type: BucketType,
         req: UploadInput,
+        content_length: u64,
     ) -> Self {
         let state = Arc::new(UploadState {
             request: Arc::new(req),
             bucket_type,
-            work: Mutex::new(UploadWorkState::default()),
+            work: Mutex::new(UploadWorkState::PendingInit {
+                content_length,
+                init_in_flight: false,
+            }),
         });
         TransferContext { handle, state }
     }

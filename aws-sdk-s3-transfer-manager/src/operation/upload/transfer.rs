@@ -6,11 +6,21 @@
 //! Upload transfer implementation for scheduler integration.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use tokio::sync::oneshot;
+
+use crate::error::Error;
 use crate::io::PartData;
 use crate::operation::upload::context::{UploadContext, UploadWorkState};
+use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
 use crate::scheduler::{TransferId, WorkData, WorkItem, WorkOutcome, WorkPhase};
+
+/// Channel for delivering upload result to handle
+pub(crate) type UploadResultSender = oneshot::Sender<Result<UploadOutput, Error>>;
+pub(crate) type UploadResultReceiver = oneshot::Receiver<Result<UploadOutput, Error>>;
+
+// TODO(redux): what about retries?
 
 /// Upload transfer that generates and executes upload work.
 ///
@@ -20,16 +30,17 @@ pub(crate) struct UploadTransfer {
     id: TransferId,
     ctx: UploadContext,
     done: Arc<AtomicBool>,
-    // TODO: result_tx: Mutex<Option<oneshot::Sender<Result<UploadOutput, Error>>>>,
+    result_tx: Arc<Mutex<Option<UploadResultSender>>>,
 }
 
 impl UploadTransfer {
-    /// Create a new upload transfer
-    pub(crate) fn new(id: TransferId, ctx: UploadContext) -> Self {
+    /// Create a new upload transfer with result channel
+    pub(crate) fn new(id: TransferId, ctx: UploadContext, result_tx: UploadResultSender) -> Self {
         Self {
             id,
             ctx,
             done: Arc::new(AtomicBool::new(false)),
+            result_tx: Arc::new(Mutex::new(Some(result_tx))),
         }
     }
 
@@ -38,13 +49,17 @@ impl UploadTransfer {
     pub(crate) fn stub(id: TransferId, part_count: usize) -> Self {
         use crate::operation::upload::UploadInput;
         use crate::types::BucketType;
+        use crate::DEFAULT_CONCURRENCY;
 
-        // Create minimal context for testing
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let handle = Arc::new(crate::client::Handle {
             config: crate::Config::builder().client(s3_client).build(),
             scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(8),
+            ),
+            new_scheduler: crate::scheduler::Scheduler::new(
+                DEFAULT_CONCURRENCY,
+                DEFAULT_CONCURRENCY,
             ),
         });
 
@@ -54,21 +69,17 @@ impl UploadTransfer {
             .build()
             .unwrap();
 
-        let ctx = UploadContext::new(handle, BucketType::Standard, input);
+        let content_length = part_count as u64 * 8 * 1024 * 1024;
+        let ctx = UploadContext::new(handle, BucketType::Standard, input, content_length);
 
-        // Initialize work state
-        {
-            let mut work = ctx.state.work.lock().unwrap();
-            *work = UploadWorkState::PendingInit {
-                content_length: part_count as u64 * 8 * 1024 * 1024,
-                init_in_flight: false,
-            };
-        }
+        // Create a dummy channel for testing (receiver is dropped)
+        let (result_tx, _) = oneshot::channel();
 
         Self {
             id,
             ctx,
             done: Arc::new(AtomicBool::new(false)),
+            result_tx: Arc::new(Mutex::new(Some(result_tx))),
         }
     }
 
@@ -238,13 +249,21 @@ impl UploadTransfer {
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
         // TODO: Actually call CompleteMultipartUpload via SDK
-        // TODO: Send result via channel
 
         {
             let mut work = self.ctx.state.work.lock().unwrap();
             *work = UploadWorkState::Done;
         }
         self.done.store(true, Ordering::Release);
+
+        // Send result to handle
+        // TODO: Build actual UploadOutput from response
+        let result = UploadOutputBuilder::default()
+            .build()
+            .expect("UploadOutput has no required fields");
+        if let Some(tx) = self.result_tx.lock().unwrap().take() {
+            let _ = tx.send(Ok(result));
+        }
 
         WorkOutcome::Success {
             next_phase: None,

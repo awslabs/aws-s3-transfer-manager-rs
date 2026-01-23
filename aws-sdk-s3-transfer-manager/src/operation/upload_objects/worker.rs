@@ -712,8 +712,14 @@ mod tests {
         let config = crate::Config::builder().client(s3_client).build();
 
         let scheduler = Scheduler::new(ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY));
+        let new_scheduler =
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY, DEFAULT_CONCURRENCY);
 
-        let handle = std::sync::Arc::new(Handle { config, scheduler });
+        let handle = std::sync::Arc::new(Handle {
+            config,
+            scheduler,
+            new_scheduler,
+        });
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)
