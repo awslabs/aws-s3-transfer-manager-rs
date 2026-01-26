@@ -5,8 +5,9 @@
 
 //! Transfer types for scheduler integration.
 
-use super::{TransferId, WorkItem, WorkOutcome};
+use super::{PollWork, TransferId, WorkOutcome};
 use crate::operation::upload::UploadTransfer;
+use crate::scheduler::WorkItem;
 
 /// A transfer operation that generates and executes work.
 ///
@@ -29,21 +30,18 @@ impl Transfer {
         }
     }
 
-    pub(crate) fn next_work(&self) -> Option<WorkItem> {
+    /// Poll for the next work item.
+    ///
+    /// Returns:
+    /// - `PollWork::Ready(work)` - work available to execute
+    /// - `PollWork::Pending` - blocked, don't poll until woken
+    /// - `PollWork::Done` - transfer complete
+    pub(crate) fn poll_work(&self) -> PollWork {
         match self {
-            Transfer::Upload(u) => u.next_work(),
+            Transfer::Upload(u) => u.poll_work(),
             Transfer::Download(_) => todo!("download not yet implemented"),
             #[cfg(test)]
-            Transfer::Mock(m) => m.next_work(),
-        }
-    }
-
-    pub(crate) fn is_done(&self) -> bool {
-        match self {
-            Transfer::Upload(u) => u.is_done(),
-            Transfer::Download(_) => todo!("download not yet implemented"),
-            #[cfg(test)]
-            Transfer::Mock(m) => m.is_done(),
+            Transfer::Mock(m) => m.poll_work(),
         }
     }
 
@@ -103,12 +101,19 @@ mod mock {
             self.inner.id
         }
 
-        pub(crate) fn next_work(&self) -> Option<WorkItem> {
+        pub(crate) fn poll_work(&self) -> PollWork {
+            if self.inner.done.load(Ordering::SeqCst) {
+                return PollWork::Done;
+            }
+
             let num = self.inner.next_work_num.fetch_add(1, Ordering::SeqCst);
             if num >= self.inner.total_work {
-                return None;
+                // Reset so we don't keep incrementing
+                self.inner.next_work_num.store(self.inner.total_work, Ordering::SeqCst);
+                // All work generated, but not done until completed
+                return PollWork::Pending;
             }
-            Some(WorkItem {
+            PollWork::Ready(WorkItem {
                 transfer_id: self.inner.id,
                 kind: WorkKind::Network,
                 data: WorkData::UploadPart {
@@ -116,10 +121,6 @@ mod mock {
                     part_data: None,
                 },
             })
-        }
-
-        pub(crate) fn is_done(&self) -> bool {
-            self.inner.done.load(Ordering::SeqCst)
         }
 
         pub(crate) async fn execute(&self, _work: &mut WorkItem) -> WorkOutcome {

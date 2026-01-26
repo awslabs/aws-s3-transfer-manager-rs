@@ -46,6 +46,18 @@ pub(crate) enum WorkData {
     // TODO: GetObjectRange (download)
 }
 
+/// Result of polling a transfer for work.
+#[derive(Debug)]
+pub(crate) enum PollWork {
+    /// Work is available to execute.
+    Ready(WorkItem),
+    /// Transfer is blocked waiting for in-flight work to complete.
+    /// Scheduler should not poll again until `wake(transfer_id)` is called.
+    Pending,
+    /// Transfer has completed all work.
+    Done,
+}
+
 /// Result of executing a work item.
 #[derive(Debug)]
 pub(crate) enum WorkOutcome {

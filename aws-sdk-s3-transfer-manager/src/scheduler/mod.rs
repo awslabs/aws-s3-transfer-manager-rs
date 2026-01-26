@@ -11,7 +11,7 @@ mod work;
 pub(crate) use queue::WorkQueue;
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{DownloadTransfer, Transfer};
-pub(crate) use work::{TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+pub(crate) use work::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 #[cfg(test)]
 pub(crate) use transfer::MockTransfer;

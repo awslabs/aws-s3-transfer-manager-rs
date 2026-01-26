@@ -23,7 +23,7 @@ use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
-use crate::scheduler::{TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
@@ -92,20 +92,26 @@ impl UploadTransfer {
         self.id
     }
 
-    pub(crate) fn is_done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
-    }
+    /// Poll for the next work item.
+    ///
+    /// Returns:
+    /// - `PollWork::Ready(work)` - work available to execute
+    /// - `PollWork::Pending` - blocked waiting for in-flight work
+    /// - `PollWork::Done` - transfer complete
+    pub(crate) fn poll_work(&self) -> PollWork {
+        if self.done.load(Ordering::Acquire) {
+            return PollWork::Done;
+        }
 
-    pub(crate) fn next_work(&self) -> Option<WorkItem> {
         let mut work = self.ctx.state.work.lock().unwrap();
 
         match &mut *work {
             UploadWorkState::PendingInit { init_in_flight, .. } => {
                 if *init_in_flight {
-                    return None;
+                    return PollWork::Pending;
                 }
                 *init_in_flight = true;
-                Some(WorkItem {
+                PollWork::Ready(WorkItem {
                     transfer_id: self.id,
                     kind: WorkKind::Network,
                     data: WorkData::CreateMPU,
@@ -118,12 +124,17 @@ impl UploadTransfer {
                 ..
             } => {
                 if *next_part > *total_parts {
-                    return None;
+                    // All parts generated, waiting for in-flight to complete
+                    if *parts_in_flight > 0 {
+                        return PollWork::Pending;
+                    }
+                    // Should have transitioned to Completing - unexpected
+                    return PollWork::Pending;
                 }
                 let part_number = *next_part;
                 *next_part += 1;
                 *parts_in_flight += 1;
-                Some(WorkItem {
+                PollWork::Ready(WorkItem {
                     transfer_id: self.id,
                     kind: WorkKind::DataIO,
                     data: WorkData::UploadPart {
@@ -136,16 +147,16 @@ impl UploadTransfer {
                 complete_in_flight, ..
             } => {
                 if *complete_in_flight {
-                    return None;
+                    return PollWork::Pending;
                 }
                 *complete_in_flight = true;
-                Some(WorkItem {
+                PollWork::Ready(WorkItem {
                     transfer_id: self.id,
                     kind: WorkKind::Network,
                     data: WorkData::CompleteMPU,
                 })
             }
-            UploadWorkState::Done => None,
+            UploadWorkState::Done => PollWork::Done,
         }
     }
 
