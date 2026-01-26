@@ -72,12 +72,11 @@ impl Upload {
         // MPU has max of 10K parts which requires us to know the upper bound
         // on the content length (today anyway). While true for file-based workloads,
         // the upper `size_hint` might not be equal to the actual bytes transferred.
-        let content_length = stream
-            .size_hint()
-            .upper()
-            .ok_or_else(crate::io::error::Error::upper_bound_size_hint_required)?;
+        if stream.size_hint().upper().is_none() {
+            return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
+        }
 
-        let ctx = new_context(handle.clone(), input, content_length);
+        let ctx = new_context(handle.clone(), input, stream);
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
@@ -93,13 +92,13 @@ impl Upload {
 fn new_context(
     handle: Arc<crate::client::Handle>,
     req: UploadInput,
-    content_length: u64,
+    stream: crate::io::InputStream,
 ) -> UploadContext {
     UploadContext::new(
         handle,
         BucketType::from_bucket_name(req.bucket().expect("bucket is available")),
         req,
-        content_length,
+        stream,
     )
 }
 

@@ -6,8 +6,13 @@
 use crate::operation::upload::UploadInput;
 use crate::operation::TransferContext;
 use crate::types::BucketType;
+use aws_sdk_s3::types::CompletedPart;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+
+use crate::io::part_reader::PartReader;
+use crate::io::InputStream;
+use crate::operation::upload::UploadOutputBuilder;
 
 pub(crate) type UploadContext = TransferContext<UploadState>;
 
@@ -16,12 +21,23 @@ impl UploadContext {
         handle: Arc<crate::client::Handle>,
         bucket_type: BucketType,
         req: UploadInput,
-        content_length: u64,
+        stream: InputStream,
     ) -> Self {
+        // TODO(redux): For unknown content length (streaming uploads), this will need adjustment.
+        // Currently we require known length. When we support unknown length:
+        // - content_length becomes Option<u64>
+        // - total_parts in Active state becomes Option<u64>
+        // - Work generation continues until stream exhausted rather than counting parts
+        let content_length = stream
+            .size_hint()
+            .upper()
+            .expect("content_length required; unknown length not yet supported");
+
         let state = Arc::new(UploadState {
             request: Arc::new(req),
             bucket_type,
             work: Mutex::new(UploadWorkState::PendingInit {
+                stream,
                 content_length,
                 init_in_flight: false,
             }),
@@ -56,29 +72,31 @@ impl UploadState {
 }
 
 /// Mutable state for tracking upload work progress
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) enum UploadWorkState {
-    /// Not yet initialized
-    #[default]
-    Uninitialized,
-    /// Waiting to start - need to call CreateMPU
+    /// Waiting to start - need to call CreateMPU (or PutObject for small uploads)
     PendingInit {
-        // TODO: stream: InputStream,
+        stream: InputStream,
         content_length: u64,
         init_in_flight: bool,
     },
-    /// CreateMPU done, uploading parts
-    Active {
+    /// Data transfer in progress (uploading parts for MPU, or body for PutObject)
+    Transferring {
         upload_id: String,
-        // TODO: part_reader: Arc<PartReader>,
+        part_reader: Arc<PartReader>,
         next_part: u64,
         total_parts: u64,
         parts_in_flight: usize,
-        // TODO: completed_parts: Vec<CompletedPart>,
-        // TODO: response_builder: UploadOutputBuilder,
+        completed_parts: Vec<CompletedPart>,
+        response_builder: UploadOutputBuilder,
     },
-    /// All parts done, calling CompleteMPU
-    Completing { complete_in_flight: bool },
+    /// All parts done, calling CompleteMPU (MPU only)
+    Completing {
+        upload_id: String,
+        completed_parts: Vec<CompletedPart>,
+        response_builder: UploadOutputBuilder,
+        complete_in_flight: bool,
+    },
     /// Done
     Done,
 }

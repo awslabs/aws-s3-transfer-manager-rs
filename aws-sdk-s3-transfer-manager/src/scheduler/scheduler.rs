@@ -88,7 +88,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam_queue::SegQueue;
 
-use super::{Transfer, WorkItem, WorkOutcome, WorkPhase, WorkQueue};
+use super::{Transfer, WorkItem, WorkKind, WorkOutcome, WorkQueue};
 
 /// Completion message sent when work finishes
 struct WorkComplete {
@@ -258,16 +258,19 @@ impl Scheduler {
 
 impl SchedulerInner {
     fn on_work_complete(&mut self, work: WorkItem, outcome: WorkOutcome) {
-        self.mark_complete(work.phase);
+        self.mark_complete(work.kind);
         match outcome {
-            WorkOutcome::Success { next_phase, data } => {
-                if let Some(phase) = next_phase {
+            WorkOutcome::Success {
+                schedule_next,
+                data,
+            } => {
+                if let Some(kind) = schedule_next {
                     let next_item = WorkItem {
                         transfer_id: work.transfer_id,
-                        phase,
+                        kind,
                         data,
                     };
-                    self.enqueue_to_phase(next_item);
+                    self.enqueue_to_kind(next_item);
                 }
             }
             WorkOutcome::Failed { .. } | WorkOutcome::Cancelled => {
@@ -307,14 +310,14 @@ impl SchedulerInner {
         }
 
         for item in new_work {
-            self.enqueue_to_phase(item);
+            self.enqueue_to_kind(item);
         }
     }
 
-    fn enqueue_to_phase(&mut self, item: WorkItem) {
-        match item.phase {
-            WorkPhase::DataIO => self.data_io_queue.push(item),
-            WorkPhase::Network => self.network_queue.push(item),
+    fn enqueue_to_kind(&mut self, item: WorkItem) {
+        match item.kind {
+            WorkKind::DataIO => self.data_io_queue.push(item),
+            WorkKind::Network => self.network_queue.push(item),
         }
     }
 
@@ -330,10 +333,10 @@ impl SchedulerInner {
         self.data_io_queue.in_flight_count() + self.network_queue.in_flight_count()
     }
 
-    fn mark_complete(&mut self, phase: WorkPhase) {
-        match phase {
-            WorkPhase::DataIO => self.data_io_queue.mark_complete(),
-            WorkPhase::Network => self.network_queue.mark_complete(),
+    fn mark_complete(&mut self, kind: WorkKind) {
+        match kind {
+            WorkKind::DataIO => self.data_io_queue.mark_complete(),
+            WorkKind::Network => self.network_queue.mark_complete(),
         }
     }
 }
@@ -341,15 +344,14 @@ impl SchedulerInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::upload::UploadTransfer;
-    use crate::scheduler::TransferId;
+    use crate::scheduler::{MockTransfer, TransferId};
     use std::time::Duration;
 
     #[tokio::test]
     async fn test_single_transfer_completes() {
         let scheduler = Scheduler::new(4, 4);
 
-        let transfer = Transfer::Upload(UploadTransfer::stub(
+        let transfer = Transfer::Mock(MockTransfer::new(
             TransferId {
                 id: 1,
                 parent: None,
@@ -359,7 +361,6 @@ mod tests {
 
         scheduler.enqueue_transfer(transfer);
 
-        // Wait for completion
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_done() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -376,7 +377,7 @@ mod tests {
         let scheduler = Scheduler::new(4, 4);
 
         for i in 0..5 {
-            let transfer = Transfer::Upload(UploadTransfer::stub(
+            let transfer = Transfer::Mock(MockTransfer::new(
                 TransferId {
                     id: i,
                     parent: None,
