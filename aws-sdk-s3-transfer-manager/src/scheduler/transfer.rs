@@ -109,7 +109,9 @@ mod mock {
             let num = self.inner.next_work_num.fetch_add(1, Ordering::SeqCst);
             if num >= self.inner.total_work {
                 // Reset so we don't keep incrementing
-                self.inner.next_work_num.store(self.inner.total_work, Ordering::SeqCst);
+                self.inner
+                    .next_work_num
+                    .store(self.inner.total_work, Ordering::SeqCst);
                 // All work generated, but not done until completed
                 return PollWork::Pending;
             }

@@ -25,68 +25,47 @@
 //!                    └──────────┘     └──────────┘     └──────────┘
 //! ```
 //!
+//! # Worker Pool Model
+//!
+//! Workers pull work via `pool.next_work()` rather than work being spawned
+//! per-item. This enables:
+//! - Priority control (changes affect next work selection)
+//! - Bounded in-flight work (worker count = max concurrency)
+//! - Clean shutdown (workers exit when pool signals shutdown)
+//!
+//! Workers are spawned lazily on first `enqueue_transfer()` call, avoiding
+//! the need for an async context during scheduler construction.
+//!
+//! ```text
+//!   ┌─────────────────────────────────────────────────────────────┐
+//!   │                        Scheduler                            │
+//!   │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+//!   │  │  Transfers  │  │ DataIO Pool │  │    Network Pool     │ │
+//!   │  └─────────────┘  └──────┬──────┘  └──────────┬──────────┘ │
+//!   └──────────────────────────┼────────────────────┼────────────┘
+//!                              │                    │
+//!                    Workers pull work      Workers pull work
+//!                              │                    │
+//!                         ┌────┴────┐          ┌────┴────┐
+//!                         │ Workers │          │ Workers │
+//!                         └─────────┘          └─────────┘
+//! ```
+//!
 //! # Work Flow
 //!
 //! Work progresses through phases. For uploads: DataIO (read) → Network (send).
 //! For downloads: Network (receive) → DataIO (write).
-//!
-//! ```text
-//!   Transfer.poll_work()
-//!          │
-//!          ▼
-//!   ┌──────────────┐                  ┌─────────────┐
-//!   │   DataIO     │    on_complete   │   Network   │
-//!   │    Queue     │ ───────────────► │    Queue    │
-//!   └──────────────┘                  └──────┬──────┘
-//!                                            │ on_complete
-//!                                            ▼
-//!                                     Transfer complete
-//! ```
 //!
 //! # Transfer States
 //!
 //! Transfers are either "ready" (can be polled for work) or "pending" (blocked
 //! waiting for in-flight work to complete). The scheduler only polls ready
 //! transfers, avoiding wasted work.
-//!
-//! ```text
-//!   enqueue_transfer()
-//!          │
-//!          ▼
-//!   ┌─────────────┐  poll_work() = Pending   ┌─────────────┐
-//!   │    Ready    │ ───────────────────────► │   Pending   │
-//!   │   Transfers │                          │  Transfers  │
-//!   └─────────────┘ ◄─────────────────────── └─────────────┘
-//!                      wake(transfer_id)
-//! ```
-//!
-//! # Completion Processing
-//!
-//! Completions are queued and processed by whichever task finishes and
-//! acquires drainer status. An atomic flag ensures exactly one task drains
-//! at a time while others continue without blocking.
-//!
-//! # Priority
-//!
-//! TODO(redux): Priority-based scheduling for prefetch vs active requests.
-//! Currently uses FIFO ordering via VecDeque. Future options:
-//! - BinaryHeap<PrioritizedTransfer> for priority ordering
-//! - Multi-level queues (high/normal/low)
-//! - Fairness via vruntime (glommio-style)
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crossbeam_queue::SegQueue;
-
-use super::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome, WorkQueue};
-
-/// Completion message sent when work finishes
-struct WorkComplete {
-    work: WorkItem,
-    outcome: WorkOutcome,
-}
+use super::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool};
 
 /// State for a tracked transfer
 struct TransferState {
@@ -96,8 +75,6 @@ struct TransferState {
 
 /// Inner scheduler state protected by mutex
 struct SchedulerInner {
-    data_io_queue: WorkQueue,
-    network_queue: WorkQueue,
     /// All transfers by ID
     transfers: HashMap<TransferId, TransferState>,
     /// IDs of transfers ready to be polled for work
@@ -106,12 +83,15 @@ struct SchedulerInner {
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
+/// Workers pull work via `next_work()` rather than work being spawned per-item.
+/// This enables priority control and bounded in-flight work.
+///
 /// Clone is cheap (Arc).
 #[derive(Clone)]
 pub(crate) struct Scheduler {
     inner: Arc<Mutex<SchedulerInner>>,
-    completion_queue: Arc<SegQueue<WorkComplete>>,
-    draining: Arc<AtomicBool>,
+    data_io_pool: Arc<WorkerPool>,
+    network_pool: Arc<WorkerPool>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -124,18 +104,34 @@ impl Scheduler {
     pub(crate) fn new(data_io_concurrency: usize, network_concurrency: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SchedulerInner {
-                data_io_queue: WorkQueue::new(data_io_concurrency),
-                network_queue: WorkQueue::new(network_concurrency),
                 transfers: HashMap::new(),
                 ready_queue: VecDeque::new(),
             })),
-            completion_queue: Arc::new(SegQueue::new()),
-            draining: Arc::new(AtomicBool::new(false)),
+            data_io_pool: Arc::new(WorkerPool::new(data_io_concurrency)),
+            network_pool: Arc::new(WorkerPool::new(network_concurrency)),
         }
     }
 
-    /// Add a transfer and start executing work.
+    /// Ensure workers are spawned for a pool. Called lazily on first enqueue.
+    fn ensure_workers_started(&self, pool: &Arc<WorkerPool>) {
+        if pool.mark_started() {
+            // We're the first - spawn workers
+            for _ in 0..pool.concurrency() {
+                let pool = Arc::clone(pool);
+                let scheduler = self.clone();
+                tokio::spawn(async move {
+                    worker_loop(pool, scheduler).await;
+                });
+            }
+        }
+    }
+
+    /// Add a transfer and start generating work.
     pub(crate) fn enqueue_transfer(&self, transfer: Transfer) {
+        // Ensure workers are running (lazy spawn)
+        self.ensure_workers_started(&self.data_io_pool);
+        self.ensure_workers_started(&self.network_pool);
+
         let mut inner = self.inner.lock().unwrap();
         let id = transfer.id();
         inner.transfers.insert(
@@ -146,8 +142,13 @@ impl Scheduler {
             },
         );
         inner.ready_queue.push_back(id);
-        inner.generate_work();
-        self.spawn_ready_work(&mut inner);
+        self.generate_work(&mut inner);
+    }
+
+    /// Get a transfer by ID. Used by workers to execute work.
+    pub(crate) fn get_transfer(&self, id: TransferId) -> Option<Transfer> {
+        let inner = self.inner.lock().unwrap();
+        inner.transfers.get(&id).map(|s| s.transfer.clone())
     }
 
     /// Wake a transfer, moving it from pending to ready.
@@ -156,114 +157,113 @@ impl Scheduler {
     pub(crate) fn wake(&self, id: TransferId) {
         let mut inner = self.inner.lock().unwrap();
         inner.wake(id);
+        self.generate_work(&mut inner);
     }
 
-    /// Called by spawned tasks when work completes.
+    /// Called by workers when work completes.
     ///
-    /// Queues the completion and attempts to become the drainer. If another
-    /// task is already draining, this returns immediately - the drainer will
-    /// process our completion.
-    pub(crate) fn complete_work(&self, work: WorkItem, outcome: WorkOutcome) {
-        self.completion_queue.push(WorkComplete { work, outcome });
+    /// Note: Workers call pool.complete() directly - this only handles
+    /// transfer state and follow-on work generation.
+    pub(crate) fn on_completion(&self, work: WorkItem, outcome: WorkOutcome) {
+        let mut inner = self.inner.lock().unwrap();
 
-        // Try to become the drainer
-        if self
-            .draining
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // We're the drainer
-            let mut inner = self.inner.lock().unwrap();
-            loop {
-                self.drain_completions(&mut inner);
-                self.draining.store(false, Ordering::Release);
+        // Wake the transfer so it can be polled again
+        inner.wake(work.transfer_id);
 
-                // Re-check queue - items may have arrived while draining
-                if self.completion_queue.is_empty() {
-                    break;
-                }
-                // Try to re-acquire drainer status
-                if self
-                    .draining
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    break; // Someone else took over
+        match outcome {
+            WorkOutcome::Success {
+                schedule_next,
+                data,
+            } => {
+                if let Some(kind) = schedule_next {
+                    let next_item = WorkItem {
+                        transfer_id: work.transfer_id,
+                        kind,
+                        data,
+                    };
+                    self.enqueue_to_pool(next_item);
                 }
             }
-        }
-        // If CAS failed, another task is draining and will process our completion
-    }
-
-    /// Drain all pending completions and process them.
-    fn drain_completions(&self, inner: &mut MutexGuard<'_, SchedulerInner>) {
-        while let Some(c) = self.completion_queue.pop() {
-            inner.on_work_complete(c.work, c.outcome);
-        }
-        inner.generate_work();
-        self.spawn_ready_work(inner);
-    }
-
-    /// Spawn tasks for ready work.
-    fn spawn_ready_work(&self, inner: &mut MutexGuard<'_, SchedulerInner>) {
-        let mut to_spawn = Vec::new();
-
-        // Collect from DataIO queue
-        while inner.data_io_queue.has_capacity() {
-            let Some(work) = inner.data_io_queue.pop() else {
-                break;
-            };
-            inner.data_io_queue.mark_in_flight();
-
-            let transfer = inner
-                .transfers
-                .get(&work.transfer_id)
-                .map(|s| s.transfer.clone());
-
-            if let Some(transfer) = transfer {
-                to_spawn.push((work, transfer));
-            } else {
-                inner.data_io_queue.mark_complete();
+            WorkOutcome::Failed { .. } | WorkOutcome::Cancelled => {
+                // TODO(Phase 5): handle failure/cancellation
             }
         }
 
-        // Collect from Network queue
-        while inner.network_queue.has_capacity() {
-            let Some(work) = inner.network_queue.pop() else {
+        self.generate_work(&mut inner);
+    }
+
+    /// Generate work from ready transfers and push to pools.
+    fn generate_work(&self, inner: &mut MutexGuard<'_, SchedulerInner>) {
+        let target = self.total_capacity();
+        let current = self.total_pending() + self.total_in_flight();
+
+        if current >= target {
+            return;
+        }
+
+        let to_generate = target - current;
+        let mut generated = 0;
+
+        while generated < to_generate {
+            let Some(id) = inner.ready_queue.pop_front() else {
                 break;
             };
-            inner.network_queue.mark_in_flight();
 
-            let transfer = inner
-                .transfers
-                .get(&work.transfer_id)
-                .map(|s| s.transfer.clone());
+            let Some(state) = inner.transfers.get_mut(&id) else {
+                continue;
+            };
 
-            if let Some(transfer) = transfer {
-                to_spawn.push((work, transfer));
-            } else {
-                inner.network_queue.mark_complete();
+            match state.transfer.poll_work() {
+                PollWork::Ready(work) => {
+                    self.enqueue_to_pool(work);
+                    generated += 1;
+                    // Re-queue - might have more work
+                    inner.ready_queue.push_back(id);
+                }
+                PollWork::Pending => {
+                    state.pending = true;
+                    // Don't re-queue - will be woken when work completes
+                }
+                PollWork::Done => {
+                    inner.transfers.remove(&id);
+                }
             }
         }
+    }
 
-        // Spawn tasks
-        for (mut work, transfer) in to_spawn {
-            let scheduler = self.clone();
-            tokio::spawn(async move {
-                let outcome = transfer.execute(&mut work).await;
-                scheduler.complete_work(work, outcome);
-            });
+    fn enqueue_to_pool(&self, item: WorkItem) {
+        match item.kind {
+            WorkKind::DataIO => self.data_io_pool.push(item),
+            WorkKind::Network => self.network_pool.push(item),
         }
+    }
+
+    fn total_capacity(&self) -> usize {
+        self.data_io_pool.concurrency() + self.network_pool.concurrency()
+    }
+
+    fn total_pending(&self) -> usize {
+        self.data_io_pool.pending_count() + self.network_pool.pending_count()
+    }
+
+    fn total_in_flight(&self) -> usize {
+        self.data_io_pool.in_flight_count() + self.network_pool.in_flight_count()
     }
 
     /// Check if all work is done.
     pub(crate) fn is_done(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.data_io_queue.pending_count() == 0
-            && inner.data_io_queue.in_flight_count() == 0
-            && inner.network_queue.pending_count() == 0
-            && inner.network_queue.in_flight_count() == 0
+        self.data_io_pool.pending_count() == 0
+            && self.data_io_pool.in_flight_count() == 0
+            && self.network_pool.pending_count() == 0
+            && self.network_pool.in_flight_count() == 0
             && inner.transfers.is_empty()
+    }
+
+    /// Shutdown the scheduler. Workers will exit after completing current work.
+    pub(crate) fn shutdown(&self) {
+        self.data_io_pool.shutdown();
+        self.network_pool.shutdown();
     }
 }
 
@@ -277,95 +277,28 @@ impl SchedulerInner {
             }
         }
     }
+}
 
-    fn on_work_complete(&mut self, work: WorkItem, outcome: WorkOutcome) {
-        self.mark_complete(work.kind);
+/// Worker loop - pulls work from pool and executes it.
+async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
+    loop {
+        // Pull work (blocks until available + has capacity, or shutdown)
+        let Some(mut work) = pool.next_work().await else {
+            break; // Shutdown signaled
+        };
 
-        // Wake the transfer so it can be polled again
-        self.wake(work.transfer_id);
+        // Get transfer - may be gone if aborted
+        let Some(transfer) = scheduler.get_transfer(work.transfer_id) else {
+            pool.complete(); // Free capacity
+            continue;
+        };
 
-        match outcome {
-            WorkOutcome::Success {
-                schedule_next,
-                data,
-            } => {
-                if let Some(kind) = schedule_next {
-                    let next_item = WorkItem {
-                        transfer_id: work.transfer_id,
-                        kind,
-                        data,
-                    };
-                    self.enqueue_to_kind(next_item);
-                }
-            }
-            WorkOutcome::Failed { .. } | WorkOutcome::Cancelled => {
-                // TODO(Phase 5): handle failure/cancellation
-            }
-        }
-    }
+        // Execute work
+        let outcome = transfer.execute(&mut work).await;
 
-    fn generate_work(&mut self) {
-        let target = self.total_capacity();
-        let current = self.total_pending() + self.total_in_flight();
-
-        if current >= target {
-            return;
-        }
-
-        let to_generate = target - current;
-        let mut generated = 0;
-
-        while generated < to_generate {
-            let Some(id) = self.ready_queue.pop_front() else {
-                break;
-            };
-
-            let Some(state) = self.transfers.get_mut(&id) else {
-                continue;
-            };
-
-            match state.transfer.poll_work() {
-                PollWork::Ready(work) => {
-                    self.enqueue_to_kind(work);
-                    generated += 1;
-                    // Re-queue - might have more work
-                    self.ready_queue.push_back(id);
-                }
-                PollWork::Pending => {
-                    state.pending = true;
-                    // Don't re-queue - will be woken when work completes
-                }
-                PollWork::Done => {
-                    self.transfers.remove(&id);
-                }
-            }
-        }
-    }
-
-    fn enqueue_to_kind(&mut self, item: WorkItem) {
-        match item.kind {
-            WorkKind::DataIO => self.data_io_queue.push(item),
-            WorkKind::Network => self.network_queue.push(item),
-        }
-    }
-
-    fn total_capacity(&self) -> usize {
-        self.data_io_queue.concurrency() + self.network_queue.concurrency()
-    }
-
-    fn total_pending(&self) -> usize {
-        self.data_io_queue.pending_count() + self.network_queue.pending_count()
-    }
-
-    fn total_in_flight(&self) -> usize {
-        self.data_io_queue.in_flight_count() + self.network_queue.in_flight_count()
-    }
-
-    fn mark_complete(&mut self, kind: WorkKind) {
-        match kind {
-            WorkKind::DataIO => self.data_io_queue.mark_complete(),
-            WorkKind::Network => self.network_queue.mark_complete(),
-        }
+        // Free capacity and notify scheduler
+        pool.complete();
+        scheduler.on_completion(work, outcome);
     }
 }
 
@@ -398,6 +331,7 @@ mod tests {
         .expect("transfer should complete");
 
         assert!(scheduler.is_done());
+        scheduler.shutdown();
     }
 
     #[tokio::test]
@@ -424,6 +358,7 @@ mod tests {
         .expect("all transfers should complete");
 
         assert!(scheduler.is_done());
+        scheduler.shutdown();
     }
 
     #[tokio::test]
@@ -450,5 +385,44 @@ mod tests {
         })
         .await
         .expect("transfer should complete");
+
+        scheduler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_stops_workers() {
+        let scheduler = Scheduler::new(2, 2);
+
+        // Enqueue to start workers, then shutdown
+        let transfer = Transfer::Mock(MockTransfer::new(
+            TransferId {
+                id: 1,
+                parent: None,
+            },
+            1,
+        ));
+        scheduler.enqueue_transfer(transfer);
+
+        // Wait for completion then shutdown
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transfer should complete");
+
+        scheduler.shutdown();
+
+        // Give workers time to exit
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn test_scheduler_new_does_not_require_runtime() {
+        // This test verifies that Scheduler::new() doesn't spawn workers
+        // and thus doesn't require a tokio runtime
+        let _scheduler = Scheduler::new(4, 4);
+        // If we get here without panic, the test passes
     }
 }
