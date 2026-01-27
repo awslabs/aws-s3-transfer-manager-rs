@@ -93,6 +93,7 @@ pub(crate) enum UploadWorkState {
     /// All parts done, calling CompleteMPU (MPU only)
     Completing {
         upload_id: String,
+        part_reader: Arc<PartReader>,
         completed_parts: Vec<CompletedPart>,
         response_builder: UploadOutputBuilder,
         complete_in_flight: bool,

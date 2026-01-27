@@ -67,7 +67,13 @@ impl Client {
     pub fn new(config: Config) -> Client {
         let scheduler = Scheduler::new(config.concurrency().clone());
         // TODO(redux): derive concurrency from config properly
-        let new_scheduler = NewScheduler::new(DEFAULT_CONCURRENCY, DEFAULT_CONCURRENCY);
+        // Derive concurrency for new scheduler from config
+        let concurrency = match config.concurrency() {
+            ConcurrencyMode::Explicit(n) => *n,
+            _ => DEFAULT_CONCURRENCY,
+        };
+        let new_scheduler = NewScheduler::new(concurrency, concurrency);
+
         let handle = Arc::new(Handle {
             config,
             scheduler,

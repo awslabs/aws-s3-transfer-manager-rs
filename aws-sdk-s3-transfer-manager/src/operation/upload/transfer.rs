@@ -366,6 +366,7 @@ impl UploadTransfer {
             if should_complete {
                 if let UploadWorkState::Transferring {
                     upload_id,
+                    part_reader,
                     completed_parts,
                     response_builder,
                     ..
@@ -373,6 +374,7 @@ impl UploadTransfer {
                 {
                     *work = UploadWorkState::Completing {
                         upload_id,
+                        part_reader,
                         completed_parts,
                         response_builder,
                         complete_in_flight: false,
@@ -391,15 +393,16 @@ impl UploadTransfer {
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
-        let (upload_id, mut completed_parts, response_builder) = {
+        let (upload_id, mut completed_parts, response_builder, part_reader) = {
             let mut work = self.ctx.state.work.lock().unwrap();
             match std::mem::replace(&mut *work, UploadWorkState::Done) {
                 UploadWorkState::Completing {
                     upload_id,
                     completed_parts,
                     response_builder,
+                    part_reader,
                     ..
-                } => (upload_id, completed_parts, response_builder),
+                } => (upload_id, completed_parts, response_builder, part_reader),
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
@@ -407,18 +410,22 @@ impl UploadTransfer {
         completed_parts.sort_by_key(|p| p.part_number);
 
         let req = self.ctx.state.request();
-        let complete_req = self
+        let base_req = self
             .ctx
             .client()
             .complete_multipart_upload()
-            .bucket(req.bucket().unwrap_or_default())
-            .key(req.key().unwrap_or_default())
             .upload_id(&upload_id)
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(completed_parts))
                     .build(),
             );
+
+        let complete_req =
+            super::input::convert::copy_fields_to_complete_mpu_request(req, base_req, || async {
+                part_reader.full_object_checksum().await
+            })
+            .await;
 
         let resp = match complete_req
             .send()
@@ -457,5 +464,251 @@ impl UploadTransfer {
             )));
         }
         WorkOutcome::Failed { error }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::InputStream;
+    use crate::operation::upload::UploadInput;
+    use crate::scheduler::{PollWork, WorkData, WorkKind};
+    use crate::types::BucketType;
+    use crate::DEFAULT_CONCURRENCY;
+    use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+    use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+    use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use bytes::Bytes;
+
+    /// Create an UploadTransfer for testing with a mocked S3 client
+    fn create_test_transfer(
+        s3_client: aws_sdk_s3::Client,
+        content: Vec<u8>,
+    ) -> (UploadTransfer, UploadResultReceiver) {
+        let handle = Arc::new(crate::client::Handle {
+            config: crate::Config::builder().client(s3_client).build(),
+            scheduler: crate::runtime::scheduler::Scheduler::new(
+                crate::types::ConcurrencyMode::Explicit(8),
+            ),
+            new_scheduler: crate::scheduler::Scheduler::new(
+                DEFAULT_CONCURRENCY,
+                DEFAULT_CONCURRENCY,
+            ),
+        });
+
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let stream = InputStream::from(content);
+        let ctx = UploadContext::new(handle, BucketType::Standard, input, stream);
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let transfer = UploadTransfer::new(id, ctx, result_tx);
+        (transfer, result_rx)
+    }
+
+    fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id("test-upload-id")
+                .build()
+        });
+
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_output(|| {
+            CompleteMultipartUploadOutput::builder()
+                .e_tag("final-etag")
+                .build()
+        });
+
+        mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[create_mpu, upload_part, complete_mpu]
+        )
+    }
+
+    // ==================== poll_work tests ====================
+
+    #[test]
+    fn test_poll_work_initial_state_returns_create_mpu() {
+        let s3_client = mock_client!(aws_sdk_s3, []);
+        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts at 8MB default
+        let (transfer, _rx) = create_test_transfer(s3_client, content);
+
+        let work = transfer.poll_work();
+        assert!(matches!(work, PollWork::Ready(w) if matches!(w.data, WorkData::CreateMPU)));
+    }
+
+    #[test]
+    fn test_poll_work_pending_while_init_in_flight() {
+        let s3_client = mock_client!(aws_sdk_s3, []);
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let (transfer, _rx) = create_test_transfer(s3_client, content);
+
+        // First poll returns CreateMPU
+        let work = transfer.poll_work();
+        assert!(matches!(work, PollWork::Ready(_)));
+
+        // Second poll should return Pending (init_in_flight = true)
+        let work = transfer.poll_work();
+        assert!(matches!(work, PollWork::Pending));
+    }
+
+    #[tokio::test]
+    async fn test_poll_work_generates_parts_after_create_mpu() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts
+        let (transfer, _rx) = create_test_transfer(s3_client, content);
+
+        // Get and execute CreateMPU
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready"),
+        };
+        transfer.execute(&mut work).await;
+
+        // Now should generate UploadPart work items
+        let work1 = transfer.poll_work();
+        assert!(
+            matches!(work1, PollWork::Ready(w) if matches!(w.data, WorkData::UploadPart { part_number: 1, .. }))
+        );
+
+        let work2 = transfer.poll_work();
+        assert!(
+            matches!(work2, PollWork::Ready(w) if matches!(w.data, WorkData::UploadPart { part_number: 2, .. }))
+        );
+
+        // After all parts generated, should be Pending
+        let work3 = transfer.poll_work();
+        assert!(matches!(work3, PollWork::Pending));
+    }
+
+    // ==================== execute tests ====================
+
+    #[tokio::test]
+    async fn test_execute_create_mpu_transitions_to_transferring() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let (transfer, _rx) = create_test_transfer(s3_client, content);
+
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready"),
+        };
+
+        let outcome = transfer.execute(&mut work).await;
+        assert!(matches!(
+            outcome,
+            WorkOutcome::Success {
+                schedule_next: None,
+                ..
+            }
+        ));
+
+        // After CreateMPU, should be able to generate parts
+        let next = transfer.poll_work();
+        assert!(
+            matches!(next, PollWork::Ready(w) if matches!(w.data, WorkData::UploadPart { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_part_returns_schedule_next_network() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 8 * 1024 * 1024]; // 8MB = 1 part
+        let (transfer, _rx) = create_test_transfer(s3_client, content);
+
+        // Execute CreateMPU
+        let mut create_work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready"),
+        };
+        transfer.execute(&mut create_work).await;
+
+        // Get UploadPart work (DataIO phase)
+        let mut part_work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready"),
+        };
+        assert_eq!(part_work.kind, WorkKind::DataIO);
+
+        // Execute DataIO phase - should return schedule_next = Network
+        let outcome = transfer.execute(&mut part_work).await;
+        match outcome {
+            WorkOutcome::Success {
+                schedule_next,
+                data,
+            } => {
+                assert_eq!(schedule_next, Some(WorkKind::Network));
+                // Data should have part_data populated
+                if let WorkData::UploadPart { part_data, .. } = data {
+                    assert!(part_data.is_some());
+                } else {
+                    panic!("expected UploadPart data");
+                }
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_full_mpu_flow() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 8 * 1024 * 1024]; // 8MB = 1 part
+        let (transfer, rx) = create_test_transfer(s3_client, content);
+
+        // 1. CreateMPU
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready"),
+        };
+        transfer.execute(&mut work).await;
+
+        // 2. UploadPart - DataIO phase
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready"),
+        };
+        let outcome = transfer.execute(&mut work).await;
+
+        // 3. UploadPart - Network phase (continue with schedule_next data)
+        let mut work = match outcome {
+            WorkOutcome::Success {
+                schedule_next: Some(WorkKind::Network),
+                data,
+            } => WorkItem {
+                transfer_id: transfer.id(),
+                kind: WorkKind::Network,
+                data,
+            },
+            _ => panic!("expected schedule_next Network"),
+        };
+        transfer.execute(&mut work).await;
+
+        // 4. CompleteMPU
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready for CompleteMPU"),
+        };
+        assert!(matches!(work.data, WorkData::CompleteMPU));
+        transfer.execute(&mut work).await;
+
+        // 5. Should be Done
+        assert!(matches!(transfer.poll_work(), PollWork::Done));
+
+        // 6. Result should be available
+        let result = rx.await.expect("result channel");
+        assert!(result.is_ok());
     }
 }

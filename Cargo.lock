@@ -2072,6 +2072,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "integration-tests"
+version = "0.0.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-sdk-s3-transfer-manager",
+ "s3-mock-server",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

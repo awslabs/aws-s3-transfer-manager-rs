@@ -42,7 +42,11 @@ pub(crate) enum WorkData {
     },
     /// Complete multipart upload (Network only)
     CompleteMPU,
-    // TODO: PutObject (single part upload)
+    // /// Single PutObject upload (for small files below MPU threshold)
+    // PutObject {
+    //     /// Body data - None before DataIO, Some after
+    //     body: Option<PartData>,
+    // },
     // TODO: GetObjectRange (download)
 }
 

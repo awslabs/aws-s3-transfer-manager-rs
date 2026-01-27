@@ -1,0 +1,16 @@
+[package]
+name = "integration-tests"
+version = "0.0.0"
+edition = "2021"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
+publish = false
+description = "Integration tests for aws-sdk-s3-transfer-manager using s3-mock-server"
+
+[dependencies]
+aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+aws-sdk-s3 = "1"
+aws-config = "1"
+s3-mock-server = { path = "../s3-mock-server" }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -102,37 +102,9 @@ fn new_context(
     )
 }
 
-// TODO(redux): Old implementation below - remove once new scheduler is wired
-// Key concerns from old impl that need addressing:
+// TODO(redux): Key concerns from old impl that need addressing:
 // - Single PutObject vs MPU threshold check (min_mpu_threshold, is_mpu_only)
 // - 0 byte object edge case for MPU
 // - Part size calculation: max(configured_part_size, content_length / 10000)
 // - Tracing spans for send-upload-part, send-create-multipart-upload, etc.
 // - Permit acquisition from old scheduler
-
-#[cfg(test)]
-mod test {
-    use crate::io::InputStream;
-    use crate::operation::upload::UploadInput;
-    use crate::types::ConcurrencyMode;
-    use crate::types::PartSize;
-    use bytes::Bytes;
-
-    // TODO(redux): These tests use the old implementation and will fail.
-    // They document expected behavior that needs to be preserved.
-
-    #[tokio::test]
-    async fn test_basic_upload_object() {
-        todo!("Test needs updating for new scheduler model");
-    }
-
-    #[tokio::test]
-    async fn test_basic_mpu() {
-        todo!("Test needs updating for new scheduler model");
-    }
-
-    #[tokio::test]
-    async fn test_abort_multipart_upload() {
-        todo!("Test needs updating for new scheduler model");
-    }
-}
