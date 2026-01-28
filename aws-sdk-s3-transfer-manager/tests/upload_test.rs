@@ -182,9 +182,6 @@ async fn test_many_uploads_no_deadlock() {
     }
 }
 
-// TODO(redux): This test uses InputStream::from_part_stream which goes through new scheduler.
-// Needs investigation - may be related to how we handle empty streams with large size hints.
-#[ignore = "TODO(redux): part stream test needs adjustment for new scheduler"]
 #[tokio::test]
 async fn test_large_upload_part_size_bump() {
     let (_guard, logs_rx) = capture_test_logs();

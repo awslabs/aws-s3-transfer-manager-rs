@@ -248,6 +248,8 @@ impl UploadTransfer {
 
         let total_parts = content_length.div_ceil(part_size);
 
+        tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
+
         let part_reader = Arc::new(
             PartReaderBuilder::new()
                 .stream(stream)
@@ -319,6 +321,9 @@ impl UploadTransfer {
             }
             Ok(None) => {
                 tracing::warn!("part_reader returned None for part {}", part_number);
+                // Stream exhausted early - decrement parts_in_flight and check
+                // if we should transition to Completing
+                self.maybe_transition_to_completing();
                 WorkOutcome::Success {
                     schedule_next: None,
                     data: WorkData::UploadPart {
@@ -385,43 +390,18 @@ impl UploadTransfer {
             .set_checksum_sha256(resp.checksum_sha256.clone())
             .build();
 
-        // Single lock to record completion and potentially transition state
+        // Record completed part
         {
             let mut work = self.ctx.state.work.lock().unwrap();
-            let should_complete = if let UploadWorkState::Transferring {
-                parts_in_flight,
-                next_part,
-                total_parts,
-                completed_parts,
-                ..
+            if let UploadWorkState::Transferring {
+                completed_parts, ..
             } = &mut *work
             {
                 completed_parts.push(completed);
-                *parts_in_flight -= 1;
-                *next_part > *total_parts && *parts_in_flight == 0
-            } else {
-                false
-            };
-
-            if should_complete {
-                if let UploadWorkState::Transferring {
-                    upload_id,
-                    part_reader,
-                    completed_parts,
-                    response_builder,
-                    ..
-                } = std::mem::replace(&mut *work, UploadWorkState::Done)
-                {
-                    *work = UploadWorkState::Completing {
-                        upload_id,
-                        part_reader,
-                        completed_parts,
-                        response_builder,
-                        complete_in_flight: false,
-                    };
-                }
             }
         }
+
+        self.maybe_transition_to_completing();
 
         WorkOutcome::Success {
             schedule_next: None,
@@ -429,6 +409,42 @@ impl UploadTransfer {
                 part_number,
                 part_data: None,
             },
+        }
+    }
+
+    /// Decrement parts_in_flight and transition to Completing if all parts done.
+    fn maybe_transition_to_completing(&self) {
+        let mut work = self.ctx.state.work.lock().unwrap();
+        let should_complete = if let UploadWorkState::Transferring {
+            parts_in_flight,
+            next_part,
+            total_parts,
+            ..
+        } = &mut *work
+        {
+            *parts_in_flight -= 1;
+            *next_part > *total_parts && *parts_in_flight == 0
+        } else {
+            false
+        };
+
+        if should_complete {
+            if let UploadWorkState::Transferring {
+                upload_id,
+                part_reader,
+                completed_parts,
+                response_builder,
+                ..
+            } = std::mem::replace(&mut *work, UploadWorkState::Done)
+            {
+                *work = UploadWorkState::Completing {
+                    upload_id,
+                    part_reader,
+                    completed_parts,
+                    response_builder,
+                    complete_in_flight: false,
+                };
+            }
         }
     }
 
