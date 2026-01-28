@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::io::PartData;
+use crate::io::{InputStream, PartData};
 
 /// The kind of work to be executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub(crate) struct TransferId {
 }
 
 /// A unit of work to be scheduled.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct WorkItem {
     pub(crate) transfer_id: TransferId,
     pub(crate) kind: WorkKind,
@@ -30,7 +30,7 @@ pub(crate) struct WorkItem {
 }
 
 /// Data associated with a work item.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum WorkData {
     /// Create multipart upload (Network only)
     CreateMPU,
@@ -42,11 +42,18 @@ pub(crate) enum WorkData {
     },
     /// Complete multipart upload (Network only)
     CompleteMPU,
-    // /// Single PutObject upload (for small files below MPU threshold)
-    // PutObject {
-    //     /// Body data - None before DataIO, Some after
-    //     body: Option<PartData>,
-    // },
+    /// Single PutObject upload (for small files below MPU threshold)
+    ///
+    /// TODO(redux): Currently PutObject is Network-only - the actual disk I/O happens lazily
+    /// when the SDK consumes the ByteStream during HTTP send. For true scheduler control over
+    /// disk I/O (important for large numbers of small files), we should:
+    /// 1. Have DataIO phase read file into memory (or into a buffer we control)
+    /// 2. Network phase sends from that buffer
+    /// This requires tighter integration between InputStream internals and our scheduler.
+    PutObject {
+        /// The input stream to upload - converted to ByteStream at send time
+        stream: Option<InputStream>,
+    },
     // TODO: GetObjectRange (download)
 }
 

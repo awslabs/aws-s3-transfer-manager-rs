@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
 use crate::error::{self, Error};
 use crate::io::part_reader::Builder as PartReaderBuilder;
-use crate::io::PartData;
+use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{UploadContext, UploadWorkState};
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
@@ -106,16 +106,37 @@ impl UploadTransfer {
         let mut work = self.ctx.state.work.lock().unwrap();
 
         match &mut *work {
-            UploadWorkState::PendingInit { init_in_flight, .. } => {
+            UploadWorkState::PendingInit {
+                init_in_flight,
+                content_length,
+                stream,
+            } => {
                 if *init_in_flight {
                     return PollWork::Pending;
                 }
-                *init_in_flight = true;
-                PollWork::Ready(WorkItem {
-                    transfer_id: self.id,
-                    kind: WorkKind::Network,
-                    data: WorkData::CreateMPU,
-                })
+
+                let use_mpu = stream.is_mpu_only()
+                    || *content_length >= self.ctx.handle.mpu_threshold_bytes();
+                if use_mpu {
+                    *init_in_flight = true;
+                    PollWork::Ready(WorkItem {
+                        transfer_id: self.id,
+                        kind: WorkKind::Network,
+                        data: WorkData::CreateMPU,
+                    })
+                } else {
+                    // Take ownership of stream by replacing state
+                    match std::mem::replace(&mut *work, UploadWorkState::PutObjectInFlight) {
+                        UploadWorkState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
+                            transfer_id: self.id,
+                            kind: WorkKind::Network,
+                            data: WorkData::PutObject {
+                                stream: Some(stream),
+                            },
+                        }),
+                        _ => unreachable!(),
+                    }
+                }
             }
             UploadWorkState::Transferring {
                 next_part,
@@ -156,6 +177,7 @@ impl UploadTransfer {
                     data: WorkData::CompleteMPU,
                 })
             }
+            UploadWorkState::PutObjectInFlight { .. } => PollWork::Pending,
             UploadWorkState::Done => PollWork::Done,
         }
     }
@@ -171,6 +193,7 @@ impl UploadTransfer {
                     .await
             }
             WorkData::CompleteMPU => self.execute_complete_mpu().await,
+            WorkData::PutObject { stream } => self.execute_put_object(stream).await,
         }
     }
 
@@ -389,6 +412,53 @@ impl UploadTransfer {
                 part_number,
                 part_data: None,
             },
+        }
+    }
+
+    async fn execute_put_object(&self, stream: &mut Option<InputStream>) -> WorkOutcome {
+        use crate::operation::upload::input::convert::copy_fields_to_put_object_request;
+
+        let stream = stream
+            .take()
+            .expect("stream should be present for PutObject");
+
+        // TODO(redux): Currently PutObject does not use our DataIO scheduling - the actual
+        // disk I/O happens lazily when the SDK consumes the ByteStream during HTTP send.
+        // For true scheduler control over disk I/O (important for large numbers of small files),
+        // InputStream internals will need to be tightly integrated with our DataIO work layer.
+        let byte_stream = match stream.into_byte_stream().await {
+            Ok(bs) => bs,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let req = self.ctx.state.request();
+        let put_req = copy_fields_to_put_object_request(
+            req,
+            self.ctx.client().put_object().body(byte_stream),
+        );
+
+        let resp = match put_req
+            .send()
+            .instrument(tracing::debug_span!("send-put-object"))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let result = UploadOutputBuilder::from(resp)
+            .build()
+            .expect("valid response");
+
+        self.done.store(true, Ordering::Release);
+
+        if let Some(tx) = self.result_tx.lock().unwrap().take() {
+            let _ = tx.send(Ok(result));
+        }
+
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: WorkData::PutObject { stream: None },
         }
     }
 
@@ -626,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_read_part_returns_schedule_next_network() {
         let s3_client = mock_s3_client_for_mpu();
-        let content = vec![0u8; 8 * 1024 * 1024]; // 8MB = 1 part
+        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts (above MPU threshold)
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
         // Execute CreateMPU
@@ -665,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_full_mpu_flow() {
         let s3_client = mock_s3_client_for_mpu();
-        let content = vec![0u8; 8 * 1024 * 1024]; // 8MB = 1 part
+        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts (above MPU threshold)
         let (transfer, rx) = create_test_transfer(s3_client, content);
 
         // 1. CreateMPU
@@ -693,6 +763,27 @@ mod tests {
                 data,
             },
             _ => panic!("expected schedule_next Network"),
+        };
+        transfer.execute(&mut work).await;
+
+        // 3b. Second UploadPart - DataIO phase
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready(w) => w,
+            _ => panic!("expected Ready for part 2"),
+        };
+        let outcome = transfer.execute(&mut work).await;
+
+        // 3c. Second UploadPart - Network phase
+        let mut work = match outcome {
+            WorkOutcome::Success {
+                schedule_next: Some(WorkKind::Network),
+                data,
+            } => WorkItem {
+                transfer_id: transfer.id(),
+                kind: WorkKind::Network,
+                data,
+            },
+            _ => panic!("expected schedule_next Network for part 2"),
         };
         transfer.execute(&mut work).await;
 

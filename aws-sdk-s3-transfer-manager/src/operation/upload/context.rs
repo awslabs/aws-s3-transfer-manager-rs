@@ -80,7 +80,7 @@ pub(crate) enum UploadWorkState {
         content_length: u64,
         init_in_flight: bool,
     },
-    /// Data transfer in progress (uploading parts for MPU, or body for PutObject)
+    /// Data transfer in progress (uploading parts for MPU)
     Transferring {
         upload_id: String,
         part_reader: Arc<PartReader>,
@@ -98,6 +98,8 @@ pub(crate) enum UploadWorkState {
         response_builder: UploadOutputBuilder,
         complete_in_flight: bool,
     },
+    /// PutObject in flight (single request upload)
+    PutObjectInFlight,
     /// Done
     Done,
 }

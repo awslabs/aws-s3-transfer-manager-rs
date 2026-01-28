@@ -84,7 +84,6 @@ fn mock_s3_client_for_multipart_upload(bucket_name: String) -> Client {
 // TODO(redux): Tests below use mock_s3_client_for_put_object and expect PutObject.
 // Currently the new scheduler always uses MPU. Re-enable when PutObject path is implemented.
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_successful_multiple_objects_upload_via_put_object() {
     let recursion_root = "test";
@@ -157,7 +156,6 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
     );
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_successful_multiple_objects_upload_with_symlinks() {
     let temp_dir1 = create_test_dir(Some("temp1"), vec![("sample.jpg", 1)], &[]);
@@ -229,7 +227,6 @@ async fn test_successful_multiple_objects_upload_with_symlinks() {
     }
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_source_dir_is_symlink() {
     let temp_dir1 = create_test_dir(Some("temp1"), vec![], &[]);
@@ -278,7 +275,6 @@ async fn test_source_dir_is_symlink() {
     }
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_failed_upload_policy_continue() {
     let recursion_root = "test";
@@ -320,7 +316,6 @@ async fn test_failed_upload_policy_continue() {
     assert_eq!(2, output.total_bytes_transferred());
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
     let test_dir = create_test_dir(Some("test"), vec![("sample.jpg", 1)], &[]);
@@ -357,7 +352,6 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
 }
 
 /// Fail when source is not a directory
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_source_dir_not_valid() {
     let source = tempfile::NamedTempFile::new().unwrap();
@@ -380,7 +374,6 @@ async fn test_source_dir_not_valid() {
     assert!(format!("{}", DisplayErrorContext(err)).contains("is not a directory"));
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_error_when_custom_delimiter_appears_in_filename() {
     let recursion_root = "test";
@@ -418,7 +411,6 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
         .contains("a custom delimiter `-` should not appear"));
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
     let (_guard, rx) = capture_test_logs();
@@ -468,7 +460,7 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
     assert!(rx.contents().contains("received cancellation signal"));
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
+#[ignore = "TODO(redux): requires abort implementation"]
 #[tokio::test]
 async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancelled() {
     let (_guard, rx) = capture_test_logs();
@@ -526,7 +518,6 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
     );
 }
 
-#[ignore = "TODO(redux): requires single PutObject path"]
 #[tokio::test]
 async fn test_drop_upload_objects_handle() {
     let test_dir = create_test_dir(
