@@ -28,6 +28,8 @@ use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkO
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
+use tokio_util::sync::CancellationToken;
+
 pub(crate) type UploadResultSender = oneshot::Sender<Result<UploadOutput, Error>>;
 pub(crate) type UploadResultReceiver = oneshot::Receiver<Result<UploadOutput, Error>>;
 
@@ -37,6 +39,7 @@ pub(crate) struct UploadTransfer {
     id: TransferId,
     ctx: UploadContext,
     done: Arc<AtomicBool>,
+    cancellation_token: CancellationToken,
     result_tx: Arc<Mutex<Option<UploadResultSender>>>,
 }
 
@@ -46,6 +49,7 @@ impl UploadTransfer {
             id,
             ctx,
             done: Arc::new(AtomicBool::new(false)),
+            cancellation_token: CancellationToken::new(),
             result_tx: Arc::new(Mutex::new(Some(result_tx))),
         }
     }
@@ -84,12 +88,18 @@ impl UploadTransfer {
             id,
             ctx,
             done: Arc::new(AtomicBool::new(false)),
+            cancellation_token: CancellationToken::new(),
             result_tx: Arc::new(Mutex::new(Some(result_tx))),
         }
     }
 
     pub(crate) fn id(&self) -> TransferId {
         self.id
+    }
+
+    /// Get the cancellation token for this transfer.
+    pub(crate) fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
     }
 
     /// Poll for the next work item.

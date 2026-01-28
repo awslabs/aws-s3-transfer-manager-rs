@@ -160,6 +160,20 @@ impl Scheduler {
         self.generate_work(&mut inner);
     }
 
+    /// Cancel a transfer, removing it from the scheduler.
+    ///
+    /// In-flight work may still complete, but:
+    /// - No new work will be generated for this transfer
+    /// - Follow-on work won't be scheduled
+    /// - Workers will skip queued work when they find transfer missing
+    ///
+    /// TODO(redux): When upload_objects/download_objects use the new scheduler,
+    /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
+    pub(crate) fn cancel_transfer(&self, id: TransferId) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.transfers.remove(&id);
+    }
+
     /// Called by workers when work completes.
     ///
     /// Note: Workers call pool.complete() directly - this only handles
@@ -167,25 +181,32 @@ impl Scheduler {
     pub(crate) fn on_completion(&self, work: WorkItem, outcome: WorkOutcome) {
         let mut inner = self.inner.lock().unwrap();
 
-        // Wake the transfer so it can be polled again
-        inner.wake(work.transfer_id);
+        // Only process if transfer still exists (not cancelled)
+        let transfer_exists = inner.transfers.contains_key(&work.transfer_id);
+        if transfer_exists {
+            // Wake the transfer so it can be polled again
+            inner.wake(work.transfer_id);
+        }
 
         match outcome {
             WorkOutcome::Success {
                 schedule_next,
                 data,
             } => {
-                if let Some(kind) = schedule_next {
-                    let next_item = WorkItem {
-                        transfer_id: work.transfer_id,
-                        kind,
-                        data,
-                    };
-                    self.enqueue_to_pool(next_item);
+                // Only enqueue follow-on work if transfer still exists
+                if transfer_exists {
+                    if let Some(kind) = schedule_next {
+                        let next_item = WorkItem {
+                            transfer_id: work.transfer_id,
+                            kind,
+                            data,
+                        };
+                        self.enqueue_to_pool(next_item);
+                    }
                 }
             }
             WorkOutcome::Failed { .. } | WorkOutcome::Cancelled => {
-                // TODO(Phase 5): handle failure/cancellation
+                // Work failed or was cancelled - no follow-on work
             }
         }
 
@@ -250,8 +271,8 @@ impl Scheduler {
         self.data_io_pool.in_flight_count() + self.network_pool.in_flight_count()
     }
 
-    /// Check if all work is done.
-    pub(crate) fn is_done(&self) -> bool {
+    /// Check if scheduler is idle (no transfers, no pending work, no in-flight work).
+    pub(crate) fn is_idle(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         self.data_io_pool.pending_count() == 0
             && self.data_io_pool.in_flight_count() == 0
@@ -293,8 +314,13 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             continue;
         };
 
-        // Execute work
-        let outcome = transfer.execute(&mut work).await;
+        // Execute work with cancellation support
+        let token = transfer.cancellation_token().clone();
+        let outcome = tokio::select! {
+            biased;
+            _ = token.cancelled() => WorkOutcome::Cancelled,
+            outcome = transfer.execute(&mut work) => outcome,
+        };
 
         // Free capacity and notify scheduler
         pool.complete();
@@ -305,124 +331,109 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::transfer::mock::{FixedWorkCount, WithDelay};
     use crate::scheduler::MockTransfer;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
     async fn test_single_transfer_completes() {
         let scheduler = Scheduler::new(4, 4);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
 
-        let transfer = Transfer::Mock(MockTransfer::new(
-            TransferId {
-                id: 1,
-                parent: None,
-            },
-            2,
-        ));
-
+        let sm = Arc::new(FixedWorkCount::new(5));
+        let transfer = Transfer::Mock(MockTransfer::new(id, sm.clone()));
         scheduler.enqueue_transfer(transfer);
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !scheduler.is_done() {
+            while !scheduler.is_idle() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("transfer should complete");
+        .expect("scheduler should become idle");
 
-        assert!(scheduler.is_done());
+        assert!(sm.is_complete());
+        assert_eq!(sm.completed_count(), 5);
         scheduler.shutdown();
     }
 
     #[tokio::test]
     async fn test_multiple_transfers_complete() {
         let scheduler = Scheduler::new(4, 4);
+        let mut state_machines = Vec::new();
 
-        for i in 0..5 {
-            let transfer = Transfer::Mock(MockTransfer::new(
-                TransferId {
-                    id: i,
-                    parent: None,
-                },
-                3,
-            ));
-            scheduler.enqueue_transfer(transfer);
+        for i in 0..3u64 {
+            let id = TransferId {
+                id: i,
+                parent: None,
+            };
+            let sm = Arc::new(FixedWorkCount::new(4));
+            state_machines.push(sm.clone());
+            scheduler.enqueue_transfer(Transfer::Mock(MockTransfer::new(id, sm)));
         }
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !scheduler.is_done() {
+            while !scheduler.is_idle() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("all transfers should complete");
+        .expect("scheduler should become idle");
 
-        assert!(scheduler.is_done());
+        for (i, sm) in state_machines.iter().enumerate() {
+            assert!(sm.is_complete(), "transfer {} should be complete", i);
+            assert_eq!(sm.completed_count(), 4);
+        }
         scheduler.shutdown();
-    }
-
-    #[tokio::test]
-    async fn test_pending_transfer_not_polled_until_woken() {
-        // This test verifies that a transfer returning Pending
-        // is not polled again until wake() is called
-        let scheduler = Scheduler::new(4, 4);
-
-        let transfer = Transfer::Mock(MockTransfer::new(
-            TransferId {
-                id: 1,
-                parent: None,
-            },
-            2,
-        ));
-
-        scheduler.enqueue_transfer(transfer);
-
-        // Should complete - work completes trigger wake
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !scheduler.is_done() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("transfer should complete");
-
-        scheduler.shutdown();
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_stops_workers() {
-        let scheduler = Scheduler::new(2, 2);
-
-        // Enqueue to start workers, then shutdown
-        let transfer = Transfer::Mock(MockTransfer::new(
-            TransferId {
-                id: 1,
-                parent: None,
-            },
-            1,
-        ));
-        scheduler.enqueue_transfer(transfer);
-
-        // Wait for completion then shutdown
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !scheduler.is_done() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("transfer should complete");
-
-        scheduler.shutdown();
-
-        // Give workers time to exit
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[test]
-    fn test_scheduler_new_does_not_require_runtime() {
-        // This test verifies that Scheduler::new() doesn't spawn workers
-        // and thus doesn't require a tokio runtime
+    fn test_new_does_not_require_runtime() {
         let _scheduler = Scheduler::new(4, 4);
-        // If we get here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn test_cancel_transfer_stops_work() {
+        let scheduler = Scheduler::new(2, 2);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+
+        // Use WithDelay to make work slow enough to cancel mid-flight
+        let inner = FixedWorkCount::new(20);
+        let sm = Arc::new(WithDelay::new(inner, Duration::from_millis(50)));
+        let transfer = Transfer::Mock(MockTransfer::new(id, sm.clone()));
+        scheduler.enqueue_transfer(transfer);
+
+        // Let some work start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Cancel the transfer
+        scheduler.cancel_transfer(id);
+        assert!(scheduler.get_transfer(id).is_none());
+
+        // Wait for scheduler to become idle
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle after cancel");
+
+        // Should have completed fewer than total (cancelled early)
+        let completed = sm.inner().completed_count();
+        assert!(
+            completed < 20,
+            "expected fewer than 20 completions, got {}",
+            completed
+        );
+
+        scheduler.shutdown();
     }
 }
