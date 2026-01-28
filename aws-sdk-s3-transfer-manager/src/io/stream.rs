@@ -96,7 +96,11 @@ impl InputStream {
     /// Converts `InputStream` to ByteStream that can be used in PutObject.
     pub(crate) async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
         match self.inner {
-            RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path)
+            RawInputStream::Fs(path_body) => ByteStream::read_from()
+                .path(&path_body.path)
+                .offset(path_body.offset)
+                .length(aws_sdk_s3::primitives::Length::Exact(path_body.length))
+                .build()
                 .await
                 .map_err(error::from_kind(error::ErrorKind::IOError)),
             RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
