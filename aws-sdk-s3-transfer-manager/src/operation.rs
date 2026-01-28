@@ -31,8 +31,12 @@ pub(crate) type CancelNotificationReceiver = tokio::sync::watch::Receiver<bool>;
 /// `State` is whatever additional operation specific state is required for the operation.
 #[derive(Debug)]
 pub(crate) struct TransferContext<State> {
-    handle: Arc<crate::client::Handle>,
-    state: Arc<State>,
+    /// Unique identifier for this transfer
+    pub(crate) id: crate::scheduler::TransferId,
+    /// Access to client handle (scheduler, S3 client, config)
+    pub(crate) handle: Arc<crate::client::Handle>,
+    /// Operation-specific state
+    pub(crate) state: Arc<State>,
 }
 
 impl<State> TransferContext<State> {
@@ -45,6 +49,7 @@ impl<State> TransferContext<State> {
 impl<State> Clone for TransferContext<State> {
     fn clone(&self) -> Self {
         Self {
+            id: self.id,
             handle: self.handle.clone(),
             state: self.state.clone(),
         }

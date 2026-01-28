@@ -18,6 +18,7 @@ pub(crate) type UploadContext = TransferContext<UploadState>;
 
 impl UploadContext {
     pub(crate) fn new(
+        id: crate::scheduler::TransferId,
         handle: Arc<crate::client::Handle>,
         bucket_type: BucketType,
         req: UploadInput,
@@ -41,8 +42,9 @@ impl UploadContext {
                 content_length,
                 init_in_flight: false,
             }),
+            create_mpu_complete: tokio::sync::Notify::new(),
         });
-        TransferContext { handle, state }
+        TransferContext { id, handle, state }
     }
 }
 
@@ -57,6 +59,10 @@ pub(crate) struct UploadState {
 
     /// Mutable state for driving work forward
     pub(crate) work: Mutex<UploadWorkState>,
+
+    /// Notified when CreateMPU completes (success or failure).
+    /// Used by abort() to wait for in-flight CreateMPU before checking upload_id.
+    pub(crate) create_mpu_complete: tokio::sync::Notify,
 }
 
 impl UploadState {
@@ -68,6 +74,28 @@ impl UploadState {
     /// Type of S3 bucket targeted by this operation
     pub(crate) fn bucket_type(&self) -> BucketType {
         self.bucket_type
+    }
+
+    /// Get the upload_id if MPU was started.
+    pub(crate) fn upload_id(&self) -> Option<String> {
+        let work = self.work.lock().unwrap();
+        match &*work {
+            UploadWorkState::Transferring { upload_id, .. }
+            | UploadWorkState::Completing { upload_id, .. } => Some(upload_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Check if CreateMPU is currently in flight.
+    pub(crate) fn is_create_mpu_in_flight(&self) -> bool {
+        let work = self.work.lock().unwrap();
+        matches!(
+            &*work,
+            UploadWorkState::PendingInit {
+                init_in_flight: true,
+                ..
+            }
+        )
     }
 }
 

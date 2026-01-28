@@ -36,7 +36,6 @@ pub(crate) type UploadResultReceiver = oneshot::Receiver<Result<UploadOutput, Er
 /// Upload transfer that generates and executes upload work.
 #[derive(Debug, Clone)]
 pub(crate) struct UploadTransfer {
-    id: TransferId,
     ctx: UploadContext,
     done: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
@@ -44,9 +43,8 @@ pub(crate) struct UploadTransfer {
 }
 
 impl UploadTransfer {
-    pub(crate) fn new(id: TransferId, ctx: UploadContext, result_tx: UploadResultSender) -> Self {
+    pub(crate) fn new(ctx: UploadContext, result_tx: UploadResultSender) -> Self {
         Self {
-            id,
             ctx,
             done: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
@@ -81,11 +79,10 @@ impl UploadTransfer {
 
         let content_length = part_count as u64 * 8 * 1024 * 1024;
         let stream = InputStream::from(vec![0u8; content_length as usize]);
-        let ctx = UploadContext::new(handle, BucketType::Standard, input, stream);
+        let ctx = UploadContext::new(id, handle, BucketType::Standard, input, stream);
 
         let (result_tx, _) = oneshot::channel();
         Self {
-            id,
             ctx,
             done: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
@@ -94,7 +91,7 @@ impl UploadTransfer {
     }
 
     pub(crate) fn id(&self) -> TransferId {
-        self.id
+        self.ctx.id
     }
 
     /// Get the cancellation token for this transfer.
@@ -130,7 +127,7 @@ impl UploadTransfer {
                 if use_mpu {
                     *init_in_flight = true;
                     PollWork::Ready(WorkItem {
-                        transfer_id: self.id,
+                        transfer_id: self.id(),
                         kind: WorkKind::Network,
                         data: WorkData::CreateMPU,
                     })
@@ -138,7 +135,7 @@ impl UploadTransfer {
                     // Take ownership of stream by replacing state
                     match std::mem::replace(&mut *work, UploadWorkState::PutObjectInFlight) {
                         UploadWorkState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
-                            transfer_id: self.id,
+                            transfer_id: self.id(),
                             kind: WorkKind::Network,
                             data: WorkData::PutObject {
                                 stream: Some(stream),
@@ -166,7 +163,7 @@ impl UploadTransfer {
                 *next_part += 1;
                 *parts_in_flight += 1;
                 PollWork::Ready(WorkItem {
-                    transfer_id: self.id,
+                    transfer_id: self.id(),
                     kind: WorkKind::DataIO,
                     data: WorkData::UploadPart {
                         part_number,
@@ -182,7 +179,7 @@ impl UploadTransfer {
                 }
                 *complete_in_flight = true;
                 PollWork::Ready(WorkItem {
-                    transfer_id: self.id,
+                    transfer_id: self.id(),
                     kind: WorkKind::Network,
                     data: WorkData::CompleteMPU,
                 })
@@ -208,6 +205,13 @@ impl UploadTransfer {
     }
 
     async fn execute_create_mpu(&self) -> WorkOutcome {
+        let outcome = self.do_execute_create_mpu().await;
+        // Always notify waiters that CreateMPU is complete (success or failure)
+        self.ctx.state.create_mpu_complete.notify_waiters();
+        outcome
+    }
+
+    async fn do_execute_create_mpu(&self) -> WorkOutcome {
         let client = self.ctx.client();
         let req = self.ctx.state.request();
 
@@ -264,6 +268,9 @@ impl UploadTransfer {
             };
         }
 
+        // NOTE: data field is unused for CreateMPU - we just echo back the input.
+        // The data field is only meaningful for phase transitions (e.g., DataIO → Network
+        // for UploadPart where part_data is carried forward).
         WorkOutcome::Success {
             schedule_next: None,
             data: WorkData::CreateMPU,
@@ -583,15 +590,15 @@ mod tests {
             .build()
             .unwrap();
 
-        let stream = InputStream::from(content);
-        let ctx = UploadContext::new(handle, BucketType::Standard, input, stream);
-
-        let (result_tx, result_rx) = oneshot::channel();
         let id = TransferId {
             id: 1,
             parent: None,
         };
-        let transfer = UploadTransfer::new(id, ctx, result_tx);
+        let stream = InputStream::from(content);
+        let ctx = UploadContext::new(id, handle, BucketType::Standard, input, stream);
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let transfer = UploadTransfer::new(ctx, result_tx);
         (transfer, result_rx)
     }
 

@@ -76,25 +76,27 @@ impl Upload {
             return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
         }
 
-        let ctx = new_context(handle.clone(), input, stream);
+        let ctx = new_context(transfer_id, handle.clone(), input, stream);
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
-        let transfer = UploadTransfer::new(transfer_id, ctx, result_tx);
+        let transfer = UploadTransfer::new(ctx.clone(), result_tx);
         handle
             .new_scheduler
             .enqueue_transfer(crate::scheduler::Transfer::Upload(transfer));
 
-        Ok(UploadHandle::new(result_rx))
+        Ok(UploadHandle::new(result_rx, ctx))
     }
 }
 
 fn new_context(
+    id: crate::scheduler::TransferId,
     handle: Arc<crate::client::Handle>,
     req: UploadInput,
     stream: crate::io::InputStream,
 ) -> UploadContext {
     UploadContext::new(
+        id,
         handle,
         BucketType::from_bucket_name(req.bucket().expect("bucket is available")),
         req,
@@ -108,3 +110,70 @@ fn new_context(
 // - Part size calculation: max(configured_part_size, content_length / 10000)
 // - Tracing spans for send-upload-part, send-create-multipart-upload, etc.
 // - Permit acquisition from old scheduler
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
+    use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+    use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use bytes::Bytes;
+
+    use crate::io::InputStream;
+    use crate::metrics::unit::ByteUnit;
+    use crate::operation::upload::UploadInput;
+    use crate::types::{ConcurrencyMode, PartSize};
+
+    // TODO(redux): This test should migrate to an integration test with better mock server
+    // support for timing coordination. Currently it just verifies abort() doesn't panic
+    // and returns an AbortedUpload. A proper test would verify AbortMultipartUpload is
+    // called with the correct upload_id after CreateMPU completes.
+    #[tokio::test]
+    async fn test_abort_upload() {
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+
+        let create_mpu =
+            mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(move || {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .then_output(|| UploadPartOutput::builder().build());
+
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .then_output(|| AbortMultipartUploadOutput::builder().build());
+
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[create_mpu, upload_part, abort_mpu]
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let request = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream);
+        let handle = request.initiate_with(&tm).unwrap();
+
+        // Small delay to let scheduler start processing
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Abort should complete without error
+        let result = handle.abort().await;
+        assert!(result.is_ok());
+    }
+}

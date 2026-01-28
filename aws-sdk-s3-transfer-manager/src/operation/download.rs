@@ -265,7 +265,12 @@ impl DownloadContext {
             cancel_rx,
             bucket_type,
         });
-        TransferContext { handle, state }
+        // TODO(redux): Download doesn't use new scheduler yet, use dummy id
+        let id = crate::scheduler::TransferId {
+            id: 0,
+            parent: None,
+        };
+        TransferContext { id, handle, state }
     }
 
     /// The target part size to use for this download

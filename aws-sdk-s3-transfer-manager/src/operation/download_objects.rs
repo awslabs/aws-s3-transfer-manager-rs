@@ -105,6 +105,11 @@ impl DownloadObjectsContext {
             successful_downloads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
         });
-        TransferContext { handle, state }
+        // TODO(redux): DownloadObjects doesn't use new scheduler yet, use dummy id
+        let id = crate::scheduler::TransferId {
+            id: 0,
+            parent: None,
+        };
+        TransferContext { id, handle, state }
     }
 }

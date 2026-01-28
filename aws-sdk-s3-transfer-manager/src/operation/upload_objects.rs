@@ -114,6 +114,11 @@ impl UploadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
-        TransferContext { handle, state }
+        // TODO(redux): UploadObjects doesn't use new scheduler yet, use dummy id
+        let id = crate::scheduler::TransferId {
+            id: 0,
+            parent: None,
+        };
+        TransferContext { id, handle, state }
     }
 }
