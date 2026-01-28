@@ -460,7 +460,7 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
     assert!(rx.contents().contains("received cancellation signal"));
 }
 
-#[ignore = "TODO(redux): requires abort implementation"]
+#[ignore = "TODO(redux): upload_objects uses old scheduler"]
 #[tokio::test]
 async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancelled() {
     let (_guard, rx) = capture_test_logs();

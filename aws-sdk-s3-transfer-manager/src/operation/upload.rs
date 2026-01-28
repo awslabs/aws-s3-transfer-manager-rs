@@ -11,7 +11,6 @@ mod output;
 
 mod context;
 mod handle;
-mod service;
 mod transfer;
 
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
@@ -116,6 +115,7 @@ mod test {
     use std::sync::Arc;
 
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
+    use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -175,5 +175,128 @@ mod test {
         // Abort should complete without error
         let result = handle.abort().await;
         assert!(result.is_ok());
+    }
+}
+
+/// Integration-style tests using StaticReplayClient for retry behavior
+#[cfg(test)]
+mod retry_tests {
+    use aws_sdk_s3::config::Region;
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_types::body::SdkBody;
+    use bytes::Bytes;
+
+    use crate::io::InputStream;
+    use crate::metrics::unit::ByteUnit;
+    use crate::types::{ConcurrencyMode, PartSize};
+
+    fn dummy_request() -> http::Request<SdkBody> {
+        http::Request::builder().body(SdkBody::empty()).unwrap()
+    }
+
+    /// Test that SDK retries transient errors for upload_part.
+    #[tokio::test]
+    async fn test_upload_part_retry() {
+        // Responses in order: CreateMPU, UploadPart (500), UploadPart (200 retry), CompleteMPU
+        let http_client = StaticReplayClient::new(vec![
+            // CreateMultipartUpload - success
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <InitiateMultipartUploadResult>
+                            <Bucket>test-bucket</Bucket>
+                            <Key>test-key</Key>
+                            <UploadId>test-upload-id</UploadId>
+                        </InitiateMultipartUploadResult>"#,
+                    ))
+                    .unwrap(),
+            ),
+            // UploadPart - first attempt fails with 500
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(500)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <Error>
+                            <Code>InternalError</Code>
+                            <Message>Internal Server Error</Message>
+                        </Error>"#,
+                    ))
+                    .unwrap(),
+            ),
+            // UploadPart - retry succeeds
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .header("ETag", "\"test-etag\"")
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // CompleteMultipartUpload - success
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <CompleteMultipartUploadResult>
+                            <Location>https://test-bucket.s3.amazonaws.com/test-key</Location>
+                            <Bucket>test-bucket</Bucket>
+                            <Key>test-key</Key>
+                            <ETag>"final-etag"</ETag>
+                        </CompleteMultipartUploadResult>"#,
+                    ))
+                    .unwrap(),
+            ),
+        ]);
+
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client.clone())
+                .region(Region::from_static("us-west-2"))
+                .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3))
+                .with_test_defaults()
+                .build(),
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(s3_client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+
+        let handle = tm
+            .upload()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream)
+            .initiate()
+            .unwrap();
+
+        let result = handle.join().await;
+        assert!(
+            result.is_ok(),
+            "upload should succeed after retry: {:?}",
+            result.err()
+        );
+
+        // Verify all 4 requests were made (including the retry)
+        let requests: Vec<_> = http_client.actual_requests().collect();
+        assert_eq!(
+            4,
+            requests.len(),
+            "should have made 4 requests (including retry)"
+        );
     }
 }
