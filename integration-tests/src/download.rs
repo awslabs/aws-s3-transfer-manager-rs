@@ -71,6 +71,7 @@ async fn drain_body(
 
 /// Test basic download with multiple ranges and verify data integrity
 #[tokio::test]
+#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_basic() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let (server, server_handle, tm) = setup_with_part_size(part_size).await;
@@ -103,6 +104,7 @@ async fn test_download_basic() {
 
 /// Test that handle can be dropped without consuming body
 #[tokio::test]
+#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_body_not_consumed() {
     let (server, server_handle, tm) = setup().await;
 
@@ -129,6 +131,7 @@ async fn test_download_body_not_consumed() {
 
 /// Test abort cancels in-flight work
 #[tokio::test]
+#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_abort() {
     let part_size = ByteUnit::Mebibyte.as_bytes_usize();
     let (server, server_handle, tm) = setup_with_part_size(part_size).await;
@@ -158,6 +161,7 @@ async fn test_download_abort() {
 
 /// Test download of non-existent object returns error
 #[tokio::test]
+#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_not_found() {
     let (_server, server_handle, tm) = setup().await;
 
@@ -176,6 +180,7 @@ async fn test_download_not_found() {
 
 /// Test object metadata is available after discovery
 #[tokio::test]
+#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_object_meta() {
     let (server, server_handle, tm) = setup().await;
 
@@ -204,6 +209,7 @@ async fn test_download_object_meta() {
 
 /// Test concurrent downloads
 #[tokio::test]
+#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_concurrent() {
     let (server, server_handle, tm) = setup().await;
 

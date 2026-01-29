@@ -1,59 +1,58 @@
-use std::sync::Arc;
-
-use crate::error::{self, ErrorKind};
-use tokio::{
-    sync::{oneshot::Receiver, Mutex, OnceCell},
-    task,
-};
-
 /*
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::body::Body;
 
-use super::object_meta::ObjectMetadata;
+use tokio::sync::{mpsc, Mutex, OnceCell};
+
+use crate::error::{self, ErrorKind};
+use crate::operation::download::body::Body;
+use crate::operation::download::object_meta::ObjectMetadata;
+use crate::operation::download::ChunkOutput;
+use crate::operation::download::DownloadContext;
 
 /// Response type for a single download object request.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DownloadHandle {
-    /// Object metadata receiver.
-    pub(crate) object_meta_rx: Mutex<Option<Receiver<ObjectMetadata>>>,
-    /// Object metadata.
-    pub(crate) object_meta: OnceCell<ObjectMetadata>,
-
-    /// The object content, in chunks, and the metadata for each chunk
+    /// The object content
     pub(crate) body: Body,
 
-    /// Discovery task
-    pub(crate) discovery: task::JoinHandle<()>,
+    /// Object metadata (populated after discovery)
+    pub(crate) object_meta: OnceCell<ObjectMetadata>,
 
-    /// All child tasks (ranged GetObject) spawned for this download
-    pub(crate) tasks: Arc<Mutex<task::JoinSet<()>>>,
+    /// Download context
+    pub(crate) ctx: DownloadContext,
+
+    /// Chunk receiver - kept to pass to body
+    pub(crate) chunk_rx: Mutex<Option<mpsc::Receiver<Result<ChunkOutput, error::Error>>>>,
 }
 
 impl DownloadHandle {
-    /// Object metadata
-    pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
-        let meta = self
-            .object_meta
-            .get_or_try_init(|| async {
-                let mut object_meta_rx = self.object_meta_rx.lock().await;
-                let object_meta_rx = object_meta_rx
-                    .take()
-                    .ok_or("object_meta_rx is already taken")
-                    .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))?;
-                object_meta_rx
-                    .await
-                    .map_err(error::from_kind(ErrorKind::ObjectNotDiscoverable))
-            })
-            .await?;
+    pub(crate) fn new(ctx: DownloadContext) -> Self {
+        let concurrency = ctx.handle.num_workers();
+        let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
+        // TODO(redux): chunk_tx goes to DownloadTransfer for sending chunks
+        drop(chunk_tx);
 
-        Ok(meta)
+        Self {
+            body: Body::new(chunk_rx),
+            object_meta: OnceCell::new(),
+            ctx,
+            chunk_rx: Mutex::new(None),
+        }
     }
 
-    /// The object content, in chunks, and the metadata for each chunk
+    /// Object metadata
+    ///
+    /// TODO(redux): This should wait for discovery work item to complete
+    pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
+        self.object_meta.get().ok_or_else(|| {
+            error::from_kind(ErrorKind::ObjectNotDiscoverable)("discovery not yet implemented")
+        })
+    }
+
+    /// The object content
     pub fn body(&self) -> &Body {
         &self.body
     }
@@ -65,14 +64,9 @@ impl DownloadHandle {
 
     /// Abort the download and cancel any in-progress work.
     pub async fn abort(mut self) {
+        self.ctx.cancel();
         self.body.close();
-        self.discovery.abort();
-        let _ = self.discovery.await;
-        // It's safe to grab the lock here because discovery is already complete, and we will never
-        // lock tasks again after discovery to spawn more tasks.
-        let mut tasks = self.tasks.lock().await;
-        tasks.abort_all();
-        while (tasks.join_next().await).is_some() {}
+        // TODO(redux): Cancel via scheduler
     }
 }
 

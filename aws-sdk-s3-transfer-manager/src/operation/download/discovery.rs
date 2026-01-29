@@ -250,6 +250,14 @@ mod tests {
         tm.handle.clone()
     }
 
+    fn test_ctx(handle: Arc<crate::client::Handle>, input: &DownloadInput) -> DownloadContext {
+        let id = crate::scheduler::TransferId {
+            id: 0,
+            parent: None,
+        };
+        DownloadContext::new(id, handle, BucketType::Standard, input.clone())
+    }
+
     #[test]
     fn test_strategy_from_req() {
         assert_eq!(
@@ -282,16 +290,16 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext::new(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            BucketType::Standard,
-        );
-
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
+
+        let ctx = test_ctx(
+            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
+            &input,
+        );
 
         let discovery = discover_obj_with_head(&ctx, &input).await.unwrap();
         let remaining = discovery.remaining.unwrap();
@@ -314,13 +322,13 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
+
+        let ctx = test_ctx(test_handle(client, target_part_size), &request);
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         let remaining = discovery.remaining.unwrap();
@@ -351,13 +359,13 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
+
+        let ctx = test_ctx(test_handle(client, target_part_size), &request);
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         assert!(discovery.remaining.is_none());
@@ -386,14 +394,14 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .range("bytes=200-499")
             .build()
             .unwrap();
+
+        let ctx = test_ctx(test_handle(client, target_part_size), &request);
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         let remaining = discovery.remaining.unwrap();
@@ -424,14 +432,14 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .range("bytes=200-123456")
             .build()
             .unwrap();
+
+        let ctx = test_ctx(test_handle(client, target_part_size), &request);
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         assert!(discovery.remaining.is_none());
@@ -458,13 +466,13 @@ mod tests {
             .then_output(|| GetObjectOutput::builder().content_length(0).build());
         let client = mock_client!(aws_sdk_s3, &[&get_range_rule, &get_first_part_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
+
+        let ctx = test_ctx(test_handle(client, target_part_size), &request);
 
         let discovery = discover_obj(&ctx, &request).await.unwrap();
         assert!(discovery.remaining.is_none());
