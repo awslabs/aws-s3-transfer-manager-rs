@@ -8,4 +8,5 @@
 //! These tests use s3-mock-server to test the full transfer manager flow
 //! against a real HTTP server, validating the public API without mocking internals.
 
+pub mod download;
 pub mod upload;

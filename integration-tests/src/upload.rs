@@ -6,6 +6,7 @@
 //! Upload integration tests.
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
+use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use s3_mock_server::S3MockServer;
 
 /// Setup transfer manager with mock server
@@ -30,7 +31,7 @@ async fn setup() -> (s3_mock_server::ServerHandle, aws_sdk_s3_transfer_manager::
 async fn test_mpu_upload_small_file() {
     let (server_handle, tm) = setup().await;
 
-    let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts at 8MB default
+    let content = vec![0u8; 16 * ByteUnit::Mebibyte.as_bytes_usize()]; // 16MB = 2 parts at 8MB default
     let expected_content = content.clone();
 
     let upload_handle = tm
@@ -45,7 +46,8 @@ async fn test_mpu_upload_small_file() {
     assert!(result.e_tag().is_some(), "should have etag");
     assert!(result.upload_id().is_some(), "should have upload_id for MPU");
 
-    // Verify data was uploaded correctly by downloading it
+    // TODO(redux): Use mock server's get_object API instead of going through S3 client
+    // once that API is available on ServerHandle
     let s3_client = server_handle.client().await;
     let get_result = s3_client
         .get_object()
@@ -69,7 +71,7 @@ async fn test_mpu_upload_concurrent() {
 
     // Start multiple concurrent uploads
     for i in 0..5 {
-        let content = vec![i as u8; 8 * 1024 * 1024]; // 8MB each
+        let content = vec![i as u8; 8 * ByteUnit::Mebibyte.as_bytes_usize()];
         let key = format!("concurrent-key-{}", i);
 
         let upload_handle = tm
@@ -97,7 +99,7 @@ async fn test_upload_verify_data_integrity() {
     let (server_handle, tm) = setup().await;
 
     // Create content with recognizable pattern
-    let content: Vec<u8> = (0..24 * 1024 * 1024) // 24MB = 3 parts
+    let content: Vec<u8> = (0..24 * ByteUnit::Mebibyte.as_bytes_usize()) // 24MB = 3 parts
         .map(|i| (i % 256) as u8)
         .collect();
     let expected_content = content.clone();
@@ -112,7 +114,8 @@ async fn test_upload_verify_data_integrity() {
 
     upload_handle.join().await.expect("upload complete");
 
-    // Download and verify
+    // TODO(redux): Use mock server's get_object API instead of going through S3 client
+    // once that API is available on ServerHandle
     let s3_client = server_handle.client().await;
     let get_result = s3_client
         .get_object()
