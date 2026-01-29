@@ -112,10 +112,8 @@ fn new_context(
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
 
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
-    use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};

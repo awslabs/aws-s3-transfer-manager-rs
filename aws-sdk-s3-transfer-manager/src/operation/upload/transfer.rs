@@ -201,6 +201,7 @@ impl UploadTransfer {
             }
             WorkData::CompleteMPU => self.execute_complete_mpu().await,
             WorkData::PutObject { stream } => self.execute_put_object(stream).await,
+            _ => unreachable!("upload transfer received unexpected work data"),
         }
     }
 
@@ -582,7 +583,6 @@ mod tests {
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
-    use bytes::Bytes;
 
     /// Create an UploadTransfer for testing with a mocked S3 client
     fn create_test_transfer(

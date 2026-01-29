@@ -232,9 +232,7 @@ impl MockStateMachine for MpuUpload {
                         data: WorkData::CompleteMPU,
                     }
                 }
-                WorkData::PutObject { .. } => {
-                    panic!("MpuUpload does not handle PutObject")
-                }
+                _ => unreachable!("MpuUpload received unexpected work data"),
             }
         })
     }
@@ -480,7 +478,7 @@ mod tests {
         let id = test_id();
 
         // Should generate 3 work items
-        for i in 1..=3 {
+        for _i in 1..=3 {
             match sm.poll_work(id) {
                 PollWork::Ready(work) => {
                     assert_eq!(work.transfer_id, id);
@@ -509,7 +507,7 @@ mod tests {
         sm.execute(&mut work).await;
 
         // Next polls -> UploadPart (DataIO)
-        for part in 1..=2 {
+        for _part in 1..=2 {
             let mut work = match sm.poll_work(id) {
                 PollWork::Ready(w) => w,
                 other => panic!("expected Ready(UploadPart), got {:?}", other),

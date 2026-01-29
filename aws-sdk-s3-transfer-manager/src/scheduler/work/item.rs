@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::ops::RangeInclusive;
+
 use crate::io::{InputStream, PartData};
 
 /// The kind of work to be executed.
@@ -31,6 +33,7 @@ pub(crate) struct WorkItem {
 
 /// Data associated with a work item.
 #[derive(Debug)]
+#[non_exhaustive]
 pub(crate) enum WorkData {
     /// Create multipart upload (Network only)
     CreateMPU,
@@ -54,7 +57,13 @@ pub(crate) enum WorkData {
         /// The input stream to upload - converted to ByteStream at send time
         stream: Option<InputStream>,
     },
-    // TODO: GetObjectRange (download)
+    /// Download a range of an object (Network only for now)
+    GetObjectRange {
+        /// Byte range to download (inclusive)
+        range: RangeInclusive<u64>,
+        /// Sequence number for ordering chunks in the output Body
+        seq: u64,
+    },
 }
 
 /// Result of polling a transfer for work.
