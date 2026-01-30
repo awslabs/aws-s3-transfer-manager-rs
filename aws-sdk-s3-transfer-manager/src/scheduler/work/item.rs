@@ -4,8 +4,12 @@
  */
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use crate::io::{InputStream, PartData};
+use crate::operation::download::ChunkMetadata;
+
+use aws_sdk_s3::primitives::ByteStream;
 
 /// The kind of work to be executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +39,7 @@ pub(crate) struct WorkItem {
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum WorkData {
+    // ==================== Upload ====================
     /// Create multipart upload (Network only)
     CreateMPU,
     /// Upload a single part
@@ -57,12 +62,27 @@ pub(crate) enum WorkData {
         /// The input stream to upload - converted to ByteStream at send time
         stream: Option<InputStream>,
     },
+
+    // ==================== Download ====================
+    /// Discover object metadata (HeadObject or first ranged GET)
+    Discovery,
+    /// Read the body from discovery's initial chunk
+    ReadDiscoveryBody {
+        /// The body stream from discovery
+        stream: ByteStream,
+        /// Sequence number (always 0 for initial chunk)
+        seq: u64,
+        /// Metadata from the discovery response
+        chunk_meta: ChunkMetadata,
+    },
     /// Download a range of an object (Network only for now)
     GetObjectRange {
         /// Byte range to download (inclusive)
         range: RangeInclusive<u64>,
         /// Sequence number for ordering chunks in the output Body
         seq: u64,
+        /// ETag for if_match consistency (from discovery, shared across all ranges)
+        etag: Option<Arc<str>>,
     },
 }
 

@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
 use crate::error;
 use crate::operation::download::body::ChunkOutput;
+use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{CancelNotificationReceiver, CancelNotificationSender, TransferContext};
 use crate::types::BucketType;
@@ -21,6 +23,7 @@ impl DownloadContext {
         handle: Arc<crate::client::Handle>,
         bucket_type: BucketType,
         input: DownloadInput,
+        chunk_tx: ChunkSender,
     ) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
@@ -29,8 +32,9 @@ impl DownloadContext {
             cancel_tx,
             cancel_rx,
             current_seq: AtomicU64::new(0),
+            work: Mutex::new(DownloadWorkState::new(chunk_tx)),
         });
-        TransferContext { id, handle, state }
+        TransferContext::from_state(id, handle, state)
     }
 
     /// The target part size to use for this download
@@ -56,11 +60,7 @@ impl DownloadContext {
     /// Send cancellation signal
     pub(crate) fn cancel(&self) {
         let _ = self.state.cancel_tx.send(true);
-    }
-
-    /// Check if cancelled
-    pub(crate) fn is_cancelled(&self) -> bool {
-        *self.state.cancel_rx.borrow()
+        self.set_cancelled();
     }
 
     /// Get a receiver for cancellation notifications
@@ -86,6 +86,9 @@ pub(crate) struct DownloadState {
 
     /// Sequence counter for chunks
     pub(crate) current_seq: AtomicU64,
+
+    /// Mutable work state (protected by mutex)
+    pub(crate) work: Mutex<DownloadWorkState>,
 }
 
 impl DownloadState {
@@ -101,24 +104,42 @@ impl DownloadState {
 }
 
 /// Mutable state for tracking download work progress
-///
-/// TODO(redux): Use this in DownloadTransfer state machine
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum DownloadWorkState {
-    /// Waiting to discover object metadata
-    PendingDiscovery,
+    /// Waiting to start discovery
+    PendingDiscovery {
+        /// Channel to send chunks to Body (passed to Transferring state)
+        chunk_tx: ChunkSender,
+    },
+
+    /// Discovery request in flight
+    DiscoveryInFlight {
+        /// Channel to send chunks to Body
+        chunk_tx: ChunkSender,
+    },
 
     /// Data transfer in progress (downloading ranges)
     Transferring {
+        /// Remaining byte range to fetch (None if all ranges generated)
+        remaining: Option<RangeInclusive<u64>>,
         /// Number of ranges currently in flight
         ranges_in_flight: usize,
-        /// ETag for consistency (if_match on subsequent requests)
-        etag: Option<String>,
+        /// ETag for consistency (shared across all range requests)
+        etag: Option<Arc<str>>,
+        /// Object metadata from discovery
+        object_meta: ObjectMetadata,
+        /// Channel to send chunks to Body
+        chunk_tx: ChunkSender,
     },
 
     /// Done
     Done,
+}
+
+impl DownloadWorkState {
+    pub(crate) fn new(chunk_tx: ChunkSender) -> Self {
+        DownloadWorkState::PendingDiscovery { chunk_tx }
+    }
 }
 
 /// Channel sender for chunks - will be used by DownloadTransfer

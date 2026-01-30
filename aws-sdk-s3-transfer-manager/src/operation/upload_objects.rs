@@ -119,6 +119,6 @@ impl UploadObjectsContext {
             id: 0,
             parent: None,
         };
-        TransferContext { id, handle, state }
+        TransferContext::from_state(id, handle, state)
     }
 }

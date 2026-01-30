@@ -251,11 +251,13 @@ mod tests {
     }
 
     fn test_ctx(handle: Arc<crate::client::Handle>, input: &DownloadInput) -> DownloadContext {
+        use tokio::sync::mpsc;
         let id = crate::scheduler::TransferId {
             id: 0,
             parent: None,
         };
-        DownloadContext::new(id, handle, BucketType::Standard, input.clone())
+        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+        DownloadContext::new(id, handle, BucketType::Standard, input.clone(), chunk_tx)
     }
 
     #[test]

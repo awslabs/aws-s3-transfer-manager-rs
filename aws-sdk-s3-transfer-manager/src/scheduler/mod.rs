@@ -8,7 +8,7 @@ mod transfer;
 mod work;
 
 pub(crate) use scheduler::Scheduler;
-pub(crate) use transfer::{DownloadTransfer, Transfer};
+pub(crate) use transfer::Transfer;
 pub(crate) use work::{
     PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome, WorkQueue, WorkerPool,
 };

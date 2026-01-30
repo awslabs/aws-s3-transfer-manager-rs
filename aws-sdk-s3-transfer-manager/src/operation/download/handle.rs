@@ -29,14 +29,12 @@ pub struct DownloadHandle {
 }
 
 impl DownloadHandle {
-    pub(crate) fn new(ctx: DownloadContext) -> Self {
-        let concurrency = ctx.handle.num_workers();
-        let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
-        // TODO(redux): chunk_tx goes to DownloadTransfer for sending chunks
-        drop(chunk_tx);
-
+    pub(crate) fn new(
+        ctx: DownloadContext,
+        chunk_rx: mpsc::Receiver<Result<ChunkOutput, error::Error>>,
+    ) -> Self {
         Self {
-            body: Body::new(chunk_rx),
+            body: Body::new(chunk_rx, ctx.clone()),
             object_meta: OnceCell::new(),
             ctx,
             chunk_rx: Mutex::new(None),

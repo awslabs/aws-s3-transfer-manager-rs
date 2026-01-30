@@ -44,7 +44,7 @@ impl UploadContext {
             }),
             create_mpu_complete: tokio::sync::Notify::new(),
         });
-        TransferContext { id, handle, state }
+        TransferContext::from_state(id, handle, state)
     }
 }
 

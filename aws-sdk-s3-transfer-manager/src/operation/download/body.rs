@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::io::AggregatedBytes;
 
 use super::chunk_meta::ChunkMetadata;
+use super::context::DownloadContext;
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
 ///
@@ -20,6 +21,7 @@ use super::chunk_meta::ChunkMetadata;
 pub struct Body {
     inner: UnorderedBody,
     sequencer: Sequencer,
+    ctx: Option<DownloadContext>,
 }
 
 type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
@@ -45,17 +47,18 @@ pub struct ChunkOutput {
 impl Body {
     /// Create a new empty body
     pub fn empty() -> Self {
-        Self::new_from_channel(None)
+        Self::new_from_channel(None, None)
     }
 
-    pub(crate) fn new(chunks: BodyChannel) -> Self {
-        Self::new_from_channel(Some(chunks))
+    pub(crate) fn new(chunks: BodyChannel, ctx: DownloadContext) -> Self {
+        Self::new_from_channel(Some(chunks), Some(ctx))
     }
 
-    fn new_from_channel(chunks: Option<BodyChannel>) -> Self {
+    fn new_from_channel(chunks: Option<BodyChannel>, ctx: Option<DownloadContext>) -> Self {
         Self {
             inner: UnorderedBody::new(chunks),
             sequencer: Sequencer::new(),
+            ctx,
         }
     }
 
@@ -72,6 +75,9 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
+    ///
+    /// On failure, returns `Some(Err(...))` with the error kind from the actual failure.
+    /// Call `join()` on the handle to get the full error with source chain.
     pub async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         loop {
             if self.sequencer.is_ordered() {
@@ -79,7 +85,16 @@ impl Body {
             }
 
             match self.inner.next().await {
-                None => break,
+                None => {
+                    // Channel closed - check if transfer failed
+                    if let Some(ctx) = &self.ctx {
+                        if let Some(kind) = ctx.error_kind() {
+                            self.close();
+                            return Some(Err(crate::error::from_kind(kind)("transfer failed")));
+                        }
+                    }
+                    break;
+                }
                 Some(Ok(chunk)) => self.sequencer.push(chunk),
                 Some(Err(err)) => {
                     self.close();
