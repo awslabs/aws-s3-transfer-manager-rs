@@ -11,7 +11,7 @@ use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::ChunkOutput;
 use crate::operation::download::DownloadContext;
-use crate::operation::StateMachineCompleteReceiver;
+use crate::operation::StateMachineTerminalReceiver;
 
 /// Response type for a single download object request.
 #[derive(Debug)]
@@ -24,14 +24,14 @@ pub struct DownloadHandle {
     pub(crate) ctx: DownloadContext,
 
     /// Completion signal receiver - signals state machine reached terminal state
-    pub(crate) completion_rx: Option<StateMachineCompleteReceiver>,
+    pub(crate) completion_rx: Option<StateMachineTerminalReceiver>,
 }
 
 impl DownloadHandle {
     pub(crate) fn new(
         ctx: DownloadContext,
         chunk_rx: mpsc::Receiver<Result<ChunkOutput, error::Error>>,
-        completion_rx: StateMachineCompleteReceiver,
+        completion_rx: StateMachineTerminalReceiver,
     ) -> Self {
         Self {
             body: Body::new(chunk_rx, ctx.clone()),

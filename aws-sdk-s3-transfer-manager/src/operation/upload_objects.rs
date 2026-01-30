@@ -115,7 +115,7 @@ impl UploadObjectsContext {
     fn new(
         handle: Arc<crate::client::Handle>,
         input: UploadObjectsInput,
-    ) -> (Self, crate::operation::StateMachineCompleteReceiver) {
+    ) -> (Self, crate::operation::StateMachineTerminalReceiver) {
         let (cancel_tx, cancel_rx) = watch::channel(());
         let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
         // TODO(redux): UploadObjects doesn't use new scheduler yet, use dummy id

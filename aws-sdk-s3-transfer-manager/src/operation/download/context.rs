@@ -20,7 +20,7 @@ impl DownloadContext {
         bucket_type: BucketType,
         input: DownloadInput,
         chunk_tx: ChunkSender,
-    ) -> (Self, crate::operation::StateMachineCompleteReceiver) {
+    ) -> (Self, crate::operation::StateMachineTerminalReceiver) {
         let state = Arc::new(DownloadState {
             request: Arc::new(input),
             bucket_type,

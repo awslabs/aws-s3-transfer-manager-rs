@@ -98,7 +98,7 @@ fn new_context(
     stream: crate::io::InputStream,
 ) -> (
     UploadContext,
-    crate::operation::StateMachineCompleteReceiver,
+    crate::operation::StateMachineTerminalReceiver,
 ) {
     UploadContext::new(
         id,

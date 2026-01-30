@@ -30,8 +30,8 @@ pub(crate) type CancelBroadcastSender = tokio::sync::watch::Sender<()>;
 pub(crate) type CancelBroadcastReceiver = tokio::sync::watch::Receiver<()>;
 
 // Type aliases for state machine completion signal (one-to-one, state machine → handle)
-pub(crate) type StateMachineCompleteSender = tokio::sync::oneshot::Sender<()>;
-pub(crate) type StateMachineCompleteReceiver = tokio::sync::oneshot::Receiver<()>;
+pub(crate) type StateMachineTerminalSender = tokio::sync::oneshot::Sender<()>;
+pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()>;
 
 /// Channel for sending download chunks to Body
 pub(crate) type ChunkSender =
@@ -191,7 +191,7 @@ pub(crate) struct TransferContext<State> {
     /// Error storage (only used when status == Failed)
     error: Arc<Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
-    completion_tx: Arc<Mutex<Option<StateMachineCompleteSender>>>,
+    completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
 }
 
 impl<State> TransferContext<State> {
@@ -201,7 +201,7 @@ impl<State> TransferContext<State> {
         id: crate::scheduler::TransferId,
         handle: Arc<crate::client::Handle>,
         state: Arc<State>,
-    ) -> (Self, StateMachineCompleteReceiver) {
+    ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let ctx = Self {
             id,

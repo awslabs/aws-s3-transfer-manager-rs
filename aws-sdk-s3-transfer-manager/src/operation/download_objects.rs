@@ -99,7 +99,7 @@ impl DownloadObjectsContext {
     fn new(
         handle: Arc<crate::client::Handle>,
         input: DownloadObjectsInput,
-    ) -> (Self, crate::operation::StateMachineCompleteReceiver) {
+    ) -> (Self, crate::operation::StateMachineTerminalReceiver) {
         let (cancel_tx, cancel_rx) = watch::channel(());
         let state = Arc::new(DownloadObjectsState {
             input,
