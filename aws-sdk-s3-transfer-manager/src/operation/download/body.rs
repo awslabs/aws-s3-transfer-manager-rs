@@ -21,7 +21,7 @@ use super::context::DownloadContext;
 pub struct Body {
     inner: UnorderedBody,
     sequencer: Sequencer,
-    ctx: Option<DownloadContext>,
+    ctx: DownloadContext,
 }
 
 type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
@@ -45,16 +45,7 @@ pub struct ChunkOutput {
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
 impl Body {
-    /// Create a new empty body
-    pub fn empty() -> Self {
-        Self::new_from_channel(None, None)
-    }
-
     pub(crate) fn new(chunks: BodyChannel, ctx: DownloadContext) -> Self {
-        Self::new_from_channel(Some(chunks), Some(ctx))
-    }
-
-    fn new_from_channel(chunks: Option<BodyChannel>, ctx: Option<DownloadContext>) -> Self {
         Self {
             inner: UnorderedBody::new(chunks),
             sequencer: Sequencer::new(),
@@ -87,22 +78,19 @@ impl Body {
             match self.inner.next().await {
                 None => {
                     // Channel closed - check if transfer failed or was cancelled
-                    // TODO(cleanup): ctx is Option because Body::empty() exists but is unused.
-                    // Consider removing empty() and making ctx non-optional.
-                    let terminal_error = self.ctx.as_ref().and_then(|ctx| {
-                        if ctx.is_cancelled() {
-                            Some(crate::error::from_kind(
-                                crate::error::ErrorKind::OperationCancelled,
-                            )("download cancelled"))
-                        } else if ctx.is_failed() {
-                            let kind = ctx
-                                .error_kind()
-                                .unwrap_or(crate::error::ErrorKind::ChildOperationFailed);
-                            Some(crate::error::from_kind(kind)("transfer failed"))
-                        } else {
-                            None
-                        }
-                    });
+                    let terminal_error = if self.ctx.is_cancelled() {
+                        Some(crate::error::from_kind(
+                            crate::error::ErrorKind::OperationCancelled,
+                        )("download cancelled"))
+                    } else if self.ctx.is_failed() {
+                        let kind = self
+                            .ctx
+                            .error_kind()
+                            .unwrap_or(crate::error::ErrorKind::ChildOperationFailed);
+                        Some(crate::error::from_kind(kind)("transfer failed"))
+                    } else {
+                        None
+                    };
                     if let Some(err) = terminal_error {
                         self.close();
                         return Some(Err(err));
@@ -198,11 +186,11 @@ impl PartialEq for SequencedChunk {
 /// A body that returns chunks in whatever order they are received.
 #[derive(Debug)]
 pub(crate) struct UnorderedBody {
-    chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
+    chunks: BodyChannel,
 }
 
 impl UnorderedBody {
-    fn new(chunks: Option<BodyChannel>) -> Self {
+    fn new(chunks: BodyChannel) -> Self {
         Self { chunks }
     }
 
@@ -213,17 +201,12 @@ impl UnorderedBody {
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
     pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
-        match self.chunks.as_mut() {
-            None => None,
-            Some(ch) => ch.recv().await,
-        }
+        self.chunks.recv().await
     }
 
     /// Close the body
     pub(crate) fn close(&mut self) {
-        if let Some(ch) = &mut self.chunks {
-            ch.close();
-        }
+        self.chunks.close();
     }
 }
 
@@ -244,6 +227,31 @@ mod tests {
         }
     }
 
+    fn test_body(rx: mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>) -> Body {
+        use crate::operation::download::context::DownloadContext;
+        use crate::operation::download::DownloadInput;
+        use crate::types::BucketType;
+
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .with_test_defaults()
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .build(),
+        );
+        let config = crate::Config::builder().client(s3_client).build();
+        let tm = crate::Client::new(config);
+        let id = crate::scheduler::TransferId { id: 0, parent: None };
+        let input = DownloadInput::builder()
+            .bucket("test")
+            .key("test")
+            .build()
+            .unwrap();
+        let (tx, _) = mpsc::channel(1);
+        let (ctx, _) = DownloadContext::new(id, tm.handle.clone(), BucketType::Standard, input, tx);
+
+        Body::new(rx, ctx)
+    }
+
     #[test]
     fn test_sequencer() {
         let mut sequencer = Sequencer::new();
@@ -257,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new_from_channel(Some(rx), None);
+        let mut body = test_body(rx);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -283,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new_from_channel(Some(rx), None);
+        let mut body = test_body(rx);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();

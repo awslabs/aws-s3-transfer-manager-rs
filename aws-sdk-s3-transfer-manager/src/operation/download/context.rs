@@ -3,16 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
 
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::operation::{
-    CancelNotificationReceiver, CancelNotificationSender, ChunkSender, TransferContext,
-};
+use crate::operation::{ChunkSender, TransferContext};
 use crate::types::BucketType;
 
 pub(crate) type DownloadContext = TransferContext<DownloadState>;
@@ -25,12 +21,9 @@ impl DownloadContext {
         input: DownloadInput,
         chunk_tx: ChunkSender,
     ) -> (Self, crate::operation::CompletionReceiver) {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             request: Arc::new(input),
             bucket_type,
-            cancel_tx,
-            cancel_rx,
             current_seq: AtomicU64::new(0),
             work: Mutex::new(DownloadWorkState::new(chunk_tx)),
         });
@@ -56,18 +49,6 @@ impl DownloadContext {
     pub(crate) fn current_seq(&self) -> u64 {
         self.state.current_seq.load(Ordering::SeqCst)
     }
-
-    /// Send cancellation signal
-    pub(crate) fn cancel(&self) {
-        let _ = self.state.cancel_tx.send(true);
-        self.set_cancelled();
-    }
-
-    // TODO(redux) - not used?
-    /// Get a receiver for cancellation notifications
-    pub(crate) fn cancel_rx(&self) -> CancelNotificationReceiver {
-        self.state.cancel_rx.clone()
-    }
 }
 
 /// Download operation specific state
@@ -78,12 +59,6 @@ pub(crate) struct DownloadState {
 
     /// Type of S3 bucket targeted by this operation
     pub(crate) bucket_type: BucketType,
-
-    /// Cancellation sender
-    pub(crate) cancel_tx: CancelNotificationSender,
-
-    /// Cancellation receiver
-    pub(crate) cancel_rx: CancelNotificationReceiver,
 
     /// Sequence counter for chunks
     pub(crate) current_seq: AtomicU64,
@@ -122,7 +97,7 @@ pub(crate) enum DownloadWorkState {
     /// Data transfer in progress (downloading ranges)
     Transferring {
         /// Remaining byte range to fetch (None if all ranges generated)
-        remaining: Option<RangeInclusive<u64>>,
+        remaining: Option<std::ops::RangeInclusive<u64>>,
         /// Number of ranges currently in flight
         ranges_in_flight: usize,
         /// ETag for consistency (shared across all range requests)

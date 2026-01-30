@@ -111,8 +111,7 @@ impl DownloadHandle {
     /// When this method returns, all work for this transfer has been
     /// cancelled or completed. No further work will be executed.
     pub async fn abort(mut self) {
-        // signal cancellation
-        self.ctx.cancel();
+        self.ctx.set_cancelled();
         self.body.close();
 
         // Cancel transfer and purge queued work
@@ -132,7 +131,7 @@ impl DownloadHandle {
 impl Drop for DownloadHandle {
     fn drop(&mut self) {
         if self.ctx.is_active() {
-            self.ctx.cancel();
+            self.ctx.set_cancelled();
             self.ctx.handle.new_scheduler.cancel_transfer(self.ctx.id);
         }
     }
