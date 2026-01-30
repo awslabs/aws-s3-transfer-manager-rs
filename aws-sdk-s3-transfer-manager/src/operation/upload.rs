@@ -96,7 +96,10 @@ fn new_context(
     handle: Arc<crate::client::Handle>,
     req: UploadInput,
     stream: crate::io::InputStream,
-) -> (UploadContext, crate::operation::CompletionReceiver) {
+) -> (
+    UploadContext,
+    crate::operation::StateMachineCompleteReceiver,
+) {
     UploadContext::new(
         id,
         handle,

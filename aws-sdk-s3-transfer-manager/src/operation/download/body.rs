@@ -240,7 +240,10 @@ mod tests {
         );
         let config = crate::Config::builder().client(s3_client).build();
         let tm = crate::Client::new(config);
-        let id = crate::scheduler::TransferId { id: 0, parent: None };
+        let id = crate::scheduler::TransferId {
+            id: 0,
+            parent: None,
+        };
         let input = DownloadInput::builder()
             .bucket("test")
             .key("test")

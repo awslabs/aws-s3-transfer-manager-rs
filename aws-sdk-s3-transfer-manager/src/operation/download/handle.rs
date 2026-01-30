@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::mpsc;
 
 use crate::error::{self, ErrorKind};
 use crate::operation::download::body::Body;
@@ -11,7 +11,7 @@ use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::ChunkOutput;
 use crate::operation::download::DownloadContext;
-use crate::operation::CompletionReceiver;
+use crate::operation::StateMachineCompleteReceiver;
 
 /// Response type for a single download object request.
 #[derive(Debug)]
@@ -20,25 +20,21 @@ pub struct DownloadHandle {
     /// The object content
     pub(crate) body: Body,
 
-    /// Object metadata (populated after discovery)
-    pub(crate) object_meta: OnceCell<ObjectMetadata>,
-
     /// Download context
     pub(crate) ctx: DownloadContext,
 
     /// Completion signal receiver - signals state machine reached terminal state
-    pub(crate) completion_rx: Option<CompletionReceiver>,
+    pub(crate) completion_rx: Option<StateMachineCompleteReceiver>,
 }
 
 impl DownloadHandle {
     pub(crate) fn new(
         ctx: DownloadContext,
         chunk_rx: mpsc::Receiver<Result<ChunkOutput, error::Error>>,
-        completion_rx: CompletionReceiver,
+        completion_rx: StateMachineCompleteReceiver,
     ) -> Self {
         Self {
             body: Body::new(chunk_rx, ctx.clone()),
-            object_meta: OnceCell::new(),
             ctx,
             completion_rx: Some(completion_rx),
         }
@@ -46,10 +42,23 @@ impl DownloadHandle {
 
     /// Object metadata
     ///
-    /// TODO(redux): This should wait for discovery work item to complete
+    /// Waits for discovery to complete if metadata is not yet available.
     pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
-        self.object_meta.get().ok_or_else(|| {
-            error::from_kind(ErrorKind::ObjectNotDiscoverable)("discovery not yet implemented")
+        // Fast path: already available
+        if let Some(meta) = self.ctx.state.object_meta.get() {
+            return Ok(meta);
+        }
+
+        // Wait for discovery to complete
+        self.ctx.state.discovery_notify.notified().await;
+
+        // Check result
+        self.ctx.state.object_meta.get().ok_or_else(|| {
+            if self.ctx.is_cancelled() {
+                error::from_kind(ErrorKind::OperationCancelled)("download cancelled")
+            } else {
+                error::from_kind(ErrorKind::ObjectNotDiscoverable)("discovery failed")
+            }
         })
     }
 
@@ -101,9 +110,15 @@ impl DownloadHandle {
             return Err(err);
         }
 
-        // Success - build output
-        // TODO(redux): populate object_meta from discovery
-        Ok(DownloadOutput::new(ObjectMetadata::default()))
+        // Success - discovery must have completed
+        let object_meta = self
+            .ctx
+            .state
+            .object_meta
+            .get()
+            .expect("object_meta must be set on successful completion")
+            .clone();
+        Ok(DownloadOutput::new(object_meta))
     }
 
     /// Abort the download and cancel any in-progress work.

@@ -20,11 +20,13 @@ impl DownloadContext {
         bucket_type: BucketType,
         input: DownloadInput,
         chunk_tx: ChunkSender,
-    ) -> (Self, crate::operation::CompletionReceiver) {
+    ) -> (Self, crate::operation::StateMachineCompleteReceiver) {
         let state = Arc::new(DownloadState {
             request: Arc::new(input),
             bucket_type,
             current_seq: AtomicU64::new(0),
+            object_meta: std::sync::OnceLock::new(),
+            discovery_notify: tokio::sync::Notify::new(),
             work: Mutex::new(DownloadWorkState::new(chunk_tx)),
         });
         TransferContext::from_state(id, handle, state)
@@ -62,6 +64,12 @@ pub(crate) struct DownloadState {
 
     /// Sequence counter for chunks
     pub(crate) current_seq: AtomicU64,
+
+    /// Object metadata from discovery (set once discovery completes)
+    pub(crate) object_meta: std::sync::OnceLock<ObjectMetadata>,
+
+    /// Notified when discovery completes (success or failure)
+    pub(crate) discovery_notify: tokio::sync::Notify,
 
     /// Mutable work state (protected by mutex)
     pub(crate) work: Mutex<DownloadWorkState>,

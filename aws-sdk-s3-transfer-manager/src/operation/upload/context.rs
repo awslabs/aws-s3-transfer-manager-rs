@@ -23,7 +23,7 @@ impl UploadContext {
         bucket_type: BucketType,
         req: UploadInput,
         stream: InputStream,
-    ) -> (Self, crate::operation::CompletionReceiver) {
+    ) -> (Self, crate::operation::StateMachineCompleteReceiver) {
         // TODO(redux): For unknown content length (streaming uploads), this will need adjustment.
         // Currently we require known length. When we support unknown length:
         // - content_length becomes Option<u64>

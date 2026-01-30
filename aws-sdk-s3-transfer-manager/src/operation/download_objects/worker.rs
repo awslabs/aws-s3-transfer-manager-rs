@@ -135,7 +135,7 @@ pub(super) async fn download_objects(
                                     FailedTransferPolicy::Abort => {
                                         // Sending a cancellation signal during graceful shutdown would be redundant.
                                         if err.kind() != &ErrorKind::OperationCancelled
-                                            && ctx.state.cancel_tx.send(true).is_err()
+                                            && ctx.state.cancel_tx.send(()).is_err()
                                         {
                                             tracing::warn!(
                                                 "all receiver ends have been dropped, unable to send a cancellation signal"

@@ -24,7 +24,7 @@ mod worker;
 use crate::{error, types::FailedUpload};
 
 use super::{
-    validate_target_is_dir, CancelNotificationReceiver, CancelNotificationSender, TransferContext,
+    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, TransferContext,
 };
 
 /// Operation struct for uploading multiple objects to Amazon S3
@@ -85,8 +85,8 @@ pub(crate) struct UploadObjectsState {
     // TODO - Determine if `input` should be separated from this struct
     // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: UploadObjectsInput,
-    cancel_tx: CancelNotificationSender,
-    cancel_rx: CancelNotificationReceiver,
+    cancel_tx: CancelBroadcastSender,
+    cancel_rx: CancelBroadcastReceiver,
     failed_uploads: Mutex<Vec<FailedUpload>>,
     successful_uploads: AtomicU64,
     total_bytes_transferred: AtomicU64,
@@ -95,8 +95,8 @@ pub(crate) struct UploadObjectsState {
 impl UploadObjectsState {
     pub(crate) fn new(
         input: UploadObjectsInput,
-        cancel_tx: CancelNotificationSender,
-        cancel_rx: CancelNotificationReceiver,
+        cancel_tx: CancelBroadcastSender,
+        cancel_rx: CancelBroadcastReceiver,
     ) -> Self {
         Self {
             input,
@@ -115,8 +115,8 @@ impl UploadObjectsContext {
     fn new(
         handle: Arc<crate::client::Handle>,
         input: UploadObjectsInput,
-    ) -> (Self, crate::operation::CompletionReceiver) {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+    ) -> (Self, crate::operation::StateMachineCompleteReceiver) {
+        let (cancel_tx, cancel_rx) = watch::channel(());
         let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
         // TODO(redux): UploadObjects doesn't use new scheduler yet, use dummy id
         let id = crate::scheduler::TransferId {

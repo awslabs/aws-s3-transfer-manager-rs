@@ -145,7 +145,11 @@ impl DownloadTransfer {
 
         let discovery = match discover_obj(&self.ctx, input).await {
             Ok(d) => d,
-            Err(e) => return self.fail(e),
+            Err(e) => {
+                // Notify waiters that discovery failed
+                self.ctx.state.discovery_notify.notify_waiters();
+                return self.fail(e);
+            }
         };
 
         let ObjectDiscovery {
@@ -154,6 +158,11 @@ impl DownloadTransfer {
             initial_chunk,
             chunk_meta,
         } = discovery;
+
+        // Store object_meta for object_meta() and join()
+        let _ = self.ctx.state.object_meta.set(object_meta.clone());
+        // Notify waiters that discovery completed
+        self.ctx.state.discovery_notify.notify_waiters();
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
