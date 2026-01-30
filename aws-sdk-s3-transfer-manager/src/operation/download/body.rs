@@ -243,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let mut body = Body::new_from_channel(Some(rx), None);
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -269,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_error() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let mut body = Body::new_from_channel(Some(rx), None);
         tokio::spawn(async move {
             let data = Bytes::from("chunk 0".to_string());
             let mut aggregated = SegmentedBuf::new();

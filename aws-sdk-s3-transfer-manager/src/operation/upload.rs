@@ -75,7 +75,10 @@ impl Upload {
             return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
         }
 
-        let ctx = new_context(transfer_id, handle.clone(), input, stream);
+        // TODO(redux): Upload still uses result_tx/rx pattern. Should migrate to
+        // unified completion pattern where ctx.signal_terminal() is used and
+        // output is stored in UploadState.
+        let (ctx, _completion_rx) = new_context(transfer_id, handle.clone(), input, stream);
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
@@ -93,7 +96,7 @@ fn new_context(
     handle: Arc<crate::client::Handle>,
     req: UploadInput,
     stream: crate::io::InputStream,
-) -> UploadContext {
+) -> (UploadContext, crate::operation::CompletionReceiver) {
     UploadContext::new(
         id,
         handle,

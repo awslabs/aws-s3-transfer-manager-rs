@@ -73,13 +73,14 @@ impl Download {
         let concurrency = handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
 
-        let ctx = DownloadContext::new(transfer_id, handle.clone(), bucket_type, input, chunk_tx);
+        let (ctx, completion_rx) =
+            DownloadContext::new(transfer_id, handle.clone(), bucket_type, input, chunk_tx);
 
         let transfer = DownloadTransfer::new(ctx.clone());
         handle
             .new_scheduler
             .enqueue_transfer(crate::scheduler::Transfer::Download(transfer));
 
-        Ok(DownloadHandle::new(ctx, chunk_rx))
+        Ok(DownloadHandle::new(ctx, chunk_rx, completion_rx))
     }
 }

@@ -507,7 +507,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let ctx = DownloadObjectsContext::new(client.handle.clone(), input);
+        let (ctx, _completion_rx) = DownloadObjectsContext::new(client.handle.clone(), input);
 
         let (work_tx, work_rx) = async_channel::unbounded();
 
@@ -565,7 +565,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let ctx = DownloadObjectsContext::new(client.handle.clone(), input);
+        let (ctx, _completion_rx) = DownloadObjectsContext::new(client.handle.clone(), input);
 
         let (work_tx, work_rx) = async_channel::unbounded();
 

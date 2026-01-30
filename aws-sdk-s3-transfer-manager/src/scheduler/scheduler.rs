@@ -63,7 +63,10 @@
 //! transfers, avoiding wasted work.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use super::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool};
 
@@ -79,6 +82,10 @@ struct SchedulerInner {
     transfers: HashMap<TransferId, TransferState>,
     /// IDs of transfers ready to be polled for work
     ready_queue: VecDeque<TransferId>,
+    /// Count of outstanding work items per transfer (queued + executing)
+    outstanding: HashMap<TransferId, usize>,
+    /// Wakers waiting for a transfer to become idle (outstanding == 0)
+    idle_wakers: HashMap<TransferId, Vec<Waker>>,
 }
 
 /// Event-driven scheduler for coordinating transfer work.
@@ -106,6 +113,8 @@ impl Scheduler {
             inner: Arc::new(Mutex::new(SchedulerInner {
                 transfers: HashMap::new(),
                 ready_queue: VecDeque::new(),
+                outstanding: HashMap::new(),
+                idle_wakers: HashMap::new(),
             })),
             data_io_pool: Arc::new(WorkerPool::new(data_io_concurrency)),
             network_pool: Arc::new(WorkerPool::new(network_concurrency)),
@@ -162,16 +171,57 @@ impl Scheduler {
 
     /// Cancel a transfer, removing it from the scheduler.
     ///
-    /// In-flight work may still complete, but:
-    /// - No new work will be generated for this transfer
-    /// - Follow-on work won't be scheduled
-    /// - Workers will skip queued work when they find transfer missing
+    /// - Removes transfer from scheduler (no new work generated)
+    /// - Purges queued work for this transfer from pools
+    /// - Outstanding work being executed will complete naturally
+    /// - Use `wait_for_idle(id)` to wait for all outstanding work to finish
     ///
     /// TODO(redux): When upload_objects/download_objects use the new scheduler,
     /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
-    pub(crate) fn cancel_transfer(&self, id: TransferId) {
+    pub(crate) fn cancel_transfer(&self, id: TransferId) -> Option<Transfer> {
         let mut inner = self.inner.lock().unwrap();
-        inner.transfers.remove(&id);
+
+        // Remove from transfer map
+        let transfer = inner.transfers.remove(&id)?.transfer;
+
+        // Purge queued work and adjust outstanding count
+        let purged =
+            self.data_io_pool.remove_for_transfer(id) + self.network_pool.remove_for_transfer(id);
+
+        if purged > 0 {
+            self.decrement_outstanding_by(&mut inner, id, purged);
+        }
+
+        Some(transfer)
+    }
+
+    /// Wait for a transfer to have no outstanding work.
+    pub(crate) fn wait_for_idle(&self, id: TransferId) -> WaitForIdle {
+        WaitForIdle {
+            scheduler: self.inner.clone(),
+            id,
+        }
+    }
+
+    /// Decrement outstanding count and wake idle waiters if zero.
+    fn decrement_outstanding(&self, inner: &mut SchedulerInner, id: TransferId) {
+        self.decrement_outstanding_by(inner, id, 1);
+    }
+
+    /// Decrement outstanding count by N and wake idle waiters if zero.
+    fn decrement_outstanding_by(&self, inner: &mut SchedulerInner, id: TransferId, n: usize) {
+        if let Some(count) = inner.outstanding.get_mut(&id) {
+            *count = count.saturating_sub(n);
+            if *count == 0 {
+                inner.outstanding.remove(&id);
+                // Wake any wait_for_idle waiters
+                if let Some(wakers) = inner.idle_wakers.remove(&id) {
+                    for waker in wakers {
+                        waker.wake();
+                    }
+                }
+            }
+        }
     }
 
     /// Called by workers when work completes.
@@ -180,6 +230,9 @@ impl Scheduler {
     /// transfer state and follow-on work generation.
     pub(crate) fn on_completion(&self, work: WorkItem, outcome: WorkOutcome) {
         let mut inner = self.inner.lock().unwrap();
+
+        // Decrement outstanding count for this transfer
+        self.decrement_outstanding(&mut inner, work.transfer_id);
 
         // Only process if transfer still exists (not cancelled)
         let transfer_exists = inner.transfers.contains_key(&work.transfer_id);
@@ -201,7 +254,7 @@ impl Scheduler {
                             kind,
                             data,
                         };
-                        self.enqueue_to_pool(next_item);
+                        self.enqueue_to_pool(&mut inner, next_item);
                     }
                 }
             }
@@ -214,7 +267,7 @@ impl Scheduler {
     }
 
     /// Generate work from ready transfers and push to pools.
-    fn generate_work(&self, inner: &mut MutexGuard<'_, SchedulerInner>) {
+    fn generate_work(&self, inner: &mut SchedulerInner) {
         let target = self.total_capacity();
         let current = self.total_pending() + self.total_in_flight();
 
@@ -236,7 +289,7 @@ impl Scheduler {
 
             match state.transfer.poll_work() {
                 PollWork::Ready(work) => {
-                    self.enqueue_to_pool(work);
+                    self.enqueue_to_pool(inner, work);
                     generated += 1;
                     // Re-queue - might have more work
                     inner.ready_queue.push_back(id);
@@ -252,7 +305,8 @@ impl Scheduler {
         }
     }
 
-    fn enqueue_to_pool(&self, item: WorkItem) {
+    fn enqueue_to_pool(&self, inner: &mut SchedulerInner, item: WorkItem) {
+        *inner.outstanding.entry(item.transfer_id).or_insert(0) += 1;
         match item.kind {
             WorkKind::DataIO => self.data_io_pool.push(item),
             WorkKind::Network => self.network_pool.push(item),
@@ -285,6 +339,33 @@ impl Scheduler {
     pub(crate) fn shutdown(&self) {
         self.data_io_pool.shutdown();
         self.network_pool.shutdown();
+    }
+}
+
+/// Future that resolves when a transfer has no outstanding work.
+pub(crate) struct WaitForIdle {
+    scheduler: Arc<Mutex<SchedulerInner>>,
+    id: TransferId,
+}
+
+impl Future for WaitForIdle {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.scheduler.lock().unwrap();
+
+        if !inner.outstanding.contains_key(&self.id) {
+            // No outstanding work - idle
+            Poll::Ready(())
+        } else {
+            // Register waker to be notified when outstanding hits zero
+            inner
+                .idle_wakers
+                .entry(self.id)
+                .or_default()
+                .push(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 

@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use super::WorkItem;
+use super::{TransferId, WorkItem};
 
 /// A queue of work items with concurrency control
 #[derive(Debug)]
@@ -56,5 +56,12 @@ impl WorkQueue {
 
     pub(crate) fn in_flight_count(&self) -> usize {
         self.in_flight
+    }
+
+    /// Remove all pending work for a transfer. Returns count removed.
+    pub(crate) fn remove_for_transfer(&mut self, id: TransferId) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|item| item.transfer_id != id);
+        before - self.pending.len()
     }
 }

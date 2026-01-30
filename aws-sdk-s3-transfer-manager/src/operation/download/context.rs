@@ -24,7 +24,7 @@ impl DownloadContext {
         bucket_type: BucketType,
         input: DownloadInput,
         chunk_tx: ChunkSender,
-    ) -> Self {
+    ) -> (Self, crate::operation::CompletionReceiver) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let state = Arc::new(DownloadState {
             request: Arc::new(input),
@@ -63,6 +63,7 @@ impl DownloadContext {
         self.set_cancelled();
     }
 
+    // TODO(redux) - not used?
     /// Get a receiver for cancellation notifications
     pub(crate) fn cancel_rx(&self) -> CancelNotificationReceiver {
         self.state.cancel_rx.clone()

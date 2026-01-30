@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use tokio::sync::Notify;
 
-use super::{WorkItem, WorkQueue};
+use super::{TransferId, WorkItem, WorkQueue};
 
 /// A pool of workers that pull work from a queue.
 #[derive(Debug)]
@@ -97,5 +97,10 @@ impl WorkerPool {
     /// Number of in-flight work items.
     pub(crate) fn in_flight_count(&self) -> usize {
         self.queue.lock().unwrap().in_flight_count()
+    }
+
+    /// Remove all pending work for a transfer. Returns count removed.
+    pub(crate) fn remove_for_transfer(&self, id: TransferId) -> usize {
+        self.queue.lock().unwrap().remove_for_transfer(id)
     }
 }

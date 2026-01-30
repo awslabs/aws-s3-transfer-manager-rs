@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
@@ -79,7 +79,8 @@ impl UploadTransfer {
 
         let content_length = part_count as u64 * 8 * 1024 * 1024;
         let stream = InputStream::from(vec![0u8; content_length as usize]);
-        let ctx = UploadContext::new(id, handle, BucketType::Standard, input, stream);
+        let (ctx, _completion_rx) =
+            UploadContext::new(id, handle, BucketType::Standard, input, stream);
 
         let (result_tx, _) = oneshot::channel();
         Self {
@@ -611,7 +612,8 @@ mod tests {
             parent: None,
         };
         let stream = InputStream::from(content);
-        let ctx = UploadContext::new(id, handle, BucketType::Standard, input, stream);
+        let (ctx, _completion_rx) =
+            UploadContext::new(id, handle, BucketType::Standard, input, stream);
 
         let (result_tx, result_rx) = oneshot::channel();
         let transfer = UploadTransfer::new(ctx, result_tx);

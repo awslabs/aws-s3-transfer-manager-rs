@@ -257,7 +257,9 @@ mod tests {
             parent: None,
         };
         let (chunk_tx, _chunk_rx) = mpsc::channel(1);
-        DownloadContext::new(id, handle, BucketType::Standard, input.clone(), chunk_tx)
+        let (ctx, _completion_rx) =
+            DownloadContext::new(id, handle, BucketType::Standard, input.clone(), chunk_tx);
+        ctx
     }
 
     #[test]

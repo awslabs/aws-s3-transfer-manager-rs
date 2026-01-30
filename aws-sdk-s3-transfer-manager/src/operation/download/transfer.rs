@@ -7,11 +7,10 @@
 
 use std::cmp;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes_utils::SegmentedBuf;
-use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
@@ -21,29 +20,18 @@ use crate::operation::download::context::{DownloadContext, DownloadWorkState};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
-use tokio_util::sync::CancellationToken;
-
-/// Sender to signal that the download state machine has completed (success, failure, or cancel)
-pub(crate) type CompletionSender = oneshot::Sender<()>;
-/// Receiver to wait for the download state machine to complete
-pub(crate) type CompletionReceiver = oneshot::Receiver<()>;
-
 /// Download transfer that generates and executes download work.
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadTransfer {
     ctx: DownloadContext,
-    done: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    completion_tx: Arc<Mutex<Option<CompletionSender>>>,
 }
 
 impl DownloadTransfer {
-    pub(crate) fn new(ctx: DownloadContext, completion_tx: CompletionSender) -> Self {
+    pub(crate) fn new(ctx: DownloadContext) -> Self {
         Self {
             ctx,
-            done: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
-            completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
         }
     }
 
@@ -56,7 +44,7 @@ impl DownloadTransfer {
     }
 
     pub(crate) fn poll_work(&self) -> PollWork {
-        if self.done.load(Ordering::Acquire) {
+        if !self.ctx.is_active() {
             return PollWork::Done;
         }
 
@@ -106,9 +94,9 @@ impl DownloadTransfer {
                     // All ranges generated, waiting for in-flight to complete
                     PollWork::Pending
                 } else {
-                    // All done
-                    self.done.store(true, Ordering::Release);
                     *work = DownloadWorkState::Done;
+                    // all done - success
+                    self.complete();
                     PollWork::Done
                 }
             }
@@ -124,8 +112,12 @@ impl DownloadTransfer {
                 seq,
                 chunk_meta,
             } => {
-                self.execute_read_discovery_body(std::mem::take(stream), *seq, std::mem::take(chunk_meta))
-                    .await
+                self.execute_read_discovery_body(
+                    std::mem::take(stream),
+                    *seq,
+                    std::mem::take(chunk_meta),
+                )
+                .await
             }
             WorkData::GetObjectRange { range, seq, etag } => {
                 self.execute_get_range(range.clone(), *seq, etag.clone())
@@ -312,14 +304,18 @@ impl DownloadTransfer {
     }
 
     fn fail(&self, error: Error) -> WorkOutcome {
-        self.done.store(true, Ordering::Release);
         self.ctx.set_failed(error);
-        // Return a placeholder error - the real error is stored in ctx.status
-        // and will be retrieved by Body when channel closes
+        self.ctx.signal_terminal();
+
         WorkOutcome::Failed {
             error: crate::error::from_kind(crate::error::ErrorKind::RuntimeError)(
                 "transfer failed",
             ),
         }
+    }
+
+    fn complete(&self) {
+        self.ctx.set_completed();
+        self.ctx.signal_terminal();
     }
 }

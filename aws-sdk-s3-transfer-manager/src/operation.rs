@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{fs::Metadata, path::Path, sync::Arc};
-use std::sync::Mutex;
+use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::{fs::Metadata, path::Path};
 
 use crate::error;
 
@@ -23,35 +25,150 @@ pub mod upload_objects;
 // The default delimiter of the S3 object key
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
+// TODO(redux) - why use bool, just use () on cancellation channels.
 // Type aliases to channel ends to send/receive cancel notification
 pub(crate) type CancelNotificationSender = tokio::sync::watch::Sender<bool>;
 pub(crate) type CancelNotificationReceiver = tokio::sync::watch::Receiver<bool>;
 
-/// Error state for a failed transfer
-#[derive(Debug)]
-pub(crate) enum TransferError {
-    /// Error is available
-    Err(Box<error::Error>),
-    /// Error was already taken
-    Taken,
+/// Completion channel types
+pub(crate) type CompletionSender = tokio::sync::oneshot::Sender<()>;
+pub(crate) type CompletionReceiver = tokio::sync::oneshot::Receiver<()>;
+
+/// Transfer lifecycle status.
+///
+/// ## State Machine
+///
+/// ```text
+///              ┌──────────┐
+///  (enqueued)──►  Active  │
+///              └────┬─────┘
+///                   │
+///      ┌────────────┼────────────┐
+///      │            │            │
+///      ▼            ▼            ▼
+/// ┌──────────┐ ┌──────────┐ ┌───────────┐
+/// │Completed │ │  Failed  │ │ Cancelled │
+/// └──────────┘ └──────────┘ └───────────┘
+///
+/// Terminal states: Completed, Failed, Cancelled
+/// ```
+///
+/// ## Transitions
+///
+/// - `Active → Completed`: All work finished successfully, output available
+/// - `Active → Failed`: A work item failed, error stored in context
+/// - `Active → Cancelled`: User requested cancellation or handle dropped
+///
+/// ## First-Write-Wins Semantics
+///
+/// Only one transition from `Active` succeeds. Concurrent failures, cancellations,
+/// or completion attempts race - the first one wins, others are no-ops.
+///
+/// ## Terminal State Signaling
+///
+/// After transitioning to a terminal state, call `signal_terminal()` to notify
+/// waiters (e.g., `join()`). This signals "state machine has reached terminal
+/// state" - in-flight work may still be completing/draining.
+///
+/// ## Data Availability
+///
+/// | Status    | Error Available | Output Available |
+/// |-----------|-----------------|------------------|
+/// | Active    | No              | No               |
+/// | Completed | No              | Yes              |
+/// | Failed    | Yes (take once) | No               |
+/// | Cancelled | No              | No               |
+#[derive(Clone)]
+pub(crate) struct StateMachineStatus(Arc<AtomicU8>);
+
+// Status constants
+const STATUS_ACTIVE: u8 = 0;
+const STATUS_COMPLETED: u8 = 1;
+const STATUS_FAILED: u8 = 2;
+const STATUS_CANCELLED: u8 = 3;
+
+impl StateMachineStatus {
+    /// Create a new status in the Active state
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(STATUS_ACTIVE)))
+    }
+
+    /// Transition to Completed. Returns true if this call made the transition.
+    #[inline]
+    pub(crate) fn set_completed(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATUS_ACTIVE,
+                STATUS_COMPLETED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Transition to Failed. Returns true if this call made the transition.
+    #[inline]
+    pub(crate) fn set_failed(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATUS_ACTIVE,
+                STATUS_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Transition to Cancelled. Returns true if this call made the transition.
+    #[inline]
+    pub(crate) fn set_cancelled(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATUS_ACTIVE,
+                STATUS_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_ACTIVE
+    }
+
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_COMPLETED
+    }
+
+    #[inline]
+    pub(crate) fn is_failed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_FAILED
+    }
+
+    #[inline]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_CANCELLED
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self.0.load(Ordering::Acquire) {
+            STATUS_ACTIVE => "Active",
+            STATUS_COMPLETED => "Completed",
+            STATUS_FAILED => "Failed",
+            STATUS_CANCELLED => "Cancelled",
+            _ => "Unknown",
+        }
+    }
 }
 
-/// Transfer lifecycle status
-#[derive(Debug)]
-pub(crate) enum TransferStatus {
-    /// Transfer is actively processing
-    Active,
-    /// Transfer completed successfully
-    Completed,
-    /// Transfer failed
-    Failed(TransferError),
-    /// Transfer was cancelled
-    Cancelled,
-}
-
-impl Default for TransferStatus {
-    fn default() -> Self {
-        TransferStatus::Active
+impl fmt::Debug for StateMachineStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("StateMachineStatus")
+            .field(&self.as_str())
+            .finish()
     }
 }
 
@@ -66,23 +183,32 @@ pub(crate) struct TransferContext<State> {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// Operation-specific state
     pub(crate) state: Arc<State>,
-    /// Transfer lifecycle status (Arc for Clone)
-    status: Arc<Mutex<TransferStatus>>,
+    /// Transfer lifecycle status
+    status: StateMachineStatus,
+    /// Error storage (only used when status == Failed)
+    error: Arc<Mutex<Option<Box<error::Error>>>>,
+    /// Completion signal sender - signals "state machine reached terminal state"
+    completion_tx: Arc<Mutex<Option<CompletionSender>>>,
 }
 
 impl<State> TransferContext<State> {
-    /// Create a new transfer context from pre-built state
+    /// Create a new transfer context from pre-built state.
+    /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn from_state(
         id: crate::scheduler::TransferId,
         handle: Arc<crate::client::Handle>,
         state: Arc<State>,
-    ) -> Self {
-        Self {
+    ) -> (Self, CompletionReceiver) {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let ctx = Self {
             id,
             handle,
             state,
-            status: Arc::new(Mutex::new(TransferStatus::Active)),
-        }
+            status: StateMachineStatus::new(),
+            error: Arc::new(Mutex::new(None)),
+            completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
+        };
+        (ctx, completion_rx)
     }
 
     /// The S3 client to use for SDK operations
@@ -90,73 +216,80 @@ impl<State> TransferContext<State> {
         self.handle.config.client()
     }
 
-    /// Mark transfer as failed. First-write-wins - returns true if this call set the status.
+    /// Mark transfer as failed and store the error.
+    /// First-write-wins - returns true if this call set the status.
     pub(crate) fn set_failed(&self, err: error::Error) -> bool {
-        let mut status = self.status.lock().unwrap();
-        if matches!(*status, TransferStatus::Active) {
-            *status = TransferStatus::Failed(TransferError::Err(Box::new(err)));
+        if self.status.set_failed() {
+            *self.error.lock().unwrap() = Some(Box::new(err));
             true
         } else {
-            tracing::debug!("set_failed called but status already {:?}", *status);
             false
         }
     }
 
-    /// Mark transfer as completed. First-write-wins - returns true if this call set the status.
+    /// Mark transfer as completed.
+    /// First-write-wins - returns true if this call set the status.
+    #[inline]
     pub(crate) fn set_completed(&self) -> bool {
-        let mut status = self.status.lock().unwrap();
-        if matches!(*status, TransferStatus::Active) {
-            *status = TransferStatus::Completed;
-            true
-        } else {
-            tracing::debug!("set_completed called but status already {:?}", *status);
-            false
-        }
+        self.status.set_completed()
     }
 
-    /// Mark transfer as cancelled. First-write-wins - returns true if this call set the status.
+    /// Mark transfer as cancelled.
+    /// First-write-wins - returns true if this call set the status.
+    #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        let mut status = self.status.lock().unwrap();
-        if matches!(*status, TransferStatus::Active) {
-            *status = TransferStatus::Cancelled;
-            true
-        } else {
-            tracing::debug!("set_cancelled called but status already {:?}", *status);
-            false
-        }
+        self.status.set_cancelled()
     }
 
     /// Take the error if transfer failed. Returns None if not failed or already taken.
     pub(crate) fn take_error(&self) -> Option<error::Error> {
-        let mut status = self.status.lock().unwrap();
-        match &mut *status {
-            TransferStatus::Failed(transfer_err) => {
-                match std::mem::replace(transfer_err, TransferError::Taken) {
-                    TransferError::Err(err) => Some(*err),
-                    TransferError::Taken => None,
-                }
-            }
-            _ => None,
+        if self.status.is_failed() {
+            self.error.lock().unwrap().take().map(|e| *e)
+        } else {
+            None
         }
     }
 
     /// Peek at the error kind if transfer failed. Returns None if not failed or already taken.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
-        let status = self.status.lock().unwrap();
-        match &*status {
-            TransferStatus::Failed(TransferError::Err(err)) => Some(err.kind().clone()),
-            _ => None,
+        if self.status.is_failed() {
+            self.error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|e| e.kind().clone())
+        } else {
+            None
         }
     }
 
     /// Check if transfer has failed
+    #[inline]
     pub(crate) fn is_failed(&self) -> bool {
-        matches!(*self.status.lock().unwrap(), TransferStatus::Failed(_))
+        self.status.is_failed()
     }
 
     /// Check if transfer was cancelled
+    #[inline]
     pub(crate) fn is_cancelled(&self) -> bool {
-        matches!(*self.status.lock().unwrap(), TransferStatus::Cancelled)
+        self.status.is_cancelled()
+    }
+
+    /// Check if transfer is still active (not completed, failed, or cancelled)
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.status.is_active()
+    }
+
+    /// Signal that the transfer state machine has reached a terminal state.
+    ///
+    /// Call this after `set_completed()`/`set_failed()`/`set_cancelled()`.
+    /// Wakes any waiters (e.g., `join()`). Note: in-flight work may still
+    /// be draining when this is called.
+    pub(crate) fn signal_terminal(&self) {
+        if let Some(tx) = self.completion_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -167,6 +300,8 @@ impl<State> Clone for TransferContext<State> {
             handle: self.handle.clone(),
             state: self.state.clone(),
             status: self.status.clone(),
+            error: self.error.clone(),
+            completion_tx: self.completion_tx.clone(),
         }
     }
 }
