@@ -568,7 +568,7 @@ impl UploadTransfer {
                 "upload failed",
             )));
         }
-        WorkOutcome::Failed { error }
+        WorkOutcome::Failed
     }
 }
 

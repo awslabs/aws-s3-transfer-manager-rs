@@ -86,12 +86,26 @@ impl Body {
 
             match self.inner.next().await {
                 None => {
-                    // Channel closed - check if transfer failed
-                    if let Some(ctx) = &self.ctx {
-                        if let Some(kind) = ctx.error_kind() {
-                            self.close();
-                            return Some(Err(crate::error::from_kind(kind)("transfer failed")));
+                    // Channel closed - check if transfer failed or was cancelled
+                    // TODO(cleanup): ctx is Option because Body::empty() exists but is unused.
+                    // Consider removing empty() and making ctx non-optional.
+                    let terminal_error = self.ctx.as_ref().and_then(|ctx| {
+                        if ctx.is_cancelled() {
+                            Some(crate::error::from_kind(
+                                crate::error::ErrorKind::OperationCancelled,
+                            )("download cancelled"))
+                        } else if ctx.is_failed() {
+                            let kind = ctx
+                                .error_kind()
+                                .unwrap_or(crate::error::ErrorKind::ChildOperationFailed);
+                            Some(crate::error::from_kind(kind)("transfer failed"))
+                        } else {
+                            None
                         }
+                    });
+                    if let Some(err) = terminal_error {
+                        self.close();
+                        return Some(Err(err));
                     }
                     break;
                 }

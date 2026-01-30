@@ -6,13 +6,13 @@
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
-use crate::error;
-use crate::operation::download::body::ChunkOutput;
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::operation::{CancelNotificationReceiver, CancelNotificationSender, TransferContext};
+use crate::operation::{
+    CancelNotificationReceiver, CancelNotificationSender, ChunkSender, TransferContext,
+};
 use crate::types::BucketType;
 
 pub(crate) type DownloadContext = TransferContext<DownloadState>;
@@ -142,7 +142,3 @@ impl DownloadWorkState {
         DownloadWorkState::PendingDiscovery { chunk_tx }
     }
 }
-
-/// Channel sender for chunks - will be used by DownloadTransfer
-#[allow(dead_code)]
-pub(crate) type ChunkSender = mpsc::Sender<Result<ChunkOutput, error::Error>>;

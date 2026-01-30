@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::io::{InputStream, PartData};
 use crate::operation::download::ChunkMetadata;
+use crate::operation::ChunkSender;
 
 use aws_sdk_s3::primitives::ByteStream;
 
@@ -65,7 +66,10 @@ pub(crate) enum WorkData {
 
     // ==================== Download ====================
     /// Discover object metadata (HeadObject or first ranged GET)
-    Discovery,
+    Discovery {
+        /// Channel to send chunks to Body
+        chunk_tx: ChunkSender,
+    },
     /// Read the body from discovery's initial chunk
     ReadDiscoveryBody {
         /// The body stream from discovery
@@ -74,6 +78,8 @@ pub(crate) enum WorkData {
         seq: u64,
         /// Metadata from the discovery response
         chunk_meta: ChunkMetadata,
+        /// Channel to send chunks to Body
+        chunk_tx: ChunkSender,
     },
     /// Download a range of an object (Network only for now)
     GetObjectRange {
@@ -83,6 +89,8 @@ pub(crate) enum WorkData {
         seq: u64,
         /// ETag for if_match consistency (from discovery, shared across all ranges)
         etag: Option<Arc<str>>,
+        /// Channel to send chunks to Body
+        chunk_tx: ChunkSender,
     },
 }
 
@@ -106,8 +114,7 @@ pub(crate) enum WorkOutcome {
         schedule_next: Option<WorkKind>,
         data: WorkData,
     },
-    Failed {
-        error: crate::error::Error,
-    },
+    /// Work failed - error is stored in transfer context, not here
+    Failed,
     Cancelled,
 }

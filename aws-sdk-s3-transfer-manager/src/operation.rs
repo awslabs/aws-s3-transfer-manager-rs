@@ -34,6 +34,10 @@ pub(crate) type CancelNotificationReceiver = tokio::sync::watch::Receiver<bool>;
 pub(crate) type CompletionSender = tokio::sync::oneshot::Sender<()>;
 pub(crate) type CompletionReceiver = tokio::sync::oneshot::Receiver<()>;
 
+/// Channel for sending download chunks to Body
+pub(crate) type ChunkSender =
+    tokio::sync::mpsc::Sender<Result<download::ChunkOutput, crate::error::Error>>;
+
 /// Transfer lifecycle status.
 ///
 /// ## State Machine

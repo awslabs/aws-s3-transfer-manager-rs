@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use tokio::sync::{mpsc, Mutex, OnceCell};
+use tokio::sync::{mpsc, OnceCell};
 
 use crate::error::{self, ErrorKind};
 use crate::operation::download::body::Body;
@@ -26,11 +26,7 @@ pub struct DownloadHandle {
     /// Download context
     pub(crate) ctx: DownloadContext,
 
-    /// Chunk receiver - kept to pass to body
-    pub(crate) chunk_rx: Mutex<Option<mpsc::Receiver<Result<ChunkOutput, error::Error>>>>,
-
     /// Completion signal receiver - signals state machine reached terminal state
-    // TODO(redux): Move to TransferContext to unify across transfer types
     pub(crate) completion_rx: Option<CompletionReceiver>,
 }
 
@@ -44,7 +40,6 @@ impl DownloadHandle {
             body: Body::new(chunk_rx, ctx.clone()),
             object_meta: OnceCell::new(),
             ctx,
-            chunk_rx: Mutex::new(None),
             completion_rx: Some(completion_rx),
         }
     }

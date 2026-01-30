@@ -356,9 +356,7 @@ impl<S: MockStateMachine> MockStateMachine for FailAt<S> {
         Box::pin(async move {
             let count = self.execution_count.fetch_add(1, Ordering::SeqCst) + 1;
             if count == self.fail_at {
-                WorkOutcome::Failed {
-                    error: Error::new(self.error_kind.clone(), self.error_msg),
-                }
+                WorkOutcome::Failed
             } else {
                 self.inner.execute(work).await
             }

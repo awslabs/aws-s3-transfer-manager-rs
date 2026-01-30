@@ -6,7 +6,6 @@
 //! Download transfer implementation for scheduler integration.
 
 use std::cmp;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use bytes_utils::SegmentedBuf;
@@ -18,6 +17,7 @@ use crate::operation::download::body::ChunkOutput;
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadContext, DownloadWorkState};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
+use crate::operation::ChunkSender;
 use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 /// Download transfer that generates and executes download work.
@@ -52,12 +52,16 @@ impl DownloadTransfer {
 
         match &mut *work {
             DownloadWorkState::PendingDiscovery { chunk_tx } => {
-                let chunk_tx = chunk_tx.clone();
-                *work = DownloadWorkState::DiscoveryInFlight { chunk_tx };
+                let chunk_tx_clone = chunk_tx.clone();
+                *work = DownloadWorkState::DiscoveryInFlight {
+                    chunk_tx: chunk_tx.clone(),
+                };
                 PollWork::Ready(WorkItem {
                     transfer_id: self.id(),
                     kind: WorkKind::Network,
-                    data: WorkData::Discovery,
+                    data: WorkData::Discovery {
+                        chunk_tx: chunk_tx_clone,
+                    },
                 })
             }
             DownloadWorkState::DiscoveryInFlight { .. } => PollWork::Pending,
@@ -65,6 +69,7 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight,
                 etag,
+                chunk_tx,
                 ..
             } => {
                 if let Some(range) = remaining.take() {
@@ -88,6 +93,7 @@ impl DownloadTransfer {
                             range: chunk_range,
                             seq,
                             etag: etag.clone(),
+                            chunk_tx: chunk_tx.clone(),
                         },
                     })
                 } else if *ranges_in_flight > 0 {
@@ -106,28 +112,35 @@ impl DownloadTransfer {
 
     pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
         match &mut work.data {
-            WorkData::Discovery => self.execute_discovery().await,
+            WorkData::Discovery { chunk_tx } => self.execute_discovery(chunk_tx.clone()).await,
             WorkData::ReadDiscoveryBody {
                 stream,
                 seq,
                 chunk_meta,
+                chunk_tx,
             } => {
                 self.execute_read_discovery_body(
                     std::mem::take(stream),
                     *seq,
                     std::mem::take(chunk_meta),
+                    chunk_tx.clone(),
                 )
                 .await
             }
-            WorkData::GetObjectRange { range, seq, etag } => {
-                self.execute_get_range(range.clone(), *seq, etag.clone())
+            WorkData::GetObjectRange {
+                range,
+                seq,
+                etag,
+                chunk_tx,
+            } => {
+                self.execute_get_range(range.clone(), *seq, etag.clone(), chunk_tx.clone())
                     .await
             }
             _ => unreachable!("download transfer received unexpected work data"),
         }
     }
 
-    async fn execute_discovery(&self) -> WorkOutcome {
+    async fn execute_discovery(&self, chunk_tx: ChunkSender) -> WorkOutcome {
         let input = self.ctx.state.request();
 
         let discovery = match discover_obj(&self.ctx, input).await {
@@ -149,16 +162,12 @@ impl DownloadTransfer {
 
         {
             let mut work = self.ctx.state.work.lock().unwrap();
-            let chunk_tx = match std::mem::replace(&mut *work, DownloadWorkState::Done) {
-                DownloadWorkState::DiscoveryInFlight { chunk_tx } => chunk_tx,
-                _ => panic!("unexpected state in execute_discovery"),
-            };
             *work = DownloadWorkState::Transferring {
                 remaining,
                 ranges_in_flight: if has_initial_chunk { 1 } else { 0 },
                 etag,
                 object_meta,
-                chunk_tx,
+                chunk_tx: chunk_tx.clone(),
             };
         }
 
@@ -170,11 +179,12 @@ impl DownloadTransfer {
                     stream,
                     seq: 0,
                     chunk_meta,
+                    chunk_tx,
                 },
             },
             _ => WorkOutcome::Success {
                 schedule_next: None,
-                data: WorkData::Discovery,
+                data: WorkData::Discovery { chunk_tx },
             },
         }
     }
@@ -184,6 +194,7 @@ impl DownloadTransfer {
         stream: aws_sdk_s3::primitives::ByteStream,
         seq: u64,
         chunk_meta: ChunkMetadata,
+        chunk_tx: ChunkSender,
     ) -> WorkOutcome {
         // Read the body from the discovery response
         let body = match stream.collect().await {
@@ -202,32 +213,24 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        {
-            let work = self.ctx.state.work.lock().unwrap();
-            let chunk_tx = match &*work {
-                DownloadWorkState::Transferring { chunk_tx, .. } => chunk_tx,
-                _ => {
-                    return self.fail(error::from_kind(error::ErrorKind::RuntimeError)(
-                        "unexpected state",
-                    ))
-                }
-            };
-            let _ = chunk_tx.try_send(Ok(chunk));
-        }
+        let _ = chunk_tx.try_send(Ok(chunk));
 
         self.decrement_in_flight();
 
         WorkOutcome::Success {
             schedule_next: None,
-            data: WorkData::Discovery, // No follow-on work
+            data: WorkData::Discovery {
+                chunk_tx: chunk_tx.clone(),
+            },
         }
     }
 
     async fn execute_get_range(
         &self,
-        range: RangeInclusive<u64>,
+        range: std::ops::RangeInclusive<u64>,
         seq: u64,
         etag: Option<Arc<str>>,
+        chunk_tx: ChunkSender,
     ) -> WorkOutcome {
         let input = self.ctx.state.request();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
@@ -272,24 +275,18 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        {
-            let work = self.ctx.state.work.lock().unwrap();
-            let chunk_tx = match &*work {
-                DownloadWorkState::Transferring { chunk_tx, .. } => chunk_tx,
-                _ => {
-                    return self.fail(error::from_kind(error::ErrorKind::RuntimeError)(
-                        "unexpected state",
-                    ))
-                }
-            };
-            let _ = chunk_tx.try_send(Ok(chunk));
-        }
+        let _ = chunk_tx.try_send(Ok(chunk));
 
         self.decrement_in_flight();
 
         WorkOutcome::Success {
             schedule_next: None,
-            data: WorkData::GetObjectRange { range, seq, etag },
+            data: WorkData::GetObjectRange {
+                range,
+                seq,
+                etag,
+                chunk_tx,
+            },
         }
     }
 
@@ -306,12 +303,7 @@ impl DownloadTransfer {
     fn fail(&self, error: Error) -> WorkOutcome {
         self.ctx.set_failed(error);
         self.ctx.signal_terminal();
-
-        WorkOutcome::Failed {
-            error: crate::error::from_kind(crate::error::ErrorKind::RuntimeError)(
-                "transfer failed",
-            ),
-        }
+        WorkOutcome::Failed
     }
 
     fn complete(&self) {
