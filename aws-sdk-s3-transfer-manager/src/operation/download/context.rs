@@ -116,8 +116,9 @@ pub(crate) enum DownloadWorkState {
         chunk_tx: ChunkSender,
     },
 
-    /// Done
-    Done,
+    /// Terminal state - transfer ended (success, failure, or cancelled)
+    /// TransferContext status holds final result
+    Terminal,
 }
 
 impl DownloadWorkState {

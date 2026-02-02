@@ -100,13 +100,13 @@ impl DownloadTransfer {
                     // All ranges generated, waiting for in-flight to complete
                     PollWork::Pending
                 } else {
-                    *work = DownloadWorkState::Done;
+                    *work = DownloadWorkState::Terminal;
                     // all done - success
                     self.complete();
                     PollWork::Done
                 }
             }
-            DownloadWorkState::Done => PollWork::Done,
+            DownloadWorkState::Terminal => PollWork::Done,
         }
     }
 
@@ -146,8 +146,6 @@ impl DownloadTransfer {
         let discovery = match discover_obj(&self.ctx, input).await {
             Ok(d) => d,
             Err(e) => {
-                // Notify waiters that discovery failed
-                self.ctx.state.discovery_notify.notify_waiters();
                 return self.fail(e);
             }
         };
@@ -309,8 +307,15 @@ impl DownloadTransfer {
         }
     }
 
+    /// Transition to terminal failed state.
+    /// Must NOT be called while holding the work lock.
     fn fail(&self, error: Error) -> WorkOutcome {
+        // Order matters: set status/error before any wakeups
         self.ctx.set_failed(error);
+        // Transition to Terminal - releases chunk_tx
+        *self.ctx.state.work.lock().unwrap() = DownloadWorkState::Terminal;
+        // Wake all waiters
+        self.ctx.state.discovery_notify.notify_waiters();
         self.ctx.signal_terminal();
         WorkOutcome::Failed
     }
