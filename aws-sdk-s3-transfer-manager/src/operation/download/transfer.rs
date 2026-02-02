@@ -221,15 +221,17 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        let _ = chunk_tx.try_send(Ok(chunk));
-
+        let send_result = chunk_tx.send(Ok(chunk)).await;
         self.decrement_in_flight();
 
-        WorkOutcome::Success {
-            schedule_next: None,
-            data: WorkData::Discovery {
-                chunk_tx: chunk_tx.clone(),
+        match send_result {
+            Ok(()) => WorkOutcome::Success {
+                schedule_next: None,
+                data: WorkData::Discovery {
+                    chunk_tx: chunk_tx.clone(),
+                },
             },
+            Err(_) => WorkOutcome::Cancelled,
         }
     }
 
@@ -285,18 +287,20 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        let _ = chunk_tx.try_send(Ok(chunk));
-
+        let send_result = chunk_tx.send(Ok(chunk)).await;
         self.decrement_in_flight();
 
-        WorkOutcome::Success {
-            schedule_next: None,
-            data: WorkData::GetObjectRange {
-                range,
-                seq,
-                etag,
-                chunk_tx,
+        match send_result {
+            Ok(()) => WorkOutcome::Success {
+                schedule_next: None,
+                data: WorkData::GetObjectRange {
+                    range,
+                    seq,
+                    etag,
+                    chunk_tx,
+                },
             },
+            Err(_) => WorkOutcome::Cancelled,
         }
     }
 
