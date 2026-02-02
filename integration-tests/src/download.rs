@@ -129,7 +129,6 @@ async fn test_download_body_not_consumed() {
 
 /// Test abort cancels in-flight work
 #[tokio::test]
-#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_abort() {
     let part_size = ByteUnit::Mebibyte.as_bytes_usize();
     let (server, server_handle, tm) = setup_with_part_size(part_size).await;
@@ -177,7 +176,6 @@ async fn test_download_not_found() {
 
 /// Test object metadata is available after discovery
 #[tokio::test]
-#[ignore = "TODO(redux): object_meta() needs to wait for discovery"]
 async fn test_download_object_meta() {
     let (server, server_handle, tm) = setup().await;
 

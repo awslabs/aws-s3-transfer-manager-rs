@@ -100,9 +100,8 @@ impl DownloadTransfer {
                     // All ranges generated, waiting for in-flight to complete
                     PollWork::Pending
                 } else {
-                    *work = DownloadWorkState::Terminal;
-                    // all done - success
-                    self.complete();
+                    // All done - success
+                    self.complete(work);
                     PollWork::Done
                 }
             }
@@ -146,7 +145,8 @@ impl DownloadTransfer {
         let discovery = match discover_obj(&self.ctx, input).await {
             Ok(d) => d,
             Err(e) => {
-                return self.fail(e);
+                let guard = self.ctx.state.work.lock().unwrap();
+                return self.fail(guard, e);
             }
         };
 
@@ -208,7 +208,8 @@ impl DownloadTransfer {
             Ok(b) => b.into_bytes(),
             Err(e) => {
                 self.decrement_in_flight();
-                return self.fail(error::chunk_failed(ChunkId::Download(seq), e));
+                let guard = self.ctx.state.work.lock().unwrap();
+                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
             }
         };
 
@@ -258,7 +259,8 @@ impl DownloadTransfer {
             Ok(r) => r,
             Err(e) => {
                 self.decrement_in_flight();
-                return self.fail(error::chunk_failed(ChunkId::Download(seq), e));
+                let guard = self.ctx.state.work.lock().unwrap();
+                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
             }
         };
 
@@ -270,7 +272,8 @@ impl DownloadTransfer {
             Ok(b) => b.into_bytes(),
             Err(e) => {
                 self.decrement_in_flight();
-                return self.fail(error::chunk_failed(ChunkId::Download(seq), e));
+                let guard = self.ctx.state.work.lock().unwrap();
+                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
             }
         };
 
@@ -307,21 +310,28 @@ impl DownloadTransfer {
         }
     }
 
-    /// Transition to terminal failed state.
-    /// Must NOT be called while holding the work lock.
-    fn fail(&self, error: Error) -> WorkOutcome {
+    /// Transition to terminal failed state. Requires holding the work lock.
+    fn fail(
+        &self,
+        mut guard: std::sync::MutexGuard<'_, DownloadWorkState>,
+        error: Error,
+    ) -> WorkOutcome {
         // Order matters: set status/error before any wakeups
         self.ctx.set_failed(error);
         // Transition to Terminal - releases chunk_tx
-        *self.ctx.state.work.lock().unwrap() = DownloadWorkState::Terminal;
-        // Wake all waiters
+        *guard = DownloadWorkState::Terminal;
+        drop(guard); // release lock before signaling waiters
+                     // Wake all waiters
         self.ctx.state.discovery_notify.notify_waiters();
         self.ctx.signal_terminal();
         WorkOutcome::Failed
     }
 
-    fn complete(&self) {
+    /// Transition to terminal success state. Requires holding the work lock.
+    fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadWorkState>) {
         self.ctx.set_completed();
+        *guard = DownloadWorkState::Terminal;
+        drop(guard); // release lock before signaling waiters
         self.ctx.signal_terminal();
     }
 }
