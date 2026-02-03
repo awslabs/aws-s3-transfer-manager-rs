@@ -140,7 +140,6 @@ mod tests {
         assert!(tm_interceptor_exists);
     }
 
-    #[ignore = "TODO(redux): download implementation inprogress"]
     #[tokio::test]
     async fn load_with_interceptor_and_framework_metadata() {
         let (http_client, captured_request) = capture_request(None);
