@@ -350,7 +350,8 @@ impl DownloadTransfer {
 mod tests {
     use super::*;
     use crate::operation::download::DownloadInput;
-    use crate::scheduler::{PollWork, WorkData, WorkItem};
+    use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
+    use crate::scheduler::{WorkData, WorkItem, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -409,23 +410,8 @@ mod tests {
         DownloadTransfer::new(ctx)
     }
 
-    fn assert_ready(poll: PollWork) -> WorkItem {
-        match poll {
-            PollWork::Ready(w) => w,
-            PollWork::Pending => panic!("expected Ready, got Pending"),
-            PollWork::Done => panic!("expected Ready, got Done"),
-        }
-    }
-
-    fn assert_pending(poll: PollWork) {
-        assert!(matches!(poll, PollWork::Pending), "expected Pending");
-    }
-
-    fn assert_done(poll: PollWork) {
-        assert!(matches!(poll, PollWork::Done), "expected Done");
-    }
-
-    /// Execute and handle follow-on work (e.g., ReadDiscoveryBody)
+    /// Execute and handle follow-on work (e.g., ReadDiscoveryBody).
+    /// Uses DownloadTransfer directly for type-specific behavior.
     async fn execute(transfer: &DownloadTransfer, work: &mut WorkItem) -> WorkOutcome {
         let outcome = transfer.execute(work).await;
         if let WorkOutcome::Success {
@@ -576,10 +562,6 @@ mod tests {
     async fn test_cancellation_transitions_to_cancelled() {
         todo!()
     }
-
-    // =========================================================================
-    // Failure injection
-    // =========================================================================
 
     use crate::http::header::Range;
     use aws_smithy_mocks::MockResponse;

@@ -538,7 +538,8 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::operation::upload::UploadInput;
-    use crate::scheduler::{PollWork, WorkData, WorkKind};
+    use crate::scheduler::test_util::{assert_pending, assert_ready};
+    use crate::scheduler::{WorkData, WorkKind};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -612,8 +613,8 @@ mod tests {
         let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts at 8MB default
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
-        let work = transfer.poll_work();
-        assert!(matches!(work, PollWork::Ready(w) if matches!(w.data, WorkData::CreateMPU)));
+        let work = assert_ready(transfer.poll_work());
+        assert!(matches!(work.data, WorkData::CreateMPU));
     }
 
     #[test]
@@ -623,12 +624,10 @@ mod tests {
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
         // First poll returns CreateMPU
-        let work = transfer.poll_work();
-        assert!(matches!(work, PollWork::Ready(_)));
+        let _work = assert_ready(transfer.poll_work());
 
         // Second poll should return Pending (init_in_flight = true)
-        let work = transfer.poll_work();
-        assert!(matches!(work, PollWork::Pending));
+        assert_pending(transfer.poll_work());
     }
 
     #[tokio::test]
@@ -638,26 +637,24 @@ mod tests {
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
         // Get and execute CreateMPU
-        let mut work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready"),
-        };
+        let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
 
         // Now should generate UploadPart work items
-        let work1 = transfer.poll_work();
-        assert!(
-            matches!(work1, PollWork::Ready(w) if matches!(w.data, WorkData::UploadPart { part_number: 1, .. }))
-        );
+        let work1 = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work1.data,
+            WorkData::UploadPart { part_number: 1, .. }
+        ));
 
-        let work2 = transfer.poll_work();
-        assert!(
-            matches!(work2, PollWork::Ready(w) if matches!(w.data, WorkData::UploadPart { part_number: 2, .. }))
-        );
+        let work2 = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work2.data,
+            WorkData::UploadPart { part_number: 2, .. }
+        ));
 
         // After all parts generated, should be Pending
-        let work3 = transfer.poll_work();
-        assert!(matches!(work3, PollWork::Pending));
+        assert_pending(transfer.poll_work());
     }
 
     // ==================== execute tests ====================
@@ -668,10 +665,7 @@ mod tests {
         let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
-        let mut work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready"),
-        };
+        let mut work = assert_ready(transfer.poll_work());
 
         let outcome = transfer.execute(&mut work).await;
         assert!(matches!(
@@ -683,10 +677,8 @@ mod tests {
         ));
 
         // After CreateMPU, should be able to generate parts
-        let next = transfer.poll_work();
-        assert!(
-            matches!(next, PollWork::Ready(w) if matches!(w.data, WorkData::UploadPart { .. }))
-        );
+        let next = assert_ready(transfer.poll_work());
+        assert!(matches!(next.data, WorkData::UploadPart { .. }));
     }
 
     #[tokio::test]
@@ -696,17 +688,11 @@ mod tests {
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
         // Execute CreateMPU
-        let mut create_work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready"),
-        };
+        let mut create_work = assert_ready(transfer.poll_work());
         transfer.execute(&mut create_work).await;
 
         // Get UploadPart work (DataIO phase)
-        let mut part_work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready"),
-        };
+        let mut part_work = assert_ready(transfer.poll_work());
         assert_eq!(part_work.kind, WorkKind::DataIO);
 
         // Execute DataIO phase - should return schedule_next = Network
@@ -735,17 +721,11 @@ mod tests {
         let (transfer, rx) = create_test_transfer(s3_client, content);
 
         // 1. CreateMPU
-        let mut work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready"),
-        };
+        let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
 
         // 2. UploadPart - DataIO phase
-        let mut work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready"),
-        };
+        let mut work = assert_ready(transfer.poll_work());
         let outcome = transfer.execute(&mut work).await;
 
         // 3. UploadPart - Network phase (continue with schedule_next data)
@@ -763,10 +743,7 @@ mod tests {
         transfer.execute(&mut work).await;
 
         // 3b. Second UploadPart - DataIO phase
-        let mut work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready for part 2"),
-        };
+        let mut work = assert_ready(transfer.poll_work());
         let outcome = transfer.execute(&mut work).await;
 
         // 3c. Second UploadPart - Network phase
@@ -784,15 +761,13 @@ mod tests {
         transfer.execute(&mut work).await;
 
         // 4. CompleteMPU
-        let mut work = match transfer.poll_work() {
-            PollWork::Ready(w) => w,
-            _ => panic!("expected Ready for CompleteMPU"),
-        };
+        let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(work.data, WorkData::CompleteMPU));
         transfer.execute(&mut work).await;
 
         // 5. Should be Done
-        assert!(matches!(transfer.poll_work(), PollWork::Done));
+        use crate::scheduler::test_util::assert_done;
+        assert_done(transfer.poll_work());
 
         // 6. Result should be available
         let result = rx.await.expect("result channel");

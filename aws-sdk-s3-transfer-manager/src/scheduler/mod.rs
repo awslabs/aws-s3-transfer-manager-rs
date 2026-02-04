@@ -15,3 +15,8 @@ pub(crate) use work::{
 
 #[cfg(test)]
 pub(crate) use transfer::MockTransfer;
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    pub(crate) use super::transfer::test_util::*;
+}
