@@ -111,11 +111,15 @@ impl WorkData {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self.0 {
                     WorkData::CreateMPU => write!(f, "CreateMPU"),
-                    WorkData::UploadPart { part_number, .. } => write!(f, "UploadPart({})", part_number),
+                    WorkData::UploadPart { part_number, .. } => {
+                        write!(f, "UploadPart({})", part_number)
+                    }
                     WorkData::CompleteMPU => write!(f, "CompleteMPU"),
                     WorkData::PutObject { .. } => write!(f, "PutObject"),
                     WorkData::Discovery { .. } => write!(f, "Discovery"),
-                    WorkData::ReadDiscoveryBody { seq, .. } => write!(f, "ReadDiscoveryBody({})", seq),
+                    WorkData::ReadDiscoveryBody { seq, .. } => {
+                        write!(f, "ReadDiscoveryBody({})", seq)
+                    }
                     WorkData::GetObjectRange { seq, .. } => write!(f, "GetObjectRange({})", seq),
                 }
             }

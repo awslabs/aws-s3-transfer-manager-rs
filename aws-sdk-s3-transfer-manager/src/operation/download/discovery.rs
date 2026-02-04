@@ -181,7 +181,8 @@ fn first_chunk_response_handler(
     let chunk_meta: ChunkMetadata = resp.into();
     let chunk_content_len = chunk_meta
         .content_length
-        .ok_or_else(|| error::discovery_failed("response missing content-length"))? as u64;
+        .ok_or_else(|| error::discovery_failed("response missing content-length"))?
+        as u64;
     let remaining = object_meta
         .content_length()
         .checked_sub(1)
