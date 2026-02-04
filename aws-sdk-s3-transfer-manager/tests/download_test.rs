@@ -17,6 +17,7 @@ use std::{
 };
 
 use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use test_common::drain;
@@ -447,8 +448,9 @@ const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 /// Test that if the object modified during download.
 #[tokio::test]
-#[ignore = "TODO(redux): Implement DownloadTransfer - object modified handling"]
+#[ignore = "blocked on scheduler outstanding tracking bug - see tasks.md"]
 async fn test_download_object_modified() {
+    let _logs = show_test_logs();
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
@@ -501,4 +503,12 @@ async fn test_download_object_modified() {
 
     let error = drain(&mut handle).await.unwrap_err();
     assert!(format!("{:?}", error).contains("PreconditionFailed"));
+    // drain() returns a generic error; join() returns the actual error with full context
+    let _drain_err = drain(&mut handle).await.unwrap_err();
+    let error = handle.join().await.unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("PreconditionFailed"),
+        "expected PreconditionFailed, got: {:?}",
+        error
+    );
 }

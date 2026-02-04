@@ -167,6 +167,12 @@ impl StateMachineStatus {
     }
 }
 
+impl fmt::Display for StateMachineStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl fmt::Debug for StateMachineStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("StateMachineStatus")
@@ -192,6 +198,12 @@ pub(crate) struct TransferContext<State> {
     error: Arc<Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
+}
+
+impl<State> fmt::Display for TransferContext<State> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Transfer(id={}, status={})", self.id.id, self.status)
+    }
 }
 
 impl<State> TransferContext<State> {
@@ -282,6 +294,12 @@ impl<State> TransferContext<State> {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    /// Check if transfer completed successfully
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.status.is_completed()
     }
 
     /// Signal that the transfer state machine has reached a terminal state.

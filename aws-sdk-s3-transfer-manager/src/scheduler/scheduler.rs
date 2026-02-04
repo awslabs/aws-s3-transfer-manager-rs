@@ -383,19 +383,25 @@ impl SchedulerInner {
 
 /// Worker loop - pulls work from pool and executes it.
 async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
+    static WORKER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let wid = WORKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     loop {
-        // Pull work (blocks until available + has capacity, or shutdown)
         let Some(mut work) = pool.next_work().await else {
-            break; // Shutdown signaled
+            tracing::debug!(wid, "shutdown");
+            break;
         };
 
-        // Get transfer - may be gone if aborted
-        let Some(transfer) = scheduler.get_transfer(work.transfer_id) else {
-            pool.complete(); // Free capacity
+        let tid = work.transfer_id;
+
+        let Some(transfer) = scheduler.get_transfer(tid) else {
+            tracing::debug!(wid, %tid, work = %work.data.debug_label(), "transfer gone");
+            pool.complete();
             continue;
         };
 
-        // Execute work with cancellation support
+        tracing::debug!(wid, %tid, work = %work.data.debug_label(), "executing");
+
         let token = transfer.cancellation_token().clone();
         let outcome = tokio::select! {
             biased;
@@ -403,7 +409,8 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             outcome = transfer.execute(&mut work) => outcome,
         };
 
-        // Free capacity and notify scheduler
+        tracing::debug!(wid, %tid, work = %work.data.debug_label(), ?outcome, "completed");
+
         pool.complete();
         scheduler.on_completion(work, outcome);
     }

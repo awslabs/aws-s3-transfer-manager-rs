@@ -28,6 +28,15 @@ pub(crate) struct TransferId {
     pub(crate) parent: Option<u64>,
 }
 
+impl std::fmt::Display for TransferId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.parent {
+            Some(parent) => write!(f, "{}-{}", self.id, parent),
+            None => write!(f, "{}", self.id),
+        }
+    }
+}
+
 /// A unit of work to be scheduled.
 #[derive(Debug)]
 pub(crate) struct WorkItem {
@@ -92,6 +101,27 @@ pub(crate) enum WorkData {
         /// Channel to send chunks to Body
         chunk_tx: ChunkSender,
     },
+}
+
+impl WorkData {
+    /// Short label for logging
+    pub(crate) fn debug_label(&self) -> impl std::fmt::Display + '_ {
+        struct Label<'a>(&'a WorkData);
+        impl std::fmt::Display for Label<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.0 {
+                    WorkData::CreateMPU => write!(f, "CreateMPU"),
+                    WorkData::UploadPart { part_number, .. } => write!(f, "UploadPart({})", part_number),
+                    WorkData::CompleteMPU => write!(f, "CompleteMPU"),
+                    WorkData::PutObject { .. } => write!(f, "PutObject"),
+                    WorkData::Discovery { .. } => write!(f, "Discovery"),
+                    WorkData::ReadDiscoveryBody { seq, .. } => write!(f, "ReadDiscoveryBody({})", seq),
+                    WorkData::GetObjectRange { seq, .. } => write!(f, "GetObjectRange({})", seq),
+                }
+            }
+        }
+        Label(self)
+    }
 }
 
 /// Result of polling a transfer for work.

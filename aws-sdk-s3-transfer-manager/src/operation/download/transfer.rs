@@ -43,8 +43,10 @@ impl DownloadTransfer {
         &self.cancellation_token
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.ctx.is_active() {
+            tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
 
@@ -109,6 +111,7 @@ impl DownloadTransfer {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = %work.data.debug_label()))]
     pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
         match &mut work.data {
             WorkData::Discovery { chunk_tx } => self.execute_discovery(chunk_tx.clone()).await,
@@ -180,15 +183,18 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, schedule work to read it
         match (initial_chunk, chunk_meta) {
-            (Some(stream), Some(chunk_meta)) => WorkOutcome::Success {
-                schedule_next: Some(WorkKind::Network),
-                data: WorkData::ReadDiscoveryBody {
-                    stream,
-                    seq: 0,
-                    chunk_meta,
-                    chunk_tx,
-                },
-            },
+            (Some(stream), Some(chunk_meta)) => {
+                let seq = self.ctx.next_seq(); // Claim seq for initial chunk
+                WorkOutcome::Success {
+                    schedule_next: Some(WorkKind::Network),
+                    data: WorkData::ReadDiscoveryBody {
+                        stream,
+                        seq,
+                        chunk_meta,
+                        chunk_tx,
+                    },
+                }
+            }
             _ => WorkOutcome::Success {
                 schedule_next: None,
                 data: WorkData::Discovery { chunk_tx },

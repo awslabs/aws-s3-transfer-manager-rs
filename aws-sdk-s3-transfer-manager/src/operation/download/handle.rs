@@ -96,12 +96,14 @@ impl DownloadHandle {
         }
 
         if self.ctx.is_failed() {
+            tracing::debug!(ctx = %self.ctx, "join: cancelling and waiting for idle");
             self.ctx.handle.new_scheduler.cancel_transfer(self.ctx.id);
             self.ctx
                 .handle
                 .new_scheduler
                 .wait_for_idle(self.ctx.id)
                 .await;
+            tracing::debug!(ctx = %self.ctx, "join: idle, returning error");
             // take the actual error (only we should do this)
             let err = self
                 .ctx

@@ -78,28 +78,32 @@ impl Body {
             match self.inner.next().await {
                 None => {
                     // Channel closed - check if transfer failed or was cancelled
-                    let terminal_error = if self.ctx.is_cancelled() {
-                        Some(crate::error::from_kind(
+                    tracing::debug!(ctx = %self.ctx, "channel closed");
+
+                    if self.ctx.is_cancelled() {
+                        self.close();
+                        return Some(Err(crate::error::from_kind(
                             crate::error::ErrorKind::OperationCancelled,
-                        )("download cancelled"))
+                        )("download cancelled")));
                     } else if self.ctx.is_failed() {
+                        self.close();
                         let kind = self
                             .ctx
                             .error_kind()
                             .unwrap_or(crate::error::ErrorKind::ChildOperationFailed);
-                        Some(crate::error::from_kind(kind)("transfer failed"))
-                    } else {
-                        None
-                    };
-                    if let Some(err) = terminal_error {
-                        self.close();
-                        return Some(Err(err));
+                        return Some(Err(crate::error::from_kind(kind)("transfer failed")));
                     }
+                    // Channel closed - should be in terminal state
+                    debug_assert!(
+                        !self.ctx.is_active(),
+                        "channel closed but transfer still active"
+                    );
                     break;
                 }
                 Some(Ok(chunk)) => self.sequencer.push(chunk),
                 Some(Err(err)) => {
-                    self.close();
+                    // Legacy path - errors via channel. Don't close, just propagate.
+                    // TODO: Remove this path when we fully migrate to status-based errors
                     return Some(Err(err));
                 }
             }
@@ -227,7 +231,9 @@ mod tests {
         }
     }
 
-    fn test_body(rx: mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>) -> Body {
+    fn test_body(
+        rx: mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>,
+    ) -> (Body, crate::operation::download::context::DownloadContext) {
         use crate::operation::download::context::DownloadContext;
         use crate::operation::download::DownloadInput;
         use crate::types::BucketType;
@@ -252,7 +258,7 @@ mod tests {
         let (tx, _) = mpsc::channel(1);
         let (ctx, _) = DownloadContext::new(id, tm.handle.clone(), BucketType::Standard, input, tx);
 
-        Body::new(rx, ctx)
+        (Body::new(rx, ctx.clone()), ctx)
     }
 
     #[test]
@@ -268,7 +274,8 @@ mod tests {
     #[tokio::test]
     async fn test_body_next() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = test_body(rx);
+        let (mut body, ctx) = test_body(rx);
+        let ctx_clone = ctx.clone();
         tokio::spawn(async move {
             let seq = vec![2, 0, 1];
             for i in seq {
@@ -278,6 +285,8 @@ mod tests {
                 let chunk = chunk_resp(i as u64, AggregatedBytes(aggregated));
                 tx.send(Ok(chunk)).await.unwrap();
             }
+            // Mark completed before channel closes
+            ctx_clone.set_completed();
         });
 
         let mut received = Vec::new();
@@ -291,27 +300,48 @@ mod tests {
         assert_eq!(expected, received);
     }
 
+    // Test: when transfer fails, next() returns error
     #[tokio::test]
-    async fn test_body_next_error() {
+    async fn test_body_next_on_failed_transfer() {
         let (tx, rx) = mpsc::channel(2);
-        let mut body = test_body(rx);
-        tokio::spawn(async move {
-            let data = Bytes::from("chunk 0".to_string());
-            let mut aggregated = SegmentedBuf::new();
-            aggregated.push(data);
-            let chunk = chunk_resp(0, AggregatedBytes(aggregated));
-            tx.send(Ok(chunk)).await.unwrap();
-            let err = error::Error::new(error::ErrorKind::InputInvalid, "test errors".to_string());
-            tx.send(Err(err)).await.unwrap();
-        });
+        let (mut body, ctx) = test_body(rx);
 
-        let mut received = Vec::new();
-        while let Some(chunk) = body.next().await {
-            received.push(chunk);
-        }
+        // Send one chunk, then fail the transfer
+        let data = Bytes::from("chunk 0");
+        let mut aggregated = SegmentedBuf::new();
+        aggregated.push(data);
+        tx.send(Ok(chunk_resp(0, AggregatedBytes(aggregated))))
+            .await
+            .unwrap();
 
-        assert_eq!(2, received.len());
-        received.pop().unwrap().expect_err("error propagated");
-        received.pop().unwrap().expect("chunk 0 successful");
+        // Fail the transfer and close channel
+        ctx.set_failed(error::Error::new(
+            error::ErrorKind::ChildOperationFailed,
+            "simulated failure",
+        ));
+        drop(tx);
+
+        // First call returns the buffered chunk
+        let chunk = body.next().await.unwrap().unwrap();
+        assert_eq!(chunk.seq, 0);
+
+        // Second call sees channel closed + failed status, returns error
+        let err = body.next().await.unwrap().unwrap_err();
+        assert!(matches!(err.kind(), error::ErrorKind::ChildOperationFailed));
+    }
+
+    // Test: when transfer is cancelled, next() returns error
+    #[tokio::test]
+    async fn test_body_next_on_cancelled_transfer() {
+        let (tx, rx) = mpsc::channel::<Result<ChunkOutput, crate::error::Error>>(2);
+        let (mut body, ctx) = test_body(rx);
+
+        // Cancel the transfer and close channel
+        ctx.set_cancelled();
+        drop(tx);
+
+        // next() should return cancellation error
+        let err = body.next().await.unwrap().unwrap_err();
+        assert!(matches!(err.kind(), error::ErrorKind::OperationCancelled));
     }
 }
