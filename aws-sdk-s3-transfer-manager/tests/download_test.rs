@@ -112,7 +112,6 @@ fn test_tm(
 
 /// Test the object ranges are expected and we get all the data
 #[tokio::test]
-#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_download_ranges() {
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -145,7 +144,6 @@ async fn test_download_ranges() {
 
 /// Test body not consumed which should not prevent the handle from being dropped
 #[tokio::test]
-#[ignore = "TODO(redux): Implement DownloadTransfer"]
 async fn test_body_not_consumed() {
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -307,7 +305,6 @@ const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 /// Test non retryable SdkError
 #[tokio::test]
-#[ignore = "TODO(redux): Implement DownloadTransfer - error handling"]
 async fn test_non_retryable_error() {
     let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -412,7 +409,6 @@ async fn test_retry_max_attempts() {
 
 /// Test the if_match header was added correctly based on the response from server.
 #[tokio::test]
-#[ignore = "TODO(redux): Implement DownloadTransfer - if_match handling"]
 async fn test_download_if_match() {
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
