@@ -52,45 +52,6 @@ impl UploadTransfer {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn stub(id: TransferId, part_count: usize) -> Self {
-        use crate::io::InputStream;
-        use crate::operation::upload::UploadInput;
-        use crate::types::BucketType;
-        use crate::DEFAULT_CONCURRENCY;
-
-        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let handle = Arc::new(crate::client::Handle {
-            config: crate::Config::builder().client(s3_client).build(),
-            scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(8),
-            ),
-            new_scheduler: crate::scheduler::Scheduler::new(
-                DEFAULT_CONCURRENCY,
-                DEFAULT_CONCURRENCY,
-            ),
-        });
-
-        let input = UploadInput::builder()
-            .bucket("test-bucket")
-            .key("test-key")
-            .build()
-            .unwrap();
-
-        let content_length = part_count as u64 * 8 * 1024 * 1024;
-        let stream = InputStream::from(vec![0u8; content_length as usize]);
-        let (ctx, _completion_rx) =
-            UploadContext::new(id, handle, BucketType::Standard, input, stream);
-
-        let (result_tx, _) = oneshot::channel();
-        Self {
-            ctx,
-            done: Arc::new(AtomicBool::new(false)),
-            cancellation_token: CancellationToken::new(),
-            result_tx: Arc::new(Mutex::new(Some(result_tx))),
-        }
-    }
-
     pub(crate) fn id(&self) -> TransferId {
         self.ctx.id
     }
