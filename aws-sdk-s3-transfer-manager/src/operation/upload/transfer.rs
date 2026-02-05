@@ -56,6 +56,10 @@ impl UploadTransfer {
         self.ctx.id
     }
 
+    pub(crate) fn is_terminal(&self) -> bool {
+        !self.ctx.is_active()
+    }
+
     /// Get the cancellation token for this transfer.
     pub(crate) fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
@@ -81,6 +85,7 @@ impl UploadTransfer {
                 stream,
             } => {
                 if *init_in_flight {
+                    self.ctx.set_pending();
                     return PollWork::Pending;
                 }
 
@@ -89,7 +94,6 @@ impl UploadTransfer {
                 if use_mpu {
                     *init_in_flight = true;
                     PollWork::Ready(WorkItem {
-                        transfer_id: self.id(),
                         kind: WorkKind::Network,
                         data: WorkData::CreateMPU,
                     })
@@ -97,7 +101,6 @@ impl UploadTransfer {
                     // Take ownership of stream by replacing state
                     match std::mem::replace(&mut *work, UploadWorkState::PutObjectInFlight) {
                         UploadWorkState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
-                            transfer_id: self.id(),
                             kind: WorkKind::Network,
                             data: WorkData::PutObject {
                                 stream: Some(stream),
@@ -116,16 +119,17 @@ impl UploadTransfer {
                 if *next_part > *total_parts {
                     // All parts generated, waiting for in-flight to complete
                     if *parts_in_flight > 0 {
+                        self.ctx.set_pending();
                         return PollWork::Pending;
                     }
                     // Should have transitioned to Completing - unexpected
+                    self.ctx.set_pending();
                     return PollWork::Pending;
                 }
                 let part_number = *next_part;
                 *next_part += 1;
                 *parts_in_flight += 1;
                 PollWork::Ready(WorkItem {
-                    transfer_id: self.id(),
                     kind: WorkKind::DataIO,
                     data: WorkData::UploadPart {
                         part_number,
@@ -137,16 +141,19 @@ impl UploadTransfer {
                 complete_in_flight, ..
             } => {
                 if *complete_in_flight {
+                    self.ctx.set_pending();
                     return PollWork::Pending;
                 }
                 *complete_in_flight = true;
                 PollWork::Ready(WorkItem {
-                    transfer_id: self.id(),
                     kind: WorkKind::Network,
                     data: WorkData::CompleteMPU,
                 })
             }
-            UploadWorkState::PutObjectInFlight { .. } => PollWork::Pending,
+            UploadWorkState::PutObjectInFlight { .. } => {
+                self.ctx.set_pending();
+                PollWork::Pending
+            }
             UploadWorkState::Done => PollWork::Done,
         }
     }
@@ -169,8 +176,10 @@ impl UploadTransfer {
 
     async fn execute_create_mpu(&self) -> WorkOutcome {
         let outcome = self.do_execute_create_mpu().await;
-        // Always notify waiters that CreateMPU is complete (success or failure)
+        // unblock any waiters that CreateMPU is complete (success or failure)
         self.ctx.state.create_mpu_complete.notify_waiters();
+        // state changed - try to wake if we were pending
+        self.ctx.try_wake();
         outcome
     }
 
@@ -408,6 +417,8 @@ impl UploadTransfer {
                     complete_in_flight: false,
                 };
             }
+            drop(work);
+            self.ctx.try_wake();
         }
     }
 
@@ -734,7 +745,6 @@ mod tests {
                 schedule_next: Some(WorkKind::Network),
                 data,
             } => WorkItem {
-                transfer_id: transfer.id(),
                 kind: WorkKind::Network,
                 data,
             },
@@ -752,7 +762,6 @@ mod tests {
                 schedule_next: Some(WorkKind::Network),
                 data,
             } => WorkItem {
-                transfer_id: transfer.id(),
                 kind: WorkKind::Network,
                 data,
             },

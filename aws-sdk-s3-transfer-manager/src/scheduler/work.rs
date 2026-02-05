@@ -4,11 +4,6 @@
  */
 
 //! Work abstraction for the scheduler.
-//!
-//! This module contains:
-//! - `WorkItem`, `WorkData`, `WorkKind` - the work unit abstraction
-//! - `WorkQueue` - a queue with concurrency control
-//! - `WorkerPool` - a pool of workers that pull work from a queue
 
 mod item;
 mod pool;
@@ -16,4 +11,17 @@ mod queue;
 
 pub(crate) use item::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 pub(crate) use pool::WorkerPool;
-pub(crate) use queue::WorkQueue;
+use queue::WorkQueue;
+
+use super::descriptor::TransferDescriptor;
+
+/// Work item with scheduler tracking attached.
+///
+/// Wraps a `WorkItem` (what transfers produce) with the `TransferDescriptor`
+/// (scheduler's tracking context). This keeps scheduling concerns out of
+/// transfer state machines.
+#[derive(Debug)]
+pub(crate) struct ScheduledWork {
+    pub(crate) item: WorkItem,
+    pub(crate) descriptor: TransferDescriptor,
+}

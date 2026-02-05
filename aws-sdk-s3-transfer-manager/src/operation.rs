@@ -198,6 +198,8 @@ pub(crate) struct TransferContext<State> {
     error: Arc<Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
+    /// Set when poll_work returns Pending, cleared on try_wake
+    pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<State> fmt::Display for TransferContext<State> {
@@ -222,8 +224,27 @@ impl<State> TransferContext<State> {
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         (ctx, completion_rx)
+    }
+
+    /// Mark that poll_work returned Pending. Call while holding state lock.
+    #[inline]
+    pub(crate) fn set_pending(&self) {
+        self.pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Wake scheduler if we were pending. Call after state mutation that may unblock.
+    #[inline]
+    pub(crate) fn try_wake(&self) {
+        if self
+            .pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.handle.new_scheduler.wake(self.id);
+        }
     }
 
     /// The S3 client to use for SDK operations
@@ -323,6 +344,7 @@ impl<State> Clone for TransferContext<State> {
             status: self.status.clone(),
             error: self.error.clone(),
             completion_tx: self.completion_tx.clone(),
+            pending: self.pending.clone(),
         }
     }
 }

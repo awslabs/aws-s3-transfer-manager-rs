@@ -22,6 +22,7 @@ pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
         &'a self,
         work: &'a mut WorkItem,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
+    fn is_terminal(&self) -> bool;
 }
 
 /// Mock transfer that wraps any [`MockStateMachine`].
@@ -61,6 +62,10 @@ impl MockTransfer {
         &self.cancellation_token
     }
 
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.state_machine.is_terminal()
+    }
+
     pub(crate) fn poll_work(&self) -> PollWork {
         self.state_machine.poll_work(self.id)
     }
@@ -97,20 +102,13 @@ impl FixedWorkCount {
 }
 
 impl MockStateMachine for FixedWorkCount {
-    fn poll_work(&self, id: TransferId) -> PollWork {
-        let completed = self.completed.load(Ordering::SeqCst);
-        if completed >= self.total {
+    fn poll_work(&self, _id: TransferId) -> PollWork {
+        let gen = self.generated.fetch_add(1, Ordering::SeqCst);
+        if gen >= self.total {
             return PollWork::Done;
         }
 
-        let gen = self.generated.fetch_add(1, Ordering::SeqCst);
-        if gen >= self.total {
-            self.generated.store(self.total, Ordering::SeqCst);
-            return PollWork::Pending;
-        }
-
         PollWork::Ready(WorkItem {
-            transfer_id: id,
             kind: WorkKind::Network,
             data: WorkData::UploadPart {
                 part_number: gen + 1,
@@ -136,6 +134,10 @@ impl MockStateMachine for FixedWorkCount {
                 },
             }
         })
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.is_complete()
     }
 }
 
@@ -170,6 +172,10 @@ impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
             self.inner.execute(work).await
         })
     }
+
+    fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +197,7 @@ mod tests {
         for _ in 0..3 {
             assert!(matches!(sm.poll_work(id), PollWork::Ready(_)));
         }
-        assert!(matches!(sm.poll_work(id), PollWork::Pending));
+        assert!(matches!(sm.poll_work(id), PollWork::Done));
     }
 
     #[tokio::test]

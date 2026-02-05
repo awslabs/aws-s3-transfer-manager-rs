@@ -44,11 +44,7 @@ pub(crate) async fn execute(transfer: &Transfer, work: &mut WorkItem) -> WorkOut
         data,
     } = outcome
     {
-        let mut follow_on = WorkItem {
-            transfer_id: work.transfer_id,
-            kind,
-            data,
-        };
+        let mut follow_on = WorkItem { kind, data };
         return transfer.execute(&mut follow_on).await;
     }
     outcome

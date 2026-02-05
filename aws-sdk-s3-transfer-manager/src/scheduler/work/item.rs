@@ -40,7 +40,6 @@ impl std::fmt::Display for TransferId {
 /// A unit of work to be scheduled.
 #[derive(Debug)]
 pub(crate) struct WorkItem {
-    pub(crate) transfer_id: TransferId,
     pub(crate) kind: WorkKind,
     pub(crate) data: WorkData,
 }

@@ -10,8 +10,11 @@ mod work;
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::Transfer;
 pub(crate) use work::{
-    PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome, WorkerPool,
+    PollWork, ScheduledWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome, WorkerPool,
 };
+
+mod descriptor;
+mod ready_set;
 
 #[cfg(test)]
 pub(crate) use transfer::MockTransfer;

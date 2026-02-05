@@ -8,9 +8,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use super::{ScheduledWork, WorkQueue};
+use crate::scheduler::TransferId;
 use tokio::sync::Notify;
-
-use super::{TransferId, WorkItem, WorkQueue};
 
 /// A pool of workers that pull work from a queue.
 #[derive(Debug)]
@@ -34,13 +34,13 @@ impl WorkerPool {
     }
 
     /// Push work to this pool's queue.
-    pub(crate) fn push(&self, work: WorkItem) {
+    pub(crate) fn push(&self, work: ScheduledWork) {
         self.queue.lock().unwrap().push(work);
         self.work_available.notify_one();
     }
 
     /// Pull next work item. Returns None on shutdown.
-    pub(crate) async fn next_work(&self) -> Option<WorkItem> {
+    pub(crate) async fn next_work(&self) -> Option<ScheduledWork> {
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return None;
@@ -87,6 +87,11 @@ impl WorkerPool {
     /// Current concurrency limit.
     pub(crate) fn concurrency(&self) -> usize {
         self.concurrency
+    }
+
+    /// Check if pool has capacity for more work.
+    pub(crate) fn has_capacity(&self) -> bool {
+        self.queue.lock().unwrap().has_capacity()
     }
 
     /// Number of pending work items.

@@ -66,6 +66,16 @@ impl Transfer {
             Transfer::Mock(m) => m.cancellation_token(),
         }
     }
+
+    /// Check if transfer is in a terminal state (completed, failed, or cancelled).
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            Transfer::Upload(u) => u.is_terminal(),
+            Transfer::Download(d) => d.is_terminal(),
+            #[cfg(test)]
+            Transfer::Mock(m) => m.is_terminal(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,16 @@ use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadContext, DownloadWorkState};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::ChunkSender;
+
+/// Early return if transfer is terminal (failed/cancelled by another work item).
+macro_rules! bail_if_terminal {
+    ($self:expr) => {
+        if !$self.ctx.is_active() {
+            $self.decrement_in_flight();
+            return WorkOutcome::Cancelled;
+        }
+    };
+}
 use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 /// Download transfer that generates and executes download work.
@@ -37,6 +47,10 @@ impl DownloadTransfer {
 
     pub(crate) fn id(&self) -> TransferId {
         self.ctx.id
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        !self.ctx.is_active()
     }
 
     pub(crate) fn cancellation_token(&self) -> &CancellationToken {
@@ -59,14 +73,16 @@ impl DownloadTransfer {
                     chunk_tx: chunk_tx.clone(),
                 };
                 PollWork::Ready(WorkItem {
-                    transfer_id: self.id(),
                     kind: WorkKind::Network,
                     data: WorkData::Discovery {
                         chunk_tx: chunk_tx_clone,
                     },
                 })
             }
-            DownloadWorkState::DiscoveryInFlight { .. } => PollWork::Pending,
+            DownloadWorkState::DiscoveryInFlight { .. } => {
+                self.ctx.set_pending();
+                PollWork::Pending
+            }
             DownloadWorkState::Transferring {
                 remaining,
                 ranges_in_flight,
@@ -89,7 +105,6 @@ impl DownloadTransfer {
                     *ranges_in_flight += 1;
 
                     PollWork::Ready(WorkItem {
-                        transfer_id: self.id(),
                         kind: WorkKind::Network,
                         data: WorkData::GetObjectRange {
                             range: chunk_range,
@@ -100,6 +115,7 @@ impl DownloadTransfer {
                     })
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete
+                    self.ctx.set_pending();
                     PollWork::Pending
                 } else {
                     // All done - success
@@ -180,6 +196,8 @@ impl DownloadTransfer {
                 chunk_tx: chunk_tx.clone(),
             };
         }
+        // State changed from DiscoveryInFlight - try to wake
+        self.ctx.try_wake();
 
         // If discovery returned an initial chunk, schedule work to read it
         match (initial_chunk, chunk_meta) {
@@ -265,12 +283,10 @@ impl DownloadTransfer {
 
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => {
-                self.decrement_in_flight();
-                let guard = self.ctx.state.work.lock().unwrap();
-                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
-            }
+            Err(e) => return self.fail_range(seq, e),
         };
+
+        bail_if_terminal!(self);
 
         // Extract metadata before consuming body
         let chunk_meta = ChunkMetadata::from(&resp);
@@ -278,12 +294,10 @@ impl DownloadTransfer {
         // TODO(redux): Handle ByteStreamError with retry (SDK doesn't retry these)
         let body = match resp.body.collect().await {
             Ok(b) => b.into_bytes(),
-            Err(e) => {
-                self.decrement_in_flight();
-                let guard = self.ctx.state.work.lock().unwrap();
-                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
-            }
+            Err(e) => return self.fail_range(seq, e),
         };
+
+        bail_if_terminal!(self);
 
         let mut segmented = SegmentedBuf::new();
         segmented.push(body);
@@ -310,13 +324,28 @@ impl DownloadTransfer {
         }
     }
 
+    /// Fail a range request with an error.
+    fn fail_range(&self, seq: u64, e: impl Into<crate::error::BoxError>) -> WorkOutcome {
+        self.decrement_in_flight();
+        let guard = self.ctx.state.work.lock().unwrap();
+        self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e))
+    }
+
     fn decrement_in_flight(&self) {
-        let mut work = self.ctx.state.work.lock().unwrap();
-        if let DownloadWorkState::Transferring {
-            ranges_in_flight, ..
-        } = &mut *work
-        {
-            *ranges_in_flight = ranges_in_flight.saturating_sub(1);
+        let should_wake = {
+            let mut work = self.ctx.state.work.lock().unwrap();
+            if let DownloadWorkState::Transferring {
+                ranges_in_flight, ..
+            } = &mut *work
+            {
+                *ranges_in_flight = ranges_in_flight.saturating_sub(1);
+                *ranges_in_flight == 0
+            } else {
+                false
+            }
+        };
+        if should_wake {
+            self.ctx.try_wake();
         }
     }
 
@@ -419,11 +448,7 @@ mod tests {
             data,
         } = outcome
         {
-            let mut follow_on = WorkItem {
-                transfer_id: transfer.id(),
-                kind,
-                data,
-            };
+            let mut follow_on = WorkItem { kind, data };
             return transfer.execute(&mut follow_on).await;
         }
         outcome
