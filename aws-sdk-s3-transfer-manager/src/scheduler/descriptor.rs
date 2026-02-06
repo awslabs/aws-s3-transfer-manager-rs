@@ -98,7 +98,9 @@ impl TransferDescriptor {
     /// Higher priority = slower vruntime accumulation = more work share.
     pub(super) fn work_generated(&self) {
         let priority = self.priority() as u64;
-        let delta = WORK_COST / priority.max(1);
+        // Scale up before dividing to avoid integer division truncating to zero.
+        // Multiplying by 256 ensures max priority (255) still yields delta >= 1.
+        let delta = (WORK_COST * 256) / priority.max(1);
         self.add_vruntime(delta);
     }
 
@@ -287,6 +289,92 @@ mod tests {
         #[cfg(debug_assertions)]
         fn test_start_executing_without_queued_panics() {
             QueuedExecuting::new().start_executing();
+        }
+    }
+
+    mod priority_vruntime {
+        use super::*;
+        use crate::scheduler::transfer::mock::FixedWorkCount;
+        use crate::scheduler::MockTransfer;
+        use std::sync::Arc;
+
+        fn test_descriptor(id: u64) -> TransferDescriptor {
+            let transfer_id = TransferId { id, parent: None };
+            let sm = Arc::new(FixedWorkCount::new(100));
+            let transfer = Transfer::Mock(MockTransfer::new(transfer_id, sm));
+            TransferDescriptor::new(transfer)
+        }
+
+        #[test]
+        fn test_priority_affects_vruntime_accumulation() {
+            let high = test_descriptor(1);
+            let low = test_descriptor(2);
+
+            high.set_priority(255); // highest
+            low.set_priority(64); // low
+
+            // Simulate 10 work items each
+            for _ in 0..10 {
+                high.work_generated();
+                low.work_generated();
+            }
+
+            // Higher priority should accumulate LESS vruntime
+            // (lower vruntime = scheduled first = more work share)
+            let high_vrt = high.vruntime();
+            let low_vrt = low.vruntime();
+
+            assert!(
+                high_vrt < low_vrt,
+                "high priority should have lower vruntime: high={}, low={}",
+                high_vrt,
+                low_vrt
+            );
+        }
+
+        #[test]
+        fn test_max_priority_still_accumulates_vruntime() {
+            let desc = test_descriptor(1);
+            desc.set_priority(255); // max priority
+
+            desc.work_generated();
+
+            // Even max priority should accumulate SOME vruntime
+            // Otherwise it would starve all other transfers
+            assert!(
+                desc.vruntime() > 0,
+                "max priority should still accumulate vruntime, got {}",
+                desc.vruntime()
+            );
+        }
+
+        #[test]
+        fn test_priority_ratio_reflected_in_vruntime() {
+            let high = test_descriptor(1);
+            let low = test_descriptor(2);
+
+            high.set_priority(200);
+            low.set_priority(50); // 4x lower priority
+
+            // Same number of work items
+            for _ in 0..100 {
+                high.work_generated();
+                low.work_generated();
+            }
+
+            let high_vrt = high.vruntime();
+            let low_vrt = low.vruntime();
+
+            // Low priority should accumulate roughly 4x more vruntime
+            // Allow some tolerance for integer math
+            let ratio = low_vrt as f64 / high_vrt.max(1) as f64;
+            assert!(
+                ratio > 2.0,
+                "4x priority difference should yield >2x vruntime ratio: high={}, low={}, ratio={}",
+                high_vrt,
+                low_vrt,
+                ratio
+            );
         }
     }
 }
