@@ -254,7 +254,10 @@ mod tests {
         tm.handle.clone()
     }
 
-    fn test_transfer(handle: Arc<crate::client::Handle>, input: &DownloadInput) -> DownloadTransfer {
+    fn test_transfer(
+        handle: Arc<crate::client::Handle>,
+        input: &DownloadInput,
+    ) -> DownloadTransfer {
         use tokio::sync::mpsc;
         let id = crate::scheduler::TransferId {
             id: 0,

@@ -187,6 +187,17 @@ impl DownloadHandle {
         // Wait for any executing work to complete
         ctx.handle.new_scheduler.wait_for_idle(id).await;
     }
+
+    /// Get scheduling controls for this transfer.
+    ///
+    /// See [`SchedulingCtl`](crate::operation::SchedulingCtl) for available controls.
+    ///
+    /// <div class="warning">
+    /// Scheduling controls are an advanced feature.
+    /// </div>
+    pub fn scheduling(&self) -> crate::operation::SchedulingCtl<'_> {
+        self.transfer.ctx().scheduling()
+    }
 }
 
 impl Drop for DownloadHandle {

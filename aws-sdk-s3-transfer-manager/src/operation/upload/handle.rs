@@ -141,6 +141,17 @@ impl UploadHandle {
             Ok(AbortedUpload::default())
         }
     }
+
+    /// Get scheduling controls for this transfer.
+    ///
+    /// See [`SchedulingCtl`](crate::operation::SchedulingCtl) for available controls.
+    ///
+    /// <div class="warning">
+    /// Scheduling controls are an advanced feature.
+    /// </div>
+    pub fn scheduling(&self) -> crate::operation::SchedulingCtl<'_> {
+        self.transfer.ctx().scheduling()
+    }
 }
 
 impl Drop for UploadHandle {

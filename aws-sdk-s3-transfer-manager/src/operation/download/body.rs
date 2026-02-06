@@ -94,10 +94,7 @@ impl Body {
                         return Some(Err(crate::error::from_kind(kind)("transfer failed")));
                     }
                     // Channel closed - should be in terminal state
-                    debug_assert!(
-                        !ctx.is_active(),
-                        "channel closed but transfer still active"
-                    );
+                    debug_assert!(!ctx.is_active(), "channel closed but transfer still active");
                     break;
                 }
                 Some(Ok(chunk)) => self.sequencer.push(chunk),

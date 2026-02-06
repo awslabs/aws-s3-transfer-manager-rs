@@ -170,6 +170,21 @@ impl Scheduler {
         Some(desc.transfer().clone())
     }
 
+    /// Set the priority of a transfer.
+    ///
+    /// Priority affects how fast vruntime accumulates (CFS-style scheduling):
+    /// - Higher priority (255) = slower accumulation = more work share
+    /// - Lower priority (1) = faster accumulation = less work share
+    /// - Default priority is 128
+    ///
+    /// The change takes effect on the next work generation cycle.
+    pub(crate) fn set_priority(&self, id: TransferId, priority: u8) {
+        let transfers = self.0.transfers.read().unwrap();
+        if let Some(desc) = transfers.get(&id) {
+            desc.set_priority(priority);
+        }
+    }
+
     /// Called by workers when work completes.
     pub(crate) fn on_completion(&self, work: ScheduledWork, outcome: WorkOutcome) {
         let desc = &work.descriptor;
@@ -308,9 +323,11 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::transfer::mock::{FixedWorkCount, WithDelay};
+    use crate::scheduler::transfer::mock::{FixedWorkCount, MockStateMachine, WithDelay};
     use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -373,6 +390,66 @@ mod tests {
     #[test]
     fn test_new_does_not_require_runtime() {
         let _scheduler = Scheduler::new(4, 4);
+    }
+
+    #[tokio::test]
+    async fn test_set_priority() {
+        let scheduler = Scheduler::new(2, 2);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+
+        // Use a mock that returns Pending so it doesn't complete immediately
+        let sm = Arc::new(PendingForever);
+        let transfer = Transfer::Mock(MockTransfer::new(id, sm));
+        scheduler.enqueue_transfer(transfer);
+
+        // Default priority is 128
+        {
+            let transfers = scheduler.0.transfers.read().unwrap();
+            let desc = transfers.get(&id).expect("transfer should exist");
+            assert_eq!(desc.priority(), 128);
+        }
+
+        // Change priority
+        scheduler.set_priority(id, 255);
+
+        {
+            let transfers = scheduler.0.transfers.read().unwrap();
+            let desc = transfers.get(&id).expect("transfer should still exist");
+            assert_eq!(desc.priority(), 255);
+        }
+
+        // Setting priority on non-existent transfer is a no-op
+        let fake_id = TransferId {
+            id: 999,
+            parent: None,
+        };
+        scheduler.set_priority(fake_id, 100); // Should not panic
+
+        scheduler.shutdown();
+    }
+
+    /// Mock that always returns Pending (never generates work, never completes)
+    #[derive(Debug)]
+    struct PendingForever;
+
+    impl MockStateMachine for PendingForever {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            PollWork::Pending
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut WorkItem,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("PendingForever never generates work") })
+        }
+
+        fn is_terminal(&self) -> bool {
+            false
+        }
     }
 
     #[tokio::test]

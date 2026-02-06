@@ -350,6 +350,59 @@ impl TransferContext {
             let _ = tx.send(());
         }
     }
+
+    /// Get scheduling controls for this transfer.
+    pub(crate) fn scheduling(&self) -> SchedulingCtl<'_> {
+        SchedulingCtl { ctx: self }
+    }
+}
+
+/// Scheduling controls for a transfer.
+///
+/// Provides methods to adjust how this transfer is scheduled relative to others.
+/// Obtained via [`UploadHandle::scheduling()`] or [`DownloadHandle::scheduling()`].
+///
+/// [`UploadHandle::scheduling()`]: crate::operation::upload::UploadHandle::scheduling
+/// [`DownloadHandle::scheduling()`]: crate::operation::download::DownloadHandle::scheduling
+#[derive(Debug)]
+pub struct SchedulingCtl<'a> {
+    ctx: &'a TransferContext,
+}
+
+impl SchedulingCtl<'_> {
+    /// Set the priority of this transfer.
+    ///
+    /// Priority affects how work is scheduled relative to other transfers:
+    /// - Higher priority (255) = more work share, runs more often
+    /// - Lower priority (1) = less work share, runs less often
+    /// - Default priority is 128
+    ///
+    /// The scheduler uses CFS-style fair scheduling. Priority affects how fast
+    /// "virtual runtime" accumulates - higher priority transfers accumulate slower,
+    /// so they stay ahead in scheduling and get more work done.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = tm.download()
+    ///     .bucket("my-bucket")
+    ///     .key("my-key")
+    ///     .initiate()
+    ///     .await?;
+    ///
+    /// // Start as lower priority background transfer
+    /// handle.scheduling().set_priority(64);
+    ///
+    /// // ...
+    /// // User requests this data - boost priority
+    /// handle.scheduling().set_priority(255);
+    /// ```
+    pub fn set_priority(&self, priority: u8) {
+        self.ctx
+            .handle
+            .new_scheduler
+            .set_priority(self.ctx.id, priority);
+    }
 }
 
 // Keep the old generic version temporarily for migration
