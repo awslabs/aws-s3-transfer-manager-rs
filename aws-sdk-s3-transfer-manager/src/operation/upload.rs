@@ -17,8 +17,8 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
 use crate::error;
+use crate::operation::TransferContext;
 use crate::types::BucketType;
-use context::UploadContext;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3
 pub use input::{UploadInput, UploadInputBuilder};
@@ -68,53 +68,28 @@ impl Upload {
         let stream = input.take_body();
 
         // TODO(redux): Relax this constraint - unknown content length implies MPU
-        // MPU has max of 10K parts which requires us to know the upper bound
-        // on the content length (today anyway). While true for file-based workloads,
-        // the upper `size_hint` might not be equal to the actual bytes transferred.
         if stream.size_hint().upper().is_none() {
             return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
         }
 
-        // TODO(redux): Upload still uses result_tx/rx pattern. Should migrate to
-        // unified completion pattern where ctx.signal_terminal() is used and
-        // output is stored in UploadState.
-        let (ctx, _completion_rx) = new_context(transfer_id, handle.clone(), input, stream);
+        let bucket_type =
+            BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
+        // Create transfer context - completion_rx signals terminal state
+        let (ctx, _completion_rx) = TransferContext::new(transfer_id, handle.clone());
+
+        // Result channel for upload output
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
-        let transfer = UploadTransfer::new(ctx.clone(), result_tx);
+        let transfer = UploadTransfer::new(ctx, bucket_type, input, stream, result_tx);
+
         handle
             .new_scheduler
-            .enqueue_transfer(crate::scheduler::Transfer::Upload(transfer));
+            .enqueue_transfer(crate::scheduler::Transfer::Upload(transfer.clone()));
 
-        Ok(UploadHandle::new(result_rx, ctx))
+        Ok(UploadHandle::new(result_rx, transfer))
     }
 }
-
-fn new_context(
-    id: crate::scheduler::TransferId,
-    handle: Arc<crate::client::Handle>,
-    req: UploadInput,
-    stream: crate::io::InputStream,
-) -> (
-    UploadContext,
-    crate::operation::StateMachineTerminalReceiver,
-) {
-    UploadContext::new(
-        id,
-        handle,
-        BucketType::from_bucket_name(req.bucket().expect("bucket is available")),
-        req,
-        stream,
-    )
-}
-
-// TODO(redux): Key concerns from old impl that need addressing:
-// - Single PutObject vs MPU threshold check (min_mpu_threshold, is_mpu_only)
-// - 0 byte object edge case for MPU
-// - Part size calculation: max(configured_part_size, content_length / 10000)
-// - Tracing spans for send-upload-part, send-create-multipart-upload, etc.
-// - Permit acquisition from old scheduler
 
 #[cfg(test)]
 mod test {

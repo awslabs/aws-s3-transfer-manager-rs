@@ -60,7 +60,7 @@ impl Transfer {
     /// Get the cancellation token for this transfer.
     pub(crate) fn cancellation_token(&self) -> &CancellationToken {
         match self {
-            Transfer::Upload(u) => u.cancellation_token(),
+            Transfer::Upload(u) => u.ctx().cancellation_token(),
             Transfer::Download(d) => d.cancellation_token(),
             #[cfg(test)]
             Transfer::Mock(m) => m.cancellation_token(),
@@ -70,7 +70,7 @@ impl Transfer {
     /// Check if transfer is in a terminal state (completed, failed, or cancelled).
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
-            Transfer::Upload(u) => u.is_terminal(),
+            Transfer::Upload(u) => !u.ctx().is_active(),
             Transfer::Download(d) => d.is_terminal(),
             #[cfg(test)]
             Transfer::Mock(m) => m.is_terminal(),

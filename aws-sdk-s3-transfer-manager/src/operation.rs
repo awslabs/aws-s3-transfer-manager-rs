@@ -260,7 +260,7 @@ impl TransferContext {
     }
 
     /// The S3 client to use for SDK operations
-    pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
+    pub(crate) fn s3_client(&self) -> &aws_sdk_s3::Client {
         self.handle.config.client()
     }
 
@@ -338,12 +338,6 @@ impl TransferContext {
     #[inline]
     pub(crate) fn is_completed(&self) -> bool {
         self.status.is_completed()
-    }
-
-    /// Check if transfer reached a terminal state (completed, failed, or cancelled)
-    #[inline]
-    pub(crate) fn is_terminal(&self) -> bool {
-        !self.status.is_active()
     }
 
     /// Signal that the transfer state machine has reached a terminal state.

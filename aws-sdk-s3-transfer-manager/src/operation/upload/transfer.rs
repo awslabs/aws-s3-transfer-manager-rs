@@ -6,7 +6,6 @@
 //! Upload transfer implementation for scheduler integration.
 
 use std::cmp;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -18,51 +17,116 @@ use tracing::Instrument;
 use crate::error::{self, Error};
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::{InputStream, PartData};
-use crate::operation::upload::context::{UploadContext, UploadWorkState};
+use crate::operation::upload::context::UploadState;
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
-use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
+use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
+use crate::operation::TransferContext;
 use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::types::BucketType;
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
-
-use tokio_util::sync::CancellationToken;
 
 pub(crate) type UploadResultSender = oneshot::Sender<Result<UploadOutput, Error>>;
 pub(crate) type UploadResultReceiver = oneshot::Receiver<Result<UploadOutput, Error>>;
 
 /// Upload transfer that generates and executes upload work.
+///
+/// Cheap to clone - all state is behind `Arc`.
 #[derive(Debug, Clone)]
 pub(crate) struct UploadTransfer {
-    ctx: UploadContext,
-    done: Arc<AtomicBool>,
-    cancellation_token: CancellationToken,
-    result_tx: Arc<Mutex<Option<UploadResultSender>>>,
+    inner: Arc<UploadTransferInner>,
+}
+
+/// Internal state for upload transfer.
+#[derive(Debug)]
+struct UploadTransferInner {
+    /// Common transfer lifecycle management
+    ctx: TransferContext,
+    /// State machine for work progression
+    state: Mutex<UploadState>,
+    /// The original request (body taken for processing)
+    request: Arc<UploadInput>,
+    /// Type of S3 bucket targeted by this operation
+    bucket_type: BucketType,
+    /// Notified when CreateMPU completes (success or failure)
+    create_mpu_complete: tokio::sync::Notify,
+    /// Channel to send result to handle
+    result_tx: Mutex<Option<UploadResultSender>>,
 }
 
 impl UploadTransfer {
-    pub(crate) fn new(ctx: UploadContext, result_tx: UploadResultSender) -> Self {
-        Self {
+    pub(crate) fn new(
+        ctx: TransferContext,
+        bucket_type: BucketType,
+        request: UploadInput,
+        stream: InputStream,
+        result_tx: UploadResultSender,
+    ) -> Self {
+        // TODO(redux): For unknown content length (streaming uploads), this will need adjustment.
+        let content_length = stream
+            .size_hint()
+            .upper()
+            .expect("content_length required; unknown length not yet supported");
+
+        let inner = Arc::new(UploadTransferInner {
             ctx,
-            done: Arc::new(AtomicBool::new(false)),
-            cancellation_token: CancellationToken::new(),
-            result_tx: Arc::new(Mutex::new(Some(result_tx))),
+            state: Mutex::new(UploadState::PendingInit {
+                stream,
+                content_length,
+                init_in_flight: false,
+            }),
+            request: Arc::new(request),
+            bucket_type,
+            create_mpu_complete: tokio::sync::Notify::new(),
+            result_tx: Mutex::new(Some(result_tx)),
+        });
+
+        Self { inner }
+    }
+
+    /// Access the transfer context.
+    pub(crate) fn ctx(&self) -> &TransferContext {
+        &self.inner.ctx
+    }
+
+    /// Get the transfer ID.
+    pub(crate) fn id(&self) -> TransferId {
+        self.inner.ctx.id
+    }
+
+    /// The original request (sans the body as it will have been taken for processing)
+    pub(crate) fn request(&self) -> &UploadInput {
+        &self.inner.request
+    }
+
+    /// Get the upload_id if MPU was started.
+    pub(crate) fn upload_id(&self) -> Option<String> {
+        let state = self.inner.state.lock().unwrap();
+        match &*state {
+            UploadState::Transferring { upload_id, .. }
+            | UploadState::Completing { upload_id, .. } => Some(upload_id.clone()),
+            _ => None,
         }
     }
 
-    pub(crate) fn id(&self) -> TransferId {
-        self.ctx.id
+    /// Check if CreateMPU is currently in flight.
+    pub(crate) fn is_create_mpu_in_flight(&self) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        matches!(
+            &*state,
+            UploadState::PendingInit {
+                init_in_flight: true,
+                ..
+            }
+        )
     }
 
-    pub(crate) fn is_terminal(&self) -> bool {
-        !self.ctx.is_active()
-    }
-
-    /// Get the cancellation token for this transfer.
-    pub(crate) fn cancellation_token(&self) -> &CancellationToken {
-        &self.cancellation_token
+    /// Get notified when CreateMPU completes.
+    pub(crate) fn create_mpu_complete_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.create_mpu_complete.notified()
     }
 
     /// Poll for the next work item.
@@ -72,25 +136,25 @@ impl UploadTransfer {
     /// - `PollWork::Pending` - blocked waiting for in-flight work
     /// - `PollWork::Done` - transfer complete
     pub(crate) fn poll_work(&self) -> PollWork {
-        if self.done.load(Ordering::Acquire) {
+        if !self.inner.ctx.is_active() {
             return PollWork::Done;
         }
 
-        let mut work = self.ctx.state.work.lock().unwrap();
+        let mut state = self.inner.state.lock().unwrap();
 
-        match &mut *work {
-            UploadWorkState::PendingInit {
+        match &mut *state {
+            UploadState::PendingInit {
                 init_in_flight,
                 content_length,
                 stream,
             } => {
                 if *init_in_flight {
-                    self.ctx.set_pending();
+                    self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 }
 
                 let use_mpu = stream.is_mpu_only()
-                    || *content_length >= self.ctx.handle.mpu_threshold_bytes();
+                    || *content_length >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
                     PollWork::Ready(WorkItem {
@@ -99,8 +163,8 @@ impl UploadTransfer {
                     })
                 } else {
                     // Take ownership of stream by replacing state
-                    match std::mem::replace(&mut *work, UploadWorkState::PutObjectInFlight) {
-                        UploadWorkState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
+                    match std::mem::replace(&mut *state, UploadState::PutObjectInFlight) {
+                        UploadState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
                             kind: WorkKind::Network,
                             data: WorkData::PutObject {
                                 stream: Some(stream),
@@ -110,20 +174,18 @@ impl UploadTransfer {
                     }
                 }
             }
-            UploadWorkState::Transferring {
+            UploadState::Transferring {
                 next_part,
                 total_parts,
                 parts_in_flight,
                 ..
             } => {
                 if *next_part > *total_parts {
-                    // All parts generated, waiting for in-flight to complete
                     if *parts_in_flight > 0 {
-                        self.ctx.set_pending();
+                        self.inner.ctx.set_pending();
                         return PollWork::Pending;
                     }
-                    // Should have transitioned to Completing - unexpected
-                    self.ctx.set_pending();
+                    self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 }
                 let part_number = *next_part;
@@ -137,11 +199,11 @@ impl UploadTransfer {
                     },
                 })
             }
-            UploadWorkState::Completing {
+            UploadState::Completing {
                 complete_in_flight, ..
             } => {
                 if *complete_in_flight {
-                    self.ctx.set_pending();
+                    self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 }
                 *complete_in_flight = true;
@@ -150,11 +212,11 @@ impl UploadTransfer {
                     data: WorkData::CompleteMPU,
                 })
             }
-            UploadWorkState::PutObjectInFlight { .. } => {
-                self.ctx.set_pending();
+            UploadState::PutObjectInFlight { .. } => {
+                self.inner.ctx.set_pending();
                 PollWork::Pending
             }
-            UploadWorkState::Done => PollWork::Done,
+            UploadState::Done => PollWork::Done,
         }
     }
 
@@ -177,17 +239,17 @@ impl UploadTransfer {
     async fn execute_create_mpu(&self) -> WorkOutcome {
         let outcome = self.do_execute_create_mpu().await;
         // unblock any waiters that CreateMPU is complete (success or failure)
-        self.ctx.state.create_mpu_complete.notify_waiters();
+        self.inner.create_mpu_complete.notify_waiters();
         // state changed - try to wake if we were pending
-        self.ctx.try_wake();
+        self.inner.ctx.try_wake();
         outcome
     }
 
     async fn do_execute_create_mpu(&self) -> WorkOutcome {
-        let client = self.ctx.client();
-        let req = self.ctx.state.request();
+        let client = self.inner.ctx.s3_client();
 
-        let mpu_req = copy_fields_to_mpu_request(req, client.create_multipart_upload());
+        let mpu_req =
+            copy_fields_to_mpu_request(&self.inner.request, client.create_multipart_upload());
 
         let resp = match mpu_req
             .send()
@@ -202,9 +264,9 @@ impl UploadTransfer {
         let response_builder = UploadOutputBuilder::from(resp);
 
         let (stream, content_length) = {
-            let mut work = self.ctx.state.work.lock().unwrap();
-            match std::mem::replace(&mut *work, UploadWorkState::Done) {
-                UploadWorkState::PendingInit {
+            let mut state = self.inner.state.lock().unwrap();
+            match std::mem::replace(&mut *state, UploadState::Done) {
+                UploadState::PendingInit {
                     stream,
                     content_length,
                     ..
@@ -214,7 +276,7 @@ impl UploadTransfer {
         };
 
         let part_size = cmp::max(
-            self.ctx.handle.upload_part_size_bytes(),
+            self.inner.ctx.handle.upload_part_size_bytes(),
             content_length.div_ceil(MAX_PARTS),
         );
 
@@ -230,8 +292,8 @@ impl UploadTransfer {
         );
 
         {
-            let mut work = self.ctx.state.work.lock().unwrap();
-            *work = UploadWorkState::Transferring {
+            let mut state = self.inner.state.lock().unwrap();
+            *state = UploadState::Transferring {
                 upload_id,
                 part_reader,
                 next_part: 1,
@@ -242,9 +304,6 @@ impl UploadTransfer {
             };
         }
 
-        // NOTE: data field is unused for CreateMPU - we just echo back the input.
-        // The data field is only meaningful for phase transitions (e.g., DataIO → Network
-        // for UploadPart where part_data is carried forward).
         WorkOutcome::Success {
             schedule_next: None,
             data: WorkData::CreateMPU,
@@ -269,9 +328,9 @@ impl UploadTransfer {
         part_data: &mut Option<PartData>,
     ) -> WorkOutcome {
         let part_reader = {
-            let work = self.ctx.state.work.lock().unwrap();
-            match &*work {
-                UploadWorkState::Transferring { part_reader, .. } => part_reader.clone(),
+            let state = self.inner.state.lock().unwrap();
+            match &*state {
+                UploadState::Transferring { part_reader, .. } => part_reader.clone(),
                 _ => panic!("unexpected state for read_part"),
             }
         };
@@ -293,8 +352,6 @@ impl UploadTransfer {
             }
             Ok(None) => {
                 tracing::warn!("part_reader returned None for part {}", part_number);
-                // Stream exhausted early - decrement parts_in_flight and check
-                // if we should transition to Completing
                 self.maybe_transition_to_completing();
                 WorkOutcome::Success {
                     schedule_next: None,
@@ -317,11 +374,10 @@ impl UploadTransfer {
             .take()
             .expect("part_data should be set after DataIO");
 
-        // Get upload_id before the async call
         let upload_id = {
-            let work = self.ctx.state.work.lock().unwrap();
-            match &*work {
-                UploadWorkState::Transferring { upload_id, .. } => upload_id.clone(),
+            let state = self.inner.state.lock().unwrap();
+            match &*state {
+                UploadState::Transferring { upload_id, .. } => upload_id.clone(),
                 _ => panic!("unexpected state for send_part"),
             }
         };
@@ -330,9 +386,10 @@ impl UploadTransfer {
         let content_length = data.data.remaining() as i64;
 
         let req = copy_fields_to_upload_part_request(
-            &self.ctx.state.request,
-            self.ctx
-                .client()
+            &self.inner.request,
+            self.inner
+                .ctx
+                .s3_client()
                 .upload_part()
                 .upload_id(&upload_id)
                 .part_number(part_num_i32)
@@ -362,12 +419,11 @@ impl UploadTransfer {
             .set_checksum_sha256(resp.checksum_sha256.clone())
             .build();
 
-        // Record completed part
         {
-            let mut work = self.ctx.state.work.lock().unwrap();
-            if let UploadWorkState::Transferring {
+            let mut state = self.inner.state.lock().unwrap();
+            if let UploadState::Transferring {
                 completed_parts, ..
-            } = &mut *work
+            } = &mut *state
             {
                 completed_parts.push(completed);
             }
@@ -384,15 +440,14 @@ impl UploadTransfer {
         }
     }
 
-    /// Decrement parts_in_flight and transition to Completing if all parts done.
     fn maybe_transition_to_completing(&self) {
-        let mut work = self.ctx.state.work.lock().unwrap();
-        let should_complete = if let UploadWorkState::Transferring {
+        let mut state = self.inner.state.lock().unwrap();
+        let should_complete = if let UploadState::Transferring {
             parts_in_flight,
             next_part,
             total_parts,
             ..
-        } = &mut *work
+        } = &mut *state
         {
             *parts_in_flight -= 1;
             *next_part > *total_parts && *parts_in_flight == 0
@@ -401,15 +456,15 @@ impl UploadTransfer {
         };
 
         if should_complete {
-            if let UploadWorkState::Transferring {
+            if let UploadState::Transferring {
                 upload_id,
                 part_reader,
                 completed_parts,
                 response_builder,
                 ..
-            } = std::mem::replace(&mut *work, UploadWorkState::Done)
+            } = std::mem::replace(&mut *state, UploadState::Done)
             {
-                *work = UploadWorkState::Completing {
+                *state = UploadState::Completing {
                     upload_id,
                     part_reader,
                     completed_parts,
@@ -417,8 +472,8 @@ impl UploadTransfer {
                     complete_in_flight: false,
                 };
             }
-            drop(work);
-            self.ctx.try_wake();
+            drop(state);
+            self.inner.ctx.try_wake();
         }
     }
 
@@ -438,10 +493,9 @@ impl UploadTransfer {
             Err(e) => return self.fail(e.into()),
         };
 
-        let req = self.ctx.state.request();
         let put_req = copy_fields_to_put_object_request(
-            req,
-            self.ctx.client().put_object().body(byte_stream),
+            &self.inner.request,
+            self.inner.ctx.s3_client().put_object().body(byte_stream),
         );
 
         let resp = match put_req
@@ -457,9 +511,10 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
-        self.done.store(true, Ordering::Release);
+        self.inner.ctx.set_completed();
+        self.inner.ctx.signal_terminal();
 
-        if let Some(tx) = self.result_tx.lock().unwrap().take() {
+        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
             let _ = tx.send(Ok(result));
         }
 
@@ -471,9 +526,9 @@ impl UploadTransfer {
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
         let (upload_id, mut completed_parts, response_builder, part_reader) = {
-            let mut work = self.ctx.state.work.lock().unwrap();
-            match std::mem::replace(&mut *work, UploadWorkState::Done) {
-                UploadWorkState::Completing {
+            let mut state = self.inner.state.lock().unwrap();
+            match std::mem::replace(&mut *state, UploadState::Done) {
+                UploadState::Completing {
                     upload_id,
                     completed_parts,
                     response_builder,
@@ -486,10 +541,10 @@ impl UploadTransfer {
 
         completed_parts.sort_by_key(|p| p.part_number);
 
-        let req = self.ctx.state.request();
         let base_req = self
+            .inner
             .ctx
-            .client()
+            .s3_client()
             .complete_multipart_upload()
             .upload_id(&upload_id)
             .multipart_upload(
@@ -498,11 +553,12 @@ impl UploadTransfer {
                     .build(),
             );
 
-        let complete_req =
-            super::input::convert::copy_fields_to_complete_mpu_request(req, base_req, || async {
-                part_reader.full_object_checksum().await
-            })
-            .await;
+        let complete_req = super::input::convert::copy_fields_to_complete_mpu_request(
+            &self.inner.request,
+            base_req,
+            || async { part_reader.full_object_checksum().await },
+        )
+        .await;
 
         let resp = match complete_req
             .send()
@@ -518,9 +574,10 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
-        self.done.store(true, Ordering::Release);
+        self.inner.ctx.set_completed();
+        self.inner.ctx.signal_terminal();
 
-        if let Some(tx) = self.result_tx.lock().unwrap().take() {
+        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
             let _ = tx.send(Ok(result));
         }
 
@@ -530,11 +587,14 @@ impl UploadTransfer {
         }
     }
 
-    /// Mark transfer as failed and send error to handle
-    fn fail(&self, error: Error) -> WorkOutcome {
-        self.done.store(true, Ordering::Release);
-        if let Some(tx) = self.result_tx.lock().unwrap().take() {
-            // Send a generic error to the handle - the actual error goes to WorkOutcome
+    fn fail(&self, _error: Error) -> WorkOutcome {
+        self.inner.ctx.set_failed(error::Error::new(
+            error::ErrorKind::RuntimeError,
+            "upload failed",
+        ));
+        self.inner.ctx.signal_terminal();
+
+        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
             let _ = tx.send(Err(error::Error::new(
                 error::ErrorKind::RuntimeError,
                 "upload failed",
@@ -548,17 +608,14 @@ impl UploadTransfer {
 mod tests {
     use super::*;
     use crate::io::InputStream;
-    use crate::operation::upload::UploadInput;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
     use crate::scheduler::{WorkData, WorkKind};
-    use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
-    /// Create an UploadTransfer for testing with a mocked S3 client
     fn create_test_transfer(
         s3_client: aws_sdk_s3::Client,
         content: Vec<u8>,
@@ -585,11 +642,10 @@ mod tests {
             parent: None,
         };
         let stream = InputStream::from(content);
-        let (ctx, _completion_rx) =
-            UploadContext::new(id, handle, BucketType::Standard, input, stream);
-
         let (result_tx, result_rx) = oneshot::channel();
-        let transfer = UploadTransfer::new(ctx, result_tx);
+
+        let (ctx, _completion_rx) = TransferContext::new(id, handle);
+        let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream, result_tx);
         (transfer, result_rx)
     }
 
@@ -616,12 +672,10 @@ mod tests {
         )
     }
 
-    // ==================== poll_work tests ====================
-
     #[test]
     fn test_poll_work_initial_state_returns_create_mpu() {
         let s3_client = mock_client!(aws_sdk_s3, []);
-        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts at 8MB default
+        let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
         let work = assert_ready(transfer.poll_work());
@@ -634,24 +688,19 @@ mod tests {
         let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
-        // First poll returns CreateMPU
         let _work = assert_ready(transfer.poll_work());
-
-        // Second poll should return Pending (init_in_flight = true)
         assert_pending(transfer.poll_work());
     }
 
     #[tokio::test]
     async fn test_poll_work_generates_parts_after_create_mpu() {
         let s3_client = mock_s3_client_for_mpu();
-        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts
+        let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
-        // Get and execute CreateMPU
         let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
 
-        // Now should generate UploadPart work items
         let work1 = assert_ready(transfer.poll_work());
         assert!(matches!(
             work1.data,
@@ -664,11 +713,8 @@ mod tests {
             WorkData::UploadPart { part_number: 2, .. }
         ));
 
-        // After all parts generated, should be Pending
         assert_pending(transfer.poll_work());
     }
-
-    // ==================== execute tests ====================
 
     #[tokio::test]
     async fn test_execute_create_mpu_transitions_to_transferring() {
@@ -687,7 +733,6 @@ mod tests {
             }
         ));
 
-        // After CreateMPU, should be able to generate parts
         let next = assert_ready(transfer.poll_work());
         assert!(matches!(next.data, WorkData::UploadPart { .. }));
     }
@@ -695,18 +740,15 @@ mod tests {
     #[tokio::test]
     async fn test_execute_read_part_returns_schedule_next_network() {
         let s3_client = mock_s3_client_for_mpu();
-        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts (above MPU threshold)
+        let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
-        // Execute CreateMPU
         let mut create_work = assert_ready(transfer.poll_work());
         transfer.execute(&mut create_work).await;
 
-        // Get UploadPart work (DataIO phase)
         let mut part_work = assert_ready(transfer.poll_work());
         assert_eq!(part_work.kind, WorkKind::DataIO);
 
-        // Execute DataIO phase - should return schedule_next = Network
         let outcome = transfer.execute(&mut part_work).await;
         match outcome {
             WorkOutcome::Success {
@@ -714,7 +756,6 @@ mod tests {
                 data,
             } => {
                 assert_eq!(schedule_next, Some(WorkKind::Network));
-                // Data should have part_data populated
                 if let WorkData::UploadPart { part_data, .. } = data {
                     assert!(part_data.is_some());
                 } else {
@@ -728,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_full_mpu_flow() {
         let s3_client = mock_s3_client_for_mpu();
-        let content = vec![0u8; 16 * 1024 * 1024]; // 16MB = 2 parts (above MPU threshold)
+        let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, rx) = create_test_transfer(s3_client, content);
 
         // 1. CreateMPU
@@ -739,7 +780,7 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         let outcome = transfer.execute(&mut work).await;
 
-        // 3. UploadPart - Network phase (continue with schedule_next data)
+        // 3. UploadPart - Network phase
         let mut work = match outcome {
             WorkOutcome::Success {
                 schedule_next: Some(WorkKind::Network),

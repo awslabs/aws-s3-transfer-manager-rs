@@ -13,7 +13,60 @@ use crate::operation::download::ChunkOutput;
 use crate::operation::download::DownloadContext;
 use crate::operation::StateMachineTerminalReceiver;
 
-/// Response type for a single download object request.
+/// Handle to an in-progress download operation.
+///
+/// This handle is returned when initiating a download and provides access to the
+/// downloaded content ([`body`](Self::body)), object metadata ([`object_meta`](Self::object_meta)),
+/// and methods to wait for completion ([`join`](Self::join)) or cancel ([`abort`](Self::abort)).
+///
+/// # Lifecycle
+///
+/// **Handles should be kept until the transfer completes or is explicitly cancelled.**
+/// The recommended pattern is to consume the body and then call [`join`](Self::join):
+///
+/// ```ignore
+/// let handle = tm.download()
+///     .bucket("my-bucket")
+///     .key("my-key")
+///     .initiate()
+///     .await?;
+///
+/// // Consume the body
+/// let mut body = handle.body_mut();
+/// while let Some(chunk) = body.next().await {
+///     let chunk = chunk?;
+///     // Process chunk...
+/// }
+///
+/// // Wait for completion and get final result
+/// let output = handle.join().await?;
+/// ```
+///
+/// # Cancellation
+///
+/// The operation can be cancelled either by dropping this handle or by calling
+/// [`abort`](Self::abort). Both methods stop the transfer, but they differ in behavior:
+///
+/// ## Dropping the handle
+///
+/// When the handle is dropped without calling `join()` or `abort()`:
+/// - The transfer is marked as cancelled
+/// - Queued work is purged from the scheduler
+/// - In-flight work may be interrupted at await points
+/// - Drop returns immediately without waiting for in-flight work
+///
+/// ## Calling `abort()`
+///
+/// When [`abort`](Self::abort) is called:
+/// - The transfer is marked as cancelled
+/// - Queued work is purged from the scheduler
+/// - Waits for all in-flight work to complete
+/// - Returns only after all cleanup is complete
+///
+/// ## Calling `join()` after failure
+///
+/// If the download fails, [`join`](Self::join) will cancel any remaining work,
+/// wait for in-flight work to complete, and return the error.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DownloadHandle {
@@ -141,8 +194,6 @@ impl DownloadHandle {
             .wait_for_idle(self.ctx.id)
             .await;
     }
-
-    // TODO(redux): should have a way to get at common transfer state/context like id() -> TransferId
 }
 
 impl Drop for DownloadHandle {
