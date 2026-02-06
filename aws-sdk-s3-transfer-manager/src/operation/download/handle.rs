@@ -9,8 +9,8 @@ use crate::error::{self, ErrorKind};
 use crate::operation::download::body::Body;
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
+use crate::operation::download::transfer::DownloadTransfer;
 use crate::operation::download::ChunkOutput;
-use crate::operation::download::DownloadContext;
 use crate::operation::StateMachineTerminalReceiver;
 
 /// Handle to an in-progress download operation.
@@ -73,8 +73,8 @@ pub struct DownloadHandle {
     /// The object content
     pub(crate) body: Body,
 
-    /// Download context
-    pub(crate) ctx: DownloadContext,
+    /// Download transfer
+    pub(crate) transfer: DownloadTransfer,
 
     /// Completion signal receiver - signals state machine reached terminal state
     pub(crate) completion_rx: Option<StateMachineTerminalReceiver>,
@@ -82,13 +82,13 @@ pub struct DownloadHandle {
 
 impl DownloadHandle {
     pub(crate) fn new(
-        ctx: DownloadContext,
+        transfer: DownloadTransfer,
         chunk_rx: mpsc::Receiver<Result<ChunkOutput, error::Error>>,
         completion_rx: StateMachineTerminalReceiver,
     ) -> Self {
         Self {
-            body: Body::new(chunk_rx, ctx.clone()),
-            ctx,
+            body: Body::new(chunk_rx, transfer.clone()),
+            transfer,
             completion_rx: Some(completion_rx),
         }
     }
@@ -98,16 +98,16 @@ impl DownloadHandle {
     /// Waits for discovery to complete if metadata is not yet available.
     pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
         // Fast path: already available
-        if let Some(meta) = self.ctx.state.object_meta.get() {
+        if let Some(meta) = self.transfer.object_meta() {
             return Ok(meta);
         }
 
         // Wait for discovery to complete
-        self.ctx.state.discovery_notify.notified().await;
+        self.transfer.discovery_notify().notified().await;
 
         // Check result
-        self.ctx.state.object_meta.get().ok_or_else(|| {
-            if self.ctx.is_cancelled() {
+        self.transfer.object_meta().ok_or_else(|| {
+            if self.transfer.ctx().is_cancelled() {
                 error::from_kind(ErrorKind::OperationCancelled)("download cancelled")
             } else {
                 error::from_kind(ErrorKind::ObjectNotDiscoverable)("discovery failed")
@@ -148,29 +148,23 @@ impl DownloadHandle {
             let _ = rx.await;
         }
 
-        if self.ctx.is_failed() {
-            tracing::debug!(ctx = %self.ctx, "join: cancelling and waiting for idle");
-            self.ctx.handle.new_scheduler.cancel_transfer(self.ctx.id);
-            self.ctx
-                .handle
-                .new_scheduler
-                .wait_for_idle(self.ctx.id)
-                .await;
-            tracing::debug!(ctx = %self.ctx, "join: idle, returning error");
+        let ctx = self.transfer.ctx();
+        let id = self.transfer.id();
+
+        if ctx.is_failed() {
+            tracing::debug!(ctx = %ctx, "join: cancelling and waiting for idle");
+            ctx.handle.new_scheduler.cancel_transfer(id);
+            ctx.handle.new_scheduler.wait_for_idle(id).await;
+            tracing::debug!(ctx = %ctx, "join: idle, returning error");
             // take the actual error (only we should do this)
-            let err = self
-                .ctx
-                .take_error()
-                .expect("error taken outside of join()");
+            let err = ctx.take_error().expect("error taken outside of join()");
             return Err(err);
         }
 
         // Success - discovery must have completed
         let object_meta = self
-            .ctx
-            .state
-            .object_meta
-            .get()
+            .transfer
+            .object_meta()
             .expect("object_meta must be set on successful completion")
             .clone();
         Ok(DownloadOutput::new(object_meta))
@@ -181,26 +175,26 @@ impl DownloadHandle {
     /// When this method returns, all work for this transfer has been
     /// cancelled or completed. No further work will be executed.
     pub async fn abort(mut self) {
-        self.ctx.set_cancelled();
+        let ctx = self.transfer.ctx();
+        let id = self.transfer.id();
+
+        ctx.set_cancelled();
         self.body.close();
 
         // Cancel transfer and purge queued work
-        self.ctx.handle.new_scheduler.cancel_transfer(self.ctx.id);
+        ctx.handle.new_scheduler.cancel_transfer(id);
 
         // Wait for any executing work to complete
-        self.ctx
-            .handle
-            .new_scheduler
-            .wait_for_idle(self.ctx.id)
-            .await;
+        ctx.handle.new_scheduler.wait_for_idle(id).await;
     }
 }
 
 impl Drop for DownloadHandle {
     fn drop(&mut self) {
-        if self.ctx.is_active() {
-            self.ctx.set_cancelled();
-            self.ctx.handle.new_scheduler.cancel_transfer(self.ctx.id);
+        let ctx = self.transfer.ctx();
+        if ctx.is_active() {
+            ctx.set_cancelled();
+            ctx.handle.new_scheduler.cancel_transfer(self.transfer.id());
         }
     }
 }

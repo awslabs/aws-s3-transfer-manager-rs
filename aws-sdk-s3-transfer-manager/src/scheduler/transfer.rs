@@ -61,7 +61,7 @@ impl Transfer {
     pub(crate) fn cancellation_token(&self) -> &CancellationToken {
         match self {
             Transfer::Upload(u) => u.ctx().cancellation_token(),
-            Transfer::Download(d) => d.cancellation_token(),
+            Transfer::Download(d) => d.ctx().cancellation_token(),
             #[cfg(test)]
             Transfer::Mock(m) => m.cancellation_token(),
         }
@@ -71,7 +71,7 @@ impl Transfer {
     pub(crate) fn is_terminal(&self) -> bool {
         match self {
             Transfer::Upload(u) => !u.ctx().is_active(),
-            Transfer::Download(d) => d.is_terminal(),
+            Transfer::Download(d) => !d.ctx().is_active(),
             #[cfg(test)]
             Transfer::Mock(m) => m.is_terminal(),
         }

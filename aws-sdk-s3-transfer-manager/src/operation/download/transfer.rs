@@ -6,24 +6,26 @@
 //! Download transfer implementation for scheduler integration.
 
 use std::cmp;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
-use tokio_util::sync::CancellationToken;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::ChunkOutput;
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::{DownloadContext, DownloadWorkState};
+use crate::operation::download::context::{DownloadState, SeqWindow};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
-use crate::operation::ChunkSender;
+use crate::operation::download::object_meta::ObjectMetadata;
+use crate::operation::download::DownloadInput;
+use crate::operation::{ChunkSender, TransferContext};
 use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::types::BucketType;
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
 macro_rules! bail_if_terminal {
     ($self:expr) => {
-        if !$self.ctx.is_active() {
+        if !$self.inner.ctx.is_active() {
             $self.decrement_in_flight();
             return WorkOutcome::Cancelled;
         }
@@ -31,45 +33,115 @@ macro_rules! bail_if_terminal {
 }
 
 /// Download transfer that generates and executes download work.
+///
+/// Cheap to clone - all state is behind `Arc`.
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadTransfer {
-    ctx: DownloadContext,
-    cancellation_token: CancellationToken,
+    inner: Arc<DownloadTransferInner>,
+}
+
+/// Internal state for download transfer.
+#[derive(Debug)]
+struct DownloadTransferInner {
+    /// Common transfer lifecycle management
+    ctx: TransferContext,
+    /// State machine for work progression
+    state: Mutex<DownloadState>,
+    /// The original request
+    request: Arc<DownloadInput>,
+    /// Type of S3 bucket targeted by this operation
+    bucket_type: BucketType,
+    /// Sequence window for backpressure control
+    seq_window: SeqWindow,
+    /// Object metadata from discovery (set once discovery completes)
+    object_meta: std::sync::OnceLock<ObjectMetadata>,
+    /// Notified when discovery completes (success or failure)
+    discovery_notify: tokio::sync::Notify,
 }
 
 impl DownloadTransfer {
-    pub(crate) fn new(ctx: DownloadContext) -> Self {
-        Self {
+    pub(crate) fn new(
+        ctx: TransferContext,
+        bucket_type: BucketType,
+        input: DownloadInput,
+        chunk_tx: ChunkSender,
+    ) -> Self {
+        let inner = Arc::new(DownloadTransferInner {
             ctx,
-            cancellation_token: CancellationToken::new(),
-        }
+            state: Mutex::new(DownloadState::new(chunk_tx)),
+            request: Arc::new(input),
+            bucket_type,
+            seq_window: SeqWindow::default(),
+            object_meta: std::sync::OnceLock::new(),
+            discovery_notify: tokio::sync::Notify::new(),
+        });
+        Self { inner }
     }
 
+    /// Access the transfer context.
+    pub(crate) fn ctx(&self) -> &TransferContext {
+        &self.inner.ctx
+    }
+
+    /// Get the transfer ID.
     pub(crate) fn id(&self) -> TransferId {
-        self.ctx.id
+        self.inner.ctx.id
     }
 
-    pub(crate) fn is_terminal(&self) -> bool {
-        !self.ctx.is_active()
+    /// The original request.
+    pub(crate) fn request(&self) -> &DownloadInput {
+        &self.inner.request
     }
 
-    pub(crate) fn cancellation_token(&self) -> &CancellationToken {
-        &self.cancellation_token
+    /// Type of S3 bucket targeted by this operation.
+    pub(crate) fn bucket_type(&self) -> BucketType {
+        self.inner.bucket_type
     }
 
+    /// Sequence window for backpressure control.
+    pub(crate) fn seq_window(&self) -> &SeqWindow {
+        &self.inner.seq_window
+    }
+
+    /// Object metadata from discovery.
+    pub(crate) fn object_meta(&self) -> Option<&ObjectMetadata> {
+        self.inner.object_meta.get()
+    }
+
+    /// Notified when discovery completes.
+    pub(crate) fn discovery_notify(&self) -> &tokio::sync::Notify {
+        &self.inner.discovery_notify
+    }
+
+    /// Get the cancellation token for this transfer.
+    pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+        self.inner.ctx.cancellation_token()
+    }
+
+    /// The target part size to use for this download.
+    fn target_part_size_bytes(&self) -> u64 {
+        self.inner.ctx.handle.download_part_size_bytes()
+    }
+
+    /// Poll for the next work item.
+    ///
+    /// Returns:
+    /// - `PollWork::Ready(work)` - work available to execute
+    /// - `PollWork::Pending` - blocked waiting for in-flight work
+    /// - `PollWork::Done` - transfer complete
     #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
     pub(crate) fn poll_work(&self) -> PollWork {
-        if !self.ctx.is_active() {
+        if !self.inner.ctx.is_active() {
             tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
 
-        let mut work = self.ctx.state.work.lock().unwrap();
+        let mut state = self.inner.state.lock().unwrap();
 
-        match &mut *work {
-            DownloadWorkState::PendingDiscovery { chunk_tx } => {
+        match &mut *state {
+            DownloadState::PendingDiscovery { chunk_tx } => {
                 let chunk_tx_clone = chunk_tx.clone();
-                *work = DownloadWorkState::DiscoveryInFlight {
+                *state = DownloadState::DiscoveryInFlight {
                     chunk_tx: chunk_tx.clone(),
                 };
                 PollWork::Ready(WorkItem {
@@ -79,11 +151,11 @@ impl DownloadTransfer {
                     },
                 })
             }
-            DownloadWorkState::DiscoveryInFlight { .. } => {
-                self.ctx.set_pending();
+            DownloadState::DiscoveryInFlight { .. } => {
+                self.inner.ctx.set_pending();
                 PollWork::Pending
             }
-            DownloadWorkState::Transferring {
+            DownloadState::Transferring {
                 remaining,
                 ranges_in_flight,
                 etag,
@@ -91,13 +163,13 @@ impl DownloadTransfer {
                 ..
             } => {
                 // Check seq window before generating work
-                let Some(seq) = self.ctx.state.seq_window.try_claim() else {
-                    self.ctx.set_pending();
+                let Some(seq) = self.inner.seq_window.try_claim() else {
+                    self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 };
 
                 if let Some(range) = remaining.take() {
-                    let part_size = self.ctx.target_part_size_bytes();
+                    let part_size = self.target_part_size_bytes();
                     let start = *range.start();
                     let end = *range.end();
                     let chunk_end = cmp::min(start + part_size - 1, end);
@@ -120,15 +192,15 @@ impl DownloadTransfer {
                     })
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete
-                    self.ctx.set_pending();
+                    self.inner.ctx.set_pending();
                     PollWork::Pending
                 } else {
                     // All done - success
-                    self.complete(work);
+                    self.complete(state);
                     PollWork::Done
                 }
             }
-            DownloadWorkState::Terminal => PollWork::Done,
+            DownloadState::Terminal => PollWork::Done,
         }
     }
 
@@ -164,12 +236,12 @@ impl DownloadTransfer {
     }
 
     async fn execute_discovery(&self, chunk_tx: ChunkSender) -> WorkOutcome {
-        let input = self.ctx.state.request();
+        let input = self.inner.request.as_ref();
 
-        let discovery = match discover_obj(&self.ctx, input).await {
+        let discovery = match discover_obj(self, input).await {
             Ok(d) => d,
             Err(e) => {
-                let guard = self.ctx.state.work.lock().unwrap();
+                let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, e);
             }
         };
@@ -182,9 +254,9 @@ impl DownloadTransfer {
         } = discovery;
 
         // Store object_meta for object_meta() and join()
-        let _ = self.ctx.state.object_meta.set(object_meta.clone());
+        let _ = self.inner.object_meta.set(object_meta.clone());
         // Notify waiters that discovery completed
-        self.ctx.state.discovery_notify.notify_waiters();
+        self.inner.discovery_notify.notify_waiters();
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
@@ -194,8 +266,7 @@ impl DownloadTransfer {
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(stream), Some(meta)) => {
                 let seq = self
-                    .ctx
-                    .state
+                    .inner
                     .seq_window
                     .try_claim()
                     .expect("seq window should have capacity at start");
@@ -208,8 +279,8 @@ impl DownloadTransfer {
         };
 
         {
-            let mut work = self.ctx.state.work.lock().unwrap();
-            *work = DownloadWorkState::Transferring {
+            let mut work = self.inner.state.lock().unwrap();
+            *work = DownloadState::Transferring {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag,
@@ -219,7 +290,7 @@ impl DownloadTransfer {
         }
 
         // State changed from DiscoveryInFlight - try to wake
-        self.ctx.try_wake();
+        self.inner.ctx.try_wake();
 
         // If discovery returned an initial chunk, schedule work to read it
         match initial_work {
@@ -251,7 +322,7 @@ impl DownloadTransfer {
             Ok(b) => b.into_bytes(),
             Err(e) => {
                 self.decrement_in_flight();
-                let guard = self.ctx.state.work.lock().unwrap();
+                let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
             }
         };
@@ -285,12 +356,13 @@ impl DownloadTransfer {
         etag: Option<Arc<str>>,
         chunk_tx: ChunkSender,
     ) -> WorkOutcome {
-        let input = self.ctx.state.request();
+        let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
         let mut req = self
+            .inner
             .ctx
-            .client()
+            .s3_client()
             .get_object()
             .bucket(input.bucket().unwrap_or_default())
             .key(input.key().unwrap_or_default())
@@ -346,14 +418,14 @@ impl DownloadTransfer {
     /// Fail a range request with an error.
     fn fail_range(&self, seq: u64, e: impl Into<crate::error::BoxError>) -> WorkOutcome {
         self.decrement_in_flight();
-        let guard = self.ctx.state.work.lock().unwrap();
+        let guard = self.inner.state.lock().unwrap();
         self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e))
     }
 
     fn decrement_in_flight(&self) {
         let should_wake = {
-            let mut work = self.ctx.state.work.lock().unwrap();
-            if let DownloadWorkState::Transferring {
+            let mut work = self.inner.state.lock().unwrap();
+            if let DownloadState::Transferring {
                 ranges_in_flight, ..
             } = &mut *work
             {
@@ -364,33 +436,33 @@ impl DownloadTransfer {
             }
         };
         if should_wake {
-            self.ctx.try_wake();
+            self.inner.ctx.try_wake();
         }
     }
 
     /// Transition to terminal failed state. Requires holding the work lock.
     fn fail(
         &self,
-        mut guard: std::sync::MutexGuard<'_, DownloadWorkState>,
+        mut guard: std::sync::MutexGuard<'_, DownloadState>,
         error: Error,
     ) -> WorkOutcome {
         // Order matters: set status/error before any wakeups
-        self.ctx.set_failed(error);
+        self.inner.ctx.set_failed(error);
         // Transition to Terminal - releases chunk_tx
-        *guard = DownloadWorkState::Terminal;
+        *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters
                      // Wake all waiters
-        self.ctx.state.discovery_notify.notify_waiters();
-        self.ctx.signal_terminal();
+        self.inner.discovery_notify.notify_waiters();
+        self.inner.ctx.signal_terminal();
         WorkOutcome::Failed
     }
 
     /// Transition to terminal success state. Requires holding the work lock.
-    fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadWorkState>) {
-        self.ctx.set_completed();
-        *guard = DownloadWorkState::Terminal;
+    fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadState>) {
+        self.inner.ctx.set_completed();
+        *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters
-        self.ctx.signal_terminal();
+        self.inner.ctx.signal_terminal();
     }
 }
 
@@ -398,8 +470,9 @@ impl DownloadTransfer {
 mod tests {
     use super::*;
     use crate::operation::download::DownloadInput;
+    use crate::operation::TransferContext;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::scheduler::{WorkData, WorkItem, WorkOutcome};
+    use crate::scheduler::{TransferId, WorkData, WorkItem, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -452,10 +525,9 @@ mod tests {
             parent: None,
         };
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
-        let (ctx, _completion_rx) =
-            DownloadContext::new(id, handle, BucketType::Standard, input, chunk_tx);
+        let (ctx, _completion_rx) = TransferContext::new(id, handle);
 
-        DownloadTransfer::new(ctx)
+        DownloadTransfer::new(ctx, BucketType::Standard, input, chunk_tx)
     }
 
     /// Execute and handle follow-on work (e.g., ReadDiscoveryBody).
@@ -598,7 +670,7 @@ mod tests {
         let outcome = execute(&transfer, &mut range).await;
 
         assert!(matches!(outcome, WorkOutcome::Failed));
-        assert!(transfer.ctx.is_failed());
+        assert!(transfer.ctx().is_failed());
     }
 
     #[tokio::test]
@@ -611,7 +683,7 @@ mod tests {
     async fn test_seq_window_limits_work_generation() {
         // Create download with many parts but small seq window
         let transfer = create_download(128 * MB, 8 * MB); // 16 parts
-        transfer.ctx.state.seq_window.set_max_gap(3);
+        transfer.seq_window().set_max_gap(3);
 
         skip_discovery(&transfer).await;
         // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
@@ -628,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn test_seq_window_consume_enables_more_work() {
         let transfer = create_download(128 * MB, 8 * MB);
-        transfer.ctx.state.seq_window.set_max_gap(2);
+        transfer.seq_window().set_max_gap(2);
 
         skip_discovery(&transfer).await;
         // After discovery: claimed=1, consumed=0
@@ -638,14 +710,14 @@ mod tests {
         assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
 
         // Simulate consumer reading seq 0
-        transfer.ctx.state.seq_window.consume(0);
+        transfer.seq_window().consume(0);
         // Now consumed=1, so claimed < 1+2=3
 
         let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
         assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
 
         // Consume seq 1
-        transfer.ctx.state.seq_window.consume(1);
+        transfer.seq_window().consume(1);
         // Now consumed=2, so claimed < 2+2=4
 
         let _w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4

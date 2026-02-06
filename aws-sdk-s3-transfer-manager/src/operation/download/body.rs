@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::io::AggregatedBytes;
 
 use super::chunk_meta::ChunkMetadata;
-use super::context::DownloadContext;
+use super::transfer::DownloadTransfer;
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
 ///
@@ -21,7 +21,7 @@ use super::context::DownloadContext;
 pub struct Body {
     inner: UnorderedBody,
     sequencer: Sequencer,
-    ctx: DownloadContext,
+    transfer: DownloadTransfer,
 }
 
 type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
@@ -45,11 +45,11 @@ pub struct ChunkOutput {
 // recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
 // we have a better scheduler in place.
 impl Body {
-    pub(crate) fn new(chunks: BodyChannel, ctx: DownloadContext) -> Self {
+    pub(crate) fn new(chunks: BodyChannel, transfer: DownloadTransfer) -> Self {
         Self {
             inner: UnorderedBody::new(chunks),
             sequencer: Sequencer::new(),
-            ctx,
+            transfer,
         }
     }
 
@@ -78,24 +78,24 @@ impl Body {
             match self.inner.next().await {
                 None => {
                     // Channel closed - check if transfer failed or was cancelled
-                    tracing::debug!(ctx = %self.ctx, "channel closed");
+                    let ctx = self.transfer.ctx().clone();
+                    tracing::debug!(transfer = %ctx, "channel closed");
 
-                    if self.ctx.is_cancelled() {
+                    if ctx.is_cancelled() {
                         self.close();
                         return Some(Err(crate::error::from_kind(
                             crate::error::ErrorKind::OperationCancelled,
                         )("download cancelled")));
-                    } else if self.ctx.is_failed() {
+                    } else if ctx.is_failed() {
                         self.close();
-                        let kind = self
-                            .ctx
+                        let kind = ctx
                             .error_kind()
                             .unwrap_or(crate::error::ErrorKind::ChildOperationFailed);
                         return Some(Err(crate::error::from_kind(kind)("transfer failed")));
                     }
                     // Channel closed - should be in terminal state
                     debug_assert!(
-                        !self.ctx.is_active(),
+                        !ctx.is_active(),
                         "channel closed but transfer still active"
                     );
                     break;
@@ -112,8 +112,8 @@ impl Body {
         let chunk = self.sequencer.pop();
         if let Some(chunk) = chunk {
             // Advance consumed seq - may enable more work generation
-            if self.ctx.state.seq_window.consume(chunk.seq) {
-                self.ctx.try_wake();
+            if self.transfer.seq_window().consume(chunk.seq) {
+                self.transfer.ctx().try_wake();
             }
             self.sequencer.advance();
             Some(Ok(chunk))
@@ -220,6 +220,7 @@ impl UnorderedBody {
 
 #[cfg(test)]
 mod tests {
+    use crate::operation::download::transfer::DownloadTransfer;
     use crate::{error, operation::download::body::ChunkOutput};
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
@@ -237,9 +238,9 @@ mod tests {
 
     fn test_body(
         rx: mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>,
-    ) -> (Body, crate::operation::download::context::DownloadContext) {
-        use crate::operation::download::context::DownloadContext;
+    ) -> (Body, DownloadTransfer) {
         use crate::operation::download::DownloadInput;
+        use crate::operation::TransferContext;
         use crate::types::BucketType;
 
         let s3_client = aws_sdk_s3::Client::from_conf(
@@ -260,9 +261,10 @@ mod tests {
             .build()
             .unwrap();
         let (tx, _) = mpsc::channel(1);
-        let (ctx, _) = DownloadContext::new(id, tm.handle.clone(), BucketType::Standard, input, tx);
+        let (ctx, _) = TransferContext::new(id, tm.handle.clone());
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, tx);
 
-        (Body::new(rx, ctx.clone()), ctx)
+        (Body::new(rx, transfer.clone()), transfer)
     }
 
     #[test]
@@ -290,7 +292,7 @@ mod tests {
                 tx.send(Ok(chunk)).await.unwrap();
             }
             // Mark completed before channel closes
-            ctx_clone.set_completed();
+            ctx_clone.ctx().set_completed();
         });
 
         let mut received = Vec::new();
@@ -308,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_on_failed_transfer() {
         let (tx, rx) = mpsc::channel(2);
-        let (mut body, ctx) = test_body(rx);
+        let (mut body, transfer) = test_body(rx);
 
         // Send one chunk, then fail the transfer
         let data = Bytes::from("chunk 0");
@@ -319,7 +321,7 @@ mod tests {
             .unwrap();
 
         // Fail the transfer and close channel
-        ctx.set_failed(error::Error::new(
+        transfer.ctx().set_failed(error::Error::new(
             error::ErrorKind::ChildOperationFailed,
             "simulated failure",
         ));
@@ -338,10 +340,10 @@ mod tests {
     #[tokio::test]
     async fn test_body_next_on_cancelled_transfer() {
         let (tx, rx) = mpsc::channel::<Result<ChunkOutput, crate::error::Error>>(2);
-        let (mut body, ctx) = test_body(rx);
+        let (mut body, transfer) = test_body(rx);
 
         // Cancel the transfer and close channel
-        ctx.set_cancelled();
+        transfer.ctx().set_cancelled();
         drop(tx);
 
         // next() should return cancellation error

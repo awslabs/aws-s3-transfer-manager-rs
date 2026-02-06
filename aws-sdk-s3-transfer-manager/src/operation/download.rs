@@ -16,7 +16,6 @@ mod body;
 pub use body::{Body, ChunkOutput};
 
 mod context;
-pub(crate) use context::DownloadContext;
 
 pub(crate) mod discovery;
 
@@ -53,6 +52,7 @@ impl Download {
         input: DownloadInput,
         _use_current_span_as_parent_for_tasks: bool,
     ) -> Result<DownloadHandle, error::Error> {
+        use crate::operation::TransferContext;
         use crate::scheduler::TransferId;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -73,14 +73,13 @@ impl Download {
         let concurrency = handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
 
-        let (ctx, completion_rx) =
-            DownloadContext::new(transfer_id, handle.clone(), bucket_type, input, chunk_tx);
+        let (ctx, completion_rx) = TransferContext::new(transfer_id, handle.clone());
 
-        let transfer = DownloadTransfer::new(ctx.clone());
+        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, chunk_tx);
         handle
             .new_scheduler
-            .enqueue_transfer(crate::scheduler::Transfer::Download(transfer));
+            .enqueue_transfer(crate::scheduler::Transfer::Download(transfer.clone()));
 
-        Ok(DownloadHandle::new(ctx, chunk_rx, completion_rx))
+        Ok(DownloadHandle::new(transfer, chunk_rx, completion_rx))
     }
 }

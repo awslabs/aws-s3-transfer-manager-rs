@@ -4,12 +4,9 @@
  */
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::operation::download::object_meta::ObjectMetadata;
-use crate::operation::download::DownloadInput;
 use crate::operation::ChunkSender;
-use crate::types::BucketType;
 
 /// Default maximum gap between claimed and consumed sequences.
 /// With 8MB parts, this is 128MB of buffered data.
@@ -87,75 +84,9 @@ impl Default for SeqWindow {
     }
 }
 
-pub(crate) type DownloadContext = crate::operation::LegacyTransferContext<DownloadState>;
-
-impl DownloadContext {
-    pub(crate) fn new(
-        id: crate::scheduler::TransferId,
-        handle: Arc<crate::client::Handle>,
-        bucket_type: BucketType,
-        input: DownloadInput,
-        chunk_tx: ChunkSender,
-    ) -> (Self, crate::operation::StateMachineTerminalReceiver) {
-        let state = Arc::new(DownloadState {
-            request: Arc::new(input),
-            bucket_type,
-            seq_window: SeqWindow::default(),
-            object_meta: std::sync::OnceLock::new(),
-            discovery_notify: tokio::sync::Notify::new(),
-            work: Mutex::new(DownloadWorkState::new(chunk_tx)),
-        });
-        crate::operation::LegacyTransferContext::from_state(id, handle, state)
-    }
-
-    /// The target part size to use for this download
-    pub(crate) fn target_part_size_bytes(&self) -> u64 {
-        self.handle.download_part_size_bytes()
-    }
-
-    /// Returns the type of bucket targeted by this operation
-    pub(crate) fn bucket_type(&self) -> BucketType {
-        self.state.bucket_type
-    }
-}
-
-/// Download operation specific state
-#[derive(Debug)]
-pub(crate) struct DownloadState {
-    /// The original request
-    pub(crate) request: Arc<DownloadInput>,
-
-    /// Type of S3 bucket targeted by this operation
-    pub(crate) bucket_type: BucketType,
-
-    /// Sequence window for backpressure control
-    pub(crate) seq_window: SeqWindow,
-
-    /// Object metadata from discovery (set once discovery completes)
-    pub(crate) object_meta: std::sync::OnceLock<ObjectMetadata>,
-
-    /// Notified when discovery completes (success or failure)
-    pub(crate) discovery_notify: tokio::sync::Notify,
-
-    /// Mutable work state (protected by mutex)
-    pub(crate) work: Mutex<DownloadWorkState>,
-}
-
-impl DownloadState {
-    /// The original request
-    pub(crate) fn request(&self) -> &DownloadInput {
-        &self.request
-    }
-
-    /// Type of S3 bucket targeted by this operation
-    pub(crate) fn bucket_type(&self) -> BucketType {
-        self.bucket_type
-    }
-}
-
 /// Mutable state for tracking download work progress
 #[derive(Debug)]
-pub(crate) enum DownloadWorkState {
+pub(crate) enum DownloadState {
     /// Waiting to start discovery
     PendingDiscovery {
         /// Channel to send chunks to Body (passed to Transferring state)
@@ -175,7 +106,7 @@ pub(crate) enum DownloadWorkState {
         /// Number of ranges currently in flight
         ranges_in_flight: usize,
         /// ETag for consistency (shared across all range requests)
-        etag: Option<Arc<str>>,
+        etag: Option<std::sync::Arc<str>>,
         /// Object metadata from discovery
         object_meta: ObjectMetadata,
         /// Channel to send chunks to Body
@@ -187,9 +118,9 @@ pub(crate) enum DownloadWorkState {
     Terminal,
 }
 
-impl DownloadWorkState {
+impl DownloadState {
     pub(crate) fn new(chunk_tx: ChunkSender) -> Self {
-        DownloadWorkState::PendingDiscovery { chunk_tx }
+        DownloadState::PendingDiscovery { chunk_tx }
     }
 }
 
