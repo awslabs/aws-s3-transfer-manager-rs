@@ -6,8 +6,9 @@
 //! Event-driven scheduler for coordinating transfer operations.
 //!
 //! The scheduler has a global view of all transfers and their associated work.
-//! It controls concurrency for specific phases (disk I/O vs network) allowing
-//! them to be tuned independently.
+//! It controls total concurrency via a single capacity target, agnostic to work kind.
+//! `WorkKind` remains as metadata for the transfer's `execute()` dispatch but is not
+//! used for capacity decisions.
 //!
 //! # Overview
 //!
@@ -39,16 +40,16 @@
 //! ```text
 //!   ┌─────────────────────────────────────────────────────────────┐
 //!   │                        Scheduler                            │
-//!   │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-//!   │  │  Transfers  │  │ DataIO Pool │  │    Network Pool     │ │
-//!   │  └─────────────┘  └──────┬──────┘  └──────────┬──────────┘ │
-//!   └──────────────────────────┼────────────────────┼────────────┘
-//!                              │                    │
-//!                    Workers pull work      Workers pull work
-//!                              │                    │
-//!                         ┌────┴────┐          ┌────┴────┐
-//!                         │ Workers │          │ Workers │
-//!                         └─────────┘          └─────────┘
+//!   │  ┌─────────────┐  ┌──────────────────────────────────────┐ │
+//!   │  │  Transfers  │  │           Worker Pool                │ │
+//!   │  └─────────────┘  └──────────────────┬───────────────────┘ │
+//!   └──────────────────────────────────────┼─────────────────────┘
+//!                                          │
+//!                                Workers pull work
+//!                                          │
+//!                                     ┌────┴────┐
+//!                                     │ Workers │
+//!                                     └─────────┘
 //! ```
 //!
 //! # Work Flow
@@ -84,8 +85,7 @@ pub(crate) struct Scheduler(Arc<SchedulerInner>);
 struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
-    data_io_pool: Arc<WorkerPool>,
-    network_pool: Arc<WorkerPool>,
+    pool: Arc<WorkerPool>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -95,17 +95,17 @@ impl std::fmt::Debug for Scheduler {
 }
 
 impl Scheduler {
-    pub(crate) fn new(data_io_concurrency: usize, network_concurrency: usize) -> Self {
+    pub(crate) fn new(concurrency: usize) -> Self {
         Self(Arc::new(SchedulerInner {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
-            data_io_pool: Arc::new(WorkerPool::new(data_io_concurrency)),
-            network_pool: Arc::new(WorkerPool::new(network_concurrency)),
+            pool: Arc::new(WorkerPool::new(concurrency)),
         }))
     }
 
     /// Ensure workers are spawned for a pool. Called lazily on first enqueue.
-    fn ensure_workers_started(&self, pool: &Arc<WorkerPool>) {
+    fn ensure_workers_started(&self) {
+        let pool = &self.0.pool;
         if pool.mark_started() {
             for _ in 0..pool.concurrency() {
                 let pool = Arc::clone(pool);
@@ -119,8 +119,7 @@ impl Scheduler {
 
     /// Add a transfer and start generating work.
     pub(crate) fn enqueue_transfer(&self, transfer: Transfer) {
-        self.ensure_workers_started(&self.0.data_io_pool);
-        self.ensure_workers_started(&self.0.network_pool);
+        self.ensure_workers_started();
 
         // start with lowest current vruntime to avoid new transfer
         // playing aggressive catchup over already in-flight transfers
@@ -162,9 +161,7 @@ impl Scheduler {
     pub(crate) fn cancel_transfer(&self, id: TransferId) -> Option<Transfer> {
         let desc = self.0.transfers.write().unwrap().remove(&id)?;
 
-        // Purge queued work
-        let purged = self.0.data_io_pool.remove_for_transfer(id)
-            + self.0.network_pool.remove_for_transfer(id);
+        let purged = self.0.pool.remove_for_transfer(id);
         desc.work_purged(purged);
 
         Some(desc.transfer().clone())
@@ -216,7 +213,7 @@ impl Scheduler {
     }
 
     fn has_capacity(&self) -> bool {
-        self.0.data_io_pool.has_capacity() || self.0.network_pool.has_capacity()
+        self.0.pool.has_capacity()
     }
 
     /// Generate work from ready transfers and push to pools.
@@ -248,19 +245,13 @@ impl Scheduler {
 
     fn enqueue_to_pool(&self, work: ScheduledWork) {
         work.descriptor.work_queued();
-        match work.item.kind {
-            WorkKind::DataIO => self.0.data_io_pool.push(work),
-            WorkKind::Network => self.0.network_pool.push(work),
-        }
+        self.0.pool.push(work);
     }
 
-    /// Check if scheduler is idle (no transfers, no pending work, no in-flight work).
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
-            && self.0.data_io_pool.pending_count() == 0
-            && self.0.data_io_pool.in_flight_count() == 0
-            && self.0.network_pool.pending_count() == 0
-            && self.0.network_pool.in_flight_count() == 0
+            && self.0.pool.pending_count() == 0
+            && self.0.pool.in_flight_count() == 0
     }
 
     /// Wait for a specific transfer to have no outstanding work.
@@ -276,8 +267,7 @@ impl Scheduler {
 
     /// Shutdown the scheduler. Workers will exit after completing current work.
     pub(crate) fn shutdown(&self) {
-        self.0.data_io_pool.shutdown();
-        self.0.network_pool.shutdown();
+        self.0.pool.shutdown();
     }
 }
 
@@ -324,17 +314,19 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 mod tests {
     use super::*;
     use crate::scheduler::transfer::mock::{FixedWorkCount, MockStateMachine, WithDelay};
+    use crate::scheduler::work::{WorkData, WorkKind, WorkOutcome};
     use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
     async fn test_single_transfer_completes() {
         let _logs = show_test_logs();
-        let scheduler = Scheduler::new(4, 4);
+        let scheduler = Scheduler::new(4);
         let id = TransferId {
             id: 1,
             parent: None,
@@ -359,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_transfers_complete() {
-        let scheduler = Scheduler::new(4, 4);
+        let scheduler = Scheduler::new(4);
         let mut state_machines = Vec::new();
 
         for i in 0..3u64 {
@@ -389,12 +381,12 @@ mod tests {
 
     #[test]
     fn test_new_does_not_require_runtime() {
-        let _scheduler = Scheduler::new(4, 4);
+        let _scheduler = Scheduler::new(4);
     }
 
     #[tokio::test]
     async fn test_set_priority() {
-        let scheduler = Scheduler::new(2, 2);
+        let scheduler = Scheduler::new(2);
         let id = TransferId {
             id: 1,
             parent: None,
@@ -452,10 +444,135 @@ mod tests {
         }
     }
 
+    /// Mock that generates infinite work and counts executions.
+    /// Can be stopped by calling `set_done()`.
+    #[derive(Debug)]
+    struct CountingInfinite {
+        executions: AtomicUsize,
+        done: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingInfinite {
+        fn new() -> Self {
+            Self {
+                executions: AtomicUsize::new(0),
+                done: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.executions.load(Ordering::Relaxed)
+        }
+
+        fn set_done(&self) {
+            self.done.store(true, Ordering::Release);
+        }
+    }
+
+    impl MockStateMachine for CountingInfinite {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.done.load(Ordering::Acquire) {
+                return PollWork::Done;
+            }
+            PollWork::Ready(WorkItem {
+                kind: WorkKind::Network,
+                data: WorkData::UploadPart {
+                    part_number: 1,
+                    part_data: None,
+                },
+            })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut WorkItem,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.executions.fetch_add(1, Ordering::Relaxed);
+                // Yield to prevent starving other tasks on single-threaded runtimes
+                tokio::task::yield_now().await;
+                // No schedule_next — let generate_work() pull from ready set
+                // where CFS priority ordering applies
+                WorkOutcome::Success {
+                    schedule_next: None,
+                    data: WorkData::UploadPart {
+                        part_number: 1,
+                        part_data: None,
+                    },
+                }
+            })
+        }
+
+        fn is_terminal(&self) -> bool {
+            self.done.load(Ordering::Acquire)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_priority_affects_work_distribution() {
+        let scheduler = Scheduler::new(2);
+
+        let high_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let low_id = TransferId {
+            id: 2,
+            parent: None,
+        };
+
+        let high_mock = Arc::new(CountingInfinite::new());
+        let low_mock = Arc::new(CountingInfinite::new());
+
+        let high_transfer = Transfer::Mock(MockTransfer::new(high_id, high_mock.clone()));
+        let low_transfer = Transfer::Mock(MockTransfer::new(low_id, low_mock.clone()));
+
+        scheduler.enqueue_transfer(high_transfer);
+        scheduler.enqueue_transfer(low_transfer);
+
+        // Set priorities: high=255, low=64 (4x difference)
+        scheduler.set_priority(high_id, 255);
+        scheduler.set_priority(low_id, 64);
+
+        // Wait until we have enough samples
+        let target_total = 200;
+        while high_mock.count() + low_mock.count() < target_total {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Stop generating work
+        high_mock.set_done();
+        low_mock.set_done();
+
+        scheduler.shutdown();
+
+        let high_count = high_mock.count();
+        let low_count = low_mock.count();
+
+        // High priority should get significantly more work
+        // With 4x priority difference, expect at least 1.5x more executions
+        // (conservative to avoid flakiness)
+        assert!(
+            high_count > low_count,
+            "high priority should execute more: high={}, low={}",
+            high_count,
+            low_count
+        );
+
+        let ratio = high_count as f64 / low_count.max(1) as f64;
+        assert!(
+            ratio > 1.5,
+            "expected ratio > 1.5, got {:.2} (high={}, low={})",
+            ratio,
+            high_count,
+            low_count
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires mock with wake support to test cancel mid-flight"]
     async fn test_cancel_transfer_stops_work() {
-        let scheduler = Scheduler::new(2, 2);
+        let scheduler = Scheduler::new(2);
         let id = TransferId {
             id: 1,
             parent: None,

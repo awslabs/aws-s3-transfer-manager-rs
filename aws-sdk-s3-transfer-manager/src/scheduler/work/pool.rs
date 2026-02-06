@@ -47,11 +47,9 @@ impl WorkerPool {
             }
             {
                 let mut queue = self.queue.lock().unwrap();
-                if queue.has_capacity() {
-                    if let Some(work) = queue.pop() {
-                        queue.mark_in_flight();
-                        return Some(work);
-                    }
+                if let Some(work) = queue.pop() {
+                    queue.mark_in_flight();
+                    return Some(work);
                 }
             }
             self.work_available.notified().await;

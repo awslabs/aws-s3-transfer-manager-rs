@@ -25,7 +25,7 @@ impl WorkQueue {
     }
 
     pub(super) fn has_capacity(&self) -> bool {
-        self.in_flight < self.concurrency
+        self.pending.len() + self.in_flight < self.concurrency
     }
 
     pub(super) fn push(&mut self, item: ScheduledWork) {

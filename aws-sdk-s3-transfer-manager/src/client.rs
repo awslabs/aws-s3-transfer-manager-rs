@@ -72,7 +72,7 @@ impl Client {
             ConcurrencyMode::Explicit(n) => *n,
             _ => DEFAULT_CONCURRENCY,
         };
-        let new_scheduler = NewScheduler::new(concurrency, concurrency);
+        let new_scheduler = NewScheduler::new(concurrency);
 
         let handle = Arc::new(Handle {
             config,

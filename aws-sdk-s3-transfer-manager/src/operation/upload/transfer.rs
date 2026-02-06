@@ -625,10 +625,7 @@ mod tests {
             scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(8),
             ),
-            new_scheduler: crate::scheduler::Scheduler::new(
-                DEFAULT_CONCURRENCY,
-                DEFAULT_CONCURRENCY,
-            ),
+            new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
         let input = UploadInput::builder()
