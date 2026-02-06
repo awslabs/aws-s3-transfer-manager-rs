@@ -18,6 +18,7 @@ use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadContext, DownloadWorkState};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::ChunkSender;
+use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
 macro_rules! bail_if_terminal {
@@ -28,7 +29,6 @@ macro_rules! bail_if_terminal {
         }
     };
 }
-use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 /// Download transfer that generates and executes download work.
 #[derive(Debug, Clone)]
@@ -90,6 +90,12 @@ impl DownloadTransfer {
                 chunk_tx,
                 ..
             } => {
+                // Check seq window before generating work
+                let Some(seq) = self.ctx.state.seq_window.try_claim() else {
+                    self.ctx.set_pending();
+                    return PollWork::Pending;
+                };
+
                 if let Some(range) = remaining.take() {
                     let part_size = self.ctx.target_part_size_bytes();
                     let start = *range.start();
@@ -101,7 +107,6 @@ impl DownloadTransfer {
                         *remaining = Some((chunk_end + 1)..=end);
                     }
 
-                    let seq = self.ctx.next_seq();
                     *ranges_in_flight += 1;
 
                     PollWork::Ready(WorkItem {
@@ -183,37 +188,51 @@ impl DownloadTransfer {
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
-        // If there's an initial chunk, we need to account for it in ranges_in_flight
-        let has_initial_chunk = initial_chunk.is_some();
+        // If there's an initial chunk, claim seq BEFORE waking to prevent race
+        // where poll_work exhausts the window before we can claim our seq.
+        // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
+        let initial_work = match (initial_chunk, chunk_meta) {
+            (Some(stream), Some(meta)) => {
+                let seq = self
+                    .ctx
+                    .state
+                    .seq_window
+                    .try_claim()
+                    .expect("seq window should have capacity at start");
+                Some((stream, meta, seq))
+            }
+            (None, None) => None,
+            _ => panic!(
+                "invalid discovery state: initial_chunk and chunk_meta must both be Some or None"
+            ),
+        };
 
         {
             let mut work = self.ctx.state.work.lock().unwrap();
             *work = DownloadWorkState::Transferring {
                 remaining,
-                ranges_in_flight: if has_initial_chunk { 1 } else { 0 },
+                ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag,
                 object_meta,
                 chunk_tx: chunk_tx.clone(),
             };
         }
+
         // State changed from DiscoveryInFlight - try to wake
         self.ctx.try_wake();
 
         // If discovery returned an initial chunk, schedule work to read it
-        match (initial_chunk, chunk_meta) {
-            (Some(stream), Some(chunk_meta)) => {
-                let seq = self.ctx.next_seq(); // Claim seq for initial chunk
-                WorkOutcome::Success {
-                    schedule_next: Some(WorkKind::Network),
-                    data: WorkData::ReadDiscoveryBody {
-                        stream,
-                        seq,
-                        chunk_meta,
-                        chunk_tx,
-                    },
-                }
-            }
-            _ => WorkOutcome::Success {
+        match initial_work {
+            Some((stream, chunk_meta, seq)) => WorkOutcome::Success {
+                schedule_next: Some(WorkKind::Network),
+                data: WorkData::ReadDiscoveryBody {
+                    stream,
+                    seq,
+                    chunk_meta,
+                    chunk_tx,
+                },
+            },
+            None => WorkOutcome::Success {
                 schedule_next: None,
                 data: WorkData::Discovery { chunk_tx },
             },
@@ -586,6 +605,51 @@ mod tests {
     #[ignore = "needs cancellation support"]
     async fn test_cancellation_transitions_to_cancelled() {
         todo!()
+    }
+
+    #[tokio::test]
+    async fn test_seq_window_limits_work_generation() {
+        // Create download with many parts but small seq window
+        let transfer = create_download(128 * MB, 8 * MB); // 16 parts
+        transfer.ctx.state.seq_window.set_max_gap(3);
+
+        skip_discovery(&transfer).await;
+        // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
+        // Gap=3 means: claimed < consumed + gap → claimed < 3
+        // So we can claim seq 1, 2 (claimed becomes 2, then 3)
+
+        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
+        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
+
+        // Gap exhausted (claimed=3, consumed=0, gap=3: 3 >= 0+3)
+        assert_pending(transfer.poll_work());
+    }
+
+    #[tokio::test]
+    async fn test_seq_window_consume_enables_more_work() {
+        let transfer = create_download(128 * MB, 8 * MB);
+        transfer.ctx.state.seq_window.set_max_gap(2);
+
+        skip_discovery(&transfer).await;
+        // After discovery: claimed=1, consumed=0
+        // Gap=2 means: claimed < 2, so we can only claim seq=1
+
+        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
+        assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
+
+        // Simulate consumer reading seq 0
+        transfer.ctx.state.seq_window.consume(0);
+        // Now consumed=1, so claimed < 1+2=3
+
+        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
+        assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
+
+        // Consume seq 1
+        transfer.ctx.state.seq_window.consume(1);
+        // Now consumed=2, so claimed < 2+2=4
+
+        let _w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
+        assert_pending(transfer.poll_work());
     }
 
     use crate::http::header::Range;

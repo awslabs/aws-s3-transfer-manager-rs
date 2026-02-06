@@ -111,6 +111,10 @@ impl Body {
 
         let chunk = self.sequencer.pop();
         if let Some(chunk) = chunk {
+            // Advance consumed seq - may enable more work generation
+            if self.ctx.state.seq_window.consume(chunk.seq) {
+                self.ctx.try_wake();
+            }
             self.sequencer.advance();
             Some(Ok(chunk))
         } else {
