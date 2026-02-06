@@ -24,7 +24,7 @@ mod worker;
 use crate::{error, types::FailedUpload};
 
 use super::{
-    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, TransferContext,
+    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, LegacyTransferContext,
 };
 
 /// Operation struct for uploading multiple objects to Amazon S3
@@ -109,7 +109,7 @@ impl UploadObjectsState {
     }
 }
 
-type UploadObjectsContext = TransferContext<UploadObjectsState>;
+type UploadObjectsContext = LegacyTransferContext<UploadObjectsState>;
 
 impl UploadObjectsContext {
     fn new(
@@ -123,6 +123,6 @@ impl UploadObjectsContext {
             id: 0,
             parent: None,
         };
-        TransferContext::from_state(id, handle, state)
+        LegacyTransferContext::from_state(id, handle, state)
     }
 }

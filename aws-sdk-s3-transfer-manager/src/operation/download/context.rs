@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::operation::{ChunkSender, TransferContext};
+use crate::operation::ChunkSender;
 use crate::types::BucketType;
 
 /// Default maximum gap between claimed and consumed sequences.
@@ -87,7 +87,7 @@ impl Default for SeqWindow {
     }
 }
 
-pub(crate) type DownloadContext = TransferContext<DownloadState>;
+pub(crate) type DownloadContext = crate::operation::LegacyTransferContext<DownloadState>;
 
 impl DownloadContext {
     pub(crate) fn new(
@@ -105,7 +105,7 @@ impl DownloadContext {
             discovery_notify: tokio::sync::Notify::new(),
             work: Mutex::new(DownloadWorkState::new(chunk_tx)),
         });
-        TransferContext::from_state(id, handle, state)
+        crate::operation::LegacyTransferContext::from_state(id, handle, state)
     }
 
     /// The target part size to use for this download

@@ -28,7 +28,7 @@ use tracing::Instrument;
 use crate::types::FailedDownload;
 
 use super::{
-    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, TransferContext,
+    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, LegacyTransferContext,
 };
 
 /// Operation struct for downloading multiple objects from Amazon S3
@@ -93,7 +93,7 @@ pub(crate) struct DownloadObjectsState {
     total_bytes_transferred: AtomicU64,
 }
 
-type DownloadObjectsContext = TransferContext<DownloadObjectsState>;
+type DownloadObjectsContext = LegacyTransferContext<DownloadObjectsState>;
 
 impl DownloadObjectsContext {
     fn new(
@@ -114,6 +114,6 @@ impl DownloadObjectsContext {
             id: 0,
             parent: None,
         };
-        TransferContext::from_state(id, handle, state)
+        LegacyTransferContext::from_state(id, handle, state)
     }
 }

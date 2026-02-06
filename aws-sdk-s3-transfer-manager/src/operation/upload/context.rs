@@ -4,7 +4,6 @@
  */
 
 use crate::operation::upload::UploadInput;
-use crate::operation::TransferContext;
 use crate::types::BucketType;
 use aws_sdk_s3::types::CompletedPart;
 use std::ops::Deref;
@@ -14,7 +13,7 @@ use crate::io::part_reader::PartReader;
 use crate::io::InputStream;
 use crate::operation::upload::UploadOutputBuilder;
 
-pub(crate) type UploadContext = TransferContext<UploadState>;
+pub(crate) type UploadContext = crate::operation::LegacyTransferContext<UploadState>;
 
 impl UploadContext {
     pub(crate) fn new(
@@ -44,7 +43,7 @@ impl UploadContext {
             }),
             create_mpu_complete: tokio::sync::Notify::new(),
         });
-        TransferContext::from_state(id, handle, state)
+        crate::operation::LegacyTransferContext::from_state(id, handle, state)
     }
 }
 
