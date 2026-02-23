@@ -6,6 +6,8 @@
 //! Download transfer implementation for scheduler integration.
 
 use std::cmp;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
@@ -19,7 +21,7 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{ChunkSender, TransferContext};
-use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -463,6 +465,23 @@ impl DownloadTransfer {
         *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters
         self.inner.ctx.signal_terminal();
+    }
+}
+
+impl Transfer for DownloadTransfer {
+    fn ctx(&self) -> &TransferContext {
+        DownloadTransfer::ctx(self)
+    }
+
+    fn poll_work(&self) -> PollWork {
+        DownloadTransfer::poll_work(self)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        work: &'a mut WorkItem,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        Box::pin(DownloadTransfer::execute(self, work))
     }
 }
 

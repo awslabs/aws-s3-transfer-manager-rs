@@ -85,7 +85,7 @@ impl Upload {
 
         handle
             .new_scheduler
-            .enqueue_transfer(crate::scheduler::Transfer::Upload(transfer.clone()));
+            .enqueue_transfer(Box::new(transfer.clone()));
 
         Ok(UploadHandle::new(result_rx, transfer))
     }

@@ -64,7 +64,7 @@
 //! transfers, avoiding wasted work.
 
 use super::{
-    PollWork, ScheduledWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool,
+    BoxTransfer, PollWork, ScheduledWork, Transfer, TransferId, WorkItem, WorkOutcome, WorkerPool,
 };
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -118,7 +118,7 @@ impl Scheduler {
     }
 
     /// Add a transfer and start generating work.
-    pub(crate) fn enqueue_transfer(&self, transfer: Transfer) {
+    pub(crate) fn enqueue_transfer(&self, transfer: BoxTransfer) {
         self.ensure_workers_started();
 
         // start with lowest current vruntime to avoid new transfer
@@ -158,13 +158,15 @@ impl Scheduler {
     ///
     /// TODO(redux): When upload_objects/download_objects use the new scheduler,
     /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
-    pub(crate) fn cancel_transfer(&self, id: TransferId) -> Option<Transfer> {
-        let desc = self.0.transfers.write().unwrap().remove(&id)?;
-
-        let purged = self.0.pool.remove_for_transfer(id);
-        desc.work_purged(purged);
-
-        Some(desc.transfer().clone())
+    pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
+        let desc = self.0.transfers.write().unwrap().remove(&id);
+        if let Some(desc) = desc {
+            let purged = self.0.pool.remove_for_transfer(id);
+            desc.work_purged(purged);
+            true
+        } else {
+            false
+        }
     }
 
     /// Set the priority of a transfer.
@@ -296,7 +298,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
         tracing::debug!(wid, %tid, work = %work.item.data.debug_label(), "executing");
         let transfer = work.descriptor.transfer();
 
-        let token = transfer.cancellation_token().clone();
+        let token = transfer.ctx().cancellation_token().clone();
         let outcome = tokio::select! {
             biased;
             _ = token.cancelled() => WorkOutcome::Cancelled,
@@ -333,7 +335,7 @@ mod tests {
         };
 
         let sm = Arc::new(FixedWorkCount::new(5));
-        let transfer = Transfer::Mock(MockTransfer::new(id, sm.clone()));
+        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
         scheduler.enqueue_transfer(transfer);
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -361,7 +363,7 @@ mod tests {
             };
             let sm = Arc::new(FixedWorkCount::new(4));
             state_machines.push(sm.clone());
-            scheduler.enqueue_transfer(Transfer::Mock(MockTransfer::new(id, sm)));
+            scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
         }
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -394,7 +396,7 @@ mod tests {
 
         // Use a mock that returns Pending so it doesn't complete immediately
         let sm = Arc::new(PendingForever);
-        let transfer = Transfer::Mock(MockTransfer::new(id, sm));
+        let transfer = Box::new(MockTransfer::new(id, sm));
         scheduler.enqueue_transfer(transfer);
 
         // Default priority is 128
@@ -524,8 +526,8 @@ mod tests {
         let high_mock = Arc::new(CountingInfinite::new());
         let low_mock = Arc::new(CountingInfinite::new());
 
-        let high_transfer = Transfer::Mock(MockTransfer::new(high_id, high_mock.clone()));
-        let low_transfer = Transfer::Mock(MockTransfer::new(low_id, low_mock.clone()));
+        let high_transfer = Box::new(MockTransfer::new(high_id, high_mock.clone()));
+        let low_transfer = Box::new(MockTransfer::new(low_id, low_mock.clone()));
 
         scheduler.enqueue_transfer(high_transfer);
         scheduler.enqueue_transfer(low_transfer);
@@ -581,15 +583,15 @@ mod tests {
         // Use WithDelay to make work slow enough to cancel mid-flight
         let inner = FixedWorkCount::new(20);
         let sm = Arc::new(WithDelay::new(inner, Duration::from_millis(50)));
-        let transfer = Transfer::Mock(MockTransfer::new(id, sm.clone()));
+        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
         scheduler.enqueue_transfer(transfer);
 
         // Let some work start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Cancel the transfer - returns Some on first call
-        assert!(scheduler.cancel_transfer(id).is_some());
-        assert!(scheduler.cancel_transfer(id).is_none());
+        // Cancel the transfer - returns true on first call
+        assert!(scheduler.cancel_transfer(id));
+        assert!(!scheduler.cancel_transfer(id));
 
         // Wait for scheduler to become idle
         tokio::time::timeout(Duration::from_secs(2), async {

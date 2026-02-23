@@ -35,7 +35,7 @@ pub(crate) fn assert_done(poll: PollWork) {
 }
 
 /// Execute work and handle follow-on work (e.g., DataIO -> Network phase transitions).
-pub(crate) async fn execute(transfer: &Transfer, work: &mut WorkItem) -> WorkOutcome {
+pub(crate) async fn execute(transfer: &dyn Transfer, work: &mut WorkItem) -> WorkOutcome {
     let outcome = transfer.execute(work).await;
 
     // If there's follow-on work, execute it too

@@ -78,7 +78,7 @@ impl Download {
         let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, chunk_tx);
         handle
             .new_scheduler
-            .enqueue_transfer(crate::scheduler::Transfer::Download(transfer.clone()));
+            .enqueue_transfer(Box::new(transfer.clone()));
 
         Ok(DownloadHandle::new(transfer, chunk_rx, completion_rx))
     }

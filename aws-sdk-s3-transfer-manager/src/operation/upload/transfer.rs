@@ -14,6 +14,9 @@ use bytes::Buf;
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::error::{self, Error};
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::{InputStream, PartData};
@@ -23,7 +26,7 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
 
 /// Maximum number of parts that a single S3 multipart upload supports
@@ -601,6 +604,23 @@ impl UploadTransfer {
             )));
         }
         WorkOutcome::Failed
+    }
+}
+
+impl Transfer for UploadTransfer {
+    fn ctx(&self) -> &TransferContext {
+        UploadTransfer::ctx(self)
+    }
+
+    fn poll_work(&self) -> PollWork {
+        UploadTransfer::poll_work(self)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        work: &'a mut WorkItem,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        Box::pin(UploadTransfer::execute(self, work))
     }
 }
 

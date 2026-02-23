@@ -10,7 +10,10 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use s3_mock_server::S3MockServer;
 
 /// Setup transfer manager with mock server
-async fn setup() -> (s3_mock_server::ServerHandle, aws_sdk_s3_transfer_manager::Client) {
+async fn setup() -> (
+    s3_mock_server::ServerHandle,
+    aws_sdk_s3_transfer_manager::Client,
+) {
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()
@@ -44,7 +47,10 @@ async fn test_mpu_upload_small_file() {
 
     let result = upload_handle.join().await.expect("upload complete");
     assert!(result.e_tag().is_some(), "should have etag");
-    assert!(result.upload_id().is_some(), "should have upload_id for MPU");
+    assert!(
+        result.upload_id().is_some(),
+        "should have upload_id for MPU"
+    );
 
     // TODO(redux): Use mock server's get_object API instead of going through S3 client
     // once that API is available on ServerHandle
@@ -88,7 +94,12 @@ async fn test_mpu_upload_concurrent() {
     // Wait for all uploads to complete
     for (key, handle) in handles {
         let result = handle.join().await;
-        assert!(result.is_ok(), "upload {} should succeed: {:?}", key, result);
+        assert!(
+            result.is_ok(),
+            "upload {} should succeed: {:?}",
+            key,
+            result
+        );
     }
 
     server_handle.shutdown().await.expect("shutdown");
@@ -126,7 +137,11 @@ async fn test_upload_verify_data_integrity() {
         .expect("get object");
 
     let body = get_result.body.collect().await.expect("collect body");
-    assert_eq!(body.to_vec(), expected_content, "data integrity check failed");
+    assert_eq!(
+        body.to_vec(),
+        expected_content,
+        "data integrity check failed"
+    );
 
     server_handle.shutdown().await.expect("shutdown");
 }

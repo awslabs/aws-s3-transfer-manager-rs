@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use super::{Transfer, TransferId};
+use super::{BoxTransfer, Transfer, TransferId};
 
 /// Default priority assigned to new transfers
 const DEFAULT_PRIORITY: u8 = 128;
@@ -31,14 +31,14 @@ struct Inner {
     priority: AtomicU8,
     vruntime: AtomicU64,
     queued_executing: QueuedExecuting,
-    transfer: Transfer,
+    transfer: BoxTransfer,
     idle_notify: Notify,
 }
 
 impl std::fmt::Debug for TransferDescriptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransferDescriptor")
-            .field("tid", &self.0.transfer.id())
+            .field("tid", &self.0.transfer.ctx().id)
             .field("priority", &self.priority())
             .field("vruntime", &self.vruntime())
             .finish_non_exhaustive()
@@ -46,7 +46,7 @@ impl std::fmt::Debug for TransferDescriptor {
 }
 
 impl TransferDescriptor {
-    pub(super) fn new(transfer: Transfer) -> Self {
+    pub(super) fn new(transfer: BoxTransfer) -> Self {
         Self(Arc::new(Inner {
             priority: AtomicU8::new(DEFAULT_PRIORITY),
             vruntime: AtomicU64::new(0),
@@ -56,7 +56,7 @@ impl TransferDescriptor {
         }))
     }
 
-    pub(super) fn new_with_vruntime(transfer: Transfer, initial_vruntime: u64) -> Self {
+    pub(super) fn new_with_vruntime(transfer: BoxTransfer, initial_vruntime: u64) -> Self {
         Self(Arc::new(Inner {
             priority: AtomicU8::new(DEFAULT_PRIORITY),
             vruntime: AtomicU64::new(initial_vruntime),
@@ -66,12 +66,12 @@ impl TransferDescriptor {
         }))
     }
 
-    pub(super) fn transfer(&self) -> &Transfer {
-        &self.0.transfer
+    pub(super) fn transfer(&self) -> &dyn Transfer {
+        self.0.transfer.as_ref()
     }
 
     pub(super) fn id(&self) -> TransferId {
-        self.0.transfer.id()
+        self.0.transfer.ctx().id
     }
 
     pub(super) fn priority(&self) -> u8 {
@@ -135,7 +135,7 @@ impl TransferDescriptor {
 
     /// Check if this transfer has reached a terminal state and no longer needs polled
     pub(super) fn is_terminal(&self) -> bool {
-        self.0.transfer.is_terminal()
+        !self.0.transfer.ctx().is_active()
     }
 
     pub(super) async fn wait_for_idle(&self) {
@@ -301,7 +301,7 @@ mod tests {
         fn test_descriptor(id: u64) -> TransferDescriptor {
             let transfer_id = TransferId { id, parent: None };
             let sm = Arc::new(FixedWorkCount::new(100));
-            let transfer = Transfer::Mock(MockTransfer::new(transfer_id, sm));
+            let transfer = Box::new(MockTransfer::new(transfer_id, sm));
             TransferDescriptor::new(transfer)
         }
 

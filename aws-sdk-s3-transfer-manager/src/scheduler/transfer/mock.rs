@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::scheduler::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::operation::TransferContext;
+use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
 /// Trait for mock state machines that drive transfer behavior.
 pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
@@ -29,6 +30,7 @@ pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
 #[derive(Clone)]
 pub(crate) struct MockTransfer {
     id: TransferId,
+    ctx: TransferContext,
     state_machine: Arc<dyn MockStateMachine>,
     cancellation_token: CancellationToken,
 }
@@ -47,8 +49,25 @@ impl MockTransfer {
         id: TransferId,
         state_machine: Arc<S>,
     ) -> Self {
+        use crate::DEFAULT_CONCURRENCY;
+        use std::sync::Arc;
+
+        // Create a minimal handle for testing
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder().client(s3_client).build();
+        let handle = Arc::new(crate::client::Handle {
+            config,
+            scheduler: crate::runtime::scheduler::Scheduler::new(
+                crate::types::ConcurrencyMode::Explicit(8),
+            ),
+            new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        });
+
+        let (ctx, _completion_rx) = TransferContext::new(id, handle);
+
         Self {
             id,
+            ctx,
             state_machine,
             cancellation_token: CancellationToken::new(),
         }
@@ -72,6 +91,23 @@ impl MockTransfer {
 
     pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
         self.state_machine.execute(work).await
+    }
+}
+
+impl Transfer for MockTransfer {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        MockTransfer::poll_work(self)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        work: &'a mut WorkItem,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        Box::pin(MockTransfer::execute(self, work))
     }
 }
 

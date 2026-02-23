@@ -133,13 +133,13 @@ impl ReadySet {
 mod tests {
     use super::*;
     use crate::scheduler::transfer::mock::FixedWorkCount;
-    use crate::scheduler::{MockTransfer, Transfer};
+    use crate::scheduler::MockTransfer;
     use std::sync::Arc;
 
     fn make_descriptor(id: u64, priority: u8, vruntime: u64) -> TransferDescriptor {
         let tid = TransferId { id, parent: None };
         let sm = Arc::new(FixedWorkCount::new(1));
-        let transfer = Transfer::Mock(MockTransfer::new(tid, sm));
+        let transfer = Box::new(MockTransfer::new(tid, sm));
         let desc = TransferDescriptor::new(transfer);
         desc.set_priority(priority);
         desc.set_vruntime(vruntime);
