@@ -21,7 +21,7 @@ use super::descriptor::TransferDescriptor;
 /// (scheduler's tracking context). This keeps scheduling concerns out of
 /// transfer state machines.
 #[derive(Debug)]
-pub(crate) struct ScheduledWork {
-    pub(crate) item: WorkItem,
-    pub(crate) descriptor: TransferDescriptor,
+pub(super) struct ScheduledWork {
+    pub(super) item: WorkItem,
+    pub(super) descriptor: TransferDescriptor,
 }

@@ -83,14 +83,8 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
-/// Tower related middleware and components
-pub(crate) mod middleware;
-
 /// HTTP related components and utils
 pub(crate) mod http;
-
-/// Internal runtime components
-pub(crate) mod runtime;
 
 /// Work scheduler
 pub(crate) mod scheduler;

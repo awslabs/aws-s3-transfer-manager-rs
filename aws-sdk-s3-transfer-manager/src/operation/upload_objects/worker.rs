@@ -335,8 +335,6 @@ mod tests {
             worker::{upload_single_obj, UploadObjectJob},
             UploadObjectsContext, UploadObjectsInputBuilder,
         },
-        runtime::scheduler::Scheduler,
-        types::ConcurrencyMode,
         DEFAULT_CONCURRENCY,
     };
 
@@ -713,12 +711,10 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let scheduler = Scheduler::new(ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY));
         let new_scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
 
         let handle = std::sync::Arc::new(Handle {
             config,
-            scheduler,
             new_scheduler,
         });
         let input = UploadObjectsInputBuilder::default()

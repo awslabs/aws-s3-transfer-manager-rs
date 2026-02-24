@@ -70,6 +70,7 @@ impl PartReader {
         Self { inner, stream_cx }
     }
 
+    #[allow(dead_code)] // TODO(phase3): re-wire upload part validation
     pub(crate) fn part_size(&self) -> usize {
         self.stream_cx.part_size()
     }

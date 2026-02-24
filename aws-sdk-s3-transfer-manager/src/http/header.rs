@@ -18,11 +18,6 @@ impl Range {
     pub(crate) fn bytes(rng: ByteRange) -> Self {
         Self(rng)
     }
-
-    /// Create a range from the inclusive start and end offsets
-    pub(crate) fn bytes_inclusive(start: u64, end: u64) -> Self {
-        Range::bytes(ByteRange::Inclusive(start, end))
-    }
 }
 
 impl fmt::Display for Range {

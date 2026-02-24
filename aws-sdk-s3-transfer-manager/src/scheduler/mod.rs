@@ -10,7 +10,7 @@ mod work;
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{BoxTransfer, Transfer};
 pub(crate) use work::{
-    PollWork, ScheduledWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome, WorkerPool,
+    PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome, WorkerPool,
 };
 
 mod descriptor;

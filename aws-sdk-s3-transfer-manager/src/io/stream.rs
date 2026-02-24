@@ -184,6 +184,7 @@ impl PartData {
     //
     // It is `Option` because it's not always possible to determine
     // whether the just-yielded part is the last one, e.g., streaming cases.
+    #[allow(dead_code)] // TODO(phase3): re-wire upload part validation
     pub(crate) fn is_last(&self) -> Option<bool> {
         self.is_last
     }

@@ -63,11 +63,10 @@
 //! waiting for in-flight work to complete). The scheduler only polls ready
 //! transfers, avoiding wasted work.
 
-use super::{
-    BoxTransfer, PollWork, ScheduledWork, Transfer, TransferId, WorkItem, WorkOutcome, WorkerPool,
-};
+use super::{BoxTransfer, PollWork, TransferId, WorkItem, WorkOutcome, WorkerPool};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
+use crate::scheduler::work::ScheduledWork;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -185,7 +184,7 @@ impl Scheduler {
     }
 
     /// Called by workers when work completes.
-    pub(crate) fn on_completion(&self, work: ScheduledWork, outcome: WorkOutcome) {
+    pub(super) fn on_completion(&self, work: ScheduledWork, outcome: WorkOutcome) {
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
         if is_idle {
@@ -250,6 +249,7 @@ impl Scheduler {
         self.0.pool.push(work);
     }
 
+    #[allow(dead_code)] // TODO(phase3): wire into Handle for graceful shutdown
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
             && self.0.pool.pending_count() == 0
@@ -268,6 +268,7 @@ impl Scheduler {
     }
 
     /// Shutdown the scheduler. Workers will exit after completing current work.
+    #[allow(dead_code)] // TODO(phase3): wire into Handle::drop
     pub(crate) fn shutdown(&self) {
         self.0.pool.shutdown();
     }
@@ -440,10 +441,6 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async { unreachable!("PendingForever never generates work") })
         }
-
-        fn is_terminal(&self) -> bool {
-            false
-        }
     }
 
     /// Mock that generates infinite work and counts executions.
@@ -503,10 +500,6 @@ mod tests {
                     },
                 }
             })
-        }
-
-        fn is_terminal(&self) -> bool {
-            self.done.load(Ordering::Acquire)
         }
     }
 

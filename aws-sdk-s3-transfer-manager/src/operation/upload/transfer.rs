@@ -26,7 +26,7 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, WorkData, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
 
 /// Maximum number of parts that a single S3 multipart upload supports
@@ -53,6 +53,7 @@ struct UploadTransferInner {
     /// The original request (body taken for processing)
     request: Arc<UploadInput>,
     /// Type of S3 bucket targeted by this operation
+    #[allow(dead_code)] // TODO(phase4): hedging/routing
     bucket_type: BucketType,
     /// Notified when CreateMPU completes (success or failure)
     create_mpu_complete: tokio::sync::Notify,
@@ -96,10 +97,6 @@ impl UploadTransfer {
     }
 
     /// Get the transfer ID.
-    pub(crate) fn id(&self) -> TransferId {
-        self.inner.ctx.id
-    }
-
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
         &self.inner.request
@@ -629,7 +626,7 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::scheduler::{WorkData, WorkKind};
+    use crate::scheduler::{TransferId, WorkData, WorkKind};
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -642,9 +639,6 @@ mod tests {
     ) -> (UploadTransfer, UploadResultReceiver) {
         let handle = Arc::new(crate::client::Handle {
             config: crate::Config::builder().client(s3_client).build(),
-            scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(8),
-            ),
             new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 

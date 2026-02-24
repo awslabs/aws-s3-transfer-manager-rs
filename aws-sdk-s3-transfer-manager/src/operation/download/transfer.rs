@@ -52,6 +52,7 @@ struct DownloadTransferInner {
     /// The original request
     request: Arc<DownloadInput>,
     /// Type of S3 bucket targeted by this operation
+    #[allow(dead_code)] // TODO(phase4): hedging/routing
     bucket_type: BucketType,
     /// Sequence window for backpressure control
     seq_window: SeqWindow,
@@ -91,11 +92,13 @@ impl DownloadTransfer {
     }
 
     /// The original request.
+    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
     pub(crate) fn request(&self) -> &DownloadInput {
         &self.inner.request
     }
 
     /// Type of S3 bucket targeted by this operation.
+    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
     pub(crate) fn bucket_type(&self) -> BucketType {
         self.inner.bucket_type
     }
@@ -116,6 +119,7 @@ impl DownloadTransfer {
     }
 
     /// Get the cancellation token for this transfer.
+    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
     pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
         self.inner.ctx.cancellation_token()
     }
@@ -143,9 +147,7 @@ impl DownloadTransfer {
         match &mut *state {
             DownloadState::PendingDiscovery { chunk_tx } => {
                 let chunk_tx_clone = chunk_tx.clone();
-                *state = DownloadState::DiscoveryInFlight {
-                    chunk_tx: chunk_tx.clone(),
-                };
+                *state = DownloadState::DiscoveryInFlight {};
                 PollWork::Ready(WorkItem {
                     kind: WorkKind::Network,
                     data: WorkData::Discovery {
@@ -286,7 +288,6 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag,
-                object_meta,
                 chunk_tx: chunk_tx.clone(),
             };
         }
@@ -524,9 +525,6 @@ mod tests {
 
         let handle = Arc::new(crate::client::Handle {
             config,
-            scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(8),
-            ),
             new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
@@ -753,6 +751,7 @@ mod tests {
         /// Always fail
         Always,
         /// Fail first N attempts, then succeed
+        #[allow(dead_code)] // TODO(phase3): re-enable with retry tests
         Times(usize),
     }
 
@@ -775,12 +774,6 @@ mod tests {
         /// Fail this seq always (retryable 500 error)
         fn fail(mut self, seq: u64) -> Self {
             self.failures.insert(seq, FailureBehavior::Always);
-            self
-        }
-
-        /// Fail this seq N times, then succeed (for retry testing)
-        fn fail_times(mut self, seq: u64, times: usize) -> Self {
-            self.failures.insert(seq, FailureBehavior::Times(times));
             self
         }
 

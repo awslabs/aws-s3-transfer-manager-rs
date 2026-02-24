@@ -94,12 +94,6 @@ impl ReadySet {
         self.inner.insert(key, descriptor);
     }
 
-    /// Remove a transfer from the ready set.
-    pub(super) fn remove(&self, id: TransferId, vruntime: u64) {
-        let key = ReadyKey::new(vruntime, id);
-        self.inner.remove(&key);
-    }
-
     /// Pop the transfer with lowest vruntime (highest scheduling priority).
     ///
     /// Updates min_vruntime to the popped transfer's vruntime.
@@ -114,10 +108,18 @@ impl ReadySet {
         Some(descriptor)
     }
 
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
+    pub(super) fn remove(&self, id: TransferId, vruntime: u64) {
+        let key = ReadyKey::new(vruntime, id);
+        self.inner.remove(&key);
+    }
+
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn len(&self) -> usize {
         self.inner.len()
     }

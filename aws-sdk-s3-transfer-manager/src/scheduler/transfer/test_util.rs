@@ -5,7 +5,7 @@
 
 //! Shared test utilities for transfer state machine tests.
 
-use crate::scheduler::{PollWork, Transfer, WorkItem, WorkOutcome};
+use crate::scheduler::{PollWork, WorkItem};
 
 /// Assert poll returns Ready and extract the work item.
 pub(crate) fn assert_ready(poll: PollWork) -> WorkItem {
@@ -32,20 +32,4 @@ pub(crate) fn assert_done(poll: PollWork) {
         "expected Done, got {:?}",
         poll
     );
-}
-
-/// Execute work and handle follow-on work (e.g., DataIO -> Network phase transitions).
-pub(crate) async fn execute(transfer: &dyn Transfer, work: &mut WorkItem) -> WorkOutcome {
-    let outcome = transfer.execute(work).await;
-
-    // If there's follow-on work, execute it too
-    if let WorkOutcome::Success {
-        schedule_next: Some(kind),
-        data,
-    } = outcome
-    {
-        let mut follow_on = WorkItem { kind, data };
-        return transfer.execute(&mut follow_on).await;
-    }
-    outcome
 }

@@ -46,14 +46,9 @@ impl std::fmt::Debug for TransferDescriptor {
 }
 
 impl TransferDescriptor {
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn new(transfer: BoxTransfer) -> Self {
-        Self(Arc::new(Inner {
-            priority: AtomicU8::new(DEFAULT_PRIORITY),
-            vruntime: AtomicU64::new(0),
-            queued_executing: QueuedExecuting::new(),
-            transfer,
-            idle_notify: Notify::new(),
-        }))
+        Self::new_with_vruntime(transfer, 0)
     }
 
     pub(super) fn new_with_vruntime(transfer: BoxTransfer, initial_vruntime: u64) -> Self {
@@ -86,6 +81,7 @@ impl TransferDescriptor {
         self.0.vruntime.load(Ordering::Acquire)
     }
 
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn set_vruntime(&self, vruntime: u64) {
         self.0.vruntime.store(vruntime, Ordering::Release);
     }
@@ -187,18 +183,20 @@ impl QueuedExecuting {
         prev == Self::EXECUTING_ONE
     }
 
+    fn is_idle(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 0
+    }
+
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     fn get(&self) -> (u32, u32) {
         let val = self.0.load(Ordering::Acquire);
         ((val >> 32) as u32, val as u32)
     }
 
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     fn outstanding(&self) -> u64 {
         let (q, e) = self.get();
         q as u64 + e as u64
-    }
-
-    fn is_idle(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 0
     }
 }
 

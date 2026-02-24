@@ -11,8 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_util::sync::CancellationToken;
-
 use crate::operation::TransferContext;
 use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
 
@@ -23,7 +21,6 @@ pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
         &'a self,
         work: &'a mut WorkItem,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
-    fn is_terminal(&self) -> bool;
 }
 
 /// Mock transfer that wraps any [`MockStateMachine`].
@@ -32,7 +29,6 @@ pub(crate) struct MockTransfer {
     id: TransferId,
     ctx: TransferContext,
     state_machine: Arc<dyn MockStateMachine>,
-    cancellation_token: CancellationToken,
 }
 
 impl std::fmt::Debug for MockTransfer {
@@ -57,9 +53,6 @@ impl MockTransfer {
         let config = crate::Config::builder().client(s3_client).build();
         let handle = Arc::new(crate::client::Handle {
             config,
-            scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(8),
-            ),
             new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
@@ -69,20 +62,7 @@ impl MockTransfer {
             id,
             ctx,
             state_machine,
-            cancellation_token: CancellationToken::new(),
         }
-    }
-
-    pub(crate) fn id(&self) -> TransferId {
-        self.id
-    }
-
-    pub(crate) fn cancellation_token(&self) -> &CancellationToken {
-        &self.cancellation_token
-    }
-
-    pub(crate) fn is_terminal(&self) -> bool {
-        self.state_machine.is_terminal()
     }
 
     pub(crate) fn poll_work(&self) -> PollWork {
@@ -171,10 +151,6 @@ impl MockStateMachine for FixedWorkCount {
             }
         })
     }
-
-    fn is_terminal(&self) -> bool {
-        self.is_complete()
-    }
 }
 
 /// Wraps a state machine to add delay before each execution.
@@ -207,10 +183,6 @@ impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
             tokio::time::sleep(self.delay).await;
             self.inner.execute(work).await
         })
-    }
-
-    fn is_terminal(&self) -> bool {
-        self.inner.is_terminal()
     }
 }
 

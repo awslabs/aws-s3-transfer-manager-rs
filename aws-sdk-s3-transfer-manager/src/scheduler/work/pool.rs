@@ -34,13 +34,13 @@ impl WorkerPool {
     }
 
     /// Push work to this pool's queue.
-    pub(crate) fn push(&self, work: ScheduledWork) {
+    pub(in crate::scheduler) fn push(&self, work: ScheduledWork) {
         self.queue.lock().unwrap().push(work);
         self.work_available.notify_one();
     }
 
     /// Pull next work item. Returns None on shutdown.
-    pub(crate) async fn next_work(&self) -> Option<ScheduledWork> {
+    pub(in crate::scheduler) async fn next_work(&self) -> Option<ScheduledWork> {
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return None;
@@ -64,6 +64,7 @@ impl WorkerPool {
     }
 
     /// Signal shutdown. Workers will exit after current work.
+    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         // Wake all waiting workers so they can exit
@@ -71,6 +72,7 @@ impl WorkerPool {
     }
 
     /// Check if workers have been started.
+    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
     pub(crate) fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
     }
@@ -93,11 +95,13 @@ impl WorkerPool {
     }
 
     /// Number of pending work items.
+    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
     pub(crate) fn pending_count(&self) -> usize {
         self.queue.lock().unwrap().pending_count()
     }
 
     /// Number of in-flight work items.
+    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
     pub(crate) fn in_flight_count(&self) -> usize {
         self.queue.lock().unwrap().in_flight_count()
     }

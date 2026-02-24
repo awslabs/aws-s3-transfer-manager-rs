@@ -5,7 +5,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::ChunkSender;
 
 /// Default maximum gap between claimed and consumed sequences.
@@ -69,10 +68,12 @@ impl SeqWindow {
         claimed >= consumed + max_gap
     }
 
+    #[allow(dead_code)] // TODO: io_ctl() API
     pub(crate) fn set_max_gap(&self, gap: u64) {
         self.max_gap.store(gap, Ordering::Release);
     }
 
+    #[allow(dead_code)] // TODO: io_ctl() API
     pub(crate) fn max_gap(&self) -> u64 {
         self.max_gap.load(Ordering::Acquire)
     }
@@ -94,10 +95,7 @@ pub(crate) enum DownloadState {
     },
 
     /// Discovery request in flight
-    DiscoveryInFlight {
-        /// Channel to send chunks to Body
-        chunk_tx: ChunkSender,
-    },
+    DiscoveryInFlight,
 
     /// Data transfer in progress (downloading ranges)
     Transferring {
@@ -107,8 +105,6 @@ pub(crate) enum DownloadState {
         ranges_in_flight: usize,
         /// ETag for consistency (shared across all range requests)
         etag: Option<std::sync::Arc<str>>,
-        /// Object metadata from discovery
-        object_meta: ObjectMetadata,
         /// Channel to send chunks to Body
         chunk_tx: ChunkSender,
     },

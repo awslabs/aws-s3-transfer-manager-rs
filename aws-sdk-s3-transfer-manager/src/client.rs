@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::runtime::scheduler::Scheduler;
 use crate::scheduler::Scheduler as NewScheduler;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
@@ -20,7 +19,6 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
-    pub(crate) scheduler: Scheduler,
     pub(crate) new_scheduler: NewScheduler,
 }
 
@@ -65,7 +63,6 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        let scheduler = Scheduler::new(config.concurrency().clone());
         // TODO(redux): derive concurrency from config properly
         // Derive concurrency for new scheduler from config
         let concurrency = match config.concurrency() {
@@ -76,7 +73,6 @@ impl Client {
 
         let handle = Arc::new(Handle {
             config,
-            scheduler,
             new_scheduler,
         });
         Client { handle }
