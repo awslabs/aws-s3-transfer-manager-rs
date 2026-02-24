@@ -63,7 +63,9 @@
 //! waiting for in-flight work to complete). The scheduler only polls ready
 //! transfers, avoiding wasted work.
 
-use super::{BoxTransfer, PollWork, TransferId, WorkItem, WorkOutcome, WorkerPool};
+use super::{
+    BoxTransfer, ConcurrencyController, PollWork, TransferId, WorkItem, WorkOutcome, WorkerPool,
+};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
 use crate::scheduler::work::ScheduledWork;
@@ -85,6 +87,7 @@ struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     pool: Arc<WorkerPool>,
+    controller: Arc<dyn ConcurrencyController>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -94,11 +97,17 @@ impl std::fmt::Debug for Scheduler {
 }
 
 impl Scheduler {
+    #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
+        Self::with_controller(Arc::new(super::FixedConcurrency::new(concurrency)))
+    }
+
+    pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
         Self(Arc::new(SchedulerInner {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
-            pool: Arc::new(WorkerPool::new(concurrency)),
+            pool: Arc::new(WorkerPool::new()),
+            controller,
         }))
     }
 
@@ -106,7 +115,7 @@ impl Scheduler {
     fn ensure_workers_started(&self) {
         let pool = &self.0.pool;
         if pool.mark_started() {
-            for _ in 0..pool.concurrency() {
+            for _ in 0..self.0.controller.target() {
                 let pool = Arc::clone(pool);
                 let scheduler = self.clone();
                 tokio::spawn(async move {
@@ -214,7 +223,9 @@ impl Scheduler {
     }
 
     fn has_capacity(&self) -> bool {
-        self.0.pool.has_capacity()
+        let pending = self.0.pool.pending_count();
+        let in_flight = self.0.pool.in_flight_count();
+        pending + in_flight < self.0.controller.target()
     }
 
     /// Generate work from ready transfers and push to pools.

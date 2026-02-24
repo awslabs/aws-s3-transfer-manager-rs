@@ -19,17 +19,15 @@ pub(crate) struct WorkerPool {
     work_available: Notify,
     shutdown: AtomicBool,
     started: AtomicBool,
-    concurrency: usize,
 }
 
 impl WorkerPool {
-    pub(crate) fn new(concurrency: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            queue: Mutex::new(WorkQueue::new(concurrency)),
+            queue: Mutex::new(WorkQueue::new()),
             work_available: Notify::new(),
             shutdown: AtomicBool::new(false),
             started: AtomicBool::new(false),
-            concurrency,
         }
     }
 
@@ -82,16 +80,6 @@ impl WorkerPool {
         self.started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-    }
-
-    /// Current concurrency limit.
-    pub(crate) fn concurrency(&self) -> usize {
-        self.concurrency
-    }
-
-    /// Check if pool has capacity for more work.
-    pub(crate) fn has_capacity(&self) -> bool {
-        self.queue.lock().unwrap().has_capacity()
     }
 
     /// Number of pending work items.

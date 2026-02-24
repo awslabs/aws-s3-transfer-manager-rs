@@ -3,10 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+mod concurrency;
 mod scheduler;
 mod transfer;
 mod work;
 
+pub(crate) use concurrency::{ConcurrencyController, FixedConcurrency};
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{BoxTransfer, Transfer};
 pub(crate) use work::{PollWork, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool};

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::scheduler::Scheduler;
+use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
@@ -65,11 +65,11 @@ impl Client {
     pub fn new(config: Config) -> Client {
         // TODO(redux): derive concurrency from config properly
         // Derive concurrency for new scheduler from config
-        let concurrency = match config.concurrency() {
-            ConcurrencyMode::Explicit(n) => *n,
-            _ => DEFAULT_CONCURRENCY,
+        let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
+            ConcurrencyMode::Explicit(n) => Arc::new(FixedConcurrency::new(*n)),
+            _ => Arc::new(FixedConcurrency::new(DEFAULT_CONCURRENCY)),
         };
-        let scheduler = Scheduler::new(concurrency);
+        let scheduler = Scheduler::with_controller(controller);
 
         let handle = Arc::new(Handle { config, scheduler });
         Client { handle }

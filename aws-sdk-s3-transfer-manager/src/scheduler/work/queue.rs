@@ -7,25 +7,19 @@ use std::collections::VecDeque;
 
 use super::{ScheduledWork, TransferId};
 
-/// A queue of work items with concurrency control
+/// A queue of work items with in-flight tracking
 #[derive(Debug)]
 pub(super) struct WorkQueue {
     pending: VecDeque<ScheduledWork>,
     in_flight: usize,
-    concurrency: usize,
 }
 
 impl WorkQueue {
-    pub(super) fn new(concurrency: usize) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pending: VecDeque::new(),
             in_flight: 0,
-            concurrency,
         }
-    }
-
-    pub(super) fn has_capacity(&self) -> bool {
-        self.pending.len() + self.in_flight < self.concurrency
     }
 
     pub(super) fn push(&mut self, item: ScheduledWork) {
@@ -42,11 +36,6 @@ impl WorkQueue {
 
     pub(super) fn mark_complete(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
-    }
-
-    #[allow(dead_code)] // TODO(phase3): backing for WorkerPool
-    pub(super) fn concurrency(&self) -> usize {
-        self.concurrency
     }
 
     #[allow(dead_code)] // TODO(phase3): backing for WorkerPool
