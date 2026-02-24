@@ -21,8 +21,28 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{ChunkSender, TransferContext};
-use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
+
+/// Download-specific work data.
+#[derive(Debug)]
+pub(crate) enum DownloadWork {
+    Discovery {
+        chunk_tx: ChunkSender,
+    },
+    ReadDiscoveryBody {
+        stream: aws_sdk_s3::primitives::ByteStream,
+        seq: u64,
+        chunk_meta: ChunkMetadata,
+        chunk_tx: ChunkSender,
+    },
+    GetObjectRange {
+        range: std::ops::RangeInclusive<u64>,
+        seq: u64,
+        etag: Option<Arc<str>>,
+        chunk_tx: ChunkSender,
+    },
+}
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
 macro_rules! bail_if_terminal {
@@ -150,9 +170,9 @@ impl DownloadTransfer {
                 *state = DownloadState::DiscoveryInFlight {};
                 PollWork::Ready(WorkItem {
                     kind: WorkKind::Network,
-                    data: WorkData::Discovery {
+                    data: Some(Box::new(DownloadWork::Discovery {
                         chunk_tx: chunk_tx_clone,
-                    },
+                    })),
                 })
             }
             DownloadState::DiscoveryInFlight { .. } => {
@@ -187,12 +207,12 @@ impl DownloadTransfer {
 
                     PollWork::Ready(WorkItem {
                         kind: WorkKind::Network,
-                        data: WorkData::GetObjectRange {
+                        data: Some(Box::new(DownloadWork::GetObjectRange {
                             range: chunk_range,
                             seq,
                             etag: etag.clone(),
                             chunk_tx: chunk_tx.clone(),
-                        },
+                        })),
                     })
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete
@@ -208,11 +228,12 @@ impl DownloadTransfer {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = %work.data.debug_label()))]
+    #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = ?work.data))]
     pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
-        match &mut work.data {
-            WorkData::Discovery { chunk_tx } => self.execute_discovery(chunk_tx.clone()).await,
-            WorkData::ReadDiscoveryBody {
+        let data = work.data_mut::<DownloadWork>();
+        match data {
+            DownloadWork::Discovery { chunk_tx } => self.execute_discovery(chunk_tx.clone()).await,
+            DownloadWork::ReadDiscoveryBody {
                 stream,
                 seq,
                 chunk_meta,
@@ -226,7 +247,7 @@ impl DownloadTransfer {
                 )
                 .await
             }
-            WorkData::GetObjectRange {
+            DownloadWork::GetObjectRange {
                 range,
                 seq,
                 etag,
@@ -235,7 +256,6 @@ impl DownloadTransfer {
                 self.execute_get_range(range.clone(), *seq, etag.clone(), chunk_tx.clone())
                     .await
             }
-            _ => unreachable!("download transfer received unexpected work data"),
         }
     }
 
@@ -299,16 +319,16 @@ impl DownloadTransfer {
         match initial_work {
             Some((stream, chunk_meta, seq)) => WorkOutcome::Success {
                 schedule_next: Some(WorkKind::Network),
-                data: WorkData::ReadDiscoveryBody {
+                data: Some(Box::new(DownloadWork::ReadDiscoveryBody {
                     stream,
                     seq,
                     chunk_meta,
                     chunk_tx,
-                },
+                })),
             },
             None => WorkOutcome::Success {
                 schedule_next: None,
-                data: WorkData::Discovery { chunk_tx },
+                data: None,
             },
         }
     }
@@ -344,9 +364,7 @@ impl DownloadTransfer {
         match send_result {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
-                data: WorkData::Discovery {
-                    chunk_tx: chunk_tx.clone(),
-                },
+                data: None,
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -407,12 +425,7 @@ impl DownloadTransfer {
         match send_result {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
-                data: WorkData::GetObjectRange {
-                    range,
-                    seq,
-                    etag,
-                    chunk_tx,
-                },
+                data: None,
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -492,7 +505,7 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::operation::TransferContext;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::scheduler::{TransferId, WorkData, WorkItem, WorkOutcome};
+    use crate::scheduler::{TransferId, WorkItem, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -568,8 +581,9 @@ mod tests {
     #[test]
     fn test_initial_poll_returns_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
-        let work = assert_ready(transfer.poll_work());
-        assert!(matches!(work.data, WorkData::Discovery { .. }));
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<DownloadWork>();
+        assert!(matches!(data, DownloadWork::Discovery { .. }));
     }
 
     #[test]
@@ -584,8 +598,9 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         skip_discovery(&transfer).await;
 
-        let work = assert_ready(transfer.poll_work());
-        assert!(matches!(work.data, WorkData::GetObjectRange { .. }));
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<DownloadWork>();
+        assert!(matches!(data, DownloadWork::GetObjectRange { .. }));
     }
 
     #[tokio::test]
@@ -593,11 +608,12 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         skip_discovery(&transfer).await;
 
-        let work = assert_ready(transfer.poll_work());
-        match work.data {
-            WorkData::GetObjectRange { seq, .. } => {
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<DownloadWork>();
+        match data {
+            DownloadWork::GetObjectRange { seq, .. } => {
                 assert_eq!(
-                    seq, 1,
+                    *seq, 1,
                     "seq should start at 1 when initial chunk claims seq=0"
                 );
             }
@@ -620,9 +636,10 @@ mod tests {
         let mut seqs = Vec::new();
         loop {
             match transfer.poll_work() {
-                PollWork::Ready(w) => {
-                    if let WorkData::GetObjectRange { seq, .. } = w.data {
-                        seqs.push(seq);
+                PollWork::Ready(mut w) => {
+                    let data = w.data_mut::<DownloadWork>();
+                    if let DownloadWork::GetObjectRange { seq, .. } = data {
+                        seqs.push(*seq);
                     }
                 }
                 _ => break,

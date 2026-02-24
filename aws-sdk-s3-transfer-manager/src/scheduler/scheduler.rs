@@ -290,13 +290,13 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         // Skip execution if transfer already terminal (failed/cancelled by another work item)
         if work.descriptor.is_terminal() {
-            tracing::debug!(wid, %tid, work = %work.item.data.debug_label(), "skipped (terminal)");
+            tracing::debug!(wid, %tid, work = ?work.item.data, "skipped (terminal)");
             pool.complete();
             scheduler.on_completion(work, WorkOutcome::Cancelled);
             continue;
         }
 
-        tracing::debug!(wid, %tid, work = %work.item.data.debug_label(), "executing");
+        tracing::debug!(wid, %tid, work = ?work.item.data, "executing");
         let transfer = work.descriptor.transfer();
 
         let token = transfer.ctx().cancellation_token().clone();
@@ -306,7 +306,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             outcome = transfer.execute(&mut work.item) => outcome,
         };
 
-        tracing::debug!(wid, %tid, work = %work.item.data.debug_label(), ?outcome, "completed");
+        tracing::debug!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
 
         pool.complete();
         scheduler.on_completion(work, outcome);
@@ -317,7 +317,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 mod tests {
     use super::*;
     use crate::scheduler::transfer::mock::{FixedWorkCount, MockStateMachine, WithDelay};
-    use crate::scheduler::work::{WorkData, WorkKind, WorkOutcome};
+    use crate::scheduler::work::{WorkKind, WorkOutcome};
     use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
@@ -475,10 +475,7 @@ mod tests {
             }
             PollWork::Ready(WorkItem {
                 kind: WorkKind::Network,
-                data: WorkData::UploadPart {
-                    part_number: 1,
-                    part_data: None,
-                },
+                data: None,
             })
         }
 
@@ -494,10 +491,7 @@ mod tests {
                 // where CFS priority ordering applies
                 WorkOutcome::Success {
                     schedule_next: None,
-                    data: WorkData::UploadPart {
-                        part_number: 1,
-                        part_data: None,
-                    },
+                    data: None,
                 }
             })
         }

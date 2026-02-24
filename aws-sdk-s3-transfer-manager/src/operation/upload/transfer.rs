@@ -26,8 +26,22 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, Transfer, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
+
+/// Upload-specific work data.
+#[derive(Debug)]
+pub(crate) enum UploadWork {
+    CreateMPU,
+    UploadPart {
+        part_number: u64,
+        part_data: Option<PartData>,
+    },
+    CompleteMPU,
+    PutObject {
+        stream: Option<InputStream>,
+    },
+}
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
@@ -159,16 +173,16 @@ impl UploadTransfer {
                     *init_in_flight = true;
                     PollWork::Ready(WorkItem {
                         kind: WorkKind::Network,
-                        data: WorkData::CreateMPU,
+                        data: Some(Box::new(UploadWork::CreateMPU)),
                     })
                 } else {
                     // Take ownership of stream by replacing state
                     match std::mem::replace(&mut *state, UploadState::PutObjectInFlight) {
                         UploadState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
                             kind: WorkKind::Network,
-                            data: WorkData::PutObject {
+                            data: Some(Box::new(UploadWork::PutObject {
                                 stream: Some(stream),
-                            },
+                            })),
                         }),
                         _ => unreachable!(),
                     }
@@ -193,10 +207,10 @@ impl UploadTransfer {
                 *parts_in_flight += 1;
                 PollWork::Ready(WorkItem {
                     kind: WorkKind::DataIO,
-                    data: WorkData::UploadPart {
+                    data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: None,
-                    },
+                    })),
                 })
             }
             UploadState::Completing {
@@ -209,7 +223,7 @@ impl UploadTransfer {
                 *complete_in_flight = true;
                 PollWork::Ready(WorkItem {
                     kind: WorkKind::Network,
-                    data: WorkData::CompleteMPU,
+                    data: Some(Box::new(UploadWork::CompleteMPU)),
                 })
             }
             UploadState::PutObjectInFlight { .. } => {
@@ -221,18 +235,19 @@ impl UploadTransfer {
     }
 
     pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
-        match &mut work.data {
-            WorkData::CreateMPU => self.execute_create_mpu().await,
-            WorkData::UploadPart {
+        let kind = work.kind;
+        let data = work.data_mut::<UploadWork>();
+        match data {
+            UploadWork::CreateMPU => self.execute_create_mpu().await,
+            UploadWork::UploadPart {
                 part_number,
                 part_data,
             } => {
-                self.execute_upload_part(*part_number, part_data, work.kind)
+                self.execute_upload_part(*part_number, part_data, kind)
                     .await
             }
-            WorkData::CompleteMPU => self.execute_complete_mpu().await,
-            WorkData::PutObject { stream } => self.execute_put_object(stream).await,
-            _ => unreachable!("upload transfer received unexpected work data"),
+            UploadWork::CompleteMPU => self.execute_complete_mpu().await,
+            UploadWork::PutObject { stream } => self.execute_put_object(stream).await,
         }
     }
 
@@ -306,7 +321,7 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
-            data: WorkData::CreateMPU,
+            data: None,
         }
     }
 
@@ -344,10 +359,10 @@ impl UploadTransfer {
                 *part_data = Some(data);
                 WorkOutcome::Success {
                     schedule_next: Some(WorkKind::Network),
-                    data: WorkData::UploadPart {
+                    data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: part_data.take(),
-                    },
+                    })),
                 }
             }
             Ok(None) => {
@@ -355,10 +370,7 @@ impl UploadTransfer {
                 self.maybe_transition_to_completing();
                 WorkOutcome::Success {
                     schedule_next: None,
-                    data: WorkData::UploadPart {
-                        part_number,
-                        part_data: None,
-                    },
+                    data: None,
                 }
             }
             Err(e) => self.fail(e.into()),
@@ -433,10 +445,7 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
-            data: WorkData::UploadPart {
-                part_number,
-                part_data: None,
-            },
+            data: None,
         }
     }
 
@@ -520,7 +529,7 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
-            data: WorkData::PutObject { stream: None },
+            data: None,
         }
     }
 
@@ -583,7 +592,7 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
-            data: WorkData::CompleteMPU,
+            data: None,
         }
     }
 
@@ -626,7 +635,7 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::scheduler::{TransferId, WorkData, WorkKind};
+    use crate::scheduler::{TransferId, WorkKind};
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -689,8 +698,9 @@ mod tests {
         let content = vec![0u8; 16 * 1024 * 1024];
         let (transfer, _rx) = create_test_transfer(s3_client, content);
 
-        let work = assert_ready(transfer.poll_work());
-        assert!(matches!(work.data, WorkData::CreateMPU));
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::CreateMPU));
     }
 
     #[test]
@@ -712,16 +722,18 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
 
-        let work1 = assert_ready(transfer.poll_work());
+        let mut work1 = assert_ready(transfer.poll_work());
+        let data1 = work1.data_mut::<UploadWork>();
         assert!(matches!(
-            work1.data,
-            WorkData::UploadPart { part_number: 1, .. }
+            data1,
+            UploadWork::UploadPart { part_number: 1, .. }
         ));
 
-        let work2 = assert_ready(transfer.poll_work());
+        let mut work2 = assert_ready(transfer.poll_work());
+        let data2 = work2.data_mut::<UploadWork>();
         assert!(matches!(
-            work2.data,
-            WorkData::UploadPart { part_number: 2, .. }
+            data2,
+            UploadWork::UploadPart { part_number: 2, .. }
         ));
 
         assert_pending(transfer.poll_work());
@@ -744,8 +756,9 @@ mod tests {
             }
         ));
 
-        let next = assert_ready(transfer.poll_work());
-        assert!(matches!(next.data, WorkData::UploadPart { .. }));
+        let mut next = assert_ready(transfer.poll_work());
+        let data = next.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::UploadPart { .. }));
     }
 
     #[tokio::test]
@@ -767,10 +780,18 @@ mod tests {
                 data,
             } => {
                 assert_eq!(schedule_next, Some(WorkKind::Network));
-                if let WorkData::UploadPart { part_data, .. } = data {
-                    assert!(part_data.is_some());
+                if let Some(mut boxed_data) = data {
+                    let upload_work = (*boxed_data)
+                        .as_any_mut()
+                        .downcast_mut::<UploadWork>()
+                        .unwrap();
+                    if let UploadWork::UploadPart { part_data, .. } = upload_work {
+                        assert!(part_data.is_some());
+                    } else {
+                        panic!("expected UploadPart data");
+                    }
                 } else {
-                    panic!("expected UploadPart data");
+                    panic!("expected Some data");
                 }
             }
             _ => panic!("expected Success"),
@@ -823,7 +844,8 @@ mod tests {
 
         // 4. CompleteMPU
         let mut work = assert_ready(transfer.poll_work());
-        assert!(matches!(work.data, WorkData::CompleteMPU));
+        let data = work.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::CompleteMPU));
         transfer.execute(&mut work).await;
 
         // 5. Should be Done

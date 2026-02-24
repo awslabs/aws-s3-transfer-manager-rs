@@ -9,7 +9,7 @@ mod item;
 mod pool;
 mod queue;
 
-pub(crate) use item::{PollWork, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+pub(crate) use item::{PollWork, TransferId, WorkItem, WorkKind, WorkOutcome};
 pub(crate) use pool::WorkerPool;
 use queue::WorkQueue;
 

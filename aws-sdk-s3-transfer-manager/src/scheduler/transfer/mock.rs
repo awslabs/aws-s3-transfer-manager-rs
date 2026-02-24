@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, Transfer, TransferId, WorkData, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
 
 /// Trait for mock state machines that drive transfer behavior.
 pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
@@ -126,28 +126,19 @@ impl MockStateMachine for FixedWorkCount {
 
         PollWork::Ready(WorkItem {
             kind: WorkKind::Network,
-            data: WorkData::UploadPart {
-                part_number: gen + 1,
-                part_data: None,
-            },
+            data: None,
         })
     }
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        _work: &'a mut WorkItem,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
             self.completed.fetch_add(1, Ordering::SeqCst);
             WorkOutcome::Success {
                 schedule_next: None,
-                data: WorkData::UploadPart {
-                    part_number: match &work.data {
-                        WorkData::UploadPart { part_number, .. } => *part_number,
-                        _ => 0,
-                    },
-                    part_data: None,
-                },
+                data: None,
             }
         })
     }

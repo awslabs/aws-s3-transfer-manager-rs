@@ -152,7 +152,9 @@ mod test {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Abort should complete without error
-        let result = handle.abort().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.abort())
+            .await
+            .expect("abort timed out");
         assert!(result.is_ok());
     }
 }
@@ -263,7 +265,9 @@ mod retry_tests {
             .initiate()
             .unwrap();
 
-        let result = handle.join().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+            .await
+            .expect("join timed out");
         assert!(
             result.is_ok(),
             "upload should succeed after retry: {:?}",
