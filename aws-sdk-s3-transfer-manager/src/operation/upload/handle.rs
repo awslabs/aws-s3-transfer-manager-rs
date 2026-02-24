@@ -109,10 +109,10 @@ impl UploadHandle {
         let create_mpu_in_flight = self.transfer.is_create_mpu_in_flight();
 
         // Cancel the transfer and purge queued work
-        ctx.handle.new_scheduler.cancel_transfer(ctx.id);
+        ctx.handle.scheduler.cancel_transfer(ctx.id);
 
         // Wait for any executing work to complete
-        ctx.handle.new_scheduler.wait_for_idle(ctx.id).await;
+        ctx.handle.scheduler.wait_for_idle(ctx.id).await;
 
         // If CreateMPU was in flight, wait for it to complete or be cancelled
         if create_mpu_in_flight {
@@ -159,7 +159,7 @@ impl Drop for UploadHandle {
         let ctx = self.transfer.ctx();
         if ctx.is_active() {
             ctx.set_cancelled();
-            ctx.handle.new_scheduler.cancel_transfer(ctx.id);
+            ctx.handle.scheduler.cancel_transfer(ctx.id);
         }
     }
 }

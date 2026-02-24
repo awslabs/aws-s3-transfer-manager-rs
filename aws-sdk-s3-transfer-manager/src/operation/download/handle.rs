@@ -153,8 +153,8 @@ impl DownloadHandle {
 
         if ctx.is_failed() {
             tracing::debug!(ctx = %ctx, "join: cancelling and waiting for idle");
-            ctx.handle.new_scheduler.cancel_transfer(id);
-            ctx.handle.new_scheduler.wait_for_idle(id).await;
+            ctx.handle.scheduler.cancel_transfer(id);
+            ctx.handle.scheduler.wait_for_idle(id).await;
             tracing::debug!(ctx = %ctx, "join: idle, returning error");
             // take the actual error (only we should do this)
             let err = ctx.take_error().expect("error taken outside of join()");
@@ -182,10 +182,10 @@ impl DownloadHandle {
         self.body.close();
 
         // Cancel transfer and purge queued work
-        ctx.handle.new_scheduler.cancel_transfer(id);
+        ctx.handle.scheduler.cancel_transfer(id);
 
         // Wait for any executing work to complete
-        ctx.handle.new_scheduler.wait_for_idle(id).await;
+        ctx.handle.scheduler.wait_for_idle(id).await;
     }
 
     /// Get scheduling controls for this transfer.
@@ -205,7 +205,7 @@ impl Drop for DownloadHandle {
         let ctx = self.transfer.ctx();
         if ctx.is_active() {
             ctx.set_cancelled();
-            ctx.handle.new_scheduler.cancel_transfer(self.transfer.id());
+            ctx.handle.scheduler.cancel_transfer(self.transfer.id());
         }
     }
 }

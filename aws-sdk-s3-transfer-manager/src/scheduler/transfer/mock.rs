@@ -53,7 +53,7 @@ impl MockTransfer {
         let config = crate::Config::builder().client(s3_client).build();
         let handle = Arc::new(crate::client::Handle {
             config,
-            new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
         let (ctx, _completion_rx) = TransferContext::new(id, handle);

@@ -84,7 +84,7 @@ impl Upload {
         let transfer = UploadTransfer::new(ctx, bucket_type, input, stream, result_tx);
 
         handle
-            .new_scheduler
+            .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
 
         Ok(UploadHandle::new(result_rx, transfer))

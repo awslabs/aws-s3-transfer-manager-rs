@@ -648,7 +648,7 @@ mod tests {
     ) -> (UploadTransfer, UploadResultReceiver) {
         let handle = Arc::new(crate::client::Handle {
             config: crate::Config::builder().client(s3_client).build(),
-            new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
         let input = UploadInput::builder()

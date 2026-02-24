@@ -711,12 +711,9 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let new_scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
+        let scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
 
-        let handle = std::sync::Arc::new(Handle {
-            config,
-            new_scheduler,
-        });
+        let handle = std::sync::Arc::new(Handle { config, scheduler });
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)

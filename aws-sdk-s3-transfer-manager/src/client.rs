@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::scheduler::Scheduler as NewScheduler;
+use crate::scheduler::Scheduler;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
@@ -19,7 +19,7 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
-    pub(crate) new_scheduler: NewScheduler,
+    pub(crate) scheduler: Scheduler,
 }
 
 impl Handle {
@@ -69,12 +69,9 @@ impl Client {
             ConcurrencyMode::Explicit(n) => *n,
             _ => DEFAULT_CONCURRENCY,
         };
-        let new_scheduler = NewScheduler::new(concurrency);
+        let scheduler = Scheduler::new(concurrency);
 
-        let handle = Arc::new(Handle {
-            config,
-            new_scheduler,
-        });
+        let handle = Arc::new(Handle { config, scheduler });
         Client { handle }
     }
 

@@ -250,7 +250,7 @@ impl TransferContext {
             .pending
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            self.handle.new_scheduler.wake(self.id);
+            self.handle.scheduler.wake(self.id);
         }
     }
 
@@ -389,7 +389,7 @@ impl SchedulingCtl<'_> {
     pub fn set_priority(&self, priority: u8) {
         self.ctx
             .handle
-            .new_scheduler
+            .scheduler
             .set_priority(self.ctx.id, priority);
     }
 }

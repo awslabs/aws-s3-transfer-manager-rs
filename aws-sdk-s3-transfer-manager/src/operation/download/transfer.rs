@@ -538,7 +538,7 @@ mod tests {
 
         let handle = Arc::new(crate::client::Handle {
             config,
-            new_scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
         let input = DownloadInput::builder()
