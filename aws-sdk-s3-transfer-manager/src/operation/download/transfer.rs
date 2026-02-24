@@ -358,7 +358,7 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        let send_result = chunk_tx.send(Ok(chunk)).await;
+        let send_result = chunk_tx.send(chunk).await;
         self.decrement_in_flight();
 
         match send_result {
@@ -419,7 +419,7 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        let send_result = chunk_tx.send(Ok(chunk)).await;
+        let send_result = chunk_tx.send(chunk).await;
         self.decrement_in_flight();
 
         match send_result {

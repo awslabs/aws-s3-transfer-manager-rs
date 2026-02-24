@@ -83,7 +83,7 @@ pub struct DownloadHandle {
 impl DownloadHandle {
     pub(crate) fn new(
         transfer: DownloadTransfer,
-        chunk_rx: mpsc::Receiver<Result<ChunkOutput, error::Error>>,
+        chunk_rx: mpsc::Receiver<ChunkOutput>,
         completion_rx: StateMachineTerminalReceiver,
     ) -> Self {
         Self {

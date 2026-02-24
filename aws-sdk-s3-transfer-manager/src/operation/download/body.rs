@@ -24,7 +24,7 @@ pub struct Body {
     transfer: DownloadTransfer,
 }
 
-type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
+type BodyChannel = mpsc::Receiver<ChunkOutput>;
 
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
@@ -97,12 +97,7 @@ impl Body {
                     debug_assert!(!ctx.is_active(), "channel closed but transfer still active");
                     break;
                 }
-                Some(Ok(chunk)) => self.sequencer.push(chunk),
-                Some(Err(err)) => {
-                    // Legacy path - errors via channel. Don't close, just propagate.
-                    // TODO: Remove this path when we fully migrate to status-based errors
-                    return Some(Err(err));
-                }
+                Some(chunk) => self.sequencer.push(chunk),
             }
         }
 
@@ -205,7 +200,7 @@ impl UnorderedBody {
     /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
     /// in the right order. Consumers are expected to sort the data themselves
     /// using the chunk sequence number (starting from zero).
-    pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
+    pub(crate) async fn next(&mut self) -> Option<ChunkOutput> {
         self.chunks.recv().await
     }
 
@@ -233,9 +228,7 @@ mod tests {
         }
     }
 
-    fn test_body(
-        rx: mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>,
-    ) -> (Body, DownloadTransfer) {
+    fn test_body(rx: mpsc::Receiver<ChunkOutput>) -> (Body, DownloadTransfer) {
         use crate::operation::download::DownloadInput;
         use crate::operation::TransferContext;
         use crate::types::BucketType;
@@ -286,7 +279,7 @@ mod tests {
                 let mut aggregated = SegmentedBuf::new();
                 aggregated.push(data);
                 let chunk = chunk_resp(i as u64, AggregatedBytes(aggregated));
-                tx.send(Ok(chunk)).await.unwrap();
+                tx.send(chunk).await.unwrap();
             }
             // Mark completed before channel closes
             ctx_clone.ctx().set_completed();
@@ -313,7 +306,7 @@ mod tests {
         let data = Bytes::from("chunk 0");
         let mut aggregated = SegmentedBuf::new();
         aggregated.push(data);
-        tx.send(Ok(chunk_resp(0, AggregatedBytes(aggregated))))
+        tx.send(chunk_resp(0, AggregatedBytes(aggregated)))
             .await
             .unwrap();
 
@@ -336,7 +329,7 @@ mod tests {
     // Test: when transfer is cancelled, next() returns error
     #[tokio::test]
     async fn test_body_next_on_cancelled_transfer() {
-        let (tx, rx) = mpsc::channel::<Result<ChunkOutput, crate::error::Error>>(2);
+        let (tx, rx) = mpsc::channel::<ChunkOutput>(2);
         let (mut body, transfer) = test_body(rx);
 
         // Cancel the transfer and close channel

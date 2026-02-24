@@ -34,8 +34,7 @@ pub(crate) type StateMachineTerminalSender = tokio::sync::oneshot::Sender<()>;
 pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()>;
 
 /// Channel for sending download chunks to Body
-pub(crate) type ChunkSender =
-    tokio::sync::mpsc::Sender<Result<download::ChunkOutput, crate::error::Error>>;
+pub(crate) type ChunkSender = tokio::sync::mpsc::Sender<download::ChunkOutput>;
 
 /// Transfer lifecycle status.
 ///
