@@ -69,7 +69,9 @@ use super::{
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
 use crate::scheduler::work::ScheduledWork;
+use futures_util::FutureExt;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 /// Event-driven scheduler for coordinating transfer work.
@@ -311,10 +313,26 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
         let transfer = work.descriptor.transfer();
 
         let token = transfer.ctx().cancellation_token().clone();
-        let outcome = tokio::select! {
-            biased;
-            _ = token.cancelled() => WorkOutcome::Cancelled,
-            outcome = transfer.execute(&mut work.item) => outcome,
+        let outcome = AssertUnwindSafe(async {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => WorkOutcome::Cancelled,
+                outcome = transfer.execute(&mut work.item) => outcome,
+            }
+        })
+        .catch_unwind()
+        .await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_panic) => {
+                tracing::error!(wid, %tid, "panic in transfer execute");
+                let err = crate::error::from_kind(crate::error::ErrorKind::RuntimeError)(
+                    "worker panic during execute",
+                );
+                transfer.ctx().set_failed(err);
+                WorkOutcome::Failed
+            }
         };
 
         tracing::debug!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
