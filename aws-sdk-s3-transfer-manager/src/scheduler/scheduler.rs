@@ -611,6 +611,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_priority_change_mid_flight() {
+        let scheduler = Scheduler::new(2);
+
+        let a_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let b_id = TransferId {
+            id: 2,
+            parent: None,
+        };
+
+        let a_mock = Arc::new(CountingInfinite::new());
+        let b_mock = Arc::new(CountingInfinite::new());
+
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(a_id, a_mock.clone())));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(b_id, b_mock.clone())));
+
+        // Both at default priority (128) — let them run equally
+        while a_mock.count() + b_mock.count() < 100 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Snapshot counts, then shift priority heavily
+        let a_before = a_mock.count();
+        let b_before = b_mock.count();
+        scheduler.set_priority(a_id, 255);
+        scheduler.set_priority(b_id, 1);
+
+        // Let them run more
+        while (a_mock.count() - a_before) + (b_mock.count() - b_before) < 200 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        a_mock.set_done();
+        b_mock.set_done();
+        scheduler.shutdown();
+
+        let a_after = a_mock.count() - a_before;
+        let b_after = b_mock.count() - b_before;
+
+        // 255:1 priority ratio — A should get the vast majority of work
+        let ratio = a_after as f64 / b_after.max(1) as f64;
+        assert!(
+            ratio > 3.0,
+            "after priority change (255 vs 1), expected ratio > 3.0, got {:.2} (a={}, b={})",
+            ratio,
+            a_after,
+            b_after
+        );
+    }
+
+    #[tokio::test]
     async fn test_failed_transfer_cleaned_up() {
         let _logs = show_test_logs();
         let scheduler = Scheduler::new(2);
