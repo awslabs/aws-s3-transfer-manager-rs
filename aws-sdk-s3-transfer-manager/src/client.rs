@@ -63,7 +63,7 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        // TODO(redux): derive concurrency from config properly
+        // TODO: derive concurrency from config properly
         // Derive concurrency for new scheduler from config
         let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
             ConcurrencyMode::Explicit(n) => Arc::new(FixedConcurrency::new(*n)),

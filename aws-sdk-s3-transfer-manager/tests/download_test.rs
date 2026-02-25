@@ -444,7 +444,6 @@ const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 /// Test that if the object modified during download.
 #[tokio::test]
-#[ignore = "blocked on scheduler outstanding tracking bug - see tasks.md"]
 async fn test_download_object_modified() {
     let _logs = show_test_logs();
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
@@ -497,10 +496,11 @@ async fn test_download_object_modified() {
         .initiate()
         .unwrap();
 
-    let error = drain(&mut handle).await.unwrap_err();
-    assert!(format!("{:?}", error).contains("PreconditionFailed"));
-    // drain() returns a generic error; join() returns the actual error with full context
+    // drain() sees the transfer failed — body returns an error when channel closes
     let _drain_err = drain(&mut handle).await.unwrap_err();
+    // drain again to exhaust the body
+    let _ = drain(&mut handle).await;
+    // join() returns the actual SDK error with full context
     let error = handle.join().await.unwrap_err();
     assert!(
         format!("{:?}", error).contains("PreconditionFailed"),

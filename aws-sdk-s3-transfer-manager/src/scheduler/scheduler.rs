@@ -166,13 +166,21 @@ impl Scheduler {
     /// - Outstanding work being executed will complete naturally
     /// - Use `wait_for_idle(id)` to wait for all outstanding work to finish
     ///
-    /// TODO(redux): When upload_objects/download_objects use the new scheduler,
+    /// TODO: When upload_objects/download_objects use the new scheduler,
     /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
     pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
         let desc = self.0.transfers.write().unwrap().remove(&id);
         if let Some(desc) = desc {
+            let ctx = desc.transfer().ctx();
+            // Ensure transfer is terminal so ready_set and workers skip it.
+            // May already be set by the handle (set_cancelled/set_failed) — that's fine.
+            if ctx.is_active() {
+                ctx.set_cancelled();
+            }
+            ctx.signal_terminal();
             let purged = self.0.pool.remove_for_transfer(id);
             desc.work_purged(purged);
+            desc.notify_idle();
             true
         } else {
             false
@@ -258,6 +266,11 @@ impl Scheduler {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
             };
+
+            // Skip cancelled/failed transfers still in the ready set
+            if desc.is_terminal() {
+                continue;
+            }
 
             match desc.transfer().poll_work() {
                 PollWork::Ready(item) => {
@@ -740,7 +753,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires mock with wake support to test cancel mid-flight"]
     async fn test_cancel_transfer_stops_work() {
         let scheduler = Scheduler::new(2);
         let id = TransferId {

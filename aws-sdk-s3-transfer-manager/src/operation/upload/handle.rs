@@ -101,7 +101,7 @@ impl UploadHandle {
 
         // Register waiter before checking state to avoid missing notification
         let notified = self.transfer.create_mpu_complete_notified();
-        // TODO(redux): There's an edge case where CreateMPU HTTP request is in-flight,
+        // TODO: There's an edge case where CreateMPU HTTP request is in-flight,
         // we cancel, but the server still processes the request. The MPU would be
         // orphaned. This is the same behavior as the old implementation. S3 lifecycle
         // rules can clean up incomplete MPUs. To fully fix this would require waiting

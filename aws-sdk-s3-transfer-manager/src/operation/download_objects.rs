@@ -57,7 +57,7 @@ impl DownloadObjects {
         parent_span_for_tasks.follows_from(tracing::Span::current());
 
         let concurrency = handle.num_workers();
-        // TODO(redux): DownloadObjects doesn't use new scheduler yet, completion_rx unused
+        // TODO: DownloadObjects doesn't use new scheduler yet, completion_rx unused
         let (ctx, _completion_rx) = DownloadObjectsContext::new(handle.clone(), input);
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
@@ -109,7 +109,7 @@ impl DownloadObjectsContext {
             successful_downloads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
         });
-        // TODO(redux): DownloadObjects doesn't use new scheduler yet, use dummy id
+        // TODO: DownloadObjects doesn't use new scheduler yet, use dummy id
         let id = crate::scheduler::TransferId {
             id: 0,
             parent: None,

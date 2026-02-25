@@ -134,7 +134,7 @@ impl DownloadHandle {
     /// If the body has not been fully consumed, this will cancel the transfer
     /// and wait for outstanding work to complete before returning.
     ///
-    /// TODO(redux): Currently, in-flight work is only cancelled when join() is called
+    /// TODO: Currently, in-flight work is only cancelled when join() is called
     /// after a failure. Consider proactively cancelling on failure so resources are
     /// released without requiring user action.
     pub async fn join(mut self) -> Result<DownloadOutput, error::Error> {

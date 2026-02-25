@@ -83,7 +83,7 @@ impl UploadTransfer {
         stream: InputStream,
         result_tx: UploadResultSender,
     ) -> Self {
-        // TODO(redux): For unknown content length (streaming uploads), this will need adjustment.
+        // TODO: For unknown content length (streaming uploads), this will need adjustment.
         let content_length = stream
             .size_hint()
             .upper()
@@ -493,7 +493,7 @@ impl UploadTransfer {
             .take()
             .expect("stream should be present for PutObject");
 
-        // TODO(redux): Currently PutObject does not use our DataIO scheduling - the actual
+        // TODO: Currently PutObject does not use our DataIO scheduling - the actual
         // disk I/O happens lazily when the SDK consumes the ByteStream during HTTP send.
         // For true scheduler control over disk I/O (important for large numbers of small files),
         // InputStream internals will need to be tightly integrated with our DataIO work layer.

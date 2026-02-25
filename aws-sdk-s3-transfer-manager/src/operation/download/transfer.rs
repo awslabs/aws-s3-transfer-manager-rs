@@ -403,7 +403,7 @@ impl DownloadTransfer {
         // Extract metadata before consuming body
         let chunk_meta = ChunkMetadata::from(&resp);
 
-        // TODO(redux): Handle ByteStreamError with retry (SDK doesn't retry these)
+        // TODO: Handle ByteStreamError with retry (SDK doesn't retry these)
         let body = match resp.body.collect().await {
             Ok(b) => b.into_bytes(),
             Err(e) => return self.fail_range(seq, e),
@@ -618,10 +618,54 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs HeadObject mock path"]
     async fn test_seq_starts_at_zero_without_initial_chunk() {
-        // TODO: create_download with HeadObject mock (no initial chunk)
-        todo!()
+        let head_obj = mock!(aws_sdk_s3::Client::head_object).then_output(|| {
+            aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+                .content_length(24 * MB as i64)
+                .e_tag("test-etag")
+                .build()
+        });
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            aws_sdk_s3::operation::get_object::GetObjectOutput::builder()
+                .content_length(8 * MB as i64)
+                .content_range(format!("bytes 0-{}/{}", 8 * MB - 1, 24 * MB))
+                .e_tag("test-etag")
+                .body(ByteStream::from(vec![0u8; 8 * MB as usize]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_obj, get_obj]);
+
+        let config = crate::Config::builder()
+            .client(client)
+            .part_size(crate::types::PartSize::Target(8 * MB))
+            .build();
+
+        let handle = Arc::new(crate::client::Handle {
+            config,
+            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        });
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .range("bytes=0-")
+            .build()
+            .unwrap();
+
+        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, chunk_tx);
+
+        skip_discovery(&transfer).await;
+
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<DownloadWork>();
+        match data {
+            DownloadWork::GetObjectRange { seq, .. } => {
+                assert_eq!(*seq, 0, "seq should start at 0 when no initial chunk");
+            }
+            _ => panic!("expected GetObjectRange"),
+        }
     }
 
     #[tokio::test]
@@ -701,9 +745,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs cancellation support"]
     async fn test_cancellation_transitions_to_cancelled() {
-        todo!()
+        let transfer = create_download(24 * MB, 8 * MB);
+        skip_discovery(&transfer).await;
+
+        transfer.ctx().set_cancelled();
+        transfer.ctx().signal_terminal();
+
+        assert!(transfer.ctx().is_cancelled());
+        assert_done(transfer.poll_work());
     }
 
     #[tokio::test]

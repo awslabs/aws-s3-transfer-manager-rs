@@ -37,7 +37,7 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
-        // TODO(redux): we were getting checksum behavior for free from SDK, moving to presigning and dedicated HTTP stack requires us to consider that
+        // TODO: we were getting checksum behavior for free from SDK, moving to presigning and dedicated HTTP stack requires us to consider that
         if input.checksum_strategy.is_none() {
             // User didn't explicitly set checksum strategy.
             // If SDK is configured to send checksums: use default checksum strategy.
@@ -57,7 +57,7 @@ impl Upload {
 
         let stream = input.take_body();
 
-        // TODO(redux): Relax this constraint - unknown content length implies MPU
+        // TODO: Relax this constraint - unknown content length implies MPU
         if stream.size_hint().upper().is_none() {
             return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
         }
@@ -95,10 +95,6 @@ mod test {
     use crate::operation::upload::UploadInput;
     use crate::types::{ConcurrencyMode, PartSize};
 
-    // TODO(redux): This test should migrate to an integration test with better mock server
-    // support for timing coordination. Currently it just verifies abort() doesn't panic
-    // and returns an AbortedUpload. A proper test would verify AbortMultipartUpload is
-    // called with the correct upload_id after CreateMPU completes.
     #[tokio::test]
     async fn test_abort_upload() {
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
