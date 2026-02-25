@@ -342,7 +342,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (ctx, _completion_rx) = DownloadObjectsContext::new(client.handle.clone(), input);
+        let ctx = DownloadObjectsContext::new(client.handle.clone(), input);
         let mut stream = ListObjectsStream::new(ctx);
 
         let mut keys = Vec::new();

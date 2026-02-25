@@ -430,8 +430,6 @@ impl SchedulingCtl<'_> {
 /// DEPRECATED: Use non-generic `TransferContext` instead. This will be removed.
 #[derive(Debug)]
 pub(crate) struct LegacyTransferContext<State> {
-    /// Unique identifier for this transfer
-    pub(crate) id: crate::scheduler::TransferId,
     /// Access to client handle (scheduler, S3 client, config)
     pub(crate) handle: Arc<crate::client::Handle>,
     /// Operation-specific state
@@ -440,37 +438,23 @@ pub(crate) struct LegacyTransferContext<State> {
     status: StateMachineStatus,
     /// Error storage (only used when status == Failed)
     error: Arc<Mutex<Option<Box<error::Error>>>>,
-    /// Completion signal sender - signals "state machine reached terminal state"
-    completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
-    /// Set when poll_work returns Pending, cleared on try_wake
-    pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<State> fmt::Display for LegacyTransferContext<State> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Transfer(id={}, status={})", self.id.id, self.status)
+        write!(f, "Transfer(status={})", self.status)
     }
 }
 
 impl<State> LegacyTransferContext<State> {
     /// Create a new transfer context from pre-built state.
-    /// Returns the context and a receiver for terminal state notification.
-    pub(crate) fn from_state(
-        id: crate::scheduler::TransferId,
-        handle: Arc<crate::client::Handle>,
-        state: Arc<State>,
-    ) -> (Self, StateMachineTerminalReceiver) {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let ctx = Self {
-            id,
+    pub(crate) fn from_state(handle: Arc<crate::client::Handle>, state: Arc<State>) -> Self {
+        Self {
             handle,
             state,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
-            completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
-            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        (ctx, completion_rx)
+        }
     }
 
     /// The S3 client to use for SDK operations
@@ -482,13 +466,10 @@ impl<State> LegacyTransferContext<State> {
 impl<State> Clone for LegacyTransferContext<State> {
     fn clone(&self) -> Self {
         Self {
-            id: self.id,
             handle: self.handle.clone(),
             state: self.state.clone(),
             status: self.status.clone(),
             error: self.error.clone(),
-            completion_tx: self.completion_tx.clone(),
-            pending: self.pending.clone(),
         }
     }
 }

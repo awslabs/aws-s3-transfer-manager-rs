@@ -716,7 +716,7 @@ mod tests {
             .bucket(bucket)
             .build()
             .unwrap();
-        let (ctx, _completion_rx) = UploadObjectsContext::new(handle, input);
+        let ctx = UploadObjectsContext::new(handle, input);
         let job = UploadObjectJob {
             object: InputStream::from(Bytes::from_static(b"doesnotmatter")),
             key: "doesnotmatter".to_owned(),

@@ -55,8 +55,7 @@ impl UploadObjects {
             }
         };
         let concurrency = handle.num_workers();
-        // TODO: UploadObjects doesn't use new scheduler yet, completion_rx unused
-        let (ctx, _completion_rx) = UploadObjectsContext::new(handle.clone(), input);
+        let ctx = UploadObjectsContext::new(handle.clone(), input);
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
         let mut tasks = JoinSet::new();
@@ -112,17 +111,9 @@ impl UploadObjectsState {
 type UploadObjectsContext = LegacyTransferContext<UploadObjectsState>;
 
 impl UploadObjectsContext {
-    fn new(
-        handle: Arc<crate::client::Handle>,
-        input: UploadObjectsInput,
-    ) -> (Self, crate::operation::StateMachineTerminalReceiver) {
+    fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(());
         let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
-        // TODO: UploadObjects doesn't use new scheduler yet, use dummy id
-        let id = crate::scheduler::TransferId {
-            id: 0,
-            parent: None,
-        };
-        LegacyTransferContext::from_state(id, handle, state)
+        LegacyTransferContext::from_state(handle, state)
     }
 }

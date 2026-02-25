@@ -57,8 +57,7 @@ impl DownloadObjects {
         parent_span_for_tasks.follows_from(tracing::Span::current());
 
         let concurrency = handle.num_workers();
-        // TODO: DownloadObjects doesn't use new scheduler yet, completion_rx unused
-        let (ctx, _completion_rx) = DownloadObjectsContext::new(handle.clone(), input);
+        let ctx = DownloadObjectsContext::new(handle.clone(), input);
 
         // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
         let mut tasks = JoinSet::new();
@@ -96,10 +95,7 @@ pub(crate) struct DownloadObjectsState {
 type DownloadObjectsContext = LegacyTransferContext<DownloadObjectsState>;
 
 impl DownloadObjectsContext {
-    fn new(
-        handle: Arc<crate::client::Handle>,
-        input: DownloadObjectsInput,
-    ) -> (Self, crate::operation::StateMachineTerminalReceiver) {
+    fn new(handle: Arc<crate::client::Handle>, input: DownloadObjectsInput) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(());
         let state = Arc::new(DownloadObjectsState {
             input,
@@ -109,11 +105,6 @@ impl DownloadObjectsContext {
             successful_downloads: AtomicU64::default(),
             total_bytes_transferred: AtomicU64::default(),
         });
-        // TODO: DownloadObjects doesn't use new scheduler yet, use dummy id
-        let id = crate::scheduler::TransferId {
-            id: 0,
-            parent: None,
-        };
-        LegacyTransferContext::from_state(id, handle, state)
+        LegacyTransferContext::from_state(handle, state)
     }
 }
