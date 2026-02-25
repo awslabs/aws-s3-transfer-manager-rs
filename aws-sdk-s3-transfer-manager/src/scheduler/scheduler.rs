@@ -202,8 +202,11 @@ impl Scheduler {
             desc.notify_idle();
         }
 
-        // if terminal, no further work can be queued
+        // Terminal transfer: no further work to generate. Clean up when fully drained.
         if desc.is_terminal() {
+            if is_idle {
+                self.0.transfers.write().unwrap().remove(&desc.id());
+            }
             return;
         }
 
@@ -222,6 +225,25 @@ impl Scheduler {
 
         // capacity has freed try to queue up more work
         self.generate_work();
+    }
+
+    /// Handle a panic during work execution. The transfer's internal state is
+    /// unknown, so the scheduler forces the terminal transition from outside.
+    pub(super) fn on_panic(&self, work: ScheduledWork) {
+        let desc = &work.descriptor;
+        let ctx = desc.transfer().ctx();
+
+        let err = crate::error::from_kind(crate::error::ErrorKind::RuntimeError)(
+            "worker panic during execute",
+        );
+        ctx.set_failed(err);
+        ctx.signal_terminal();
+
+        let is_idle = desc.work_finished();
+        if is_idle {
+            self.0.transfers.write().unwrap().remove(&desc.id());
+        }
+        desc.notify_idle();
     }
 
     fn has_capacity(&self) -> bool {
@@ -327,11 +349,9 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             Ok(outcome) => outcome,
             Err(_panic) => {
                 tracing::error!(wid, %tid, "panic in transfer execute");
-                let err = crate::error::from_kind(crate::error::ErrorKind::RuntimeError)(
-                    "worker panic during execute",
-                );
-                transfer.ctx().set_failed(err);
-                WorkOutcome::Failed
+                pool.complete();
+                scheduler.on_panic(work);
+                continue;
             }
         };
 
@@ -345,7 +365,10 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::transfer::mock::{FixedWorkCount, MockStateMachine, WithDelay};
+    use crate::scheduler::transfer::mock::{
+        FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
+    };
+    use crate::scheduler::transfer::Transfer;
     use crate::scheduler::work::{WorkKind, WorkOutcome};
     use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
@@ -585,6 +608,82 @@ mod tests {
             high_count,
             low_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_failed_transfer_cleaned_up() {
+        let _logs = show_test_logs();
+        let scheduler = Scheduler::new(2);
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let sm = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
+            WorkOutcome::Failed
+        }));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle after failed transfer");
+
+        assert!(!scheduler.0.transfers.read().unwrap().contains_key(&id));
+        scheduler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_panic_transfer_cleaned_up_and_error_propagated() {
+        let _logs = show_test_logs();
+        let scheduler = Scheduler::new(2);
+
+        let panic_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let panic_sm = Arc::new(WithExecute::new(
+            FixedWorkCount::new(1),
+            |_| -> WorkOutcome { panic!("boom") },
+        ));
+        let panic_mock = MockTransfer::new(panic_id, panic_sm);
+        let panic_ctx = panic_mock.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(panic_mock));
+
+        let ok_id = TransferId {
+            id: 2,
+            parent: None,
+        };
+        let ok_sm = Arc::new(FixedWorkCount::new(3));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(ok_id, ok_sm.clone())));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle");
+
+        assert!(panic_ctx.is_failed());
+        assert_eq!(
+            panic_ctx.error_kind(),
+            Some(crate::error::ErrorKind::RuntimeError),
+        );
+        assert!(!scheduler
+            .0
+            .transfers
+            .read()
+            .unwrap()
+            .contains_key(&panic_id));
+
+        assert!(ok_sm.is_complete());
+        assert_eq!(ok_sm.completed_count(), 3);
+
+        scheduler.shutdown();
     }
 
     #[tokio::test]

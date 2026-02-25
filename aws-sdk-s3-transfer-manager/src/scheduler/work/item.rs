@@ -73,14 +73,22 @@ pub(crate) enum PollWork {
 }
 
 /// Result of executing a work item.
+///
+/// Contract between transfer state machines and the scheduler:
+/// - `Success`: Transfer is still active. Scheduler handles follow-on work and continues polling.
+/// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
+///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
+/// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
+///   Same cleanup as `Failed`.
 pub(crate) enum WorkOutcome {
+    /// Work completed successfully. Optionally schedule follow-on work.
     Success {
-        /// Schedule follow-on work of this kind, or None if complete.
         schedule_next: Option<WorkKind>,
         data: Option<Box<dyn WorkData>>,
     },
-    /// Work failed - error is stored in transfer context, not here
+    /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed,
+    /// Work was skipped or aborted because the transfer is already terminal.
     Cancelled,
 }
 

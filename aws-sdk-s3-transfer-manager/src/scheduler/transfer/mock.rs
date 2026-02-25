@@ -70,7 +70,16 @@ impl MockTransfer {
     }
 
     pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
-        self.state_machine.execute(work).await
+        let outcome = self.state_machine.execute(work).await;
+        // Mirror real transfer behavior: Failed means the transfer transitions
+        // itself to terminal state before returning.
+        if matches!(outcome, WorkOutcome::Failed) {
+            self.ctx.set_failed(crate::error::from_kind(
+                crate::error::ErrorKind::RuntimeError,
+            )("mock transfer failed"));
+            self.ctx.signal_terminal();
+        }
+        outcome
     }
 }
 
@@ -174,6 +183,43 @@ impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
             tokio::time::sleep(self.delay).await;
             self.inner.execute(work).await
         })
+    }
+}
+
+/// Wraps a state machine to override execute behavior with a custom function.
+pub(crate) struct WithExecute<S> {
+    inner: S,
+    execute_fn: fn(&mut WorkItem) -> WorkOutcome,
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for WithExecute<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WithExecute")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<S> WithExecute<S> {
+    pub(crate) fn new(inner: S, execute_fn: fn(&mut WorkItem) -> WorkOutcome) -> Self {
+        Self { inner, execute_fn }
+    }
+}
+
+impl<S> MockStateMachine for WithExecute<S>
+where
+    S: MockStateMachine,
+{
+    fn poll_work(&self, id: TransferId) -> PollWork {
+        self.inner.poll_work(id)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        work: &'a mut WorkItem,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        let outcome = (self.execute_fn)(work);
+        Box::pin(async move { outcome })
     }
 }
 

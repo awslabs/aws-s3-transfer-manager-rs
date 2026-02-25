@@ -698,9 +698,6 @@ mod tests {
         }
     }
 
-    // TODO(redux): This test requires upload_objects to use the new scheduler.
-    // Re-enable once upload_objects migration is complete.
-    #[ignore = "TODO(redux): upload_objects uses old scheduler"]
     #[tokio::test]
     async fn test_cancel_single_upload_via_put_object() {
         let bucket = "doesnotmatter";

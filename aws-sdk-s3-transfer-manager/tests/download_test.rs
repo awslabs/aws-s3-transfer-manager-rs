@@ -161,7 +161,6 @@ async fn test_body_not_consumed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked on scheduler outstanding tracking bug - see tasks.md"]
 async fn test_abort_download() {
     let data = rand_data(25 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = ByteUnit::Mebibyte.as_bytes_usize();
