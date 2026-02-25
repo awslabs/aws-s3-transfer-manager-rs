@@ -259,12 +259,8 @@ mod tests {
         input: &DownloadInput,
     ) -> DownloadTransfer {
         use tokio::sync::mpsc;
-        let id = crate::scheduler::TransferId {
-            id: 0,
-            parent: None,
-        };
         let (chunk_tx, _chunk_rx) = mpsc::channel(1);
-        let (ctx, _completion_rx) = TransferContext::new(id, handle);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
         DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), chunk_tx)
     }
 

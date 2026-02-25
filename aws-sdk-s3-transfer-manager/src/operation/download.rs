@@ -53,19 +53,10 @@ impl Download {
         _use_current_span_as_parent_for_tasks: bool,
     ) -> Result<DownloadHandle, error::Error> {
         use crate::operation::TransferContext;
-        use crate::scheduler::TransferId;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
         if input.part_number().is_some() {
             todo!("single part download not implemented")
         }
-
-        // TODO(redux): Consider where transfer ID generation should live
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        let transfer_id = TransferId {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            parent: None,
-        };
 
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
@@ -73,7 +64,7 @@ impl Download {
         let concurrency = handle.num_workers();
         let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
 
-        let (ctx, completion_rx) = TransferContext::new(transfer_id, handle.clone());
+        let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
         let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, chunk_tx);
         handle

@@ -241,17 +241,13 @@ mod tests {
         );
         let config = crate::Config::builder().client(s3_client).build();
         let tm = crate::Client::new(config);
-        let id = crate::scheduler::TransferId {
-            id: 0,
-            parent: None,
-        };
         let input = DownloadInput::builder()
             .bucket("test")
             .key("test")
             .build()
             .unwrap();
         let (tx, _) = mpsc::channel(1);
-        let (ctx, _) = TransferContext::new(id, tm.handle.clone());
+        let (ctx, _) = TransferContext::new(tm.handle.clone());
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, tx);
 
         (Body::new(rx, transfer.clone()), transfer)

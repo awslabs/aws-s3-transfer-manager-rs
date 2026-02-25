@@ -4,11 +4,20 @@
  */
 
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fs::Metadata, path::Path};
 
 use crate::error;
+
+static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_transfer_id() -> crate::scheduler::TransferId {
+    crate::scheduler::TransferId {
+        id: NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed),
+        parent: None,
+    }
+}
 
 /// Types for single object upload operation
 pub mod upload;
@@ -218,7 +227,25 @@ impl fmt::Debug for TransferContext {
 impl TransferContext {
     /// Create a new transfer context.
     /// Returns the context and a receiver for terminal state notification.
-    pub(crate) fn new(
+    pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
+        let id = next_transfer_id();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let ctx = Self {
+            id,
+            handle,
+            status: StateMachineStatus::new(),
+            error: Arc::new(Mutex::new(None)),
+            completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        };
+        (ctx, completion_rx)
+    }
+
+    /// Create a new transfer context with a specific ID (for testing).
+    /// Returns the context and a receiver for terminal state notification.
+    #[cfg(test)]
+    pub(crate) fn with_id(
         id: crate::scheduler::TransferId,
         handle: Arc<crate::client::Handle>,
     ) -> (Self, StateMachineTerminalReceiver) {

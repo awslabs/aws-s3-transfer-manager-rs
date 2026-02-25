@@ -635,7 +635,7 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::scheduler::{TransferId, WorkKind};
+    use crate::scheduler::WorkKind;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -657,14 +657,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let id = TransferId {
-            id: 1,
-            parent: None,
-        };
         let stream = InputStream::from(content);
         let (result_tx, result_rx) = oneshot::channel();
 
-        let (ctx, _completion_rx) = TransferContext::new(id, handle);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream, result_tx);
         (transfer, result_rx)
     }

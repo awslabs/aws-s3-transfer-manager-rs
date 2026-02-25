@@ -505,7 +505,7 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::operation::TransferContext;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::scheduler::{TransferId, WorkItem, WorkOutcome};
+    use crate::scheduler::{WorkItem, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -547,12 +547,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let id = TransferId {
-            id: 1,
-            parent: None,
-        };
         let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
-        let (ctx, _completion_rx) = TransferContext::new(id, handle);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
 
         DownloadTransfer::new(ctx, BucketType::Standard, input, chunk_tx)
     }

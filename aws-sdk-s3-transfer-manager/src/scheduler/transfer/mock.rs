@@ -56,7 +56,7 @@ impl MockTransfer {
             scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
         });
 
-        let (ctx, _completion_rx) = TransferContext::new(id, handle);
+        let (ctx, _completion_rx) = TransferContext::with_id(id, handle);
 
         Self {
             id,

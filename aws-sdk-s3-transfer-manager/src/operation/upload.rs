@@ -37,16 +37,6 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
-        use crate::scheduler::TransferId;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        // TODO(redux): Consider where transfer ID generation should live
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        let transfer_id = TransferId {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            parent: None,
-        };
-
         // TODO(redux): we were getting checksum behavior for free from SDK, moving to presigning and dedicated HTTP stack requires us to consider that
         if input.checksum_strategy.is_none() {
             // User didn't explicitly set checksum strategy.
@@ -76,7 +66,7 @@ impl Upload {
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
         // Create transfer context - completion_rx signals terminal state
-        let (ctx, _completion_rx) = TransferContext::new(transfer_id, handle.clone());
+        let (ctx, _completion_rx) = TransferContext::new(handle.clone());
 
         // Result channel for upload output
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
