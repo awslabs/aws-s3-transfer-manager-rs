@@ -151,8 +151,6 @@ impl DownloadHandle {
         let ctx = self.transfer.ctx();
         let id = self.transfer.id();
 
-        ctx.handle.scheduler.dump_stats();
-
         if ctx.is_failed() {
             tracing::debug!(ctx = %ctx, "join: cancelling and waiting for idle");
             ctx.handle.scheduler.cancel_transfer(id);

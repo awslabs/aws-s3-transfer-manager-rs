@@ -72,7 +72,7 @@ use crate::scheduler::work::ScheduledWork;
 use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+
 use std::sync::Arc;
 
 /// Event-driven scheduler for coordinating transfer work.
@@ -91,63 +91,6 @@ struct SchedulerInner {
     ready_set: ReadySet,
     pool: Arc<WorkerPool>,
     controller: Arc<dyn ConcurrencyController>,
-    stats: SchedulerStats,
-}
-
-/// Throwaway instrumentation for performance investigation.
-/// Raw atomics, printed on Drop. Will be replaced by proper telemetry.
-struct SchedulerStats {
-    generate_work_calls: AtomicU64,
-    poll_work_ready: AtomicU64,
-    poll_work_pending: AtomicU64,
-    poll_work_done: AtomicU64,
-    wake_calls: AtomicU64,
-    on_completion_calls: AtomicU64,
-}
-
-impl SchedulerStats {
-    fn new() -> Self {
-        Self {
-            generate_work_calls: AtomicU64::new(0),
-            poll_work_ready: AtomicU64::new(0),
-            poll_work_pending: AtomicU64::new(0),
-            poll_work_done: AtomicU64::new(0),
-            wake_calls: AtomicU64::new(0),
-            on_completion_calls: AtomicU64::new(0),
-        }
-    }
-
-    fn dump(&self) {
-        let ready = self.poll_work_ready.load(Ordering::Relaxed);
-        let pending = self.poll_work_pending.load(Ordering::Relaxed);
-        let done = self.poll_work_done.load(Ordering::Relaxed);
-        if ready + pending + done > 0 {
-            eprintln!(
-                "[scheduler stats] generate_work={} poll_work(ready={} pending={} done={}) wake={} on_completion={}",
-                self.generate_work_calls.load(Ordering::Relaxed),
-                ready, pending, done,
-                self.wake_calls.load(Ordering::Relaxed),
-                self.on_completion_calls.load(Ordering::Relaxed),
-            );
-        }
-    }
-}
-
-impl Drop for SchedulerStats {
-    fn drop(&mut self) {
-        let ready = self.poll_work_ready.load(Ordering::Relaxed);
-        let pending = self.poll_work_pending.load(Ordering::Relaxed);
-        let done = self.poll_work_done.load(Ordering::Relaxed);
-        if ready + pending + done > 0 {
-            eprintln!(
-                "[scheduler stats] generate_work={} poll_work(ready={} pending={} done={}) wake={} on_completion={}",
-                self.generate_work_calls.load(Ordering::Relaxed),
-                ready, pending, done,
-                self.wake_calls.load(Ordering::Relaxed),
-                self.on_completion_calls.load(Ordering::Relaxed),
-            );
-        }
-    }
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -168,7 +111,6 @@ impl Scheduler {
             ready_set: ReadySet::new(),
             pool: Arc::new(WorkerPool::new()),
             controller,
-            stats: SchedulerStats::new(),
         }))
     }
 
@@ -208,7 +150,6 @@ impl Scheduler {
     /// Called by state machines when they transition from blocked to ready.
     /// Only generates work if transfer exists and was inserted to ready set.
     pub(crate) fn wake(&self, id: TransferId) {
-        self.0.stats.wake_calls.fetch_add(1, Ordering::Relaxed);
         let desc = {
             let transfers = self.0.transfers.read().unwrap();
             transfers.get(&id).cloned()
@@ -264,7 +205,6 @@ impl Scheduler {
 
     /// Called by workers when work completes.
     pub(super) fn on_completion(&self, work: ScheduledWork, outcome: WorkOutcome) {
-        self.0.stats.on_completion_calls.fetch_add(1, Ordering::Relaxed);
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
         if is_idle {
@@ -323,7 +263,6 @@ impl Scheduler {
 
     /// Generate work from ready transfers and push to pools.
     fn generate_work(&self) {
-        self.0.stats.generate_work_calls.fetch_add(1, Ordering::Relaxed);
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
@@ -336,7 +275,6 @@ impl Scheduler {
 
             match desc.transfer().poll_work() {
                 PollWork::Ready(item) => {
-                    self.0.stats.poll_work_ready.fetch_add(1, Ordering::Relaxed);
                     desc.work_generated();
                     self.0.ready_set.insert(desc.clone());
                     self.enqueue_to_pool(ScheduledWork {
@@ -345,11 +283,9 @@ impl Scheduler {
                     });
                 }
                 PollWork::Pending => {
-                    self.0.stats.poll_work_pending.fetch_add(1, Ordering::Relaxed);
                     // re-added on wake as state machine progresses
                 }
                 PollWork::Done => {
-                    self.0.stats.poll_work_done.fetch_add(1, Ordering::Relaxed);
                     // done generating work, remove from transfers
                     self.0.transfers.write().unwrap().remove(&desc.id());
                 }
@@ -360,10 +296,6 @@ impl Scheduler {
     fn enqueue_to_pool(&self, work: ScheduledWork) {
         work.descriptor.work_queued();
         self.0.pool.push(work);
-    }
-
-    pub(crate) fn dump_stats(&self) {
-        self.0.stats.dump();
     }
 
     #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown

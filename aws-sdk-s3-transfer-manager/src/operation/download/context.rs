@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::operation::ChunkSender;
 
-/// Default maximum gap between claimed and consumed sequences.
-/// With 8MB parts, this is 128MB of buffered data.
-const DEFAULT_SEQ_WINDOW_MAX_GAP: u64 = 16;
+/// Default seq window multiplier applied to concurrency.
+/// gap = concurrency * multiplier. With concurrency=128, gap=512.
+const SEQ_WINDOW_CONCURRENCY_MULTIPLIER: u64 = 4;
 
 /// Controls how far ahead of consumer work can be generated.
 ///
@@ -25,7 +25,11 @@ pub(crate) struct SeqWindow {
 }
 
 impl SeqWindow {
-    pub(crate) fn new(max_gap: u64) -> Self {
+    pub(crate) fn new(concurrency: usize) -> Self {
+        Self::with_max_gap(concurrency as u64 * SEQ_WINDOW_CONCURRENCY_MULTIPLIER)
+    }
+
+    pub(crate) fn with_max_gap(max_gap: u64) -> Self {
         Self {
             consumed: AtomicU64::new(0),
             claimed: AtomicU64::new(0),
@@ -79,12 +83,6 @@ impl SeqWindow {
     }
 }
 
-impl Default for SeqWindow {
-    fn default() -> Self {
-        Self::new(DEFAULT_SEQ_WINDOW_MAX_GAP)
-    }
-}
-
 /// Mutable state for tracking download work progress
 #[derive(Debug)]
 pub(crate) enum DownloadState {
@@ -126,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_seq_window_try_claim_within_gap() {
-        let window = SeqWindow::new(4);
+        let window = SeqWindow::with_max_gap(4);
 
         // Should be able to claim 0, 1, 2, 3
         assert_eq!(window.try_claim(), Some(0));
@@ -140,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_seq_window_consume_enables_claim() {
-        let window = SeqWindow::new(2);
+        let window = SeqWindow::with_max_gap(2);
 
         // Claim up to gap
         assert_eq!(window.try_claim(), Some(0));
@@ -157,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_seq_window_consume_returns_false_when_not_exhausted() {
-        let window = SeqWindow::new(4);
+        let window = SeqWindow::with_max_gap(4);
 
         assert_eq!(window.try_claim(), Some(0));
         // Window not exhausted (claimed=1, consumed=0, gap=4)
@@ -168,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_seq_window_out_of_order_consume() {
-        let window = SeqWindow::new(2);
+        let window = SeqWindow::with_max_gap(2);
 
         assert_eq!(window.try_claim(), Some(0));
         assert_eq!(window.try_claim(), Some(1));
@@ -185,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_seq_window_set_max_gap() {
-        let window = SeqWindow::new(2);
+        let window = SeqWindow::with_max_gap(2);
 
         assert_eq!(window.try_claim(), Some(0));
         assert_eq!(window.try_claim(), Some(1));

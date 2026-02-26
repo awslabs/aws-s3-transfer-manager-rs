@@ -89,12 +89,13 @@ impl DownloadTransfer {
         input: DownloadInput,
         chunk_tx: ChunkSender,
     ) -> Self {
+        let concurrency = ctx.handle.num_workers();
         let inner = Arc::new(DownloadTransferInner {
             ctx,
             state: Mutex::new(DownloadState::new(chunk_tx)),
             request: Arc::new(input),
             bucket_type,
-            seq_window: SeqWindow::default(),
+            seq_window: SeqWindow::new(concurrency),
             object_meta: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
