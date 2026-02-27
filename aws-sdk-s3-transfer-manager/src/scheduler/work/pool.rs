@@ -69,12 +69,6 @@ impl WorkerPool {
         self.work_available.notify_waiters();
     }
 
-    /// Check if workers have been started.
-    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
-    pub(crate) fn is_started(&self) -> bool {
-        self.started.load(Ordering::Acquire)
-    }
-
     /// Mark workers as started. Returns true if this call started them (was first).
     pub(crate) fn mark_started(&self) -> bool {
         self.started
@@ -83,13 +77,11 @@ impl WorkerPool {
     }
 
     /// Number of pending work items.
-    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
     pub(crate) fn pending_count(&self) -> usize {
         self.queue.lock().unwrap().pending_count()
     }
 
     /// Number of in-flight work items.
-    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
     pub(crate) fn in_flight_count(&self) -> usize {
         self.queue.lock().unwrap().in_flight_count()
     }

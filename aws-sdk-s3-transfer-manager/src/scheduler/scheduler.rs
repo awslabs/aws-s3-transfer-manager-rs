@@ -3,65 +3,52 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Event-driven scheduler for coordinating transfer operations.
+//! Scheduler for coordinating transfer execution.
 //!
-//! The scheduler has a global view of all transfers and their associated work.
-//! It controls total concurrency via a single capacity target, agnostic to work kind.
-//! `WorkKind` remains as metadata for the transfer's `execute()` dispatch but is not
-//! used for capacity decisions.
+//! The scheduler holds transfers and polls them for work, maintaining control over
+//! ordering and admission until the moment of execution. This enables priority
+//! changes, cancellation, adaptive concurrency, and memory bounding.
 //!
-//! # Overview
+//! # Scheduling Model
 //!
-//! ```text
-//!   ┌─────────────┐     enqueue      ┌─────────────┐
-//!   │   Upload    │ ───────────────► │  Scheduler  │
-//!   │  Transfer   │                  │             │
-//!   └─────────────┘                  └──────┬──────┘
-//!                                           │
-//!                          ┌────────────────┼────────────────┐
-//!                          ▼                ▼                ▼
-//!                    ┌──────────┐     ┌──────────┐     ┌──────────┐
-//!                    │ Transfer │     │ Transfer │     │ Transfer │
-//!                    │    A     │     │    B     │     │    C     │
-//!                    └──────────┘     └──────────┘     └──────────┘
-//! ```
+//! Transfers are state machines that implement [`Transfer`]. The scheduler polls
+//! them via `poll_work()` when capacity is available, receiving work items or
+//! signals that the transfer is blocked (`Pending`) or finished (`Done`).
 //!
-//! # Worker Pool Model
-//!
-//! Workers pull work via `pool.next_work()` rather than work being spawned
-//! per-item. This enables:
-//! - Priority control (changes affect next work selection)
-//! - Bounded in-flight work (worker count = max concurrency)
-//! - Clean shutdown (workers exit when pool signals shutdown)
-//!
-//! Workers are spawned lazily on first `enqueue_transfer()` call, avoiding
-//! the need for an async context during scheduler construction.
+//! Work generation is event-driven. The scheduler generates work when a transfer
+//! arrives, is woken, work completes (freeing capacity), or the concurrency target
+//! changes. It never polls on a timer.
 //!
 //! ```text
-//!   ┌─────────────────────────────────────────────────────────────┐
-//!   │                        Scheduler                            │
-//!   │  ┌─────────────┐  ┌──────────────────────────────────────┐ │
-//!   │  │  Transfers  │  │           Worker Pool                │ │
-//!   │  └─────────────┘  └──────────────────┬───────────────────┘ │
-//!   └──────────────────────────────────────┼─────────────────────┘
-//!                                          │
-//!                                Workers pull work
-//!                                          │
-//!                                     ┌────┴────┐
-//!                                     │ Workers │
-//!                                     └─────────┘
+//!   enqueue ──► Transfers ──► Ready Set ──► generate_work() ──► Execution
+//!                  ▲                                                │
+//!   wake ─────────►│                                                │
+//!                  │                                                │
+//!                  └──────────── on_completion() ◄──────────────────┘
 //! ```
 //!
-//! # Work Flow
+//! # Fair Scheduling (CFS)
 //!
-//! Work progresses through phases. For uploads: DataIO (read) → Network (send).
-//! For downloads: Network (receive) → DataIO (write).
+//! When multiple transfers are ready, the scheduler uses Completely Fair Scheduling.
+//! Each transfer accumulates virtual runtime as it generates work. The transfer with
+//! the lowest virtual runtime is selected next. Priority acts as a weight: higher
+//! priority means slower accumulation, so the transfer generates more work before
+//! yielding to others.
 //!
-//! # Transfer States
+//! # Backpressure
 //!
-//! Transfers are either "ready" (can be polled for work) or "pending" (blocked
-//! waiting for in-flight work to complete). The scheduler only polls ready
-//! transfers, avoiding wasted work.
+//! Transfers that cannot acquire resources (sequence window full, memory budget
+//! exhausted) return `Pending` from `poll_work()`. The scheduler stops polling them
+//! until `wake()` is called, which re-inserts the transfer into the ready set and
+//! triggers work generation.
+//!
+//! # State Machine Contracts
+//!
+//! A [`Transfer`] implementation must uphold:
+//! - **Failed lifecycle**: record the error and signal termination before returning
+//!   a failure outcome.
+//! - **Pending/wake obligation**: every `Pending` must have a future wake path.
+//! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{
     BoxTransfer, ConcurrencyController, PollWork, TransferId, WorkItem, WorkOutcome, WorkerPool,
@@ -74,14 +61,10 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 
 use std::sync::Arc;
+use std::sync::RwLock;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
-/// Workers pull work via `next_work()` rather than work being spawned per-item.
-/// This enables priority control and bounded in-flight work.
-///
-use std::sync::RwLock;
-
 /// Clone is cheap (Arc).
 #[derive(Clone)]
 pub(crate) struct Scheduler(Arc<SchedulerInner>);

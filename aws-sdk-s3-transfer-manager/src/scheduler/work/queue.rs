@@ -38,12 +38,10 @@ impl WorkQueue {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
-    #[allow(dead_code)] // TODO(phase3): backing for WorkerPool
     pub(super) fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    #[allow(dead_code)] // TODO(phase3): backing for WorkerPool
     pub(super) fn in_flight_count(&self) -> usize {
         self.in_flight
     }
