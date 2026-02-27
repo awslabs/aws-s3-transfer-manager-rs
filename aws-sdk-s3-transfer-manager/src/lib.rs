@@ -92,6 +92,9 @@ pub(crate) mod http;
 /// Internal runtime components
 pub(crate) mod runtime;
 
+/// Scheduler for coordinating transfer execution
+pub(crate) mod scheduler;
+
 /// Metrics
 pub mod metrics;
 

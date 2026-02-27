@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::runtime::scheduler::Scheduler;
+use crate::runtime::scheduler::Scheduler as LegacyScheduler;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
@@ -19,7 +19,8 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
-    pub(crate) scheduler: Scheduler,
+    pub(crate) scheduler: crate::scheduler::Scheduler,
+    pub(crate) legacy_scheduler: LegacyScheduler,
 }
 
 impl Handle {
@@ -63,8 +64,19 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        let scheduler = Scheduler::new(config.concurrency().clone());
-        let handle = Arc::new(Handle { config, scheduler });
+        use crate::scheduler::FixedConcurrency;
+        let new_scheduler = crate::scheduler::Scheduler::with_controller(Arc::new(
+            FixedConcurrency::new(match config.concurrency() {
+                ConcurrencyMode::Explicit(c) => *c,
+                _ => crate::DEFAULT_CONCURRENCY,
+            }),
+        ));
+        let legacy_scheduler = LegacyScheduler::new(config.concurrency().clone());
+        let handle = Arc::new(Handle {
+            config,
+            scheduler: new_scheduler,
+            legacy_scheduler,
+        });
         Client { handle }
     }
 

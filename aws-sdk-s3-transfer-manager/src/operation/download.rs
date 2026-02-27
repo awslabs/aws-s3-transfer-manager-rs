@@ -127,7 +127,7 @@ async fn send_discovery(
     // acquire a permit for discovery
     let permit = ctx
         .handle
-        .scheduler
+        .legacy_scheduler
         .acquire_permit(PermitType::Network(NetworkPermitContext {
             payload_size_estimate: 0,
             bucket_type: ctx.bucket_type(),
