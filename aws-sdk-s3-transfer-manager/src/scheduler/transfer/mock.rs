@@ -148,6 +148,7 @@ impl MockStateMachine for FixedWorkCount {
             WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
+                metrics: None,
             }
         })
     }

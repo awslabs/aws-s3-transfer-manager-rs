@@ -322,6 +322,7 @@ impl UploadTransfer {
         WorkOutcome::Success {
             schedule_next: None,
             data: None,
+            metrics: None,
         }
     }
 
@@ -363,6 +364,7 @@ impl UploadTransfer {
                         part_number,
                         part_data: part_data.take(),
                     })),
+                    metrics: None,
                 }
             }
             Ok(None) => {
@@ -371,6 +373,7 @@ impl UploadTransfer {
                 WorkOutcome::Success {
                     schedule_next: None,
                     data: None,
+                    metrics: None,
                 }
             }
             Err(e) => self.fail(e.into()),
@@ -445,6 +448,7 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
+            metrics: None,
             data: None,
         }
     }
@@ -528,6 +532,7 @@ impl UploadTransfer {
         }
 
         WorkOutcome::Success {
+            metrics: None,
             schedule_next: None,
             data: None,
         }
@@ -591,6 +596,7 @@ impl UploadTransfer {
         }
 
         WorkOutcome::Success {
+            metrics: None,
             schedule_next: None,
             data: None,
         }
@@ -774,6 +780,7 @@ mod tests {
             WorkOutcome::Success {
                 schedule_next,
                 data,
+                ..
             } => {
                 assert_eq!(schedule_next, Some(WorkKind::Network));
                 if let Some(mut boxed_data) = data {
@@ -813,6 +820,7 @@ mod tests {
             WorkOutcome::Success {
                 schedule_next: Some(WorkKind::Network),
                 data,
+                ..
             } => WorkItem {
                 kind: WorkKind::Network,
                 data,
@@ -830,6 +838,7 @@ mod tests {
             WorkOutcome::Success {
                 schedule_next: Some(WorkKind::Network),
                 data,
+                ..
             } => WorkItem {
                 kind: WorkKind::Network,
                 data,

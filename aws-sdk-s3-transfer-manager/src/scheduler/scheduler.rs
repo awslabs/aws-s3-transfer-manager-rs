@@ -51,8 +51,10 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{
-    BoxTransfer, ConcurrencyController, PollWork, TransferId, WorkItem, WorkOutcome, WorkerPool,
+    BoxTransfer, CompletionSample, ConcurrencyController, IoMetrics, PollWork, TransferId,
+    WorkItem, WorkOutcome, WorkerPool,
 };
+
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
 use crate::scheduler::work::ScheduledWork;
@@ -62,6 +64,7 @@ use std::panic::AssertUnwindSafe;
 
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Instant;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -206,6 +209,7 @@ impl Scheduler {
         if let WorkOutcome::Success {
             schedule_next: Some(kind),
             data,
+            ..
         } = outcome
         {
             let next = ScheduledWork {
@@ -330,6 +334,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         tracing::debug!(wid, %tid, work = ?work.item.data, "executing");
         let transfer = work.descriptor.transfer();
+        let started = Instant::now();
 
         let token = transfer.ctx().cancellation_token().clone();
         let outcome = AssertUnwindSafe(async {
@@ -354,11 +359,22 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         tracing::debug!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
 
+        let io_metrics = match &outcome {
+            WorkOutcome::Success { metrics, .. } => metrics.unwrap_or_default(),
+            _ => IoMetrics::default(),
+        };
+        let sample = CompletionSample {
+            metrics: io_metrics,
+            duration: started.elapsed(),
+            error: None,
+            kind: work.item.kind,
+        };
+        scheduler.0.controller.on_completion(&sample);
+
         pool.complete();
         scheduler.on_completion(work, outcome);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +557,7 @@ mod tests {
                 WorkOutcome::Success {
                     schedule_next: None,
                     data: None,
+                    metrics: None,
                 }
             })
         }

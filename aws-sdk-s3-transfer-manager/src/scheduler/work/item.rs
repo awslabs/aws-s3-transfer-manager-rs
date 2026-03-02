@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use super::super::concurrency::IoMetrics;
 use std::any::Any;
 
 /// Opaque work data carried by work items. Each state machine defines its own type.
@@ -85,6 +86,7 @@ pub(crate) enum WorkOutcome {
     Success {
         schedule_next: Option<WorkKind>,
         data: Option<Box<dyn WorkData>>,
+        metrics: Option<IoMetrics>,
     },
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed,
@@ -98,10 +100,12 @@ impl std::fmt::Debug for WorkOutcome {
             WorkOutcome::Success {
                 schedule_next,
                 data,
+                metrics,
             } => f
                 .debug_struct("Success")
                 .field("schedule_next", schedule_next)
                 .field("data", data)
+                .field("metrics", metrics)
                 .finish(),
             WorkOutcome::Failed => write!(f, "Failed"),
             WorkOutcome::Cancelled => write!(f, "Cancelled"),

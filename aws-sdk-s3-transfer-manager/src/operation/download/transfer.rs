@@ -326,10 +326,12 @@ impl DownloadTransfer {
                     chunk_meta,
                     chunk_tx,
                 })),
+                metrics: None,
             },
             None => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
+                metrics: None,
             },
         }
     }
@@ -366,6 +368,7 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
+                metrics: None,
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -427,6 +430,7 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
+                metrics: None,
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -561,6 +565,7 @@ mod tests {
         if let WorkOutcome::Success {
             schedule_next: Some(kind),
             data,
+            ..
         } = outcome
         {
             let mut follow_on = WorkItem { kind, data };
