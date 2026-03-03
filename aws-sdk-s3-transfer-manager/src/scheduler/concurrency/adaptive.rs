@@ -41,21 +41,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use aws_sdk_s3::error::SdkError;
-use aws_smithy_runtime_api::http::Response;
-use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-
-use super::concurrency::{CompletionSample, ConcurrencyController, ErrorKind};
-
-// S3 error codes that indicate throttling. Subset of the SDK's full list,
-// filtered to codes S3 actually returns.
-const THROTTLING_CODES: &[&str] = &[
-    "Throttling",
-    "ThrottlingException",
-    "SlowDown",
-    "RequestLimitExceeded",
-    "BandwidthLimitExceeded",
-];
+use super::{CompletionSample, ConcurrencyController, ErrorKind};
 
 /// Configuration for the adaptive concurrency controller.
 #[derive(Debug, Clone)]
@@ -427,78 +413,10 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 }
 
-
-/// Classify an SDK error for adaptive concurrency decisions.
-///
-/// Throttle errors trigger immediate concurrency reduction. Transient errors
-/// are noise (don't affect the algorithm). Permanent errors are transfer-level
-/// concerns handled elsewhere.
-pub(crate) fn classify_sdk_error<E>(err: &SdkError<E, Response>) -> ErrorKind
-where
-    E: ProvideErrorMetadata,
-{
-    match err {
-        SdkError::ServiceError(ctx) => {
-            // Check error code first (most specific signal)
-            if let Some(code) = ctx.err().code() {
-                if THROTTLING_CODES.iter().any(|&c| c == code) {
-                    return ErrorKind::Throttle;
-                }
-            }
-            // Fall back to HTTP status code
-            match ctx.raw().status().as_u16() {
-                429 | 503 => ErrorKind::Throttle,
-                500 | 502 | 504 => ErrorKind::Transient,
-                _ => ErrorKind::Permanent,
-            }
-        }
-        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => ErrorKind::Transient,
-        _ => ErrorKind::Transient,
-    }
-}
-
-/// Classify an error for adaptive concurrency by walking the source chain.
-///
-/// Attempts to downcast to each SDK error type we use. Returns `None` for
-/// non-SDK errors (I/O errors, panics, etc.).
-pub(crate) fn classify_error(err: &crate::error::Error) -> Option<ErrorKind> {
-    use aws_sdk_s3::error::SdkError;
-    use aws_sdk_s3::operation::{
-        complete_multipart_upload::CompleteMultipartUploadError,
-        create_multipart_upload::CreateMultipartUploadError, get_object::GetObjectError,
-        put_object::PutObjectError, upload_part::UploadPartError,
-    };
-    use std::error::Error as _;
-
-    let mut source: Option<&(dyn std::error::Error + 'static)> = err.source();
-    while let Some(e) = source {
-        if let Some(e) = e.downcast_ref::<SdkError<GetObjectError>>() {
-            return Some(classify_sdk_error(e));
-        }
-        if let Some(e) = e.downcast_ref::<SdkError<CreateMultipartUploadError>>() {
-            return Some(classify_sdk_error(e));
-        }
-        if let Some(e) = e.downcast_ref::<SdkError<UploadPartError>>() {
-            return Some(classify_sdk_error(e));
-        }
-        if let Some(e) = e.downcast_ref::<SdkError<CompleteMultipartUploadError>>() {
-            return Some(classify_sdk_error(e));
-        }
-        if let Some(e) = e.downcast_ref::<SdkError<PutObjectError>>() {
-            return Some(classify_sdk_error(e));
-        }
-        if let Some(e) = e.downcast_ref::<SdkError<aws_sdk_s3::Error>>() {
-            return Some(classify_sdk_error(e));
-        }
-        source = e.source();
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::concurrency::{CompletionSample, ErrorKind, IoMetrics};
-    use super::super::WorkKind;
+    use super::super::super::WorkKind;
+    use super::super::{CompletionSample, ErrorKind, IoMetrics};
     use super::*;
 
     struct TestController(AdaptiveConcurrencyController);

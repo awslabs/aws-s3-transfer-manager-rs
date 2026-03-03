@@ -603,7 +603,7 @@ impl UploadTransfer {
     }
 
     fn fail(&self, error: Error) -> WorkOutcome {
-        let error_class = crate::scheduler::classify_error(&error);
+        let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error::Error::new(
             error::ErrorKind::RuntimeError,
             "upload failed",
@@ -616,7 +616,7 @@ impl UploadTransfer {
                 "upload failed",
             )));
         }
-        WorkOutcome::Failed { error: error_class }
+        WorkOutcome::Failed { classification }
     }
 }
 

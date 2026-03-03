@@ -89,7 +89,7 @@ pub(crate) enum WorkOutcome {
         metrics: Option<IoMetrics>,
     },
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
-    Failed { error: Option<ErrorKind> },
+    Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
     Cancelled,
 }
@@ -107,9 +107,10 @@ impl std::fmt::Debug for WorkOutcome {
                 .field("data", data)
                 .field("metrics", metrics)
                 .finish(),
-            WorkOutcome::Failed { error } => {
-                f.debug_struct("Failed").field("error", error).finish()
-            }
+            WorkOutcome::Failed { classification } => f
+                .debug_struct("Failed")
+                .field("classification", classification)
+                .finish(),
             WorkOutcome::Cancelled => write!(f, "Cancelled"),
         }
     }

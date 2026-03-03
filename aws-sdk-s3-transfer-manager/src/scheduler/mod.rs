@@ -3,15 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-mod adaptive;
 mod concurrency;
 mod scheduler;
 mod transfer;
 mod work;
 
-pub(crate) use adaptive::{classify_error, AdaptiveConcurrencyController, AdaptiveConfig};
 pub(crate) use concurrency::{
-    CompletionSample, ConcurrencyController, FixedConcurrency, IoMetrics,
+    classify_error, AdaptiveConcurrencyController, AdaptiveConfig, CompletionSample,
+    ConcurrencyController, FixedConcurrency, IoMetrics,
 };
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{BoxTransfer, Transfer};

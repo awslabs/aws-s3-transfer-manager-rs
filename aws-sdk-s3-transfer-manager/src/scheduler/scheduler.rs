@@ -197,15 +197,15 @@ impl Scheduler {
         elapsed: Duration,
     ) {
         // Report to concurrency controller
-        let (io_metrics, error) = match &outcome {
+        let (io_metrics, classification) = match &outcome {
             WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
-            WorkOutcome::Failed { error } => (IoMetrics::default(), *error),
+            WorkOutcome::Failed { classification } => (IoMetrics::default(), *classification),
             WorkOutcome::Cancelled => (IoMetrics::default(), None),
         };
         let sample = CompletionSample {
             metrics: io_metrics,
             duration: elapsed,
-            error,
+            error: classification,
             kind: work.item.kind,
         };
         self.0.controller.on_completion(&sample);
@@ -695,7 +695,9 @@ mod tests {
             parent: None,
         };
         let sm = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
-            WorkOutcome::Failed { error: None }
+            WorkOutcome::Failed {
+                classification: None,
+            }
         }));
         scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
 
