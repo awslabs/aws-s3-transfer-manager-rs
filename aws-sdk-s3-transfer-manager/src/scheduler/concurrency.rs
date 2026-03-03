@@ -65,6 +65,8 @@ pub(crate) struct CompletionSample {
 pub(crate) trait ConcurrencyController: Send + Sync + fmt::Debug {
     /// Current concurrency target. May change between calls.
     fn target(&self) -> usize;
+    /// Called when a work item is dispatched to a worker.
+    fn on_dispatch(&self) {}
     fn on_completion(&self, _sample: &CompletionSample) {}
 }
 

@@ -339,6 +339,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             tracing::debug!(wid, "shutdown");
             break;
         };
+        scheduler.0.controller.on_dispatch();
 
         let tid = work.descriptor.id();
         work.descriptor.work_started();

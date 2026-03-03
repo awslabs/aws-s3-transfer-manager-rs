@@ -193,6 +193,10 @@ pub(crate) struct AdaptiveConcurrencyController {
     config: AdaptiveConfig,
     /// Current concurrency target. Read lock-free by `target()`.
     target: AtomicUsize,
+    /// Current number of in-flight work items.
+    in_flight: AtomicUsize,
+    /// Peak in-flight during the current measurement window.
+    peak_in_flight: AtomicUsize,
     /// Network bytes accumulated during the current measurement window (sent + received).
     ///
     /// Note: control plane completions (CreateMPU, CompleteMPU) contribute to
@@ -208,6 +212,8 @@ impl AdaptiveConcurrencyController {
         let initial = config.initial_concurrency;
         Self {
             target: AtomicUsize::new(initial),
+            in_flight: AtomicUsize::new(0),
+            peak_in_flight: AtomicUsize::new(0),
             network_window: IOWindow::new(),
             state: Mutex::new(AlgorithmState {
                 phase: Phase::SlowStart,
@@ -251,6 +257,7 @@ impl AdaptiveConcurrencyController {
         let (bytes, _completions) = self.network_window.take();
         let elapsed = state.window_start.elapsed();
         state.window_start = Instant::now();
+        let peak = self.peak_in_flight.swap(0, Ordering::Relaxed);
 
         let goodput = if elapsed.is_zero() {
             0.0
@@ -258,7 +265,7 @@ impl AdaptiveConcurrencyController {
             bytes as f64 / elapsed.as_secs_f64()
         };
 
-        let new_target = self.run_algorithm(&mut state, goodput);
+        let new_target = self.run_algorithm(&mut state, goodput, peak);
         let clamped = match self.config.max_concurrency {
             Some(max) => new_target.min(max),
             None => new_target,
@@ -269,7 +276,12 @@ impl AdaptiveConcurrencyController {
 
     /// Run the three-state algorithm with a new goodput measurement.
     /// Returns the next probing concurrency level.
-    fn run_algorithm(&self, state: &mut AlgorithmState, goodput: f64) -> usize {
+    fn run_algorithm(
+        &self,
+        state: &mut AlgorithmState,
+        goodput: f64,
+        peak_in_flight: usize,
+    ) -> usize {
         // Record measurement before comparing
         state.recent_goodput.push_back(goodput);
         if state.recent_goodput.len() > self.config.history_size {
@@ -283,9 +295,12 @@ impl AdaptiveConcurrencyController {
             return self.clamp_probe(state.probing_concurrency, state.accepted_concurrency);
         }
 
-        // TODO(adaptive): exercised check -- reject probe if peak in_flight
-        // didn't reach accepted_concurrency. Needs pool.in_flight_count()
-        // plumbed to the controller.
+        // Exercised check: reject probe if we never actually ran at the probed level.
+        // If peak in-flight didn't reach accepted_concurrency, the throughput measurement
+        // doesn't reflect the probed concurrency — skip the algorithm and re-probe.
+        if peak_in_flight < state.accepted_concurrency {
+            return self.clamp_probe(state.probing_concurrency, state.accepted_concurrency);
+        }
 
         match state.phase {
             Phase::SlowStart => self.run_slow_start(state, goodput),
@@ -395,7 +410,13 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
         self.target.load(Ordering::Relaxed)
     }
 
+    fn on_dispatch(&self) {
+        let n = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_in_flight.fetch_max(n, Ordering::Relaxed);
+    }
+
     fn on_completion(&self, sample: &CompletionSample) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
         self.network_window
             .add(sample.metrics.bytes_sent, sample.metrics.bytes_received);
 
@@ -427,9 +448,17 @@ mod tests {
         }
 
         /// Feed a goodput measurement and run the algorithm. Returns new target.
+        /// Defaults peak in-flight to accepted_concurrency (exercised).
         fn record_goodput(&self, goodput: f64) -> usize {
             let mut state = self.0.state.lock().unwrap();
-            self.0.run_algorithm(&mut state, goodput)
+            let peak = state.accepted_concurrency;
+            self.0.run_algorithm(&mut state, goodput, peak)
+        }
+
+        /// Feed a goodput measurement with an explicit peak in-flight value.
+        fn record_goodput_with_peak(&self, goodput: f64, peak: usize) -> usize {
+            let mut state = self.0.state.lock().unwrap();
+            self.0.run_algorithm(&mut state, goodput, peak)
         }
 
         fn phase(&self) -> Phase {
@@ -611,5 +640,38 @@ mod tests {
 
         let clamped = tc.0.clamp_probe(3, 100);
         assert_eq!(clamped, 50);
+    }
+
+    // -- Exercised check --
+
+    #[test]
+    fn exercised_check_rejects_unexercised_probe() {
+        // If peak in-flight didn't reach accepted_concurrency, the probe
+        // should be rejected regardless of throughput improvement.
+        let tc = TestController::new(test_config());
+        tc.record_goodput(1000.0);
+        tc.record_goodput(2000.0); // SlowStart accepts, accepted moves to 20
+        assert_eq!(tc.accepted(), 20);
+
+        // Great throughput but peak in-flight was only 5 (way below accepted=20)
+        let target = tc.record_goodput_with_peak(5000.0, 5);
+        // Should NOT accept — probe wasn't exercised. accepted stays at 20.
+        assert_eq!(tc.accepted(), 20);
+        // Target should still be the same probing level (re-probe)
+        assert!(target > 20); // still probing upward
+    }
+
+    #[test]
+    fn exercised_check_passes_when_exercised() {
+        // If peak in-flight reached accepted_concurrency, normal algorithm runs.
+        let tc = TestController::new(test_config());
+        tc.record_goodput(1000.0);
+        tc.record_goodput(2000.0); // accepted=20
+        assert_eq!(tc.accepted(), 20);
+
+        // Peak in-flight = 20 (matches accepted), throughput improved
+        tc.record_goodput_with_peak(5000.0, 20);
+        // Should accept — probe was exercised and throughput improved
+        assert!(tc.accepted() > 20);
     }
 }
