@@ -21,7 +21,9 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{ChunkSender, TransferContext};
-use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{
+    IoMetrics, PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome,
+};
 use crate::types::BucketType;
 
 /// Download-specific work data.
@@ -353,6 +355,7 @@ impl DownloadTransfer {
             }
         };
 
+        let body_len = body.len() as u64;
         let mut segmented = SegmentedBuf::new();
         segmented.push(body);
         let chunk = ChunkOutput {
@@ -368,7 +371,10 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
-                metrics: None,
+                metrics: Some(IoMetrics {
+                    bytes_received: body_len,
+                    ..Default::default()
+                }),
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -415,6 +421,7 @@ impl DownloadTransfer {
 
         bail_if_terminal!(self);
 
+        let body_len = body.len() as u64;
         let mut segmented = SegmentedBuf::new();
         segmented.push(body);
         let chunk = ChunkOutput {
@@ -430,7 +437,10 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
-                metrics: None,
+                metrics: Some(IoMetrics {
+                    bytes_received: body_len,
+                    ..Default::default()
+                }),
             },
             Err(_) => WorkOutcome::Cancelled,
         }
