@@ -62,6 +62,7 @@ use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -77,6 +78,7 @@ struct SchedulerInner {
     ready_set: ReadySet,
     pool: Arc<WorkerPool>,
     controller: Arc<dyn ConcurrencyController>,
+    worker_count: AtomicUsize,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -97,6 +99,7 @@ impl Scheduler {
             ready_set: ReadySet::new(),
             pool: Arc::new(WorkerPool::new()),
             controller,
+            worker_count: AtomicUsize::new(0),
         }))
     }
 
@@ -104,13 +107,15 @@ impl Scheduler {
     fn ensure_workers_started(&self) {
         let pool = &self.0.pool;
         if pool.mark_started() {
-            for _ in 0..self.0.controller.target() {
+            let target = self.0.controller.target();
+            for _ in 0..target {
                 let pool = Arc::clone(pool);
                 let scheduler = self.clone();
                 tokio::spawn(async move {
                     worker_loop(pool, scheduler).await;
                 });
             }
+            self.0.worker_count.store(target, Ordering::Relaxed);
         }
     }
 
@@ -267,8 +272,35 @@ impl Scheduler {
         pending + in_flight < self.0.controller.target()
     }
 
+    /// Spawn additional workers if the concurrency target has grown beyond
+    /// the current worker count. Workers that become excess when the target
+    /// shrinks simply idle-park on `next_work`.
+    fn ensure_worker_capacity(&self) {
+        let target = self.0.controller.target();
+        let current = self.0.worker_count.load(Ordering::Relaxed);
+        if target > current {
+            // CAS to avoid double-spawning from concurrent generate_work calls
+            if self
+                .0
+                .worker_count
+                .compare_exchange(current, target, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                for _ in current..target {
+                    let pool = Arc::clone(&self.0.pool);
+                    let scheduler = self.clone();
+                    tokio::spawn(async move {
+                        worker_loop(pool, scheduler).await;
+                    });
+                }
+                tracing::debug!(old = current, new = target, "spawning additional workers");
+            }
+        }
+    }
+
     /// Generate work from ready transfers and push to pools.
     fn generate_work(&self) {
+        self.ensure_worker_capacity();
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
@@ -346,13 +378,13 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         // Skip execution if transfer already terminal (failed/cancelled by another work item)
         if work.descriptor.is_terminal() {
-            tracing::debug!(wid, %tid, work = ?work.item.data, "skipped (terminal)");
+            tracing::trace!(wid, %tid, work = ?work.item.data, "skipped (terminal)");
             pool.complete();
             scheduler.on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
-        tracing::debug!(wid, %tid, work = ?work.item.data, "executing");
+        tracing::trace!(wid, %tid, work = ?work.item.data, "executing");
         let transfer = work.descriptor.transfer();
         let started = Instant::now();
 
@@ -377,7 +409,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             }
         };
 
-        tracing::debug!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
+        tracing::trace!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
 
         let elapsed = started.elapsed();
         pool.complete();

@@ -254,7 +254,7 @@ impl AdaptiveConcurrencyController {
             return;
         }
 
-        let (bytes, _completions) = self.network_window.take();
+        let (bytes, completions) = self.network_window.take();
         let elapsed = state.window_start.elapsed();
         state.window_start = Instant::now();
         let peak = self.peak_in_flight.swap(0, Ordering::Relaxed);
@@ -265,13 +265,24 @@ impl AdaptiveConcurrencyController {
             bytes as f64 / elapsed.as_secs_f64()
         };
 
+        tracing::trace!(
+            goodput_mbps = goodput / 1_000_000.0,
+            peak,
+            completions,
+            window_ms = elapsed.as_millis() as u64,
+            "concurrency window evaluated"
+        );
+
         let new_target = self.run_algorithm(&mut state, goodput, peak);
         let clamped = match self.config.max_concurrency {
             Some(max) => new_target.min(max),
             None => new_target,
         }
         .max(1);
-        self.target.store(clamped, Ordering::Relaxed);
+        let old_target = self.target.swap(clamped, Ordering::Relaxed);
+        if old_target != clamped {
+            tracing::debug!(old_target, new_target = clamped, phase = ?state.phase, "concurrency target updated");
+        }
     }
 
     /// Run the three-state algorithm with a new goodput measurement.
@@ -299,6 +310,11 @@ impl AdaptiveConcurrencyController {
         // If peak in-flight didn't reach accepted_concurrency, the throughput measurement
         // doesn't reflect the probed concurrency — skip the algorithm and re-probe.
         if peak_in_flight < state.accepted_concurrency {
+            tracing::trace!(
+                peak_in_flight,
+                accepted = state.accepted_concurrency,
+                "probe skipped, not exercised"
+            );
             return self.clamp_probe(state.probing_concurrency, state.accepted_concurrency);
         }
 
@@ -318,11 +334,15 @@ impl AdaptiveConcurrencyController {
         let accept = ratio >= 1.0 + self.config.slow_start_acceptance_margin;
 
         if accept {
+            tracing::trace!(phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
             state.accepted_concurrency = state.probing_concurrency;
             state.probing_concurrency =
                 (state.accepted_concurrency as f64 * self.config.slow_start_multiplier) as usize;
         } else {
+            tracing::trace!(phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.slow_start_acceptance_margin, "probe rejected");
+            let old_phase = state.phase;
             state.phase = Phase::StableProbing;
+            tracing::debug!(from = ?old_phase, to = ?state.phase, accepted = state.accepted_concurrency, "concurrency phase transition");
             state.consecutive_probes = 0;
             state.probing_concurrency = (state.accepted_concurrency as f64
                 * (1.0 + self.config.stable_probe_pct))
@@ -342,12 +362,16 @@ impl AdaptiveConcurrencyController {
         let accept = ratio >= 1.0 + self.config.stable_acceptance_margin;
 
         if accept {
+            tracing::trace!(phase = ?Phase::StableProbing, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
             state.accepted_concurrency = state.probing_concurrency;
             state.consecutive_probes = 0;
         } else {
+            tracing::trace!(phase = ?Phase::StableProbing, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.stable_acceptance_margin, "probe rejected");
             state.consecutive_probes += 1;
             if state.consecutive_probes >= self.config.shedding_transition_threshold {
+                let old_phase = state.phase;
                 state.phase = Phase::StableShedding;
+                tracing::debug!(from = ?old_phase, to = ?state.phase, accepted = state.accepted_concurrency, "concurrency phase transition");
                 state.consecutive_probes = 0;
             }
         }
@@ -372,13 +396,17 @@ impl AdaptiveConcurrencyController {
         let accept = ratio >= 1.0 - self.config.stable_acceptance_margin;
 
         if accept {
+            tracing::trace!(phase = ?Phase::StableShedding, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
             state.accepted_concurrency = state.probing_concurrency;
             state.consecutive_probes += 1;
             let reduction = self.config.stable_probe_pct * (state.consecutive_probes + 1) as f64;
             state.probing_concurrency =
                 (state.accepted_concurrency as f64 * (1.0 - reduction)) as usize;
         } else {
+            tracing::trace!(phase = ?Phase::StableShedding, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.stable_acceptance_margin, "probe rejected");
+            let old_phase = state.phase;
             state.phase = Phase::StableProbing;
+            tracing::debug!(from = ?old_phase, to = ?state.phase, accepted = state.accepted_concurrency, "concurrency phase transition");
             state.consecutive_probes = 0;
             state.probing_concurrency = (state.accepted_concurrency as f64
                 * (1.0 + self.config.stable_probe_pct))
@@ -424,6 +452,7 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
         if sample.error == Some(ErrorKind::Throttle) {
             if let Ok(mut state) = self.state.lock() {
                 if state.phase != Phase::StableShedding {
+                    tracing::debug!(from = ?state.phase, to = ?Phase::StableShedding, "throttle error, transitioning to StableShedding");
                     state.phase = Phase::StableShedding;
                     state.consecutive_probes = 0;
                 }
