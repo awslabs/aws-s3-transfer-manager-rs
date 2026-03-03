@@ -111,9 +111,10 @@ impl Default for AdaptiveConfig {
                 max_duration: Duration::from_secs(5),
             },
             slow_start: SlowStartConfig {
-                // 3s lets new connections warm up before judging whether
-                // throughput has plateaued. Matches SDK connect timeout.
-                evaluation_interval: Duration::from_secs(3),
+                // 500ms matches stable window. Per-completion growth adds
+                // concurrency between evaluations; this interval controls
+                // how often we check for throughput plateau.
+                evaluation_interval: Duration::from_millis(500),
                 // SlowStart requires 10% improvement to stay in phase.
                 acceptance_margin: 0.10,
                 // 90% of target must be in-flight for per-completion growth.
@@ -355,7 +356,11 @@ impl AdaptiveConcurrencyController {
         // Exercised check: reject probe if we never actually ran at the probed level.
         // If peak in-flight didn't reach accepted_concurrency, the throughput measurement
         // doesn't reflect the probed concurrency — skip the algorithm and re-probe.
-        if peak_in_flight < state.accepted_concurrency {
+        // Only applies to stable phases; SlowStart growth is per-completion with its
+        // own exercised gate.
+        if Phase::from_usize(self.phase.load(Ordering::Relaxed)) != Phase::SlowStart
+            && peak_in_flight < state.accepted_concurrency
+        {
             tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY,
                 peak_in_flight,
                 accepted = state.accepted_concurrency,
@@ -806,5 +811,20 @@ mod tests {
         tc.record_goodput(1000.0); // SlowStart reject -> StableProbing, history cleared
         assert_eq!(tc.phase(), Phase::StableProbing);
         assert_eq!(tc.history_len(), 0);
+    }
+
+    #[test]
+    fn window_evaluation_does_not_clobber_per_completion_target() {
+        // Per-completion growth ramps target during SlowStart. The windowed
+        // evaluation must not overwrite it — even if peak in-flight is low
+        // (e.g., inter-transfer gap spans the window).
+        let tc = TestController::new(test_config());
+        // Simulate per-completion growth having ramped target to 200
+        tc.0.target.store(200, Ordering::Relaxed);
+        // Window evaluation with low peak (inter-transfer gap)
+        let target = tc.record_goodput_with_peak(1000.0, 5);
+        // Target must not be reset to initial
+        assert!(target >= 200, "window evaluation clobbered per-completion target: {target}");
+        assert_eq!(tc.phase(), Phase::SlowStart);
     }
 }
