@@ -10,10 +10,10 @@
 //!
 //! ## Algorithm
 //!
-//! **SlowStart**: Upward probing with capped growth. Doubles concurrency each window
-//! at low levels, but caps absolute growth at high levels to avoid overwhelming
-//! connection establishment. Accepts if throughput improved by >= 10% over the
-//! previous window. On rejection, transitions to StableProbing.
+//! **SlowStart**: Per-completion growth. Each completion where in-flight >= 90%
+//! of target increments the target by 1. Growth rate is naturally limited by
+//! completion rate. Windowed evaluation detects throughput plateau and transitions
+//! to StableProbing.
 //!
 //! **StableProbing**: Linear upward probes (+2% per window). Accepts if throughput
 //! exceeds the best recent measurement by >= 2%. After N consecutive rejections
@@ -30,10 +30,10 @@
 //!
 //! ## Thread Safety
 //!
-//! `on_completion` is called from multiple worker threads. Network bytes are
-//! accumulated via atomic add (lock-free hot path). The algorithm state is behind
-//! a Mutex, touched only at window boundaries via `try_lock` to avoid blocking
-//! workers.
+//! `on_completion` is called from multiple worker threads. During SlowStart,
+//! each exercised completion increments the target atomically (lock-free).
+//! Network bytes are accumulated via atomic add. The algorithm state is behind
+//! a Mutex, touched only at window boundaries via `try_lock`.
 //!
 //! Adapted from the SimpleSlowStart algorithm.
 
@@ -48,90 +48,90 @@ use super::{CompletionSample, ConcurrencyController, ErrorKind};
 /// Configuration for the adaptive concurrency controller.
 #[derive(Debug, Clone)]
 pub(crate) struct AdaptiveConfig {
-    /// Starting concurrency before any measurements.
     pub initial_concurrency: usize,
-    /// Hard ceiling on concurrency. None means unlimited.
     pub max_concurrency: Option<usize>,
-    /// How long each measurement window lasts.
-    pub window_duration: Duration,
-    /// Minimum completions before the algorithm runs. If fewer completions
-    /// arrive within window_duration, the window extends until this threshold
-    /// is met or max_window_duration is reached. Prevents the algorithm from
-    /// acting on noisy signal during cold start (connection warmup, DNS, TLS).
-    pub min_completions_per_window: usize,
-    /// Hard cap on window extension. If min_completions hasn't been reached
-    /// by this duration, the algorithm runs with whatever data is available.
-    pub max_window_duration: Duration,
-    /// Measurement window during SlowStart. Longer than `window_duration` to
-    /// allow new connections to warm up (TLS handshake, TCP slow start) before
-    /// evaluating whether the probe improved throughput.
-    pub slow_start_window_duration: Duration,
-    /// SlowStart growth factor. Applied as a multiplier on accepted concurrency,
-    /// then capped by `max_slow_start_growth` to limit connection establishment rate.
-    pub slow_start_multiplier: f64,
-    /// Maximum absolute growth per SlowStart window. Caps the number of new
-    /// connections established in a single window. Growth is
-    /// `min(current * multiplier, current + max_slow_start_growth)` —
-    /// exponential at low concurrency, linear at high concurrency.
-    pub max_slow_start_growth: usize,
-    /// SlowStart acceptance threshold. Throughput must improve by at least
-    /// this ratio (default 0.10 = 10%) to accept an upward probe.
-    pub slow_start_acceptance_margin: f64,
-    /// StableProbing/StableShedding acceptance threshold (default 0.02 = 2%).
-    /// Upward probes must improve by this much. Downward probes must stay
-    /// within this much of peak.
-    pub stable_acceptance_margin: f64,
-    /// Probe size as fraction of current concurrency (default 0.02 = 2%).
-    /// StableProbing: additive increment. StableShedding: multiplicative
-    /// reduction that accelerates with consecutive accepted probes.
-    pub stable_probe_pct: f64,
-    /// Minimum change per probe step (default 5).
+    pub window: WindowConfig,
+    pub slow_start: SlowStartConfig,
+    pub stable: StableConfig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WindowConfig {
+    /// Window duration for throughput measurement.
+    pub duration: Duration,
+    /// Minimum completions required before the algorithm evaluates.
+    /// Prevents acting on noisy signal during cold start.
+    pub min_completions: usize,
+    /// Maximum time to wait for min_completions before evaluating anyway.
+    pub max_duration: Duration,
+}
+
+/// SlowStart phase settings. Growth is per-completion; these control the
+/// windowed transition evaluation.
+#[derive(Debug, Clone)]
+pub(crate) struct SlowStartConfig {
+    /// Minimum time between transition evaluations. Longer than the stable
+    /// window to smooth noisy throughput from warming connections.
+    pub evaluation_interval: Duration,
+    /// Throughput must improve by this ratio to stay in SlowStart.
+    pub acceptance_margin: f64,
+    /// Fraction of target that in-flight must reach for per-completion growth.
+    pub exercised_threshold: f64,
+}
+
+/// StableProbing and StableShedding settings.
+#[derive(Debug, Clone)]
+pub(crate) struct StableConfig {
+    /// Acceptance threshold for probing (improvement) and shedding (degradation).
+    pub acceptance_margin: f64,
+    /// Probe size as fraction of current concurrency.
+    pub probe_pct: f64,
+    /// Minimum change per probe step.
     pub min_probe_size: usize,
-    /// Maximum change per probe step (default 200).
+    /// Maximum change per probe step.
     pub max_probe_size: usize,
-    /// Number of recent goodput measurements to retain (default 10).
-    /// StableShedding compares against the max of this history.
+    /// Recent goodput measurements to retain.
     pub history_size: usize,
-    /// Consecutive rejections in StableProbing before transitioning to
-    /// StableShedding (default 3).
+    /// Consecutive rejections before transitioning to StableShedding.
     pub shedding_transition_threshold: usize,
 }
 
 impl Default for AdaptiveConfig {
     fn default() -> Self {
         Self {
-            initial_concurrency: 10,
+            initial_concurrency: 32,
             max_concurrency: None,
-            // Measurement window. 500ms is responsive while still smoothing
-            // per-request variance.
-            // Extended automatically if min_completions not met (cold start).
-            window_duration: Duration::from_millis(500),
-            // ~80MB at 8MB parts. One full round of completions at initial=10.
-            min_completions_per_window: 10,
-            // Don't wait forever for completions on a slow connection.
-            max_window_duration: Duration::from_secs(5),
-            // SlowStart window: 3s matches SDK connect timeout. Gives new
-            // connections time to establish and contribute to throughput
-            // before the algorithm evaluates the probe.
-            slow_start_window_duration: Duration::from_secs(3),
-            slow_start_multiplier: 2.0,
-            // Cap absolute growth per SlowStart window. Prevents overwhelming
-            // the connection stack when doubling would add hundreds of
-            // connections simultaneously.
-            max_slow_start_growth: 64,
-            // SlowStart requires 10% improvement to accept a doubling.
-            slow_start_acceptance_margin: 0.10,
-            // Stable states require 2% improvement (probing) or 2% of peak (shedding).
-            stable_acceptance_margin: 0.02,
-            // Probe size: 2% of current concurrency per step.
-            stable_probe_pct: 0.02,
-            // Don't probe smaller than 5 or larger than 200 per step.
-            min_probe_size: 5,
-            max_probe_size: 200,
-            // StableShedding compares against max of last 10 windows.
-            history_size: 10,
-            // 3 consecutive rejections in StableProbing triggers shedding.
-            shedding_transition_threshold: 3,
+            window: WindowConfig {
+                // 500ms is responsive while still smoothing per-request variance.
+                duration: Duration::from_millis(500),
+                // Enough completions for a meaningful throughput estimate.
+                // Prevents acting on noisy signal during cold start.
+                min_completions: 10,
+                // Don't wait forever for completions on a slow connection.
+                max_duration: Duration::from_secs(5),
+            },
+            slow_start: SlowStartConfig {
+                // 3s lets new connections warm up before judging whether
+                // throughput has plateaued. Matches SDK connect timeout.
+                evaluation_interval: Duration::from_secs(3),
+                // SlowStart requires 10% improvement to stay in phase.
+                acceptance_margin: 0.10,
+                // 90% of target must be in-flight for per-completion growth.
+                exercised_threshold: 0.9,
+            },
+            stable: StableConfig {
+                // 2% improvement (probing) or 2% of peak (shedding).
+                acceptance_margin: 0.02,
+                // 2% of current concurrency per probe step.
+                probe_pct: 0.02,
+                // Don't probe smaller than 5 or larger than 200 per step.
+                min_probe_size: 5,
+                max_probe_size: 200,
+                // StableShedding compares against max of last 10 windows.
+                history_size: 10,
+                // 3 consecutive rejections in StableProbing triggers shedding.
+                shedding_transition_threshold: 3,
+            },
         }
     }
 }
@@ -139,18 +139,30 @@ impl Default for AdaptiveConfig {
 /// Algorithm phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Exponential growth (2x). Finding the ballpark.
-    SlowStart,
+    /// Per-completion growth. Finding the ballpark.
+    SlowStart = 0,
     /// Small upward probes (+2%). Tracking the optimum.
-    StableProbing,
+    StableProbing = 1,
     /// Accelerating downward probes. Shedding excess concurrency.
-    StableShedding,
+    StableShedding = 2,
 }
 
-/// Mutable algorithm state, protected by Mutex. Only touched at window boundaries.
+impl Phase {
+    fn from_usize(v: usize) -> Self {
+        match v {
+            0 => Phase::SlowStart,
+            1 => Phase::StableProbing,
+            2 => Phase::StableShedding,
+            _ => Phase::StableProbing,
+        }
+    }
+}
+
+/// Mutable algorithm state, protected by Mutex. Touched at window boundaries
+/// and during phase transitions (including throttle-triggered transitions from
+/// `on_completion`).
 #[derive(Debug)]
 struct AlgorithmState {
-    phase: Phase,
     /// Last concurrency level where a probe was accepted.
     accepted_concurrency: usize,
     /// Concurrency level being tested in the current window.
@@ -158,9 +170,9 @@ struct AlgorithmState {
     /// Circular buffer of recent goodput measurements (bytes/sec).
     recent_goodput: VecDeque<f64>,
     /// Consecutive probe results in the same direction within the current phase.
-    /// SlowStart: consecutive accepts (unused, transitions on first reject).
     /// StableProbing: consecutive rejections (triggers shedding at threshold).
     /// StableShedding: consecutive accepts (accelerates reduction).
+    /// Unused during SlowStart.
     consecutive_probes: usize,
     window_start: Instant,
 }
@@ -222,6 +234,8 @@ pub(crate) struct AdaptiveConcurrencyController {
     /// the completion count but carry zero bytes, slightly diluting the goodput
     /// signal. Accepted as noise -- not worth filtering.
     network_window: IOWindow,
+    /// Algorithm phase. Stored as AtomicUsize for lock-free reads.
+    phase: AtomicUsize,
     /// Algorithm state. Only accessed at window boundaries.
     state: Mutex<AlgorithmState>,
 }
@@ -234,22 +248,16 @@ impl AdaptiveConcurrencyController {
             in_flight: AtomicUsize::new(0),
             peak_in_flight: AtomicUsize::new(0),
             network_window: IOWindow::new(),
+            phase: AtomicUsize::new(Phase::SlowStart as usize),
             state: Mutex::new(AlgorithmState {
-                phase: Phase::SlowStart,
                 accepted_concurrency: initial,
                 probing_concurrency: initial,
-                recent_goodput: VecDeque::with_capacity(config.history_size),
+                recent_goodput: VecDeque::with_capacity(config.stable.history_size),
                 consecutive_probes: 0,
                 window_start: Instant::now(),
             }),
             config,
         }
-    }
-
-    /// Compute next SlowStart probe: exponential growth capped by max absolute growth.
-    fn slow_start_probe(&self, accepted: usize) -> usize {
-        let uncapped = (accepted as f64 * self.config.slow_start_multiplier) as usize;
-        uncapped.min(accepted + self.config.max_slow_start_growth)
     }
 
     /// Check if the measurement window has elapsed and enough data has been
@@ -266,9 +274,9 @@ impl AdaptiveConcurrencyController {
             return;
         };
         let elapsed = state.window_start.elapsed();
-        let window_duration = match state.phase {
-            Phase::SlowStart => self.config.slow_start_window_duration,
-            _ => self.config.window_duration,
+        let window_duration = match Phase::from_usize(self.phase.load(Ordering::Relaxed)) {
+            Phase::SlowStart => self.config.slow_start.evaluation_interval,
+            _ => self.config.window.duration,
         };
         if elapsed < window_duration {
             return;
@@ -277,8 +285,8 @@ impl AdaptiveConcurrencyController {
         // Extend the window if we don't have enough completions for a
         // meaningful signal, but cap at max_window_duration to avoid stalling.
         let completions = self.network_window.completions.load(Ordering::Relaxed);
-        if (completions as usize) < self.config.min_completions_per_window
-            && elapsed < self.config.max_window_duration
+        if (completions as usize) < self.config.window.min_completions
+            && elapsed < self.config.window.max_duration
         {
             return;
         }
@@ -310,8 +318,19 @@ impl AdaptiveConcurrencyController {
         .max(1);
         let old_target = self.target.swap(clamped, Ordering::Relaxed);
         if old_target != clamped {
-            tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, old_target, new_target = clamped, phase = ?state.phase, "concurrency target updated");
+            tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, old_target, new_target = clamped, phase = ?Phase::from_usize(self.phase.load(Ordering::Relaxed)), "concurrency target updated");
         }
+    }
+
+    /// Transition to a new phase, resetting measurement history.
+    /// Clearing history forces a bootstrap period (2 windows) in the new phase,
+    /// giving the system time to stabilize at the new operating point.
+    fn transition_to(&self, state: &mut AlgorithmState, new_phase: Phase) {
+        let old_phase = Phase::from_usize(self.phase.load(Ordering::Relaxed));
+        self.phase.store(new_phase as usize, Ordering::Relaxed);
+        state.recent_goodput.clear();
+        state.consecutive_probes = 0;
+        tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?old_phase, to = ?new_phase, accepted = state.accepted_concurrency, "concurrency phase transition");
     }
 
     /// Run the three-state algorithm with a new goodput measurement.
@@ -324,14 +343,13 @@ impl AdaptiveConcurrencyController {
     ) -> usize {
         // Record measurement before comparing
         state.recent_goodput.push_back(goodput);
-        if state.recent_goodput.len() > self.config.history_size {
+        if state.recent_goodput.len() > self.config.stable.history_size {
             state.recent_goodput.pop_front();
         }
 
         // Bootstrap: need at least 2 measurements to compute ratios
         if state.recent_goodput.len() < 2 {
-            state.probing_concurrency = self.slow_start_probe(state.accepted_concurrency);
-            return self.clamp_probe(state.probing_concurrency, state.accepted_concurrency);
+            return self.target.load(Ordering::Relaxed);
         }
 
         // Exercised check: reject probe if we never actually ran at the probed level.
@@ -346,38 +364,35 @@ impl AdaptiveConcurrencyController {
             return self.clamp_probe(state.probing_concurrency, state.accepted_concurrency);
         }
 
-        match state.phase {
+        match Phase::from_usize(self.phase.load(Ordering::Relaxed)) {
             Phase::SlowStart => self.run_slow_start(state, goodput),
             Phase::StableProbing => self.run_stable_probing(state, goodput),
             Phase::StableShedding => self.run_stable_shedding(state, goodput),
         }
     }
 
-    /// SlowStart: upward probing with capped growth. Exponential at low
-    /// concurrency (doubling), linear at high concurrency (capped by
-    /// max_slow_start_growth). Accepts if throughput improved by >=
-    /// slow_start_acceptance_margin. On rejection, transitions to StableProbing.
+    /// SlowStart: windowed evaluation detects throughput plateau. Growth happens
+    /// per-completion in `on_completion`. On accept, preserves the per-completion
+    /// target. On reject (plateau), transitions to StableProbing.
     fn run_slow_start(&self, state: &mut AlgorithmState, measured: f64) -> usize {
         let previous = state.recent_goodput[state.recent_goodput.len() - 2];
         let ratio = ratio(measured, previous);
-        let accept = ratio >= 1.0 + self.config.slow_start_acceptance_margin;
+        let accept = ratio >= 1.0 + self.config.slow_start.acceptance_margin;
+
+        let current_target = self.target.load(Ordering::Relaxed);
+        state.accepted_concurrency = current_target;
 
         if accept {
-            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
-            state.accepted_concurrency = state.probing_concurrency;
-            state.probing_concurrency = self.slow_start_probe(state.accepted_concurrency);
+            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, current_target, ratio, "SlowStart continuing");
+            current_target
         } else {
-            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.slow_start_acceptance_margin, "probe rejected");
-            let old_phase = state.phase;
-            state.phase = Phase::StableProbing;
-            tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?old_phase, to = ?state.phase, accepted = state.accepted_concurrency, "concurrency phase transition");
-            state.consecutive_probes = 0;
+            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, current_target, ratio, threshold = self.config.slow_start.acceptance_margin, "SlowStart plateau");
+            self.transition_to(state, Phase::StableProbing);
             state.probing_concurrency = (state.accepted_concurrency as f64
-                * (1.0 + self.config.stable_probe_pct))
+                * (1.0 + self.config.stable.probe_pct))
                 .ceil() as usize;
+            self.clamp_probe(state.probing_concurrency, state.accepted_concurrency)
         }
-
-        self.clamp_probe(state.probing_concurrency, state.accepted_concurrency)
     }
 
     /// StableProbing: linear upward probes (+stable_probe_pct). Accepts if
@@ -394,25 +409,22 @@ impl AdaptiveConcurrencyController {
             .copied()
             .fold(0.0f64, f64::max);
         let ratio = ratio(measured, best_recent);
-        let accept = ratio >= 1.0 + self.config.stable_acceptance_margin;
+        let accept = ratio >= 1.0 + self.config.stable.acceptance_margin;
 
         if accept {
             tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::StableProbing, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
             state.accepted_concurrency = state.probing_concurrency;
             state.consecutive_probes = 0;
         } else {
-            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::StableProbing, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.stable_acceptance_margin, "probe rejected");
+            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::StableProbing, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.stable.acceptance_margin, "probe rejected");
             state.consecutive_probes += 1;
-            if state.consecutive_probes >= self.config.shedding_transition_threshold {
-                let old_phase = state.phase;
-                state.phase = Phase::StableShedding;
-                tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?old_phase, to = ?state.phase, accepted = state.accepted_concurrency, "concurrency phase transition");
-                state.consecutive_probes = 0;
+            if state.consecutive_probes >= self.config.stable.shedding_transition_threshold {
+                self.transition_to(state, Phase::StableShedding);
             }
         }
 
         state.probing_concurrency = (state.accepted_concurrency as f64
-            * (1.0 + self.config.stable_probe_pct))
+            * (1.0 + self.config.stable.probe_pct))
             .ceil() as usize;
 
         self.clamp_probe(state.probing_concurrency, state.accepted_concurrency)
@@ -428,23 +440,20 @@ impl AdaptiveConcurrencyController {
             .iter()
             .fold(0.0f64, |acc, &x| acc.max(x));
         let ratio = ratio(measured, max_recent);
-        let accept = ratio >= 1.0 - self.config.stable_acceptance_margin;
+        let accept = ratio >= 1.0 - self.config.stable.acceptance_margin;
 
         if accept {
             tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::StableShedding, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
             state.accepted_concurrency = state.probing_concurrency;
             state.consecutive_probes += 1;
-            let reduction = self.config.stable_probe_pct * (state.consecutive_probes + 1) as f64;
+            let reduction = self.config.stable.probe_pct * (state.consecutive_probes + 1) as f64;
             state.probing_concurrency =
                 (state.accepted_concurrency as f64 * (1.0 - reduction)) as usize;
         } else {
-            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::StableShedding, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.stable_acceptance_margin, "probe rejected");
-            let old_phase = state.phase;
-            state.phase = Phase::StableProbing;
-            tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?old_phase, to = ?state.phase, accepted = state.accepted_concurrency, "concurrency phase transition");
-            state.consecutive_probes = 0;
+            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::StableShedding, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.stable.acceptance_margin, "probe rejected");
+            self.transition_to(state, Phase::StableProbing);
             state.probing_concurrency = (state.accepted_concurrency as f64
-                * (1.0 + self.config.stable_probe_pct))
+                * (1.0 + self.config.stable.probe_pct))
                 .ceil() as usize;
         }
 
@@ -454,8 +463,8 @@ impl AdaptiveConcurrencyController {
     /// Clamp probe to [min_probe_size, accepted + max_probe_size] and >= 1.
     fn clamp_probe(&self, probe: usize, accepted: usize) -> usize {
         probe
-            .max(self.config.min_probe_size)
-            .min(accepted + self.config.max_probe_size)
+            .max(self.config.stable.min_probe_size)
+            .min(accepted + self.config.stable.max_probe_size)
             .max(1)
     }
 }
@@ -479,17 +488,34 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 
     fn on_completion(&self, sample: &CompletionSample) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let prev = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let current_in_flight = prev.saturating_sub(1);
         self.network_window
             .add(sample.metrics.bytes_sent, sample.metrics.bytes_received);
+
+        // Per-completion growth during SlowStart. Each exercised completion
+        // increments target by 1. Growth rate is naturally limited by
+        // completion rate.
+        if Phase::from_usize(self.phase.load(Ordering::Relaxed)) == Phase::SlowStart {
+            let target = self.target.load(Ordering::Relaxed);
+            let threshold = (target as f64 * self.config.slow_start.exercised_threshold) as usize;
+            if current_in_flight >= threshold {
+                let new_target = self.target.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(max) = self.config.max_concurrency {
+                    // Clamp back if we exceeded max. Harmless race: multiple
+                    // threads may clamp, all to the same value.
+                    if new_target > max {
+                        self.target.store(max, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
 
         // Throttle error: immediate transition to shedding
         if sample.error == Some(ErrorKind::Throttle) {
             if let Ok(mut state) = self.state.lock() {
-                if state.phase != Phase::StableShedding {
-                    tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?state.phase, to = ?Phase::StableShedding, "throttle error, transitioning to StableShedding");
-                    state.phase = Phase::StableShedding;
-                    state.consecutive_probes = 0;
+                if Phase::from_usize(self.phase.load(Ordering::Relaxed)) != Phase::StableShedding {
+                    self.transition_to(&mut state, Phase::StableShedding);
                 }
             }
         }
@@ -526,7 +552,7 @@ mod tests {
         }
 
         fn phase(&self) -> Phase {
-            self.0.state.lock().unwrap().phase
+            Phase::from_usize(self.0.phase.load(Ordering::Relaxed))
         }
 
         fn accepted(&self) -> usize {
@@ -564,33 +590,33 @@ mod tests {
     fn bootstrap_records_first_measurement_without_running_algorithm() {
         let tc = TestController::new(test_config());
         let target = tc.record_goodput(1000.0);
-        // First measurement: no comparison possible, just set probing = initial * 2
+        // First measurement: bootstrap returns current target (no per-completion growth in test)
         assert_eq!(tc.phase(), Phase::SlowStart);
-        assert_eq!(target, 20); // 10 * 2.0
-        assert_eq!(tc.accepted(), 10); // unchanged
+        assert_eq!(target, 32); // initial_concurrency
+        assert_eq!(tc.accepted(), 32); // unchanged
         assert_eq!(tc.history_len(), 1);
     }
 
-    // -- SlowStart --
+    // -- SlowStart windowed evaluation --
 
     #[test]
-    fn slow_start_accepts_on_sufficient_improvement() {
+    fn slow_start_stays_in_phase_on_throughput_improvement() {
         let tc = TestController::new(test_config());
         tc.record_goodput(1000.0); // bootstrap
-        let target = tc.record_goodput(1200.0); // 20% improvement, > 10% threshold
+        tc.record_goodput(1200.0); // 20% improvement, > 10% threshold
+                                   // Stays in SlowStart (per-completion growth continues)
         assert_eq!(tc.phase(), Phase::SlowStart);
-        // accepted moves to probing (20), new probing = 20 * 2 = 40
-        assert_eq!(tc.accepted(), 20);
-        assert_eq!(target, 40);
+        assert_eq!(tc.accepted(), 32); // accepted = current_target
     }
 
     #[test]
     fn slow_start_rejects_insufficient_improvement() {
         let tc = TestController::new(test_config());
         tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1050.0); // 5% improvement, < 10% threshold
+        tc.record_goodput(1050.0); // 5% improvement, < 10% threshold -> StableProbing
         assert_eq!(tc.phase(), Phase::StableProbing);
-        assert_eq!(tc.accepted(), 10); // unchanged, probe rejected
+        assert_eq!(tc.accepted(), 32); // accepted = current_target
+        assert_eq!(tc.history_len(), 0); // cleared by transition
     }
 
     // -- StableProbing --
@@ -598,20 +624,21 @@ mod tests {
     #[test]
     fn stable_probing_accepts_on_improvement() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1000.0); // reject -> StableProbing, accepted=10
-                                   // Now in StableProbing. probing = ceil(10 * 1.02) = 11
-        tc.record_goodput(1030.0); // 3% improvement over previous 1000, > 2%
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (history cleared)
+        tc.record_goodput(1000.0); // StableProbing bootstrap
+        tc.record_goodput(1030.0); // probing=33, 1030/1000=1.03 > 1.02, accept
         assert_eq!(tc.phase(), Phase::StableProbing);
-        assert_eq!(tc.accepted(), 11); // accepted the probe
+        assert_eq!(tc.accepted(), 33); // accepted the probe
         assert_eq!(tc.consecutive_probes(), 0); // reset on accept
     }
 
     #[test]
     fn stable_probing_rejects_to_shedding_after_threshold() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1000.0); // reject -> StableProbing
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
         tc.record_goodput(1000.0); // reject 3 -> StableShedding
@@ -623,13 +650,14 @@ mod tests {
     #[test]
     fn stable_shedding_accepts_when_throughput_near_peak() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1000.0); // -> StableProbing
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
-        tc.record_goodput(1000.0); // reject 3 -> StableShedding
-                                   // Peak is 1000. 985 is within 2%.
-        tc.record_goodput(985.0);
+        tc.record_goodput(1000.0); // reject 3 -> StableShedding (cleared)
+        tc.record_goodput(1000.0); // StableShedding bootstrap
+        tc.record_goodput(985.0); // peak=1000, 985 within 2%
         assert_eq!(tc.phase(), Phase::StableShedding);
         assert_eq!(tc.consecutive_probes(), 1); // accepted, accelerating
     }
@@ -637,13 +665,14 @@ mod tests {
     #[test]
     fn stable_shedding_rejects_to_probing_when_throughput_drops() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1000.0); // -> StableProbing
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
-        tc.record_goodput(1000.0); // reject 3 -> StableShedding
-                                   // Peak is 1000. 900 is 10% below -- well outside 2% margin.
-        tc.record_goodput(900.0);
+        tc.record_goodput(1000.0); // reject 3 -> StableShedding (cleared)
+        tc.record_goodput(1000.0); // StableShedding bootstrap
+        tc.record_goodput(900.0); // peak=1000, 10% below, outside 2% margin
         assert_eq!(tc.phase(), Phase::StableProbing);
     }
 
@@ -652,8 +681,11 @@ mod tests {
     #[test]
     fn throttle_forces_shedding() {
         let config = AdaptiveConfig {
-            window_duration: Duration::ZERO,
-            min_completions_per_window: 0,
+            window: WindowConfig {
+                duration: Duration::ZERO,
+                min_completions: 0,
+                ..AdaptiveConfig::default().window
+            },
             ..Default::default()
         };
         let tc = TestController::new(config);
@@ -672,8 +704,11 @@ mod tests {
         let config = AdaptiveConfig {
             initial_concurrency: 100,
             max_concurrency: Some(150),
-            window_duration: Duration::ZERO,
-            min_completions_per_window: 0,
+            window: WindowConfig {
+                duration: Duration::ZERO,
+                min_completions: 0,
+                ..AdaptiveConfig::default().window
+            },
             ..Default::default()
         };
         let tc = TestController::new(config);
@@ -697,7 +732,10 @@ mod tests {
     fn min_probe_size_enforced() {
         let config = AdaptiveConfig {
             initial_concurrency: 100,
-            min_probe_size: 50,
+            stable: StableConfig {
+                min_probe_size: 50,
+                ..AdaptiveConfig::default().stable
+            },
             ..Default::default()
         };
         let tc = TestController::new(config);
@@ -710,48 +748,63 @@ mod tests {
 
     #[test]
     fn exercised_check_rejects_unexercised_probe() {
-        // If peak in-flight didn't reach accepted_concurrency, the probe
-        // should be rejected regardless of throughput improvement.
+        // Test exercised check in StableProbing where it matters for windowed evaluation.
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0);
-        tc.record_goodput(2000.0); // SlowStart accepts, accepted moves to 20
-        assert_eq!(tc.accepted(), 20);
-
-        // Great throughput but peak in-flight was only 5 (way below accepted=20)
-        let target = tc.record_goodput_with_peak(5000.0, 5);
-        // Should NOT accept — probe wasn't exercised. accepted stays at 20.
-        assert_eq!(tc.accepted(), 20);
-        // Target should still be the same probing level (re-probe)
-        assert!(target > 20); // still probing upward
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.record_goodput(1000.0); // StableProbing bootstrap, accepted=32
+        let target = tc.record_goodput_with_peak(5000.0, 5); // peak=5, below accepted=32
+        assert_eq!(tc.accepted(), 32); // not accepted, probe not exercised
+        assert!(target >= 32); // still probing
     }
 
     #[test]
     fn exercised_check_passes_when_exercised() {
-        // If peak in-flight reached accepted_concurrency, normal algorithm runs.
+        // In StableProbing, peak in-flight matches accepted, throughput improved.
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0);
-        tc.record_goodput(2000.0); // accepted=20
-        assert_eq!(tc.accepted(), 20);
-
-        // Peak in-flight = 20 (matches accepted), throughput improved
-        tc.record_goodput_with_peak(5000.0, 20);
-        // Should accept — probe was exercised and throughput improved
-        assert!(tc.accepted() > 20);
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.record_goodput(1000.0); // StableProbing bootstrap, accepted=32
+        tc.record_goodput_with_peak(1030.0, 32); // peak=32, 3% > 2%
+        assert_eq!(tc.accepted(), 33); // accepted the probe
     }
 
-    // -- SlowStart growth cap --
+    // -- Per-completion SlowStart growth --
 
     #[test]
-    fn slow_start_caps_growth_at_high_concurrency() {
-        let config = AdaptiveConfig {
-            initial_concurrency: 100,
-            max_slow_start_growth: 64,
-            ..AdaptiveConfig::default()
-        };
-        let tc = TestController::new(config);
-        // Bootstrap: first probe from 100
-        let target = tc.record_goodput(1000.0);
-        // Uncapped would be 100 * 2 = 200. Capped: min(200, 100 + 64) = 164.
-        assert_eq!(target, 164);
+    fn slow_start_per_completion_growth() {
+        let controller = AdaptiveConcurrencyController::new(AdaptiveConfig::default());
+        // Simulate dispatches to get in_flight up to target
+        for _ in 0..32 {
+            controller.on_dispatch();
+        }
+        // in_flight=32, target=32. 32 >= floor(32*0.9)=28. Exercised.
+        let s = sample(8_000_000);
+        controller.on_completion(&s);
+        assert_eq!(controller.target(), 33);
+    }
+
+    #[test]
+    fn slow_start_no_growth_when_not_exercised() {
+        let controller = AdaptiveConcurrencyController::new(AdaptiveConfig::default());
+        // Only 5 dispatches — well below 90% of 32
+        for _ in 0..5 {
+            controller.on_dispatch();
+        }
+        let s = sample(8_000_000);
+        controller.on_completion(&s);
+        assert_eq!(controller.target(), 32);
+    }
+
+    // -- History reset --
+
+    #[test]
+    fn history_cleared_on_phase_transition() {
+        let tc = TestController::new(test_config());
+        tc.record_goodput(1000.0); // SlowStart bootstrap, history=1
+        assert_eq!(tc.history_len(), 1);
+        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing, history cleared
+        assert_eq!(tc.phase(), Phase::StableProbing);
+        assert_eq!(tc.history_len(), 0);
     }
 }
