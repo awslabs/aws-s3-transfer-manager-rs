@@ -323,13 +323,15 @@ impl AdaptiveConcurrencyController {
         }
     }
 
-    /// Transition to a new phase, resetting measurement history.
-    /// Clearing history forces a bootstrap period (2 windows) in the new phase,
-    /// giving the system time to stabilize at the new operating point.
+    /// Transition to a new phase. Clears history only when leaving SlowStart
+    /// (different operating regime). StableProbing ↔ StableShedding transitions
+    /// preserve history — they're fine-tuning around the same operating point.
     fn transition_to(&self, state: &mut AlgorithmState, new_phase: Phase) {
         let old_phase = Phase::from_usize(self.phase.load(Ordering::Relaxed));
         self.phase.store(new_phase as usize, Ordering::Relaxed);
-        state.recent_goodput.clear();
+        if old_phase == Phase::SlowStart {
+            state.recent_goodput.clear();
+        }
         state.consecutive_probes = 0;
         tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?old_phase, to = ?new_phase, accepted = state.accepted_concurrency, "concurrency phase transition");
     }
@@ -660,9 +662,8 @@ mod tests {
         tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
-        tc.record_goodput(1000.0); // reject 3 -> StableShedding (cleared)
-        tc.record_goodput(1000.0); // StableShedding bootstrap
-        tc.record_goodput(985.0); // peak=1000, 985 within 2%
+        tc.record_goodput(1000.0); // reject 3 -> StableShedding (history preserved)
+        tc.record_goodput(985.0); // peak=1000, 985 within 2%, accept
         assert_eq!(tc.phase(), Phase::StableShedding);
         assert_eq!(tc.consecutive_probes(), 1); // accepted, accelerating
     }
@@ -675,8 +676,7 @@ mod tests {
         tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
-        tc.record_goodput(1000.0); // reject 3 -> StableShedding (cleared)
-        tc.record_goodput(1000.0); // StableShedding bootstrap
+        tc.record_goodput(1000.0); // reject 3 -> StableShedding (history preserved)
         tc.record_goodput(900.0); // peak=1000, 10% below, outside 2% margin
         assert_eq!(tc.phase(), Phase::StableProbing);
     }
@@ -801,16 +801,87 @@ mod tests {
         assert_eq!(controller.target(), 32);
     }
 
-    // -- History reset --
+    // -- History management --
 
     #[test]
-    fn history_cleared_on_phase_transition() {
+    fn history_cleared_on_slow_start_exit() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap, history=1
+        tc.record_goodput(1000.0); // SlowStart bootstrap
         assert_eq!(tc.history_len(), 1);
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing, history cleared
+        tc.record_goodput(1000.0); // SlowStart reject → StableProbing
         assert_eq!(tc.phase(), Phase::StableProbing);
-        assert_eq!(tc.history_len(), 0);
+        assert_eq!(tc.history_len(), 0); // clean slate for stable phase
+    }
+
+    #[test]
+    fn history_preserved_between_stable_phases() {
+        let tc = TestController::new(test_config());
+        // Get to StableProbing
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // → StableProbing (history cleared)
+
+        // Build up history in StableProbing
+        tc.record_goodput(1000.0); // bootstrap
+        tc.record_goodput(1000.0); // reject 1
+        tc.record_goodput(1000.0); // reject 2
+        let history_before = tc.history_len();
+        assert!(history_before >= 3);
+
+        tc.record_goodput(1000.0); // reject 3 → StableShedding
+        assert_eq!(tc.phase(), Phase::StableShedding);
+        // History must survive the transition — one more entry was added
+        assert!(
+            tc.history_len() > history_before,
+            "history lost on StableProbing → StableShedding: {} -> {}",
+            history_before,
+            tc.history_len()
+        );
+    }
+
+    #[test]
+    fn stable_probing_does_not_creep_on_flat_throughput() {
+        let tc = TestController::new(test_config());
+        // Get to StableProbing
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // → StableProbing
+
+        // Feed flat throughput for many windows
+        let initial_accepted = tc.accepted();
+        for _ in 0..20 {
+            tc.record_goodput(1000.0);
+        }
+        // Accepted should not have crept upward significantly
+        let final_accepted = tc.accepted();
+        assert!(
+            final_accepted <= initial_accepted + 5,
+            "StableProbing crept from {} to {} on flat throughput",
+            initial_accepted,
+            final_accepted
+        );
+    }
+
+    #[test]
+    fn shedding_retains_peak_knowledge_from_probing() {
+        let tc = TestController::new(test_config());
+        // Get to StableProbing
+        tc.record_goodput(1000.0); // SlowStart bootstrap
+        tc.record_goodput(1000.0); // → StableProbing
+
+        // StableProbing sees high throughput
+        tc.record_goodput(5000.0); // bootstrap
+        tc.record_goodput(5000.0); // reject 1 (5000 vs best 5000 = 1.0 < 1.02)
+        tc.record_goodput(5000.0); // reject 2
+        tc.record_goodput(5000.0); // reject 3 → StableShedding
+        assert_eq!(tc.phase(), Phase::StableShedding);
+
+        // StableShedding should compare against 5000 (peak from probing history).
+        // A measurement of 4000 is 20% below peak — should reject.
+        tc.record_goodput(4000.0);
+        assert_eq!(
+            tc.phase(),
+            Phase::StableProbing,
+            "StableShedding accepted 4000 vs peak 5000 — lost peak knowledge"
+        );
     }
 
     #[test]
@@ -824,7 +895,10 @@ mod tests {
         // Window evaluation with low peak (inter-transfer gap)
         let target = tc.record_goodput_with_peak(1000.0, 5);
         // Target must not be reset to initial
-        assert!(target >= 200, "window evaluation clobbered per-completion target: {target}");
+        assert!(
+            target >= 200,
+            "window evaluation clobbered per-completion target: {target}"
+        );
         assert_eq!(tc.phase(), Phase::SlowStart);
     }
 }
