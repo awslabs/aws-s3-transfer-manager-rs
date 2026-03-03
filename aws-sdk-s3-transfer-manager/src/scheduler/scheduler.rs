@@ -64,7 +64,7 @@ use std::panic::AssertUnwindSafe;
 
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -190,7 +190,26 @@ impl Scheduler {
     }
 
     /// Called by workers when work completes.
-    pub(super) fn on_completion(&self, work: ScheduledWork, outcome: WorkOutcome) {
+    pub(super) fn on_completion(
+        &self,
+        work: ScheduledWork,
+        outcome: WorkOutcome,
+        elapsed: Duration,
+    ) {
+        // Report to concurrency controller
+        let (io_metrics, error) = match &outcome {
+            WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
+            WorkOutcome::Failed { error } => (IoMetrics::default(), *error),
+            WorkOutcome::Cancelled => (IoMetrics::default(), None),
+        };
+        let sample = CompletionSample {
+            metrics: io_metrics,
+            duration: elapsed,
+            error,
+            kind: work.item.kind,
+        };
+        self.0.controller.on_completion(&sample);
+
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
         if is_idle {
@@ -328,7 +347,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
         if work.descriptor.is_terminal() {
             tracing::debug!(wid, %tid, work = ?work.item.data, "skipped (terminal)");
             pool.complete();
-            scheduler.on_completion(work, WorkOutcome::Cancelled);
+            scheduler.on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
@@ -359,20 +378,9 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         tracing::debug!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
 
-        let io_metrics = match &outcome {
-            WorkOutcome::Success { metrics, .. } => metrics.unwrap_or_default(),
-            _ => IoMetrics::default(),
-        };
-        let sample = CompletionSample {
-            metrics: io_metrics,
-            duration: started.elapsed(),
-            error: None,
-            kind: work.item.kind,
-        };
-        scheduler.0.controller.on_completion(&sample);
-
+        let elapsed = started.elapsed();
         pool.complete();
-        scheduler.on_completion(work, outcome);
+        scheduler.on_completion(work, outcome, elapsed);
     }
 }
 #[cfg(test)]
@@ -687,7 +695,7 @@ mod tests {
             parent: None,
         };
         let sm = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
-            WorkOutcome::Failed
+            WorkOutcome::Failed { error: None }
         }));
         scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
 

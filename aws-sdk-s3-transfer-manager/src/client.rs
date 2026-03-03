@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
+use crate::scheduler::{
+    AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
+    Scheduler,
+};
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
@@ -63,11 +66,10 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        // TODO: derive concurrency from config properly
-        // Derive concurrency for new scheduler from config
         let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
             ConcurrencyMode::Explicit(n) => Arc::new(FixedConcurrency::new(*n)),
-            _ => Arc::new(FixedConcurrency::new(DEFAULT_CONCURRENCY)),
+            // TODO: target throughput -- adaptive with max constraint?
+            _ => Arc::new(AdaptiveConcurrencyController::new(AdaptiveConfig::default())),
         };
         let scheduler = Scheduler::with_controller(controller);
 

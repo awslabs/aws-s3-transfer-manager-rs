@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::super::concurrency::IoMetrics;
+use super::super::concurrency::{ErrorKind, IoMetrics};
 use std::any::Any;
 
 /// Opaque work data carried by work items. Each state machine defines its own type.
@@ -89,7 +89,7 @@ pub(crate) enum WorkOutcome {
         metrics: Option<IoMetrics>,
     },
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
-    Failed,
+    Failed { error: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
     Cancelled,
 }
@@ -107,7 +107,9 @@ impl std::fmt::Debug for WorkOutcome {
                 .field("data", data)
                 .field("metrics", metrics)
                 .finish(),
-            WorkOutcome::Failed => write!(f, "Failed"),
+            WorkOutcome::Failed { error } => {
+                f.debug_struct("Failed").field("error", error).finish()
+            }
             WorkOutcome::Cancelled => write!(f, "Cancelled"),
         }
     }

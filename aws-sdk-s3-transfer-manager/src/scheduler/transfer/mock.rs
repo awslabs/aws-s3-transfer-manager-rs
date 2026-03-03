@@ -73,7 +73,7 @@ impl MockTransfer {
         let outcome = self.state_machine.execute(work).await;
         // Mirror real transfer behavior: Failed means the transfer transitions
         // itself to terminal state before returning.
-        if matches!(outcome, WorkOutcome::Failed) {
+        if matches!(outcome, WorkOutcome::Failed { .. }) {
             self.ctx.set_failed(crate::error::from_kind(
                 crate::error::ErrorKind::RuntimeError,
             )("mock transfer failed"));

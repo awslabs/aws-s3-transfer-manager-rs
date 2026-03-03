@@ -467,6 +467,7 @@ impl DownloadTransfer {
         mut guard: std::sync::MutexGuard<'_, DownloadState>,
         error: Error,
     ) -> WorkOutcome {
+        let error_class = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
         self.inner.ctx.set_failed(error);
         // Transition to Terminal - releases chunk_tx
@@ -475,7 +476,7 @@ impl DownloadTransfer {
                      // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
         self.inner.ctx.signal_terminal();
-        WorkOutcome::Failed
+        WorkOutcome::Failed { error: error_class }
     }
 
     /// Transition to terminal success state. Requires holding the work lock.
@@ -746,7 +747,7 @@ mod tests {
         let mut range = assert_ready(transfer.poll_work());
         let outcome = execute(&transfer, &mut range).await;
 
-        assert!(matches!(outcome, WorkOutcome::Failed));
+        assert!(matches!(outcome, WorkOutcome::Failed { .. }));
         assert!(transfer.ctx().is_failed());
     }
 
