@@ -293,7 +293,7 @@ impl Scheduler {
                         worker_loop(pool, scheduler).await;
                     });
                 }
-                tracing::debug!(old = current, new = target, "spawning additional workers");
+                tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING, old = current, new = target, "spawning additional workers");
             }
         }
     }
@@ -368,7 +368,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
     loop {
         let Some(mut work) = pool.next_work().await else {
-            tracing::debug!(wid, "shutdown");
+            tracing::debug!(target: crate::telemetry::TARGET_EXECUTION, wid, "shutdown");
             break;
         };
         scheduler.0.controller.on_dispatch();
@@ -378,13 +378,13 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         // Skip execution if transfer already terminal (failed/cancelled by another work item)
         if work.descriptor.is_terminal() {
-            tracing::trace!(wid, %tid, work = ?work.item.data, "skipped (terminal)");
+            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, "skipped (terminal)");
             pool.complete();
             scheduler.on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
-        tracing::trace!(wid, %tid, work = ?work.item.data, "executing");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, "executing");
         let transfer = work.descriptor.transfer();
         let started = Instant::now();
 
@@ -402,14 +402,14 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(_panic) => {
-                tracing::error!(wid, %tid, "panic in transfer execute");
+                tracing::error!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "panic in transfer execute");
                 pool.complete();
                 scheduler.on_panic(work);
                 continue;
             }
         };
 
-        tracing::trace!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, ?outcome, "completed");
 
         let elapsed = started.elapsed();
         pool.complete();

@@ -26,7 +26,7 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, Transfer, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{IoMetrics, PollWork, Transfer, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
 
 /// Upload-specific work data.
@@ -400,6 +400,8 @@ impl UploadTransfer {
         let part_num_i32 = part_number as i32;
         let content_length = data.data.remaining() as i64;
 
+        let bytes_sent = content_length as u64;
+
         let req = copy_fields_to_upload_part_request(
             &self.inner.request,
             self.inner
@@ -448,7 +450,7 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
-            metrics: None,
+            metrics: Some(IoMetrics::bytes_sent(bytes_sent)),
             data: None,
         }
     }

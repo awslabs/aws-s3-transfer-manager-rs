@@ -39,6 +39,24 @@ pub(crate) struct IoMetrics {
     pub bytes_received: u64,
 }
 
+impl IoMetrics {
+    /// Metrics for a network send (upload part, put object).
+    pub fn bytes_sent(bytes_sent: u64) -> Self {
+        Self {
+            bytes_sent,
+            ..Default::default()
+        }
+    }
+
+    /// Metrics for a network receive (download range, get object).
+    pub fn bytes_received(bytes_received: u64) -> Self {
+        Self {
+            bytes_received,
+            ..Default::default()
+        }
+    }
+}
+
 /// Per-work-item completion data reported to the concurrency controller.
 ///
 /// Built by the scheduler from work outcomes. The controller uses aggregate

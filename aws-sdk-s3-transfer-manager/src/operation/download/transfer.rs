@@ -355,7 +355,7 @@ impl DownloadTransfer {
             }
         };
 
-        let body_len = body.len() as u64;
+        let bytes_received = body.len() as u64;
         let mut segmented = SegmentedBuf::new();
         segmented.push(body);
         let chunk = ChunkOutput {
@@ -371,10 +371,7 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
-                metrics: Some(IoMetrics {
-                    bytes_received: body_len,
-                    ..Default::default()
-                }),
+                metrics: Some(IoMetrics::bytes_received(bytes_received)),
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -421,7 +418,7 @@ impl DownloadTransfer {
 
         bail_if_terminal!(self);
 
-        let body_len = body.len() as u64;
+        let bytes_received = body.len() as u64;
         let mut segmented = SegmentedBuf::new();
         segmented.push(body);
         let chunk = ChunkOutput {
@@ -437,10 +434,7 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
-                metrics: Some(IoMetrics {
-                    bytes_received: body_len,
-                    ..Default::default()
-                }),
+                metrics: Some(IoMetrics::bytes_received(bytes_received)),
             },
             Err(_) => WorkOutcome::Cancelled,
         }
