@@ -60,6 +60,10 @@ pub(crate) struct AdaptiveConfig {
     /// Hard cap on window extension. If min_completions hasn't been reached
     /// by this duration, the algorithm runs with whatever data is available.
     pub max_window_duration: Duration,
+    /// Measurement window during SlowStart. Longer than `window_duration` to
+    /// allow new connections to warm up (TLS handshake, TCP slow start) before
+    /// evaluating whether the probe improved throughput.
+    pub slow_start_window_duration: Duration,
     /// SlowStart growth factor (default 2.0 = double each window).
     pub slow_start_multiplier: f64,
     /// SlowStart acceptance threshold. Throughput must improve by at least
@@ -98,6 +102,10 @@ impl Default for AdaptiveConfig {
             min_completions_per_window: 10,
             // Don't wait forever for completions on a slow connection.
             max_window_duration: Duration::from_secs(5),
+            // SlowStart window: 3s matches SDK connect timeout. Gives new
+            // connections time to establish and contribute to throughput
+            // before the algorithm evaluates the probe.
+            slow_start_window_duration: Duration::from_secs(3),
             // SlowStart: 10 -> 20 -> 40 -> 80 -> 160
             slow_start_multiplier: 2.0,
             // SlowStart requires 10% improvement to accept a doubling.
@@ -241,7 +249,11 @@ impl AdaptiveConcurrencyController {
             return;
         };
         let elapsed = state.window_start.elapsed();
-        if elapsed < self.config.window_duration {
+        let window_duration = match state.phase {
+            Phase::SlowStart => self.config.slow_start_window_duration,
+            _ => self.config.window_duration,
+        };
+        if elapsed < window_duration {
             return;
         }
 
