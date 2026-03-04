@@ -262,12 +262,26 @@ impl AdaptiveConcurrencyController {
         }
         .max(1);
         let old_target = self.target.swap(clamped, Ordering::Relaxed);
+
+        let phase = Phase::from_usize(self.phase.load(Ordering::Relaxed));
+        let gbps = crate::metrics::unit::ByteUnit::Gigabit.as_bytes_u64() as f64;
+        tracing::trace!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            goodput_gbps = goodput / gbps,
+            smoothed_gbps = smoothed / gbps,
+            accepted = state.accepted_concurrency,
+            target = clamped,
+            ?phase,
+            peak,
+            "evaluation"
+        );
         if old_target != clamped {
             tracing::debug!(
                 target: crate::telemetry::TARGET_CONCURRENCY,
                 old_target,
                 new_target = clamped,
-                phase = ?Phase::from_usize(self.phase.load(Ordering::Relaxed)),
+                accepted = state.accepted_concurrency,
+                ?phase,
                 "concurrency target updated"
             );
         }
