@@ -65,6 +65,8 @@ pub(crate) struct SlowStartConfig {
     pub acceptance_margin: f64,
     /// Additive growth per accepted window.
     pub max_growth: usize,
+    /// Consecutive rejections required before exiting SlowStart.
+    pub exit_threshold: usize,
 }
 
 /// StableProbing and StableShedding settings.
@@ -98,6 +100,8 @@ impl Default for AdaptiveConfig {
                 acceptance_margin: 0.10,
                 // +64 connections per accepted window.
                 max_growth: 64,
+                // Tolerate 2 noisy windows before exiting SlowStart.
+                exit_threshold: 3,
             },
             stable: StableConfig {
                 // 2% improvement (probing) or 2% of peak (shedding).
@@ -150,9 +154,9 @@ struct AlgorithmState {
     /// Circular buffer of recent goodput measurements (bytes/sec).
     recent_goodput: VecDeque<f64>,
     /// Consecutive probe results in the same direction within the current phase.
+    /// SlowStart: consecutive rejections (triggers exit at threshold).
     /// StableProbing: consecutive rejections (triggers shedding at threshold).
     /// StableShedding: consecutive accepts (accelerates reduction).
-    /// Unused during SlowStart.
     consecutive_probes: usize,
     last_evaluation: Instant,
 }
@@ -305,8 +309,8 @@ impl AdaptiveConcurrencyController {
 
     /// SlowStart: additive growth (+max_growth per window). Accepts if throughput
     /// improved by >= acceptance_margin over the best recent measurement.
-    /// Comparing against the best (not just previous) detects the throughput
-    /// curve flattening sooner — each step must beat the high-water mark.
+    /// Requires multiple consecutive rejections before exiting to tolerate
+    /// noisy measurements during connection warmup.
     fn run_slow_start(&self, state: &mut AlgorithmState, measured: f64) -> usize {
         let best = state
             .recent_goodput
@@ -319,16 +323,20 @@ impl AdaptiveConcurrencyController {
         let accept = ratio >= 1.0 + self.config.slow_start.acceptance_margin;
 
         if accept {
+            state.consecutive_probes = 0;
             tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, "probe accepted");
             state.accepted_concurrency = state.probing_concurrency;
             state.probing_concurrency =
                 state.accepted_concurrency + self.config.slow_start.max_growth;
         } else {
-            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, threshold = self.config.slow_start.acceptance_margin, "SlowStart plateau");
-            self.transition_to(state, Phase::StableProbing);
-            state.probing_concurrency = (state.accepted_concurrency as f64
-                * (1.0 + self.config.stable.probe_pct))
-                .ceil() as usize;
+            state.consecutive_probes += 1;
+            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY, phase = ?Phase::SlowStart, probing = state.probing_concurrency, accepted = state.accepted_concurrency, ratio, consecutive = state.consecutive_probes, threshold = self.config.slow_start.acceptance_margin, "SlowStart plateau");
+            if state.consecutive_probes >= self.config.slow_start.exit_threshold {
+                self.transition_to(state, Phase::StableProbing);
+                state.probing_concurrency = (state.accepted_concurrency as f64
+                    * (1.0 + self.config.stable.probe_pct))
+                    .ceil() as usize;
+            }
         }
 
         self.clamp_probe(state.probing_concurrency, state.accepted_concurrency)
@@ -487,6 +495,18 @@ mod tests {
         fn history_len(&self) -> usize {
             self.0.state.lock().unwrap().recent_goodput.len()
         }
+
+        /// Drive through SlowStart to StableProbing by feeding flat throughput.
+        /// Returns with accepted = initial_concurrency, history cleared.
+        fn exit_slow_start(&self) {
+            self.record_goodput(1000.0); // bootstrap
+                                         // Need exit_threshold consecutive rejections (default 3)
+            let threshold = self.0.config.slow_start.exit_threshold;
+            for _ in 0..threshold {
+                self.record_goodput(1000.0);
+            }
+            assert_eq!(self.phase(), Phase::StableProbing);
+        }
     }
 
     fn test_config() -> AdaptiveConfig {
@@ -533,10 +553,12 @@ mod tests {
     fn slow_start_rejects_insufficient_improvement() {
         let tc = TestController::new(test_config());
         tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1050.0); // 5% improvement, < 10% threshold -> StableProbing
+        tc.record_goodput(1050.0); // 5% < 10% threshold, rejection 1
+        assert_eq!(tc.phase(), Phase::SlowStart); // still in SlowStart
+        tc.record_goodput(1050.0); // rejection 2
+        tc.record_goodput(1050.0); // rejection 3 -> StableProbing
         assert_eq!(tc.phase(), Phase::StableProbing);
-        assert_eq!(tc.accepted(), 32); // accepted = current_target
-        assert_eq!(tc.history_len(), 0); // cleared by transition
+        assert_eq!(tc.accepted(), 32);
     }
 
     // -- StableProbing --
@@ -544,8 +566,7 @@ mod tests {
     #[test]
     fn stable_probing_accepts_on_improvement() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (history cleared)
+        tc.exit_slow_start();
         tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1030.0); // probing=33, 1030/1000=1.03 > 1.02, accept
         assert_eq!(tc.phase(), Phase::StableProbing);
@@ -556,8 +577,7 @@ mod tests {
     #[test]
     fn stable_probing_rejects_to_shedding_after_threshold() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.exit_slow_start();
         tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
@@ -570,8 +590,7 @@ mod tests {
     #[test]
     fn stable_shedding_accepts_when_throughput_near_peak() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.exit_slow_start();
         tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
@@ -584,8 +603,7 @@ mod tests {
     #[test]
     fn stable_shedding_rejects_to_probing_when_throughput_drops() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.exit_slow_start();
         tc.record_goodput(1000.0); // StableProbing bootstrap
         tc.record_goodput(1000.0); // reject 1
         tc.record_goodput(1000.0); // reject 2
@@ -672,8 +690,7 @@ mod tests {
     fn exercised_check_rejects_unexercised_probe() {
         // Test exercised check in StableProbing where it matters for windowed evaluation.
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.exit_slow_start();
         tc.record_goodput(1000.0); // StableProbing bootstrap, accepted=32
         let target = tc.record_goodput_with_peak(5000.0, 5); // peak=5, below accepted=32
         assert_eq!(tc.accepted(), 32); // not accepted, probe not exercised
@@ -684,8 +701,7 @@ mod tests {
     fn exercised_check_passes_when_exercised() {
         // In StableProbing, peak in-flight matches accepted, throughput improved.
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // SlowStart reject -> StableProbing (cleared)
+        tc.exit_slow_start();
         tc.record_goodput(1000.0); // StableProbing bootstrap, accepted=32
         tc.record_goodput_with_peak(1030.0, 32); // peak=32, 3% > 2%
         assert_eq!(tc.accepted(), 33); // accepted the probe
@@ -710,9 +726,11 @@ mod tests {
     fn slow_start_exits_on_plateau() {
         let tc = TestController::new(test_config());
         tc.record_goodput(1000.0); // bootstrap
-        tc.record_goodput(1050.0); // 5% < 10% threshold -> StableProbing
+        tc.record_goodput(1050.0); // rejection 1
+        tc.record_goodput(1050.0); // rejection 2
+        tc.record_goodput(1050.0); // rejection 3 -> StableProbing
         assert_eq!(tc.phase(), Phase::StableProbing);
-        assert_eq!(tc.accepted(), 32); // accepted stays at initial (probe rejected)
+        assert_eq!(tc.accepted(), 32);
     }
 
     // -- Gap filtering --
@@ -742,9 +760,7 @@ mod tests {
     #[test]
     fn history_cleared_on_slow_start_exit() {
         let tc = TestController::new(test_config());
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        assert_eq!(tc.history_len(), 1);
-        tc.record_goodput(1000.0); // SlowStart reject → StableProbing
+        tc.exit_slow_start();
         assert_eq!(tc.phase(), Phase::StableProbing);
         assert_eq!(tc.history_len(), 0); // clean slate for stable phase
     }
@@ -752,9 +768,7 @@ mod tests {
     #[test]
     fn history_preserved_between_stable_phases() {
         let tc = TestController::new(test_config());
-        // Get to StableProbing
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // → StableProbing (history cleared)
+        tc.exit_slow_start();
 
         // Build up history in StableProbing
         tc.record_goodput(1000.0); // bootstrap
@@ -777,9 +791,7 @@ mod tests {
     #[test]
     fn stable_probing_does_not_creep_on_flat_throughput() {
         let tc = TestController::new(test_config());
-        // Get to StableProbing
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // → StableProbing
+        tc.exit_slow_start();
 
         // Feed flat throughput for many windows
         let initial_accepted = tc.accepted();
@@ -799,9 +811,7 @@ mod tests {
     #[test]
     fn shedding_retains_peak_knowledge_from_probing() {
         let tc = TestController::new(test_config());
-        // Get to StableProbing
-        tc.record_goodput(1000.0); // SlowStart bootstrap
-        tc.record_goodput(1000.0); // → StableProbing
+        tc.exit_slow_start();
 
         // StableProbing sees high throughput
         tc.record_goodput(5000.0); // bootstrap
