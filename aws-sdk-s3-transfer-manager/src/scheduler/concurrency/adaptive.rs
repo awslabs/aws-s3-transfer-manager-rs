@@ -304,10 +304,18 @@ impl AdaptiveConcurrencyController {
     }
 
     /// SlowStart: additive growth (+max_growth per window). Accepts if throughput
-    /// improved by >= acceptance_margin. On rejection, transitions to StableProbing.
+    /// improved by >= acceptance_margin over the best recent measurement.
+    /// Comparing against the best (not just previous) detects the throughput
+    /// curve flattening sooner — each step must beat the high-water mark.
     fn run_slow_start(&self, state: &mut AlgorithmState, measured: f64) -> usize {
-        let previous = state.recent_goodput[state.recent_goodput.len() - 2];
-        let ratio = ratio(measured, previous);
+        let best = state
+            .recent_goodput
+            .iter()
+            .rev()
+            .skip(1)
+            .copied()
+            .fold(0.0f64, f64::max);
+        let ratio = ratio(measured, best);
         let accept = ratio >= 1.0 + self.config.slow_start.acceptance_margin;
 
         if accept {
