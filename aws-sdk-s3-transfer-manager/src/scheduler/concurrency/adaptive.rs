@@ -5,34 +5,34 @@
 
 //! Adaptive concurrency controller.
 //!
-//! Three-state machine that adjusts concurrency target based on observed network
-//! goodput (bytes sent + received per measurement window).
+//! Three-state machine that discovers and maintains the optimal concurrency
+//! for the current network conditions.
 //!
-//! ## Algorithm
+//! ## Throughput Measurement
 //!
-//! **SlowStart**: Additive growth (+64 per window). Accepts if throughput improved
-//! by >= 10% over the previous window. On rejection, transitions to StableProbing.
+//! Throughput comes from shared [`IOCounters`] sliding windows. Raw measurements
+//! are smoothed through a windowed max filter (inspired by BBR's bandwidth
+//! estimation) before reaching the algorithm. A single low measurement — common
+//! at transfer boundaries — doesn't affect the max. Sustained throughput changes
+//! are tracked as old samples age out of the window.
 //!
-//! **StableProbing**: Linear upward probes (+2% per window). Accepts if throughput
-//! exceeds the best recent measurement by >= 2%. After N consecutive rejections
-//! (default 3), transitions to StableShedding.
+//! ## Phases
 //!
-//! **StableShedding**: Accelerating downward probes (-2%, -4%, -6%, ...). Accepts if
-//! throughput stays within 2% of peak (max of recent history). On rejection (throughput
-//! degraded too much), transitions back to StableProbing.
+//! **SlowStart**: Additive growth (+`max_growth` per evaluation). Compares
+//! against the best recent measurement; requires consecutive rejections before
+//! exiting to ride through noisy warmup windows.
+//!
+//! **StableProbing**: Small upward probes (+2%). Must beat the best recent
+//! measurement by 2%. Three consecutive rejections trigger StableShedding.
+//!
+//! **StableShedding**: Accelerating downward probes (-2%, -4%, -6%...).
+//! Accepts while throughput stays within 2% of peak. Rejects back to
+//! StableProbing when throughput drops too far.
 //!
 //! ## Error-Aware Transitions
 //!
-//! Throttle errors (503, 429, SlowDown) trigger an immediate transition to
-//! StableShedding regardless of current state, bypassing the measurement window.
-//!
-//! ## Thread Safety
-//!
-//! `on_completion` is called from multiple worker threads. Network bytes are
-//! accumulated via atomic add (lock-free hot path). The algorithm state is behind
-//! a Mutex, touched only at window boundaries via `try_lock`.
-//!
-//! Adapted from the SimpleSlowStart algorithm.
+//! Throttle errors (503, 429, SlowDown) bypass the evaluation timer and
+//! transition immediately to StableShedding.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,6 +56,10 @@ pub(crate) struct AdaptiveConfig {
 pub(crate) struct WindowConfig {
     /// Evaluation interval. The controller checks throughput this often.
     pub duration: Duration,
+    /// Number of raw measurements to retain for windowed-max smoothing.
+    /// The algorithm sees the max of the last N measurements, filtering
+    /// transient drops (transfer boundary gaps, warmup noise).
+    pub smoothing_window: usize,
 }
 
 /// SlowStart phase settings.
@@ -94,12 +98,15 @@ impl Default for AdaptiveConfig {
             window: WindowConfig {
                 // 500ms is responsive while still smoothing per-request variance.
                 duration: Duration::from_millis(500),
+                // 4 measurements = 2s. Transient drops (transfer boundary gaps)
+                // don't affect the max; sustained drops age out naturally.
+                smoothing_window: 4,
             },
             slow_start: SlowStartConfig {
                 // 10% improvement required to accept growth step.
                 acceptance_margin: 0.10,
-                // +64 connections per accepted window.
-                max_growth: 64,
+                // +32 connections per accepted window.
+                max_growth: 32,
                 // Tolerate 2 noisy windows before exiting SlowStart.
                 exit_threshold: 3,
             },
@@ -151,8 +158,12 @@ struct AlgorithmState {
     accepted_concurrency: usize,
     /// Concurrency level being tested in the current window.
     probing_concurrency: usize,
-    /// Circular buffer of recent goodput measurements (bytes/sec).
+    /// Smoothed goodput fed to the algorithm (bytes/sec). Each entry is the
+    /// windowed max of raw measurements at that evaluation point.
     recent_goodput: VecDeque<f64>,
+    /// Raw goodput measurements for windowed-max smoothing. Transient drops
+    /// don't affect the max; sustained drops age out naturally.
+    raw_goodput: VecDeque<f64>,
     /// Consecutive probe results in the same direction within the current phase.
     /// SlowStart: consecutive rejections (triggers exit at threshold).
     /// StableProbing: consecutive rejections (triggers shedding at threshold).
@@ -197,6 +208,7 @@ impl AdaptiveConcurrencyController {
                 accepted_concurrency: initial,
                 probing_concurrency: initial,
                 recent_goodput: VecDeque::with_capacity(config.stable.history_size),
+                raw_goodput: VecDeque::with_capacity(config.window.smoothing_window),
                 consecutive_probes: 0,
                 last_evaluation: Instant::now(),
             }),
@@ -227,14 +239,23 @@ impl AdaptiveConcurrencyController {
 
         let goodput = self.io_counters.network_throughput();
 
+        // Windowed max: push raw measurement, feed max to algorithm.
+        // Transient drops (transfer boundary gaps) don't affect the max.
+        state.raw_goodput.push_back(goodput);
+        if state.raw_goodput.len() > self.config.window.smoothing_window {
+            state.raw_goodput.pop_front();
+        }
+        let smoothed = state.raw_goodput.iter().copied().fold(0.0f64, f64::max);
+
         tracing::trace!(
             target: crate::telemetry::TARGET_CONCURRENCY,
             goodput_mbps = goodput / 1_000_000.0,
+            smoothed_mbps = smoothed / 1_000_000.0,
             peak,
             "window evaluated"
         );
 
-        let new_target = self.run_algorithm(&mut state, goodput, peak);
+        let new_target = self.run_algorithm(&mut state, smoothed, peak);
         let clamped = match self.config.max_concurrency {
             Some(max) => new_target.min(max),
             None => new_target,
@@ -260,6 +281,7 @@ impl AdaptiveConcurrencyController {
         self.phase.store(new_phase as usize, Ordering::Relaxed);
         if old_phase == Phase::SlowStart {
             state.recent_goodput.clear();
+            state.raw_goodput.clear();
         }
         state.consecutive_probes = 0;
         tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, from = ?old_phase, to = ?new_phase, accepted = state.accepted_concurrency, "concurrency phase transition");
@@ -530,9 +552,9 @@ mod tests {
     fn bootstrap_records_first_measurement_without_running_algorithm() {
         let tc = TestController::new(test_config());
         let target = tc.record_goodput(1000.0);
-        // First measurement: bootstrap sets probing = 32 + 64 = 96
+        // First measurement: bootstrap sets probing = 32 + 32 = 64
         assert_eq!(tc.phase(), Phase::SlowStart);
-        assert_eq!(target, 96);
+        assert_eq!(target, 64);
         assert_eq!(tc.accepted(), 32); // unchanged
         assert_eq!(tc.history_len(), 1);
     }
@@ -546,7 +568,7 @@ mod tests {
         tc.record_goodput(1200.0); // 20% improvement, > 10% threshold
                                    // Stays in SlowStart, accepted moves to probing level
         assert_eq!(tc.phase(), Phase::SlowStart);
-        assert_eq!(tc.accepted(), 96); // accepted = previous probing (32+64)
+        assert_eq!(tc.accepted(), 64); // accepted = previous probing (32+32)
     }
 
     #[test]
@@ -619,6 +641,7 @@ mod tests {
         let config = AdaptiveConfig {
             window: WindowConfig {
                 duration: Duration::from_nanos(10),
+                smoothing_window: 4,
             },
             ..Default::default()
         };
@@ -640,6 +663,7 @@ mod tests {
             max_concurrency: Some(150),
             window: WindowConfig {
                 duration: Duration::from_nanos(10),
+                smoothing_window: 4,
             },
             ..Default::default()
         };
@@ -712,14 +736,14 @@ mod tests {
     #[test]
     fn slow_start_additive_growth() {
         let tc = TestController::new(test_config());
-        // Bootstrap: first measurement, probing = 32 + 64 = 96
+        // Bootstrap: first measurement, probing = 32 + 32 = 64
         let target = tc.record_goodput(1000.0);
-        assert_eq!(target, 96);
+        assert_eq!(target, 64);
         assert_eq!(tc.accepted(), 32);
-        // Accept: throughput improved 20%, accepted = 96, probing = 96 + 64 = 160
+        // Accept: throughput improved 20%, accepted = 64, probing = 64 + 32 = 96
         let target = tc.record_goodput(1200.0);
-        assert_eq!(tc.accepted(), 96);
-        assert_eq!(target, 160);
+        assert_eq!(tc.accepted(), 64);
+        assert_eq!(target, 96);
     }
 
     #[test]
@@ -742,6 +766,7 @@ mod tests {
         let config = AdaptiveConfig {
             window: WindowConfig {
                 duration: Duration::from_nanos(10),
+                smoothing_window: 4,
             },
             ..Default::default()
         };
