@@ -55,7 +55,7 @@ use super::{
     WorkOutcome, WorkerPool,
 };
 
-use crate::metrics::IoSample;
+use crate::metrics::{IOCounters, IoSample};
 
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -80,6 +80,7 @@ struct SchedulerInner {
     ready_set: ReadySet,
     pool: Arc<WorkerPool>,
     controller: Arc<dyn ConcurrencyController>,
+    io_counters: Arc<IOCounters>,
     worker_count: AtomicUsize,
 }
 
@@ -92,15 +93,22 @@ impl std::fmt::Debug for Scheduler {
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
-        Self::with_controller(Arc::new(super::FixedConcurrency::new(concurrency)))
+        Self::with_controller(
+            Arc::new(super::FixedConcurrency::new(concurrency)),
+            Arc::new(IOCounters::new(Duration::from_millis(500))),
+        )
     }
 
-    pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
+    pub(crate) fn with_controller(
+        controller: Arc<dyn ConcurrencyController>,
+        io_counters: Arc<IOCounters>,
+    ) -> Self {
         Self(Arc::new(SchedulerInner {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
             pool: Arc::new(WorkerPool::new()),
             controller,
+            io_counters,
             worker_count: AtomicUsize::new(0),
         }))
     }
@@ -210,6 +218,7 @@ impl Scheduler {
             WorkOutcome::Cancelled => (IoSample::default(), None),
         };
         io_sample.duration = elapsed;
+        self.0.io_counters.record(&io_sample);
         let sample = CompletionSample {
             io: io_sample,
             error: classification,

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::IOCounters;
 use crate::scheduler::{
     AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
     Scheduler,
@@ -66,12 +67,17 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
+        let adaptive_config = AdaptiveConfig::default();
+        let io_counters = Arc::new(IOCounters::new(adaptive_config.window.duration));
         let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
             ConcurrencyMode::Explicit(n) => Arc::new(FixedConcurrency::new(*n)),
             // TODO: target throughput -- adaptive with max constraint?
-            _ => Arc::new(AdaptiveConcurrencyController::new(AdaptiveConfig::default())),
+            _ => Arc::new(AdaptiveConcurrencyController::new(
+                adaptive_config,
+                Arc::clone(&io_counters),
+            )),
         };
-        let scheduler = Scheduler::with_controller(controller);
+        let scheduler = Scheduler::with_controller(controller, io_counters);
 
         let handle = Arc::new(Handle { config, scheduler });
         Client { handle }

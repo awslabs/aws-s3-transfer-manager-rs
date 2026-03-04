@@ -35,12 +35,12 @@
 //! Adapted from the SimpleSlowStart algorithm.
 
 use std::collections::VecDeque;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{CompletionSample, ConcurrencyController, ErrorKind};
+use crate::metrics::IOCounters;
 
 /// Configuration for the adaptive concurrency controller.
 #[derive(Debug, Clone)]
@@ -54,20 +54,13 @@ pub(crate) struct AdaptiveConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowConfig {
-    /// Window duration for throughput measurement.
+    /// Evaluation interval. The controller checks throughput this often.
     pub duration: Duration,
-    /// Minimum completions required before the algorithm evaluates.
-    /// Prevents acting on noisy signal during cold start.
-    pub min_completions: usize,
-    /// Maximum time to wait for min_completions before evaluating anyway.
-    pub max_duration: Duration,
 }
 
 /// SlowStart phase settings.
 #[derive(Debug, Clone)]
 pub(crate) struct SlowStartConfig {
-    /// Minimum time between evaluations.
-    pub evaluation_interval: Duration,
     /// Throughput must improve by this ratio to accept a growth step.
     pub acceptance_margin: f64,
     /// Additive growth per accepted window.
@@ -99,16 +92,8 @@ impl Default for AdaptiveConfig {
             window: WindowConfig {
                 // 500ms is responsive while still smoothing per-request variance.
                 duration: Duration::from_millis(500),
-                // Enough completions for a meaningful throughput estimate.
-                // Prevents acting on noisy signal during cold start.
-                min_completions: 10,
-                // Don't wait forever for completions on a slow connection.
-                max_duration: Duration::from_secs(5),
             },
             slow_start: SlowStartConfig {
-                // 500ms between evaluations. Fast enough for responsive ramp,
-                // long enough for meaningful throughput measurement.
-                evaluation_interval: Duration::from_millis(500),
                 // 10% improvement required to accept growth step.
                 acceptance_margin: 0.10,
                 // +64 connections per accepted window.
@@ -169,44 +154,7 @@ struct AlgorithmState {
     /// StableShedding: consecutive accepts (accelerates reduction).
     /// Unused during SlowStart.
     consecutive_probes: usize,
-    window_start: Instant,
-}
-
-/// Accumulates bytes over a measurement window.
-struct IOWindow {
-    bytes: AtomicU64,
-    completions: AtomicU64,
-}
-
-impl IOWindow {
-    fn new() -> Self {
-        Self {
-            bytes: AtomicU64::new(0),
-            completions: AtomicU64::new(0),
-        }
-    }
-
-    fn add(&self, bytes_sent: u64, bytes_received: u64) {
-        self.bytes
-            .fetch_add(bytes_sent + bytes_received, Ordering::Relaxed);
-        self.completions.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Resets accumulators and returns (bytes, completions).
-    fn take(&self) -> (u64, u64) {
-        let bytes = self.bytes.swap(0, Ordering::Relaxed);
-        let completions = self.completions.swap(0, Ordering::Relaxed);
-        (bytes, completions)
-    }
-}
-
-impl fmt::Debug for IOWindow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IOWindow")
-            .field("bytes", &self.bytes.load(Ordering::Relaxed))
-            .field("completions", &self.completions.load(Ordering::Relaxed))
-            .finish()
-    }
+    last_evaluation: Instant,
 }
 
 /// Adaptive concurrency controller.
@@ -223,12 +171,9 @@ pub(crate) struct AdaptiveConcurrencyController {
     in_flight: AtomicUsize,
     /// Peak in-flight during the current measurement window.
     peak_in_flight: AtomicUsize,
-    /// Network bytes accumulated during the current measurement window (sent + received).
-    ///
-    /// Note: control plane completions (CreateMPU, CompleteMPU) contribute to
-    /// the completion count but carry zero bytes, slightly diluting the goodput
-    /// signal. Accepted as noise -- not worth filtering.
-    network_window: IOWindow,
+    /// Shared sliding-window I/O counters. The scheduler records samples;
+    /// the controller reads throughput at evaluation boundaries.
+    io_counters: Arc<IOCounters>,
     /// Algorithm phase. Stored as AtomicUsize for lock-free reads.
     phase: AtomicUsize,
     /// Algorithm state. Only accessed at window boundaries.
@@ -236,83 +181,53 @@ pub(crate) struct AdaptiveConcurrencyController {
 }
 
 impl AdaptiveConcurrencyController {
-    pub(crate) fn new(config: AdaptiveConfig) -> Self {
+    pub(crate) fn new(config: AdaptiveConfig, io_counters: Arc<IOCounters>) -> Self {
         let initial = config.initial_concurrency;
         Self {
             target: AtomicUsize::new(initial),
             in_flight: AtomicUsize::new(0),
             peak_in_flight: AtomicUsize::new(0),
-            network_window: IOWindow::new(),
+            io_counters,
             phase: AtomicUsize::new(Phase::SlowStart as usize),
             state: Mutex::new(AlgorithmState {
                 accepted_concurrency: initial,
                 probing_concurrency: initial,
                 recent_goodput: VecDeque::with_capacity(config.stable.history_size),
                 consecutive_probes: 0,
-                window_start: Instant::now(),
+                last_evaluation: Instant::now(),
             }),
             config,
         }
     }
 
-    /// Check if the measurement window has elapsed and enough data has been
-    /// collected to run the algorithm. Uses try_lock to avoid blocking workers.
+    /// Check if the evaluation interval has elapsed and run the algorithm.
+    /// Uses try_lock to avoid blocking workers.
     ///
     /// Returns early (no-op) if:
     /// - Another thread holds the lock (contention avoidance)
-    /// - The minimum window duration hasn't elapsed yet
-    /// - The window has elapsed but fewer than min_completions have arrived
-    ///   and we haven't hit max_window_duration yet (cold start protection:
-    ///   avoids acting on noisy signal from connection warmup, DNS, TLS)
+    /// - The evaluation interval hasn't elapsed yet
+    /// - IOCounters reports idle (no data in the sliding window)
     fn maybe_update_window(&self) {
         let Ok(mut state) = self.state.try_lock() else {
             return;
         };
-        let elapsed = state.window_start.elapsed();
-        let window_duration = match Phase::from_usize(self.phase.load(Ordering::Relaxed)) {
-            Phase::SlowStart => self.config.slow_start.evaluation_interval,
-            _ => self.config.window.duration,
-        };
-        if elapsed < window_duration {
+        if state.last_evaluation.elapsed() < self.config.window.duration {
             return;
         }
-
-        let completions = self.network_window.completions.load(Ordering::Relaxed);
-        if (completions as usize) < self.config.window.min_completions {
-            if elapsed < self.config.window.max_duration {
-                // Not enough signal yet, keep waiting.
-                return;
-            }
-            // Window expired with too few completions (inter-transfer gap).
-            // Discard — don't record or evaluate.
-            self.network_window.take();
-            state.window_start = Instant::now();
-            self.peak_in_flight.swap(0, Ordering::Relaxed);
-            tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY,
-                completions,
-                window_ms = elapsed.as_millis() as u64,
-                "window discarded, insufficient completions"
-            );
-            return;
-        }
-
-        let (bytes, completions) = self.network_window.take();
-        let elapsed = state.window_start.elapsed();
-        state.window_start = Instant::now();
+        state.last_evaluation = Instant::now();
         let peak = self.peak_in_flight.swap(0, Ordering::Relaxed);
 
-        let goodput = if elapsed.is_zero() {
-            0.0
-        } else {
-            bytes as f64 / elapsed.as_secs_f64()
-        };
+        if self.io_counters.is_idle() {
+            return;
+        }
 
-        tracing::trace!(target: crate::telemetry::TARGET_CONCURRENCY,
+        let goodput = self.io_counters.network_throughput();
+
+        tracing::trace!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
             goodput_mbps = goodput / 1_000_000.0,
             peak,
-            completions,
-            window_ms = elapsed.as_millis() as u64,
-            "concurrency window evaluated"
+            "window evaluated"
         );
 
         let new_target = self.run_algorithm(&mut state, goodput, peak);
@@ -323,7 +238,13 @@ impl AdaptiveConcurrencyController {
         .max(1);
         let old_target = self.target.swap(clamped, Ordering::Relaxed);
         if old_target != clamped {
-            tracing::debug!(target: crate::telemetry::TARGET_CONCURRENCY, old_target, new_target = clamped, phase = ?Phase::from_usize(self.phase.load(Ordering::Relaxed)), "concurrency target updated");
+            tracing::debug!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                old_target,
+                new_target = clamped,
+                phase = ?Phase::from_usize(self.phase.load(Ordering::Relaxed)),
+                "concurrency target updated"
+            );
         }
     }
 
@@ -499,8 +420,6 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
 
     fn on_completion(&self, sample: &CompletionSample) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
-        self.network_window
-            .add(sample.io.network_tx, sample.io.network_rx);
 
         // Throttle error: immediate transition to shedding
         if sample.error == Some(ErrorKind::Throttle) {
@@ -520,13 +439,15 @@ mod tests {
     use super::super::super::WorkKind;
     use super::super::{CompletionSample, ErrorKind};
     use super::*;
-    use crate::metrics::IoSample;
+    use crate::metrics::{IOCounters, IoSample};
+    use std::sync::Arc;
 
     struct TestController(AdaptiveConcurrencyController);
 
     impl TestController {
         fn new(config: AdaptiveConfig) -> Self {
-            Self(AdaptiveConcurrencyController::new(config))
+            let io_counters = Arc::new(IOCounters::new(config.window.duration));
+            Self(AdaptiveConcurrencyController::new(config, io_counters))
         }
 
         /// Feed a goodput measurement and run the algorithm. Returns new target.
@@ -671,9 +592,7 @@ mod tests {
     fn throttle_forces_shedding() {
         let config = AdaptiveConfig {
             window: WindowConfig {
-                duration: Duration::ZERO,
-                min_completions: 0,
-                ..AdaptiveConfig::default().window
+                duration: Duration::from_nanos(10),
             },
             ..Default::default()
         };
@@ -694,9 +613,7 @@ mod tests {
             initial_concurrency: 100,
             max_concurrency: Some(150),
             window: WindowConfig {
-                duration: Duration::ZERO,
-                min_completions: 0,
-                ..AdaptiveConfig::default().window
+                duration: Duration::from_nanos(10),
             },
             ..Default::default()
         };
@@ -705,11 +622,19 @@ mod tests {
         // Feed two windows of increasing goodput through on_completion
         // to trigger SlowStart accept and target update.
         for _ in 0..20 {
+            tc.0.io_counters.record(&IoSample {
+                network_tx: 8_000_000,
+                ..Default::default()
+            });
             tc.0.on_completion(&sample(8_000_000));
         }
-        // Force window boundary by sleeping briefly (window_duration is ZERO)
+        // Force window boundary by sleeping briefly
         std::thread::sleep(Duration::from_millis(1));
         for _ in 0..20 {
+            tc.0.io_counters.record(&IoSample {
+                network_tx: 16_000_000,
+                ..Default::default()
+            });
             tc.0.on_completion(&sample(16_000_000));
         }
 
@@ -785,35 +710,23 @@ mod tests {
     // -- Gap filtering --
 
     #[test]
-    fn gap_windows_not_recorded() {
-        // Windows with very few completions (inter-transfer gaps) should be
-        // discarded, not recorded in history.
+    fn idle_window_skips_evaluation() {
+        // When IOCounters reports idle (no completions in the window),
+        // the controller should not evaluate or record history.
         let config = AdaptiveConfig {
             window: WindowConfig {
-                duration: Duration::ZERO,
-                min_completions: 10,
-                max_duration: Duration::from_secs(5),
+                duration: Duration::from_nanos(10),
             },
             ..Default::default()
         };
-        let controller = AdaptiveConcurrencyController::new(config);
-        // Simulate a gap: only 3 completions (below min_completions=10)
-        for _ in 0..3 {
-            controller.on_dispatch();
-            controller.on_completion(&sample(1_000_000));
-        }
-        // Force window evaluation by sleeping past duration
-        std::thread::sleep(Duration::from_millis(1));
-        // One more completion to trigger maybe_update_window
+        let io_counters = Arc::new(IOCounters::new(Duration::from_secs(1)));
+        let controller = AdaptiveConcurrencyController::new(config, Arc::clone(&io_counters));
+        // Don't record any bytes — IOCounters is idle
         controller.on_dispatch();
-        controller.on_completion(&sample(1_000_000));
-        // History should be empty — gap window was discarded
+        controller.on_completion(&sample(0));
+        // History should be empty — idle window was skipped
         let state = controller.state.lock().unwrap();
-        assert_eq!(
-            state.recent_goodput.len(),
-            0,
-            "gap window was recorded in history"
-        );
+        assert_eq!(state.recent_goodput.len(), 0, "idle window was evaluated");
     }
 
     // -- History management --
