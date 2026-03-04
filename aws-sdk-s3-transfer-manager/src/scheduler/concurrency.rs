@@ -8,13 +8,13 @@ mod adaptive;
 pub(crate) use adaptive::{AdaptiveConcurrencyController, AdaptiveConfig};
 
 use std::fmt;
-use std::time::Duration;
 
 use aws_sdk_s3::error::SdkError;
 use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
 use super::WorkKind;
+use crate::metrics::IoSample;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
@@ -26,47 +26,14 @@ pub(crate) enum ErrorKind {
     Permanent,
 }
 
-/// I/O throughput metrics reported by a completed work item.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct IoMetrics {
-    /// Bytes read from disk (upload source)
-    pub bytes_read: u64,
-    /// Bytes written to disk (download sink)
-    pub bytes_written: u64,
-    /// Bytes sent over network (upload)
-    pub bytes_sent: u64,
-    /// Bytes received from network (download)
-    pub bytes_received: u64,
-}
-
-impl IoMetrics {
-    /// Metrics for a network send (upload part, put object).
-    pub fn bytes_sent(bytes_sent: u64) -> Self {
-        Self {
-            bytes_sent,
-            ..Default::default()
-        }
-    }
-
-    /// Metrics for a network receive (download range, get object).
-    pub fn bytes_received(bytes_received: u64) -> Self {
-        Self {
-            bytes_received,
-            ..Default::default()
-        }
-    }
-}
-
 /// Per-work-item completion data reported to the concurrency controller.
 ///
 /// Built by the scheduler from work outcomes. The controller uses aggregate
 /// goodput (bytes over time) to adjust the concurrency target.
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionSample {
-    /// I/O bytes transferred during this work item.
-    pub metrics: IoMetrics,
-    /// Wall-clock duration of this work item's execution.
-    pub duration: Duration,
+    /// I/O bytes and duration for this work item.
+    pub io: IoSample,
     /// Error classification, if the work item failed.
     pub error: Option<ErrorKind>,
     /// What kind of work this was (disk or network).

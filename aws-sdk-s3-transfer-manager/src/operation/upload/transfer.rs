@@ -20,13 +20,14 @@ use std::pin::Pin;
 use crate::error::{self, Error};
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::{InputStream, PartData};
+use crate::metrics::IoSample;
 use crate::operation::upload::context::UploadState;
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{IoMetrics, PollWork, Transfer, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{PollWork, Transfer, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
 
 /// Upload-specific work data.
@@ -450,7 +451,10 @@ impl UploadTransfer {
 
         WorkOutcome::Success {
             schedule_next: None,
-            metrics: Some(IoMetrics::bytes_sent(bytes_sent)),
+            metrics: Some(IoSample {
+                network_tx: bytes_sent,
+                ..Default::default()
+            }),
             data: None,
         }
     }

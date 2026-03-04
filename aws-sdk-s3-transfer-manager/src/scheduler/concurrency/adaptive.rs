@@ -500,7 +500,7 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     fn on_completion(&self, sample: &CompletionSample) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
         self.network_window
-            .add(sample.metrics.bytes_sent, sample.metrics.bytes_received);
+            .add(sample.io.network_tx, sample.io.network_rx);
 
         // Throttle error: immediate transition to shedding
         if sample.error == Some(ErrorKind::Throttle) {
@@ -518,8 +518,9 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
 #[cfg(test)]
 mod tests {
     use super::super::super::WorkKind;
-    use super::super::{CompletionSample, ErrorKind, IoMetrics};
+    use super::super::{CompletionSample, ErrorKind};
     use super::*;
+    use crate::metrics::IoSample;
 
     struct TestController(AdaptiveConcurrencyController);
 
@@ -565,11 +566,10 @@ mod tests {
 
     fn sample(bytes_sent: u64) -> CompletionSample {
         CompletionSample {
-            metrics: IoMetrics {
-                bytes_sent,
+            io: IoSample {
+                network_tx: bytes_sent,
                 ..Default::default()
             },
-            duration: Duration::from_millis(100),
             error: None,
             kind: WorkKind::Network,
         }

@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::super::concurrency::{ErrorKind, IoMetrics};
+use super::super::concurrency::ErrorKind;
+use crate::metrics::IoSample;
 use std::any::Any;
 
 /// Opaque work data carried by work items. Each state machine defines its own type.
@@ -86,7 +87,7 @@ pub(crate) enum WorkOutcome {
     Success {
         schedule_next: Option<WorkKind>,
         data: Option<Box<dyn WorkData>>,
-        metrics: Option<IoMetrics>,
+        metrics: Option<IoSample>,
     },
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed { classification: Option<ErrorKind> },

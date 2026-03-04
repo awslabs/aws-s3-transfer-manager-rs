@@ -14,6 +14,7 @@ use bytes_utils::SegmentedBuf;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
+use crate::metrics::IoSample;
 use crate::operation::download::body::ChunkOutput;
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadState, SeqWindow};
@@ -21,9 +22,7 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{ChunkSender, TransferContext};
-use crate::scheduler::{
-    IoMetrics, PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome,
-};
+use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
 use crate::types::BucketType;
 
 /// Download-specific work data.
@@ -371,7 +370,10 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
-                metrics: Some(IoMetrics::bytes_received(bytes_received)),
+                metrics: Some(IoSample {
+                    network_rx: bytes_received,
+                    ..Default::default()
+                }),
             },
             Err(_) => WorkOutcome::Cancelled,
         }
@@ -434,7 +436,10 @@ impl DownloadTransfer {
             Ok(()) => WorkOutcome::Success {
                 schedule_next: None,
                 data: None,
-                metrics: Some(IoMetrics::bytes_received(bytes_received)),
+                metrics: Some(IoSample {
+                    network_rx: bytes_received,
+                    ..Default::default()
+                }),
             },
             Err(_) => WorkOutcome::Cancelled,
         }

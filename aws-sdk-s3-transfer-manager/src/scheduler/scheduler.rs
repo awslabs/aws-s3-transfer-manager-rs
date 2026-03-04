@@ -51,9 +51,11 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{
-    BoxTransfer, CompletionSample, ConcurrencyController, IoMetrics, PollWork, TransferId,
-    WorkItem, WorkOutcome, WorkerPool,
+    BoxTransfer, CompletionSample, ConcurrencyController, PollWork, TransferId, WorkItem,
+    WorkOutcome, WorkerPool,
 };
+
+use crate::metrics::IoSample;
 
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -202,14 +204,14 @@ impl Scheduler {
         elapsed: Duration,
     ) {
         // Report to concurrency controller
-        let (io_metrics, classification) = match &outcome {
+        let (mut io_sample, classification) = match &outcome {
             WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
-            WorkOutcome::Failed { classification } => (IoMetrics::default(), *classification),
-            WorkOutcome::Cancelled => (IoMetrics::default(), None),
+            WorkOutcome::Failed { classification } => (IoSample::default(), *classification),
+            WorkOutcome::Cancelled => (IoSample::default(), None),
         };
+        io_sample.duration = elapsed;
         let sample = CompletionSample {
-            metrics: io_metrics,
-            duration: elapsed,
+            io: io_sample,
             error: classification,
             kind: work.item.kind,
         };

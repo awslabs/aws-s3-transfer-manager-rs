@@ -10,7 +10,7 @@ mod work;
 
 pub(crate) use concurrency::{
     classify_error, AdaptiveConcurrencyController, AdaptiveConfig, CompletionSample,
-    ConcurrencyController, FixedConcurrency, IoMetrics,
+    ConcurrencyController, FixedConcurrency,
 };
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{BoxTransfer, Transfer};
