@@ -298,13 +298,11 @@ mod tests {
     mod priority_vruntime {
         use super::*;
         use crate::scheduler::transfer::mock::FixedWorkCount;
-        use crate::scheduler::MockTransfer;
-        use std::sync::Arc;
 
         fn test_descriptor(id: u64) -> TransferDescriptor {
             let transfer_id = TransferId { id, parent: None };
-            let sm = Arc::new(FixedWorkCount::new(100));
-            let transfer = Box::new(MockTransfer::new(transfer_id, sm));
+            let transfer: Box<dyn crate::scheduler::Transfer> =
+                Box::new(FixedWorkCount::new(transfer_id, 100));
             TransferDescriptor::new(transfer)
         }
 

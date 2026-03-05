@@ -356,12 +356,10 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::transfer::mock::{
-        FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
-    };
+    use crate::scheduler::context::TransferContext;
+    use crate::scheduler::transfer::mock::{test_context, FixedWorkCount, WithDelay, WithExecute};
     use crate::scheduler::transfer::Transfer;
     use crate::scheduler::work::{WorkItem, WorkKind, WorkOutcome};
-    use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
@@ -378,9 +376,8 @@ mod tests {
             parent: None,
         };
 
-        let sm = Arc::new(FixedWorkCount::new(5));
-        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
-        scheduler.enqueue_transfer(transfer);
+        let sm = Arc::new(FixedWorkCount::new(id, 5));
+        scheduler.enqueue_transfer(Box::new(sm.clone()));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
@@ -405,9 +402,9 @@ mod tests {
                 id: i,
                 parent: None,
             };
-            let sm = Arc::new(FixedWorkCount::new(4));
+            let sm = Arc::new(FixedWorkCount::new(id, 4));
             state_machines.push(sm.clone());
-            scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
+            scheduler.enqueue_transfer(Box::new(sm));
         }
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -439,9 +436,8 @@ mod tests {
         };
 
         // Use a mock that returns Pending so it doesn't complete immediately
-        let sm = Arc::new(PendingForever);
-        let transfer = Box::new(MockTransfer::new(id, sm));
-        scheduler.enqueue_transfer(transfer);
+        let sm = Arc::new(PendingForever::new(id));
+        scheduler.enqueue_transfer(Box::new(sm));
 
         // Default priority is 128
         {
@@ -471,10 +467,24 @@ mod tests {
 
     /// Mock that always returns Pending (never generates work, never completes)
     #[derive(Debug)]
-    struct PendingForever;
+    struct PendingForever {
+        ctx: TransferContext,
+    }
 
-    impl MockStateMachine for PendingForever {
-        fn poll_work(&self, _id: TransferId) -> PollWork {
+    impl PendingForever {
+        fn new(id: TransferId) -> Self {
+            Self {
+                ctx: test_context(id),
+            }
+        }
+    }
+
+    impl Transfer for PendingForever {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
             PollWork::Pending
         }
 
@@ -490,13 +500,15 @@ mod tests {
     /// Can be stopped by calling `set_done()`.
     #[derive(Debug)]
     struct CountingInfinite {
+        ctx: TransferContext,
         executions: AtomicUsize,
         done: std::sync::atomic::AtomicBool,
     }
 
     impl CountingInfinite {
-        fn new() -> Self {
+        fn new(id: TransferId) -> Self {
             Self {
+                ctx: test_context(id),
                 executions: AtomicUsize::new(0),
                 done: std::sync::atomic::AtomicBool::new(false),
             }
@@ -511,8 +523,12 @@ mod tests {
         }
     }
 
-    impl MockStateMachine for CountingInfinite {
-        fn poll_work(&self, _id: TransferId) -> PollWork {
+    impl Transfer for CountingInfinite {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
             if self.done.load(Ordering::Acquire) {
                 return PollWork::Done;
             }
@@ -550,14 +566,11 @@ mod tests {
             parent: None,
         };
 
-        let high_mock = Arc::new(CountingInfinite::new());
-        let low_mock = Arc::new(CountingInfinite::new());
+        let high_mock = Arc::new(CountingInfinite::new(high_id));
+        let low_mock = Arc::new(CountingInfinite::new(low_id));
 
-        let high_transfer = Box::new(MockTransfer::new(high_id, high_mock.clone()));
-        let low_transfer = Box::new(MockTransfer::new(low_id, low_mock.clone()));
-
-        scheduler.enqueue_transfer(high_transfer);
-        scheduler.enqueue_transfer(low_transfer);
+        scheduler.enqueue_transfer(Box::new(high_mock.clone()));
+        scheduler.enqueue_transfer(Box::new(low_mock.clone()));
 
         // Set priorities: high=255, low=64 (4x difference)
         scheduler.set_priority(high_id, 255);
@@ -611,11 +624,11 @@ mod tests {
             parent: None,
         };
 
-        let a_mock = Arc::new(CountingInfinite::new());
-        let b_mock = Arc::new(CountingInfinite::new());
+        let a_mock = Arc::new(CountingInfinite::new(a_id));
+        let b_mock = Arc::new(CountingInfinite::new(b_id));
 
-        scheduler.enqueue_transfer(Box::new(MockTransfer::new(a_id, a_mock.clone())));
-        scheduler.enqueue_transfer(Box::new(MockTransfer::new(b_id, b_mock.clone())));
+        scheduler.enqueue_transfer(Box::new(a_mock.clone()));
+        scheduler.enqueue_transfer(Box::new(b_mock.clone()));
 
         // Both at default priority (128) -- let them run equally
         while a_mock.count() + b_mock.count() < 100 {
@@ -660,10 +673,8 @@ mod tests {
             id: 1,
             parent: None,
         };
-        let sm = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
-            WorkOutcome::Failed
-        }));
-        scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
+        let sm = WithExecute::new(FixedWorkCount::new(id, 1), |_| WorkOutcome::Failed);
+        scheduler.enqueue_transfer(Box::new(sm));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
@@ -686,20 +697,18 @@ mod tests {
             id: 1,
             parent: None,
         };
-        let panic_sm = Arc::new(WithExecute::new(
-            FixedWorkCount::new(1),
-            |_| -> WorkOutcome { panic!("boom") },
-        ));
-        let panic_mock = MockTransfer::new(panic_id, panic_sm);
-        let panic_ctx = panic_mock.ctx().clone();
-        scheduler.enqueue_transfer(Box::new(panic_mock));
+        let panic_sm = WithExecute::new(FixedWorkCount::new(panic_id, 1), |_| -> WorkOutcome {
+            panic!("boom")
+        });
+        let panic_ctx = panic_sm.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(panic_sm));
 
         let ok_id = TransferId {
             id: 2,
             parent: None,
         };
-        let ok_sm = Arc::new(FixedWorkCount::new(3));
-        scheduler.enqueue_transfer(Box::new(MockTransfer::new(ok_id, ok_sm.clone())));
+        let ok_sm = Arc::new(FixedWorkCount::new(ok_id, 3));
+        scheduler.enqueue_transfer(Box::new(ok_sm.clone()));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
@@ -736,10 +745,9 @@ mod tests {
         };
 
         // Use WithDelay to make work slow enough to cancel mid-flight
-        let inner = FixedWorkCount::new(20);
+        let inner = FixedWorkCount::new(id, 20);
         let sm = Arc::new(WithDelay::new(inner, Duration::from_millis(50)));
-        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
-        scheduler.enqueue_transfer(transfer);
+        scheduler.enqueue_transfer(Box::new(sm.clone()));
 
         // Let some work start
         tokio::time::sleep(Duration::from_millis(100)).await;

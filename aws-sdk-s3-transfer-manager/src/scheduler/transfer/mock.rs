@@ -14,108 +14,58 @@ use std::time::Duration;
 use crate::scheduler::context::TransferContext;
 use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
 
-/// Trait for mock state machines that drive transfer behavior.
-pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
-    fn poll_work(&self, id: TransferId) -> PollWork;
-    fn execute<'a>(
-        &'a self,
-        work: &'a mut WorkItem,
-    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
+/// Create a TransferContext for testing.
+pub(crate) fn test_context(id: TransferId) -> TransferContext {
+    use crate::DEFAULT_CONCURRENCY;
+
+    let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+    let config = crate::Config::builder().client(s3_client).build();
+    let handle = Arc::new(crate::client::Handle {
+        config,
+        scheduler: crate::scheduler::Scheduler::with_controller(Arc::new(
+            crate::scheduler::FixedConcurrency::new(DEFAULT_CONCURRENCY),
+        )),
+        legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
+            crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
+        ),
+    });
+
+    let (ctx, _completion_rx) = TransferContext::with_id(id, handle);
+    ctx
 }
 
-/// Mock transfer that wraps any [`MockStateMachine`].
-#[derive(Clone)]
-pub(crate) struct MockTransfer {
-    id: TransferId,
-    ctx: TransferContext,
-    state_machine: Arc<dyn MockStateMachine>,
-}
-
-impl std::fmt::Debug for MockTransfer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MockTransfer")
-            .field("id", &self.id)
-            .field("state_machine", &self.state_machine)
-            .finish()
-    }
-}
-
-impl MockTransfer {
-    pub(crate) fn new<S: MockStateMachine + 'static>(
-        id: TransferId,
-        state_machine: Arc<S>,
-    ) -> Self {
-        use crate::DEFAULT_CONCURRENCY;
-        use std::sync::Arc;
-
-        // Create a minimal handle for testing
-        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().client(s3_client).build();
-        let handle = Arc::new(crate::client::Handle {
-            config,
-            scheduler: crate::scheduler::Scheduler::with_controller(Arc::new(
-                crate::scheduler::FixedConcurrency::new(DEFAULT_CONCURRENCY),
-            )),
-            legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
-            ),
-        });
-
-        let (ctx, _completion_rx) = TransferContext::with_id(id, handle);
-
-        Self {
-            id,
-            ctx,
-            state_machine,
-        }
-    }
-
-    pub(crate) fn poll_work(&self) -> PollWork {
-        self.state_machine.poll_work(self.id)
-    }
-
-    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
-        let outcome = self.state_machine.execute(work).await;
-        // Mirror real transfer behavior: Failed means the transfer transitions
-        // itself to terminal state before returning.
-        if matches!(outcome, WorkOutcome::Failed) {
-            self.ctx.set_failed(crate::error::from_kind(
-                crate::error::ErrorKind::RuntimeError,
-            )("mock transfer failed"));
-            self.ctx.signal_terminal();
-        }
-        outcome
-    }
-}
-
-impl Transfer for MockTransfer {
+/// Blanket impl so `Arc<T>` can be used as `Box<dyn Transfer>` in tests
+/// while retaining shared access to the inner mock.
+impl<T: Transfer> Transfer for Arc<T> {
     fn ctx(&self) -> &TransferContext {
-        &self.ctx
+        (**self).ctx()
     }
 
     fn poll_work(&self) -> PollWork {
-        MockTransfer::poll_work(self)
+        (**self).poll_work()
     }
 
     fn execute<'a>(
         &'a self,
         work: &'a mut WorkItem,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
-        Box::pin(MockTransfer::execute(self, work))
+        (**self).execute(work)
     }
 }
 
-/// Simple state machine that generates N Network work items.
+/// Simple transfer that generates N Network work items.
 #[derive(Debug)]
 pub(crate) struct FixedWorkCount {
+    ctx: TransferContext,
     total: u64,
     generated: AtomicU64,
     completed: AtomicU64,
 }
 
 impl FixedWorkCount {
-    pub(crate) fn new(count: u64) -> Self {
+    pub(crate) fn new(id: TransferId, count: u64) -> Self {
         Self {
+            ctx: test_context(id),
             total: count,
             generated: AtomicU64::new(0),
             completed: AtomicU64::new(0),
@@ -131,8 +81,12 @@ impl FixedWorkCount {
     }
 }
 
-impl MockStateMachine for FixedWorkCount {
-    fn poll_work(&self, _id: TransferId) -> PollWork {
+impl Transfer for FixedWorkCount {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
         let gen = self.generated.fetch_add(1, Ordering::SeqCst);
         if gen >= self.total {
             return PollWork::Done;
@@ -155,14 +109,14 @@ impl MockStateMachine for FixedWorkCount {
     }
 }
 
-/// Wraps a state machine to add delay before each execution.
+/// Wraps a transfer to add delay before each execution.
 #[derive(Debug)]
 pub(crate) struct WithDelay<S> {
     inner: S,
     delay: Duration,
 }
 
-impl<S: MockStateMachine> WithDelay<S> {
+impl<S: Transfer> WithDelay<S> {
     pub(crate) fn new(inner: S, delay: Duration) -> Self {
         Self { inner, delay }
     }
@@ -172,9 +126,13 @@ impl<S: MockStateMachine> WithDelay<S> {
     }
 }
 
-impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
-    fn poll_work(&self, id: TransferId) -> PollWork {
-        self.inner.poll_work(id)
+impl<S: Transfer> Transfer for WithDelay<S> {
+    fn ctx(&self) -> &TransferContext {
+        self.inner.ctx()
+    }
+
+    fn poll_work(&self) -> PollWork {
+        self.inner.poll_work()
     }
 
     fn execute<'a>(
@@ -188,7 +146,10 @@ impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
     }
 }
 
-/// Wraps a state machine to override execute behavior with a custom function.
+/// Wraps a transfer to override execute behavior with a custom function.
+///
+/// If the execute_fn returns `WorkOutcome::Failed`, the inner transfer's context
+/// is transitioned to terminal state (mirroring real transfer behavior).
 pub(crate) struct WithExecute<S> {
     inner: S,
     execute_fn: fn(&mut WorkItem) -> WorkOutcome,
@@ -202,18 +163,19 @@ impl<S: std::fmt::Debug> std::fmt::Debug for WithExecute<S> {
     }
 }
 
-impl<S> WithExecute<S> {
+impl<S: Transfer> WithExecute<S> {
     pub(crate) fn new(inner: S, execute_fn: fn(&mut WorkItem) -> WorkOutcome) -> Self {
         Self { inner, execute_fn }
     }
 }
 
-impl<S> MockStateMachine for WithExecute<S>
-where
-    S: MockStateMachine,
-{
-    fn poll_work(&self, id: TransferId) -> PollWork {
-        self.inner.poll_work(id)
+impl<S: Transfer> Transfer for WithExecute<S> {
+    fn ctx(&self) -> &TransferContext {
+        self.inner.ctx()
+    }
+
+    fn poll_work(&self) -> PollWork {
+        self.inner.poll_work()
     }
 
     fn execute<'a>(
@@ -221,7 +183,15 @@ where
         work: &'a mut WorkItem,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         let outcome = (self.execute_fn)(work);
-        Box::pin(async move { outcome })
+        Box::pin(async move {
+            if matches!(outcome, WorkOutcome::Failed) {
+                self.inner.ctx().set_failed(crate::error::from_kind(
+                    crate::error::ErrorKind::RuntimeError,
+                )("mock transfer failed"));
+                self.inner.ctx().signal_terminal();
+            }
+            outcome
+        })
     }
 }
 
@@ -238,21 +208,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_fixed_work_count() {
-        let sm = FixedWorkCount::new(3);
-        let id = test_id();
+        let sm = FixedWorkCount::new(test_id(), 3);
 
         for _ in 0..3 {
-            assert!(matches!(sm.poll_work(id), PollWork::Ready(_)));
+            assert!(matches!(sm.poll_work(), PollWork::Ready(_)));
         }
-        assert!(matches!(sm.poll_work(id), PollWork::Done));
+        assert!(matches!(sm.poll_work(), PollWork::Done));
     }
 
     #[tokio::test]
     async fn test_with_delay() {
-        let sm = WithDelay::new(FixedWorkCount::new(1), Duration::from_millis(50));
-        let id = test_id();
+        let sm = WithDelay::new(FixedWorkCount::new(test_id(), 1), Duration::from_millis(50));
 
-        let mut work = match sm.poll_work(id) {
+        let mut work = match sm.poll_work() {
             PollWork::Ready(w) => w,
             _ => panic!("expected Ready"),
         };

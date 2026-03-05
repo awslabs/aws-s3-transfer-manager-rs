@@ -50,6 +50,3 @@ pub(crate) mod mock;
 
 #[cfg(test)]
 pub(crate) mod test_util;
-
-#[cfg(test)]
-pub(crate) use mock::MockTransfer;
