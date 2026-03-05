@@ -24,6 +24,7 @@ pub(crate) struct FixedConcurrency(usize);
 
 impl FixedConcurrency {
     pub(crate) fn new(target: usize) -> Self {
+        assert!(target > 0, "concurrency target must be at least 1");
         Self(target)
     }
 }

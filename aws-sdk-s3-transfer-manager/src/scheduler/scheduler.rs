@@ -50,9 +50,7 @@
 //! - **Pending/wake obligation**: every `Pending` must have a future wake path.
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
-use super::{
-    BoxTransfer, ConcurrencyController, PollWork, TransferId, WorkItem, WorkOutcome, WorkerPool,
-};
+use super::{BoxTransfer, ConcurrencyController, PollWork, TransferId, WorkOutcome, WorkerPool};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
 use crate::scheduler::work::ScheduledWork;
@@ -203,13 +201,9 @@ impl Scheduler {
         }
 
         // handle any follow-on work
-        if let WorkOutcome::Success {
-            schedule_next: Some(kind),
-            data,
-        } = outcome
-        {
+        if let WorkOutcome::Success(Some(follow_on)) = outcome {
             let next = ScheduledWork {
-                item: WorkItem { kind, data },
+                item: follow_on,
                 descriptor: desc.clone(),
             };
             self.enqueue_to_pool(next);
@@ -366,7 +360,7 @@ mod tests {
         FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
     };
     use crate::scheduler::transfer::Transfer;
-    use crate::scheduler::work::{WorkKind, WorkOutcome};
+    use crate::scheduler::work::{WorkItem, WorkKind, WorkOutcome};
     use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
@@ -538,10 +532,7 @@ mod tests {
                 tokio::task::yield_now().await;
                 // No schedule_next -- let generate_work() pull from ready set
                 // where CFS priority ordering applies
-                WorkOutcome::Success {
-                    schedule_next: None,
-                    data: None,
-                }
+                WorkOutcome::Success(None)
             })
         }
     }

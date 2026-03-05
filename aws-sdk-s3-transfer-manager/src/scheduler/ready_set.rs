@@ -84,10 +84,11 @@ impl ReadySet {
 
     /// Add a transfer to the ready set.
     ///
-    /// INVARIANT: Callers must ensure a transfer is not inserted twice. This happens
-    /// naturally if: (1) `poll_work()` returning `Ready` is immediately followed by
-    /// re-insert, and (2) `wake()` is only called when the transfer returned `Pending`.
-    /// Violating this invariant causes duplicate polling.
+    /// INVARIANT: Callers must ensure a transfer is not inserted twice. Duplicate
+    /// insertion causes the same transfer to be polled multiple times per scheduling
+    /// round, generating more work than intended and skewing CFS fairness (the
+    /// transfer accumulates vruntime once per poll, so duplicates get double the
+    /// scheduling share).
     pub(super) fn insert(&self, descriptor: TransferDescriptor) {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());

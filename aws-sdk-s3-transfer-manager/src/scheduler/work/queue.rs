@@ -30,6 +30,8 @@ impl WorkQueue {
         self.pending.pop_front()
     }
 
+    /// Record that a dequeued item is now executing. Separate from `pop` because
+    /// work may be staged (batched, routed) between dequeue and execution.
     pub(super) fn mark_in_flight(&mut self) {
         self.in_flight += 1;
     }

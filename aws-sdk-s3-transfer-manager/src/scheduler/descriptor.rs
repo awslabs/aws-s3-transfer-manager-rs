@@ -146,6 +146,11 @@ impl TransferDescriptor {
 
 /// Packed atomic counter for queued + executing counts.
 /// Layout: `[queued: u32][executing: u32]`
+///
+/// Packed into a single AtomicU64 so transitions (queued-to-executing, read both)
+/// are a single atomic operation. Two separate AtomicU32s would require two loads
+/// to read both counts, with a possible inconsistent snapshot between them, and
+/// two CAS operations for the queued-to-executing transition.
 #[derive(Debug, Default)]
 struct QueuedExecuting(AtomicU64);
 

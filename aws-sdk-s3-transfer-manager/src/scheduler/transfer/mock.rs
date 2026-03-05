@@ -150,10 +150,7 @@ impl MockStateMachine for FixedWorkCount {
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
             self.completed.fetch_add(1, Ordering::SeqCst);
-            WorkOutcome::Success {
-                schedule_next: None,
-                data: None,
-            }
+            WorkOutcome::Success(None)
         })
     }
 }

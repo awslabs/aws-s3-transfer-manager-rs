@@ -81,11 +81,9 @@ pub(crate) enum PollWork {
 /// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
 ///   Same cleanup as `Failed`.
 pub(crate) enum WorkOutcome {
-    /// Work completed successfully. Optionally schedule follow-on work.
-    Success {
-        schedule_next: Option<WorkKind>,
-        data: Option<Box<dyn WorkData>>,
-    },
+    /// Work completed successfully. Contains follow-on work item if the logical
+    /// operation has another phase (e.g. disk read completed, now send over network).
+    Success(Option<WorkItem>),
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed,
     /// Work was skipped or aborted because the transfer is already terminal.
@@ -95,13 +93,9 @@ pub(crate) enum WorkOutcome {
 impl std::fmt::Debug for WorkOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorkOutcome::Success {
-                schedule_next,
-                data,
-            } => f
+            WorkOutcome::Success(follow_on) => f
                 .debug_struct("Success")
-                .field("schedule_next", schedule_next)
-                .field("data", data)
+                .field("follow_on", follow_on)
                 .finish(),
             WorkOutcome::Failed => write!(f, "Failed"),
             WorkOutcome::Cancelled => write!(f, "Cancelled"),
