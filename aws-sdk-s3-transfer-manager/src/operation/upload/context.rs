@@ -3,46 +3,44 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::operation::upload::UploadInput;
-use crate::operation::TransferContext;
-use crate::types::BucketType;
-use std::ops::Deref;
+use aws_sdk_s3::types::CompletedPart;
 use std::sync::Arc;
 
-pub(crate) type UploadContext = TransferContext<UploadState>;
+use crate::io::part_reader::PartReader;
+use crate::io::InputStream;
+use crate::operation::upload::UploadOutputBuilder;
 
-impl UploadContext {
-    pub(crate) fn new(
-        handle: Arc<crate::client::Handle>,
-        bucket_type: BucketType,
-        req: UploadInput,
-    ) -> Self {
-        let state = Arc::new(UploadState {
-            request: Arc::new(req),
-            bucket_type,
-        });
-        TransferContext { handle, state }
-    }
-}
-
-/// Internal context used to drive a single Upload operation
-#[derive(Debug, Clone)]
-pub(crate) struct UploadState {
-    /// the original request (NOTE: the body will have been taken for processing, only the other fields remain)
-    pub(crate) request: Arc<UploadInput>,
-
-    /// Type of S3 bucket targeted by this operation
-    pub(crate) bucket_type: BucketType,
-}
-
-impl UploadState {
-    /// The original request (sans the body as it will have been taken for processing)
-    pub(crate) fn request(&self) -> &UploadInput {
-        self.request.deref()
-    }
-
-    /// Type of S3 bucket targeted by this operation
-    pub(crate) fn bucket_type(&self) -> BucketType {
-        self.bucket_type
-    }
+/// State machine for tracking upload work progress.
+///
+/// Represents the current phase of an upload operation.
+#[derive(Debug)]
+pub(crate) enum UploadState {
+    /// Waiting to start - need to call CreateMPU (or PutObject for small uploads)
+    PendingInit {
+        stream: InputStream,
+        content_length: u64,
+        init_in_flight: bool,
+    },
+    /// Data transfer in progress (uploading parts for MPU)
+    Transferring {
+        upload_id: String,
+        part_reader: Arc<PartReader>,
+        next_part: u64,
+        total_parts: u64,
+        parts_in_flight: usize,
+        completed_parts: Vec<CompletedPart>,
+        response_builder: UploadOutputBuilder,
+    },
+    /// All parts done, calling CompleteMPU (MPU only)
+    Completing {
+        upload_id: String,
+        part_reader: Arc<PartReader>,
+        completed_parts: Vec<CompletedPart>,
+        response_builder: UploadOutputBuilder,
+        complete_in_flight: bool,
+    },
+    /// PutObject in flight (single request upload)
+    PutObjectInFlight,
+    /// Done
+    Done,
 }
