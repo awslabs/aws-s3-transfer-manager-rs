@@ -65,18 +65,15 @@ impl Upload {
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
         // Create transfer context - completion_rx signals terminal state
-        let (ctx, _completion_rx) = TransferContext::new(handle.clone());
+        let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        // Result channel for upload output
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-
-        let transfer = UploadTransfer::new(ctx, bucket_type, input, stream, result_tx);
+        let transfer = UploadTransfer::new(ctx, bucket_type, input, stream);
 
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
 
-        Ok(UploadHandle::new(result_rx, transfer))
+        Ok(UploadHandle::new(completion_rx, transfer))
     }
 }
 

@@ -11,13 +11,12 @@ use std::sync::{Arc, Mutex};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Buf;
-use tokio::sync::oneshot;
 use tracing::Instrument;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::error::{self, Error};
+use crate::error::Error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::UploadState;
@@ -45,9 +44,6 @@ pub(crate) enum UploadWork {
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
-pub(crate) type UploadResultSender = oneshot::Sender<Result<UploadOutput, Error>>;
-pub(crate) type UploadResultReceiver = oneshot::Receiver<Result<UploadOutput, Error>>;
-
 /// Upload transfer that generates and executes upload work.
 ///
 /// Cheap to clone - all state is behind `Arc`.
@@ -70,8 +66,8 @@ struct UploadTransferInner {
     bucket_type: BucketType,
     /// Notified when CreateMPU completes (success or failure)
     create_mpu_complete: tokio::sync::Notify,
-    /// Channel to send result to handle
-    result_tx: Mutex<Option<UploadResultSender>>,
+    /// Upload result, stored on successful completion. Read by join().
+    result: Mutex<Option<UploadOutput>>,
 }
 
 impl UploadTransfer {
@@ -80,7 +76,6 @@ impl UploadTransfer {
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
-        result_tx: UploadResultSender,
     ) -> Self {
         // TODO: For unknown content length (streaming uploads), this will need adjustment.
         let content_length = stream
@@ -98,7 +93,7 @@ impl UploadTransfer {
             request: Arc::new(request),
             bucket_type,
             create_mpu_complete: tokio::sync::Notify::new(),
-            result_tx: Mutex::new(Some(result_tx)),
+            result: Mutex::new(None),
         });
 
         Self { inner }
@@ -113,6 +108,11 @@ impl UploadTransfer {
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
         &self.inner.request
+    }
+
+    /// Take the upload result. Available after successful completion.
+    pub(crate) fn take_result(&self) -> Option<UploadOutput> {
+        self.inner.result.lock().unwrap().take()
     }
 
     /// Get the upload_id if MPU was started.
@@ -510,12 +510,9 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
+        *self.inner.result.lock().unwrap() = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
-
-        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
-            let _ = tx.send(Ok(result));
-        }
 
         WorkOutcome::Success(None)
     }
@@ -570,29 +567,16 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
+        *self.inner.result.lock().unwrap() = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
-
-        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
-            let _ = tx.send(Ok(result));
-        }
 
         WorkOutcome::Success(None)
     }
 
-    fn fail(&self, _error: Error) -> WorkOutcome {
-        self.inner.ctx.set_failed(error::Error::new(
-            error::ErrorKind::RuntimeError,
-            "upload failed",
-        ));
+    fn fail(&self, error: Error) -> WorkOutcome {
+        self.inner.ctx.set_failed(error);
         self.inner.ctx.signal_terminal();
-
-        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
-            let _ = tx.send(Err(error::Error::new(
-                error::ErrorKind::RuntimeError,
-                "upload failed",
-            )));
-        }
         WorkOutcome::Failed
     }
 }
@@ -626,10 +610,7 @@ mod tests {
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
-    fn create_test_transfer(
-        s3_client: aws_sdk_s3::Client,
-        content: Vec<u8>,
-    ) -> (UploadTransfer, UploadResultReceiver) {
+    fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
         let handle = Arc::new(crate::client::Handle {
             config: crate::Config::builder().client(s3_client).build(),
             scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
@@ -645,11 +626,9 @@ mod tests {
             .unwrap();
 
         let stream = InputStream::from(content);
-        let (result_tx, result_rx) = oneshot::channel();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream, result_tx);
-        (transfer, result_rx)
+        UploadTransfer::new(ctx, BucketType::Standard, input, stream)
     }
 
     fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
@@ -679,7 +658,7 @@ mod tests {
     fn test_poll_work_initial_state_returns_create_mpu() {
         let s3_client = mock_client!(aws_sdk_s3, []);
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<UploadWork>();
@@ -690,7 +669,7 @@ mod tests {
     fn test_poll_work_pending_while_init_in_flight() {
         let s3_client = mock_client!(aws_sdk_s3, []);
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let _work = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
@@ -700,7 +679,7 @@ mod tests {
     async fn test_poll_work_generates_parts_after_create_mpu() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
@@ -726,7 +705,7 @@ mod tests {
     async fn test_execute_create_mpu_transitions_to_transferring() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut work = assert_ready(transfer.poll_work());
 
@@ -742,7 +721,7 @@ mod tests {
     async fn test_execute_read_part_returns_schedule_next_network() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut create_work = assert_ready(transfer.poll_work());
         transfer.execute(&mut create_work).await;
@@ -776,7 +755,7 @@ mod tests {
     async fn test_execute_full_mpu_flow() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         // 1. CreateMPU
         let mut work = assert_ready(transfer.poll_work());
@@ -821,7 +800,6 @@ mod tests {
         assert_done(transfer.poll_work());
 
         // 6. Result should be available
-        let result = rx.await.expect("result channel");
-        assert!(result.is_ok());
+        assert!(transfer.take_result().is_some());
     }
 }
