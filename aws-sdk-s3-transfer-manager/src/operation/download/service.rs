@@ -154,7 +154,7 @@ pub(super) fn chunk_service(
        + Clone
        + Send {
     let svc = service_fn(download_chunk_handler);
-    let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
+    let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.legacy_scheduler.clone());
 
     ServiceBuilder::new()
         .layer(concurrency_limit)

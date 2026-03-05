@@ -109,7 +109,7 @@ pub(super) fn upload_part_service(
        + Clone
        + Send {
     let svc = service_fn(upload_part_handler);
-    let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.scheduler.clone());
+    let concurrency_limit = ConcurrencyLimitLayer::new(ctx.handle.legacy_scheduler.clone());
 
     let svc = ServiceBuilder::new()
         .layer(concurrency_limit)
@@ -239,7 +239,12 @@ mod tests {
             ctx: UploadContext {
                 handle: Arc::new(Handle {
                     config: Config::builder().client(s3_client).build(),
-                    scheduler: Scheduler::new(ConcurrencyMode::Explicit(1)),
+                    scheduler: crate::scheduler::Scheduler::with_controller(Arc::new(
+                        crate::scheduler::FixedConcurrency::new(1),
+                    )),
+                    legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
+                        ConcurrencyMode::Explicit(1),
+                    ),
                 }),
                 state: Arc::new(UploadState {
                     request: Arc::new(

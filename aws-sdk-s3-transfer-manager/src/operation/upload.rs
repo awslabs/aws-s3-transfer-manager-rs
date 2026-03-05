@@ -117,7 +117,7 @@ async fn put_object(
 
     let _permit = ctx
         .handle
-        .scheduler
+        .legacy_scheduler
         .acquire_permit(PermitType::Network(NetworkPermitContext {
             payload_size_estimate: content_length as u64,
             bucket_type: ctx.state.bucket_type(),
