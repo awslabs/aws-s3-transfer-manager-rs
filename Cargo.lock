@@ -288,6 +288,8 @@ dependencies = [
  "md5",
  "path-clean",
  "pin-project-lite",
+ "serde",
+ "serde_json",
  "tempfile",
  "test-common",
  "tokio",

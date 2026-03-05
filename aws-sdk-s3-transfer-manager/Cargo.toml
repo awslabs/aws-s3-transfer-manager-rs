@@ -54,6 +54,8 @@ test-common = { path = "./test-common" }
 tokio-test = "0.4.4"
 tower-test = "0.4.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 jemallocator = "0.5.4"

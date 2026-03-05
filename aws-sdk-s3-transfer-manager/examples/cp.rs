@@ -3,16 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time;
+use std::time::{self, SystemTime};
 
-use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_smithy_types::date_time::{DateTime, Format};
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use tokio::fs;
@@ -27,6 +27,13 @@ use jemallocator::Jemalloc;
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
 
 #[derive(Debug, Clone, clap::Parser)]
 #[command(name = "cp")]
@@ -54,6 +61,14 @@ pub struct Args {
     /// Command is performed on all files or objects under the specified directory or prefix
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     recursive: bool,
+
+    /// Number of iterations to run (reuses TM client across iterations)
+    #[arg(long, default_value_t = 1)]
+    iterations: u32,
+
+    /// Output format
+    #[arg(long, default_value = "text")]
+    output: OutputFormat,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -138,21 +153,61 @@ impl S3Uri {
     }
 }
 
+#[derive(serde::Serialize)]
+struct IterationResult {
+    iteration: u32,
+    start: String,
+    end: String,
+    duration_secs: f64,
+    bytes_transferred: u64,
+    throughput_gbps: f64,
+}
+
 fn invalid_arg(message: &str) -> ! {
     Args::command()
         .error(clap::error::ErrorKind::InvalidValue, message)
         .exit()
 }
 
+async fn do_single_download(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    key: &str,
+    dest: &Path,
+) -> Result<u64, BoxError> {
+    let is_dev_null = dest == Path::new("/dev/null");
+
+    if !is_dev_null {
+        println!("dest file opened, starting download");
+    }
+
+    // TODO(aws-sdk-rust#1159) - rewrite this less naively,
+    //      likely abstract this into performant utils for single file download. Higher level
+    //      TM will handle it's own thread pool for filesystem work
+    let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
+
+    if is_dev_null {
+        drain_body(handle.body_mut()).await?;
+    } else {
+        let dest_file = fs::File::create(dest).await?;
+        write_body(handle.body_mut(), dest_file)
+            .instrument(tracing::debug_span!("write-output"))
+            .await?;
+    }
+
+    let obj_size_bytes = handle.object_meta().await?.content_length();
+    handle.join().await?;
+    Ok(obj_size_bytes as u64)
+}
+
 async fn do_recursive_download(
-    args: Args,
-    tm: aws_sdk_s3_transfer_manager::Client,
-) -> Result<(), BoxError> {
-    let (bucket, key_prefix) = args.source.expect_s3().parts();
-    let dest = args.dest.expect_local();
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    key_prefix: &str,
+    dest: &Path,
+) -> Result<u64, BoxError> {
     fs::create_dir_all(dest).await?;
 
-    let start = time::Instant::now();
     let handle = tm
         .download_objects()
         .bucket(bucket)
@@ -164,124 +219,23 @@ async fn do_recursive_download(
     let output = handle.join().await?;
     tracing::info!("download output: {output:?}");
 
-    let elapsed = start.elapsed();
     let transfer_size_bytes = output.total_bytes_transferred();
-    let throughput = Throughput::new(transfer_size_bytes, elapsed);
-
     println!(
-        "downloaded {} objects totalling {transfer_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
+        "downloaded {} objects totalling {transfer_size_bytes} bytes ({})",
         output.objects_downloaded(),
         ByteUnit::display(transfer_size_bytes)
     );
-    Ok(())
+    Ok(transfer_size_bytes)
 }
 
-async fn do_download(args: Args) -> Result<(), BoxError> {
-    let (bucket, _) = args.source.expect_s3().parts();
-
-    let tm_config = aws_sdk_s3_transfer_manager::from_env()
-        .concurrency(args.concurrency.mode())
-        .part_size(PartSize::Target(args.part_size))
-        .load()
-        .await;
-
-    warmup(&tm_config, bucket).await?;
-
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    if args.recursive {
-        return do_recursive_download(args, tm).await;
-    }
-
-    let (bucket, key) = args.source.expect_s3().parts();
-    let dest = fs::File::create(args.dest.expect_local()).await?;
-    println!("dest file opened, starting download");
-
-    let start = time::Instant::now();
-
-    // TODO(aws-sdk-rust#1159) - rewrite this less naively,
-    //      likely abstract this into performant utils for single file download. Higher level
-    //      TM will handle it's own thread pool for filesystem work
-    let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
-
-    let write_result = write_body(handle.body_mut(), dest)
-        .instrument(tracing::debug_span!("write-output"))
-        .await;
-
-    println!("write result: {:?}", write_result);
-
-    let elapsed = start.elapsed();
-    let obj_size_bytes = handle.object_meta().await?.content_length();
-
-    println!("joining handle");
-    handle.join().await?;
-    let throughput = Throughput::new(obj_size_bytes, elapsed);
-
-    println!(
-        "downloaded {obj_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
-        ByteUnit::display(obj_size_bytes)
-    );
-
-    Ok(())
-}
-
-async fn do_recursive_upload(
-    args: Args,
-    tm: aws_sdk_s3_transfer_manager::Client,
-) -> Result<(), BoxError> {
-    let Args { source, dest, .. } = args;
-    let source_dir = source.expect_local();
-    let (bucket, key_prefix) = dest.expect_s3().parts();
-
-    let start = time::Instant::now();
-    let handle = tm
-        .upload_objects()
-        .source(source_dir)
-        .bucket(bucket)
-        .key_prefix(key_prefix)
-        .recursive(true)
-        .send()
-        .await?;
-
-    let output = handle.join().await?;
-    tracing::info!("recursive upload output: {output:?}");
-
-    let elapsed = start.elapsed();
-    let transfer_size_bytes = output.total_bytes_transferred();
-    let throughput = Throughput::new(transfer_size_bytes, elapsed);
-
-    println!(
-        "uploaded {} objects totalling {transfer_size_bytes} bytes ({}) in {elapsed:?}; {throughput}",
-        output.objects_uploaded(),
-        ByteUnit::display(transfer_size_bytes)
-    );
-    Ok(())
-}
-
-async fn do_upload(args: Args) -> Result<(), BoxError> {
-    let (bucket, key) = args.dest.expect_s3().parts();
-
-    let tm_config = aws_sdk_s3_transfer_manager::from_env()
-        .concurrency(args.concurrency.mode())
-        .part_size(PartSize::Target(args.part_size))
-        .load()
-        .await;
-
-    warmup(&tm_config, bucket).await?;
-
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    if args.recursive {
-        return do_recursive_upload(args, tm).await;
-    }
-
-    let path = args.source.expect_local();
-    let file_meta = fs::metadata(path).await.expect("file metadata");
-
-    let stream = InputStream::from_path(path)?;
-
-    println!("starting upload");
-    let start = time::Instant::now();
+async fn do_single_upload(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    key: &str,
+    source: &Path,
+) -> Result<u64, BoxError> {
+    let file_meta = fs::metadata(source).await.expect("file metadata");
+    let stream = InputStream::from_path(source)?;
 
     let handle = tm
         .upload()
@@ -291,22 +245,39 @@ async fn do_upload(args: Args) -> Result<(), BoxError> {
         .initiate()?;
 
     let _resp = handle.join().await?;
-    let elapsed = start.elapsed();
+    Ok(file_meta.len())
+}
 
-    let obj_size_bytes = file_meta.len();
-    let obj_size_mebibytes = ByteUnit::Mebibyte.convert(obj_size_bytes);
-    let throughput = Throughput::new(obj_size_bytes, elapsed);
+async fn do_recursive_upload(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    key_prefix: &str,
+    source: &Path,
+) -> Result<u64, BoxError> {
+    let handle = tm
+        .upload_objects()
+        .source(source)
+        .bucket(bucket)
+        .key_prefix(key_prefix)
+        .recursive(true)
+        .send()
+        .await?;
 
+    let output = handle.join().await?;
+    tracing::info!("recursive upload output: {output:?}");
+
+    let transfer_size_bytes = output.total_bytes_transferred();
     println!(
-        "uploaded {obj_size_bytes} bytes ({obj_size_mebibytes} MiB) in {elapsed:?}; {throughput}"
+        "uploaded {} objects totalling {transfer_size_bytes} bytes ({})",
+        output.objects_uploaded(),
+        ByteUnit::display(transfer_size_bytes)
     );
-
-    Ok(())
+    Ok(transfer_size_bytes)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let args = dbg!(Args::parse());
+    let args = Args::parse();
     if args.tokio_console {
         console_subscriber::init();
     } else {
@@ -318,18 +289,91 @@ async fn main() -> Result<(), BoxError> {
 
     tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
 
+    // Validate direction early
     use TransferUri::*;
-    let result = match (&args.source, &args.dest) {
-        (Local(_), S3(_)) => do_upload(args).await,
+    let is_download = match (&args.source, &args.dest) {
+        (Local(_), S3(_)) => false,
+        (S3(_), Local(_)) => true,
         (Local(_), Local(_)) => invalid_arg("local to local transfer not supported"),
-        (S3(_), Local(_)) => do_download(args).await,
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
     };
 
-    if let Err(ref err) = result {
-        tracing::error!("transfer failed: {}", DisplayErrorContext(err.as_ref()));
+    let tm_config = aws_sdk_s3_transfer_manager::from_env()
+        .concurrency(args.concurrency.mode())
+        .part_size(PartSize::Target(args.part_size))
+        .load()
+        .await;
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+
+    let json_output = matches!(args.output, OutputFormat::Json);
+
+    let mut iteration_results = Vec::new();
+    for i in 1..=args.iterations {
+        let start = SystemTime::now();
+        let wall_start = time::Instant::now();
+
+        let bytes = if is_download {
+            let (bucket, key) = args.source.expect_s3().parts();
+            let dest = args.dest.expect_local();
+            if args.recursive {
+                do_recursive_download(&tm, bucket, key, dest).await?
+            } else {
+                do_single_download(&tm, bucket, key, dest).await?
+            }
+        } else {
+            let (bucket, key) = args.dest.expect_s3().parts();
+            let source = args.source.expect_local();
+            if args.recursive {
+                do_recursive_upload(&tm, bucket, key, source).await?
+            } else {
+                do_single_upload(&tm, bucket, key, source).await?
+            }
+        };
+
+        let elapsed = wall_start.elapsed();
+        let end = SystemTime::now();
+        let duration_secs = elapsed.as_secs_f64();
+        let throughput_gbps = (bytes as f64 * 8.0) / (duration_secs * 1_000_000_000.0);
+
+        if !json_output {
+            let throughput = Throughput::new(bytes, elapsed);
+            println!(
+                "iteration {i}/{}: {} ({}) {throughput} in {elapsed:?}",
+                args.iterations,
+                bytes,
+                ByteUnit::display(bytes),
+            );
+        }
+
+        iteration_results.push(IterationResult {
+            iteration: i,
+            start: format_time(start),
+            end: format_time(end),
+            duration_secs,
+            bytes_transferred: bytes,
+            throughput_gbps,
+        });
+
+        // Clean up dest file between download iterations (not needed for /dev/null or uploads)
+        if is_download && !args.recursive && i < args.iterations {
+            let dest = args.dest.expect_local();
+            if dest != Path::new("/dev/null") {
+                let _ = fs::remove_file(dest).await;
+            }
+        }
     }
 
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&iteration_results)?);
+    }
+
+    Ok(())
+}
+
+async fn drain_body(body: &mut Body) -> Result<(), BoxError> {
+    while let Some(chunk) = body.next().await {
+        let _chunk = chunk?;
+    }
     Ok(())
 }
 
@@ -348,26 +392,8 @@ async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError>
     Ok(())
 }
 
-async fn warmup(
-    config: &aws_sdk_s3_transfer_manager::Config,
-    bucket: &str,
-) -> Result<(), BoxError> {
-    println!("warming up client...");
-    let s3 = config.client();
-
-    let mut handles = Vec::new();
-    for _ in 0..16 {
-        let s3 = s3.clone();
-        let bucket = bucket.to_owned();
-        let warmup_task = async move { s3.head_bucket().bucket(bucket).send().await };
-        let handle = tokio::spawn(warmup_task);
-        handles.push(handle);
-    }
-
-    for h in handles {
-        let _ = h.await?;
-    }
-
-    println!("warming up complete");
-    Ok(())
+fn format_time(time: SystemTime) -> String {
+    DateTime::from(time)
+        .fmt(Format::DateTime)
+        .expect("valid time")
 }
