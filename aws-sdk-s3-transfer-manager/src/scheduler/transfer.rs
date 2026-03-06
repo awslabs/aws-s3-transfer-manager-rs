@@ -10,7 +10,7 @@ use std::pin::Pin;
 
 use super::{PollWork, WorkOutcome};
 use crate::operation::TransferContext;
-use crate::scheduler::WorkItem;
+use crate::scheduler::IoRequest;
 
 /// A transfer operation that generates and executes work.
 pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
@@ -18,7 +18,7 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
     fn poll_work(&self) -> PollWork;
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
 }
 

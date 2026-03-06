@@ -14,7 +14,7 @@ pub(crate) use concurrency::{
 };
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{BoxTransfer, Transfer};
-pub(crate) use work::{PollWork, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool};
+pub(crate) use work::{IoKind, IoRequest, PollWork, TransferId, WorkOutcome, WorkerPool};
 
 mod descriptor;
 mod ready_set;

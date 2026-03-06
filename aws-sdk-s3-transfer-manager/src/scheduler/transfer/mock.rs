@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
 
 /// Trait for mock state machines that drive transfer behavior.
 pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
     fn poll_work(&self, id: TransferId) -> PollWork;
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
 }
 
@@ -69,7 +69,7 @@ impl MockTransfer {
         self.state_machine.poll_work(self.id)
     }
 
-    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
+    pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let outcome = self.state_machine.execute(work).await;
         // Mirror real transfer behavior: Failed means the transfer transitions
         // itself to terminal state before returning.
@@ -94,7 +94,7 @@ impl Transfer for MockTransfer {
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(MockTransfer::execute(self, work))
     }
@@ -133,15 +133,15 @@ impl MockStateMachine for FixedWorkCount {
             return PollWork::Done;
         }
 
-        PollWork::Ready(WorkItem {
-            kind: WorkKind::Network,
+        PollWork::Ready(IoRequest {
+            kind: IoKind::Network,
             data: None,
         })
     }
 
     fn execute<'a>(
         &'a self,
-        _work: &'a mut WorkItem,
+        _work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
             self.completed.fetch_add(1, Ordering::SeqCst);
@@ -178,7 +178,7 @@ impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
@@ -190,7 +190,7 @@ impl<S: MockStateMachine> MockStateMachine for WithDelay<S> {
 /// Wraps a state machine to override execute behavior with a custom function.
 pub(crate) struct WithExecute<S> {
     inner: S,
-    execute_fn: fn(&mut WorkItem) -> WorkOutcome,
+    execute_fn: fn(&mut IoRequest) -> WorkOutcome,
 }
 
 impl<S: std::fmt::Debug> std::fmt::Debug for WithExecute<S> {
@@ -202,7 +202,7 @@ impl<S: std::fmt::Debug> std::fmt::Debug for WithExecute<S> {
 }
 
 impl<S> WithExecute<S> {
-    pub(crate) fn new(inner: S, execute_fn: fn(&mut WorkItem) -> WorkOutcome) -> Self {
+    pub(crate) fn new(inner: S, execute_fn: fn(&mut IoRequest) -> WorkOutcome) -> Self {
         Self { inner, execute_fn }
     }
 }
@@ -217,7 +217,7 @@ where
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         let outcome = (self.execute_fn)(work);
         Box::pin(async move { outcome })

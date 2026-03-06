@@ -51,7 +51,7 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{
-    BoxTransfer, CompletionSample, ConcurrencyController, PollWork, TransferId, WorkItem,
+    BoxTransfer, CompletionSample, ConcurrencyController, IoRequest, PollWork, TransferId,
     WorkOutcome, WorkerPool,
 };
 
@@ -248,7 +248,7 @@ impl Scheduler {
         } = outcome
         {
             let next = ScheduledWork {
-                item: WorkItem { kind, data },
+                item: IoRequest { kind, data },
                 descriptor: desc.clone(),
             };
             self.enqueue_to_pool(next);
@@ -434,7 +434,7 @@ mod tests {
         FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
     };
     use crate::scheduler::transfer::Transfer;
-    use crate::scheduler::work::{WorkKind, WorkOutcome};
+    use crate::scheduler::work::{IoKind, WorkOutcome};
     use crate::scheduler::MockTransfer;
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
@@ -554,7 +554,7 @@ mod tests {
 
         fn execute<'a>(
             &'a self,
-            _work: &'a mut WorkItem,
+            _work: &'a mut IoRequest,
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async { unreachable!("PendingForever never generates work") })
         }
@@ -590,15 +590,15 @@ mod tests {
             if self.done.load(Ordering::Acquire) {
                 return PollWork::Done;
             }
-            PollWork::Ready(WorkItem {
-                kind: WorkKind::Network,
+            PollWork::Ready(IoRequest {
+                kind: IoKind::Network,
                 data: None,
             })
         }
 
         fn execute<'a>(
             &'a self,
-            _work: &'a mut WorkItem,
+            _work: &'a mut IoRequest,
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.executions.fetch_add(1, Ordering::Relaxed);

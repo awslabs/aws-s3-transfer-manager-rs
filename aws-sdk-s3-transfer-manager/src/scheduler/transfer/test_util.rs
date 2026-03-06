@@ -5,10 +5,10 @@
 
 //! Shared test utilities for transfer state machine tests.
 
-use crate::scheduler::{PollWork, WorkItem};
+use crate::scheduler::{IoRequest, PollWork};
 
 /// Assert poll returns Ready and extract the work item.
-pub(crate) fn assert_ready(poll: PollWork) -> WorkItem {
+pub(crate) fn assert_ready(poll: PollWork) -> IoRequest {
     match poll {
         PollWork::Ready(w) => w,
         PollWork::Pending => panic!("expected Ready, got Pending"),

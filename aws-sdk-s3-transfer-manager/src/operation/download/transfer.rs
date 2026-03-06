@@ -22,7 +22,7 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{ChunkSender, TransferContext};
-use crate::scheduler::{PollWork, Transfer, TransferId, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
 use crate::types::BucketType;
 
 /// Download-specific work data.
@@ -170,8 +170,8 @@ impl DownloadTransfer {
             DownloadState::PendingDiscovery { chunk_tx } => {
                 let chunk_tx_clone = chunk_tx.clone();
                 *state = DownloadState::DiscoveryInFlight {};
-                PollWork::Ready(WorkItem {
-                    kind: WorkKind::Network,
+                PollWork::Ready(IoRequest {
+                    kind: IoKind::Network,
                     data: Some(Box::new(DownloadWork::Discovery {
                         chunk_tx: chunk_tx_clone,
                     })),
@@ -207,8 +207,8 @@ impl DownloadTransfer {
 
                     *ranges_in_flight += 1;
 
-                    PollWork::Ready(WorkItem {
-                        kind: WorkKind::Network,
+                    PollWork::Ready(IoRequest {
+                        kind: IoKind::Network,
                         data: Some(Box::new(DownloadWork::GetObjectRange {
                             range: chunk_range,
                             seq,
@@ -231,7 +231,7 @@ impl DownloadTransfer {
     }
 
     #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = ?work.data))]
-    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
+    pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<DownloadWork>();
         match data {
             DownloadWork::Discovery { chunk_tx } => self.execute_discovery(chunk_tx.clone()).await,
@@ -320,7 +320,7 @@ impl DownloadTransfer {
         // If discovery returned an initial chunk, schedule work to read it
         match initial_work {
             Some((stream, chunk_meta, seq)) => WorkOutcome::Success {
-                schedule_next: Some(WorkKind::Network),
+                schedule_next: Some(IoKind::Network),
                 data: Some(Box::new(DownloadWork::ReadDiscoveryBody {
                     stream,
                     seq,
@@ -508,7 +508,7 @@ impl Transfer for DownloadTransfer {
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(DownloadTransfer::execute(self, work))
     }
@@ -520,7 +520,7 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::operation::TransferContext;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::scheduler::{WorkItem, WorkOutcome};
+    use crate::scheduler::{IoRequest, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -570,7 +570,7 @@ mod tests {
 
     /// Execute and handle follow-on work (e.g., ReadDiscoveryBody).
     /// Uses DownloadTransfer directly for type-specific behavior.
-    async fn execute(transfer: &DownloadTransfer, work: &mut WorkItem) -> WorkOutcome {
+    async fn execute(transfer: &DownloadTransfer, work: &mut IoRequest) -> WorkOutcome {
         let outcome = transfer.execute(work).await;
         if let WorkOutcome::Success {
             schedule_next: Some(kind),
@@ -578,7 +578,7 @@ mod tests {
             ..
         } = outcome
         {
-            let mut follow_on = WorkItem { kind, data };
+            let mut follow_on = IoRequest { kind, data };
             return transfer.execute(&mut follow_on).await;
         }
         outcome

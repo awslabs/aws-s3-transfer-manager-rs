@@ -488,7 +488,7 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::WorkKind;
+    use super::super::super::IoKind;
     use super::super::{CompletionSample, ErrorKind};
     use super::*;
     use crate::metrics::{IOCounters, IoSample};
@@ -556,7 +556,7 @@ mod tests {
                 ..Default::default()
             },
             error: None,
-            kind: WorkKind::Network,
+            kind: IoKind::Network,
         }
     }
 

@@ -13,7 +13,7 @@ use aws_sdk_s3::error::SdkError;
 use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-use super::WorkKind;
+use super::IoKind;
 use crate::metrics::IoSample;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub(crate) struct CompletionSample {
     /// Error classification, if the work item failed.
     pub error: Option<ErrorKind>,
     /// What kind of work this was (disk or network).
-    pub kind: WorkKind,
+    pub kind: IoKind,
 }
 
 /// Controls how many work items can be in-flight concurrently.

@@ -27,7 +27,7 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{PollWork, Transfer, WorkItem, WorkKind, WorkOutcome};
+use crate::scheduler::{IoKind, IoRequest, PollWork, Transfer, WorkOutcome};
 use crate::types::BucketType;
 
 /// Upload-specific work data.
@@ -172,15 +172,15 @@ impl UploadTransfer {
                     || *content_length >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
-                    PollWork::Ready(WorkItem {
-                        kind: WorkKind::Network,
+                    PollWork::Ready(IoRequest {
+                        kind: IoKind::Network,
                         data: Some(Box::new(UploadWork::CreateMPU)),
                     })
                 } else {
                     // Take ownership of stream by replacing state
                     match std::mem::replace(&mut *state, UploadState::PutObjectInFlight) {
-                        UploadState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
-                            kind: WorkKind::Network,
+                        UploadState::PendingInit { stream, .. } => PollWork::Ready(IoRequest {
+                            kind: IoKind::Network,
                             data: Some(Box::new(UploadWork::PutObject {
                                 stream: Some(stream),
                             })),
@@ -206,8 +206,8 @@ impl UploadTransfer {
                 let part_number = *next_part;
                 *next_part += 1;
                 *parts_in_flight += 1;
-                PollWork::Ready(WorkItem {
-                    kind: WorkKind::DataIO,
+                PollWork::Ready(IoRequest {
+                    kind: IoKind::DataIO,
                     data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: None,
@@ -222,8 +222,8 @@ impl UploadTransfer {
                     return PollWork::Pending;
                 }
                 *complete_in_flight = true;
-                PollWork::Ready(WorkItem {
-                    kind: WorkKind::Network,
+                PollWork::Ready(IoRequest {
+                    kind: IoKind::Network,
                     data: Some(Box::new(UploadWork::CompleteMPU)),
                 })
             }
@@ -235,7 +235,7 @@ impl UploadTransfer {
         }
     }
 
-    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
+    pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let kind = work.kind;
         let data = work.data_mut::<UploadWork>();
         match data {
@@ -331,11 +331,11 @@ impl UploadTransfer {
         &self,
         part_number: u64,
         part_data: &mut Option<PartData>,
-        kind: WorkKind,
+        kind: IoKind,
     ) -> WorkOutcome {
         match kind {
-            WorkKind::DataIO => self.execute_read_part(part_number, part_data).await,
-            WorkKind::Network => self.execute_send_part(part_number, part_data).await,
+            IoKind::DataIO => self.execute_read_part(part_number, part_data).await,
+            IoKind::Network => self.execute_send_part(part_number, part_data).await,
         }
     }
 
@@ -360,7 +360,7 @@ impl UploadTransfer {
             Ok(Some(data)) => {
                 *part_data = Some(data);
                 WorkOutcome::Success {
-                    schedule_next: Some(WorkKind::Network),
+                    schedule_next: Some(IoKind::Network),
                     data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: part_data.take(),
@@ -637,7 +637,7 @@ impl Transfer for UploadTransfer {
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(UploadTransfer::execute(self, work))
     }
@@ -648,7 +648,7 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::scheduler::WorkKind;
+    use crate::scheduler::IoKind;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -780,7 +780,7 @@ mod tests {
         transfer.execute(&mut create_work).await;
 
         let mut part_work = assert_ready(transfer.poll_work());
-        assert_eq!(part_work.kind, WorkKind::DataIO);
+        assert_eq!(part_work.kind, IoKind::DataIO);
 
         let outcome = transfer.execute(&mut part_work).await;
         match outcome {
@@ -789,7 +789,7 @@ mod tests {
                 data,
                 ..
             } => {
-                assert_eq!(schedule_next, Some(WorkKind::Network));
+                assert_eq!(schedule_next, Some(IoKind::Network));
                 if let Some(mut boxed_data) = data {
                     let upload_work = (*boxed_data)
                         .as_any_mut()
@@ -825,11 +825,11 @@ mod tests {
         // 3. UploadPart - Network phase
         let mut work = match outcome {
             WorkOutcome::Success {
-                schedule_next: Some(WorkKind::Network),
+                schedule_next: Some(IoKind::Network),
                 data,
                 ..
-            } => WorkItem {
-                kind: WorkKind::Network,
+            } => IoRequest {
+                kind: IoKind::Network,
                 data,
             },
             _ => panic!("expected schedule_next Network"),
@@ -843,11 +843,11 @@ mod tests {
         // 3c. Second UploadPart - Network phase
         let mut work = match outcome {
             WorkOutcome::Success {
-                schedule_next: Some(WorkKind::Network),
+                schedule_next: Some(IoKind::Network),
                 data,
                 ..
-            } => WorkItem {
-                kind: WorkKind::Network,
+            } => IoRequest {
+                kind: IoKind::Network,
                 data,
             },
             _ => panic!("expected schedule_next Network for part 2"),
