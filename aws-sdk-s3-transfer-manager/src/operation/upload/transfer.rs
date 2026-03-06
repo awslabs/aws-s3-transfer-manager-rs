@@ -207,7 +207,7 @@ impl UploadTransfer {
                 *next_part += 1;
                 *parts_in_flight += 1;
                 PollWork::Ready(IoRequest {
-                    kind: IoKind::DataIO,
+                    kind: IoKind::Disk,
                     data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: None,
@@ -334,7 +334,7 @@ impl UploadTransfer {
         kind: IoKind,
     ) -> WorkOutcome {
         match kind {
-            IoKind::DataIO => self.execute_read_part(part_number, part_data).await,
+            IoKind::Disk => self.execute_read_part(part_number, part_data).await,
             IoKind::Network => self.execute_send_part(part_number, part_data).await,
         }
     }
@@ -780,7 +780,7 @@ mod tests {
         transfer.execute(&mut create_work).await;
 
         let mut part_work = assert_ready(transfer.poll_work());
-        assert_eq!(part_work.kind, IoKind::DataIO);
+        assert_eq!(part_work.kind, IoKind::Disk);
 
         let outcome = transfer.execute(&mut part_work).await;
         match outcome {

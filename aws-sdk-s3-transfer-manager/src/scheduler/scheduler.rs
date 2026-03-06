@@ -52,22 +52,21 @@
 
 use super::{
     BoxTransfer, CompletionSample, ConcurrencyController, IoRequest, PollWork, TransferId,
-    WorkOutcome, WorkerPool,
+    WorkOutcome,
 };
 
 use crate::metrics::{IOCounters, IoSample};
+use crate::runtime::ExecutionRuntime;
 
+use crate::runtime::ScheduledWork;
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
-use crate::scheduler::work::ScheduledWork;
-use futures_util::FutureExt;
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -78,10 +77,10 @@ pub(crate) struct Scheduler(Arc<SchedulerInner>);
 struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
-    pool: Arc<WorkerPool>,
     controller: Arc<dyn ConcurrencyController>,
     io_counters: Arc<IOCounters>,
-    worker_count: AtomicUsize,
+    runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
+    dispatched: AtomicUsize,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -90,49 +89,80 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
+/// Builder for constructing a [`Scheduler`] with its runtime.
+pub(crate) struct SchedulerBuilder {
+    controller: Arc<dyn ConcurrencyController>,
+    io_counters: Arc<IOCounters>,
+}
+
+impl SchedulerBuilder {
+    pub(crate) fn new(
+        controller: Arc<dyn ConcurrencyController>,
+        io_counters: Arc<IOCounters>,
+    ) -> Self {
+        Self {
+            controller,
+            io_counters,
+        }
+    }
+
+    pub(crate) fn build(
+        self,
+        runtime_factory: impl FnOnce(Scheduler) -> Arc<dyn ExecutionRuntime>,
+    ) -> Scheduler {
+        let scheduler = Scheduler(Arc::new(SchedulerInner {
+            transfers: RwLock::new(HashMap::new()),
+            ready_set: ReadySet::new(),
+            controller: self.controller,
+            io_counters: self.io_counters,
+            runtime: OnceLock::new(),
+            dispatched: AtomicUsize::new(0),
+        }));
+        let runtime = runtime_factory(scheduler.clone());
+        scheduler
+            .0
+            .runtime
+            .set(runtime)
+            .expect("runtime already set");
+        scheduler
+    }
+}
+
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
-        Self::with_controller(
+        SchedulerBuilder::new(
             Arc::new(super::FixedConcurrency::new(concurrency)),
             Arc::new(IOCounters::new(Duration::from_millis(500))),
         )
+        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
+    #[allow(dead_code)] // TODO(phase3): evaluate removing in favor of SchedulerBuilder
     pub(crate) fn with_controller(
         controller: Arc<dyn ConcurrencyController>,
         io_counters: Arc<IOCounters>,
     ) -> Self {
-        Self(Arc::new(SchedulerInner {
-            transfers: RwLock::new(HashMap::new()),
-            ready_set: ReadySet::new(),
-            pool: Arc::new(WorkerPool::new()),
-            controller,
-            io_counters,
-            worker_count: AtomicUsize::new(0),
-        }))
+        SchedulerBuilder::new(controller, io_counters)
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
-    /// Ensure workers are spawned for a pool. Called lazily on first enqueue.
-    fn ensure_workers_started(&self) {
-        let pool = &self.0.pool;
-        if pool.mark_started() {
-            let target = self.0.controller.target();
-            for _ in 0..target {
-                let pool = Arc::clone(pool);
-                let scheduler = self.clone();
-                tokio::spawn(async move {
-                    worker_loop(pool, scheduler).await;
-                });
-            }
-            self.0.worker_count.store(target, Ordering::Relaxed);
-        }
+    fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
+        self.0.runtime.get().expect("runtime not initialized")
+    }
+
+    /// Returns the concurrency controller's current target.
+    pub(crate) fn controller_target(&self) -> usize {
+        self.0.controller.target()
+    }
+
+    /// Called by the runtime when a worker picks up work.
+    pub(crate) fn on_dispatch(&self) {
+        self.0.controller.on_dispatch();
     }
 
     /// Add a transfer and start generating work.
     pub(crate) fn enqueue_transfer(&self, transfer: BoxTransfer) {
-        self.ensure_workers_started();
-
         // start with lowest current vruntime to avoid new transfer
         // playing aggressive catchup over already in-flight transfers
         let desc = TransferDescriptor::new_with_vruntime(transfer, self.0.ready_set.min_vruntime());
@@ -180,7 +210,8 @@ impl Scheduler {
                 ctx.set_cancelled();
             }
             ctx.signal_terminal();
-            let purged = self.0.pool.remove_for_transfer(id);
+            let purged = self.runtime().remove_pending_for_transfer(id);
+            self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
             desc.work_purged(purged);
             desc.notify_idle();
             true
@@ -205,12 +236,14 @@ impl Scheduler {
     }
 
     /// Called by workers when work completes.
-    pub(super) fn on_completion(
+    pub(crate) fn on_completion(
         &self,
         work: ScheduledWork,
         outcome: WorkOutcome,
         elapsed: Duration,
     ) {
+        self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
+
         // Report to concurrency controller
         let (mut io_sample, classification) = match &outcome {
             WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
@@ -251,7 +284,7 @@ impl Scheduler {
                 item: IoRequest { kind, data },
                 descriptor: desc.clone(),
             };
-            self.enqueue_to_pool(next);
+            self.dispatch_to_runtime(next);
         }
 
         // capacity has freed try to queue up more work
@@ -260,7 +293,9 @@ impl Scheduler {
 
     /// Handle a panic during work execution. The transfer's internal state is
     /// unknown, so the scheduler forces the terminal transition from outside.
-    pub(super) fn on_panic(&self, work: ScheduledWork) {
+    pub(crate) fn on_panic(&self, work: ScheduledWork) {
+        self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
+
         let desc = &work.descriptor;
         let ctx = desc.transfer().ctx();
 
@@ -278,40 +313,11 @@ impl Scheduler {
     }
 
     fn has_capacity(&self) -> bool {
-        let pending = self.0.pool.pending_count();
-        let in_flight = self.0.pool.in_flight_count();
-        pending + in_flight < self.0.controller.target()
+        self.0.dispatched.load(Ordering::Relaxed) < self.0.controller.target()
     }
 
-    /// Spawn additional workers if the concurrency target has grown beyond
-    /// the current worker count. Workers that become excess when the target
-    /// shrinks simply idle-park on `next_work`.
-    fn ensure_worker_capacity(&self) {
-        let target = self.0.controller.target();
-        let current = self.0.worker_count.load(Ordering::Relaxed);
-        if target > current {
-            // CAS to avoid double-spawning from concurrent generate_work calls
-            if self
-                .0
-                .worker_count
-                .compare_exchange(current, target, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                for _ in current..target {
-                    let pool = Arc::clone(&self.0.pool);
-                    let scheduler = self.clone();
-                    tokio::spawn(async move {
-                        worker_loop(pool, scheduler).await;
-                    });
-                }
-                tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING, old = current, new = target, "spawning additional workers");
-            }
-        }
-    }
-
-    /// Generate work from ready transfers and push to pools.
+    /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
-        self.ensure_worker_capacity();
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
@@ -326,7 +332,7 @@ impl Scheduler {
                 PollWork::Ready(item) => {
                     desc.work_generated();
                     self.0.ready_set.insert(desc.clone());
-                    self.enqueue_to_pool(ScheduledWork {
+                    self.dispatch_to_runtime(ScheduledWork {
                         item,
                         descriptor: desc,
                     });
@@ -342,16 +348,16 @@ impl Scheduler {
         }
     }
 
-    fn enqueue_to_pool(&self, work: ScheduledWork) {
+    fn dispatch_to_runtime(&self, work: ScheduledWork) {
+        self.0.dispatched.fetch_add(1, Ordering::Relaxed);
         work.descriptor.work_queued();
-        self.0.pool.push(work);
+        self.runtime().dispatch(work);
     }
 
     #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
-            && self.0.pool.pending_count() == 0
-            && self.0.pool.in_flight_count() == 0
+            && self.0.dispatched.load(Ordering::Relaxed) == 0
     }
 
     /// Wait for a specific transfer to have no outstanding work.
@@ -368,63 +374,7 @@ impl Scheduler {
     /// Shutdown the scheduler. Workers will exit after completing current work.
     #[allow(dead_code)] // TODO(phase3): wire into Handle::drop
     pub(crate) fn shutdown(&self) {
-        self.0.pool.shutdown();
-    }
-}
-
-/// Worker loop - pulls work from pool and executes it.
-async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
-    static WORKER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let wid = WORKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    loop {
-        let Some(mut work) = pool.next_work().await else {
-            tracing::debug!(target: crate::telemetry::TARGET_EXECUTION, wid, "shutdown");
-            break;
-        };
-        scheduler.0.controller.on_dispatch();
-
-        let tid = work.descriptor.id();
-        work.descriptor.work_started();
-
-        // Skip execution if transfer already terminal (failed/cancelled by another work item)
-        if work.descriptor.is_terminal() {
-            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, "skipped (terminal)");
-            pool.complete();
-            scheduler.on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
-            continue;
-        }
-
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, "executing");
-        let transfer = work.descriptor.transfer();
-        let started = Instant::now();
-
-        let token = transfer.ctx().cancellation_token().clone();
-        let outcome = AssertUnwindSafe(async {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => WorkOutcome::Cancelled,
-                outcome = transfer.execute(&mut work.item) => outcome,
-            }
-        })
-        .catch_unwind()
-        .await;
-
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(_panic) => {
-                tracing::error!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "panic in transfer execute");
-                pool.complete();
-                scheduler.on_panic(work);
-                continue;
-            }
-        };
-
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, ?outcome, "completed");
-
-        let elapsed = started.elapsed();
-        pool.complete();
-        scheduler.on_completion(work, outcome, elapsed);
+        self.runtime().shutdown();
     }
 }
 #[cfg(test)]

@@ -6,17 +6,17 @@
 mod concurrency;
 mod scheduler;
 mod transfer;
-mod work;
+pub(crate) mod work;
 
 pub(crate) use concurrency::{
     classify_error, AdaptiveConcurrencyController, AdaptiveConfig, CompletionSample,
     ConcurrencyController, FixedConcurrency,
 };
-pub(crate) use scheduler::Scheduler;
+pub(crate) use scheduler::{Scheduler, SchedulerBuilder};
 pub(crate) use transfer::{BoxTransfer, Transfer};
-pub(crate) use work::{IoKind, IoRequest, PollWork, TransferId, WorkOutcome, WorkerPool};
+pub(crate) use work::{IoKind, IoRequest, PollWork, TransferId, WorkOutcome};
 
-mod descriptor;
+pub(crate) mod descriptor;
 mod ready_set;
 
 #[cfg(test)]

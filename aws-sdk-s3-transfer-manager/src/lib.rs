@@ -89,6 +89,9 @@ pub(crate) mod http;
 /// Work scheduler
 pub(crate) mod scheduler;
 
+/// Execution runtime
+pub(crate) mod runtime;
+
 /// Telemetry target constants
 pub(crate) mod telemetry;
 
