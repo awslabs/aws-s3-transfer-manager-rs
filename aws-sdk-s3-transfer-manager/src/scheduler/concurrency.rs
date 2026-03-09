@@ -13,8 +13,8 @@ use aws_sdk_s3::error::SdkError;
 use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-use super::IoKind;
 use crate::metrics::IoSample;
+use crate::transfer::IoKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorKind {

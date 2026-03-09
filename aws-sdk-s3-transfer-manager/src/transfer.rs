@@ -3,11 +3,44 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Work abstraction for the scheduler.
+//! Transfer types that define what a transfer is and what it produces.
 
-use super::concurrency::ErrorKind;
 use crate::metrics::IoSample;
+use crate::operation::TransferContext;
+use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+
+/// A transfer operation that the scheduler polls for work and the runtime executes.
+///
+/// Each transfer (upload, download) is a state machine that produces IO requests
+/// on demand via `poll_work()` and executes them via `execute()`. The scheduler
+/// calls `poll_work()` when capacity is available; the runtime calls `execute()`
+/// on whatever thread or executor it manages.
+///
+/// Implementations must uphold:
+/// - **Failed lifecycle**: record the error and signal termination before returning
+///   `WorkOutcome::Failed`.
+/// - **Pending/wake obligation**: every `PollWork::Pending` must have a corresponding
+///   future call to `scheduler.wake(id)`.
+/// - **Panic safety**: handled externally by the runtime via `catch_unwind`.
+pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
+    /// The transfer's shared context (id, handle, status, cancellation).
+    fn ctx(&self) -> &TransferContext;
+
+    /// Poll for the next IO request. Returns `Ready` with work, `Pending` if
+    /// blocked, or `Done` when all work has been generated.
+    fn poll_work(&self) -> PollWork;
+
+    /// Execute an IO request. Called by the runtime, not the scheduler.
+    fn execute<'a>(
+        &'a self,
+        work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
+}
+
+pub(crate) type BoxTransfer = Box<dyn Transfer>;
 
 /// Opaque work data carried by work items. Each state machine defines its own type.
 /// The scheduler never inspects this — it ferries it across the scheduling boundary

@@ -50,10 +50,8 @@
 //! - **Pending/wake obligation**: every `Pending` must have a future wake path.
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
-use super::{
-    BoxTransfer, CompletionSample, ConcurrencyController, IoRequest, PollWork, TransferId,
-    WorkOutcome,
-};
+use super::{CompletionSample, ConcurrencyController};
+use crate::transfer::{BoxTransfer, IoRequest, PollWork, TransferId, WorkOutcome};
 
 use crate::metrics::{IOCounters, IoSample};
 use crate::runtime::ExecutionRuntime;
@@ -383,9 +381,8 @@ mod tests {
     use crate::scheduler::transfer::mock::{
         FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
     };
-    use crate::scheduler::transfer::Transfer;
-    use crate::scheduler::work::{IoKind, WorkOutcome};
     use crate::scheduler::MockTransfer;
+    use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;

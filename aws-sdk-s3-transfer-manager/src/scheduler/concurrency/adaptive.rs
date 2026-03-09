@@ -488,10 +488,10 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::IoKind;
     use super::super::{CompletionSample, ErrorKind};
     use super::*;
     use crate::metrics::{IOCounters, IoSample};
+    use crate::transfer::IoKind;
     use std::sync::Arc;
 
     struct TestController(AdaptiveConcurrencyController);

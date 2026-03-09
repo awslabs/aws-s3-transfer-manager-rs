@@ -22,7 +22,7 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::operation::{ChunkSender, TransferContext};
-use crate::scheduler::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
 use crate::types::BucketType;
 
 /// Download-specific work data.
@@ -520,7 +520,7 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::operation::TransferContext;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::scheduler::{IoRequest, WorkOutcome};
+    use crate::transfer::{IoRequest, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;

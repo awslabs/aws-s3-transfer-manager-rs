@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::runtime::ScheduledWork;
-use crate::scheduler::TransferId;
+use crate::transfer::TransferId;
 use tokio::sync::Notify;
 
 /// A queue of work items with in-flight tracking.

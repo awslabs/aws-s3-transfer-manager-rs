@@ -15,10 +15,14 @@ use futures_util::FutureExt;
 mod worker_pool;
 
 use super::{ExecutionRuntime, ScheduledWork};
-use crate::scheduler::{Scheduler, TransferId, WorkOutcome};
+use crate::scheduler::Scheduler;
+use crate::transfer::{TransferId, WorkOutcome};
 use worker_pool::WorkerPool;
 
 /// Runtime that spawns tokio tasks to execute work from a shared [`WorkerPool`].
+///
+/// Assumes it is running within an existing tokio multi-threaded runtime context.
+/// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,

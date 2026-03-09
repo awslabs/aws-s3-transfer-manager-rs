@@ -11,14 +11,16 @@ mod tokio_mt;
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
 use crate::scheduler::descriptor::TransferDescriptor;
-use crate::scheduler::work::IoRequest;
-use crate::scheduler::TransferId;
+use crate::transfer::{IoRequest, TransferId};
 
 /// Work item with scheduler tracking attached.
 ///
-/// Wraps an `IoRequest` (what transfers produce) with the `TransferDescriptor`
-/// (scheduler's tracking context). This keeps scheduling concerns out of
-/// transfer state machines.
+/// Wraps an `IoRequest` with a `TransferDescriptor` that the runtime uses to
+/// report execution lifecycle events back to the scheduler. The runtime calls
+/// `descriptor.work_started()` when execution begins and the scheduler observes
+/// completion via `descriptor.work_finished()` in `on_completion`. This lets the
+/// scheduler track outstanding work without prescribing when or how the runtime
+/// executes it.
 #[derive(Debug)]
 pub(crate) struct ScheduledWork {
     pub(crate) item: IoRequest,

@@ -86,6 +86,9 @@ pub mod config;
 /// HTTP related components and utils
 pub(crate) mod http;
 
+/// Transfer types
+pub(crate) mod transfer;
+
 /// Work scheduler
 pub(crate) mod scheduler;
 

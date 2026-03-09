@@ -27,7 +27,7 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::operation::TransferContext;
-use crate::scheduler::{IoKind, IoRequest, PollWork, Transfer, WorkOutcome};
+use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, WorkOutcome};
 use crate::types::BucketType;
 
 /// Upload-specific work data.
@@ -648,7 +648,7 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::scheduler::IoKind;
+    use crate::transfer::IoKind;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;

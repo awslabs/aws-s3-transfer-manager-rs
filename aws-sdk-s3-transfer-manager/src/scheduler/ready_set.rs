@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crossbeam_skiplist::SkipMap;
 
 use super::descriptor::TransferDescriptor;
-use super::TransferId;
+use crate::transfer::TransferId;
 
 /// Key for ordering transfers in the ready set.
 ///

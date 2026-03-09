@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::operation::TransferContext;
-use crate::scheduler::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
 
 /// Trait for mock state machines that drive transfer behavior.
 pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {

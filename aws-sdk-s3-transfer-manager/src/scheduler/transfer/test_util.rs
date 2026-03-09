@@ -5,7 +5,7 @@
 
 //! Shared test utilities for transfer state machine tests.
 
-use crate::scheduler::{IoRequest, PollWork};
+use crate::transfer::{IoRequest, PollWork};
 
 /// Assert poll returns Ready and extract the work item.
 pub(crate) fn assert_ready(poll: PollWork) -> IoRequest {

@@ -12,8 +12,8 @@ use crate::error;
 
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_transfer_id() -> crate::scheduler::TransferId {
-    crate::scheduler::TransferId {
+fn next_transfer_id() -> crate::transfer::TransferId {
+    crate::transfer::TransferId {
         id: NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed),
         parent: None,
     }
@@ -194,7 +194,7 @@ impl fmt::Debug for StateMachineStatus {
 #[derive(Clone)]
 pub(crate) struct TransferContext {
     /// Unique identifier for this transfer
-    pub(crate) id: crate::scheduler::TransferId,
+    pub(crate) id: crate::transfer::TransferId,
     /// Access to client handle (scheduler, S3 client, config)
     pub(crate) handle: Arc<crate::client::Handle>,
     /// Transfer lifecycle status
@@ -246,7 +246,7 @@ impl TransferContext {
     /// Returns the context and a receiver for terminal state notification.
     #[cfg(test)]
     pub(crate) fn with_id(
-        id: crate::scheduler::TransferId,
+        id: crate::transfer::TransferId,
         handle: Arc<crate::client::Handle>,
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use super::{BoxTransfer, Transfer, TransferId};
+use crate::transfer::{BoxTransfer, Transfer, TransferId};
 
 /// Default priority assigned to new transfers
 const DEFAULT_PRIORITY: u8 = 128;
