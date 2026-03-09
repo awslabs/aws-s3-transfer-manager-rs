@@ -26,8 +26,7 @@ use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
-use crate::operation::TransferContext;
-use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, WorkOutcome};
+use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
 
 /// Upload-specific work data.

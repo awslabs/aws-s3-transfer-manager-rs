@@ -11,7 +11,7 @@ use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
 use crate::operation::download::ChunkOutput;
-use crate::operation::StateMachineTerminalReceiver;
+use crate::transfer::StateMachineTerminalReceiver;
 
 /// Handle to an in-progress download operation.
 ///
@@ -190,12 +190,12 @@ impl DownloadHandle {
 
     /// Get scheduling controls for this transfer.
     ///
-    /// See [`SchedulingCtl`](crate::operation::SchedulingCtl) for available controls.
+    /// See [`SchedulingCtl`](crate::transfer::SchedulingCtl) for available controls.
     ///
     /// <div class="warning">
     /// Scheduling controls are an advanced feature.
     /// </div>
-    pub fn scheduling(&self) -> crate::operation::SchedulingCtl<'_> {
+    pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }
 }

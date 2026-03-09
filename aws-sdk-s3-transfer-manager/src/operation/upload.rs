@@ -17,7 +17,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
 use crate::error;
-use crate::operation::TransferContext;
+use crate::transfer::TransferContext;
 use crate::types::BucketType;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3

@@ -144,12 +144,12 @@ impl UploadHandle {
 
     /// Get scheduling controls for this transfer.
     ///
-    /// See [`SchedulingCtl`](crate::operation::SchedulingCtl) for available controls.
+    /// See [`SchedulingCtl`](crate::transfer::SchedulingCtl) for available controls.
     ///
     /// <div class="warning">
     /// Scheduling controls are an advanced feature.
     /// </div>
-    pub fn scheduling(&self) -> crate::operation::SchedulingCtl<'_> {
+    pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }
 }

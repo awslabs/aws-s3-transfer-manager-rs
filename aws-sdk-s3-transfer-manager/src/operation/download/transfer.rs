@@ -21,8 +21,10 @@ use crate::operation::download::context::{DownloadState, SeqWindow};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::operation::{ChunkSender, TransferContext};
-use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+use crate::operation::ChunkSender;
+use crate::transfer::{
+    IoKind, IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
+};
 use crate::types::BucketType;
 
 /// Download-specific work data.
@@ -518,8 +520,8 @@ impl Transfer for DownloadTransfer {
 mod tests {
     use super::*;
     use crate::operation::download::DownloadInput;
-    use crate::operation::TransferContext;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
+    use crate::transfer::TransferContext;
     use crate::transfer::{IoRequest, WorkOutcome};
     use crate::types::BucketType;
     use crate::DEFAULT_CONCURRENCY;

@@ -219,7 +219,7 @@ mod tests {
     };
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
-    use crate::operation::TransferContext;
+    use crate::transfer::TransferContext;
     use crate::types::BucketType;
     use crate::types::PartSize;
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};

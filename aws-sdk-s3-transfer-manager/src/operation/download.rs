@@ -52,7 +52,7 @@ impl Download {
         input: DownloadInput,
         _use_current_span_as_parent_for_tasks: bool,
     ) -> Result<DownloadHandle, error::Error> {
-        use crate::operation::TransferContext;
+        use crate::transfer::TransferContext;
 
         if input.part_number().is_some() {
             todo!("single part download not implemented")

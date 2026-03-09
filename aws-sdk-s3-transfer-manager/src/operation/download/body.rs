@@ -230,7 +230,7 @@ mod tests {
 
     fn test_body(rx: mpsc::Receiver<ChunkOutput>) -> (Body, DownloadTransfer) {
         use crate::operation::download::DownloadInput;
-        use crate::operation::TransferContext;
+        use crate::transfer::TransferContext;
         use crate::types::BucketType;
 
         let s3_client = aws_sdk_s3::Client::from_conf(
