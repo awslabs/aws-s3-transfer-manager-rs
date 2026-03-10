@@ -10,8 +10,11 @@
 mod tokio_mt;
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
+mod managed;
+pub(crate) use managed::ManagedThreadRuntime;
+
 mod topology;
-pub(crate) use topology::{ManagedThreadConfig, NumaNode, ThreadId, Topology};
+pub(crate) use topology::{NumaNode, ThreadId, Topology};
 
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::transfer::{IoRequest, TransferId};

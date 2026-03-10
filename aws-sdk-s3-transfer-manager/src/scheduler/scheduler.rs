@@ -136,6 +136,21 @@ impl Scheduler {
         .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_managed_runtime(concurrency: usize) -> Self {
+        SchedulerBuilder::new(
+            Arc::new(super::FixedConcurrency::new(concurrency)),
+            Arc::new(IOCounters::new(Duration::from_millis(500))),
+        )
+        .build(|scheduler| {
+            Arc::new(
+                crate::runtime::ManagedThreadRuntime::builder(scheduler)
+                    .topology(crate::runtime::Topology::uniform(4))
+                    .build(),
+            )
+        })
+    }
+
     #[allow(dead_code)] // TODO(phase3): evaluate removing in favor of SchedulerBuilder
     pub(crate) fn with_controller(
         controller: Arc<dyn ConcurrencyController>,
@@ -394,6 +409,32 @@ mod tests {
     async fn test_single_transfer_completes() {
         let _logs = show_test_logs();
         let scheduler = Scheduler::new(4);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+
+        let sm = Arc::new(FixedWorkCount::new(5));
+        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
+        scheduler.enqueue_transfer(transfer);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle");
+
+        assert!(sm.is_complete());
+        assert_eq!(sm.completed_count(), 5);
+        scheduler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_single_transfer_completes_managed_runtime() {
+        let _logs = show_test_logs();
+        let scheduler = Scheduler::with_managed_runtime(4);
         let id = TransferId {
             id: 1,
             parent: None,

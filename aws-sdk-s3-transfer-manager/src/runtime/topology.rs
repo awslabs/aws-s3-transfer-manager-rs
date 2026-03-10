@@ -105,13 +105,6 @@ impl Topology {
     }
 }
 
-/// Configuration for the managed thread runtime.
-#[derive(Debug)]
-pub(crate) struct ManagedThreadConfig {
-    pub(crate) topology: Topology,
-    pub(crate) pin_threads: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
