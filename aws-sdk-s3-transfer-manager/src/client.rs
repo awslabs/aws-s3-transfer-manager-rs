@@ -4,7 +4,7 @@
  */
 
 use crate::metrics::IOCounters;
-use crate::runtime::TokioMultiThreadRuntime;
+use crate::runtime::{ManagedThreadRuntime, TokioMultiThreadRuntime};
 use crate::scheduler::{
     AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
     Scheduler, SchedulerBuilder,
@@ -79,7 +79,8 @@ impl Client {
             )),
         };
         let scheduler = SchedulerBuilder::new(controller, io_counters)
-            .build(|scheduler| Arc::new(TokioMultiThreadRuntime::new(scheduler)));
+            // .build(|scheduler| Arc::new(TokioMultiThreadRuntime::new(scheduler)));
+            .build(|scheduler| Arc::new(ManagedThreadRuntime::builder(scheduler).build()));
 
         let handle = Arc::new(Handle { config, scheduler });
         Client { handle }

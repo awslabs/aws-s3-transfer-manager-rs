@@ -216,7 +216,7 @@ impl ManagedThreadRuntimeBuilder {
     /// Build the runtime, spawning managed threads.
     pub(crate) fn build(self) -> ManagedThreadRuntime {
         let topology = self.topology.unwrap_or_else(|| {
-            // TODO - use many_cpu's?
+            // TODO - use many_cpu's / Topologoy::detect()
             Topology::uniform(
                 std::thread::available_parallelism()
                     .map(|n| n.get())
