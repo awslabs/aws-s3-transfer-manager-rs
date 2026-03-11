@@ -10,7 +10,7 @@ mod transfer;
 mod work;
 
 pub(crate) use concurrency::{ConcurrencyController, FixedConcurrency};
-pub(crate) use context::TransferContext;
+pub(crate) use context::{StateMachineTerminalReceiver, TransferContext};
 pub(crate) use scheduler::Scheduler;
 pub(crate) use transfer::{BoxTransfer, Transfer};
 pub(crate) use work::{PollWork, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool};

@@ -325,6 +325,7 @@ async fn main() -> Result<(), BoxError> {
         tracing::error!("transfer failed: {}", DisplayErrorContext(err.as_ref()));
     }
 
+    result?;
     Ok(())
 }
 

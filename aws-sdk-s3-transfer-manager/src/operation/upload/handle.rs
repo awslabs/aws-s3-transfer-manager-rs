@@ -3,247 +3,196 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::Arc;
-
-use crate::error::ChunkId;
-use crate::io::part_reader::PartReader;
-use crate::operation::upload::context::UploadContext;
-use crate::operation::upload::input::convert::{
-    copy_fields_to_abort_mpu_request, copy_fields_to_complete_mpu_request,
-};
-use crate::operation::upload::{UploadOutput, UploadOutputBuilder};
-use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
-use aws_sdk_s3::error::DisplayErrorContext;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use tokio::sync::Mutex;
-use tokio::task::{self, JoinHandle};
 use tracing::Instrument;
 
-#[derive(Debug)]
-pub(crate) enum UploadType {
-    MultipartUpload(MultipartUploadData),
-    PutObject(JoinHandle<Result<UploadOutput, crate::error::Error>>),
-}
+use crate::error::Error;
+use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
+use crate::operation::upload::transfer::UploadTransfer;
+use crate::operation::upload::UploadOutput;
+use crate::scheduler::StateMachineTerminalReceiver;
+use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 
-#[derive(Debug)]
-pub(crate) struct MultipartUploadData {
-    /// All child multipart upload tasks spawned for this upload
-    pub(crate) upload_part_tasks:
-        Arc<Mutex<task::JoinSet<Result<CompletedPart, crate::error::Error>>>>,
-    /// All child read body tasks spawned for this upload
-    pub(crate) read_body_tasks: task::JoinSet<Result<(), crate::error::Error>>,
-    /// The response that will eventually be yielded to the caller.
-    pub(crate) response: Option<UploadOutputBuilder>,
-    /// the multipart upload ID
-    pub(crate) upload_id: String,
-    pub(crate) part_reader: Arc<PartReader>,
-}
-
-/// Response type for a single upload object request.
+/// Handle to an in-progress upload operation.
+///
+/// This handle is returned when initiating an upload and provides methods to wait for
+/// completion ([`join`](Self::join)) or cancel the operation ([`abort`](Self::abort)).
+///
+/// # Lifecycle
+///
+/// **Handles should be kept until the transfer completes or is explicitly cancelled.**
+/// The recommended pattern is to call [`join`](Self::join) to wait for completion:
+///
+/// ```ignore
+/// let handle = tm.upload()
+///     .bucket("my-bucket")
+///     .key("my-key")
+///     .body(stream)
+///     .initiate()?;
+///
+/// // Wait for upload to complete
+/// let output = handle.join().await?;
+/// ```
 ///
 /// # Cancellation
 ///
 /// The operation can be cancelled either by dropping this handle or by calling
-/// [`Self::abort`]. In both cases, any ongoing tasks will stop processing future work
-/// and will not start processing anything new. However, there are subtle differences in
-/// how each method cancels ongoing tasks.
+/// [`abort`](Self::abort). Both methods stop the transfer, but they differ in behavior:
 ///
-/// When the handle is dropped, in-progress tasks are cancelled at their await points,
-/// meaning read body tasks may be interrupted mid-processing, or upload parts may be
-/// terminated without calling `AbortMultipartUpload` for multipart uploads.
+/// ## Dropping the handle
 ///
-/// In contrast, calling [`Self::abort`] attempts to cancel ongoing tasks more explicitly.
-/// It first calls `.abort_all` on the tasks it owns, and then invokes `AbortMultipartUpload`
-/// to abort any in-progress multipart uploads. Errors encountered during `AbortMultipartUpload`
-/// are logged, but do not affect the overall cancellation flow.
+/// When the handle is dropped without calling `join()` or `abort()`:
+/// - The transfer is marked as cancelled
+/// - Queued work is purged from the scheduler
+/// - In-flight work may be interrupted at await points
+/// - `AbortMultipartUpload` is **not** called (multipart uploads may be left incomplete)
+/// - Drop returns immediately without waiting for in-flight work
 ///
-/// In either case, if the upload operation has already been completed before the handle is dropped
-/// or aborted, the uploaded object will not be deleted from S3.
+/// **Warning:** Dropping a handle for a multipart upload without calling `abort()` may
+/// leave incomplete multipart uploads on S3. Use S3 lifecycle rules to clean these up,
+/// or call `abort()` explicitly.
+///
+/// ## Calling `abort()`
+///
+/// When [`abort`](Self::abort) is called:
+/// - The transfer is marked as cancelled
+/// - Queued work is purged from the scheduler
+/// - Waits for all in-flight work to complete
+/// - Calls `AbortMultipartUpload` if a multipart upload was started
+/// - Returns only after all cleanup is complete
+///
+/// ## Already completed transfers
+///
+/// If the upload has already completed before the handle is dropped or aborted,
+/// the uploaded object will **not** be deleted from S3.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
-    /// Initial task which determines the upload type
-    initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
-    /// The context used to drive an upload to completion
-    pub(crate) ctx: UploadContext,
+    completion_rx: Option<StateMachineTerminalReceiver>,
+    transfer: UploadTransfer,
 }
 
 impl UploadHandle {
     pub(crate) fn new(
-        ctx: UploadContext,
-        initiate_task: JoinHandle<Result<UploadType, crate::error::Error>>,
+        completion_rx: StateMachineTerminalReceiver,
+        transfer: UploadTransfer,
     ) -> Self {
-        Self { initiate_task, ctx }
+        Self {
+            completion_rx: Some(completion_rx),
+            transfer,
+        }
     }
 
     /// Consume the handle and wait for upload to complete
-    #[tracing::instrument(skip_all, level = "debug", name = "join-upload")]
-    pub async fn join(self) -> Result<UploadOutput, crate::error::Error> {
-        // TODO: We won't send completeMPU until customers join the future. This can create a
-        // bottleneck where we have many uploads not making the completeMPU call, waiting for the join
-        // to happen, and then everyone tries to do completeMPU at the same time. We should investigate doing
-        // this without waiting for join to happen.
-        complete_upload(self).await
+    pub async fn join(mut self) -> Result<UploadOutput, Error> {
+        if let Some(rx) = self.completion_rx.take() {
+            let _ = rx.await;
+        }
+
+        let ctx = self.transfer.ctx();
+
+        if ctx.is_failed() {
+            ctx.handle.scheduler.cancel_transfer(ctx.id);
+            ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+            let err = ctx.take_error().expect("failed transfer must have error");
+            return Err(err);
+        }
+
+        Ok(self
+            .transfer
+            .take_result()
+            .expect("result must be set on successful completion"))
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
-    #[tracing::instrument(skip_all, level = "debug", name = "abort-upload")]
-    pub async fn abort(self) -> Result<AbortedUpload, crate::error::Error> {
-        // TODO(aws-sdk-rust#1159) - handle already completed upload
-        self.initiate_task.abort();
-        if let Ok(Ok(upload_type)) = self.initiate_task.await {
-            match upload_type {
-                UploadType::PutObject(put_object_task) => {
-                    put_object_task.abort();
-                    let _ = put_object_task.await?;
-                    Ok(AbortedUpload::default())
-                }
-                UploadType::MultipartUpload(mpu_ctx) => {
-                    abort_multipart_upload(self.ctx.clone(), mpu_ctx).await
+    ///
+    /// This will:
+    /// 1. Cancel the transfer in the scheduler
+    /// 2. Wait for any in-flight work to complete
+    /// 3. Call AbortMultipartUpload if MPU was started
+    ///
+    /// When this method returns, all work for this transfer has been
+    /// cancelled or completed. No further work will be executed.
+    ///
+    /// TODO(aws-sdk-rust#1159): Handle already completed upload
+    pub async fn abort(self) -> Result<AbortedUpload, Error> {
+        let ctx = self.transfer.ctx();
+
+        // Register waiter before checking state to avoid missing notification
+        let notified = self.transfer.create_mpu_complete_notified();
+        // TODO: There's an edge case where CreateMPU HTTP request is in-flight,
+        // we cancel, but the server still processes the request. The MPU would be
+        // orphaned. This is the same behavior as the old implementation. S3 lifecycle
+        // rules can clean up incomplete MPUs. To fully fix this would require waiting
+        // for the HTTP response even after cancellation.
+        let create_mpu_in_flight = self.transfer.is_create_mpu_in_flight();
+
+        // Cancel the transfer and purge queued work
+        ctx.handle.scheduler.cancel_transfer(ctx.id);
+
+        // Wait for any executing work to complete
+        ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+
+        // If CreateMPU was in flight, wait for it to complete or be cancelled
+        if create_mpu_in_flight {
+            notified.await;
+        }
+
+        // Check if we have an upload_id to abort
+        let upload_id = self.transfer.upload_id();
+
+        if let Some(upload_id) = upload_id {
+            let abort_policy = self
+                .transfer
+                .request()
+                .failed_multipart_upload_policy
+                .clone()
+                .unwrap_or_default();
+
+            match abort_policy {
+                FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+                FailedMultipartUploadPolicy::AbortUpload => {
+                    let resp = copy_fields_to_abort_mpu_request(
+                        self.transfer.request(),
+                        ctx.s3_client()
+                            .abort_multipart_upload()
+                            .upload_id(&upload_id),
+                    )
+                    .send()
+                    .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                    .await?;
+
+                    Ok(AbortedUpload {
+                        upload_id: Some(upload_id),
+                        request_charged: resp.request_charged,
+                    })
                 }
             }
         } else {
-            // Nothing to abort since initiate task was not successful.
             Ok(AbortedUpload::default())
         }
     }
 }
 
-/// Abort the multipart upload and cancel any in-progress part uploads.
-async fn abort_multipart_upload(
-    ctx: UploadContext,
-    mut mpu_data: MultipartUploadData,
-) -> Result<AbortedUpload, crate::error::Error> {
-    // cancel in-progress read_body tasks
-    mpu_data.read_body_tasks.abort_all();
-    while (mpu_data.read_body_tasks.join_next().await).is_some() {}
-
-    // cancel in-progress upload tasks
-    let mut tasks = mpu_data.upload_part_tasks.lock().await;
-    tasks.abort_all();
-
-    // join all tasks
-    while (tasks.join_next().await).is_some() {}
-
-    let abort_policy = ctx
-        .state
-        .request
-        .failed_multipart_upload_policy
-        .clone()
-        .unwrap_or_default();
-    match abort_policy {
-        FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
-        FailedMultipartUploadPolicy::AbortUpload => {
-            let abort_mpu_resp = copy_fields_to_abort_mpu_request(
-                &ctx.state.request,
-                ctx.client()
-                    .abort_multipart_upload()
-                    .set_upload_id(Some(mpu_data.upload_id.clone())),
-            )
-            .send()
-            .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-            .await?;
-
-            let aborted_upload = AbortedUpload {
-                upload_id: Some(mpu_data.upload_id),
-                request_charged: abort_mpu_resp.request_charged,
-            };
-
-            Ok(aborted_upload)
+impl Drop for UploadHandle {
+    fn drop(&mut self) {
+        let ctx = self.transfer.ctx();
+        if ctx.is_active() {
+            ctx.set_cancelled();
+            ctx.handle.scheduler.cancel_transfer(ctx.id);
         }
     }
 }
 
-async fn complete_upload(handle: UploadHandle) -> Result<UploadOutput, crate::error::Error> {
-    let upload_type = handle.initiate_task.await??;
-    match upload_type {
-        UploadType::PutObject(put_object_task) => put_object_task.await?,
-        UploadType::MultipartUpload(mut mpu_data) => {
-            while let Some(join_result) = mpu_data.read_body_tasks.join_next().await {
-                if let Err(err) = join_result.expect("task completed") {
-                    tracing::error!(
-                        "multipart upload failed while trying to read the body, aborting"
-                    );
-                    // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                    if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
-                        tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
-                    };
-                    return Err(err);
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::UploadHandle;
 
-            let mut all_parts = Vec::new();
-            // join all the upload tasks. We can safely grab the lock since all the read_tasks are done.
-            let mut tasks = mpu_data.upload_part_tasks.lock().await;
-            let number_of_upload_requests = tasks.len();
-            while let Some(join_result) = tasks.join_next().await {
-                let result = join_result.expect("task completed");
-                match result {
-                    Ok(completed_part) => all_parts.push(completed_part),
-                    // TODO(aws-sdk-rust#1159, design) - do we want to return first error or collect all errors?
-                    Err(err) => {
-                        tracing::error!("multipart upload failed, aborting");
-                        // TODO(aws-sdk-rust#1159) - if cancelling causes an error we want to propagate that in the returned error somehow?
-                        drop(tasks);
-                        if let Err(err) = abort_multipart_upload(handle.ctx, mpu_data).await {
-                            tracing::error!("failed to abort upload: {}", DisplayErrorContext(err))
-                        };
-                        return Err(err);
-                    }
-                }
-            }
+    fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
 
-            tracing::trace!("completing multipart upload");
-
-            if number_of_upload_requests != all_parts.len() {
-                return Err(crate::error::chunk_failed(
-                    ChunkId::Upload(mpu_data.upload_id),
-                    format!(
-                        "The total number of UploadPart requests must match the expected number of parts: request count {}, number of parts {}",
-                        number_of_upload_requests,
-                        all_parts.len()
-                    ),
-                ));
-            }
-
-            // parts must be sorted
-            all_parts.sort_by_key(|p| p.part_number.expect("part number set"));
-
-            // complete the multipart upload
-            let req = copy_fields_to_complete_mpu_request(
-                &handle.ctx.state.request,
-                handle
-                    .ctx
-                    .client()
-                    .complete_multipart_upload()
-                    .set_upload_id(Some(mpu_data.upload_id))
-                    .multipart_upload(
-                        CompletedMultipartUpload::builder()
-                            .set_parts(Some(all_parts))
-                            .build(),
-                    ),
-                || {
-                    let part_reader = mpu_data.part_reader.clone();
-                    async move { part_reader.full_object_checksum().await }
-                },
-            )
-            .await;
-
-            let complete_mpu_resp = req
-                .send()
-                .instrument(tracing::debug_span!("send-complete-multipart-upload"))
-                .await?;
-
-            // set remaining fields from completing the multipart upload
-            let resp = mpu_data
-                .response
-                .take()
-                .expect("response set")
-                .update_from_complete_mpu(&complete_mpu_resp);
-
-            tracing::trace!("upload completed successfully");
-
-            Ok(resp.build().expect("valid response"))
-        }
+    #[test]
+    fn test_handle_properties() {
+        is_send::<UploadHandle>();
+        is_sync::<UploadHandle>();
     }
 }

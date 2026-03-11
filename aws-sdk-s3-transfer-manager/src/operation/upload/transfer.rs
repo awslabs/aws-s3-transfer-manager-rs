@@ -1,0 +1,857 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Upload transfer implementation for scheduler integration.
+
+use std::cmp;
+use std::sync::{Arc, Mutex};
+
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use bytes::Buf;
+use tracing::Instrument;
+
+use std::future::Future;
+use std::pin::Pin;
+
+use crate::error::Error;
+use crate::io::part_reader::Builder as PartReaderBuilder;
+use crate::io::{InputStream, PartData};
+use crate::operation::upload::context::UploadState;
+use crate::operation::upload::input::convert::{
+    copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
+};
+use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
+use crate::scheduler::{PollWork, Transfer, TransferContext, WorkItem, WorkKind, WorkOutcome};
+use crate::types::BucketType;
+
+/// Upload-specific work data.
+#[derive(Debug)]
+pub(crate) enum UploadWork {
+    CreateMPU,
+    UploadPart {
+        part_number: u64,
+        part_data: Option<PartData>,
+    },
+    CompleteMPU,
+    PutObject {
+        stream: Option<InputStream>,
+    },
+}
+
+/// Maximum number of parts that a single S3 multipart upload supports
+const MAX_PARTS: u64 = 10_000;
+
+/// Upload transfer that generates and executes upload work.
+///
+/// Cheap to clone — all state is behind `Arc`. The scheduler stores transfers as
+/// `Arc<dyn Transfer>` (outer Arc), while `UploadHandle` holds a direct clone of
+/// `UploadTransfer` (inner Arc) to access upload-specific methods like `take_result()`
+/// and `upload_id()` without downcasting.
+#[derive(Debug, Clone)]
+pub(crate) struct UploadTransfer {
+    inner: Arc<UploadTransferInner>,
+}
+
+/// Internal state for upload transfer.
+#[derive(Debug)]
+struct UploadTransferInner {
+    /// Common transfer lifecycle management
+    ctx: TransferContext,
+    /// State machine for work progression
+    // TODO(vnext): evaluate parking_lot::Mutex — this lock is acquired on every
+    // poll_work and execute call; parking_lot avoids syscall overhead on the
+    // uncontended path and has no poisoning.
+    state: Mutex<UploadState>,
+    /// The original request (body taken for processing)
+    request: Arc<UploadInput>,
+    /// Type of S3 bucket targeted by this operation
+    #[allow(dead_code)] // TODO(vnext): hedging/routing
+    bucket_type: BucketType,
+    /// Notified when CreateMPU completes (success or failure)
+    create_mpu_complete: tokio::sync::Notify,
+    /// Upload result, stored on successful completion. Read by join().
+    result: Mutex<Option<UploadOutput>>,
+}
+
+impl UploadTransfer {
+    pub(crate) fn new(
+        ctx: TransferContext,
+        bucket_type: BucketType,
+        request: UploadInput,
+        stream: InputStream,
+    ) -> Self {
+        // TODO(vnext): Relax this constraint — unknown content length implies MPU
+        // https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/90
+        let content_length = stream
+            .size_hint()
+            .upper()
+            .expect("content_length required; unknown length not yet supported");
+
+        let inner = Arc::new(UploadTransferInner {
+            ctx,
+            state: Mutex::new(UploadState::PendingInit {
+                stream: Some(stream),
+                content_length: Some(content_length),
+                init_in_flight: false,
+            }),
+            request: Arc::new(request),
+            bucket_type,
+            create_mpu_complete: tokio::sync::Notify::new(),
+            result: Mutex::new(None),
+        });
+
+        Self { inner }
+    }
+
+    /// Access the transfer context.
+    pub(crate) fn ctx(&self) -> &TransferContext {
+        &self.inner.ctx
+    }
+
+    /// Get the transfer ID.
+    /// The original request (sans the body as it will have been taken for processing)
+    pub(crate) fn request(&self) -> &UploadInput {
+        &self.inner.request
+    }
+
+    /// Take the upload result. Available after successful completion.
+    pub(crate) fn take_result(&self) -> Option<UploadOutput> {
+        self.inner
+            .result
+            .lock()
+            .expect("upload result lock poisoned")
+            .take()
+    }
+
+    /// Get the upload_id if MPU was started.
+    pub(crate) fn upload_id(&self) -> Option<String> {
+        let state = self.inner.state.lock().expect("upload state lock poisoned");
+        match &*state {
+            UploadState::Transferring { upload_id, .. } => Some(upload_id.clone()),
+            UploadState::Completing { upload_id, .. } => upload_id.clone(),
+            _ => None,
+        }
+    }
+
+    /// Check if CreateMPU is currently in flight.
+    pub(crate) fn is_create_mpu_in_flight(&self) -> bool {
+        let state = self.inner.state.lock().expect("upload state lock poisoned");
+        matches!(
+            &*state,
+            UploadState::PendingInit {
+                init_in_flight: true,
+                ..
+            }
+        )
+    }
+
+    /// Get notified when CreateMPU completes.
+    pub(crate) fn create_mpu_complete_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.create_mpu_complete.notified()
+    }
+
+    /// Poll for the next work item.
+    ///
+    /// Returns:
+    /// - `PollWork::Ready(work)` - work available to execute
+    /// - `PollWork::Pending` - blocked waiting for in-flight work
+    /// - `PollWork::Done` - transfer complete
+    pub(crate) fn poll_work(&self) -> PollWork {
+        if !self.inner.ctx.is_active() {
+            return PollWork::Done;
+        }
+
+        let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+
+        match &mut *state {
+            UploadState::PendingInit {
+                init_in_flight,
+                content_length,
+                stream,
+            } => {
+                if *init_in_flight {
+                    self.inner.ctx.set_pending();
+                    return PollWork::Pending;
+                }
+
+                let use_mpu = stream.as_ref().map_or(false, |s| s.is_mpu_only())
+                    || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
+                if use_mpu {
+                    *init_in_flight = true;
+                    PollWork::Ready(WorkItem {
+                        kind: WorkKind::Network,
+                        data: Some(Box::new(UploadWork::CreateMPU)),
+                    })
+                } else {
+                    // Take ownership of stream by replacing state
+                    let taken_stream = stream.take().expect("stream already taken in PendingInit");
+                    *state = UploadState::PutObjectInFlight;
+                    PollWork::Ready(WorkItem {
+                        kind: WorkKind::Network,
+                        data: Some(Box::new(UploadWork::PutObject {
+                            stream: Some(taken_stream),
+                        })),
+                    })
+                }
+            }
+            UploadState::Transferring {
+                next_part,
+                total_parts,
+                parts_in_flight,
+                upload_id,
+                part_reader,
+                completed_parts,
+                response_builder,
+            } => {
+                if *next_part > *total_parts {
+                    if *parts_in_flight > 0 {
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
+                    // All parts sent and completed — transition to Completing
+                    let upload_id = std::mem::take(upload_id);
+                    let part_reader = part_reader.clone();
+                    let completed_parts = std::mem::take(completed_parts);
+                    let response_builder =
+                        std::mem::replace(response_builder, UploadOutputBuilder::default());
+                    *state = UploadState::Completing {
+                        upload_id: Some(upload_id),
+                        part_reader: Some(part_reader),
+                        completed_parts: Some(completed_parts),
+                        response_builder: Some(response_builder),
+                        complete_in_flight: false,
+                    };
+                    drop(state);
+                    self.inner.ctx.try_wake();
+                    return PollWork::Pending;
+                }
+                let part_number = *next_part;
+                *next_part += 1;
+                *parts_in_flight += 1;
+                PollWork::Ready(WorkItem {
+                    kind: WorkKind::DataIO,
+                    data: Some(Box::new(UploadWork::UploadPart {
+                        part_number,
+                        part_data: None,
+                    })),
+                })
+            }
+            UploadState::Completing {
+                complete_in_flight, ..
+            } => {
+                if *complete_in_flight {
+                    self.inner.ctx.set_pending();
+                    return PollWork::Pending;
+                }
+                *complete_in_flight = true;
+                PollWork::Ready(WorkItem {
+                    kind: WorkKind::Network,
+                    data: Some(Box::new(UploadWork::CompleteMPU)),
+                })
+            }
+            UploadState::PutObjectInFlight { .. } => {
+                self.inner.ctx.set_pending();
+                PollWork::Pending
+            }
+            UploadState::Done => PollWork::Done,
+        }
+    }
+
+    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
+        let kind = work.kind;
+        let data = work.data_mut::<UploadWork>();
+        match data {
+            UploadWork::CreateMPU => self.execute_create_mpu().await,
+            UploadWork::UploadPart {
+                part_number,
+                part_data,
+            } => {
+                self.execute_upload_part(*part_number, part_data, kind)
+                    .await
+            }
+            UploadWork::CompleteMPU => self.execute_complete_mpu().await,
+            UploadWork::PutObject { stream } => self.execute_put_object(stream).await,
+        }
+    }
+
+    async fn execute_create_mpu(&self) -> WorkOutcome {
+        let outcome = self.do_execute_create_mpu().await;
+        // unblock any waiters that CreateMPU is complete (success or failure)
+        self.inner.create_mpu_complete.notify_waiters();
+        // state changed - try to wake if we were pending
+        self.inner.ctx.try_wake();
+        outcome
+    }
+
+    async fn do_execute_create_mpu(&self) -> WorkOutcome {
+        let client = self.inner.ctx.s3_client();
+
+        let mpu_req =
+            copy_fields_to_mpu_request(&self.inner.request, client.create_multipart_upload());
+
+        let resp = match mpu_req
+            .send()
+            .instrument(tracing::debug_span!("send-create-multipart-upload"))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let upload_id = resp.upload_id().expect("upload_id present").to_string();
+        let response_builder = UploadOutputBuilder::from(resp);
+
+        let (stream, content_length) = {
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+            match &mut *state {
+                UploadState::PendingInit {
+                    stream,
+                    content_length,
+                    ..
+                } => (
+                    stream.take().expect("stream already taken"),
+                    content_length.take().expect("content_length already taken"),
+                ),
+                _ => panic!("unexpected state for create_mpu"),
+            }
+        };
+
+        let part_size = cmp::max(
+            self.inner.ctx.handle.upload_part_size_bytes(),
+            content_length.div_ceil(MAX_PARTS),
+        );
+
+        let total_parts = content_length.div_ceil(part_size);
+
+        tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
+
+        let part_reader = Arc::new(
+            PartReaderBuilder::new()
+                .stream(stream)
+                .part_size(part_size.try_into().expect("valid part size"))
+                .build(),
+        );
+
+        {
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+            *state = UploadState::Transferring {
+                upload_id,
+                part_reader,
+                next_part: 1,
+                total_parts,
+                parts_in_flight: 0,
+                completed_parts: Vec::with_capacity(total_parts as usize),
+                response_builder,
+            };
+        }
+
+        WorkOutcome::Success(None)
+    }
+
+    async fn execute_upload_part(
+        &self,
+        part_number: u64,
+        part_data: &mut Option<PartData>,
+        kind: WorkKind,
+    ) -> WorkOutcome {
+        match kind {
+            WorkKind::DataIO => self.execute_read_part(part_number, part_data).await,
+            WorkKind::Network => self.execute_send_part(part_number, part_data).await,
+        }
+    }
+
+    async fn execute_read_part(
+        &self,
+        part_number: u64,
+        part_data: &mut Option<PartData>,
+    ) -> WorkOutcome {
+        let part_reader = {
+            let state = self.inner.state.lock().expect("upload state lock poisoned");
+            match &*state {
+                UploadState::Transferring { part_reader, .. } => part_reader.clone(),
+                _ => panic!("unexpected state for read_part"),
+            }
+        };
+
+        match part_reader
+            .next_part()
+            .instrument(tracing::debug_span!("read-upload-body"))
+            .await
+        {
+            Ok(Some(data)) => {
+                *part_data = Some(data);
+                WorkOutcome::Success(Some(WorkItem {
+                    kind: WorkKind::Network,
+                    data: Some(Box::new(UploadWork::UploadPart {
+                        part_number,
+                        part_data: part_data.take(),
+                    })),
+                }))
+            }
+            Ok(None) => {
+                tracing::trace!(
+                    "part_reader returned None for part {} (size_hint was upper bound)",
+                    part_number
+                );
+                self.maybe_transition_to_completing();
+                WorkOutcome::Success(None)
+            }
+            Err(e) => self.fail(e.into()),
+        }
+    }
+
+    async fn execute_send_part(
+        &self,
+        part_number: u64,
+        part_data: &mut Option<PartData>,
+    ) -> WorkOutcome {
+        let data = part_data
+            .take()
+            .expect("part_data should be set after DataIO");
+
+        let upload_id = {
+            let state = self.inner.state.lock().expect("upload state lock poisoned");
+            match &*state {
+                UploadState::Transferring { upload_id, .. } => upload_id.clone(),
+                _ => panic!("unexpected state for send_part"),
+            }
+        };
+
+        let part_num_i32 = part_number as i32;
+        let content_length = data.data.remaining() as i64;
+
+        let req = copy_fields_to_upload_part_request(
+            &self.inner.request,
+            self.inner
+                .ctx
+                .s3_client()
+                .upload_part()
+                .upload_id(&upload_id)
+                .part_number(part_num_i32)
+                .content_length(content_length)
+                .body(ByteStream::from(data.data)),
+            data.checksum.as_ref(),
+        );
+
+        let resp = match req
+            .customize()
+            .disable_payload_signing()
+            .send()
+            .instrument(tracing::debug_span!("send-upload-part", part_number))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let completed = CompletedPart::builder()
+            .part_number(part_num_i32)
+            .set_e_tag(resp.e_tag.clone())
+            .set_checksum_crc32(resp.checksum_crc32.clone())
+            .set_checksum_crc32_c(resp.checksum_crc32_c.clone())
+            .set_checksum_crc64_nvme(resp.checksum_crc64_nvme.clone())
+            .set_checksum_sha1(resp.checksum_sha1.clone())
+            .set_checksum_sha256(resp.checksum_sha256.clone())
+            .build();
+
+        {
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+            if let UploadState::Transferring {
+                completed_parts, ..
+            } = &mut *state
+            {
+                completed_parts.push(completed);
+            }
+        }
+
+        self.maybe_transition_to_completing();
+
+        WorkOutcome::Success(None)
+    }
+
+    fn maybe_transition_to_completing(&self) {
+        let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+        let should_complete = if let UploadState::Transferring {
+            parts_in_flight,
+            next_part,
+            total_parts,
+            ..
+        } = &mut *state
+        {
+            *parts_in_flight -= 1;
+            *next_part > *total_parts && *parts_in_flight == 0
+        } else {
+            false
+        };
+
+        if should_complete {
+            if let UploadState::Transferring {
+                upload_id,
+                part_reader,
+                completed_parts,
+                response_builder,
+                ..
+            } = std::mem::replace(&mut *state, UploadState::Done)
+            {
+                *state = UploadState::Completing {
+                    upload_id: Some(upload_id),
+                    part_reader: Some(part_reader),
+                    completed_parts: Some(completed_parts),
+                    response_builder: Some(response_builder),
+                    complete_in_flight: false,
+                };
+            }
+            drop(state);
+            self.inner.ctx.try_wake();
+        }
+    }
+
+    async fn execute_put_object(&self, stream: &mut Option<InputStream>) -> WorkOutcome {
+        use crate::operation::upload::input::convert::copy_fields_to_put_object_request;
+
+        let stream = stream
+            .take()
+            .expect("stream should be present for PutObject");
+
+        // TODO: Currently PutObject does not use our DataIO scheduling - the actual
+        // disk I/O happens lazily when the SDK consumes the ByteStream during HTTP send.
+        // For true scheduler control over disk I/O (important for large numbers of small files),
+        // InputStream internals will need to be tightly integrated with our DataIO work layer.
+        let byte_stream = match stream.into_byte_stream().await {
+            Ok(bs) => bs,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let put_req = copy_fields_to_put_object_request(
+            &self.inner.request,
+            self.inner.ctx.s3_client().put_object().body(byte_stream),
+        );
+
+        let resp = match put_req
+            .customize()
+            .disable_payload_signing()
+            .send()
+            .instrument(tracing::debug_span!("send-put-object"))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let result = UploadOutputBuilder::from(resp)
+            .build()
+            .expect("valid response");
+
+        *self
+            .inner
+            .result
+            .lock()
+            .expect("upload result lock poisoned") = Some(result);
+        self.inner.ctx.set_completed();
+        self.inner.ctx.signal_terminal();
+
+        WorkOutcome::Success(None)
+    }
+
+    async fn execute_complete_mpu(&self) -> WorkOutcome {
+        let (upload_id, mut completed_parts, response_builder, part_reader) = {
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+            match &mut *state {
+                UploadState::Completing {
+                    upload_id,
+                    completed_parts,
+                    response_builder,
+                    part_reader,
+                    ..
+                } => (
+                    upload_id.take().expect("upload_id already taken"),
+                    completed_parts
+                        .take()
+                        .expect("completed_parts already taken"),
+                    response_builder
+                        .take()
+                        .expect("response_builder already taken"),
+                    part_reader.take().expect("part_reader already taken"),
+                ),
+                _ => panic!("unexpected state for complete_mpu"),
+            }
+        };
+
+        completed_parts.sort_by_key(|p| p.part_number);
+
+        let base_req = self
+            .inner
+            .ctx
+            .s3_client()
+            .complete_multipart_upload()
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build(),
+            );
+
+        let complete_req = super::input::convert::copy_fields_to_complete_mpu_request(
+            &self.inner.request,
+            base_req,
+            || async { part_reader.full_object_checksum().await },
+        )
+        .await;
+
+        let resp = match complete_req
+            .send()
+            .instrument(tracing::debug_span!("send-complete-multipart-upload"))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return self.fail(e.into()),
+        };
+
+        let result = response_builder
+            .update_from_complete_mpu(&resp)
+            .build()
+            .expect("valid response");
+
+        *self
+            .inner
+            .result
+            .lock()
+            .expect("upload result lock poisoned") = Some(result);
+        self.inner.ctx.set_completed();
+        self.inner.ctx.signal_terminal();
+
+        WorkOutcome::Success(None)
+    }
+
+    fn fail(&self, error: Error) -> WorkOutcome {
+        self.inner.ctx.set_failed(error);
+        self.inner.ctx.signal_terminal();
+        WorkOutcome::Failed
+    }
+}
+
+impl Transfer for UploadTransfer {
+    fn ctx(&self) -> &TransferContext {
+        UploadTransfer::ctx(self)
+    }
+
+    fn poll_work(&self) -> PollWork {
+        UploadTransfer::poll_work(self)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        work: &'a mut WorkItem,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        Box::pin(UploadTransfer::execute(self, work))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::InputStream;
+    use crate::scheduler::test_util::{assert_pending, assert_ready};
+    use crate::scheduler::WorkKind;
+    use crate::DEFAULT_CONCURRENCY;
+    use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+    use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+    use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+
+    fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
+        let handle = Arc::new(crate::client::Handle {
+            config: crate::Config::builder().client(s3_client).build(),
+            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+            legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
+                crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
+            ),
+        });
+
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let stream = InputStream::from(content);
+
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        UploadTransfer::new(ctx, BucketType::Standard, input, stream)
+    }
+
+    fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id("test-upload-id")
+                .build()
+        });
+
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_output(|| {
+            CompleteMultipartUploadOutput::builder()
+                .e_tag("final-etag")
+                .build()
+        });
+
+        mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[create_mpu, upload_part, complete_mpu]
+        )
+    }
+
+    #[test]
+    fn test_poll_work_initial_state_returns_create_mpu() {
+        let s3_client = mock_client!(aws_sdk_s3, []);
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::CreateMPU));
+    }
+
+    #[test]
+    fn test_poll_work_pending_while_init_in_flight() {
+        let s3_client = mock_client!(aws_sdk_s3, []);
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        let _work = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
+    }
+
+    #[tokio::test]
+    async fn test_poll_work_generates_parts_after_create_mpu() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        let mut work = assert_ready(transfer.poll_work());
+        transfer.execute(&mut work).await;
+
+        let mut work1 = assert_ready(transfer.poll_work());
+        let data1 = work1.data_mut::<UploadWork>();
+        assert!(matches!(
+            data1,
+            UploadWork::UploadPart { part_number: 1, .. }
+        ));
+
+        let mut work2 = assert_ready(transfer.poll_work());
+        let data2 = work2.data_mut::<UploadWork>();
+        assert!(matches!(
+            data2,
+            UploadWork::UploadPart { part_number: 2, .. }
+        ));
+
+        assert_pending(transfer.poll_work());
+    }
+
+    #[tokio::test]
+    async fn test_execute_create_mpu_transitions_to_transferring() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        let mut work = assert_ready(transfer.poll_work());
+
+        let outcome = transfer.execute(&mut work).await;
+        assert!(matches!(outcome, WorkOutcome::Success(None)));
+
+        let mut next = assert_ready(transfer.poll_work());
+        let data = next.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::UploadPart { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_part_returns_schedule_next_network() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        let mut create_work = assert_ready(transfer.poll_work());
+        transfer.execute(&mut create_work).await;
+
+        let mut part_work = assert_ready(transfer.poll_work());
+        assert_eq!(part_work.kind, WorkKind::DataIO);
+
+        let outcome = transfer.execute(&mut part_work).await;
+        match outcome {
+            WorkOutcome::Success(Some(mut work_item)) => {
+                assert_eq!(work_item.kind, WorkKind::Network);
+                if let Some(ref mut boxed_data) = work_item.data {
+                    let upload_work = (**boxed_data)
+                        .as_any_mut()
+                        .downcast_mut::<UploadWork>()
+                        .unwrap();
+                    if let UploadWork::UploadPart { part_data, .. } = upload_work {
+                        assert!(part_data.is_some());
+                    } else {
+                        panic!("expected UploadPart data");
+                    }
+                } else {
+                    panic!("expected Some data");
+                }
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_full_mpu_flow() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        // 1. CreateMPU
+        let mut work = assert_ready(transfer.poll_work());
+        transfer.execute(&mut work).await;
+
+        // 2. UploadPart - DataIO phase
+        let mut work = assert_ready(transfer.poll_work());
+        let outcome = transfer.execute(&mut work).await;
+
+        // 3. UploadPart - Network phase
+        let mut work = match outcome {
+            WorkOutcome::Success(Some(work_item)) => {
+                assert_eq!(work_item.kind, WorkKind::Network);
+                work_item
+            }
+            _ => panic!("expected schedule_next Network"),
+        };
+        transfer.execute(&mut work).await;
+
+        // 3b. Second UploadPart - DataIO phase
+        let mut work = assert_ready(transfer.poll_work());
+        let outcome = transfer.execute(&mut work).await;
+
+        // 3c. Second UploadPart - Network phase
+        let mut work = match outcome {
+            WorkOutcome::Success(Some(work_item)) => {
+                assert_eq!(work_item.kind, WorkKind::Network);
+                work_item
+            }
+            _ => panic!("expected schedule_next Network for part 2"),
+        };
+        transfer.execute(&mut work).await;
+
+        // 4. CompleteMPU
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::CompleteMPU));
+        transfer.execute(&mut work).await;
+
+        // 5. Should be Done
+        use crate::scheduler::test_util::assert_done;
+        assert_done(transfer.poll_work());
+
+        // 6. Result should be available
+        assert!(transfer.take_result().is_some());
+    }
+}
