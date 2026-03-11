@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient, SharedHttpClient};
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
@@ -25,12 +26,19 @@ use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
 
+std::thread_local! {
+    /// Identifies which managed thread the current OS thread corresponds to.
+    /// Set once during thread startup, read by the per-thread HTTP client dispatch.
+    static MANAGED_THREAD_CPU: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// One managed OS thread and its tokio current-thread handle.
 struct ThreadHandle {
     id: Cpu,
     runtime_handle: tokio::runtime::Handle,
     join_handle: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<AtomicUsize>,
+    http_client: SharedHttpClient,
 }
 
 impl std::fmt::Debug for ThreadHandle {
@@ -137,13 +145,16 @@ impl ManagedThreadRuntime {
     fn new(scheduler: Scheduler, topology: Topology, pin_threads: bool) -> Self {
         let shutdown_token = CancellationToken::new();
 
+        let dns_resolver = aws_smithy_dns::HickoryDnsResolver::default();
         // spawn and initialize concurrently
         let pending: Vec<_> = topology
             .thread_ids()
             .map(|id| {
                 let shutdown = shutdown_token.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
+                let cpu_index = id.0;
 
+                let resolver = dns_resolver.clone();
                 let join_handle = std::thread::Builder::new()
                     .name(format!("s3-tm-{}", id))
                     .spawn(move || {
@@ -152,7 +163,17 @@ impl ManagedThreadRuntime {
                             .max_blocking_threads(1)
                             .build()
                             .expect("failed to create tokio current-thread runtime");
-                        let _ = tx.send(rt.handle().clone());
+
+                        // Create per-thread HTTP client on this thread's runtime.
+                        // The TLS connector and connection pool bind to this thread's reactor.
+                        let http_client = aws_smithy_http_client::Builder::new()
+                            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+                            ))
+                            .build_with_resolver(resolver);
+
+                        let _ = tx.send((rt.handle().clone(), http_client));
+                        MANAGED_THREAD_CPU.set(Some(cpu_index));
                         rt.block_on(shutdown.cancelled());
                     })
                     .expect("failed to spawn managed thread");
@@ -161,18 +182,35 @@ impl ManagedThreadRuntime {
             })
             .collect();
 
-        let threads = pending
+        let threads: Vec<_> = pending
             .into_iter()
             .map(|(id, rx, join_handle)| {
-                let runtime_handle = rx.recv().expect("managed thread failed to start");
+                let (runtime_handle, http_client) =
+                    rx.recv().expect("managed thread failed to start");
                 ThreadHandle {
                     id,
                     runtime_handle,
                     join_handle: Mutex::new(Some(join_handle)),
                     in_flight: Arc::new(AtomicUsize::new(0)),
+                    http_client,
                 }
             })
             .collect();
+
+        // Build an http_client_fn that dispatches to the per-thread HTTP client
+        // based on which managed thread is calling.
+        let per_thread_clients: Arc<Vec<SharedHttpClient>> =
+            Arc::new(threads.iter().map(|th| th.http_client.clone()).collect());
+
+        let shared_http_client = http_client_fn(move |settings, components| {
+            let cpu_index = MANAGED_THREAD_CPU
+                .with(|c| c.get())
+                .expect("http_client_fn called from non-managed thread");
+            per_thread_clients[cpu_index].http_connector(settings, components)
+        });
+
+        let mut components = RuntimeComponents::default();
+        components.set_http_client(shared_http_client);
 
         Self {
             scheduler,
@@ -181,7 +219,7 @@ impl ManagedThreadRuntime {
             threads,
             shutdown_token,
             router: DispatchRouter,
-            components: RuntimeComponents::default(),
+            components,
         }
     }
 }
@@ -299,6 +337,7 @@ mod tests {
             runtime_handle: rt.handle().clone(),
             join_handle: Mutex::new(None),
             in_flight: Arc::new(AtomicUsize::new(in_flight_count)),
+            http_client: http_client_fn(|_, _| unreachable!("test http client")),
         }
     }
 

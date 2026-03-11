@@ -310,7 +310,7 @@ fn dump_threads(label: &str) {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
     if args.tokio_console {
@@ -333,25 +333,12 @@ async fn main() -> Result<(), BoxError> {
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
     };
 
-    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .load()
-        .await;
-    let dns_resolver = aws_smithy_dns::HickoryDnsResolver::default();
-    let http_client = aws_smithy_http_client::Builder::new()
-        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-            CryptoMode::AwsLc,
-        ))
-        .build_with_resolver(dns_resolver);
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Builder::from(&shared_config)
-            .http_client(http_client)
-            .build(),
-    );
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+    let tm_config = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size))
-        .build();
+        .load()
+        .await;
+
     dump_threads("before Client::new");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
     dump_threads("after Client::new");
