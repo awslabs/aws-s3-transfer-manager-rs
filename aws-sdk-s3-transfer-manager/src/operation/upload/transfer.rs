@@ -46,7 +46,10 @@ const MAX_PARTS: u64 = 10_000;
 
 /// Upload transfer that generates and executes upload work.
 ///
-/// Cheap to clone - all state is behind `Arc`.
+/// Cheap to clone — all state is behind `Arc`. The scheduler stores transfers as
+/// `Arc<dyn Transfer>` (outer Arc), while `UploadHandle` holds a direct clone of
+/// `UploadTransfer` (inner Arc) to access upload-specific methods like `take_result()`
+/// and `upload_id()` without downcasting.
 #[derive(Debug, Clone)]
 pub(crate) struct UploadTransfer {
     inner: Arc<UploadTransferInner>,
@@ -58,6 +61,9 @@ struct UploadTransferInner {
     /// Common transfer lifecycle management
     ctx: TransferContext,
     /// State machine for work progression
+    // TODO(vnext): evaluate parking_lot::Mutex — this lock is acquired on every
+    // poll_work and execute call; parking_lot avoids syscall overhead on the
+    // uncontended path and has no poisoning.
     state: Mutex<UploadState>,
     /// The original request (body taken for processing)
     request: Arc<UploadInput>,
@@ -77,7 +83,8 @@ impl UploadTransfer {
         request: UploadInput,
         stream: InputStream,
     ) -> Self {
-        // TODO: For unknown content length (streaming uploads), this will need adjustment.
+        // TODO(vnext): Relax this constraint — unknown content length implies MPU
+        // https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/90
         let content_length = stream
             .size_hint()
             .upper()
@@ -86,8 +93,8 @@ impl UploadTransfer {
         let inner = Arc::new(UploadTransferInner {
             ctx,
             state: Mutex::new(UploadState::PendingInit {
-                stream,
-                content_length,
+                stream: Some(stream),
+                content_length: Some(content_length),
                 init_in_flight: false,
             }),
             request: Arc::new(request),
@@ -112,22 +119,26 @@ impl UploadTransfer {
 
     /// Take the upload result. Available after successful completion.
     pub(crate) fn take_result(&self) -> Option<UploadOutput> {
-        self.inner.result.lock().unwrap().take()
+        self.inner
+            .result
+            .lock()
+            .expect("upload result lock poisoned")
+            .take()
     }
 
     /// Get the upload_id if MPU was started.
     pub(crate) fn upload_id(&self) -> Option<String> {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.state.lock().expect("upload state lock poisoned");
         match &*state {
-            UploadState::Transferring { upload_id, .. }
-            | UploadState::Completing { upload_id, .. } => Some(upload_id.clone()),
+            UploadState::Transferring { upload_id, .. } => Some(upload_id.clone()),
+            UploadState::Completing { upload_id, .. } => upload_id.clone(),
             _ => None,
         }
     }
 
     /// Check if CreateMPU is currently in flight.
     pub(crate) fn is_create_mpu_in_flight(&self) -> bool {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.state.lock().expect("upload state lock poisoned");
         matches!(
             &*state,
             UploadState::PendingInit {
@@ -153,7 +164,7 @@ impl UploadTransfer {
             return PollWork::Done;
         }
 
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.state.lock().expect("upload state lock poisoned");
 
         match &mut *state {
             UploadState::PendingInit {
@@ -166,8 +177,8 @@ impl UploadTransfer {
                     return PollWork::Pending;
                 }
 
-                let use_mpu = stream.is_mpu_only()
-                    || *content_length >= self.inner.ctx.handle.mpu_threshold_bytes();
+                let use_mpu = stream.as_ref().map_or(false, |s| s.is_mpu_only())
+                    || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
                     PollWork::Ready(WorkItem {
@@ -176,29 +187,45 @@ impl UploadTransfer {
                     })
                 } else {
                     // Take ownership of stream by replacing state
-                    match std::mem::replace(&mut *state, UploadState::PutObjectInFlight) {
-                        UploadState::PendingInit { stream, .. } => PollWork::Ready(WorkItem {
-                            kind: WorkKind::Network,
-                            data: Some(Box::new(UploadWork::PutObject {
-                                stream: Some(stream),
-                            })),
-                        }),
-                        _ => unreachable!(),
-                    }
+                    let taken_stream = stream.take().expect("stream already taken in PendingInit");
+                    *state = UploadState::PutObjectInFlight;
+                    PollWork::Ready(WorkItem {
+                        kind: WorkKind::Network,
+                        data: Some(Box::new(UploadWork::PutObject {
+                            stream: Some(taken_stream),
+                        })),
+                    })
                 }
             }
             UploadState::Transferring {
                 next_part,
                 total_parts,
                 parts_in_flight,
-                ..
+                upload_id,
+                part_reader,
+                completed_parts,
+                response_builder,
             } => {
                 if *next_part > *total_parts {
                     if *parts_in_flight > 0 {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
                     }
-                    self.inner.ctx.set_pending();
+                    // All parts sent and completed — transition to Completing
+                    let upload_id = std::mem::take(upload_id);
+                    let part_reader = part_reader.clone();
+                    let completed_parts = std::mem::take(completed_parts);
+                    let response_builder =
+                        std::mem::replace(response_builder, UploadOutputBuilder::default());
+                    *state = UploadState::Completing {
+                        upload_id: Some(upload_id),
+                        part_reader: Some(part_reader),
+                        completed_parts: Some(completed_parts),
+                        response_builder: Some(response_builder),
+                        complete_in_flight: false,
+                    };
+                    drop(state);
+                    self.inner.ctx.try_wake();
                     return PollWork::Pending;
                 }
                 let part_number = *next_part;
@@ -278,14 +305,17 @@ impl UploadTransfer {
         let response_builder = UploadOutputBuilder::from(resp);
 
         let (stream, content_length) = {
-            let mut state = self.inner.state.lock().unwrap();
-            match std::mem::replace(&mut *state, UploadState::Done) {
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+            match &mut *state {
                 UploadState::PendingInit {
                     stream,
                     content_length,
                     ..
-                } => (stream, content_length),
-                _ => panic!("unexpected state"),
+                } => (
+                    stream.take().expect("stream already taken"),
+                    content_length.take().expect("content_length already taken"),
+                ),
+                _ => panic!("unexpected state for create_mpu"),
             }
         };
 
@@ -306,7 +336,7 @@ impl UploadTransfer {
         );
 
         {
-            let mut state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
             *state = UploadState::Transferring {
                 upload_id,
                 part_reader,
@@ -339,7 +369,7 @@ impl UploadTransfer {
         part_data: &mut Option<PartData>,
     ) -> WorkOutcome {
         let part_reader = {
-            let state = self.inner.state.lock().unwrap();
+            let state = self.inner.state.lock().expect("upload state lock poisoned");
             match &*state {
                 UploadState::Transferring { part_reader, .. } => part_reader.clone(),
                 _ => panic!("unexpected state for read_part"),
@@ -362,7 +392,10 @@ impl UploadTransfer {
                 }))
             }
             Ok(None) => {
-                tracing::warn!("part_reader returned None for part {}", part_number);
+                tracing::trace!(
+                    "part_reader returned None for part {} (size_hint was upper bound)",
+                    part_number
+                );
                 self.maybe_transition_to_completing();
                 WorkOutcome::Success(None)
             }
@@ -380,7 +413,7 @@ impl UploadTransfer {
             .expect("part_data should be set after DataIO");
 
         let upload_id = {
-            let state = self.inner.state.lock().unwrap();
+            let state = self.inner.state.lock().expect("upload state lock poisoned");
             match &*state {
                 UploadState::Transferring { upload_id, .. } => upload_id.clone(),
                 _ => panic!("unexpected state for send_part"),
@@ -425,7 +458,7 @@ impl UploadTransfer {
             .build();
 
         {
-            let mut state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
             if let UploadState::Transferring {
                 completed_parts, ..
             } = &mut *state
@@ -440,7 +473,7 @@ impl UploadTransfer {
     }
 
     fn maybe_transition_to_completing(&self) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.state.lock().expect("upload state lock poisoned");
         let should_complete = if let UploadState::Transferring {
             parts_in_flight,
             next_part,
@@ -464,10 +497,10 @@ impl UploadTransfer {
             } = std::mem::replace(&mut *state, UploadState::Done)
             {
                 *state = UploadState::Completing {
-                    upload_id,
-                    part_reader,
-                    completed_parts,
-                    response_builder,
+                    upload_id: Some(upload_id),
+                    part_reader: Some(part_reader),
+                    completed_parts: Some(completed_parts),
+                    response_builder: Some(response_builder),
                     complete_in_flight: false,
                 };
             }
@@ -498,6 +531,8 @@ impl UploadTransfer {
         );
 
         let resp = match put_req
+            .customize()
+            .disable_payload_signing()
             .send()
             .instrument(tracing::debug_span!("send-put-object"))
             .await
@@ -510,7 +545,11 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
-        *self.inner.result.lock().unwrap() = Some(result);
+        *self
+            .inner
+            .result
+            .lock()
+            .expect("upload result lock poisoned") = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
 
@@ -519,15 +558,24 @@ impl UploadTransfer {
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
         let (upload_id, mut completed_parts, response_builder, part_reader) = {
-            let mut state = self.inner.state.lock().unwrap();
-            match std::mem::replace(&mut *state, UploadState::Done) {
+            let mut state = self.inner.state.lock().expect("upload state lock poisoned");
+            match &mut *state {
                 UploadState::Completing {
                     upload_id,
                     completed_parts,
                     response_builder,
                     part_reader,
                     ..
-                } => (upload_id, completed_parts, response_builder, part_reader),
+                } => (
+                    upload_id.take().expect("upload_id already taken"),
+                    completed_parts
+                        .take()
+                        .expect("completed_parts already taken"),
+                    response_builder
+                        .take()
+                        .expect("response_builder already taken"),
+                    part_reader.take().expect("part_reader already taken"),
+                ),
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
@@ -567,7 +615,11 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
-        *self.inner.result.lock().unwrap() = Some(result);
+        *self
+            .inner
+            .result
+            .lock()
+            .expect("upload result lock poisoned") = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
 

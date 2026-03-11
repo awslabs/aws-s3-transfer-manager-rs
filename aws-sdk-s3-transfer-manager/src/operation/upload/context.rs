@@ -17,8 +17,8 @@ use crate::operation::upload::UploadOutputBuilder;
 pub(crate) enum UploadState {
     /// Waiting to start - need to call CreateMPU (or PutObject for small uploads)
     PendingInit {
-        stream: InputStream,
-        content_length: u64,
+        stream: Option<InputStream>,
+        content_length: Option<u64>,
         init_in_flight: bool,
     },
     /// Data transfer in progress (uploading parts for MPU)
@@ -33,10 +33,10 @@ pub(crate) enum UploadState {
     },
     /// All parts done, calling CompleteMPU (MPU only)
     Completing {
-        upload_id: String,
-        part_reader: Arc<PartReader>,
-        completed_parts: Vec<CompletedPart>,
-        response_builder: UploadOutputBuilder,
+        upload_id: Option<String>,
+        part_reader: Option<Arc<PartReader>>,
+        completed_parts: Option<Vec<CompletedPart>>,
+        response_builder: Option<UploadOutputBuilder>,
         complete_in_flight: bool,
     },
     /// PutObject in flight (single request upload)

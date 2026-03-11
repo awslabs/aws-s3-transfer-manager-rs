@@ -56,7 +56,8 @@ impl Upload {
 
         let stream = input.take_body();
 
-        // TODO: Relax this constraint - unknown content length implies MPU
+        // TODO(vnext): Relax this constraint — unknown content length implies MPU
+        // https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/90
         if stream.size_hint().upper().is_none() {
             return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
         }
@@ -138,6 +139,91 @@ mod test {
             .await
             .expect("abort timed out");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_basic_upload_object() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+
+        let body = Bytes::from_static(b"small file");
+        let stream = InputStream::from(body);
+
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(1024))
+            .client(client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let handle = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream)
+            .initiate_with(&tm)
+            .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+            .await
+            .expect("join timed out");
+        assert!(
+            result.is_ok(),
+            "PutObject upload failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_basic_mpu() {
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id("test-upload-id")
+                .build()
+        });
+
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_output(|| {
+            aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput::builder()
+                .e_tag("final-etag")
+                .build()
+        });
+
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[create_mpu, upload_part, complete_mpu]
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let handle = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream)
+            .initiate_with(&tm)
+            .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+            .await
+            .expect("join timed out");
+        assert!(result.is_ok(), "MPU upload failed: {:?}", result.err());
     }
 }
 

@@ -10,7 +10,7 @@ use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
 use crate::scheduler::StateMachineTerminalReceiver;
-use crate::types::AbortedUpload;
+use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 
 /// Handle to an in-progress upload operation.
 ///
@@ -141,20 +141,32 @@ impl UploadHandle {
         let upload_id = self.transfer.upload_id();
 
         if let Some(upload_id) = upload_id {
-            let resp = copy_fields_to_abort_mpu_request(
-                self.transfer.request(),
-                ctx.s3_client()
-                    .abort_multipart_upload()
-                    .upload_id(&upload_id),
-            )
-            .send()
-            .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-            .await?;
+            let abort_policy = self
+                .transfer
+                .request()
+                .failed_multipart_upload_policy
+                .clone()
+                .unwrap_or_default();
 
-            Ok(AbortedUpload {
-                upload_id: Some(upload_id),
-                request_charged: resp.request_charged,
-            })
+            match abort_policy {
+                FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+                FailedMultipartUploadPolicy::AbortUpload => {
+                    let resp = copy_fields_to_abort_mpu_request(
+                        self.transfer.request(),
+                        ctx.s3_client()
+                            .abort_multipart_upload()
+                            .upload_id(&upload_id),
+                    )
+                    .send()
+                    .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                    .await?;
+
+                    Ok(AbortedUpload {
+                        upload_id: Some(upload_id),
+                        request_charged: resp.request_charged,
+                    })
+                }
+            }
         } else {
             Ok(AbortedUpload::default())
         }
