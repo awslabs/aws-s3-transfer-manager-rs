@@ -160,7 +160,7 @@ impl Scheduler {
             .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
-    fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
+    pub(crate) fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
         self.0.runtime.get().expect("runtime not initialized")
     }
 
