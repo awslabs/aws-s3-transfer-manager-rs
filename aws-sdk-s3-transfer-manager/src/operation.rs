@@ -71,7 +71,7 @@ impl<State> LegacyTransferContext<State> {
 
     /// The S3 client to use for SDK operations
     pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
-        self.handle.config.client()
+        &self.handle.s3_client
     }
 }
 

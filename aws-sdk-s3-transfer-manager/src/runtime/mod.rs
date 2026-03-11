@@ -14,7 +14,9 @@ mod managed;
 pub(crate) use managed::ManagedThreadRuntime;
 
 mod topology;
-pub(crate) use topology::{NumaNode, ThreadId, Topology};
+pub(crate) use topology::{Cpu, NumaNode, Topology};
+
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::transfer::{IoRequest, TransferId};
@@ -45,4 +47,27 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 
     /// Remove all pending work for a transfer. Returns count removed.
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize;
+
+    /// Runtime-provided components for S3 client construction and execution.
+    fn components(&self) -> &RuntimeComponents;
+}
+
+/// Components provided by the execution runtime to the rest of the system.
+///
+/// The runtime populates these based on its execution model.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeComponents {
+    http_client: Option<SharedHttpClient>,
+}
+
+impl RuntimeComponents {
+    /// HTTP client appropriate for this runtime's execution model.
+    pub(crate) fn http_client(&self) -> Option<&SharedHttpClient> {
+        self.http_client.as_ref()
+    }
+
+    /// Set the HTTP client.
+    pub(crate) fn set_http_client(&mut self, client: SharedHttpClient) {
+        self.http_client = Some(client);
+    }
 }

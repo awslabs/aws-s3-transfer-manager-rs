@@ -24,6 +24,7 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
+    pub(crate) s3_client: aws_sdk_s3::Client,
     pub(crate) scheduler: Scheduler,
 }
 
@@ -63,11 +64,39 @@ impl Handle {
             PartSize::Target(explicit) => *explicit,
         }
     }
+
+    /// Create a Handle from a Config and Scheduler, resolving the S3 client.
+    #[cfg(test)]
+    pub(crate) fn with_config_and_scheduler(
+        mut config: crate::Config,
+        scheduler: Scheduler,
+    ) -> Self {
+        let s3_client = match config.take_s3_client_source() {
+            crate::config::S3ClientSource::Provided(client) => client,
+            crate::config::S3ClientSource::FromConfig(s3_config) => {
+                aws_sdk_s3::Client::from_conf(s3_config.builder.build())
+            }
+        };
+        Self {
+            config,
+            s3_client,
+            scheduler,
+        }
+    }
 }
 
 impl Client {
     /// Creates a new client from a transfer manager config.
-    pub fn new(config: Config) -> Client {
+    pub fn new(mut config: Config) -> Client {
+        let s3_client = match config.take_s3_client_source() {
+            crate::config::S3ClientSource::Provided(client) => client,
+            crate::config::S3ClientSource::FromConfig(s3_config) => {
+                let builder = s3_config.builder;
+                // TODO: inject runtime HTTP client here when enable_runtime_http is true
+                aws_sdk_s3::Client::from_conf(builder.build())
+            }
+        };
+
         let adaptive_config = AdaptiveConfig::default();
         let io_counters = Arc::new(IOCounters::new(adaptive_config.window.duration));
         let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
@@ -82,7 +111,11 @@ impl Client {
             // .build(|scheduler| Arc::new(TokioMultiThreadRuntime::new(scheduler)));
             .build(|scheduler| Arc::new(ManagedThreadRuntime::builder(scheduler).build()));
 
-        let handle = Arc::new(Handle { config, scheduler });
+        let handle = Arc::new(Handle {
+            config,
+            s3_client,
+            scheduler,
+        });
         Client { handle }
     }
 

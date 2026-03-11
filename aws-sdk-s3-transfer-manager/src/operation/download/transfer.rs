@@ -553,10 +553,10 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = Arc::new(crate::client::Handle {
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             config,
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        });
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -658,10 +658,10 @@ mod tests {
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
-        let handle = Arc::new(crate::client::Handle {
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             config,
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        });
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")

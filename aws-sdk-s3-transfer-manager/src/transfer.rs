@@ -405,7 +405,7 @@ impl TransferContext {
 
     /// The S3 client to use for SDK operations
     pub(crate) fn s3_client(&self) -> &aws_sdk_s3::Client {
-        self.handle.config.client()
+        &self.handle.s3_client
     }
 
     /// The cancellation token for this transfer

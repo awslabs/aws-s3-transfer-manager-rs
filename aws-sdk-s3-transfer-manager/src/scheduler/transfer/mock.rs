@@ -52,10 +52,10 @@ impl MockTransfer {
         // Create a minimal handle for testing
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = Arc::new(crate::client::Handle {
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             config,
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        });
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let (ctx, _completion_rx) = TransferContext::with_id(id, handle);
 

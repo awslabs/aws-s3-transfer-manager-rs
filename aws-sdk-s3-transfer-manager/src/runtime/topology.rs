@@ -7,17 +7,17 @@
 
 use std::fmt;
 
-/// Identity of a managed thread within a runtime.
+/// A logical CPU that a managed thread is pinned to.
 ///
-/// A dense index assigned during topology construction, not an OS thread id
-/// or core id. `ThreadId(0)` is the first thread created, `ThreadId(1)` the
-/// second, etc. Use [`Topology`] to map a `ThreadId` to its core and NUMA node.
+/// Dense index assigned during topology construction, not a hardware
+/// core id. Use [`Topology`] to map a `Cpu` to its hardware core and
+/// NUMA node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ThreadId(pub(crate) usize);
+pub(crate) struct Cpu(pub(crate) usize);
 
-impl fmt::Display for ThreadId {
+impl fmt::Display for Cpu {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "thread-{}", self.0)
+        write!(f, "cpu-{}", self.0)
     }
 }
 
@@ -39,7 +39,7 @@ pub(crate) struct Topology {
     /// Pre-computed: thread_id.0 to (node index, core id)
     thread_map: Vec<(usize, usize)>,
     /// Pre-computed: node index to thread ids
-    node_threads: Vec<Vec<ThreadId>>,
+    node_threads: Vec<Vec<Cpu>>,
 }
 
 impl Topology {
@@ -57,7 +57,7 @@ impl Topology {
         let mut node_threads = vec![Vec::new(); nodes.len()];
         for (node_idx, node) in nodes.iter().enumerate() {
             for &core in &node.cores {
-                let tid = ThreadId(thread_map.len());
+                let tid = Cpu(thread_map.len());
                 thread_map.push((node_idx, core));
                 node_threads[node_idx].push(tid);
             }
@@ -75,22 +75,22 @@ impl Topology {
     }
 
     /// All thread ids.
-    pub(crate) fn thread_ids(&self) -> impl Iterator<Item = ThreadId> {
-        (0..self.thread_map.len()).map(ThreadId)
+    pub(crate) fn thread_ids(&self) -> impl Iterator<Item = Cpu> {
+        (0..self.thread_map.len()).map(Cpu)
     }
 
     /// NUMA node index for a thread.
-    pub(crate) fn node_for_thread(&self, id: ThreadId) -> usize {
+    pub(crate) fn node_for_thread(&self, id: Cpu) -> usize {
         self.thread_map[id.0].0
     }
 
     /// Core id for a thread (for pinning).
-    pub(crate) fn core_for_thread(&self, id: ThreadId) -> usize {
+    pub(crate) fn core_for_thread(&self, id: Cpu) -> usize {
         self.thread_map[id.0].1
     }
 
     /// All threads on a NUMA node.
-    pub(crate) fn threads_on_node(&self, node: usize) -> &[ThreadId] {
+    pub(crate) fn threads_on_node(&self, node: usize) -> &[Cpu] {
         &self.node_threads[node]
     }
 
@@ -116,8 +116,8 @@ mod tests {
         assert_eq!(topo.num_nodes(), 1);
         assert_eq!(topo.threads_on_node(0).len(), 4);
         for i in 0..4 {
-            assert_eq!(topo.core_for_thread(ThreadId(i)), i);
-            assert_eq!(topo.node_for_thread(ThreadId(i)), 0);
+            assert_eq!(topo.core_for_thread(Cpu(i)), i);
+            assert_eq!(topo.node_for_thread(Cpu(i)), 0);
         }
     }
 
@@ -138,12 +138,12 @@ mod tests {
         assert_eq!(topo.threads_on_node(0).len(), 4);
         assert_eq!(topo.threads_on_node(1).len(), 4);
         for i in 0..4 {
-            assert_eq!(topo.node_for_thread(ThreadId(i)), 0);
-            assert_eq!(topo.core_for_thread(ThreadId(i)), i);
+            assert_eq!(topo.node_for_thread(Cpu(i)), 0);
+            assert_eq!(topo.core_for_thread(Cpu(i)), i);
         }
         for i in 4..8 {
-            assert_eq!(topo.node_for_thread(ThreadId(i)), 1);
-            assert_eq!(topo.core_for_thread(ThreadId(i)), i);
+            assert_eq!(topo.node_for_thread(Cpu(i)), 1);
+            assert_eq!(topo.core_for_thread(Cpu(i)), i);
         }
     }
 
@@ -161,21 +161,21 @@ mod tests {
         ]);
         assert_eq!(topo.num_threads(), 8);
         // Thread 0 → core 0, thread 1 → core 2, thread 2 → core 4, thread 3 → core 6
-        assert_eq!(topo.core_for_thread(ThreadId(0)), 0);
-        assert_eq!(topo.core_for_thread(ThreadId(1)), 2);
-        assert_eq!(topo.core_for_thread(ThreadId(2)), 4);
-        assert_eq!(topo.core_for_thread(ThreadId(3)), 6);
+        assert_eq!(topo.core_for_thread(Cpu(0)), 0);
+        assert_eq!(topo.core_for_thread(Cpu(1)), 2);
+        assert_eq!(topo.core_for_thread(Cpu(2)), 4);
+        assert_eq!(topo.core_for_thread(Cpu(3)), 6);
         // Thread 4 → core 1, thread 5 → core 3, thread 6 → core 5, thread 7 → core 7
-        assert_eq!(topo.core_for_thread(ThreadId(4)), 1);
-        assert_eq!(topo.core_for_thread(ThreadId(5)), 3);
-        assert_eq!(topo.core_for_thread(ThreadId(6)), 5);
-        assert_eq!(topo.core_for_thread(ThreadId(7)), 7);
+        assert_eq!(topo.core_for_thread(Cpu(4)), 1);
+        assert_eq!(topo.core_for_thread(Cpu(5)), 3);
+        assert_eq!(topo.core_for_thread(Cpu(6)), 5);
+        assert_eq!(topo.core_for_thread(Cpu(7)), 7);
     }
 
     #[test]
     fn thread_ids_iterator() {
         let topo = Topology::uniform(3);
         let ids: Vec<_> = topo.thread_ids().collect();
-        assert_eq!(ids, vec![ThreadId(0), ThreadId(1), ThreadId(2)]);
+        assert_eq!(ids, vec![Cpu(0), Cpu(1), Cpu(2)]);
     }
 }

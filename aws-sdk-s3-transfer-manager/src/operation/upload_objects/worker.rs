@@ -710,7 +710,7 @@ mod tests {
 
         let scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
 
-        let handle = std::sync::Arc::new(Handle { config, scheduler });
+        let handle = std::sync::Arc::new(Handle::with_config_and_scheduler(config, scheduler));
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)

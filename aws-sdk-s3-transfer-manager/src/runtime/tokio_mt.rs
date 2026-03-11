@@ -14,7 +14,7 @@ use futures_util::FutureExt;
 
 mod worker_pool;
 
-use super::{ExecutionRuntime, ScheduledWork};
+use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
 use worker_pool::WorkerPool;
@@ -28,6 +28,7 @@ pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
     scheduler: Scheduler,
     worker_count: AtomicUsize,
+    components: RuntimeComponents,
 }
 
 impl TokioMultiThreadRuntime {
@@ -36,6 +37,7 @@ impl TokioMultiThreadRuntime {
             pool: Arc::new(WorkerPool::new()),
             scheduler,
             worker_count: AtomicUsize::new(0),
+            components: RuntimeComponents::default(),
         }
     }
 
@@ -89,6 +91,10 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
 
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize {
         self.pool.remove_for_transfer(id)
+    }
+
+    fn components(&self) -> &RuntimeComponents {
+        &self.components
     }
 }
 

@@ -16,14 +16,62 @@ pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_
 
 // FIXME - should target throughput be configurable for upload and download independently?
 
+/// S3 client configuration for the transfer manager.
+///
+/// Wraps an `aws_sdk_s3::config::Builder` with transfer-manager-specific
+/// options. The transfer manager builds the S3 client from this configuration,
+/// injecting runtime-optimized HTTP transport by default.
+pub struct S3ClientConfig {
+    pub(crate) builder: aws_sdk_s3::config::Builder,
+    pub(crate) enable_runtime_http: bool,
+}
+
+impl S3ClientConfig {
+    /// Create a new `S3ClientConfig` from an SDK config builder.
+    pub fn new(builder: aws_sdk_s3::config::Builder) -> Self {
+        Self {
+            builder,
+            enable_runtime_http: true,
+        }
+    }
+
+    /// Control whether the transfer manager manages HTTP transport.
+    ///
+    /// When `true` (default), the runtime injects an HTTP client optimized
+    /// for its execution model (e.g. per-thread connection pools on managed
+    /// threads). When `false`, the HTTP client already set on the builder
+    /// is used as-is.
+    pub fn enable_runtime_http(mut self, enable: bool) -> Self {
+        self.enable_runtime_http = enable;
+        self
+    }
+}
+
+impl std::fmt::Debug for S3ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3ClientConfig")
+            .field("enable_runtime_http", &self.enable_runtime_http)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How the S3 client is provided to the transfer manager.
+#[derive(Debug)]
+pub(crate) enum S3ClientSource {
+    /// User provided a finished S3 client. Use as-is.
+    Provided(aws_sdk_s3::Client),
+    /// Build the S3 client from config, injecting runtime components.
+    FromConfig(S3ClientConfig),
+}
+
 /// Configuration for a [`Client`](crate::client::Client)
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
     framework_metadata: Option<FrameworkMetadata>,
-    client: aws_sdk_s3::client::Client,
+    s3_client_source: Option<S3ClientSource>,
 }
 
 impl Config {
@@ -55,20 +103,23 @@ impl Config {
         self.framework_metadata.as_ref()
     }
 
-    /// The Amazon S3 client instance that will be used to send requests to S3.
-    pub fn client(&self) -> &aws_sdk_s3::Client {
-        &self.client
+    /// Consume the S3 client source, returning it.
+    pub(crate) fn take_s3_client_source(&mut self) -> S3ClientSource {
+        self.s3_client_source
+            .take()
+            .expect("s3 client source already taken")
     }
 }
 
 /// Fluent style builder for [Config]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
-    framework_metadata: Option<FrameworkMetadata>,
+    pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
+    s3_client_config: Option<S3ClientConfig>,
 }
 
 impl Builder {
@@ -146,22 +197,39 @@ impl Builder {
     }
 
     /// Set an explicit S3 client to use.
+    ///
+    /// Either this or [`s3_config`](Self::s3_config) must be set.
+    #[doc(hidden)]
     pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
-        // TODO - decide the approach here:
-        // - Convert the client to build to modify it based on other configs for transfer manager
-        // - Instead of taking the client, take sdk-config/s3-config/builder?
         self.client = Some(client);
+        self
+    }
+
+    /// Set the S3 client configuration.
+    ///
+    /// The transfer manager builds the S3 client from this configuration,
+    /// injecting runtime-optimized HTTP transport by default. Use
+    /// [`S3ClientConfig::enable_runtime_http`] to opt out.
+    ///
+    /// Either this or [`client`](Self::client) must be set.
+    pub fn s3_config(mut self, config: S3ClientConfig) -> Self {
+        self.s3_client_config = Some(config);
         self
     }
 
     /// Consumes the builder and constructs a [`Config`]
     pub fn build(self) -> Config {
+        let s3_client_source = match (self.client, self.s3_client_config) {
+            (Some(client), _) => S3ClientSource::Provided(client),
+            (None, Some(config)) => S3ClientSource::FromConfig(config),
+            (None, None) => panic!("either client() or s3_config() must be set"),
+        };
         Config {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
             framework_metadata: self.framework_metadata,
-            client: self.client.expect("client set"),
+            s3_client_source: Some(s3_client_source),
         }
     }
 }

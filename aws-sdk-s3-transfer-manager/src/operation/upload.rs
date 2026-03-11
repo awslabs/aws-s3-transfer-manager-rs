@@ -43,8 +43,7 @@ impl Upload {
             // If SDK is configured to send checksums: use default checksum strategy.
             // Else: continue with no checksums
             if handle
-                .config
-                .client()
+                .s3_client
                 .config()
                 .request_checksum_calculation()
                 .cloned()

@@ -112,7 +112,7 @@ impl ConfigLoader {
         sdk_client_builder.push_interceptor(S3TransferManagerInterceptor::into_shared(interceptor));
         let builder = self
             .builder
-            .client(aws_sdk_s3::Client::from_conf(sdk_client_builder.build()));
+            .s3_config(crate::config::S3ClientConfig::new(sdk_client_builder));
         builder.build()
     }
 }
@@ -133,7 +133,8 @@ mod tests {
             .part_size(PartSize::Target(8))
             .load()
             .await;
-        let sdk_s3_config = config.client().config();
+        let tm_client = crate::Client::new(config);
+        let sdk_s3_config = tm_client.handle.s3_client.config();
         let tm_interceptor_exists = sdk_s3_config
             .interceptors()
             .any(|item| item.name() == "S3TransferManager");
@@ -150,9 +151,11 @@ mod tests {
             ))
             .load()
             .await;
-        // Inject the captured request to the http client to capture the request made from transfer manager.
-        let sdk_s3_config = config
-            .client()
+        // Build the TM client so we can extract the S3 client's config with interceptors.
+        let tm_client = crate::Client::new(config);
+        let sdk_s3_config = tm_client
+            .handle
+            .s3_client
             .config()
             .to_builder()
             .http_client(http_client)

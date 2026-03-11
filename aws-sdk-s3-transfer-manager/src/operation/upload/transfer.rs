@@ -658,10 +658,10 @@ mod tests {
         s3_client: aws_sdk_s3::Client,
         content: Vec<u8>,
     ) -> (UploadTransfer, UploadResultReceiver) {
-        let handle = Arc::new(crate::client::Handle {
-            config: crate::Config::builder().client(s3_client).build(),
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        });
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
+            crate::Config::builder().client(s3_client).build(),
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let input = UploadInput::builder()
             .bucket("test-bucket")

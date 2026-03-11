@@ -2,19 +2,19 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use std::error::Error;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::time::{self, SystemTime};
-
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 use aws_smithy_types::date_time::{DateTime, Format};
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::{self, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
@@ -69,6 +69,10 @@ pub struct Args {
     /// Output format
     #[arg(long, default_value = "text")]
     output: OutputFormat,
+
+    /// Directory to write output files (e.g. iterations.json)
+    #[arg(long)]
+    output_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -275,6 +279,37 @@ async fn do_recursive_upload(
     Ok(transfer_size_bytes)
 }
 
+fn dump_threads(label: &str) {
+    match std::fs::read_dir("/proc/self/task") {
+        Ok(entries) => {
+            let mut names: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for entry in entries.flatten() {
+                let status_path = entry.path().join("status");
+                let name = std::fs::read_to_string(status_path)
+                    .ok()
+                    .and_then(|s| {
+                        s.lines()
+                            .find(|l| l.starts_with("Name:"))
+                            .map(|l| l.trim_start_matches("Name:").trim().to_string())
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                *names.entry(name).or_default() += 1;
+            }
+            let total: usize = names.values().sum();
+            let mut sorted: Vec<_> = names.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("[THREADS] {label}: {total} total");
+            for (name, count) in &sorted {
+                eprintln!("[THREADS]   {count:>4} x {name}");
+            }
+        }
+        Err(_) => {
+            eprintln!("[THREADS] {label}: /proc not available");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
@@ -298,17 +333,34 @@ async fn main() -> Result<(), BoxError> {
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
     };
 
-    let tm_config = aws_sdk_s3_transfer_manager::from_env()
-        .concurrency(args.concurrency.mode())
-        .part_size(PartSize::Target(args.part_size))
+    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .load()
         .await;
+    let dns_resolver = aws_smithy_dns::HickoryDnsResolver::default();
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            CryptoMode::AwsLc,
+        ))
+        .build_with_resolver(dns_resolver);
+    let s3_client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Builder::from(&shared_config)
+            .http_client(http_client)
+            .build(),
+    );
+    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .concurrency(args.concurrency.mode())
+        .part_size(PartSize::Target(args.part_size))
+        .build();
+    dump_threads("before Client::new");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+    dump_threads("after Client::new");
 
     let json_output = matches!(args.output, OutputFormat::Json);
 
     let mut iteration_results = Vec::new();
     for i in 1..=args.iterations {
+        dump_threads(&format!("iteration {i} start"));
         let start = SystemTime::now();
         let wall_start = time::Instant::now();
 
@@ -331,6 +383,7 @@ async fn main() -> Result<(), BoxError> {
         };
 
         let elapsed = wall_start.elapsed();
+        dump_threads(&format!("iteration {i} end"));
         let end = SystemTime::now();
         let duration_secs = elapsed.as_secs_f64();
         let throughput_gbps = (bytes as f64 * 8.0) / (duration_secs * 1_000_000_000.0);
@@ -364,7 +417,12 @@ async fn main() -> Result<(), BoxError> {
     }
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&iteration_results)?);
+        let json = serde_json::to_string_pretty(&iteration_results)?;
+        if let Some(dir) = &args.output_dir {
+            fs::write(format!("{dir}/iterations.json"), &json).await?;
+        } else {
+            println!("{json}");
+        }
     }
 
     Ok(())

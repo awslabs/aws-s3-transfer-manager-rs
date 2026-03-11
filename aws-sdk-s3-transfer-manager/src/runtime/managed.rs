@@ -19,15 +19,15 @@ use std::time::{Duration, Instant};
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
-use super::topology::ThreadId;
+use super::topology::Cpu;
 use super::Topology;
-use super::{ExecutionRuntime, ScheduledWork};
+use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
 
 /// One managed OS thread and its tokio current-thread handle.
 struct ThreadHandle {
-    id: ThreadId,
+    id: Cpu,
     runtime_handle: tokio::runtime::Handle,
     join_handle: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<AtomicUsize>,
@@ -46,7 +46,7 @@ struct DispatchRouter;
 
 impl DispatchRouter {
     /// Select a thread to execute the given work.
-    fn select(&self, threads: &[ThreadHandle]) -> ThreadId {
+    fn select(&self, threads: &[ThreadHandle]) -> Cpu {
         threads
             .iter()
             .min_by_key(|th| (th.in_flight.load(Ordering::Relaxed), th.id.0))
@@ -111,6 +111,7 @@ pub(crate) struct ManagedThreadRuntime {
     threads: Vec<ThreadHandle>,
     shutdown_token: CancellationToken,
     router: DispatchRouter,
+    components: RuntimeComponents,
 }
 
 impl std::fmt::Debug for ManagedThreadRuntime {
@@ -148,6 +149,7 @@ impl ManagedThreadRuntime {
                     .spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
+                            .max_blocking_threads(1)
                             .build()
                             .expect("failed to create tokio current-thread runtime");
                         let _ = tx.send(rt.handle().clone());
@@ -179,6 +181,7 @@ impl ManagedThreadRuntime {
             threads,
             shutdown_token,
             router: DispatchRouter,
+            components: RuntimeComponents::default(),
         }
     }
 }
@@ -260,6 +263,10 @@ impl ExecutionRuntime for ManagedThreadRuntime {
         // The terminal check in the execute path handles cancelled transfers.
         0
     }
+
+    fn components(&self) -> &RuntimeComponents {
+        &self.components
+    }
 }
 
 impl Drop for ManagedThreadRuntime {
@@ -281,7 +288,7 @@ mod tests {
     /// Create a [`ThreadHandle`] with a preset in-flight count for testing
     /// router selection. No real work is spawned — only `id` and `in_flight`
     /// are meaningful.
-    fn test_thread_handle(id: ThreadId, in_flight_count: usize) -> ThreadHandle {
+    fn test_thread_handle(id: Cpu, in_flight_count: usize) -> ThreadHandle {
         let rt = Box::leak(Box::new(
             tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -328,32 +335,29 @@ mod tests {
     fn router_selects_least_loaded() {
         let router = DispatchRouter;
         let handles = vec![
-            test_thread_handle(ThreadId(0), 5),
-            test_thread_handle(ThreadId(1), 2),
-            test_thread_handle(ThreadId(2), 8),
-            test_thread_handle(ThreadId(3), 3),
+            test_thread_handle(Cpu(0), 5),
+            test_thread_handle(Cpu(1), 2),
+            test_thread_handle(Cpu(2), 8),
+            test_thread_handle(Cpu(3), 3),
         ];
-        assert_eq!(router.select(&handles), ThreadId(1));
+        assert_eq!(router.select(&handles), Cpu(1));
     }
 
     #[test]
     fn router_breaks_ties_by_id() {
         let router = DispatchRouter;
         let handles = vec![
-            test_thread_handle(ThreadId(0), 5),
-            test_thread_handle(ThreadId(1), 5),
-            test_thread_handle(ThreadId(2), 5),
+            test_thread_handle(Cpu(0), 5),
+            test_thread_handle(Cpu(1), 5),
+            test_thread_handle(Cpu(2), 5),
         ];
-        assert_eq!(router.select(&handles), ThreadId(0));
+        assert_eq!(router.select(&handles), Cpu(0));
     }
 
     #[test]
     fn router_all_zero() {
         let router = DispatchRouter;
-        let handles = vec![
-            test_thread_handle(ThreadId(0), 0),
-            test_thread_handle(ThreadId(1), 0),
-        ];
-        assert_eq!(router.select(&handles), ThreadId(0));
+        let handles = vec![test_thread_handle(Cpu(0), 0), test_thread_handle(Cpu(1), 0)];
+        assert_eq!(router.select(&handles), Cpu(0));
     }
 }

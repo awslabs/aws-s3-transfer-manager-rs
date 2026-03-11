@@ -104,6 +104,7 @@ pub mod metrics;
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::Config;
+pub use self::config::S3ClientConfig;
 
 /// Create a config loader
 pub fn from_env() -> ConfigLoader {
