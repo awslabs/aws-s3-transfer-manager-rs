@@ -7,7 +7,6 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
-use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 use aws_smithy_types::date_time::{DateTime, Format};
 use bytes::Buf;
 use clap::{CommandFactory, Parser};
@@ -73,6 +72,10 @@ pub struct Args {
     /// Directory to write output files (e.g. iterations.json)
     #[arg(long)]
     output_dir: Option<String>,
+
+    /// Enable CPU profiling (writes flamegraph SVG to output-dir or current dir)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    profile: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -345,6 +348,18 @@ async fn main() -> Result<(), BoxError> {
 
     let json_output = matches!(args.output, OutputFormat::Json);
 
+    let _profiler_guard = if args.profile {
+        Some(
+            pprof::ProfilerGuardBuilder::default()
+                .frequency(997)
+                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                .build()
+                .expect("failed to start profiler"),
+        )
+    } else {
+        None
+    };
+
     let mut iteration_results = Vec::new();
     for i in 1..=args.iterations {
         dump_threads(&format!("iteration {i} start"));
@@ -401,6 +416,18 @@ async fn main() -> Result<(), BoxError> {
                 let _ = fs::remove_file(dest).await;
             }
         }
+    }
+
+    if let Some(guard) = _profiler_guard {
+        let report = guard
+            .report()
+            .build()
+            .expect("failed to build profile report");
+        let dir = args.output_dir.as_deref().unwrap_or(".");
+        let path = format!("{dir}/flamegraph.svg");
+        let file = std::fs::File::create(&path).expect("failed to create flamegraph file");
+        report.flamegraph(file).expect("failed to write flamegraph");
+        eprintln!("Flamegraph written to {path}");
     }
 
     if json_output {

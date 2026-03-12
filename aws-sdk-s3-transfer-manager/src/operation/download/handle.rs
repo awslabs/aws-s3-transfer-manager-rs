@@ -3,14 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use tokio::sync::mpsc;
-
 use crate::error::{self, ErrorKind};
-use crate::operation::download::body::Body;
+use crate::operation::download::body::{Body, SlotBodyConsumer};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
-use crate::operation::download::ChunkOutput;
 use crate::transfer::StateMachineTerminalReceiver;
 
 /// Handle to an in-progress download operation.
@@ -83,11 +80,11 @@ pub struct DownloadHandle {
 impl DownloadHandle {
     pub(crate) fn new(
         transfer: DownloadTransfer,
-        chunk_rx: mpsc::Receiver<ChunkOutput>,
+        consumer: SlotBodyConsumer,
         completion_rx: StateMachineTerminalReceiver,
     ) -> Self {
         Self {
-            body: Body::new(chunk_rx, transfer.clone()),
+            body: Body::new(consumer, transfer.clone()),
             transfer,
             completion_rx: Some(completion_rx),
         }
@@ -179,6 +176,7 @@ impl DownloadHandle {
         let id = self.transfer.id();
 
         ctx.set_cancelled();
+        self.transfer.writer().notify_consumer();
         self.body.close();
 
         // Cancel transfer and purge queued work
@@ -205,6 +203,7 @@ impl Drop for DownloadHandle {
         let ctx = self.transfer.ctx();
         if ctx.is_active() {
             ctx.set_cancelled();
+            self.transfer.writer().notify_consumer();
             ctx.handle.scheduler.cancel_transfer(self.transfer.id());
         }
     }

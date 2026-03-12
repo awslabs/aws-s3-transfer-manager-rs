@@ -37,9 +37,9 @@ mod object_meta;
 pub use object_meta::ObjectMetadata;
 
 use crate::error;
+use crate::operation::download::body::{new_slot_body, DEFAULT_BODY_SLOT_CAPACITY};
 use crate::types::BucketType;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
@@ -61,16 +61,15 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let concurrency = handle.num_workers();
-        let (chunk_tx, chunk_rx) = mpsc::channel(concurrency);
+        let (writer, consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, chunk_tx);
+        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
 
-        Ok(DownloadHandle::new(transfer, chunk_rx, completion_rx))
+        Ok(DownloadHandle::new(transfer, consumer, completion_rx))
     }
 }

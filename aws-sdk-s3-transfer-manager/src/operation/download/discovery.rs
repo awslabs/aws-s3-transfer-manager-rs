@@ -258,10 +258,10 @@ mod tests {
         handle: Arc<crate::client::Handle>,
         input: &DownloadInput,
     ) -> DownloadTransfer {
-        use tokio::sync::mpsc;
-        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+        use crate::operation::download::body;
+        let (writer, _consumer) = body::new_slot_body(body::DEFAULT_BODY_SLOT_CAPACITY);
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), chunk_tx)
+        DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer)
     }
 
     #[test]

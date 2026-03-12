@@ -15,13 +15,12 @@ use bytes_utils::SegmentedBuf;
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
 use crate::metrics::IoSample;
-use crate::operation::download::body::ChunkOutput;
+use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::{DownloadState, SeqWindow};
+use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::operation::ChunkSender;
 use crate::transfer::{
     IoKind, IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
 };
@@ -30,21 +29,29 @@ use crate::types::BucketType;
 /// Download-specific work data.
 #[derive(Debug)]
 pub(crate) enum DownloadWork {
-    Discovery {
-        chunk_tx: ChunkSender,
-    },
+    Discovery,
     ReadDiscoveryBody {
         stream: aws_sdk_s3::primitives::ByteStream,
-        seq: u64,
+        slot: Option<BodySlot>,
         chunk_meta: ChunkMetadata,
-        chunk_tx: ChunkSender,
     },
     GetObjectRange {
         range: std::ops::RangeInclusive<u64>,
-        seq: u64,
+        slot: Option<BodySlot>,
         etag: Option<Arc<str>>,
-        chunk_tx: ChunkSender,
     },
+}
+
+impl DownloadWork {
+    /// Extract the slot from this work item, if present.
+    #[cfg(test)]
+    fn take_slot(&mut self) -> Option<BodySlot> {
+        match self {
+            DownloadWork::Discovery => None,
+            DownloadWork::ReadDiscoveryBody { slot, .. }
+            | DownloadWork::GetObjectRange { slot, .. } => slot.take(),
+        }
+    }
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -78,7 +85,7 @@ struct DownloadTransferInner {
     #[allow(dead_code)] // TODO(phase4): hedging/routing
     bucket_type: BucketType,
     /// Sequence window for backpressure control
-    seq_window: SeqWindow,
+    writer: BodyWriter,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Notified when discovery completes (success or failure)
@@ -90,15 +97,14 @@ impl DownloadTransfer {
         ctx: TransferContext,
         bucket_type: BucketType,
         input: DownloadInput,
-        chunk_tx: ChunkSender,
+        writer: BodyWriter,
     ) -> Self {
-        let concurrency = ctx.handle.num_workers();
         let inner = Arc::new(DownloadTransferInner {
             ctx,
-            state: Mutex::new(DownloadState::new(chunk_tx)),
+            state: Mutex::new(DownloadState::new()),
             request: Arc::new(input),
             bucket_type,
-            seq_window: SeqWindow::new(concurrency),
+            writer,
             object_meta: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
@@ -127,9 +133,9 @@ impl DownloadTransfer {
         self.inner.bucket_type
     }
 
-    /// Sequence window for backpressure control.
-    pub(crate) fn seq_window(&self) -> &SeqWindow {
-        &self.inner.seq_window
+    /// Body writer for backpressure control and chunk delivery.
+    pub(crate) fn writer(&self) -> &BodyWriter {
+        &self.inner.writer
     }
 
     /// Object metadata from discovery.
@@ -169,14 +175,11 @@ impl DownloadTransfer {
         let mut state = self.inner.state.lock().unwrap();
 
         match &mut *state {
-            DownloadState::PendingDiscovery { chunk_tx } => {
-                let chunk_tx_clone = chunk_tx.clone();
+            DownloadState::PendingDiscovery => {
                 *state = DownloadState::DiscoveryInFlight {};
                 PollWork::Ready(IoRequest {
                     kind: IoKind::Network,
-                    data: Some(Box::new(DownloadWork::Discovery {
-                        chunk_tx: chunk_tx_clone,
-                    })),
+                    data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
             DownloadState::DiscoveryInFlight { .. } => {
@@ -187,11 +190,10 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight,
                 etag,
-                chunk_tx,
                 ..
             } => {
                 // Check seq window before generating work
-                let Some(seq) = self.inner.seq_window.try_claim() else {
+                let Some(slot) = self.inner.writer.try_claim() else {
                     self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 };
@@ -213,9 +215,8 @@ impl DownloadTransfer {
                         kind: IoKind::Network,
                         data: Some(Box::new(DownloadWork::GetObjectRange {
                             range: chunk_range,
-                            seq,
+                            slot: Some(slot),
                             etag: etag.clone(),
-                            chunk_tx: chunk_tx.clone(),
                         })),
                     })
                 } else if *ranges_in_flight > 0 {
@@ -236,34 +237,31 @@ impl DownloadTransfer {
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<DownloadWork>();
         match data {
-            DownloadWork::Discovery { chunk_tx } => self.execute_discovery(chunk_tx.clone()).await,
+            DownloadWork::Discovery => self.execute_discovery().await,
             DownloadWork::ReadDiscoveryBody {
                 stream,
-                seq,
+                slot,
                 chunk_meta,
-                chunk_tx,
             } => {
                 self.execute_read_discovery_body(
                     std::mem::take(stream),
-                    *seq,
+                    slot.take().expect("slot already consumed"),
                     std::mem::take(chunk_meta),
-                    chunk_tx.clone(),
                 )
                 .await
             }
-            DownloadWork::GetObjectRange {
-                range,
-                seq,
-                etag,
-                chunk_tx,
-            } => {
-                self.execute_get_range(range.clone(), *seq, etag.clone(), chunk_tx.clone())
-                    .await
+            DownloadWork::GetObjectRange { range, slot, etag } => {
+                self.execute_get_range(
+                    range.clone(),
+                    slot.take().expect("slot already consumed"),
+                    etag.clone(),
+                )
+                .await
             }
         }
     }
 
-    async fn execute_discovery(&self, chunk_tx: ChunkSender) -> WorkOutcome {
+    async fn execute_discovery(&self) -> WorkOutcome {
         let input = self.inner.request.as_ref();
 
         let discovery = match discover_obj(self, input).await {
@@ -293,12 +291,12 @@ impl DownloadTransfer {
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(stream), Some(meta)) => {
-                let seq = self
+                let slot = self
                     .inner
-                    .seq_window
+                    .writer
                     .try_claim()
                     .expect("seq window should have capacity at start");
-                Some((stream, meta, seq))
+                Some((stream, meta, slot))
             }
             (None, None) => None,
             _ => panic!(
@@ -312,7 +310,6 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag,
-                chunk_tx: chunk_tx.clone(),
             };
         }
 
@@ -321,13 +318,12 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, schedule work to read it
         match initial_work {
-            Some((stream, chunk_meta, seq)) => WorkOutcome::Success {
+            Some((stream, chunk_meta, slot)) => WorkOutcome::Success {
                 schedule_next: Some(IoKind::Network),
                 data: Some(Box::new(DownloadWork::ReadDiscoveryBody {
                     stream,
-                    seq,
+                    slot: Some(slot),
                     chunk_meta,
-                    chunk_tx,
                 })),
                 metrics: None,
             },
@@ -342,52 +338,53 @@ impl DownloadTransfer {
     async fn execute_read_discovery_body(
         &self,
         stream: aws_sdk_s3::primitives::ByteStream,
-        seq: u64,
+        slot: BodySlot,
         chunk_meta: ChunkMetadata,
-        chunk_tx: ChunkSender,
     ) -> WorkOutcome {
+        let seq = slot.seq();
         // Read the body from the discovery response
-        let body = match stream.collect().await {
-            Ok(b) => b.into_bytes(),
-            Err(e) => {
-                self.decrement_in_flight();
-                let guard = self.inner.state.lock().unwrap();
-                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
-            }
-        };
-
-        let bytes_received = body.len() as u64;
         let mut segmented = SegmentedBuf::new();
-        segmented.push(body);
+        let mut bytes_received: u64 = 0;
+        let mut body_stream = stream;
+        while let Some(result) = body_stream.next().await {
+            let data = match result {
+                Ok(data) => data,
+                Err(e) => {
+                    self.decrement_in_flight();
+                    let guard = self.inner.state.lock().unwrap();
+                    return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+                }
+            };
+            bytes_received += data.len() as u64;
+            segmented.push(data);
+        }
+
         let chunk = ChunkOutput {
             seq,
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
         };
 
-        let send_result = chunk_tx.send(chunk).await;
+        slot.fill(chunk);
         self.decrement_in_flight();
 
-        match send_result {
-            Ok(()) => WorkOutcome::Success {
-                schedule_next: None,
-                data: None,
-                metrics: Some(IoSample {
-                    network_rx: bytes_received,
-                    ..Default::default()
-                }),
-            },
-            Err(_) => WorkOutcome::Cancelled,
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: None,
+            metrics: Some(IoSample {
+                network_rx: bytes_received,
+                ..Default::default()
+            }),
         }
     }
 
     async fn execute_get_range(
         &self,
         range: std::ops::RangeInclusive<u64>,
-        seq: u64,
+        slot: BodySlot,
         etag: Option<Arc<str>>,
-        chunk_tx: ChunkSender,
     ) -> WorkOutcome {
+        let seq = slot.seq();
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
@@ -415,35 +412,35 @@ impl DownloadTransfer {
         let chunk_meta = ChunkMetadata::from(&resp);
 
         // TODO: Handle ByteStreamError with retry (SDK doesn't retry these)
-        let body = match resp.body.collect().await {
-            Ok(b) => b.into_bytes(),
-            Err(e) => return self.fail_range(seq, e),
-        };
+        let mut segmented = SegmentedBuf::new();
+        let mut bytes_received: u64 = 0;
+        let mut body_stream = resp.body;
+        while let Some(result) = body_stream.next().await {
+            let data = match result {
+                Ok(data) => data,
+                Err(e) => return self.fail_range(seq, e),
+            };
+            bytes_received += data.len() as u64;
+            segmented.push(data);
+        }
 
         bail_if_terminal!(self);
-
-        let bytes_received = body.len() as u64;
-        let mut segmented = SegmentedBuf::new();
-        segmented.push(body);
         let chunk = ChunkOutput {
             seq,
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
         };
 
-        let send_result = chunk_tx.send(chunk).await;
+        slot.fill(chunk);
         self.decrement_in_flight();
 
-        match send_result {
-            Ok(()) => WorkOutcome::Success {
-                schedule_next: None,
-                data: None,
-                metrics: Some(IoSample {
-                    network_rx: bytes_received,
-                    ..Default::default()
-                }),
-            },
-            Err(_) => WorkOutcome::Cancelled,
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: None,
+            metrics: Some(IoSample {
+                network_rx: bytes_received,
+                ..Default::default()
+            }),
         }
     }
 
@@ -481,11 +478,12 @@ impl DownloadTransfer {
         let classification = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
         self.inner.ctx.set_failed(error);
-        // Transition to Terminal - releases chunk_tx
+        // Transition to Terminal
         *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters
                      // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
+        self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -495,6 +493,7 @@ impl DownloadTransfer {
         self.inner.ctx.set_completed();
         *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters
+        self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
     }
 }
@@ -564,10 +563,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+        let (writer, _consumer) = crate::operation::download::body::new_slot_body(
+            crate::operation::download::body::DEFAULT_BODY_SLOT_CAPACITY,
+        );
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
-        DownloadTransfer::new(ctx, BucketType::Standard, input, chunk_tx)
+        DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
 
     /// Execute and handle follow-on work (e.g., ReadDiscoveryBody).
@@ -625,9 +626,10 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
         match data {
-            DownloadWork::GetObjectRange { seq, .. } => {
+            DownloadWork::GetObjectRange { slot, .. } => {
                 assert_eq!(
-                    *seq, 1,
+                    slot.as_ref().unwrap().seq(),
+                    1,
                     "seq should start at 1 when initial chunk claims seq=0"
                 );
             }
@@ -670,17 +672,23 @@ mod tests {
             .build()
             .unwrap();
 
-        let (chunk_tx, _chunk_rx) = tokio::sync::mpsc::channel(8);
+        let (writer, _consumer) = crate::operation::download::body::new_slot_body(
+            crate::operation::download::body::DEFAULT_BODY_SLOT_CAPACITY,
+        );
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, chunk_tx);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
         skip_discovery(&transfer).await;
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
         match data {
-            DownloadWork::GetObjectRange { seq, .. } => {
-                assert_eq!(*seq, 0, "seq should start at 0 when no initial chunk");
+            DownloadWork::GetObjectRange { slot, .. } => {
+                assert_eq!(
+                    slot.as_ref().unwrap().seq(),
+                    0,
+                    "seq should start at 0 when no initial chunk"
+                );
             }
             _ => panic!("expected GetObjectRange"),
         }
@@ -696,8 +704,8 @@ mod tests {
             match transfer.poll_work() {
                 PollWork::Ready(mut w) => {
                     let data = w.data_mut::<DownloadWork>();
-                    if let DownloadWork::GetObjectRange { seq, .. } = data {
-                        seqs.push(*seq);
+                    if let DownloadWork::GetObjectRange { slot, .. } = data {
+                        seqs.push(slot.as_ref().unwrap().seq());
                     }
                 }
                 _ => break,
@@ -774,49 +782,111 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
+    fn create_download_with_capacity(
+        object_size: u64,
+        part_size: u64,
+        capacity: usize,
+    ) -> (
+        DownloadTransfer,
+        crate::operation::download::body::SlotBodyConsumer,
+    ) {
+        let chunk = vec![0u8; part_size as usize];
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(part_size as i64)
+                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
+                .e_tag("test-etag")
+                .body(ByteStream::from(chunk.clone()))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+
+        let config = crate::Config::builder()
+            .client(client)
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
+            config,
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let (writer, consumer) = crate::operation::download::body::new_slot_body(capacity);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        (transfer, consumer)
+    }
+
     #[tokio::test]
     async fn test_seq_window_limits_work_generation() {
-        // Create download with many parts but small seq window
-        let transfer = create_download(128 * MB, 8 * MB); // 16 parts
-        transfer.seq_window().set_max_gap(3);
+        // Create download with many parts but small slot buffer capacity
+        let (transfer, _consumer) = create_download_with_capacity(128 * MB, 8 * MB, 3);
 
         skip_discovery(&transfer).await;
         // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
-        // Gap=3 means: claimed < consumed + gap → claimed < 3
+        // Capacity=3 means: claimed < consumed + capacity → claimed < 3
         // So we can claim seq 1, 2 (claimed becomes 2, then 3)
 
         let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
         let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
 
-        // Gap exhausted (claimed=3, consumed=0, gap=3: 3 >= 0+3)
+        // Window exhausted (claimed=3, consumed=0, capacity=3: 3 >= 0+3)
         assert_pending(transfer.poll_work());
     }
 
     #[tokio::test]
     async fn test_seq_window_consume_enables_more_work() {
-        let transfer = create_download(128 * MB, 8 * MB);
-        transfer.seq_window().set_max_gap(2);
+        let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
 
         skip_discovery(&transfer).await;
-        // After discovery: claimed=1, consumed=0
-        // Gap=2 means: claimed < 2, so we can only claim seq=1
+        // After discovery: seq 0 claimed and filled by discovery, consumed=0
+        // Capacity=2 means: claimed < consumed + 2
 
-        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
+        let mut w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
         assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
 
-        // Simulate consumer reading seq 0
-        transfer.seq_window().consume(0);
-        // Now consumed=1, so claimed < 1+2=3
+        // Consume seq 0 (filled by discovery) to open the window
+        consumer.try_take_next(); // consume seq 0, consumed=1
 
-        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
+        let mut w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
         assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
 
-        // Consume seq 1
-        transfer.seq_window().consume(1);
-        // Now consumed=2, so claimed < 2+2=4
+        // Fill seq 1 from its work item, then consume it
+        let slot1 = w1.data_mut::<DownloadWork>().take_slot().expect("has slot");
+        let mut seg = bytes_utils::SegmentedBuf::new();
+        seg.push(bytes::Bytes::from("data"));
+        slot1.fill(ChunkOutput {
+            seq: 1,
+            data: crate::io::AggregatedBytes(seg),
+            metadata: Default::default(),
+        });
+        consumer.try_take_next(); // consume seq 1, consumed=2
 
-        let _w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
+        let mut w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
         assert_pending(transfer.poll_work());
+
+        // Fill seq 2 from its work item, then consume it
+        let slot2 = w2.data_mut::<DownloadWork>().take_slot().expect("has slot");
+        let mut seg = bytes_utils::SegmentedBuf::new();
+        seg.push(bytes::Bytes::from("data"));
+        slot2.fill(ChunkOutput {
+            seq: 2,
+            data: crate::io::AggregatedBytes(seg),
+            metadata: Default::default(),
+        });
+        consumer.try_take_next(); // consume seq 2
+
+        let _w4 = assert_ready(transfer.poll_work()); // seq=4
+        assert_pending(transfer.poll_work());
+
+        // Clean up remaining slots
+        drop(w3);
     }
 
     use crate::http::header::Range;
