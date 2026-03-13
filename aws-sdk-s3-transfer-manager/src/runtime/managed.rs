@@ -78,16 +78,33 @@ impl std::fmt::Debug for ThreadHandle {
 }
 
 /// Selects which managed thread should execute a work item.
+///
+/// Uses power-of-two-random-choices: pick two threads at random, return the
+/// least loaded. O(1) regardless of thread count, low contention on the
+/// atomics (only two loads instead of N). Same algorithm CRT uses for
+/// event loop selection (`get_next_loop`).
 struct DispatchRouter;
 
 impl DispatchRouter {
     /// Select a thread to execute the given work.
     fn select(&self, threads: &[ThreadHandle]) -> Cpu {
-        threads
-            .iter()
-            .min_by_key(|th| (th.in_flight.load(Ordering::Relaxed), th.id.0))
-            .expect("no threads available")
-            .id
+        let len = threads.len();
+        debug_assert!(len > 0, "no threads available");
+        if len == 1 {
+            return threads[0].id;
+        }
+        let a = fastrand::usize(..len);
+        let mut b = fastrand::usize(..len - 1);
+        if b >= a {
+            b += 1;
+        }
+        let load_a = threads[a].in_flight.load(Ordering::Relaxed);
+        let load_b = threads[b].in_flight.load(Ordering::Relaxed);
+        if load_a <= load_b {
+            threads[a].id
+        } else {
+            threads[b].id
+        }
     }
 }
 
@@ -407,24 +424,39 @@ mod tests {
             test_thread_handle(Cpu(2), 8),
             test_thread_handle(Cpu(3), 3),
         ];
-        assert_eq!(router.select(&handles), Cpu(1));
+        // Power-of-two: picks 2 random threads, returns least loaded.
+        // Over many iterations, should never pick the most loaded (Cpu(2)=8)
+        // when a lighter option exists.
+        let mut selected = std::collections::HashMap::new();
+        for _ in 0..1000 {
+            let cpu = router.select(&handles);
+            *selected.entry(cpu).or_insert(0u32) += 1;
+        }
+        // Cpu(1) with load=2 should be selected most often
+        assert!(
+            selected.get(&Cpu(1)).copied().unwrap_or(0)
+                > selected.get(&Cpu(2)).copied().unwrap_or(0),
+            "least loaded thread should be selected more than most loaded: {selected:?}"
+        );
     }
 
     #[test]
-    fn router_breaks_ties_by_id() {
+    fn router_single_thread() {
+        let router = DispatchRouter;
+        let handles = vec![test_thread_handle(Cpu(0), 5)];
+        assert_eq!(router.select(&handles), Cpu(0));
+    }
+
+    #[test]
+    fn router_two_threads_prefers_lighter() {
         let router = DispatchRouter;
         let handles = vec![
-            test_thread_handle(Cpu(0), 5),
-            test_thread_handle(Cpu(1), 5),
-            test_thread_handle(Cpu(2), 5),
+            test_thread_handle(Cpu(0), 10),
+            test_thread_handle(Cpu(1), 0),
         ];
-        assert_eq!(router.select(&handles), Cpu(0));
-    }
-
-    #[test]
-    fn router_all_zero() {
-        let router = DispatchRouter;
-        let handles = vec![test_thread_handle(Cpu(0), 0), test_thread_handle(Cpu(1), 0)];
-        assert_eq!(router.select(&handles), Cpu(0));
+        // With only 2 threads, power-of-two always picks both, returns lighter
+        for _ in 0..100 {
+            assert_eq!(router.select(&handles), Cpu(1));
+        }
     }
 }
