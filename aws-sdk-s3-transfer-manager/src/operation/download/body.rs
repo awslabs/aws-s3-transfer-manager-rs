@@ -13,7 +13,7 @@ use super::chunk_meta::ChunkMetadata;
 use super::transfer::DownloadTransfer;
 
 /// Default slot buffer capacity for download body delivery.
-pub(crate) const DEFAULT_BODY_SLOT_CAPACITY: usize = 256;
+pub(crate) const DEFAULT_BODY_SLOT_CAPACITY: usize = 512;
 
 const SLOT_EMPTY: u8 = 0;
 const SLOT_FILLED: u8 = 1;

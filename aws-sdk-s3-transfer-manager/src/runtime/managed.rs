@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
 use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient, SharedHttpClient};
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,33 @@ use super::Topology;
 use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
+
+/// DNS resolver that shuffles returned IPs to distribute connections across
+/// S3 fleet addresses. Wraps any [`ResolveDns`] implementation.
+///
+/// hyper tries resolved IPs sequentially, so without shuffling all connections
+/// land on the first IP. Shuffling gives each connection a random starting IP,
+/// spreading load across all resolved addresses.
+#[derive(Debug, Clone)]
+struct ShufflingDnsResolver<R> {
+    inner: R,
+}
+
+impl<R> ShufflingDnsResolver<R> {
+    fn new(inner: R) -> Self {
+        Self { inner }
+    }
+}
+
+impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        DnsFuture::new(async move {
+            let mut ips = self.inner.resolve_dns(name).await?;
+            fastrand::shuffle(&mut ips);
+            Ok(ips)
+        })
+    }
+}
 
 std::thread_local! {
     /// Identifies which managed thread the current OS thread corresponds to.
@@ -145,7 +173,7 @@ impl ManagedThreadRuntime {
     fn new(scheduler: Scheduler, topology: Topology, pin_threads: bool) -> Self {
         let shutdown_token = CancellationToken::new();
 
-        let dns_resolver = aws_smithy_dns::HickoryDnsResolver::default();
+        let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
         // spawn and initialize concurrently
         let pending: Vec<_> = topology
             .thread_ids()

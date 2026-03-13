@@ -72,10 +72,6 @@ pub struct Args {
     /// Directory to write output files (e.g. iterations.json)
     #[arg(long)]
     output_dir: Option<String>,
-
-    /// Enable CPU profiling (writes flamegraph SVG to output-dir or current dir)
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    profile: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -282,37 +278,6 @@ async fn do_recursive_upload(
     Ok(transfer_size_bytes)
 }
 
-fn dump_threads(label: &str) {
-    match std::fs::read_dir("/proc/self/task") {
-        Ok(entries) => {
-            let mut names: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for entry in entries.flatten() {
-                let status_path = entry.path().join("status");
-                let name = std::fs::read_to_string(status_path)
-                    .ok()
-                    .and_then(|s| {
-                        s.lines()
-                            .find(|l| l.starts_with("Name:"))
-                            .map(|l| l.trim_start_matches("Name:").trim().to_string())
-                    })
-                    .unwrap_or_else(|| "unknown".into());
-                *names.entry(name).or_default() += 1;
-            }
-            let total: usize = names.values().sum();
-            let mut sorted: Vec<_> = names.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
-            eprintln!("[THREADS] {label}: {total} total");
-            for (name, count) in &sorted {
-                eprintln!("[THREADS]   {count:>4} x {name}");
-            }
-        }
-        Err(_) => {
-            eprintln!("[THREADS] {label}: /proc not available");
-        }
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
@@ -342,27 +307,12 @@ async fn main() -> Result<(), BoxError> {
         .load()
         .await;
 
-    dump_threads("before Client::new");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-    dump_threads("after Client::new");
 
     let json_output = matches!(args.output, OutputFormat::Json);
 
-    let _profiler_guard = if args.profile {
-        Some(
-            pprof::ProfilerGuardBuilder::default()
-                .frequency(997)
-                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                .build()
-                .expect("failed to start profiler"),
-        )
-    } else {
-        None
-    };
-
     let mut iteration_results = Vec::new();
     for i in 1..=args.iterations {
-        dump_threads(&format!("iteration {i} start"));
         let start = SystemTime::now();
         let wall_start = time::Instant::now();
 
@@ -385,7 +335,6 @@ async fn main() -> Result<(), BoxError> {
         };
 
         let elapsed = wall_start.elapsed();
-        dump_threads(&format!("iteration {i} end"));
         let end = SystemTime::now();
         let duration_secs = elapsed.as_secs_f64();
         let throughput_gbps = (bytes as f64 * 8.0) / (duration_secs * 1_000_000_000.0);
@@ -416,18 +365,6 @@ async fn main() -> Result<(), BoxError> {
                 let _ = fs::remove_file(dest).await;
             }
         }
-    }
-
-    if let Some(guard) = _profiler_guard {
-        let report = guard
-            .report()
-            .build()
-            .expect("failed to build profile report");
-        let dir = args.output_dir.as_deref().unwrap_or(".");
-        let path = format!("{dir}/flamegraph.svg");
-        let file = std::fs::File::create(&path).expect("failed to create flamegraph file");
-        report.flamegraph(file).expect("failed to write flamegraph");
-        eprintln!("Flamegraph written to {path}");
     }
 
     if json_output {
