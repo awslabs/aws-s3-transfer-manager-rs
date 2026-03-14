@@ -286,7 +286,11 @@ impl Scheduler {
             return;
         }
 
-        // handle any follow-on work
+        // Handle any follow-on work.
+        // TODO: follow-on work should be pinned to the completing thread (same
+        // connection, warm cache, no cross-thread hop). The runtime knows which
+        // thread is executing — dispatch could use a local-spawn fast path when
+        // called from a managed thread instead of going through the router.
         if let WorkOutcome::Success {
             schedule_next: Some(kind),
             data,

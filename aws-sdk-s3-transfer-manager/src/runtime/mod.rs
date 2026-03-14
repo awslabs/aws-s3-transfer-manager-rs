@@ -16,6 +16,8 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::{Cpu, NumaNode, Topology};
 
+mod sync;
+
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
 use crate::scheduler::descriptor::TransferDescriptor;
