@@ -15,6 +15,7 @@ use futures_util::FutureExt;
 mod worker_pool;
 
 use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
+use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
 use worker_pool::WorkerPool;
@@ -79,10 +80,12 @@ impl TokioMultiThreadRuntime {
 }
 
 impl ExecutionRuntime for TokioMultiThreadRuntime {
-    fn dispatch(&self, work: ScheduledWork) {
+    fn dispatch(&self, batch: &mut SubmissionGuard<'_, ScheduledWork>) {
         self.ensure_workers_started();
         self.ensure_worker_capacity();
-        self.pool.push(work);
+        for work in batch.drain() {
+            self.pool.push(work);
+        }
     }
 
     fn shutdown(&self) {

@@ -56,6 +56,7 @@ use crate::transfer::{BoxTransfer, IoRequest, PollWork, TransferId, WorkOutcome}
 use crate::metrics::{IOCounters, IoSample};
 use crate::runtime::ExecutionRuntime;
 
+use crate::runtime::sync::{Submission, SubmissionQueue};
 use crate::runtime::ScheduledWork;
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -65,6 +66,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
+
+/// Batch size for work generated and submitted in a single round
+const SUBMISSION_QUEUE_SIZE: usize = 64;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -79,6 +83,7 @@ struct SchedulerInner {
     io_counters: Arc<IOCounters>,
     runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
     dispatched: AtomicUsize,
+    submission_queue: SubmissionQueue<ScheduledWork>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -115,6 +120,7 @@ impl SchedulerBuilder {
             io_counters: self.io_counters,
             runtime: OnceLock::new(),
             dispatched: AtomicUsize::new(0),
+            submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
         }));
         let runtime = runtime_factory(scheduler.clone());
         scheduler
@@ -301,7 +307,7 @@ impl Scheduler {
                 item: IoRequest { kind, data },
                 descriptor: desc.clone(),
             };
-            self.dispatch_to_runtime(next);
+            self.dispatch_single(next);
         }
 
         // capacity has freed try to queue up more work
@@ -333,8 +339,20 @@ impl Scheduler {
         self.0.dispatched.load(Ordering::Relaxed) < self.0.controller.target()
     }
 
+    /// Flush the current submission and re-enter for the next batch.
+    fn submit_and_reenter<'a>(
+        &'a self,
+        sub: Submission<'a, ScheduledWork>,
+    ) -> Submission<'a, ScheduledWork> {
+        if let Some(mut guard) = sub.submit() {
+            self.runtime().dispatch(&mut guard);
+        }
+        self.0.submission_queue.enter()
+    }
+
     /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
+        let mut sub = self.0.submission_queue.enter();
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
@@ -349,10 +367,16 @@ impl Scheduler {
                 PollWork::Ready(item) => {
                     desc.work_generated();
                     self.0.ready_set.insert(desc.clone());
-                    self.dispatch_to_runtime(ScheduledWork {
+                    self.0.dispatched.fetch_add(1, Ordering::Relaxed);
+                    desc.work_queued();
+                    let work = ScheduledWork {
                         item,
                         descriptor: desc,
-                    });
+                    };
+                    if let Err(work) = sub.push(work) {
+                        sub = self.submit_and_reenter(sub);
+                        sub.push(work).expect("empty queue after flush");
+                    }
                 }
                 PollWork::Pending => {
                     // re-added on wake as state machine progresses
@@ -363,12 +387,24 @@ impl Scheduler {
                 }
             }
         }
+        if let Some(mut guard) = sub.submit() {
+            self.runtime().dispatch(&mut guard);
+        }
     }
 
-    fn dispatch_to_runtime(&self, work: ScheduledWork) {
+    fn dispatch_single(&self, work: ScheduledWork) {
         self.0.dispatched.fetch_add(1, Ordering::Relaxed);
         work.descriptor.work_queued();
-        self.runtime().dispatch(work);
+        let sub = self.0.submission_queue.enter();
+        if let Err(work) = sub.push(work) {
+            let sub = self.submit_and_reenter(sub);
+            sub.push(work).expect("empty queue after flush");
+            if let Some(mut guard) = sub.submit() {
+                self.runtime().dispatch(&mut guard);
+            }
+        } else if let Some(mut guard) = sub.submit() {
+            self.runtime().dispatch(&mut guard);
+        }
     }
 
     #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown

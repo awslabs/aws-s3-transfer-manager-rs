@@ -6,4 +6,4 @@
 //! Synchronization primitives for the runtime.
 
 mod submission;
-pub(crate) use submission::{SubmissionGuard, SubmissionQueue};
+pub(crate) use submission::{Submission, SubmissionGuard, SubmissionQueue};

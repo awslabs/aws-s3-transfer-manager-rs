@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::topology::Cpu;
 use super::Topology;
 use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
+use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
 
@@ -314,26 +315,28 @@ impl ManagedThreadRuntimeBuilder {
 }
 
 impl ExecutionRuntime for ManagedThreadRuntime {
-    fn dispatch(&self, mut work: ScheduledWork) {
-        let thread_id = self.router.select(&self.threads);
-        let th = &self.threads[thread_id.0];
-        th.in_flight.fetch_add(1, Ordering::Relaxed);
+    fn dispatch(&self, batch: &mut SubmissionGuard<'_, ScheduledWork>) {
+        for mut work in batch.drain() {
+            let thread_id = self.router.select(&self.threads);
+            let th = &self.threads[thread_id.0];
+            th.in_flight.fetch_add(1, Ordering::Relaxed);
 
-        let scheduler = self.scheduler.clone();
-        let in_flight = Arc::clone(&th.in_flight);
+            let scheduler = self.scheduler.clone();
+            let in_flight = Arc::clone(&th.in_flight);
 
-        th.runtime_handle.spawn(async move {
-            let result = execute_work(&mut work, &scheduler).await;
-            in_flight.fetch_sub(1, Ordering::Relaxed);
-            match result {
-                ExecuteResult::Completed(outcome, elapsed) => {
-                    scheduler.on_completion(work, outcome, elapsed);
+            th.runtime_handle.spawn(async move {
+                let result = execute_work(&mut work, &scheduler).await;
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+                match result {
+                    ExecuteResult::Completed(outcome, elapsed) => {
+                        scheduler.on_completion(work, outcome, elapsed);
+                    }
+                    ExecuteResult::Panicked => {
+                        scheduler.on_panic(work);
+                    }
                 }
-                ExecuteResult::Panicked => {
-                    scheduler.on_panic(work);
-                }
-            }
-        });
+            });
+        }
     }
 
     fn shutdown(&self) {

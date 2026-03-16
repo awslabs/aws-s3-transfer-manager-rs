@@ -16,10 +16,11 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::{Cpu, NumaNode, Topology};
 
-mod sync;
+pub(crate) mod sync;
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
+use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::transfer::{IoRequest, TransferId};
 
@@ -41,8 +42,8 @@ pub(crate) struct ScheduledWork {
 ///
 /// The scheduler decides WHAT to run and WHEN. The runtime decides WHERE and HOW.
 pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
-    /// Dispatch an IO request for execution.
-    fn dispatch(&self, work: ScheduledWork);
+    /// Dispatch a batch of IO requests for execution.
+    fn dispatch(&self, batch: &mut SubmissionGuard<'_, ScheduledWork>);
 
     /// Shut down the runtime, draining in-flight work.
     fn shutdown(&self);
