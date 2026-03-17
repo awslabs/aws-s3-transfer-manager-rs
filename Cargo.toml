@@ -8,3 +8,6 @@ members = [
     "benches",
     "integration-tests"
 ]
+
+#[patch.crates-io]
+#hyper = { path = "/Users/todaaron/sandbox/rs/3P/hyper" }

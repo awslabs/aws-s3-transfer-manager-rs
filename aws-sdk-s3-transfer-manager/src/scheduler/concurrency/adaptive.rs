@@ -65,6 +65,9 @@ pub(crate) struct WindowConfig {
 /// SlowStart phase settings.
 #[derive(Debug, Clone)]
 pub(crate) struct SlowStartConfig {
+    /// Evaluation interval during SlowStart. Shorter than the stable phase
+    /// interval to ramp concurrency faster while connections are warming up.
+    pub evaluation_interval: Duration,
     /// Throughput must improve by this ratio to accept a growth step.
     pub acceptance_margin: f64,
     /// Additive growth per accepted window.
@@ -103,12 +106,16 @@ impl Default for AdaptiveConfig {
                 smoothing_window: 4,
             },
             slow_start: SlowStartConfig {
+                // 300ms evaluation during SlowStart for faster ramp.
+                evaluation_interval: Duration::from_millis(300),
                 // 10% improvement required to accept growth step.
                 acceptance_margin: 0.10,
                 // +32 connections per accepted window.
                 max_growth: 32,
-                // Tolerate 2 noisy windows before exiting SlowStart.
-                exit_threshold: 3,
+                // Tolerate 3 noisy windows before exiting SlowStart.
+                // Connection warmup (TLS handshakes, TCP slow start) causes
+                // throughput to lag behind concurrency increases.
+                exit_threshold: 4,
             },
             stable: StableConfig {
                 // 2% improvement (probing) or 2% of peak (shedding).
@@ -227,7 +234,12 @@ impl AdaptiveConcurrencyController {
         let Ok(mut state) = self.state.try_lock() else {
             return;
         };
-        if state.last_evaluation.elapsed() < self.config.window.duration {
+        let phase = Phase::from_usize(self.phase.load(Ordering::Relaxed));
+        let interval = match phase {
+            Phase::SlowStart => self.config.slow_start.evaluation_interval,
+            _ => self.config.window.duration,
+        };
+        if state.last_evaluation.elapsed() < interval {
             return;
         }
         state.last_evaluation = Instant::now();
@@ -592,7 +604,10 @@ mod tests {
         tc.record_goodput(1050.0); // 5% < 10% threshold, rejection 1
         assert_eq!(tc.phase(), Phase::SlowStart); // still in SlowStart
         tc.record_goodput(1050.0); // rejection 2
-        tc.record_goodput(1050.0); // rejection 3 -> StableProbing
+        assert_eq!(tc.phase(), Phase::SlowStart);
+        tc.record_goodput(1050.0); // rejection 3
+        assert_eq!(tc.phase(), Phase::SlowStart);
+        tc.record_goodput(1050.0); // rejection 4 -> StableProbing
         assert_eq!(tc.phase(), Phase::StableProbing);
         assert_eq!(tc.accepted(), 32);
     }
@@ -766,7 +781,8 @@ mod tests {
         tc.record_goodput(1000.0); // bootstrap
         tc.record_goodput(1050.0); // rejection 1
         tc.record_goodput(1050.0); // rejection 2
-        tc.record_goodput(1050.0); // rejection 3 -> StableProbing
+        tc.record_goodput(1050.0); // rejection 3
+        tc.record_goodput(1050.0); // rejection 4 -> StableProbing
         assert_eq!(tc.phase(), Phase::StableProbing);
         assert_eq!(tc.accepted(), 32);
     }

@@ -27,6 +27,13 @@ use jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+// #[cfg(not(target_env = "msvc"))]
+// use mimalloc::MiMalloc;
+//
+// #[cfg(not(target_env = "msvc"))]
+// #[global_allocator]
+// static GLOBAL: MiMalloc = MiMalloc;
+
 #[derive(Debug, Clone, Default, clap::ValueEnum)]
 enum OutputFormat {
     #[default]

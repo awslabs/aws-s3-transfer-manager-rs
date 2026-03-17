@@ -216,6 +216,7 @@ impl ManagedThreadRuntime {
                             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
                             ))
+                            // .tls_provider(aws_smithy_http_client::tls::Provider::S2nTls)
                             .build_with_resolver(resolver);
 
                         let _ = tx.send((rt.handle().clone(), http_client));
