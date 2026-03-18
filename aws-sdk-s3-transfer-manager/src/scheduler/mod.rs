@@ -3,22 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-mod concurrency;
-mod context;
+pub(crate) mod concurrency;
 mod scheduler;
-mod transfer;
-mod work;
 
-pub(crate) use concurrency::{ConcurrencyController, FixedConcurrency};
-pub(crate) use context::{StateMachineTerminalReceiver, TransferContext};
-pub(crate) use scheduler::Scheduler;
-pub(crate) use transfer::{BoxTransfer, Transfer};
-pub(crate) use work::{PollWork, TransferId, WorkItem, WorkKind, WorkOutcome, WorkerPool};
+pub(crate) use concurrency::{
+    classify_error, CompletionSample, ConcurrencyController, ErrorKind, FixedConcurrency,
+};
+pub(crate) use scheduler::{Scheduler, SchedulerBuilder};
 
-mod descriptor;
+pub(crate) mod descriptor;
 mod ready_set;
 
 #[cfg(test)]
-pub(crate) mod test_util {
-    pub(crate) use super::transfer::test_util::*;
-}
+pub(crate) mod test_util;

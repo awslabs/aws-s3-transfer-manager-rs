@@ -24,7 +24,7 @@ mod worker;
 use crate::{error, types::FailedUpload};
 
 use super::{
-    validate_target_is_dir, CancelNotificationReceiver, CancelNotificationSender, TransferContext,
+    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, LegacyTransferContext,
 };
 
 /// Operation struct for uploading multiple objects to Amazon S3
@@ -84,8 +84,8 @@ pub(crate) struct UploadObjectsState {
     // TODO - Determine if `input` should be separated from this struct
     // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
     input: UploadObjectsInput,
-    cancel_tx: CancelNotificationSender,
-    cancel_rx: CancelNotificationReceiver,
+    cancel_tx: CancelBroadcastSender,
+    cancel_rx: CancelBroadcastReceiver,
     failed_uploads: Mutex<Vec<FailedUpload>>,
     successful_uploads: AtomicU64,
     total_bytes_transferred: AtomicU64,
@@ -94,8 +94,8 @@ pub(crate) struct UploadObjectsState {
 impl UploadObjectsState {
     pub(crate) fn new(
         input: UploadObjectsInput,
-        cancel_tx: CancelNotificationSender,
-        cancel_rx: CancelNotificationReceiver,
+        cancel_tx: CancelBroadcastSender,
+        cancel_rx: CancelBroadcastReceiver,
     ) -> Self {
         Self {
             input,
@@ -108,12 +108,12 @@ impl UploadObjectsState {
     }
 }
 
-type UploadObjectsContext = TransferContext<UploadObjectsState>;
+type UploadObjectsContext = LegacyTransferContext<UploadObjectsState>;
 
 impl UploadObjectsContext {
     fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(());
         let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
-        TransferContext { handle, state }
+        LegacyTransferContext::from_state(handle, state)
     }
 }

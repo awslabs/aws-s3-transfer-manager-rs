@@ -2,11 +2,9 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use crate::operation::download::Body;
 use async_channel::{Receiver, Sender};
 use path_clean::PathClean;
 use std::borrow::Cow;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tokio::fs;
@@ -137,7 +135,7 @@ pub(super) async fn download_objects(
                                     FailedTransferPolicy::Abort => {
                                         // Sending a cancellation signal during graceful shutdown would be redundant.
                                         if err.kind() != &ErrorKind::OperationCancelled
-                                            && ctx.state.cancel_tx.send(true).is_err()
+                                            && ctx.state.cancel_tx.send(()).is_err()
                                         {
                                             tracing::warn!(
                                                 "all receiver ends have been dropped, unable to send a cancellation signal"
@@ -196,13 +194,12 @@ async fn download_single_obj(
     }
 
     let _ = handle.object_meta().await?;
-    let mut body = mem::replace(&mut handle.body, Body::empty());
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
     fs::create_dir_all(parent_dir).await?;
     let mut dest = fs::File::create(key_path).await?;
 
-    while let Some(chunk) = body.next().await {
+    while let Some(chunk) = handle.body_mut().next().await {
         let chunk = chunk?;
         for segment in chunk.data.into_segments() {
             dest.write_all(segment.as_ref()).await?;

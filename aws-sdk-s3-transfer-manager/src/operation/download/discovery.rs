@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
 use super::object_meta::ObjectMetadata;
-use super::DownloadContext;
+use super::transfer::DownloadTransfer;
 use super::DownloadInput;
 use crate::error;
 use crate::http::header::{self, ByteRange};
@@ -69,19 +69,19 @@ impl ObjectDiscoveryStrategy {
 /// Returns object metadata, the remaining range of data
 /// to be fetched, and _(if available)_ the first chunk of data.
 pub(super) async fn discover_obj(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     tracing::trace!("discovering object with strategy {:?}", strategy);
     let discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject => {
-            discover_obj_with_head(ctx, input)
+            discover_obj_with_head(transfer, input)
                 .instrument(tracing::debug_span!("send-head-object-for-discovery"))
                 .await
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
-            discover_obj_with_get(ctx, input, range)
+            discover_obj_with_get(transfer, input, range)
                 .instrument(tracing::debug_span!("send-ranged-get-for-discovery"))
                 .await
         }
@@ -97,7 +97,7 @@ pub(super) async fn discover_obj(
 }
 
 async fn discover_obj_with_get_first_part(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::Error> {
     // Get object first part.
@@ -106,18 +106,19 @@ async fn discover_obj_with_get_first_part(
     let resp = builder
         .set_range(None)
         .set_part_number(Some(1))
-        .send_with(ctx.client())
+        .send_with(transfer.ctx().s3_client())
         .await
         .map_err(error::discovery_failed)?;
     first_chunk_response_handler(resp, None)
 }
 
 async fn discover_obj_with_head(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let resp = ctx
-        .client()
+    let resp = transfer
+        .ctx()
+        .s3_client()
         .head_object()
         .set_range(input.range.clone())
         .set_bucket(input.bucket().map(str::to_string))
@@ -136,22 +137,23 @@ async fn discover_obj_with_head(
 }
 
 async fn discover_obj_with_get(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
     range_from_user: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
+    let target_part_size = transfer.ctx().handle.download_part_size_bytes();
     // Convert input to builder and set the range properly as the first range get.
     let byte_range = match range_from_user.as_ref() {
         Some(r) => ByteRange::Inclusive(
             *r.start(),
-            cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
+            cmp::min(*r.start() + target_part_size - 1, *r.end()),
         ),
-        None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
+        None => ByteRange::Inclusive(0, target_part_size - 1),
     };
     let builder: GetObjectInputBuilder = input.clone().into();
     let resp = builder
         .range(header::Range::bytes(byte_range))
-        .send_with(ctx.client())
+        .send_with(transfer.ctx().s3_client())
         .await;
     match resp {
         Err(error) => {
@@ -162,7 +164,7 @@ async fn discover_obj_with_get(
                 {
                     // Invalid Range Error found and no Range passed in it's an empty object.
                     // discover the object with the first part instead for empty object.
-                    discover_obj_with_get_first_part(ctx, input).await
+                    discover_obj_with_get_first_part(transfer, input).await
                 }
                 _ => Err(error::discovery_failed(error)),
             }
@@ -181,7 +183,8 @@ fn first_chunk_response_handler(
     let chunk_meta: ChunkMetadata = resp.into();
     let chunk_content_len = chunk_meta
         .content_length
-        .expect("expected content_length in chunk") as u64;
+        .ok_or_else(|| error::discovery_failed("response missing content-length"))?
+        as u64;
     let remaining = object_meta
         .content_length()
         .checked_sub(1)
@@ -214,8 +217,9 @@ mod tests {
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
-    use crate::operation::download::DownloadContext;
+    use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
+    use crate::transfer::TransferContext;
     use crate::types::BucketType;
     use crate::types::PartSize;
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
@@ -250,6 +254,16 @@ mod tests {
         tm.handle.clone()
     }
 
+    fn test_transfer(
+        handle: Arc<crate::client::Handle>,
+        input: &DownloadInput,
+    ) -> DownloadTransfer {
+        use crate::operation::download::body;
+        let (writer, _consumer) = body::new_slot_body(body::DEFAULT_BODY_SLOT_CAPACITY);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer)
+    }
+
     #[test]
     fn test_strategy_from_req() {
         assert_eq!(
@@ -282,18 +296,18 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext::new(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            BucketType::Standard,
-        );
-
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj_with_head(&ctx, &input).await.unwrap();
+        let transfer = test_transfer(
+            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
+            &input,
+        );
+
+        let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(500, remaining.clone().count());
         assert_eq!(0..=499, remaining);
@@ -314,15 +328,15 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(200, remaining.clone().count());
         assert_eq!(500..=699, remaining);
@@ -351,15 +365,15 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request).await.unwrap();
         assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
@@ -386,8 +400,6 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
@@ -395,7 +407,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(200, remaining.clone().count());
         assert_eq!(300..=499, remaining);
@@ -424,8 +438,6 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
@@ -433,7 +445,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request).await.unwrap();
         assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
@@ -458,15 +472,15 @@ mod tests {
             .then_output(|| GetObjectOutput::builder().content_length(0).build());
         let client = mock_client!(aws_sdk_s3, &[&get_range_rule, &get_first_part_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request).await.unwrap();
         assert!(discovery.remaining.is_none());
         assert!(discovery.initial_chunk.is_none());
     }

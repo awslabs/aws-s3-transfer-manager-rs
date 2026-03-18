@@ -95,6 +95,12 @@ pub(crate) mod runtime;
 /// Scheduler for coordinating transfer execution
 pub(crate) mod scheduler;
 
+/// Transfer types
+pub(crate) mod transfer;
+
+/// Telemetry target constants
+pub(crate) mod telemetry;
+
 /// Metrics
 pub mod metrics;
 

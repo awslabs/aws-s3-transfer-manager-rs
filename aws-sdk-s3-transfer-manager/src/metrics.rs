@@ -5,7 +5,9 @@
 
 use std::fmt::{self, Display};
 use std::ops;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Units of measurement
 pub mod unit {
@@ -305,6 +307,249 @@ impl fmt::Display for ThroughputDisplayContext<'_> {
     }
 }
 
+/// I/O measurement from a completed work item.
+///
+/// Captures bytes transferred in each direction and the wall-clock duration.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IoSample {
+    /// Bytes sent over network (upload)
+    pub network_tx: u64,
+    /// Bytes received from network (download)
+    pub network_rx: u64,
+    /// Bytes read from disk (upload source)
+    pub disk_read: u64,
+    /// Bytes written to disk (download sink)
+    pub disk_write: u64,
+    /// Wall-clock duration of the operation
+    pub duration: Duration,
+}
+
+impl IoSample {
+    /// Sample for a network send.
+    pub fn network_tx(bytes: u64, duration: Duration) -> Self {
+        Self {
+            network_tx: bytes,
+            duration,
+            ..Default::default()
+        }
+    }
+
+    /// Sample for a network receive.
+    pub fn network_rx(bytes: u64, duration: Duration) -> Self {
+        Self {
+            network_rx: bytes,
+            duration,
+            ..Default::default()
+        }
+    }
+}
+
+/// Number of buckets to use for calculating IO windows
+const IO_WINDOW_BUCKETS: usize = 10;
+
+struct Bucket {
+    bytes: AtomicU64,
+    /// Monotonic index identifying which rotation owns this slot.
+    /// A bucket is live when `current_idx - epoch < IO_WINDOW_BUCKETS`.
+    epoch: AtomicUsize,
+}
+
+/// Rolling window for measuring recent throughput.
+///
+/// Tracks bytes over a short, fixed-duration window (e.g. 500ms) to provide
+/// a smoothed estimate of current throughput. The window is divided into
+/// equal-duration buckets arranged in a ring — each bucket accumulates bytes
+/// during its time slice, and stale buckets age out automatically.
+///
+/// `throughput()` returns bytes/sec over the full window duration. During
+/// ramp-up or after idle gaps, partially-filled windows naturally report
+/// lower values (fixed denominator, not per-bucket averaging).
+///
+/// `add()` uses `try_lock` so producers never block waiting for rotation.
+pub(crate) struct IOWindow {
+    buckets: [Bucket; IO_WINDOW_BUCKETS],
+    /// Monotonic counter. `current_idx % IO_WINDOW_BUCKETS` is the active slot.
+    current_idx: AtomicUsize,
+    /// Start time of the current bucket's time slice.
+    bucket_start: Mutex<Instant>,
+    bucket_duration: Duration,
+    window_duration: Duration,
+}
+
+impl IOWindow {
+    pub(crate) fn new(window_duration: Duration) -> Self {
+        let bucket_duration = window_duration / IO_WINDOW_BUCKETS as u32;
+        let buckets = std::array::from_fn(|_| Bucket {
+            bytes: AtomicU64::new(0),
+            epoch: AtomicUsize::new(0),
+        });
+        Self {
+            buckets,
+            current_idx: AtomicUsize::new(0),
+            bucket_start: Mutex::new(Instant::now()),
+            bucket_duration,
+            window_duration,
+        }
+    }
+
+    /// Advance the ring to catch up with elapsed time. Advances
+    /// `bucket_start` by `bucket_duration` increments (not wall-clock reset)
+    /// to keep buckets aligned to a consistent time grid.
+    ///
+    /// If more than `IO_WINDOW_BUCKETS` durations have elapsed, the entire
+    /// ring is stale — clears all buckets in one step instead of looping.
+    fn maybe_rotate(&self, guard: &mut std::sync::MutexGuard<'_, Instant>) -> usize {
+        let elapsed = guard.elapsed();
+        if elapsed < self.bucket_duration {
+            return self.current_idx.load(Ordering::Acquire);
+        }
+
+        let steps = (elapsed.as_nanos() / self.bucket_duration.as_nanos()) as usize;
+
+        if steps >= IO_WINDOW_BUCKETS {
+            let current = self.current_idx.load(Ordering::Acquire) + steps;
+            self.current_idx.store(current, Ordering::Release);
+            for bucket in self.buckets.iter() {
+                bucket.bytes.store(0, Ordering::Release);
+                bucket.epoch.store(current, Ordering::Release);
+            }
+            **guard = **guard + self.bucket_duration * steps as u32;
+            current
+        } else {
+            let mut current = self.current_idx.load(Ordering::Acquire);
+            while guard.elapsed() >= self.bucket_duration {
+                current = self.current_idx.fetch_add(1, Ordering::AcqRel) + 1;
+                let slot = current % IO_WINDOW_BUCKETS;
+                self.buckets[slot].bytes.store(0, Ordering::Release);
+                self.buckets[slot].epoch.store(current, Ordering::Release);
+                **guard = **guard + self.bucket_duration;
+            }
+            current
+        }
+    }
+
+    /// Add bytes to the current bucket, rotating first if needed.
+    pub(crate) fn add(&self, bytes: u64) {
+        if let Ok(mut guard) = self.bucket_start.try_lock() {
+            self.maybe_rotate(&mut guard);
+        }
+        let slot = self.current_idx.load(Ordering::Acquire) % IO_WINDOW_BUCKETS;
+        self.buckets[slot].bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Throughput in bytes/sec over the window.
+    pub(crate) fn throughput(&self) -> f64 {
+        let mut guard = self.bucket_start.lock().unwrap();
+        let current = self.maybe_rotate(&mut guard);
+        let sum: u64 = self
+            .buckets
+            .iter()
+            .filter(|b| current - b.epoch.load(Ordering::Acquire) < IO_WINDOW_BUCKETS)
+            .map(|b| b.bytes.load(Ordering::Acquire))
+            .sum();
+        if sum == 0 {
+            return 0.0;
+        }
+        sum as f64 / self.window_duration.as_secs_f64()
+    }
+
+    /// True if no live bucket has any bytes.
+    pub(crate) fn is_idle(&self) -> bool {
+        let mut guard = self.bucket_start.lock().unwrap();
+        let current = self.maybe_rotate(&mut guard);
+        self.buckets.iter().all(|b| {
+            current - b.epoch.load(Ordering::Acquire) >= IO_WINDOW_BUCKETS
+                || b.bytes.load(Ordering::Acquire) == 0
+        })
+    }
+}
+
+impl fmt::Debug for IOWindow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IOWindow")
+            .field("window_duration", &self.window_duration)
+            .field("throughput_bps", &self.throughput())
+            .finish()
+    }
+}
+
+/// Rolling throughput counters broken down by I/O direction.
+///
+/// Wraps four [`IOWindow`]s — network sent/received and disk read/written —
+/// to provide per-direction and aggregate throughput measurements.
+pub(crate) struct IOCounters {
+    network_tx: IOWindow,
+    network_rx: IOWindow,
+    disk_read: IOWindow,
+    disk_write: IOWindow,
+}
+
+impl IOCounters {
+    /// Create counters with the given window duration for all windows.
+    pub(crate) fn new(window_duration: Duration) -> Self {
+        Self {
+            network_tx: IOWindow::new(window_duration),
+            network_rx: IOWindow::new(window_duration),
+            disk_read: IOWindow::new(window_duration),
+            disk_write: IOWindow::new(window_duration),
+        }
+    }
+
+    /// Record an I/O sample into the appropriate windows.
+    pub(crate) fn record(&self, sample: &IoSample) {
+        self.network_tx.add(sample.network_tx);
+        self.network_rx.add(sample.network_rx);
+        self.disk_read.add(sample.disk_read);
+        self.disk_write.add(sample.disk_write);
+    }
+
+    /// Record network bytes (sent + received).
+    pub(crate) fn record_network(&self, bytes_sent: u64, bytes_received: u64) {
+        self.network_tx.add(bytes_sent);
+        self.network_rx.add(bytes_received);
+    }
+
+    /// Record disk bytes (read + written).
+    pub(crate) fn record_disk(&self, bytes_read: u64, bytes_written: u64) {
+        self.disk_read.add(bytes_read);
+        self.disk_write.add(bytes_written);
+    }
+
+    /// Network throughput (sent + received) in bytes/sec.
+    pub(crate) fn network_throughput(&self) -> f64 {
+        self.network_tx.throughput() + self.network_rx.throughput()
+    }
+
+    /// Disk throughput (read + written) in bytes/sec.
+    pub(crate) fn disk_throughput(&self) -> f64 {
+        self.disk_read.throughput() + self.disk_write.throughput()
+    }
+
+    /// Total throughput across all directions in bytes/sec.
+    pub(crate) fn total_throughput(&self) -> f64 {
+        self.network_throughput() + self.disk_throughput()
+    }
+
+    /// True if all windows are idle.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.network_tx.is_idle()
+            && self.network_rx.is_idle()
+            && self.disk_read.is_idle()
+            && self.disk_write.is_idle()
+    }
+}
+
+impl fmt::Debug for IOCounters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IOCounters")
+            .field("network_sent_bps", &self.network_tx.throughput())
+            .field("network_received_bps", &self.network_rx.throughput())
+            .field("disk_read_bps", &self.disk_read.throughput())
+            .field("disk_written_bps", &self.disk_write.throughput())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{str::FromStr, time::Duration};
@@ -413,5 +658,108 @@ mod tests {
                 ByteCountDisplayContext::new(1091242563, ByteUnit::Mebibyte)
             )
         );
+    }
+
+    // --- IOWindow tests ---
+
+    use super::IOWindow;
+
+    #[test]
+    fn io_window_empty_returns_zero() {
+        let w = IOWindow::new(Duration::from_millis(500));
+        assert_eq!(w.throughput(), 0.0);
+        assert!(w.is_idle());
+    }
+
+    #[test]
+    fn io_window_single_add() {
+        // 1MB in a 1s window = 1MB/s
+        let w = IOWindow::new(Duration::from_secs(1));
+        w.add(1_000_000);
+        let tp = w.throughput();
+        assert!((tp - 1_000_000.0).abs() < 1.0, "expected ~1MB/s, got {tp}");
+        assert!(!w.is_idle());
+    }
+
+    #[test]
+    fn io_window_multiple_adds_accumulate() {
+        let w = IOWindow::new(Duration::from_secs(1));
+        w.add(500_000);
+        w.add(500_000);
+        let tp = w.throughput();
+        assert!((tp - 1_000_000.0).abs() < 1.0, "expected ~1MB/s, got {tp}");
+    }
+
+    #[test]
+    fn io_window_stale_buckets_evicted() {
+        let w = IOWindow::new(Duration::from_millis(100));
+        w.add(1_000_000);
+        assert!(!w.is_idle());
+        // Sleep past the full window duration
+        std::thread::sleep(Duration::from_millis(150));
+        // Trigger rotation
+        w.add(0);
+        assert!(w.is_idle(), "stale data should have been evicted");
+        assert_eq!(w.throughput(), 0.0);
+    }
+
+    #[test]
+    fn io_window_spans_multiple_buckets() {
+        // Window = 500ms, bucket = 50ms. Add to two different buckets.
+        let w = IOWindow::new(Duration::from_millis(500));
+        w.add(500_000);
+        // Sleep past one bucket duration to force rotation
+        std::thread::sleep(Duration::from_millis(60));
+        w.add(500_000);
+        let tp = w.throughput();
+        // Both buckets live, total = 1MB / 0.5s = 2MB/s
+        assert!(
+            (tp - 2_000_000.0).abs() < 100_000.0,
+            "expected ~2MB/s, got {tp}"
+        );
+    }
+
+    // --- IOCounters tests ---
+
+    use super::IOCounters;
+
+    #[test]
+    fn io_counters_network_throughput() {
+        let c = IOCounters::new(Duration::from_secs(1));
+        c.record_network(1_000_000, 2_000_000);
+        let tp = c.network_throughput();
+        assert!((tp - 3_000_000.0).abs() < 1.0, "expected ~3MB/s, got {tp}");
+    }
+
+    #[test]
+    fn io_counters_disk_throughput() {
+        let c = IOCounters::new(Duration::from_secs(1));
+        c.record_disk(4_000_000, 1_000_000);
+        let tp = c.disk_throughput();
+        assert!((tp - 5_000_000.0).abs() < 1.0, "expected ~5MB/s, got {tp}");
+    }
+
+    #[test]
+    fn io_counters_total_throughput() {
+        let c = IOCounters::new(Duration::from_secs(1));
+        c.record_network(1_000_000, 2_000_000);
+        c.record_disk(3_000_000, 4_000_000);
+        let tp = c.total_throughput();
+        assert!(
+            (tp - 10_000_000.0).abs() < 1.0,
+            "expected ~10MB/s, got {tp}"
+        );
+    }
+
+    #[test]
+    fn io_counters_is_idle_when_all_idle() {
+        let c = IOCounters::new(Duration::from_millis(100));
+        assert!(c.is_idle());
+        c.record_network(1_000, 0);
+        assert!(!c.is_idle());
+        std::thread::sleep(Duration::from_millis(150));
+        // Trigger rotation on the window that has data
+        c.record_network(0, 0);
+        assert!(c.is_idle());
     }
 }

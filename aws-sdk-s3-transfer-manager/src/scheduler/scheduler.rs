@@ -50,16 +50,19 @@
 //! - **Pending/wake obligation**: every `Pending` must have a future wake path.
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
-use super::{BoxTransfer, ConcurrencyController, PollWork, TransferId, WorkOutcome, WorkerPool};
+use super::{CompletionSample, ConcurrencyController};
+use crate::transfer::{BoxTransfer, IoKind, IoRequest, PollWork, TransferId, WorkOutcome};
+
+use crate::metrics::{IOCounters, IoSample};
+use crate::runtime::{ExecutionRuntime, ScheduledWork};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
-use crate::scheduler::work::ScheduledWork;
-use futures_util::FutureExt;
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -70,8 +73,10 @@ pub(crate) struct Scheduler(Arc<SchedulerInner>);
 struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
-    pool: Arc<WorkerPool>,
     controller: Arc<dyn ConcurrencyController>,
+    io_counters: Arc<IOCounters>,
+    runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
+    dispatched: AtomicUsize,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -80,39 +85,86 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
+/// Builder for constructing a [`Scheduler`] with its runtime.
+pub(crate) struct SchedulerBuilder {
+    controller: Arc<dyn ConcurrencyController>,
+    io_counters: Arc<IOCounters>,
+}
+
+impl SchedulerBuilder {
+    pub(crate) fn new(
+        controller: Arc<dyn ConcurrencyController>,
+        io_counters: Arc<IOCounters>,
+    ) -> Self {
+        Self {
+            controller,
+            io_counters,
+        }
+    }
+
+    /// Build the scheduler with its runtime.
+    ///
+    /// Takes a factory that receives the scheduler and returns a runtime.
+    /// This breaks the circular dependency: the scheduler needs the runtime
+    /// to dispatch work, and the runtime needs the scheduler to report
+    /// completions. The factory creates the runtime with a scheduler
+    /// reference, then the scheduler stores the runtime via `OnceLock`.
+    pub(crate) fn build(
+        self,
+        runtime_factory: impl FnOnce(Scheduler) -> Arc<dyn ExecutionRuntime>,
+    ) -> Scheduler {
+        let scheduler = Scheduler(Arc::new(SchedulerInner {
+            transfers: RwLock::new(HashMap::new()),
+            ready_set: ReadySet::new(),
+            controller: self.controller,
+            io_counters: self.io_counters,
+            runtime: OnceLock::new(),
+            dispatched: AtomicUsize::new(0),
+        }));
+        let runtime = runtime_factory(scheduler.clone());
+        scheduler
+            .0
+            .runtime
+            .set(runtime)
+            .expect("runtime already set");
+        scheduler
+    }
+}
+
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
-        Self::with_controller(Arc::new(super::FixedConcurrency::new(concurrency)))
+        SchedulerBuilder::new(
+            Arc::new(super::FixedConcurrency::new(concurrency)),
+            Arc::new(IOCounters::new(Duration::from_millis(500))),
+        )
+        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
     pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
-        Self(Arc::new(SchedulerInner {
-            transfers: RwLock::new(HashMap::new()),
-            ready_set: ReadySet::new(),
-            pool: Arc::new(WorkerPool::new()),
+        SchedulerBuilder::new(
             controller,
-        }))
+            Arc::new(IOCounters::new(Duration::from_millis(500))),
+        )
+        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
-    /// Ensure workers are spawned for a pool. Called lazily on first enqueue.
-    fn ensure_workers_started(&self) {
-        let pool = &self.0.pool;
-        if pool.mark_started() {
-            for _ in 0..self.0.controller.target() {
-                let pool = Arc::clone(pool);
-                let scheduler = self.clone();
-                tokio::spawn(async move {
-                    worker_loop(pool, scheduler).await;
-                });
-            }
-        }
+    pub(crate) fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
+        self.0.runtime.get().expect("runtime not initialized")
+    }
+
+    /// Returns the concurrency controller's current target.
+    pub(crate) fn controller_target(&self) -> usize {
+        self.0.controller.target()
+    }
+
+    /// Called by the runtime when a worker picks up work.
+    pub(crate) fn on_dispatch(&self) {
+        self.0.controller.on_dispatch();
     }
 
     /// Add a transfer and start generating work.
     pub(crate) fn enqueue_transfer(&self, transfer: BoxTransfer) {
-        self.ensure_workers_started();
-
         // start with lowest current vruntime to avoid new transfer
         // playing aggressive catchup over already in-flight transfers
         let desc = TransferDescriptor::new_with_vruntime(transfer, self.0.ready_set.min_vruntime());
@@ -142,25 +194,22 @@ impl Scheduler {
     }
 
     /// Cancel a transfer, removing it from the scheduler.
-    ///
-    /// - Removes from transfers map
-    /// - Purges queued work for this transfer from pools
-    /// - Outstanding work being executed will complete naturally
-    /// - Use `wait_for_idle(id)` to wait for all outstanding work to finish
-    ///
-    /// TODO: When upload_objects/download_objects use the new scheduler,
-    /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
+    /// Purges queued work for this transfer, any in-flight work may complete naturally.
+    /// Use [`Scheduler::wait_for_idle`] to wait for all outstanding work to finish
     pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
+        // TODO(vnext): When upload_objects/download_objects use the new scheduler,
+        //       this needs to cancel child transfers too (where tid.parent == Some(id.id)).
         let desc = self.0.transfers.write().unwrap().remove(&id);
         if let Some(desc) = desc {
             let ctx = desc.transfer().ctx();
             // Ensure transfer is terminal so ready_set and workers skip it.
-            // May already be set by the handle (set_cancelled/set_failed) -- that's fine.
+            // May already be set by the handle (set_cancelled/set_failed) that's fine.
             if ctx.is_active() {
                 ctx.set_cancelled();
             }
             ctx.signal_terminal();
-            let purged = self.0.pool.remove_for_transfer(id);
+            let purged = self.runtime().remove_pending_for_transfer(id);
+            self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
             desc.work_purged(purged);
             desc.notify_idle();
             true
@@ -185,7 +234,29 @@ impl Scheduler {
     }
 
     /// Called by workers when work completes.
-    pub(super) fn on_completion(&self, work: ScheduledWork, outcome: WorkOutcome) {
+    pub(crate) fn on_completion(
+        &self,
+        work: ScheduledWork,
+        outcome: WorkOutcome,
+        elapsed: Duration,
+    ) {
+        self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
+
+        // Report to concurrency controller
+        let (mut io_sample, classification) = match &outcome {
+            WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
+            WorkOutcome::Failed { classification } => (IoSample::default(), *classification),
+            WorkOutcome::Cancelled => (IoSample::default(), None),
+        };
+        io_sample.duration = elapsed;
+        self.0.io_counters.record(&io_sample);
+        let sample = CompletionSample {
+            io: io_sample,
+            error: classification,
+            kind: work.item.kind,
+        };
+        self.0.controller.on_completion(&sample);
+
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
         if is_idle {
@@ -201,12 +272,17 @@ impl Scheduler {
         }
 
         // handle any follow-on work
-        if let WorkOutcome::Success(Some(follow_on)) = outcome {
+        if let WorkOutcome::Success {
+            schedule_next: Some(kind),
+            data,
+            ..
+        } = outcome
+        {
             let next = ScheduledWork {
-                item: follow_on,
+                item: IoRequest { kind, data },
                 descriptor: desc.clone(),
             };
-            self.enqueue_to_pool(next);
+            self.dispatch_single(next);
         }
 
         // capacity has freed try to queue up more work
@@ -215,7 +291,9 @@ impl Scheduler {
 
     /// Handle a panic during work execution. The transfer's internal state is
     /// unknown, so the scheduler forces the terminal transition from outside.
-    pub(super) fn on_panic(&self, work: ScheduledWork) {
+    pub(crate) fn on_panic(&self, work: ScheduledWork) {
+        self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
+
         let desc = &work.descriptor;
         let ctx = desc.transfer().ctx();
 
@@ -233,19 +311,16 @@ impl Scheduler {
     }
 
     fn has_capacity(&self) -> bool {
-        let pending = self.0.pool.pending_count();
-        let in_flight = self.0.pool.in_flight_count();
-        pending + in_flight < self.0.controller.target()
+        self.0.dispatched.load(Ordering::Relaxed) < self.0.controller.target()
     }
 
-    /// Generate work from ready transfers and push to pools.
+    /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
             };
 
-            // Skip cancelled/failed transfers still in the ready set
             if desc.is_terminal() {
                 continue;
             }
@@ -254,32 +329,31 @@ impl Scheduler {
                 PollWork::Ready(item) => {
                     desc.work_generated();
                     self.0.ready_set.insert(desc.clone());
-                    self.enqueue_to_pool(ScheduledWork {
+                    self.dispatch_single(ScheduledWork {
                         item,
                         descriptor: desc,
                     });
                 }
                 PollWork::Pending => {
-                    // re-added on wake as state machine progresses
+                    // re-added on wake
                 }
                 PollWork::Done => {
-                    // done generating work, remove from transfers
                     self.0.transfers.write().unwrap().remove(&desc.id());
                 }
             }
         }
     }
 
-    fn enqueue_to_pool(&self, work: ScheduledWork) {
+    fn dispatch_single(&self, work: ScheduledWork) {
+        self.0.dispatched.fetch_add(1, Ordering::Relaxed);
         work.descriptor.work_queued();
-        self.0.pool.push(work);
+        self.runtime().dispatch(work);
     }
 
     #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
-            && self.0.pool.pending_count() == 0
-            && self.0.pool.in_flight_count() == 0
+            && self.0.dispatched.load(Ordering::Relaxed) == 0
     }
 
     /// Wait for a specific transfer to have no outstanding work.
@@ -293,79 +367,26 @@ impl Scheduler {
         }
     }
 
-    /// Shutdown the scheduler. Workers will exit after completing current work.
+    /// Shutdown the scheduler.
     #[allow(dead_code)] // TODO: wire into Handle::drop
     pub(crate) fn shutdown(&self) {
-        self.0.pool.shutdown();
-    }
-}
-
-/// Worker loop - pulls work from pool and executes it.
-async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
-    static WORKER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let wid = WORKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    loop {
-        let Some(mut work) = pool.next_work().await else {
-            tracing::debug!(wid, "shutdown");
-            break;
-        };
-
-        let tid = work.descriptor.id();
-        work.descriptor.work_started();
-
-        // Skip execution if transfer already terminal (failed/cancelled by another work item)
-        if work.descriptor.is_terminal() {
-            tracing::debug!(wid, %tid, work = ?work.item.data, "skipped (terminal)");
-            pool.complete();
-            scheduler.on_completion(work, WorkOutcome::Cancelled);
-            continue;
-        }
-
-        tracing::debug!(wid, %tid, work = ?work.item.data, "executing");
-        let transfer = work.descriptor.transfer();
-
-        let token = transfer.ctx().cancellation_token().clone();
-        let outcome = AssertUnwindSafe(async {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => WorkOutcome::Cancelled,
-                outcome = transfer.execute(&mut work.item) => outcome,
-            }
-        })
-        .catch_unwind()
-        .await;
-
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(_panic) => {
-                tracing::error!(wid, %tid, "panic in transfer execute");
-                pool.complete();
-                scheduler.on_panic(work);
-                continue;
-            }
-        };
-
-        tracing::debug!(wid, %tid, work = ?work.item.data, ?outcome, "completed");
-
-        pool.complete();
-        scheduler.on_completion(work, outcome);
+        self.runtime().shutdown();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::context::TransferContext;
-    use crate::scheduler::transfer::mock::{test_context, FixedWorkCount, WithDelay, WithExecute};
-    use crate::scheduler::transfer::Transfer;
-    use crate::scheduler::work::{WorkItem, WorkKind, WorkOutcome};
+    use crate::scheduler::test_util::{FixedWorkCount, MockStateMachine, WithDelay, WithExecute};
+    use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    use crate::scheduler::test_util::MockTransfer;
 
     #[tokio::test]
     async fn test_single_transfer_completes() {
@@ -376,8 +397,9 @@ mod tests {
             parent: None,
         };
 
-        let sm = Arc::new(FixedWorkCount::new(id, 5));
-        scheduler.enqueue_transfer(Box::new(sm.clone()));
+        let sm = Arc::new(FixedWorkCount::new(5));
+        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
+        scheduler.enqueue_transfer(transfer);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
@@ -402,9 +424,9 @@ mod tests {
                 id: i,
                 parent: None,
             };
-            let sm = Arc::new(FixedWorkCount::new(id, 4));
+            let sm = Arc::new(FixedWorkCount::new(4));
             state_machines.push(sm.clone());
-            scheduler.enqueue_transfer(Box::new(sm));
+            scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
         }
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -435,18 +457,16 @@ mod tests {
             parent: None,
         };
 
-        // Use a mock that returns Pending so it doesn't complete immediately
-        let sm = Arc::new(PendingForever::new(id));
-        scheduler.enqueue_transfer(Box::new(sm));
+        let sm = Arc::new(PendingForever);
+        let transfer = Box::new(MockTransfer::new(id, sm));
+        scheduler.enqueue_transfer(transfer);
 
-        // Default priority is 128
         {
             let transfers = scheduler.0.transfers.read().unwrap();
             let desc = transfers.get(&id).expect("transfer should exist");
             assert_eq!(desc.priority(), 128);
         }
 
-        // Change priority
         scheduler.set_priority(id, 255);
 
         {
@@ -455,60 +475,40 @@ mod tests {
             assert_eq!(desc.priority(), 255);
         }
 
-        // Setting priority on non-existent transfer is a no-op
         let fake_id = TransferId {
             id: 999,
             parent: None,
         };
-        scheduler.set_priority(fake_id, 100); // Should not panic
+        scheduler.set_priority(fake_id, 100);
 
         scheduler.shutdown();
     }
 
-    /// Mock that always returns Pending (never generates work, never completes)
     #[derive(Debug)]
-    struct PendingForever {
-        ctx: TransferContext,
-    }
+    struct PendingForever;
 
-    impl PendingForever {
-        fn new(id: TransferId) -> Self {
-            Self {
-                ctx: test_context(id),
-            }
-        }
-    }
-
-    impl Transfer for PendingForever {
-        fn ctx(&self) -> &TransferContext {
-            &self.ctx
-        }
-
-        fn poll_work(&self) -> PollWork {
+    impl MockStateMachine for PendingForever {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
             PollWork::Pending
         }
 
         fn execute<'a>(
             &'a self,
-            _work: &'a mut WorkItem,
+            _work: &'a mut IoRequest,
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async { unreachable!("PendingForever never generates work") })
         }
     }
 
-    /// Mock that generates infinite work and counts executions.
-    /// Can be stopped by calling `set_done()`.
     #[derive(Debug)]
     struct CountingInfinite {
-        ctx: TransferContext,
         executions: AtomicUsize,
         done: std::sync::atomic::AtomicBool,
     }
 
     impl CountingInfinite {
-        fn new(id: TransferId) -> Self {
+        fn new() -> Self {
             Self {
-                ctx: test_context(id),
                 executions: AtomicUsize::new(0),
                 done: std::sync::atomic::AtomicBool::new(false),
             }
@@ -523,32 +523,29 @@ mod tests {
         }
     }
 
-    impl Transfer for CountingInfinite {
-        fn ctx(&self) -> &TransferContext {
-            &self.ctx
-        }
-
-        fn poll_work(&self) -> PollWork {
+    impl MockStateMachine for CountingInfinite {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
             if self.done.load(Ordering::Acquire) {
                 return PollWork::Done;
             }
-            PollWork::Ready(WorkItem {
-                kind: WorkKind::Network,
+            PollWork::Ready(IoRequest {
+                kind: IoKind::Network,
                 data: None,
             })
         }
 
         fn execute<'a>(
             &'a self,
-            _work: &'a mut WorkItem,
+            _work: &'a mut IoRequest,
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.executions.fetch_add(1, Ordering::Relaxed);
-                // Yield to prevent starving other tasks on single-threaded runtimes
                 tokio::task::yield_now().await;
-                // No schedule_next -- let generate_work() pull from ready set
-                // where CFS priority ordering applies
-                WorkOutcome::Success(None)
+                WorkOutcome::Success {
+                    schedule_next: None,
+                    data: None,
+                    metrics: None,
+                }
             })
         }
     }
@@ -566,13 +563,15 @@ mod tests {
             parent: None,
         };
 
-        let high_mock = Arc::new(CountingInfinite::new(high_id));
-        let low_mock = Arc::new(CountingInfinite::new(low_id));
+        let high_mock = Arc::new(CountingInfinite::new());
+        let low_mock = Arc::new(CountingInfinite::new());
 
-        scheduler.enqueue_transfer(Box::new(high_mock.clone()));
-        scheduler.enqueue_transfer(Box::new(low_mock.clone()));
+        let high_transfer = Box::new(MockTransfer::new(high_id, high_mock.clone()));
+        let low_transfer = Box::new(MockTransfer::new(low_id, low_mock.clone()));
 
-        // Set priorities: high=255, low=64 (4x difference)
+        scheduler.enqueue_transfer(high_transfer);
+        scheduler.enqueue_transfer(low_transfer);
+
         scheduler.set_priority(high_id, 255);
         scheduler.set_priority(low_id, 64);
 
@@ -624,11 +623,11 @@ mod tests {
             parent: None,
         };
 
-        let a_mock = Arc::new(CountingInfinite::new(a_id));
-        let b_mock = Arc::new(CountingInfinite::new(b_id));
+        let a_mock = Arc::new(CountingInfinite::new());
+        let b_mock = Arc::new(CountingInfinite::new());
 
-        scheduler.enqueue_transfer(Box::new(a_mock.clone()));
-        scheduler.enqueue_transfer(Box::new(b_mock.clone()));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(a_id, a_mock.clone())));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(b_id, b_mock.clone())));
 
         // Both at default priority (128) -- let them run equally
         while a_mock.count() + b_mock.count() < 100 {
@@ -673,8 +672,12 @@ mod tests {
             id: 1,
             parent: None,
         };
-        let sm = WithExecute::new(FixedWorkCount::new(id, 1), |_| WorkOutcome::Failed);
-        scheduler.enqueue_transfer(Box::new(sm));
+        let sm = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
+            WorkOutcome::Failed {
+                classification: None,
+            }
+        }));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
@@ -697,18 +700,20 @@ mod tests {
             id: 1,
             parent: None,
         };
-        let panic_sm = WithExecute::new(FixedWorkCount::new(panic_id, 1), |_| -> WorkOutcome {
-            panic!("boom")
-        });
-        let panic_ctx = panic_sm.ctx().clone();
-        scheduler.enqueue_transfer(Box::new(panic_sm));
+        let panic_sm = Arc::new(WithExecute::new(
+            FixedWorkCount::new(1),
+            |_| -> WorkOutcome { panic!("boom") },
+        ));
+        let panic_mock = MockTransfer::new(panic_id, panic_sm);
+        let panic_ctx = panic_mock.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(panic_mock));
 
         let ok_id = TransferId {
             id: 2,
             parent: None,
         };
-        let ok_sm = Arc::new(FixedWorkCount::new(ok_id, 3));
-        scheduler.enqueue_transfer(Box::new(ok_sm.clone()));
+        let ok_sm = Arc::new(FixedWorkCount::new(3));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(ok_id, ok_sm.clone())));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
@@ -745,9 +750,10 @@ mod tests {
         };
 
         // Use WithDelay to make work slow enough to cancel mid-flight
-        let inner = FixedWorkCount::new(id, 20);
+        let inner = FixedWorkCount::new(20);
         let sm = Arc::new(WithDelay::new(inner, Duration::from_millis(50)));
-        scheduler.enqueue_transfer(Box::new(sm.clone()));
+        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
+        scheduler.enqueue_transfer(transfer);
 
         // Let some work start
         tokio::time::sleep(Duration::from_millis(100)).await;

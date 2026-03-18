@@ -71,6 +71,7 @@ pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
             Ok(chunk) => data.put(chunk.data.into_bytes()),
             Err(err) => {
                 error.get_or_insert(err);
+                break;
             }
         }
     }
