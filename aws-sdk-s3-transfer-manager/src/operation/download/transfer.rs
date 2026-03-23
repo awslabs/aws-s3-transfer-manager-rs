@@ -361,6 +361,7 @@ impl DownloadTransfer {
 
         let chunk = ChunkOutput {
             seq,
+            offset: 0,
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
         };
@@ -427,6 +428,7 @@ impl DownloadTransfer {
         bail_if_terminal!(self);
         let chunk = ChunkOutput {
             seq,
+            offset: *range.start(),
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
         };
@@ -863,6 +865,7 @@ mod tests {
         seg.push(bytes::Bytes::from("data"));
         slot1.fill(ChunkOutput {
             seq: 1,
+            offset: 0,
             data: crate::io::AggregatedBytes(seg),
             metadata: Default::default(),
         });
@@ -877,6 +880,7 @@ mod tests {
         seg.push(bytes::Bytes::from("data"));
         slot2.fill(ChunkOutput {
             seq: 2,
+            offset: 0,
             data: crate::io::AggregatedBytes(seg),
             metadata: Default::default(),
         });

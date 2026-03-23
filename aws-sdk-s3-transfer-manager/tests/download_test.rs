@@ -508,3 +508,67 @@ async fn test_download_object_modified() {
         error
     );
 }
+
+/// Test download via `write_to_path` writes all data and cleans up temp files.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path() {
+    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&dest_path).unwrap();
+    assert_eq!(data.as_ref(), written.as_slice());
+
+    // No .s3tmp files should remain
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}
+
+/// Test that aborting a download-to-file cleans up both temp and dest files.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_abort_cleans_up() {
+    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.abort().await;
+
+    assert!(!dest_path.exists(), "dest file should not exist after abort");
+
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}

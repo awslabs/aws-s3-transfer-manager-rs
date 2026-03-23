@@ -8,15 +8,12 @@ use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
 use aws_smithy_types::date_time::{DateTime, Format};
-use bytes::Buf;
 use clap::{CommandFactory, Parser};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{self, SystemTime};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
-use tracing::Instrument;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -187,27 +184,23 @@ async fn do_single_download(
 ) -> Result<u64, BoxError> {
     let is_dev_null = dest == Path::new("/dev/null");
 
-    if !is_dev_null {
-        println!("dest file opened, starting download");
-    }
-
-    // TODO(aws-sdk-rust#1159) - rewrite this less naively,
-    //      likely abstract this into performant utils for single file download. Higher level
-    //      TM will handle it's own thread pool for filesystem work
-    let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
-
     if is_dev_null {
+        let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
         drain_body(handle.body_mut()).await?;
+        let obj_size_bytes = handle.object_meta().await?.content_length();
+        handle.join().await?;
+        Ok(obj_size_bytes as u64)
     } else {
-        let dest_file = fs::File::create(dest).await?;
-        write_body(handle.body_mut(), dest_file)
-            .instrument(tracing::debug_span!("write-output"))
+        let handle = tm
+            .download()
+            .bucket(bucket)
+            .key(key)
+            .write_to_path(dest)
             .await?;
+        let obj_size_bytes = handle.object_meta().await?.content_length();
+        handle.join().await?;
+        Ok(obj_size_bytes as u64)
     }
-
-    let obj_size_bytes = handle.object_meta().await?.content_length();
-    handle.join().await?;
-    Ok(obj_size_bytes as u64)
 }
 
 async fn do_recursive_download(
@@ -389,21 +382,6 @@ async fn main() -> Result<(), BoxError> {
 async fn drain_body(body: &mut Body) -> Result<(), BoxError> {
     while let Some(chunk) = body.next().await {
         let _chunk = chunk?;
-    }
-    Ok(())
-}
-
-async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError> {
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.unwrap().data;
-        tracing::trace!("recv'd chunk remaining={}", chunk.remaining());
-        let mut segment_cnt = 1;
-        for segment in chunk.into_segments() {
-            dest.write_all(segment.as_ref()).await?;
-            tracing::trace!("wrote segment size: {}", segment.remaining());
-            segment_cnt += 1;
-        }
-        tracing::trace!("chunk had {segment_cnt} segments");
     }
     Ok(())
 }
