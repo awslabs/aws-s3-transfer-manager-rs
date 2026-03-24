@@ -20,6 +20,7 @@ use std::pin::Pin;
 use crate::error::{self, Error};
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::{InputStream, PartData};
+use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IoSample;
 use crate::operation::upload::context::UploadState;
 use crate::operation::upload::input::convert::{
@@ -73,6 +74,8 @@ struct UploadTransferInner {
     create_mpu_complete: tokio::sync::Notify,
     /// Channel to send result to handle
     result_tx: Mutex<Option<UploadResultSender>>,
+    /// Adaptive latency tracking for timeout+retry on upload parts
+    latencies: LatencyTracker,
 }
 
 impl UploadTransfer {
@@ -100,6 +103,7 @@ impl UploadTransfer {
             bucket_type,
             create_mpu_complete: tokio::sync::Notify::new(),
             result_tx: Mutex::new(Some(result_tx)),
+            latencies: LatencyTracker::new(),
         });
 
         Self { inner }
@@ -409,28 +413,39 @@ impl UploadTransfer {
 
         let bytes_sent = content_length as u64;
 
-        let req = copy_fields_to_upload_part_request(
-            &self.inner.request,
-            self.inner
-                .ctx
-                .s3_client()
-                .upload_part()
-                .upload_id(&upload_id)
-                .part_number(part_num_i32)
-                .content_length(content_length)
-                .body(ByteStream::from(data.data)),
-            data.checksum.as_ref(),
-        );
+        let upload_id = upload_id.clone();
+        let data_bytes = data.data;
+        let checksum = data.checksum;
 
-        let resp = match req
-            .customize()
-            .disable_payload_signing()
-            .send()
-            .instrument(tracing::debug_span!("send-upload-part", part_number))
+        let resp = match self
+            .inner
+            .latencies
+            .guarded(|| {
+                let body = ByteStream::from(data_bytes.clone());
+                let req = copy_fields_to_upload_part_request(
+                    &self.inner.request,
+                    self.inner
+                        .ctx
+                        .s3_client()
+                        .upload_part()
+                        .upload_id(&upload_id)
+                        .part_number(part_num_i32)
+                        .content_length(content_length)
+                        .body(body),
+                    checksum.as_ref(),
+                );
+                async move {
+                    req.customize()
+                        .disable_payload_signing()
+                        .send()
+                        .instrument(tracing::debug_span!("send-upload-part", part_number))
+                        .await
+                }
+            })
             .await
         {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => return self.fail(e),
         };
 
         let completed = CompletedPart::builder()

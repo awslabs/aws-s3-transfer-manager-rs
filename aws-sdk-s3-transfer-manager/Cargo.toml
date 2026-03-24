@@ -37,6 +37,7 @@ parking_lot = "0.12"
 aws-smithy-http-client = { version = "1.0.6", features = ["rustls-aws-lc"] }
 aws-smithy-dns = { version = "0.1.9", features = ["hickory-dns"] }
 fastrand = "2.1.1"
+hdrhistogram = "7"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs"] }

@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+pub(crate) mod latency;
+
 use std::fmt::{self, Display};
 use std::ops;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

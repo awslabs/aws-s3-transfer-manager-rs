@@ -14,6 +14,7 @@ use bytes_utils::SegmentedBuf;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
+use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IoSample;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
@@ -90,6 +91,8 @@ struct DownloadTransferInner {
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// Adaptive latency tracking for timeout+retry on range requests
+    latencies: LatencyTracker,
 }
 
 impl DownloadTransfer {
@@ -107,6 +110,7 @@ impl DownloadTransfer {
             writer,
             object_meta: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            latencies: LatencyTracker::new(),
         });
         Self { inner }
     }
@@ -409,41 +413,47 @@ impl DownloadTransfer {
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
-        let mut req = self
+        let result = self
             .inner
-            .ctx
-            .s3_client()
-            .get_object()
-            .bucket(input.bucket().unwrap_or_default())
-            .key(input.key().unwrap_or_default())
-            .range(range_header);
+            .latencies
+            .guarded(|| {
+                let rh = range_header.clone();
+                let etag = etag.clone();
+                let mut req = self
+                    .inner
+                    .ctx
+                    .s3_client()
+                    .get_object()
+                    .bucket(input.bucket().unwrap_or_default())
+                    .key(input.key().unwrap_or_default())
+                    .range(rh);
 
-        if let Some(ref etag) = etag {
-            req = req.if_match(etag.as_ref());
-        }
+                if let Some(ref etag) = etag {
+                    req = req.if_match(etag.as_ref());
+                }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
+                async move {
+                    let resp = req.send().await.map_err(crate::error::Error::from)?;
+                    let chunk_meta = ChunkMetadata::from(&resp);
+                    let mut segmented = SegmentedBuf::new();
+                    let mut bytes_received: u64 = 0;
+                    let mut body_stream = resp.body;
+                    while let Some(result) = body_stream.next().await {
+                        let data = result.map_err(|e| {
+                            crate::error::Error::new(crate::error::ErrorKind::IOError, e)
+                        })?;
+                        bytes_received += data.len() as u64;
+                        segmented.push(data);
+                    }
+                    Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
+                }
+            })
+            .await;
+
+        let (chunk_meta, segmented, bytes_received) = match result {
+            Ok(val) => val,
             Err(e) => return self.fail_range(seq, e),
         };
-
-        bail_if_terminal!(self);
-
-        // Extract metadata before consuming body
-        let chunk_meta = ChunkMetadata::from(&resp);
-
-        // TODO: Handle ByteStreamError with retry (SDK doesn't retry these)
-        let mut segmented = SegmentedBuf::new();
-        let mut bytes_received: u64 = 0;
-        let mut body_stream = resp.body;
-        while let Some(result) = body_stream.next().await {
-            let data = match result {
-                Ok(data) => data,
-                Err(e) => return self.fail_range(seq, e),
-            };
-            bytes_received += data.len() as u64;
-            segmented.push(data);
-        }
 
         bail_if_terminal!(self);
         let chunk = ChunkOutput {
