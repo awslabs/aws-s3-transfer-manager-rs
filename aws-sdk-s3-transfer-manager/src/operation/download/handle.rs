@@ -295,7 +295,9 @@ impl ManagedDownloadHandle {
     ///
     /// On success, fsyncs the file and atomically renames the temporary file
     /// to the destination path. On failure, deletes the temporary file.
-    pub async fn join(mut self) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
+    pub async fn join(
+        mut self,
+    ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
         let result = self.inner.join().await;
 
         match &result {

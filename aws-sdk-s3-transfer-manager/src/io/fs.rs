@@ -17,6 +17,15 @@ pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::
     sys::write_all_at(file, buf, offset)
 }
 
+/// Pre-allocate disk space for `file` so that at least `len` bytes can be
+/// written without triggering per-write metadata updates or late ENOSPC.
+///
+/// This is best-effort: on platforms without fallocate support the call is a
+/// no-op.
+pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+    sys::preallocate(file, len)
+}
+
 #[cfg(unix)]
 mod sys {
     use bytes::Buf;
@@ -40,6 +49,16 @@ mod sys {
         }
         Ok(())
     }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        nix::fcntl::posix_fallocate(file.as_fd(), 0, len as i64).map_err(io::Error::from)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        file.set_len(len)
+    }
 }
 
 #[cfg(windows)]
@@ -60,6 +79,10 @@ mod sys {
         }
         Ok(())
     }
+
+    pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -73,6 +96,10 @@ mod sys {
             io::ErrorKind::Unsupported,
             "positioned writes not supported on this platform",
         ))
+    }
+
+    pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -232,5 +259,18 @@ mod tests {
         assert_eq!(contents.len(), part_size * 2);
         assert!(contents[..part_size].iter().all(|&b| b == 0xAA));
         assert!(contents[part_size..].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn preallocate_sets_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prealloc.bin");
+        let file = File::create(&path).unwrap();
+
+        let len = 1024 * 1024; // 1 MB
+        preallocate(&file, len).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), len);
     }
 }

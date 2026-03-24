@@ -286,6 +286,16 @@ impl DownloadTransfer {
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
+        // Pre-allocate disk space for the full download to avoid per-write
+        // metadata updates and late ENOSPC errors.
+        let chunk_content_len = chunk_meta
+            .as_ref()
+            .and_then(|m| m.content_length)
+            .unwrap_or(0) as u64;
+        let total_file_size =
+            chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
+        self.inner.writer.preallocate(total_file_size);
+
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
@@ -361,12 +371,22 @@ impl DownloadTransfer {
 
         let chunk = ChunkOutput {
             seq,
-            offset: 0,
+            offset: chunk_meta
+                .content_range
+                .as_deref()
+                .and_then(crate::http::header::parse_content_range)
+                .map(|r| *r.start())
+                .unwrap_or(0),
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
         };
 
         slot.fill(chunk);
+        if let Err(e) = self.inner.writer.try_flush() {
+            self.decrement_in_flight();
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        }
         self.decrement_in_flight();
 
         WorkOutcome::Success {
@@ -434,6 +454,11 @@ impl DownloadTransfer {
         };
 
         slot.fill(chunk);
+        if let Err(e) = self.inner.writer.try_flush() {
+            self.decrement_in_flight();
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        }
         self.decrement_in_flight();
 
         WorkOutcome::Success {
@@ -485,6 +510,7 @@ impl DownloadTransfer {
         drop(guard); // release lock before signaling waiters
                      // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
+        let _ = self.inner.writer.finalize();
         self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
@@ -492,6 +518,10 @@ impl DownloadTransfer {
 
     /// Transition to terminal success state. Requires holding the work lock.
     fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadState>) {
+        if let Err(e) = self.inner.writer.finalize() {
+            self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            return;
+        }
         self.inner.ctx.set_completed();
         *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters

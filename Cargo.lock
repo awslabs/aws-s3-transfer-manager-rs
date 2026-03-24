@@ -2158,6 +2158,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-s3-transfer-manager",
  "s3-mock-server",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]

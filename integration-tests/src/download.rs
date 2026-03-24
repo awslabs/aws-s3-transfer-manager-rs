@@ -31,9 +31,10 @@ async fn setup() -> (
     (server, handle, tm)
 }
 
-/// Setup with custom part size for testing ranged downloads
-async fn setup_with_part_size(
+/// Setup with custom part size and concurrency
+async fn setup_concurrent(
     part_size: usize,
+    concurrency: usize,
 ) -> (
     S3MockServer,
     s3_mock_server::ServerHandle,
@@ -50,11 +51,22 @@ async fn setup_with_part_size(
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3_client)
         .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencyMode::Explicit(1)) // Sequential for predictable behavior
+        .concurrency(ConcurrencyMode::Explicit(concurrency))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 
     (server, handle, tm)
+}
+
+/// Setup with custom part size for testing ranged downloads (sequential)
+async fn setup_with_part_size(
+    part_size: usize,
+) -> (
+    S3MockServer,
+    s3_mock_server::ServerHandle,
+    aws_sdk_s3_transfer_manager::Client,
+) {
+    setup_concurrent(part_size, 1).await
 }
 
 /// Helper to drain download body
@@ -194,7 +206,7 @@ async fn test_download_object_meta() {
 
     let meta = handle.object_meta().await.expect("get object meta");
     assert_eq!(
-        meta.content_length(),
+        meta.total_object_size(),
         content.len() as u64,
         "content length should match"
     );
@@ -243,3 +255,221 @@ async fn test_download_concurrent() {
 
     server_handle.shutdown().await.expect("shutdown");
 }
+
+/// Generate deterministic data using prime 251 to avoid alignment patterns.
+fn deterministic_data(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i % 251) as u8).collect()
+}
+
+/// Test download to file path with concurrent multi-part download (100 MB, 5 MB parts, 8 workers).
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+
+    let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    server
+        .add_object("write-to-path-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("write-to-path-key")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&dest_path).unwrap();
+    assert_eq!(written.len(), content.len(), "size mismatch");
+    assert_eq!(written, content, "data integrity check failed");
+
+    // No .s3tmp files should remain
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+
+    server_handle.shutdown().await.expect("shutdown");
+}
+
+/// Test download to caller-provided file handle (50 MB, 5 MB parts, 8 workers).
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_file() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+
+    let size = 50 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    server
+        .add_object("write-to-file-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("file_output.dat");
+    let file = std::fs::File::create(&file_path).unwrap();
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("write-to-file-key")
+        .write_to_file(file)
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&file_path).unwrap();
+    assert_eq!(written.len(), content.len(), "size mismatch");
+    assert_eq!(written, content, "data integrity check failed");
+
+    server_handle.shutdown().await.expect("shutdown");
+}
+
+/// Test ranged download to file path (bytes 10000000-59999999 of 100 MB object).
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_ranged() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+
+    let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    server
+        .add_object("ranged-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("ranged_output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("ranged-key")
+        .range("bytes=10000000-59999999")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&dest_path).unwrap();
+    let expected_len = 59_999_999 - 10_000_000 + 1;
+    assert_eq!(written.len(), expected_len, "ranged file size mismatch");
+    assert_eq!(
+        &written[..],
+        &content[10_000_000..=59_999_999],
+        "ranged data integrity check failed"
+    );
+
+    server_handle.shutdown().await.expect("shutdown");
+}
+
+/// Test single-part download to file (2 MB object, 5 MB part size — no range splitting).
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_single_part() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+
+    let size = 2 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    server
+        .add_object("single-part-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("single_part.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("single-part-key")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&dest_path).unwrap();
+    assert_eq!(written.len(), content.len(), "size mismatch");
+    assert_eq!(written, content, "data integrity check failed");
+
+    server_handle.shutdown().await.expect("shutdown");
+}
+
+/// Integrity stress test: 100 MB, 5 MB parts, 16 concurrent workers.
+/// Exercises the batched flush path under high concurrency.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_integrity() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 16).await;
+
+    let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    server
+        .add_object("integrity-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("integrity.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("integrity-key")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&dest_path).unwrap();
+    assert_eq!(written.len(), content.len(), "size mismatch");
+    assert_eq!(written, content, "byte-for-byte integrity check failed");
+
+    server_handle.shutdown().await.expect("shutdown");
+}
+
+// TODO(vnext): integration tests to add
+//
+// Data integrity:
+// - test_download_write_to_path_auto_concurrency: Auto concurrency mode, 50 MB
+//   Verifies adaptive controller works end-to-end without crash/deadlock.
+//
+// Scale:
+// - test_download_many_transfers: 100+ concurrent downloads, all complete with
+//   correct checksums. Exercises scheduler fairness and slot buffer under load.
+// - test_download_whale_and_small: one 200 MB transfer + 50 × 2 MB transfers
+//   running simultaneously. Verifies large transfers don't starve small ones.
+// - test_mixed_upload_download: concurrent uploads and downloads against same
+//   mock server. Exercises scheduler with mixed workload types.
+//
+// Cancellation:
+// - test_download_abort_one_of_many: start 20 transfers, abort 5 mid-flight,
+//   verify the other 15 complete with correct data and no temp files leak.
+// - test_download_cancel_half: start 100 transfers, cancel 50, verify rest complete.
+//
+// Scheduler stress:
+// - test_download_high_transfer_count_limited_concurrency: 100+ transfers with
+//   low explicit concurrency (e.g. 4). Verifies no starvation, all complete.
+//
+// Infrastructure improvements:
+// - Switch all large data assertions from assert_eq! to checksum comparison
+//   (e.g. aws-smithy-checksums CRC32) for better failure output and efficiency.
+// - Add priority change tests when priority API is exposed on handles.

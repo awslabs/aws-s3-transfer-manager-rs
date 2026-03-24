@@ -187,7 +187,7 @@ async fn do_single_download(
     if is_dev_null {
         let mut handle = tm.download().bucket(bucket).key(key).initiate()?;
         drain_body(handle.body_mut()).await?;
-        let obj_size_bytes = handle.object_meta().await?.content_length();
+        let obj_size_bytes = handle.object_meta().await?.total_object_size();
         handle.join().await?;
         Ok(obj_size_bytes as u64)
     } else {
@@ -197,7 +197,7 @@ async fn do_single_download(
             .key(key)
             .write_to_path(dest)
             .await?;
-        let obj_size_bytes = handle.object_meta().await?.content_length();
+        let obj_size_bytes = handle.object_meta().await?.total_object_size();
         handle.join().await?;
         Ok(obj_size_bytes as u64)
     }

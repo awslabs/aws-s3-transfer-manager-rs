@@ -4,9 +4,22 @@
  */
 
 use core::fmt;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use crate::error;
+
+/// Parse a Content-Range response header into an inclusive byte range.
+///
+/// Expects format `bytes START-END/TOTAL` (e.g. `bytes 200-500/1000`).
+/// Returns `None` if the header is missing, malformed, or not a bytes range.
+pub(crate) fn parse_content_range(header: &str) -> Option<RangeInclusive<u64>> {
+    let byte_range_str = header.strip_prefix("bytes ")?.split_once('/')?.0;
+    let (start_str, end_str) = byte_range_str.split_once('-')?;
+    let start = start_str.parse::<u64>().ok()?;
+    let end = end_str.parse::<u64>().ok()?;
+    Some(start..=end)
+}
 
 /// Representation of `Range` header.
 /// NOTE: S3 only supports a single bytes range this is a simplified representation
@@ -130,6 +143,20 @@ mod tests {
             }
             _ => panic!("unexpected error type"),
         }
+    }
+
+    #[test]
+    fn test_parse_content_range() {
+        use super::parse_content_range;
+        assert_eq!(parse_content_range("bytes 0-499/1000"), Some(0..=499));
+        assert_eq!(
+            parse_content_range("bytes 10000000-14999999/100000000"),
+            Some(10000000..=14999999)
+        );
+        assert_eq!(parse_content_range("bytes 0-0/1"), Some(0..=0));
+        assert_eq!(parse_content_range("invalid"), None);
+        assert_eq!(parse_content_range("bytes abc-def/100"), None);
+        assert_eq!(parse_content_range("bytes 0-499"), None);
     }
 
     #[test]

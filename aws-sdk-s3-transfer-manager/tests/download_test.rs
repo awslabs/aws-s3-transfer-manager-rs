@@ -563,7 +563,73 @@ async fn test_download_write_to_path_abort_cleans_up() {
 
     handle.abort().await;
 
-    assert!(!dest_path.exists(), "dest file should not exist after abort");
+    assert!(
+        !dest_path.exists(),
+        "dest file should not exist after abort"
+    );
+
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}
+
+/// Test that a mid-transfer error cleans up temp and destination files.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_error_cleans_up() {
+    let _logs = show_test_logs();
+    let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+
+    // Discovery succeeds, second request fails with 412 PreconditionFailed.
+    let http_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .header("ETag", "my-etag")
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(412)
+                .body(SdkBody::from(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>PreconditionFailed</Code></Error>"#,
+                ))
+                .unwrap(),
+        ),
+    ]);
+
+    let tm = test_tm(http_client, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("should_not_exist.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    let result = handle.join().await;
+    assert!(result.is_err(), "expected error from failed transfer");
+
+    assert!(
+        !dest_path.exists(),
+        "destination file should not exist after error"
+    );
 
     let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()

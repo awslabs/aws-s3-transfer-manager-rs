@@ -39,7 +39,7 @@ aws-smithy-dns = { version = "0.1.9", features = ["hickory-dns"] }
 fastrand = "2.1.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["uio"] }
+nix = { version = "0.31", features = ["uio", "fs"] }
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.122.0", features = ["behavior-version-latest", "test-util"] }

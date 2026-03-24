@@ -21,8 +21,8 @@ pub(crate) mod discovery;
 
 mod handle;
 pub use handle::DownloadHandle;
-pub use handle::ManagedDownloadHandle;
 pub(crate) use handle::DownloadHandleInner;
+pub use handle::ManagedDownloadHandle;
 
 mod output;
 pub use output::DownloadOutput;
@@ -91,12 +91,13 @@ impl Download {
         );
         let temp_path = dest_path.with_file_name(temp_name);
 
-        let tokio_file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-            error::from_kind(error::ErrorKind::IOError)(e)
-        })?;
+        let tokio_file = tokio::fs::File::create(&temp_path)
+            .await
+            .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
         let file = tokio_file.into_std().await;
 
-        let inner = Self::orchestrate_with_sink(handle, input, file, 0)?;
+        let range_start = object_range_start_from_input(&input);
+        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, true)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -107,7 +108,8 @@ impl Download {
         input: DownloadInput,
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, error::Error> {
-        let inner = Self::orchestrate_with_sink(handle, input, file, 0)?;
+        let range_start = object_range_start_from_input(&input);
+        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, false)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
@@ -119,6 +121,7 @@ impl Download {
         input: DownloadInput,
         file: std::fs::File,
         object_range_start: u64,
+        owns_file: bool,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -129,8 +132,12 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) =
-            body::new_slot_body_with_sink(DEFAULT_BODY_SLOT_CAPACITY, file, object_range_start);
+        let (writer, _consumer) = body::new_slot_body_with_sink(
+            DEFAULT_BODY_SLOT_CAPACITY,
+            file,
+            object_range_start,
+            owns_file,
+        );
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
@@ -144,4 +151,19 @@ impl Download {
             completion_rx: Some(completion_rx),
         })
     }
+}
+
+/// Extract the byte range start from the user's range header, if present.
+/// Returns 0 for no range or non-inclusive ranges (suffix, open-ended).
+fn object_range_start_from_input(input: &DownloadInput) -> u64 {
+    use crate::http::header;
+    use std::str::FromStr;
+    input
+        .range()
+        .and_then(|r| header::Range::from_str(r).ok())
+        .map(|r| match r.0 {
+            header::ByteRange::Inclusive(start, _) => start,
+            _ => 0,
+        })
+        .unwrap_or(0)
 }

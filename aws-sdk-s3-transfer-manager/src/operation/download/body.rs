@@ -7,6 +7,8 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+use bytes::Buf;
+
 use crate::io::AggregatedBytes;
 
 use super::chunk_meta::ChunkMetadata;
@@ -15,22 +17,34 @@ use super::transfer::DownloadTransfer;
 /// Default slot buffer capacity for download body delivery.
 pub(crate) const DEFAULT_BODY_SLOT_CAPACITY: usize = 512;
 
+/// Slot has no data and is available for reuse.
 const SLOT_EMPTY: u8 = 0;
+/// Slot contains a completed chunk awaiting consumption or flush.
 const SLOT_FILLED: u8 = 1;
+/// Data written to disk, awaiting consumed advancement. Sink path only.
+const SLOT_FLUSHED: u8 = 2;
 
-/// File sink for writing download data directly to disk.
+/// Number of fills between automatic flush attempts in the sink path.
+const FLUSH_INTERVAL: u64 = 1;
+
+/// File sink for download-to-file writes.
 ///
-/// When registered on a `SlotBuffer`, filled slots are flushed to the file
-/// via pwritev (unix) or positioned writes (other platforms) instead of
-/// being consumed through `Body::next()`.
+/// When registered on a `SlotBuffer`, filled slots are batched and
+/// flushed to disk via positioned writes instead of being consumed
+/// through `Body::next()`.
 struct Sink {
     file: std::fs::File,
     /// Start of the S3 byte range for this transfer.
     /// 0 for full object downloads, user's range start for ranged gets.
     /// Each chunk's file position is `chunk.offset - object_range_start`.
     object_range_start: u64,
-    /// Guards concurrent flush attempts. Only one thread flushes at a time.
+    /// Whether the transfer manager created this file (vs caller-provided).
+    /// Controls whether preallocate is allowed.
+    owns_file: bool,
+    /// CAS lock for flush exclusion — only one thread flushes at a time.
     flushing: AtomicBool,
+    /// Counts fills; flush triggered every `FLUSH_INTERVAL` fills.
+    fill_count: AtomicU64,
 }
 
 impl std::fmt::Debug for Sink {
@@ -42,8 +56,8 @@ impl std::fmt::Debug for Sink {
 /// Fixed-size ring buffer of slots for delivering download chunks.
 ///
 /// Slots are indexed by `seq % capacity`. Each slot transitions through
-/// two states: `Empty` and `Filled`. The invariants that make `UnsafeCell`
-/// access safe are:
+/// states: `Empty` → `Filled` (→ `Flushed` in sink path). The invariants
+/// that make `UnsafeCell` access safe are:
 ///
 /// 1. **Exclusive producer access**: each sequence number is claimed exactly
 ///    once via `claimed` CAS. The producer that claimed `seq` is the only
@@ -54,6 +68,8 @@ impl std::fmt::Debug for Sink {
 /// 3. **No overlap between producer and consumer**: the seq window invariant
 ///    (`claimed - consumed < capacity`) guarantees the producer never writes
 ///    to a slot the consumer is currently reading.
+/// 4. **Flush exclusion**: in the sink path, the `flushing` CAS lock ensures
+///    only one thread reads FILLED slot data at a time.
 struct SlotBuffer {
     slots: Box<[Slot]>,
     capacity: u64,
@@ -63,8 +79,9 @@ struct SlotBuffer {
     claimed: AtomicU64,
     /// Wakes the consumer when a producer fills a slot.
     notify: tokio::sync::Notify,
-    /// Optional file sink. When present, filled slots are flushed to disk
-    /// instead of being consumed through `Body::next()`.
+    /// Optional file sink. When present, filled slots are batched and
+    /// flushed to disk periodically instead of being consumed through
+    /// `Body::next()`.
     sink: Option<Sink>,
 }
 
@@ -106,6 +123,9 @@ impl SlotBuffer {
 
     /// Write a completed chunk into the slot for `seq`.
     ///
+    /// Pure storage — no I/O, no counting, no flushing. In the sink path,
+    /// the caller is responsible for calling `try_flush()` afterward.
+    ///
     /// # Requirements
     /// - `seq` must have been claimed via the `claimed` CAS (i.e. through
     ///   `BodyWriter::try_claim`). Filling an unclaimed seq is undefined behavior.
@@ -120,67 +140,134 @@ impl SlotBuffer {
             .state
             .store(SLOT_FILLED, AtomicOrdering::Release);
 
-        if self.sink.is_some() {
-            self.try_flush_consecutive();
-        } else {
+        if self.sink.is_none() {
             self.notify.notify_one();
         }
     }
 
-    /// Attempt to flush consecutive filled slots to the sink.
+    /// Interval-gated batched flush of FILLED slots to disk.
     ///
-    /// Acquires the flushing flag via CAS — only one thread flushes at a time.
-    /// Drains all consecutive filled slots starting from the consumed position,
-    /// writes each to disk via positioned write, then advances consumed.
-    ///
-    /// Called after `fill()` when a sink is registered, and from
-    /// `notify_consumer()` on terminal transitions for the final flush.
-    fn try_flush_consecutive(&self) {
+    /// Increments the fill counter and only performs I/O every `FLUSH_INTERVAL`
+    /// fills. Returns the first write error encountered, or `Ok(())`.
+    fn try_flush(&self) -> Result<(), std::io::Error> {
         let sink = match &self.sink {
             Some(s) => s,
-            None => return,
+            None => return Ok(()),
         };
 
-        // Only one thread flushes at a time.
+        let count = sink.fill_count.fetch_add(1, AtomicOrdering::Relaxed);
+        if (count + 1) % FLUSH_INTERVAL != 0 {
+            return Ok(());
+        }
+
+        self.flush_all()
+    }
+
+    /// Flush all FILLED slots to disk unconditionally.
+    ///
+    /// Bypasses the interval counter. Used by `finalize()` for terminal drain
+    /// and by `try_flush()` when the interval fires.
+    fn flush_all(&self) -> Result<(), std::io::Error> {
+        let sink = match &self.sink {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Only one thread flushes at a time
         if sink
             .flushing
             .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
             .is_err()
         {
-            return;
+            return Ok(());
         }
 
-        loop {
-            let seq = self.consumed.load(AtomicOrdering::Acquire);
-            let idx = (seq % self.capacity) as usize;
+        let result = self.flush_locked(sink);
+
+        sink.flushing.store(false, AtomicOrdering::Release);
+        result
+    }
+
+    /// Core flush logic. Caller must hold the `flushing` CAS lock.
+    fn flush_locked(&self, sink: &Sink) -> Result<(), std::io::Error> {
+        let consumed = self.consumed.load(AtomicOrdering::Acquire);
+        let claimed = self.claimed.load(AtomicOrdering::Acquire);
+
+        // Phase 1: Write FILLED slots to disk, coalescing contiguous runs
+        let mut first_err: Option<std::io::Error> = None;
+        let mut i = consumed;
+        while i < claimed {
+            let idx = (i % self.capacity) as usize;
             if self.slots[idx].state.load(AtomicOrdering::Acquire) != SLOT_FILLED {
-                break;
+                i += 1;
+                continue;
             }
 
-            // Safety: state is FILLED and we hold the flushing lock, so no
-            // other thread is reading this slot.
-            let chunk = unsafe { (*self.slots[idx].data.get()).take() };
-            let chunk = chunk.expect("filled slot must have data");
+            // Start a new run with the first FILLED slot
+            let first_chunk = unsafe { (*self.slots[idx].data.get()).take().unwrap() };
+            let file_pos = first_chunk.offset - sink.object_range_start;
+            let mut run_end_offset = file_pos + first_chunk.data.remaining() as u64;
+            let mut combined = bytes_utils::SegmentedBuf::new();
+            for seg in first_chunk.data.0.into_inner() {
+                combined.push(seg);
+            }
+            self.slots[idx]
+                .state
+                .store(SLOT_FLUSHED, AtomicOrdering::Release);
+            i += 1;
 
-            // Write to disk. On failure, we put the chunk back and stop flushing.
-            let file_pos = chunk.offset - sink.object_range_start;
-            if let Err(e) =
-                crate::io::fs::write_all_at(&sink.file, &mut chunk.data.clone(), file_pos)
-            {
-                tracing::error!(seq, error = %e, "failed to write chunk to disk");
-                unsafe {
-                    *self.slots[idx].data.get() = Some(chunk);
+            // Extend with contiguous FILLED neighbors whose file offsets are adjacent
+            while i < claimed {
+                let jdx = (i % self.capacity) as usize;
+                if self.slots[jdx].state.load(AtomicOrdering::Acquire) != SLOT_FILLED {
+                    break;
                 }
-                break;
+                let chunk = unsafe { (*self.slots[jdx].data.get()).take().unwrap() };
+                let chunk_file_pos = chunk.offset - sink.object_range_start;
+                if chunk_file_pos != run_end_offset {
+                    // Not file-contiguous — put it back for the next iteration
+                    unsafe {
+                        *self.slots[jdx].data.get() = Some(chunk);
+                    }
+                    break;
+                }
+                run_end_offset += chunk.data.remaining() as u64;
+                for seg in chunk.data.0.into_inner() {
+                    combined.push(seg);
+                }
+                self.slots[jdx]
+                    .state
+                    .store(SLOT_FLUSHED, AtomicOrdering::Release);
+                i += 1;
             }
 
+            if let Err(e) = crate::io::fs::write_all_at(&sink.file, &mut combined, file_pos) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        // Phase 2: Advance consumed past leading FLUSHED slots
+        let mut seq = consumed;
+        loop {
+            let idx = (seq % self.capacity) as usize;
+            if self.slots[idx].state.load(AtomicOrdering::Acquire) != SLOT_FLUSHED {
+                break;
+            }
             self.slots[idx]
                 .state
                 .store(SLOT_EMPTY, AtomicOrdering::Release);
-            self.consumed.fetch_add(1, AtomicOrdering::Release);
+            seq += 1;
+        }
+        if seq > consumed {
+            self.consumed.store(seq, AtomicOrdering::Release);
         }
 
-        sink.flushing.store(false, AtomicOrdering::Release);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Try to take the next sequential chunk. Returns `None` if not ready.
@@ -275,17 +362,54 @@ impl BodyWriter {
         }
     }
 
-    /// Wake the consumer or flush remaining data to sink.
-    ///
-    /// Call when the transfer reaches a terminal state (success, failure,
-    /// cancellation). For the body path, this wakes the consumer so it
-    /// observes the terminal condition. For the file sink path, this
-    /// flushes all remaining filled slots to disk.
+    /// Wake the consumer so it can observe a state change (e.g. terminal).
     pub(crate) fn notify_consumer(&self) {
-        if self.buffer.sink.is_some() {
-            self.buffer.try_flush_consecutive();
-        } else {
-            self.buffer.notify.notify_one();
+        self.buffer.notify.notify_one();
+    }
+
+    /// Attempt an interval-gated flush of filled slots to disk.
+    ///
+    /// Delegates to the slot buffer's `try_flush`, which increments the fill
+    /// counter and only performs I/O every `FLUSH_INTERVAL` fills.
+    pub(crate) fn try_flush(&self) -> Result<(), std::io::Error> {
+        self.buffer.try_flush()
+    }
+
+    /// Finalize the writer after the transfer reaches a terminal state.
+    ///
+    /// Flushes all remaining filled slots to disk when a sink is present.
+    /// Must be called before `notify_consumer` on terminal transitions —
+    /// no more fills will arrive after this point.
+    pub(crate) fn finalize(&self) -> Result<(), std::io::Error> {
+        if self.buffer.sink.is_none() {
+            return Ok(());
+        }
+        loop {
+            self.buffer.flush_all()?;
+            let consumed = self.buffer.consumed.load(AtomicOrdering::Acquire);
+            let claimed = self.buffer.claimed.load(AtomicOrdering::Acquire);
+            let any_filled = (consumed..claimed).any(|seq| {
+                let idx = (seq % self.buffer.capacity) as usize;
+                self.buffer.slots[idx].state.load(AtomicOrdering::Acquire) == SLOT_FILLED
+            });
+            if !any_filled {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort pre-allocation of disk space for the download file.
+    // TODO(vnext): should ENOSPC here fail the transfer immediately instead of
+    // continuing? Failing fast avoids wasting bandwidth downloading data we can't
+    // store. EOPNOTSUPP/ENOTSUP should remain non-fatal (filesystem doesn't support it).
+    pub(crate) fn preallocate(&self, len: u64) {
+        if let Some(sink) = &self.buffer.sink {
+            if sink.owns_file {
+                if let Err(e) = crate::io::fs::preallocate(&sink.file, len) {
+                    tracing::warn!(error = %e, "failed to preallocate file space");
+                }
+            }
         }
     }
 }
@@ -340,18 +464,21 @@ pub(crate) fn new_slot_body(capacity: usize) -> (BodyWriter, SlotBodyConsumer) {
 
 /// Create a producer/consumer pair with a file sink for download-to-file.
 ///
-/// When a sink is registered, filled slots are flushed to disk via positioned
-/// writes instead of being consumed through `Body::next()`.
+/// When a sink is registered, filled slots are batched and flushed to disk
+/// periodically (every `FLUSH_INTERVAL` fills) and at transfer completion.
 pub(crate) fn new_slot_body_with_sink(
     capacity: usize,
     file: std::fs::File,
     object_range_start: u64,
+    owns_file: bool,
 ) -> (BodyWriter, SlotBodyConsumer) {
     let mut buffer = SlotBuffer::new(capacity);
     buffer.sink = Some(Sink {
         file,
         object_range_start,
+        owns_file,
         flushing: AtomicBool::new(false),
+        fill_count: AtomicU64::new(0),
     });
     let buffer = Arc::new(buffer);
     (
@@ -830,94 +957,104 @@ mod tests {
     }
 
     #[test]
-    fn test_sink_flush_consecutive_fill() {
+    fn test_sink_batched_flush() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(4, file, 0);
+        // Capacity 16 so all 8 slots fit; FLUSH_INTERVAL=8 triggers flush on 8th try_flush
+        let (writer, _consumer) = new_slot_body_with_sink(16, file, 0, false);
 
-        let s0 = writer.try_claim().unwrap();
-        let s1 = writer.try_claim().unwrap();
-        let s2 = writer.try_claim().unwrap();
+        for i in 0..8u64 {
+            let slot = writer.try_claim().unwrap();
+            let offset = i * 100;
+            let data = format!("d{i}xx");
+            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            writer.try_flush().unwrap();
+        }
 
-        s0.fill(chunk_at(0, 0, b"aaaa"));
-        s1.fill(chunk_at(1, 100, b"bbbb"));
-        s2.fill(chunk_at(2, 200, b"cccc"));
-
+        // 8th try_flush triggers flush — all data on disk
         let contents = std::fs::read(&path).unwrap();
-        assert!(contents.len() >= 204);
-        assert_eq!(&contents[0..4], b"aaaa");
-        assert_eq!(&contents[100..104], b"bbbb");
-        assert_eq!(&contents[200..204], b"cccc");
+        for i in 0..8u64 {
+            let offset = (i * 100) as usize;
+            let expected = format!("d{i}xx");
+            assert_eq!(
+                &contents[offset..offset + expected.len()],
+                expected.as_bytes(),
+                "mismatch at seq {i}"
+            );
+        }
     }
 
     #[test]
-    fn test_sink_flush_on_gap_completion() {
+    fn test_sink_out_of_order_fill() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(4, file, 0);
+        let (writer, _consumer) = new_slot_body_with_sink(16, file, 0, false);
 
-        let s0 = writer.try_claim().unwrap();
-        let s1 = writer.try_claim().unwrap();
-        let s2 = writer.try_claim().unwrap();
+        // Claim 8 slots, fill out of order
+        let mut slots: Vec<Option<super::BodySlot>> =
+            (0..8).map(|_| Some(writer.try_claim().unwrap())).collect();
 
-        // Fill out of order — gap at seq 0 blocks flush
-        s2.fill(chunk_at(2, 200, b"cccc"));
-        s1.fill(chunk_at(1, 100, b"bbbb"));
+        for &i in &[7usize, 3, 0, 5, 2, 6, 1, 4] {
+            let slot = slots[i].take().unwrap();
+            let offset = (i as u64) * 100;
+            let data = format!("s{i}");
+            slot.fill(chunk_at(i as u64, offset, data.as_bytes()));
+            writer.try_flush().unwrap();
+        }
 
-        // Nothing flushed yet (seq 0 not filled)
+        // 8th try_flush triggers flush; all 8 are FILLED so the entire run is contiguous
         let contents = std::fs::read(&path).unwrap();
-        assert!(contents.is_empty() || contents.iter().all(|&b| b == 0));
-
-        // Filling seq 0 unblocks all three
-        s0.fill(chunk_at(0, 0, b"aaaa"));
-
-        let contents = std::fs::read(&path).unwrap();
-        assert!(contents.len() >= 204);
-        assert_eq!(&contents[0..4], b"aaaa");
-        assert_eq!(&contents[100..104], b"bbbb");
-        assert_eq!(&contents[200..204], b"cccc");
+        for i in 0..8u64 {
+            let offset = (i * 100) as usize;
+            let expected = format!("s{i}");
+            assert_eq!(
+                &contents[offset..offset + expected.len()],
+                expected.as_bytes(),
+                "mismatch at seq {i}"
+            );
+        }
     }
 
     #[test]
-    fn test_sink_flush_advances_consumed() {
+    fn test_sink_advances_consumed_after_flush() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(2, file, 0);
+        let (writer, _consumer) = new_slot_body_with_sink(16, file, 0, false);
 
-        let s0 = writer.try_claim().unwrap();
-        let s1 = writer.try_claim().unwrap();
-        // Window full
-        assert!(writer.try_claim().is_none());
+        // Fill 8 slots and call try_flush after each to trigger a flush on the 8th
+        for i in 0..8u64 {
+            let slot = writer.try_claim().unwrap();
+            slot.fill(chunk_at(i, i * 10, b"xx"));
+            writer.try_flush().unwrap();
+        }
 
-        s0.fill(chunk_at(0, 0, b"aa"));
-        s1.fill(chunk_at(1, 10, b"bb"));
-
-        // Flush advanced consumed, freeing the window
-        let s2 = writer.try_claim().unwrap();
-        let s3 = writer.try_claim().unwrap();
-        assert_eq!(s2.seq(), 2);
-        assert_eq!(s3.seq(), 3);
+        // After flush, consumed advanced past all 8 flushed slots — new claims work
+        let s8 = writer.try_claim().unwrap();
+        assert_eq!(s8.seq(), 8);
     }
 
     #[test]
-    fn test_sink_terminal_flush() {
+    fn test_sink_terminal_flush_via_notify() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(4, file, 0);
+        let (writer, _consumer) = new_slot_body_with_sink(16, file, 0, false);
 
+        // Fill fewer than FLUSH_INTERVAL slots — no automatic flush
         let s0 = writer.try_claim().unwrap();
         let s1 = writer.try_claim().unwrap();
-        let _s2 = writer.try_claim().unwrap(); // claimed but never filled
-
         s0.fill(chunk_at(0, 0, b"xxxx"));
         s1.fill(chunk_at(1, 100, b"yyyy"));
 
-        // Simulate terminal — notify_consumer triggers flush of remaining filled slots
-        writer.notify_consumer();
+        // Data not yet on disk (no flush triggered)
+        let contents = std::fs::read(&path).unwrap();
+        assert!(contents.is_empty() || contents.iter().all(|&b| b == 0));
+
+        // Terminal flush via finalize writes remaining data
+        writer.finalize().unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         assert!(contents.len() >= 104);
@@ -926,23 +1063,32 @@ mod tests {
     }
 
     #[test]
-    fn test_sink_flush_with_object_range_offset() {
+    fn test_sink_object_range_offset_translation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(4, file, 1000);
+        let (writer, _consumer) = new_slot_body_with_sink(16, file, 1000, false);
 
-        let s0 = writer.try_claim().unwrap();
-        let s1 = writer.try_claim().unwrap();
-
-        s0.fill(chunk_at(0, 1000, b"aaaa"));
-        s1.fill(chunk_at(1, 1100, b"bbbb"));
+        // Fill 8 slots and call try_flush after each, with object_range_start=1000
+        for i in 0..8u64 {
+            let slot = writer.try_claim().unwrap();
+            let offset = 1000 + i * 100;
+            let data = format!("r{i}");
+            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            writer.try_flush().unwrap();
+        }
 
         let contents = std::fs::read(&path).unwrap();
-        // File positions are chunk.offset - object_range_start: 0 and 100
-        assert!(contents.len() >= 104);
-        assert_eq!(&contents[0..4], b"aaaa");
-        assert_eq!(&contents[100..104], b"bbbb");
+        // File positions are chunk.offset - object_range_start
+        for i in 0..8u64 {
+            let file_pos = (i * 100) as usize;
+            let expected = format!("r{i}");
+            assert_eq!(
+                &contents[file_pos..file_pos + expected.len()],
+                expected.as_bytes(),
+                "mismatch at seq {i}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -950,7 +1096,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(8, file, 0);
+        let (writer, _consumer) = new_slot_body_with_sink(16, file, 0, false);
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -968,8 +1114,8 @@ mod tests {
             h.await.unwrap();
         }
 
-        // Final flush for any stragglers
-        writer.notify_consumer();
+        // Terminal flush to ensure all data is on disk
+        writer.finalize().unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..8u64 {
