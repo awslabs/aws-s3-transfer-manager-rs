@@ -58,6 +58,12 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 /// Components provided by the execution runtime to the rest of the system.
 ///
 /// The runtime populates these based on its execution model.
+// TODO(vnext): When migrating to hyper-util composable pools (pool::cache), the
+// Cached<S>::Drop unconditionally returns connections to the pool with no health
+// check. Mid-flight connections dropped via timeout will go back in broken. Need
+// to either contribute an is_ready check upstream or explicitly close the
+// connection before dropping. The legacy pool's Pooled::Drop checks is_open()
+// which correctly destroys mid-flight connections. See bosun.md for details.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,

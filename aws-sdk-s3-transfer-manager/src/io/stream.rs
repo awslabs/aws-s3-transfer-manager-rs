@@ -170,13 +170,24 @@ impl StreamContext {
 /// Contents and (optional) metadata for a single part of a [multipart upload].
 ///
 /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
     pub(crate) data: Bytes,
     pub(crate) checksum: Option<String>,
     pub(crate) is_last: Option<bool>,
+}
+
+impl std::fmt::Debug for PartData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartData")
+            .field("part_number", &self.part_number)
+            .field("data_len", &self.data.len())
+            .field("checksum", &self.checksum)
+            .field("is_last", &self.is_last)
+            .finish()
+    }
 }
 
 impl PartData {

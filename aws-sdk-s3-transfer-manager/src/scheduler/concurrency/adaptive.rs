@@ -246,6 +246,12 @@ impl AdaptiveConcurrencyController {
         let peak = self.peak_in_flight.swap(0, Ordering::Relaxed);
 
         if self.io_counters.is_idle() {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                in_flight = self.in_flight.load(Ordering::Relaxed),
+                target = self.target.load(Ordering::Relaxed),
+                "idle — skipping evaluation",
+            );
             return;
         }
 

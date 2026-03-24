@@ -501,7 +501,7 @@ pub struct Body {
 
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ChunkOutput {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
@@ -514,6 +514,17 @@ pub struct ChunkOutput {
     /// The metadata associated with this particular ranged GetObject request. This contains all the
     /// metadata returned by the S3 GetObject operation.
     pub metadata: ChunkMetadata,
+}
+
+impl std::fmt::Debug for ChunkOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkOutput")
+            .field("seq", &self.seq)
+            .field("offset", &self.offset)
+            .field("data_len", &self.data.remaining())
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 impl Body {

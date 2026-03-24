@@ -319,6 +319,13 @@ impl UploadTransfer {
             };
         }
 
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            total_parts,
+            part_size,
+            "MPU created, transferring",
+        );
+
         WorkOutcome::Success {
             schedule_next: None,
             data: None,
@@ -445,6 +452,13 @@ impl UploadTransfer {
                 completed_parts.push(completed);
             }
         }
+
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            part_number,
+            bytes_sent,
+            "part uploaded",
+        );
 
         self.maybe_transition_to_completing();
 
@@ -608,6 +622,11 @@ impl UploadTransfer {
     }
 
     fn fail(&self, error: Error) -> WorkOutcome {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            %error,
+            "upload failed",
+        );
         let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error::Error::new(
             error::ErrorKind::RuntimeError,

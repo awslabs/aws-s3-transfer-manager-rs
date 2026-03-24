@@ -461,6 +461,13 @@ impl DownloadTransfer {
         }
         self.decrement_in_flight();
 
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            seq,
+            offset = *range.start(),
+            "chunk downloaded",
+        );
+
         WorkOutcome::Success {
             schedule_next: None,
             data: None,
@@ -502,6 +509,10 @@ impl DownloadTransfer {
         mut guard: std::sync::MutexGuard<'_, DownloadState>,
         error: Error,
     ) -> WorkOutcome {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download failed",
+        );
         let classification = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
         self.inner.ctx.set_failed(error);

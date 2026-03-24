@@ -118,13 +118,13 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         // Skip execution if transfer already terminal (failed/cancelled by another work item)
         if work.descriptor.is_terminal() {
-            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, "skipped (terminal)");
+            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, kind = ?work.item.kind, "skipped (terminal)");
             pool.complete();
             scheduler.on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, "executing");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, kind = ?work.item.kind, "executing");
         let transfer = work.descriptor.transfer();
         let started = Instant::now();
 
@@ -149,7 +149,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             }
         };
 
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = ?work.item.data, ?outcome, "completed");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, kind = ?work.item.kind, ?outcome, "completed");
 
         let elapsed = started.elapsed();
         pool.complete();

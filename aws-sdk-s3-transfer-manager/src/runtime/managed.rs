@@ -123,11 +123,11 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
     work.descriptor.work_started();
 
     if work.descriptor.is_terminal() {
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, work = ?work.item.data, "skipped (terminal)");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, kind = ?work.item.kind, "skipped (terminal)");
         return ExecuteResult::Completed(WorkOutcome::Cancelled, Duration::ZERO);
     }
 
-    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, work = ?work.item.data, "executing");
+    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, kind = ?work.item.kind, "executing");
     let transfer = work.descriptor.transfer();
     let started = Instant::now();
 

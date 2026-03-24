@@ -51,6 +51,7 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{CompletionSample, ConcurrencyController};
+use crate::telemetry;
 use crate::transfer::{BoxTransfer, IoRequest, PollWork, TransferId, WorkOutcome};
 
 use crate::metrics::{IOCounters, IoSample};
@@ -186,12 +187,14 @@ impl Scheduler {
         // playing aggressive catchup over already in-flight transfers
         let desc = TransferDescriptor::new_with_vruntime(transfer, self.0.ready_set.min_vruntime());
 
+        let id = desc.id();
         {
             let mut transfers = self.0.transfers.write().unwrap();
-            transfers.insert(desc.id(), desc.clone());
+            transfers.insert(id, desc.clone());
             self.0.ready_set.insert(desc);
         }
 
+        tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, "transfer enqueued");
         self.generate_work();
     }
 
@@ -233,6 +236,7 @@ impl Scheduler {
             self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
             desc.work_purged(purged);
             desc.notify_idle();
+            tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, purged, "transfer cancelled");
             true
         } else {
             false
@@ -261,6 +265,25 @@ impl Scheduler {
         outcome: WorkOutcome,
         elapsed: Duration,
     ) {
+        let outcome_tag = match &outcome {
+            WorkOutcome::Success { schedule_next, .. } => {
+                if schedule_next.is_some() {
+                    "success+followon"
+                } else {
+                    "success"
+                }
+            }
+            WorkOutcome::Failed { .. } => "failed",
+            WorkOutcome::Cancelled => "cancelled",
+        };
+        tracing::trace!(
+            target: telemetry::TARGET_SCHEDULING,
+            id = %work.descriptor.id(),
+            kind = ?work.item.kind,
+            ?elapsed,
+            outcome = outcome_tag,
+            "work completed",
+        );
         self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
 
         // Report to concurrency controller
@@ -350,9 +373,28 @@ impl Scheduler {
         self.0.submission_queue.enter()
     }
 
+    /// Push work into the submission, flushing and retrying on contention.
+    fn enqueue<'a>(
+        &'a self,
+        mut sub: Submission<'a, ScheduledWork>,
+        work: ScheduledWork,
+    ) -> Submission<'a, ScheduledWork> {
+        let mut pending = work;
+        loop {
+            match sub.push(pending) {
+                Ok(()) => return sub,
+                Err(returned) => {
+                    sub = self.submit_and_reenter(sub);
+                    pending = returned;
+                }
+            }
+        }
+    }
+
     /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
         let mut sub = self.0.submission_queue.enter();
+        let mut generated = 0usize;
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
@@ -365,6 +407,7 @@ impl Scheduler {
 
             match desc.transfer().poll_work() {
                 PollWork::Ready(item) => {
+                    generated += 1;
                     desc.work_generated();
                     self.0.ready_set.insert(desc.clone());
                     self.0.dispatched.fetch_add(1, Ordering::Relaxed);
@@ -373,10 +416,7 @@ impl Scheduler {
                         item,
                         descriptor: desc,
                     };
-                    if let Err(work) = sub.push(work) {
-                        sub = self.submit_and_reenter(sub);
-                        sub.push(work).expect("empty queue after flush");
-                    }
+                    sub = self.enqueue(sub, work);
                 }
                 PollWork::Pending => {
                     // re-added on wake as state machine progresses
@@ -390,19 +430,23 @@ impl Scheduler {
         if let Some(mut guard) = sub.submit() {
             self.runtime().dispatch(&mut guard);
         }
+        if generated > 0 {
+            tracing::trace!(
+                target: telemetry::TARGET_SCHEDULING,
+                generated,
+                dispatched = self.0.dispatched.load(Ordering::Relaxed),
+                target = self.0.controller.target(),
+                "work generated",
+            );
+        }
     }
 
     fn dispatch_single(&self, work: ScheduledWork) {
         self.0.dispatched.fetch_add(1, Ordering::Relaxed);
         work.descriptor.work_queued();
         let sub = self.0.submission_queue.enter();
-        if let Err(work) = sub.push(work) {
-            let sub = self.submit_and_reenter(sub);
-            sub.push(work).expect("empty queue after flush");
-            if let Some(mut guard) = sub.submit() {
-                self.runtime().dispatch(&mut guard);
-            }
-        } else if let Some(mut guard) = sub.submit() {
+        let sub = self.enqueue(sub, work);
+        if let Some(mut guard) = sub.submit() {
             self.runtime().dispatch(&mut guard);
         }
     }
@@ -873,6 +917,88 @@ mod tests {
             completed
         );
 
+        scheduler.shutdown();
+    }
+
+    /// Mock that generates N work items where each execution produces a follow-on.
+    /// First execute returns Success with schedule_next, second returns Success with None.
+    #[derive(Debug)]
+    struct FollowOnWorkCount {
+        total: usize,
+        generated: AtomicUsize,
+        completed: AtomicUsize,
+    }
+
+    impl FollowOnWorkCount {
+        fn new(total: usize) -> Self {
+            Self {
+                total,
+                generated: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MockStateMachine for FollowOnWorkCount {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            let n = self.generated.fetch_add(1, Ordering::Relaxed);
+            if n >= self.total {
+                return PollWork::Done;
+            }
+            PollWork::Ready(IoRequest {
+                kind: IoKind::Disk,
+                data: None,
+            })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            let kind = work.kind;
+            Box::pin(async move {
+                match kind {
+                    IoKind::Disk => WorkOutcome::Success {
+                        schedule_next: Some(IoKind::Network),
+                        data: None,
+                        metrics: None,
+                    },
+                    IoKind::Network => {
+                        self.completed.fetch_add(1, Ordering::Relaxed);
+                        WorkOutcome::Success {
+                            schedule_next: None,
+                            data: None,
+                            metrics: None,
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    /// Regression test: 64 managed threads completing follow-on dispatches simultaneously
+    /// must not panic on submission queue contention.
+    #[tokio::test]
+    async fn test_concurrent_followon_dispatch() {
+        let _logs = show_test_logs();
+        let scheduler = Scheduler::with_managed_runtime(256);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+
+        let sm = Arc::new(FollowOnWorkCount::new(256));
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm.clone())));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle");
+
+        assert_eq!(sm.completed.load(Ordering::Relaxed), 256);
         scheduler.shutdown();
     }
 }

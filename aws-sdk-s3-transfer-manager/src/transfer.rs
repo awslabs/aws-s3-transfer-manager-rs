@@ -143,7 +143,7 @@ impl std::fmt::Debug for WorkOutcome {
             } => f
                 .debug_struct("Success")
                 .field("schedule_next", schedule_next)
-                .field("data", data)
+                .field("has_data", &data.is_some())
                 .field("metrics", metrics)
                 .finish(),
             WorkOutcome::Failed { classification } => f
