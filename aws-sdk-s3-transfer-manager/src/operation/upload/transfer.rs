@@ -20,7 +20,6 @@ use std::pin::Pin;
 use crate::error::{self, Error};
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::{InputStream, PartData};
-use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IoSample;
 use crate::operation::upload::context::UploadState;
 use crate::operation::upload::input::convert::{
@@ -74,8 +73,6 @@ struct UploadTransferInner {
     create_mpu_complete: tokio::sync::Notify,
     /// Channel to send result to handle
     result_tx: Mutex<Option<UploadResultSender>>,
-    /// Adaptive latency tracking for timeout+retry on upload parts
-    latencies: LatencyTracker,
 }
 
 impl UploadTransfer {
@@ -103,7 +100,6 @@ impl UploadTransfer {
             bucket_type,
             create_mpu_complete: tokio::sync::Notify::new(),
             result_tx: Mutex::new(Some(result_tx)),
-            latencies: LatencyTracker::new(),
         });
 
         Self { inner }
@@ -423,7 +419,9 @@ impl UploadTransfer {
 
         let resp = match self
             .inner
-            .latencies
+            .ctx
+            .handle
+            .upload_latencies
             .guarded(|| {
                 let body = ByteStream::from(data_bytes.clone());
                 let req = copy_fields_to_upload_part_request(

@@ -330,11 +330,30 @@ impl Scheduler {
                 item: IoRequest { kind, data },
                 descriptor: desc.clone(),
             };
+            tracing::trace!(
+                target: telemetry::TARGET_SCHEDULING,
+                id = %desc.id(),
+                ?kind,
+                "dispatching follow-on",
+            );
             self.dispatch_single(next);
+            tracing::trace!(
+                target: telemetry::TARGET_SCHEDULING,
+                id = %desc.id(),
+                "follow-on dispatched",
+            );
         }
 
         // capacity has freed try to queue up more work
+        tracing::trace!(
+            target: telemetry::TARGET_SCHEDULING,
+            "entering generate_work from on_completion",
+        );
         self.generate_work();
+        tracing::trace!(
+            target: telemetry::TARGET_SCHEDULING,
+            "generate_work returned",
+        );
     }
 
     /// Handle a panic during work execution. The transfer's internal state is

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IOCounters;
 use crate::runtime::{ManagedThreadRuntime, TokioMultiThreadRuntime};
 use crate::scheduler::{
@@ -26,6 +27,8 @@ pub(crate) struct Handle {
     pub(crate) config: crate::Config,
     pub(crate) s3_client: aws_sdk_s3::Client,
     pub(crate) scheduler: Scheduler,
+    pub(crate) upload_latencies: LatencyTracker,
+    pub(crate) download_latencies: LatencyTracker,
 }
 
 impl Handle {
@@ -81,6 +84,8 @@ impl Handle {
             config,
             s3_client,
             scheduler,
+            upload_latencies: LatencyTracker::new(),
+            download_latencies: LatencyTracker::new(),
         }
     }
 }
@@ -121,6 +126,8 @@ impl Client {
             config,
             s3_client,
             scheduler,
+            upload_latencies: LatencyTracker::new(),
+            download_latencies: LatencyTracker::new(),
         });
         Client { handle }
     }

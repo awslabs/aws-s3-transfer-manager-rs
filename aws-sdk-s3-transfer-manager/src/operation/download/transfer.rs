@@ -14,7 +14,6 @@ use bytes_utils::SegmentedBuf;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
-use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IoSample;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
@@ -91,8 +90,6 @@ struct DownloadTransferInner {
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
-    /// Adaptive latency tracking for timeout+retry on range requests
-    latencies: LatencyTracker,
 }
 
 impl DownloadTransfer {
@@ -110,7 +107,6 @@ impl DownloadTransfer {
             writer,
             object_meta: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
-            latencies: LatencyTracker::new(),
         });
         Self { inner }
     }
@@ -415,7 +411,9 @@ impl DownloadTransfer {
 
         let result = self
             .inner
-            .latencies
+            .ctx
+            .handle
+            .download_latencies
             .guarded(|| {
                 let rh = range_header.clone();
                 let etag = etag.clone();

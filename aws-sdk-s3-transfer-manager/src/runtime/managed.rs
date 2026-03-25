@@ -324,9 +324,31 @@ impl ExecutionRuntime for ManagedThreadRuntime {
 
             let scheduler = self.scheduler.clone();
             let in_flight = Arc::clone(&th.in_flight);
+            let tid = work.descriptor.id();
+            let kind = work.item.kind;
+
+            tracing::trace!(
+                target: crate::telemetry::TARGET_EXECUTION,
+                %tid,
+                ?kind,
+                thread = thread_id.0,
+                "dispatching to managed thread",
+            );
 
             th.runtime_handle.spawn(async move {
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_EXECUTION,
+                    %tid,
+                    ?kind,
+                    "execute starting",
+                );
                 let result = execute_work(&mut work, &scheduler).await;
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_EXECUTION,
+                    %tid,
+                    ?kind,
+                    "execute finished, entering on_completion",
+                );
                 in_flight.fetch_sub(1, Ordering::Relaxed);
                 match result {
                     ExecuteResult::Completed(outcome, elapsed) => {
@@ -336,6 +358,12 @@ impl ExecutionRuntime for ManagedThreadRuntime {
                         scheduler.on_panic(work);
                     }
                 }
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_EXECUTION,
+                    %tid,
+                    ?kind,
+                    "on_completion returned",
+                );
             });
         }
     }
