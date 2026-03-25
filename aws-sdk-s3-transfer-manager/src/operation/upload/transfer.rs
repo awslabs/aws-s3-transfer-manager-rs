@@ -303,6 +303,15 @@ impl UploadTransfer {
             match PartReaderBuilder::new()
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
+                .direct_io(
+                    self.inner
+                        .ctx
+                        .handle
+                        .scheduler
+                        .runtime()
+                        .components()
+                        .direct_io(),
+                )
                 .build()
             {
                 Ok(reader) => reader,

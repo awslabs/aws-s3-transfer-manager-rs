@@ -164,7 +164,7 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(part_size);
+        let stream_cx = StreamContext::new(part_size, false);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"hello");
@@ -199,7 +199,7 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(part_size);
+        let stream_cx = StreamContext::new(part_size, false);
 
         // partial read
         handle.read(b"hello");

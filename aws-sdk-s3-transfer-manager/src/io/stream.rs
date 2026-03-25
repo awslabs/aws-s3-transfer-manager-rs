@@ -145,11 +145,16 @@ pub(super) enum RawInputStream {
 #[derive(Debug)]
 pub struct StreamContext {
     part_size: usize,
+    /// When true, file I/O runs directly on the calling thread.
+    direct_io: bool,
 }
 
 impl StreamContext {
-    pub(super) fn new(part_size: usize) -> Self {
-        Self { part_size }
+    pub(super) fn new(part_size: usize, direct_io: bool) -> Self {
+        Self {
+            part_size,
+            direct_io,
+        }
     }
 
     /// The part size to use when yielding parts.
@@ -157,6 +162,11 @@ impl StreamContext {
     /// result in exceeding the maximum number of parts allowed).
     pub fn part_size(&self) -> usize {
         self.part_size
+    }
+
+    /// Whether file I/O should run directly on the calling thread.
+    pub(crate) fn direct_io(&self) -> bool {
+        self.direct_io
     }
 
     // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.

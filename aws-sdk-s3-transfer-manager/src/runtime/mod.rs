@@ -18,6 +18,8 @@ pub(crate) use topology::{Cpu, NumaNode, Topology};
 
 pub(crate) mod sync;
 
+use std::sync::Arc;
+
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
 use crate::runtime::sync::SubmissionGuard;
@@ -67,6 +69,9 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,
+    /// When true, file I/O runs directly on the calling thread (managed threads).
+    /// When false, file I/O is offloaded via spawn_blocking (shared runtimes).
+    direct_io: bool,
 }
 
 impl RuntimeComponents {
@@ -78,5 +83,15 @@ impl RuntimeComponents {
     /// Set the HTTP client.
     pub(crate) fn set_http_client(&mut self, client: SharedHttpClient) {
         self.http_client = Some(client);
+    }
+
+    /// Whether file I/O should run directly on the calling thread.
+    pub(crate) fn direct_io(&self) -> bool {
+        self.direct_io
+    }
+
+    /// Set direct I/O mode.
+    pub(crate) fn set_direct_io(&mut self, direct: bool) {
+        self.direct_io = direct;
     }
 }

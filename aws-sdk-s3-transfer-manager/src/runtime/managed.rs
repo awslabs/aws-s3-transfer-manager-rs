@@ -258,6 +258,7 @@ impl ManagedThreadRuntime {
 
         let mut components = RuntimeComponents::default();
         components.set_http_client(shared_http_client);
+        components.set_direct_io(true);
 
         Self {
             scheduler,
