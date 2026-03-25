@@ -125,10 +125,7 @@ impl LatencyTracker {
     ///
     /// SDK errors (the inner `Err`) are returned immediately without retry —
     /// they represent server-side rejections, not straggler latency.
-    pub(crate) async fn guarded<T, E, F, Fut>(
-        &self,
-        mut build: F,
-    ) -> Result<T, crate::error::Error>
+    pub(crate) async fn guarded<T, E, F, Fut>(&self, mut build: F) -> Result<T, crate::error::Error>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, E>>,

@@ -304,10 +304,14 @@ impl UploadTransfer {
         tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
 
         let part_reader = Arc::new(
-            PartReaderBuilder::new()
+            match PartReaderBuilder::new()
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
-                .build(),
+                .build()
+            {
+                Ok(reader) => reader,
+                Err(e) => return self.fail(e.into()),
+            },
         );
 
         {
