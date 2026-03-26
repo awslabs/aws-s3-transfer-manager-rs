@@ -288,8 +288,7 @@ fn handle_failed_upload(
     match ctx.state.input.failure_policy() {
         FailedTransferPolicy::Abort => {
             // Sending a cancellation signal during graceful shutdown would be redundant.
-            if err.kind() != &ErrorKind::OperationCancelled
-                && ctx.state.cancel_tx.send(true).is_err()
+            if err.kind() != &ErrorKind::OperationCancelled && ctx.state.cancel_tx.send(()).is_err()
             {
                 tracing::warn!(
                     "all receiver ends have been dropped, unable to send a cancellation signal"
@@ -413,7 +412,7 @@ mod tests {
             input: UploadObjectsInput,
         ) -> (BTreeMap<String, usize>, Vec<error::Error>) {
             let (list_directory_tx, list_directory_rx) = async_channel::unbounded();
-            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let (cancel_tx, cancel_rx) = watch::channel(());
 
             let join_handle = tokio::spawn(list_directory_contents(
                 Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx)),
@@ -735,7 +734,7 @@ mod tests {
             key: "doesnotmatter".to_owned(),
         };
 
-        ctx.state.cancel_tx.send(true).unwrap();
+        ctx.state.cancel_tx.send(()).unwrap();
 
         let err = upload_single_obj(&ctx, job).await.unwrap_err();
 

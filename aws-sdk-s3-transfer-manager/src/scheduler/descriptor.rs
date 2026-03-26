@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use super::{BoxTransfer, Transfer, TransferId};
+use crate::transfer::{BoxTransfer, Transfer, TransferId};
 
 /// Default priority assigned to new transfers
 const DEFAULT_PRIORITY: u8 = 128;
@@ -25,7 +25,7 @@ const WORK_COST: u64 = 128;
 /// - Outstanding work tracking (queued + executing)
 /// - The transfer itself for polling work
 #[derive(Clone)]
-pub(super) struct TransferDescriptor(Arc<Inner>);
+pub(crate) struct TransferDescriptor(Arc<Inner>);
 
 struct Inner {
     priority: AtomicU8,
@@ -47,11 +47,11 @@ impl std::fmt::Debug for TransferDescriptor {
 
 impl TransferDescriptor {
     #[cfg(test)] // TODO: evaluate for public scheduling API
-    pub(super) fn new(transfer: BoxTransfer) -> Self {
+    pub(crate) fn new(transfer: BoxTransfer) -> Self {
         Self::new_with_vruntime(transfer, 0)
     }
 
-    pub(super) fn new_with_vruntime(transfer: BoxTransfer, initial_vruntime: u64) -> Self {
+    pub(crate) fn new_with_vruntime(transfer: BoxTransfer, initial_vruntime: u64) -> Self {
         Self(Arc::new(Inner {
             priority: AtomicU8::new(DEFAULT_PRIORITY),
             vruntime: AtomicU64::new(initial_vruntime),
@@ -61,28 +61,28 @@ impl TransferDescriptor {
         }))
     }
 
-    pub(super) fn transfer(&self) -> &dyn Transfer {
+    pub(crate) fn transfer(&self) -> &dyn Transfer {
         self.0.transfer.as_ref()
     }
 
-    pub(super) fn id(&self) -> TransferId {
+    pub(crate) fn id(&self) -> TransferId {
         self.0.transfer.ctx().id
     }
 
-    pub(super) fn priority(&self) -> u8 {
+    pub(crate) fn priority(&self) -> u8 {
         self.0.priority.load(Ordering::Acquire)
     }
 
-    pub(super) fn set_priority(&self, priority: u8) {
+    pub(crate) fn set_priority(&self, priority: u8) {
         self.0.priority.store(priority, Ordering::Release);
     }
 
-    pub(super) fn vruntime(&self) -> u64 {
+    pub(crate) fn vruntime(&self) -> u64 {
         self.0.vruntime.load(Ordering::Acquire)
     }
 
     #[cfg(test)] // TODO: evaluate for public scheduling API
-    pub(super) fn set_vruntime(&self, vruntime: u64) {
+    pub(crate) fn set_vruntime(&self, vruntime: u64) {
         self.0.vruntime.store(vruntime, Ordering::Release);
     }
 
@@ -92,7 +92,7 @@ impl TransferDescriptor {
 
     /// Record work generation and update vruntime based on priority.
     /// Higher priority = slower vruntime accumulation = more work share.
-    pub(super) fn work_generated(&self) {
+    pub(crate) fn work_generated(&self) {
         let priority = self.priority() as u64;
         // Scale up before dividing to avoid integer division truncating to zero.
         // Multiplying by 256 ensures max priority (255) still yields delta >= 1.
@@ -101,45 +101,47 @@ impl TransferDescriptor {
     }
 
     /// Called when work is enqueued (to be executed)
-    pub(super) fn work_queued(&self) {
+    pub(crate) fn work_queued(&self) {
         self.0.queued_executing.increment_queued();
     }
 
     /// Called when worker picks up work (atomic queued-- / executing++)
-    pub(super) fn work_started(&self) {
+    pub(crate) fn work_started(&self) {
         self.0.queued_executing.start_executing();
     }
 
     /// Called when worker completes work. Returns true if transfer is now idle.
-    pub(super) fn work_finished(&self) -> bool {
+    pub(crate) fn work_finished(&self) -> bool {
         self.0.queued_executing.finish_executing()
     }
 
     /// Called when queued work is purged (cancelled before execution)
-    pub(super) fn work_purged(&self, count: usize) {
+    pub(crate) fn work_purged(&self, count: usize) {
         self.0.queued_executing.decrement_queued(count as u32);
     }
 
-    pub(super) fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         self.0.queued_executing.is_idle()
     }
 
     /// Wake anyone waiting on this transfer to become idle
-    pub(super) fn notify_idle(&self) {
+    pub(crate) fn notify_idle(&self) {
         self.0.idle_notify.notify_waiters();
     }
 
     /// Check if this transfer has reached a terminal state and no longer needs polled
-    pub(super) fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         !self.0.transfer.ctx().is_active()
     }
 
-    pub(super) async fn wait_for_idle(&self) {
+    pub(crate) async fn wait_for_idle(&self) {
         loop {
+            // Register interest before checking
+            let notified = self.0.idle_notify.notified();
             if self.is_idle() {
                 return;
             }
-            self.0.idle_notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -297,12 +299,13 @@ mod tests {
 
     mod priority_vruntime {
         use super::*;
-        use crate::scheduler::transfer::mock::FixedWorkCount;
+        use crate::scheduler::test_util::{FixedWorkCount, MockTransfer};
+        use std::sync::Arc;
 
         fn test_descriptor(id: u64) -> TransferDescriptor {
             let transfer_id = TransferId { id, parent: None };
-            let transfer: Box<dyn crate::scheduler::Transfer> =
-                Box::new(FixedWorkCount::new(transfer_id, 100));
+            let sm = Arc::new(FixedWorkCount::new(100));
+            let transfer = Box::new(MockTransfer::new(transfer_id, sm));
             TransferDescriptor::new(transfer)
         }
 

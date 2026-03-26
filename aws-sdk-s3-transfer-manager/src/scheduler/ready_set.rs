@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crossbeam_skiplist::SkipMap;
 
 use super::descriptor::TransferDescriptor;
-use super::TransferId;
+use crate::transfer::TransferId;
 
 /// Key for ordering transfers in the ready set.
 ///
@@ -135,12 +135,13 @@ impl ReadySet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::transfer::mock::FixedWorkCount;
+    use crate::scheduler::test_util::{FixedWorkCount, MockTransfer};
     use std::sync::Arc;
 
     fn make_descriptor(id: u64, priority: u8, vruntime: u64) -> TransferDescriptor {
         let tid = TransferId { id, parent: None };
-        let transfer: Box<dyn crate::scheduler::Transfer> = Box::new(FixedWorkCount::new(tid, 1));
+        let sm = Arc::new(FixedWorkCount::new(1));
+        let transfer = Box::new(MockTransfer::new(tid, sm));
         let desc = TransferDescriptor::new(transfer);
         desc.set_priority(priority);
         desc.set_vruntime(vruntime);

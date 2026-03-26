@@ -64,7 +64,7 @@ impl DownloadObjectsHandle {
     /// Aborts all tasks owned by the handle.
     pub async fn abort(&mut self) -> Result<(), crate::error::Error> {
         if self.ctx.state.input.failure_policy() == &FailedTransferPolicy::Abort {
-            if self.ctx.state.cancel_tx.send(true).is_err() {
+            if self.ctx.state.cancel_tx.send(()).is_err() {
                 tracing::debug!(
                     "all receiver ends have been dropped, unable to send a cancellation signal"
                 );

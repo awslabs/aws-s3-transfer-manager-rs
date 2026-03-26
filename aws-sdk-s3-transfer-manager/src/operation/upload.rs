@@ -9,7 +9,6 @@ mod checksum_strategy;
 mod input;
 mod output;
 
-mod context;
 mod handle;
 mod transfer;
 
@@ -17,7 +16,7 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
 use crate::error;
-use crate::scheduler::TransferContext;
+use crate::transfer::TransferContext;
 use crate::types::BucketType;
 pub use handle::UploadHandle;
 /// Request type for uploads to Amazon S3

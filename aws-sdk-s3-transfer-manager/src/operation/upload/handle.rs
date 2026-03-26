@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
-use crate::scheduler::StateMachineTerminalReceiver;
+use crate::transfer::StateMachineTerminalReceiver;
 use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
 
 /// Handle to an in-progress upload operation.

@@ -17,15 +17,49 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::Error;
-use crate::io::part_reader::Builder as PartReaderBuilder;
+use crate::io::part_reader::{Builder as PartReaderBuilder, PartReader};
 use crate::io::{InputStream, PartData};
-use crate::operation::upload::context::UploadState;
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
-use crate::scheduler::{PollWork, Transfer, TransferContext, WorkItem, WorkKind, WorkOutcome};
+use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
+
+/// State machine for tracking upload work progress.
+///
+/// Represents the current phase of an upload operation.
+#[derive(Debug)]
+pub(crate) enum UploadState {
+    /// Waiting to start - need to call CreateMPU (or PutObject for small uploads)
+    PendingInit {
+        stream: Option<InputStream>,
+        content_length: Option<u64>,
+        init_in_flight: bool,
+    },
+    /// Data transfer in progress (uploading parts for MPU)
+    Transferring {
+        upload_id: String,
+        part_reader: Arc<PartReader>,
+        next_part: u64,
+        total_parts: u64,
+        parts_in_flight: usize,
+        completed_parts: Vec<CompletedPart>,
+        response_builder: UploadOutputBuilder,
+    },
+    /// All parts done, calling CompleteMPU (MPU only)
+    Completing {
+        upload_id: Option<String>,
+        part_reader: Option<Arc<PartReader>>,
+        completed_parts: Option<Vec<CompletedPart>>,
+        response_builder: Option<UploadOutputBuilder>,
+        complete_in_flight: bool,
+    },
+    /// PutObject in flight (single request upload)
+    PutObjectInFlight,
+    /// Done
+    Done,
+}
 
 /// Upload-specific work data.
 #[derive(Debug)]
@@ -181,16 +215,16 @@ impl UploadTransfer {
                     || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
-                    PollWork::Ready(WorkItem {
-                        kind: WorkKind::Network,
+                    PollWork::Ready(IoRequest {
+                        kind: IoKind::Network,
                         data: Some(Box::new(UploadWork::CreateMPU)),
                     })
                 } else {
                     // Take ownership of stream by replacing state
                     let taken_stream = stream.take().expect("stream already taken in PendingInit");
                     *state = UploadState::PutObjectInFlight;
-                    PollWork::Ready(WorkItem {
-                        kind: WorkKind::Network,
+                    PollWork::Ready(IoRequest {
+                        kind: IoKind::Network,
                         data: Some(Box::new(UploadWork::PutObject {
                             stream: Some(taken_stream),
                         })),
@@ -231,8 +265,8 @@ impl UploadTransfer {
                 let part_number = *next_part;
                 *next_part += 1;
                 *parts_in_flight += 1;
-                PollWork::Ready(WorkItem {
-                    kind: WorkKind::DataIO,
+                PollWork::Ready(IoRequest {
+                    kind: IoKind::Disk,
                     data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: None,
@@ -247,8 +281,8 @@ impl UploadTransfer {
                     return PollWork::Pending;
                 }
                 *complete_in_flight = true;
-                PollWork::Ready(WorkItem {
-                    kind: WorkKind::Network,
+                PollWork::Ready(IoRequest {
+                    kind: IoKind::Network,
                     data: Some(Box::new(UploadWork::CompleteMPU)),
                 })
             }
@@ -260,7 +294,7 @@ impl UploadTransfer {
         }
     }
 
-    pub(crate) async fn execute(&self, work: &mut WorkItem) -> WorkOutcome {
+    pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let kind = work.kind;
         let data = work.data_mut::<UploadWork>();
         match data {
@@ -348,18 +382,22 @@ impl UploadTransfer {
             };
         }
 
-        WorkOutcome::Success(None)
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: None,
+            metrics: None,
+        }
     }
 
     async fn execute_upload_part(
         &self,
         part_number: u64,
         part_data: &mut Option<PartData>,
-        kind: WorkKind,
+        kind: IoKind,
     ) -> WorkOutcome {
         match kind {
-            WorkKind::DataIO => self.execute_read_part(part_number, part_data).await,
-            WorkKind::Network => self.execute_send_part(part_number, part_data).await,
+            IoKind::Disk => self.execute_read_part(part_number, part_data).await,
+            IoKind::Network => self.execute_send_part(part_number, part_data).await,
         }
     }
 
@@ -383,13 +421,14 @@ impl UploadTransfer {
         {
             Ok(Some(data)) => {
                 *part_data = Some(data);
-                WorkOutcome::Success(Some(WorkItem {
-                    kind: WorkKind::Network,
+                WorkOutcome::Success {
+                    schedule_next: Some(IoKind::Network),
                     data: Some(Box::new(UploadWork::UploadPart {
                         part_number,
                         part_data: part_data.take(),
                     })),
-                }))
+                    metrics: None,
+                }
             }
             Ok(None) => {
                 tracing::trace!(
@@ -397,7 +436,11 @@ impl UploadTransfer {
                     part_number
                 );
                 self.maybe_transition_to_completing();
-                WorkOutcome::Success(None)
+                WorkOutcome::Success {
+                    schedule_next: None,
+                    data: None,
+                    metrics: None,
+                }
             }
             Err(e) => self.fail(e.into()),
         }
@@ -469,7 +512,11 @@ impl UploadTransfer {
 
         self.maybe_transition_to_completing();
 
-        WorkOutcome::Success(None)
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: None,
+            metrics: None,
+        }
     }
 
     fn maybe_transition_to_completing(&self) {
@@ -553,7 +600,11 @@ impl UploadTransfer {
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
 
-        WorkOutcome::Success(None)
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: None,
+            metrics: None,
+        }
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
@@ -623,13 +674,18 @@ impl UploadTransfer {
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
 
-        WorkOutcome::Success(None)
+        WorkOutcome::Success {
+            schedule_next: None,
+            data: None,
+            metrics: None,
+        }
     }
 
     fn fail(&self, error: Error) -> WorkOutcome {
+        let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error);
         self.inner.ctx.signal_terminal();
-        WorkOutcome::Failed
+        WorkOutcome::Failed { classification }
     }
 }
 
@@ -644,7 +700,7 @@ impl Transfer for UploadTransfer {
 
     fn execute<'a>(
         &'a self,
-        work: &'a mut WorkItem,
+        work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(UploadTransfer::execute(self, work))
     }
@@ -655,7 +711,7 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::scheduler::WorkKind;
+    use crate::transfer::IoKind;
     use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -762,7 +818,13 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
 
         let outcome = transfer.execute(&mut work).await;
-        assert!(matches!(outcome, WorkOutcome::Success(None)));
+        assert!(matches!(
+            outcome,
+            WorkOutcome::Success {
+                schedule_next: None,
+                ..
+            }
+        ));
 
         let mut next = assert_ready(transfer.poll_work());
         let data = next.data_mut::<UploadWork>();
@@ -779,24 +841,25 @@ mod tests {
         transfer.execute(&mut create_work).await;
 
         let mut part_work = assert_ready(transfer.poll_work());
-        assert_eq!(part_work.kind, WorkKind::DataIO);
+        assert_eq!(part_work.kind, IoKind::Disk);
 
         let outcome = transfer.execute(&mut part_work).await;
         match outcome {
-            WorkOutcome::Success(Some(mut work_item)) => {
-                assert_eq!(work_item.kind, WorkKind::Network);
-                if let Some(ref mut boxed_data) = work_item.data {
-                    let upload_work = (**boxed_data)
-                        .as_any_mut()
-                        .downcast_mut::<UploadWork>()
-                        .unwrap();
-                    if let UploadWork::UploadPart { part_data, .. } = upload_work {
-                        assert!(part_data.is_some());
-                    } else {
-                        panic!("expected UploadPart data");
-                    }
+            WorkOutcome::Success {
+                schedule_next: Some(kind),
+                data: Some(data),
+                ..
+            } => {
+                assert_eq!(kind, IoKind::Network);
+                let mut work_item = IoRequest {
+                    kind,
+                    data: Some(data),
+                };
+                let upload_work = work_item.data_mut::<UploadWork>();
+                if let UploadWork::UploadPart { part_data, .. } = upload_work {
+                    assert!(part_data.is_some());
                 } else {
-                    panic!("expected Some data");
+                    panic!("expected UploadPart data");
                 }
             }
             _ => panic!("expected Success"),
@@ -819,9 +882,13 @@ mod tests {
 
         // 3. UploadPart - Network phase
         let mut work = match outcome {
-            WorkOutcome::Success(Some(work_item)) => {
-                assert_eq!(work_item.kind, WorkKind::Network);
-                work_item
+            WorkOutcome::Success {
+                schedule_next: Some(kind),
+                data,
+                ..
+            } => {
+                assert_eq!(kind, IoKind::Network);
+                IoRequest { kind, data }
             }
             _ => panic!("expected schedule_next Network"),
         };
@@ -833,9 +900,13 @@ mod tests {
 
         // 3c. Second UploadPart - Network phase
         let mut work = match outcome {
-            WorkOutcome::Success(Some(work_item)) => {
-                assert_eq!(work_item.kind, WorkKind::Network);
-                work_item
+            WorkOutcome::Success {
+                schedule_next: Some(kind),
+                data,
+                ..
+            } => {
+                assert_eq!(kind, IoKind::Network);
+                IoRequest { kind, data }
             }
             _ => panic!("expected schedule_next Network for part 2"),
         };
