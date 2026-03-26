@@ -11,13 +11,12 @@ use std::sync::{Arc, Mutex};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Buf;
-use tokio::sync::oneshot;
 use tracing::Instrument;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::error::{self, Error};
+use crate::error::Error;
 use crate::io::part_reader::Builder as PartReaderBuilder;
 use crate::io::InputStream;
 use crate::operation::upload::context::UploadState;
@@ -39,9 +38,6 @@ pub(crate) enum UploadWork {
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
-
-pub(crate) type UploadResultSender = oneshot::Sender<Result<UploadOutput, Error>>;
-pub(crate) type UploadResultReceiver = oneshot::Receiver<Result<UploadOutput, Error>>;
 
 /// Upload transfer that generates and executes upload work.
 ///
@@ -65,8 +61,8 @@ struct UploadTransferInner {
     bucket_type: BucketType,
     /// Notified when CreateMPU completes (success or failure)
     create_mpu_complete: tokio::sync::Notify,
-    /// Channel to send result to handle
-    result_tx: Mutex<Option<UploadResultSender>>,
+    /// Stored result for handle to retrieve
+    result: Mutex<Option<UploadOutput>>,
 }
 
 impl UploadTransfer {
@@ -75,7 +71,6 @@ impl UploadTransfer {
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
-        result_tx: UploadResultSender,
     ) -> Self {
         // TODO: For unknown content length (streaming uploads), this will need adjustment.
         let content_length = stream
@@ -86,14 +81,14 @@ impl UploadTransfer {
         let inner = Arc::new(UploadTransferInner {
             ctx,
             state: Mutex::new(UploadState::PendingInit {
-                stream,
-                content_length,
+                stream: Some(stream),
+                content_length: Some(content_length),
                 init_in_flight: false,
             }),
             request: Arc::new(request),
             bucket_type,
             create_mpu_complete: tokio::sync::Notify::new(),
-            result_tx: Mutex::new(Some(result_tx)),
+            result: Mutex::new(None),
         });
 
         Self { inner }
@@ -112,17 +107,22 @@ impl UploadTransfer {
 
     /// Get the upload_id if MPU was started.
     pub(crate) fn upload_id(&self) -> Option<String> {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.state.lock().expect("lock poisoned");
         match &*state {
-            UploadState::Transferring { upload_id, .. }
-            | UploadState::Completing { upload_id, .. } => Some(upload_id.clone()),
+            UploadState::Transferring { upload_id, .. } => Some(upload_id.clone()),
+            UploadState::Completing { upload_id, .. } => upload_id.clone(),
             _ => None,
         }
     }
 
+    /// Take the stored result (used by handle after completion).
+    pub(crate) fn take_result(&self) -> Option<UploadOutput> {
+        self.inner.result.lock().expect("lock poisoned").take()
+    }
+
     /// Check if CreateMPU is currently in flight.
     pub(crate) fn is_create_mpu_in_flight(&self) -> bool {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.state.lock().expect("lock poisoned");
         matches!(
             &*state,
             UploadState::PendingInit {
@@ -148,7 +148,7 @@ impl UploadTransfer {
             return PollWork::Done;
         }
 
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.state.lock().expect("lock poisoned");
 
         match &mut *state {
             UploadState::PendingInit {
@@ -161,23 +161,21 @@ impl UploadTransfer {
                     return PollWork::Pending;
                 }
 
-                let use_mpu = stream.is_mpu_only()
-                    || *content_length >= self.inner.ctx.handle.mpu_threshold_bytes();
+                let use_mpu = stream.as_ref().map_or(false, |s| s.is_mpu_only())
+                    || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
                     PollWork::Ready(IoRequest {
                         data: Some(Box::new(UploadWork::CreateMPU)),
                     })
                 } else {
-                    // Take ownership of stream by replacing state
-                    match std::mem::replace(&mut *state, UploadState::PutObjectInFlight) {
-                        UploadState::PendingInit { stream, .. } => PollWork::Ready(IoRequest {
-                            data: Some(Box::new(UploadWork::PutObject {
-                                stream: Some(stream),
-                            })),
-                        }),
-                        _ => unreachable!(),
-                    }
+                    let taken_stream = stream.take().expect("stream already taken");
+                    *state = UploadState::PutObjectInFlight;
+                    PollWork::Ready(IoRequest {
+                        data: Some(Box::new(UploadWork::PutObject {
+                            stream: Some(taken_stream),
+                        })),
+                    })
                 }
             }
             UploadState::Transferring {
@@ -191,7 +189,25 @@ impl UploadTransfer {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
                     }
-                    self.inner.ctx.set_pending();
+                    // All parts sent and completed — transition to Completing
+                    if let UploadState::Transferring {
+                        upload_id,
+                        part_reader,
+                        completed_parts,
+                        response_builder,
+                        ..
+                    } = std::mem::replace(&mut *state, UploadState::Done)
+                    {
+                        *state = UploadState::Completing {
+                            upload_id: Some(upload_id),
+                            part_reader: Some(part_reader),
+                            completed_parts: Some(completed_parts),
+                            response_builder: Some(response_builder),
+                            complete_in_flight: false,
+                        };
+                    }
+                    drop(state);
+                    self.inner.ctx.try_wake();
                     return PollWork::Pending;
                 }
                 let part_number = *next_part;
@@ -259,14 +275,17 @@ impl UploadTransfer {
         let response_builder = UploadOutputBuilder::from(resp);
 
         let (stream, content_length) = {
-            let mut state = self.inner.state.lock().unwrap();
-            match std::mem::replace(&mut *state, UploadState::Done) {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
                 UploadState::PendingInit {
                     stream,
                     content_length,
                     ..
-                } => (stream, content_length),
-                _ => panic!("unexpected state"),
+                } => (
+                    stream.take().expect("stream already taken"),
+                    content_length.take().expect("content_length already taken"),
+                ),
+                _ => panic!("unexpected state for create_mpu"),
             }
         };
 
@@ -303,7 +322,7 @@ impl UploadTransfer {
         );
 
         {
-            let mut state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().expect("lock poisoned");
             *state = UploadState::Transferring {
                 upload_id,
                 part_reader,
@@ -327,7 +346,7 @@ impl UploadTransfer {
 
     async fn execute_upload_part(&self, part_number: u64) -> WorkOutcome {
         let part_reader = {
-            let state = self.inner.state.lock().unwrap();
+            let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
                 UploadState::Transferring { part_reader, .. } => part_reader.clone(),
                 _ => panic!("unexpected state for read_part"),
@@ -341,7 +360,7 @@ impl UploadTransfer {
         {
             Ok(Some(data)) => data,
             Ok(None) => {
-                tracing::warn!("part_reader returned None for part {}", part_number);
+                tracing::trace!("part_reader returned None for part {}", part_number);
                 self.maybe_transition_to_completing();
                 return WorkOutcome::Success { data: None };
             }
@@ -350,7 +369,7 @@ impl UploadTransfer {
 
         // 2. Send part over network
         let upload_id = {
-            let state = self.inner.state.lock().unwrap();
+            let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
                 UploadState::Transferring { upload_id, .. } => upload_id.clone(),
                 _ => panic!("unexpected state for send_part"),
@@ -409,7 +428,7 @@ impl UploadTransfer {
             .build();
 
         {
-            let mut state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().expect("lock poisoned");
             if let UploadState::Transferring {
                 completed_parts, ..
             } = &mut *state
@@ -441,7 +460,7 @@ impl UploadTransfer {
     }
 
     fn maybe_transition_to_completing(&self) {
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.state.lock().expect("lock poisoned");
         let should_complete = if let UploadState::Transferring {
             parts_in_flight,
             next_part,
@@ -465,10 +484,10 @@ impl UploadTransfer {
             } = std::mem::replace(&mut *state, UploadState::Done)
             {
                 *state = UploadState::Completing {
-                    upload_id,
-                    part_reader,
-                    completed_parts,
-                    response_builder,
+                    upload_id: Some(upload_id),
+                    part_reader: Some(part_reader),
+                    completed_parts: Some(completed_parts),
+                    response_builder: Some(response_builder),
                     complete_in_flight: false,
                 };
             }
@@ -511,27 +530,33 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
+        *self.inner.result.lock().expect("lock poisoned") = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
-
-        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
-            let _ = tx.send(Ok(result));
-        }
 
         WorkOutcome::Success { data: None }
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
         let (upload_id, mut completed_parts, response_builder, part_reader) = {
-            let mut state = self.inner.state.lock().unwrap();
-            match std::mem::replace(&mut *state, UploadState::Done) {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
                 UploadState::Completing {
                     upload_id,
                     completed_parts,
                     response_builder,
                     part_reader,
                     ..
-                } => (upload_id, completed_parts, response_builder, part_reader),
+                } => (
+                    upload_id.take().expect("upload_id already taken"),
+                    completed_parts
+                        .take()
+                        .expect("completed_parts already taken"),
+                    response_builder
+                        .take()
+                        .expect("response_builder already taken"),
+                    part_reader.take().expect("part_reader already taken"),
+                ),
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
@@ -571,12 +596,9 @@ impl UploadTransfer {
             .build()
             .expect("valid response");
 
+        *self.inner.result.lock().expect("lock poisoned") = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
-
-        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
-            let _ = tx.send(Ok(result));
-        }
 
         WorkOutcome::Success { data: None }
     }
@@ -588,18 +610,8 @@ impl UploadTransfer {
             "upload failed",
         );
         let classification = crate::scheduler::classify_error(&error);
-        self.inner.ctx.set_failed(error::Error::new(
-            error::ErrorKind::RuntimeError,
-            "upload failed",
-        ));
+        self.inner.ctx.set_failed(error);
         self.inner.ctx.signal_terminal();
-
-        if let Some(tx) = self.inner.result_tx.lock().unwrap().take() {
-            let _ = tx.send(Err(error::Error::new(
-                error::ErrorKind::RuntimeError,
-                "upload failed",
-            )));
-        }
         WorkOutcome::Failed { classification }
     }
 }
@@ -632,10 +644,7 @@ mod tests {
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
-    fn create_test_transfer(
-        s3_client: aws_sdk_s3::Client,
-        content: Vec<u8>,
-    ) -> (UploadTransfer, UploadResultReceiver) {
+    fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
         let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             crate::Config::builder().client(s3_client).build(),
             crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
@@ -648,11 +657,9 @@ mod tests {
             .unwrap();
 
         let stream = InputStream::from(content);
-        let (result_tx, result_rx) = oneshot::channel();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream, result_tx);
-        (transfer, result_rx)
+        UploadTransfer::new(ctx, BucketType::Standard, input, stream)
     }
 
     fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
@@ -682,7 +689,7 @@ mod tests {
     fn test_poll_work_initial_state_returns_create_mpu() {
         let s3_client = mock_client!(aws_sdk_s3, []);
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<UploadWork>();
@@ -693,7 +700,7 @@ mod tests {
     fn test_poll_work_pending_while_init_in_flight() {
         let s3_client = mock_client!(aws_sdk_s3, []);
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let _work = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
@@ -703,7 +710,7 @@ mod tests {
     async fn test_poll_work_generates_parts_after_create_mpu() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
@@ -729,7 +736,7 @@ mod tests {
     async fn test_execute_create_mpu_transitions_to_transferring() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, _rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         let mut work = assert_ready(transfer.poll_work());
 
@@ -745,7 +752,7 @@ mod tests {
     async fn test_execute_full_mpu_flow() {
         let s3_client = mock_s3_client_for_mpu();
         let content = vec![0u8; 16 * 1024 * 1024];
-        let (transfer, rx) = create_test_transfer(s3_client, content);
+        let transfer = create_test_transfer(s3_client, content);
 
         // 1. CreateMPU
         let mut work = assert_ready(transfer.poll_work());
@@ -770,7 +777,58 @@ mod tests {
         assert_done(transfer.poll_work());
 
         // 6. Result should be available
-        let result = rx.await.expect("result channel");
-        assert!(result.is_ok());
+        let result = transfer.take_result();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_basic_upload_object() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+        // Small content below MPU threshold (default 8MB)
+        let content = vec![0u8; 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        let mut work = assert_ready(transfer.poll_work());
+        let data = work.data_mut::<UploadWork>();
+        assert!(matches!(data, UploadWork::PutObject { .. }));
+
+        let outcome = transfer.execute(&mut work).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+
+        assert!(transfer.take_result().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_basic_mpu() {
+        let s3_client = mock_s3_client_for_mpu();
+        let content = vec![0u8; 16 * 1024 * 1024];
+        let transfer = create_test_transfer(s3_client, content);
+
+        // CreateMPU
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<UploadWork>(),
+            UploadWork::CreateMPU
+        ));
+        transfer.execute(&mut work).await;
+
+        // Upload parts
+        let mut work1 = assert_ready(transfer.poll_work());
+        transfer.execute(&mut work1).await;
+        let mut work2 = assert_ready(transfer.poll_work());
+        transfer.execute(&mut work2).await;
+
+        // CompleteMPU
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<UploadWork>(),
+            UploadWork::CompleteMPU
+        ));
+        transfer.execute(&mut work).await;
+
+        assert!(transfer.take_result().is_some());
     }
 }

@@ -136,10 +136,12 @@ impl TransferDescriptor {
 
     pub(crate) async fn wait_for_idle(&self) {
         loop {
+            // Register interest before checking
+            let notified = self.0.idle_notify.notified();
             if self.is_idle() {
                 return;
             }
-            self.0.idle_notify.notified().await;
+            notified.await;
         }
     }
 }

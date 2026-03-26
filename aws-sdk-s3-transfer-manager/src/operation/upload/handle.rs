@@ -7,9 +7,11 @@ use tracing::Instrument;
 
 use crate::error::Error;
 use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
-use crate::operation::upload::transfer::{UploadResultReceiver, UploadTransfer};
+use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
+use crate::transfer::StateMachineTerminalReceiver;
 use crate::types::AbortedUpload;
+use crate::types::FailedMultipartUploadPolicy;
 
 /// Handle to an in-progress upload operation.
 ///
@@ -66,23 +68,40 @@ use crate::types::AbortedUpload;
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadHandle {
-    result_rx: Option<UploadResultReceiver>,
+    completion_rx: Option<StateMachineTerminalReceiver>,
     transfer: UploadTransfer,
 }
 
 impl UploadHandle {
-    pub(crate) fn new(result_rx: UploadResultReceiver, transfer: UploadTransfer) -> Self {
+    pub(crate) fn new(
+        completion_rx: StateMachineTerminalReceiver,
+        transfer: UploadTransfer,
+    ) -> Self {
         Self {
-            result_rx: Some(result_rx),
+            completion_rx: Some(completion_rx),
             transfer,
         }
     }
 
     /// Consume the handle and wait for upload to complete
     pub async fn join(mut self) -> Result<UploadOutput, Error> {
-        let rx = self.result_rx.take().expect("result_rx already taken");
-        rx.await
-            .map_err(|_| Error::new(crate::error::ErrorKind::RuntimeError, "upload cancelled"))?
+        if let Some(rx) = self.completion_rx.take() {
+            let _ = rx.await;
+        }
+
+        let ctx = self.transfer.ctx();
+
+        if ctx.is_failed() {
+            ctx.handle.scheduler.cancel_transfer(ctx.id);
+            ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+            let err = ctx.take_error().expect("failed transfer must have error");
+            return Err(err);
+        }
+
+        Ok(self
+            .transfer
+            .take_result()
+            .expect("result must be set on successful completion"))
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
@@ -123,32 +142,38 @@ impl UploadHandle {
         let upload_id = self.transfer.upload_id();
 
         if let Some(upload_id) = upload_id {
-            let resp = copy_fields_to_abort_mpu_request(
-                self.transfer.request(),
-                ctx.s3_client()
-                    .abort_multipart_upload()
-                    .upload_id(&upload_id),
-            )
-            .send()
-            .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-            .await?;
+            let abort_policy = self
+                .transfer
+                .request()
+                .failed_multipart_upload_policy
+                .clone()
+                .unwrap_or_default();
 
-            Ok(AbortedUpload {
-                upload_id: Some(upload_id),
-                request_charged: resp.request_charged,
-            })
+            match abort_policy {
+                FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+                FailedMultipartUploadPolicy::AbortUpload => {
+                    let resp = copy_fields_to_abort_mpu_request(
+                        self.transfer.request(),
+                        ctx.s3_client()
+                            .abort_multipart_upload()
+                            .upload_id(&upload_id),
+                    )
+                    .send()
+                    .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                    .await?;
+
+                    Ok(AbortedUpload {
+                        upload_id: Some(upload_id),
+                        request_charged: resp.request_charged,
+                    })
+                }
+            }
         } else {
             Ok(AbortedUpload::default())
         }
     }
 
     /// Get scheduling controls for this transfer.
-    ///
-    /// See [`SchedulingCtl`](crate::transfer::SchedulingCtl) for available controls.
-    ///
-    /// <div class="warning">
-    /// Scheduling controls are an advanced feature.
-    /// </div>
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }

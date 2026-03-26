@@ -336,6 +336,10 @@ impl DownloadTransfer {
             };
             bytes_received += data.len() as u64;
             segmented.push(data);
+            if !self.inner.ctx.is_active() {
+                self.decrement_in_flight();
+                return WorkOutcome::Cancelled;
+            }
         }
 
         let chunk = ChunkOutput {
@@ -390,6 +394,7 @@ impl DownloadTransfer {
             .guarded(|| {
                 let rh = range_header.clone();
                 let etag = etag.clone();
+                let ctx = self.inner.ctx.clone();
                 let mut req = self
                     .inner
                     .ctx
@@ -397,7 +402,7 @@ impl DownloadTransfer {
                     .get_object()
                     .bucket(input.bucket().unwrap_or_default())
                     .key(input.key().unwrap_or_default())
-                    .range(rh);
+                    .range(rh.clone());
 
                 if let Some(ref etag) = etag {
                     req = req.if_match(etag.as_ref());
@@ -405,6 +410,7 @@ impl DownloadTransfer {
 
                 async move {
                     let resp = req.send().await.map_err(crate::error::Error::from)?;
+                    validate_content_range(seq, &rh, resp.content_range().as_deref())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let mut segmented = SegmentedBuf::new();
                     let mut bytes_received: u64 = 0;
@@ -415,6 +421,12 @@ impl DownloadTransfer {
                         })?;
                         bytes_received += data.len() as u64;
                         segmented.push(data);
+                        if !ctx.is_active() {
+                            return Err(crate::error::Error::new(
+                                crate::error::ErrorKind::OperationCancelled,
+                                "transfer cancelled during body read",
+                            ));
+                        }
                     }
                     Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
                 }
@@ -539,6 +551,32 @@ impl Transfer for DownloadTransfer {
         work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(DownloadTransfer::execute(self, work))
+    }
+}
+
+/// Validate that the response Content-Range matches the requested range.
+fn validate_content_range(
+    seq: u64,
+    requested_range: &str,
+    response_content_range: Option<&str>,
+) -> Result<(), Error> {
+    let normalized = requested_range
+        .strip_prefix("bytes=")
+        .unwrap_or(requested_range);
+
+    if response_content_range
+        .map(|range| range.contains(normalized))
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err(error::chunk_failed(
+            ChunkId::Download(seq),
+            format!(
+                "content range mismatch: requested {}, response {:?}",
+                requested_range, response_content_range
+            ),
+        ))
     }
 }
 
@@ -1004,5 +1042,23 @@ mod tests {
                 part_size,
             )
         }
+    }
+
+    #[test]
+    fn test_validate_content_range_success() {
+        assert!(validate_content_range(0, "bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range(0, "1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_mismatch() {
+        assert!(
+            validate_content_range(0, "bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_content_range_missing() {
+        assert!(validate_content_range(0, "bytes=1024-2047", None).is_err());
     }
 }
