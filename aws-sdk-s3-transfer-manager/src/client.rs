@@ -3,13 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics::latency::LatencyTracker;
-use crate::metrics::IOCounters;
-use crate::runtime::{ManagedThreadRuntime, TokioMultiThreadRuntime};
+use crate::runtime::ManagedThreadRuntime;
 use crate::scheduler::{
     AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
     Scheduler, SchedulerBuilder,
 };
+use crate::telemetry::Telemetry;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
@@ -27,8 +26,7 @@ pub(crate) struct Handle {
     pub(crate) config: crate::Config,
     pub(crate) s3_client: aws_sdk_s3::Client,
     pub(crate) scheduler: Scheduler,
-    pub(crate) upload_latencies: LatencyTracker,
-    pub(crate) download_latencies: LatencyTracker,
+    pub(crate) telemetry: Telemetry,
 }
 
 impl Handle {
@@ -84,8 +82,7 @@ impl Handle {
             config,
             s3_client,
             scheduler,
-            upload_latencies: LatencyTracker::new(),
-            download_latencies: LatencyTracker::new(),
+            telemetry: Telemetry::new(std::time::Duration::from_millis(500)),
         }
     }
 }
@@ -95,16 +92,16 @@ impl Client {
     pub fn new(mut config: Config) -> Client {
         // 1. Create runtime (spawns threads, creates per-thread state)
         let adaptive_config = AdaptiveConfig::default();
-        let io_counters = Arc::new(IOCounters::new(adaptive_config.window.duration));
+        let telemetry = Telemetry::new(adaptive_config.window.duration);
         let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
             ConcurrencyMode::Explicit(n) => Arc::new(FixedConcurrency::new(*n)),
             // TODO: target throughput -- adaptive with max constraint?
             _ => Arc::new(AdaptiveConcurrencyController::new(
                 adaptive_config,
-                Arc::clone(&io_counters),
+                Arc::clone(&telemetry.io_counters),
             )),
         };
-        let scheduler = SchedulerBuilder::new(controller, io_counters)
+        let scheduler = SchedulerBuilder::new(controller)
             // .build(|scheduler| Arc::new(TokioMultiThreadRuntime::new(scheduler)));
             .build(|scheduler| Arc::new(ManagedThreadRuntime::builder(scheduler).build()));
 
@@ -126,8 +123,7 @@ impl Client {
             config,
             s3_client,
             scheduler,
-            upload_latencies: LatencyTracker::new(),
-            download_latencies: LatencyTracker::new(),
+            telemetry,
         });
         Client { handle }
     }

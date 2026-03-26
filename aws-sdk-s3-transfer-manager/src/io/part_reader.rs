@@ -24,6 +24,7 @@ pub(crate) struct Builder {
     stream: Option<RawInputStream>,
     part_size: usize,
     direct_io: bool,
+    io_counters: Option<std::sync::Arc<crate::metrics::IOCounters>>,
 }
 
 impl Builder {
@@ -32,6 +33,7 @@ impl Builder {
             stream: None,
             part_size: 5 * ByteUnit::Mebibyte.as_bytes_u64() as usize,
             direct_io: false,
+            io_counters: None,
         }
     }
 
@@ -55,9 +57,19 @@ impl Builder {
         self
     }
 
+    /// Set the I/O counters for recording throughput metrics.
+    pub(crate) fn io_counters(
+        mut self,
+        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+    ) -> Self {
+        self.io_counters = Some(io_counters);
+        self
+    }
+
     pub(crate) fn build(self) -> Result<PartReader, Error> {
         let stream = self.stream.expect("input stream set");
-        PartReader::new(stream, self.part_size, self.direct_io)
+        let io_counters = self.io_counters.expect("io_counters set");
+        PartReader::new(stream, self.part_size, self.direct_io, io_counters)
     }
 }
 
@@ -68,14 +80,19 @@ pub(crate) struct PartReader {
 }
 
 impl PartReader {
-    fn new(raw: RawInputStream, part_size: usize, direct_io: bool) -> Result<Self, Error> {
+    fn new(
+        raw: RawInputStream,
+        part_size: usize,
+        direct_io: bool,
+        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+    ) -> Result<Self, Error> {
         let inner = match raw {
             RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
             RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)?),
             RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
         };
 
-        let stream_cx = StreamContext::new(part_size, direct_io);
+        let stream_cx = StreamContext::new(part_size, direct_io, io_counters);
         Ok(Self { inner, stream_cx })
     }
 
@@ -240,6 +257,11 @@ impl PathBodyPartReader {
             .await??;
         }
 
+        stream_cx.io_counters().record(&crate::metrics::IoSample {
+            disk_read: part_size as u64,
+            ..Default::default()
+        });
+
         Ok(Some(PartData::new(part_number, dst).mark_last(is_last)))
     }
 
@@ -374,7 +396,13 @@ mod test {
     use crate::io::InputStream;
 
     fn test_stream_cx(part_size: usize) -> StreamContext {
-        StreamContext::new(part_size, false)
+        StreamContext::new(part_size, false, test_io_counters())
+    }
+
+    fn test_io_counters() -> std::sync::Arc<crate::metrics::IOCounters> {
+        std::sync::Arc::new(crate::metrics::IOCounters::new(
+            std::time::Duration::from_secs(1),
+        ))
     }
 
     async fn collect_parts(reader: PartReader) -> Vec<PartData> {
@@ -393,7 +421,12 @@ mod test {
         let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
         let stream = InputStream::from(data.clone());
         let expected = data.chunks(5).collect::<Vec<_>>();
-        let reader = Builder::new().part_size(5).stream(stream).build().unwrap();
+        let reader = Builder::new()
+            .part_size(5)
+            .stream(stream)
+            .io_counters(test_io_counters())
+            .build()
+            .unwrap();
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
 
@@ -423,6 +456,7 @@ mod test {
         let reader = Builder::new()
             .part_size(part_size)
             .stream(stream)
+            .io_counters(test_io_counters())
             .build()
             .unwrap();
 
@@ -495,7 +529,12 @@ mod test {
                 .collect::<Vec<_>>(),
         );
         let stream = InputStream::from_part_stream(stream);
-        let reader = Builder::new().part_size(5).stream(stream).build().unwrap();
+        let reader = Builder::new()
+            .part_size(5)
+            .stream(stream)
+            .io_counters(test_io_counters())
+            .build()
+            .unwrap();
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
         assert_eq!(expected, actual);

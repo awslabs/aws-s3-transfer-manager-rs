@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::transfer::{
-    IoKind, IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
-};
+use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 
 /// Trait for mock state machines that drive transfer behavior.
 pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
@@ -134,10 +132,7 @@ impl MockStateMachine for FixedWorkCount {
             return PollWork::Done;
         }
 
-        PollWork::Ready(IoRequest {
-            kind: IoKind::Network,
-            data: None,
-        })
+        PollWork::Ready(IoRequest { data: None })
     }
 
     fn execute<'a>(
@@ -146,11 +141,7 @@ impl MockStateMachine for FixedWorkCount {
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
             self.completed.fetch_add(1, Ordering::SeqCst);
-            WorkOutcome::Success {
-                schedule_next: None,
-                data: None,
-                metrics: None,
-            }
+            WorkOutcome::Success { data: None }
         })
     }
 }

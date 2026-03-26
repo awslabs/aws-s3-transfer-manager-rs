@@ -52,9 +52,8 @@
 
 use super::{CompletionSample, ConcurrencyController};
 use crate::telemetry;
-use crate::transfer::{BoxTransfer, IoRequest, PollWork, TransferId, WorkOutcome};
+use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
 
-use crate::metrics::{IOCounters, IoSample};
 use crate::runtime::ExecutionRuntime;
 
 use crate::runtime::sync::{Submission, SubmissionQueue};
@@ -81,7 +80,6 @@ struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     controller: Arc<dyn ConcurrencyController>,
-    io_counters: Arc<IOCounters>,
     runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
     dispatched: AtomicUsize,
     submission_queue: SubmissionQueue<ScheduledWork>,
@@ -96,18 +94,11 @@ impl std::fmt::Debug for Scheduler {
 /// Builder for constructing a [`Scheduler`] with its runtime.
 pub(crate) struct SchedulerBuilder {
     controller: Arc<dyn ConcurrencyController>,
-    io_counters: Arc<IOCounters>,
 }
 
 impl SchedulerBuilder {
-    pub(crate) fn new(
-        controller: Arc<dyn ConcurrencyController>,
-        io_counters: Arc<IOCounters>,
-    ) -> Self {
-        Self {
-            controller,
-            io_counters,
-        }
+    pub(crate) fn new(controller: Arc<dyn ConcurrencyController>) -> Self {
+        Self { controller }
     }
 
     pub(crate) fn build(
@@ -118,7 +109,6 @@ impl SchedulerBuilder {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
             controller: self.controller,
-            io_counters: self.io_counters,
             runtime: OnceLock::new(),
             dispatched: AtomicUsize::new(0),
             submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
@@ -136,34 +126,26 @@ impl SchedulerBuilder {
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
-        SchedulerBuilder::new(
-            Arc::new(super::FixedConcurrency::new(concurrency)),
-            Arc::new(IOCounters::new(Duration::from_millis(500))),
-        )
-        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency)))
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
     #[cfg(test)]
     pub(crate) fn with_managed_runtime(concurrency: usize) -> Self {
-        SchedulerBuilder::new(
-            Arc::new(super::FixedConcurrency::new(concurrency)),
-            Arc::new(IOCounters::new(Duration::from_millis(500))),
+        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency))).build(
+            |scheduler| {
+                Arc::new(
+                    crate::runtime::ManagedThreadRuntime::builder(scheduler)
+                        .topology(crate::runtime::Topology::uniform(4))
+                        .build(),
+                )
+            },
         )
-        .build(|scheduler| {
-            Arc::new(
-                crate::runtime::ManagedThreadRuntime::builder(scheduler)
-                    .topology(crate::runtime::Topology::uniform(4))
-                    .build(),
-            )
-        })
     }
 
     #[allow(dead_code)] // TODO(phase3): evaluate removing in favor of SchedulerBuilder
-    pub(crate) fn with_controller(
-        controller: Arc<dyn ConcurrencyController>,
-        io_counters: Arc<IOCounters>,
-    ) -> Self {
-        SchedulerBuilder::new(controller, io_counters)
+    pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
+        SchedulerBuilder::new(controller)
             .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
@@ -266,20 +248,13 @@ impl Scheduler {
         elapsed: Duration,
     ) {
         let outcome_tag = match &outcome {
-            WorkOutcome::Success { schedule_next, .. } => {
-                if schedule_next.is_some() {
-                    "success+followon"
-                } else {
-                    "success"
-                }
-            }
+            WorkOutcome::Success { .. } => "success",
             WorkOutcome::Failed { .. } => "failed",
             WorkOutcome::Cancelled => "cancelled",
         };
         tracing::trace!(
             target: telemetry::TARGET_SCHEDULING,
             id = %work.descriptor.id(),
-            kind = ?work.item.kind,
             ?elapsed,
             outcome = outcome_tag,
             "work completed",
@@ -287,17 +262,12 @@ impl Scheduler {
         self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
 
         // Report to concurrency controller
-        let (mut io_sample, classification) = match &outcome {
-            WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
-            WorkOutcome::Failed { classification } => (IoSample::default(), *classification),
-            WorkOutcome::Cancelled => (IoSample::default(), None),
+        let classification = match &outcome {
+            WorkOutcome::Failed { classification } => *classification,
+            _ => None,
         };
-        io_sample.duration = elapsed;
-        self.0.io_counters.record(&io_sample);
         let sample = CompletionSample {
-            io: io_sample,
             error: classification,
-            kind: work.item.kind,
         };
         self.0.controller.on_completion(&sample);
 
@@ -313,35 +283,6 @@ impl Scheduler {
                 self.0.transfers.write().unwrap().remove(&desc.id());
             }
             return;
-        }
-
-        // Handle any follow-on work.
-        // TODO: follow-on work should be pinned to the completing thread (same
-        // connection, warm cache, no cross-thread hop). The runtime knows which
-        // thread is executing — dispatch could use a local-spawn fast path when
-        // called from a managed thread instead of going through the router.
-        if let WorkOutcome::Success {
-            schedule_next: Some(kind),
-            data,
-            ..
-        } = outcome
-        {
-            let next = ScheduledWork {
-                item: IoRequest { kind, data },
-                descriptor: desc.clone(),
-            };
-            tracing::trace!(
-                target: telemetry::TARGET_SCHEDULING,
-                id = %desc.id(),
-                ?kind,
-                "dispatching follow-on",
-            );
-            self.dispatch_single(next);
-            tracing::trace!(
-                target: telemetry::TARGET_SCHEDULING,
-                id = %desc.id(),
-                "follow-on dispatched",
-            );
         }
 
         // capacity has freed try to queue up more work
@@ -460,16 +401,6 @@ impl Scheduler {
         }
     }
 
-    fn dispatch_single(&self, work: ScheduledWork) {
-        self.0.dispatched.fetch_add(1, Ordering::Relaxed);
-        work.descriptor.work_queued();
-        let sub = self.0.submission_queue.enter();
-        let sub = self.enqueue(sub, work);
-        if let Some(mut guard) = sub.submit() {
-            self.runtime().dispatch(&mut guard);
-        }
-    }
-
     #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
@@ -500,7 +431,7 @@ mod tests {
         FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
     };
     use crate::scheduler::MockTransfer;
-    use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+    use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
@@ -681,10 +612,7 @@ mod tests {
             if self.done.load(Ordering::Acquire) {
                 return PollWork::Done;
             }
-            PollWork::Ready(IoRequest {
-                kind: IoKind::Network,
-                data: None,
-            })
+            PollWork::Ready(IoRequest { data: None })
         }
 
         fn execute<'a>(
@@ -697,11 +625,7 @@ mod tests {
                 tokio::task::yield_now().await;
                 // No schedule_next — let generate_work() pull from ready set
                 // where CFS priority ordering applies
-                WorkOutcome::Success {
-                    schedule_next: None,
-                    data: None,
-                    metrics: None,
-                }
+                WorkOutcome::Success { data: None }
             })
         }
     }
@@ -936,88 +860,6 @@ mod tests {
             completed
         );
 
-        scheduler.shutdown();
-    }
-
-    /// Mock that generates N work items where each execution produces a follow-on.
-    /// First execute returns Success with schedule_next, second returns Success with None.
-    #[derive(Debug)]
-    struct FollowOnWorkCount {
-        total: usize,
-        generated: AtomicUsize,
-        completed: AtomicUsize,
-    }
-
-    impl FollowOnWorkCount {
-        fn new(total: usize) -> Self {
-            Self {
-                total,
-                generated: AtomicUsize::new(0),
-                completed: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl MockStateMachine for FollowOnWorkCount {
-        fn poll_work(&self, _id: TransferId) -> PollWork {
-            let n = self.generated.fetch_add(1, Ordering::Relaxed);
-            if n >= self.total {
-                return PollWork::Done;
-            }
-            PollWork::Ready(IoRequest {
-                kind: IoKind::Disk,
-                data: None,
-            })
-        }
-
-        fn execute<'a>(
-            &'a self,
-            work: &'a mut IoRequest,
-        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
-            let kind = work.kind;
-            Box::pin(async move {
-                match kind {
-                    IoKind::Disk => WorkOutcome::Success {
-                        schedule_next: Some(IoKind::Network),
-                        data: None,
-                        metrics: None,
-                    },
-                    IoKind::Network => {
-                        self.completed.fetch_add(1, Ordering::Relaxed);
-                        WorkOutcome::Success {
-                            schedule_next: None,
-                            data: None,
-                            metrics: None,
-                        }
-                    }
-                }
-            })
-        }
-    }
-
-    /// Regression test: 64 managed threads completing follow-on dispatches simultaneously
-    /// must not panic on submission queue contention.
-    #[tokio::test]
-    async fn test_concurrent_followon_dispatch() {
-        let _logs = show_test_logs();
-        let scheduler = Scheduler::with_managed_runtime(256);
-        let id = TransferId {
-            id: 1,
-            parent: None,
-        };
-
-        let sm = Arc::new(FollowOnWorkCount::new(256));
-        scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm.clone())));
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !scheduler.is_idle() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("scheduler should become idle");
-
-        assert_eq!(sm.completed.load(Ordering::Relaxed), 256);
         scheduler.shutdown();
     }
 }

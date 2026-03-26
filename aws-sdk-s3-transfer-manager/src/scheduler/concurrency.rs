@@ -13,9 +13,6 @@ use aws_sdk_s3::error::SdkError;
 use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-use crate::metrics::IoSample;
-use crate::transfer::IoKind;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
     /// S3 throttling (503, 429, SlowDown). Triggers immediate backoff.
@@ -32,12 +29,8 @@ pub(crate) enum ErrorKind {
 /// goodput (bytes over time) to adjust the concurrency target.
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionSample {
-    /// I/O bytes and duration for this work item.
-    pub io: IoSample,
     /// Error classification, if the work item failed.
     pub error: Option<ErrorKind>,
-    /// What kind of work this was (disk or network).
-    pub kind: IoKind,
 }
 
 /// Controls how many work items can be in-flight concurrently.

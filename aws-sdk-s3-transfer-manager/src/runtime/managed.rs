@@ -123,11 +123,11 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
     work.descriptor.work_started();
 
     if work.descriptor.is_terminal() {
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, kind = ?work.item.kind, "skipped (terminal)");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "skipped (terminal)");
         return ExecuteResult::Completed(WorkOutcome::Cancelled, Duration::ZERO);
     }
 
-    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, kind = ?work.item.kind, "executing");
+    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "executing");
     let transfer = work.descriptor.transfer();
     let started = Instant::now();
 
@@ -326,12 +326,10 @@ impl ExecutionRuntime for ManagedThreadRuntime {
             let scheduler = self.scheduler.clone();
             let in_flight = Arc::clone(&th.in_flight);
             let tid = work.descriptor.id();
-            let kind = work.item.kind;
 
             tracing::trace!(
                 target: crate::telemetry::TARGET_EXECUTION,
                 %tid,
-                ?kind,
                 thread = thread_id.0,
                 "dispatching to managed thread",
             );
@@ -340,14 +338,12 @@ impl ExecutionRuntime for ManagedThreadRuntime {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_EXECUTION,
                     %tid,
-                    ?kind,
                     "execute starting",
                 );
                 let result = execute_work(&mut work, &scheduler).await;
                 tracing::trace!(
                     target: crate::telemetry::TARGET_EXECUTION,
                     %tid,
-                    ?kind,
                     "execute finished, entering on_completion",
                 );
                 in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -362,7 +358,6 @@ impl ExecutionRuntime for ManagedThreadRuntime {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_EXECUTION,
                     %tid,
-                    ?kind,
                     "on_completion returned",
                 );
             });

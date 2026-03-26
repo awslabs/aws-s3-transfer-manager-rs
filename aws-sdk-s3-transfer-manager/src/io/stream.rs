@@ -147,13 +147,19 @@ pub struct StreamContext {
     part_size: usize,
     /// When true, file I/O runs directly on the calling thread.
     direct_io: bool,
+    io_counters: std::sync::Arc<crate::metrics::IOCounters>,
 }
 
 impl StreamContext {
-    pub(super) fn new(part_size: usize, direct_io: bool) -> Self {
+    pub(super) fn new(
+        part_size: usize,
+        direct_io: bool,
+        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+    ) -> Self {
         Self {
             part_size,
             direct_io,
+            io_counters,
         }
     }
 
@@ -167,6 +173,11 @@ impl StreamContext {
     /// Whether file I/O should run directly on the calling thread.
     pub(crate) fn direct_io(&self) -> bool {
         self.direct_io
+    }
+
+    /// Throughput counters for recording I/O metrics at the source.
+    pub(crate) fn io_counters(&self) -> &crate::metrics::IOCounters {
+        &self.io_counters
     }
 
     // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.

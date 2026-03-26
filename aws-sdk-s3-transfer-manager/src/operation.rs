@@ -29,9 +29,6 @@ pub(crate) const DEFAULT_DELIMITER: &str = "/";
 pub(crate) type CancelBroadcastSender = tokio::sync::watch::Sender<()>;
 pub(crate) type CancelBroadcastReceiver = tokio::sync::watch::Receiver<()>;
 
-/// Channel for sending download chunks to Body
-pub(crate) type ChunkSender = tokio::sync::mpsc::Sender<download::ChunkOutput>;
-
 // Keep the old generic version temporarily for migration
 // TODO(phase3): Remove after all transfers migrated
 

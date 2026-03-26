@@ -14,27 +14,19 @@ use bytes_utils::SegmentedBuf;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
-use crate::metrics::IoSample;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::transfer::{
-    IoKind, IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
-};
+use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
 
 /// Download-specific work data.
 #[derive(Debug)]
 pub(crate) enum DownloadWork {
     Discovery,
-    ReadDiscoveryBody {
-        stream: aws_sdk_s3::primitives::ByteStream,
-        slot: Option<BodySlot>,
-        chunk_meta: ChunkMetadata,
-    },
     GetObjectRange {
         range: std::ops::RangeInclusive<u64>,
         slot: Option<BodySlot>,
@@ -48,8 +40,7 @@ impl DownloadWork {
     fn take_slot(&mut self) -> Option<BodySlot> {
         match self {
             DownloadWork::Discovery => None,
-            DownloadWork::ReadDiscoveryBody { slot, .. }
-            | DownloadWork::GetObjectRange { slot, .. } => slot.take(),
+            DownloadWork::GetObjectRange { slot, .. } => slot.take(),
         }
     }
 }
@@ -178,7 +169,6 @@ impl DownloadTransfer {
             DownloadState::PendingDiscovery => {
                 *state = DownloadState::DiscoveryInFlight {};
                 PollWork::Ready(IoRequest {
-                    kind: IoKind::Network,
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
@@ -212,7 +202,6 @@ impl DownloadTransfer {
                     *ranges_in_flight += 1;
 
                     PollWork::Ready(IoRequest {
-                        kind: IoKind::Network,
                         data: Some(Box::new(DownloadWork::GetObjectRange {
                             range: chunk_range,
                             slot: Some(slot),
@@ -238,18 +227,6 @@ impl DownloadTransfer {
         let data = work.data_mut::<DownloadWork>();
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
-            DownloadWork::ReadDiscoveryBody {
-                stream,
-                slot,
-                chunk_meta,
-            } => {
-                self.execute_read_discovery_body(
-                    std::mem::take(stream),
-                    slot.take().expect("slot already consumed"),
-                    std::mem::take(chunk_meta),
-                )
-                .await
-            }
             DownloadWork::GetObjectRange { range, slot, etag } => {
                 self.execute_get_range(
                     range.clone(),
@@ -286,15 +263,16 @@ impl DownloadTransfer {
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
-        // Pre-allocate disk space for the full download to avoid per-write
-        // metadata updates and late ENOSPC errors.
+        // Optimization: Preallocate space for the full object/download size if there is a
+        // destination/sink and it supports it. e.g. pre-allocate disk space for the full
+        // download to avoid per-write metadata updates and late ENOSPC errors.
         let chunk_content_len = chunk_meta
             .as_ref()
             .and_then(|m| m.content_length)
             .unwrap_or(0) as u64;
-        let total_file_size =
+        let total_size =
             chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
-        self.inner.writer.preallocate(total_file_size);
+        self.inner.writer.preallocate(total_size);
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
@@ -326,22 +304,13 @@ impl DownloadTransfer {
         // State changed from DiscoveryInFlight - try to wake
         self.inner.ctx.try_wake();
 
-        // If discovery returned an initial chunk, schedule work to read it
+        // If discovery returned an initial chunk, process it
         match initial_work {
-            Some((stream, chunk_meta, slot)) => WorkOutcome::Success {
-                schedule_next: Some(IoKind::Network),
-                data: Some(Box::new(DownloadWork::ReadDiscoveryBody {
-                    stream,
-                    slot: Some(slot),
-                    chunk_meta,
-                })),
-                metrics: None,
-            },
-            None => WorkOutcome::Success {
-                schedule_next: None,
-                data: None,
-                metrics: None,
-            },
+            Some((stream, chunk_meta, slot)) => {
+                self.execute_read_discovery_body(stream, slot, chunk_meta)
+                    .await
+            }
+            None => WorkOutcome::Success { data: None },
         }
     }
 
@@ -389,14 +358,17 @@ impl DownloadTransfer {
         }
         self.decrement_in_flight();
 
-        WorkOutcome::Success {
-            schedule_next: None,
-            data: None,
-            metrics: Some(IoSample {
+        self.inner
+            .ctx
+            .handle
+            .telemetry
+            .io_counters
+            .record(&crate::metrics::IoSample {
                 network_rx: bytes_received,
                 ..Default::default()
-            }),
-        }
+            });
+
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_get_range(
@@ -413,7 +385,8 @@ impl DownloadTransfer {
             .inner
             .ctx
             .handle
-            .download_latencies
+            .telemetry
+            .recv_latencies
             .guarded(|| {
                 let rh = range_header.clone();
                 let etag = etag.clone();
@@ -476,14 +449,17 @@ impl DownloadTransfer {
             "chunk downloaded",
         );
 
-        WorkOutcome::Success {
-            schedule_next: None,
-            data: None,
-            metrics: Some(IoSample {
+        self.inner
+            .ctx
+            .handle
+            .telemetry
+            .io_counters
+            .record(&crate::metrics::IoSample {
                 network_rx: bytes_received,
                 ..Default::default()
-            }),
-        }
+            });
+
+        WorkOutcome::Success { data: None }
     }
 
     /// Fail a range request with an error.
@@ -622,20 +598,9 @@ mod tests {
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
 
-    /// Execute and handle follow-on work (e.g., ReadDiscoveryBody).
-    /// Uses DownloadTransfer directly for type-specific behavior.
+    /// Execute work using DownloadTransfer directly.
     async fn execute(transfer: &DownloadTransfer, work: &mut IoRequest) -> WorkOutcome {
-        let outcome = transfer.execute(work).await;
-        if let WorkOutcome::Success {
-            schedule_next: Some(kind),
-            data,
-            ..
-        } = outcome
-        {
-            let mut follow_on = IoRequest { kind, data };
-            return transfer.execute(&mut follow_on).await;
-        }
-        outcome
+        transfer.execute(work).await
     }
 
     /// Run discovery to completion

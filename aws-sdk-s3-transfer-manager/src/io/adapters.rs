@@ -164,7 +164,13 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(part_size, false);
+        let stream_cx = StreamContext::new(
+            part_size,
+            false,
+            std::sync::Arc::new(crate::metrics::IOCounters::new(
+                std::time::Duration::from_secs(1),
+            )),
+        );
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"hello");
@@ -199,7 +205,13 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(part_size, false);
+        let stream_cx = StreamContext::new(
+            part_size,
+            false,
+            std::sync::Arc::new(crate::metrics::IOCounters::new(
+                std::time::Duration::from_secs(1),
+            )),
+        );
 
         // partial read
         handle.read(b"hello");

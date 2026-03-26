@@ -509,7 +509,6 @@ mod tests {
     use super::super::{CompletionSample, ErrorKind};
     use super::*;
     use crate::metrics::{IOCounters, IoSample};
-    use crate::transfer::IoKind;
     use std::sync::Arc;
 
     struct TestController(AdaptiveConcurrencyController);
@@ -567,15 +566,8 @@ mod tests {
         AdaptiveConfig::default()
     }
 
-    fn sample(bytes_sent: u64) -> CompletionSample {
-        CompletionSample {
-            io: IoSample {
-                network_tx: bytes_sent,
-                ..Default::default()
-            },
-            error: None,
-            kind: IoKind::Network,
-        }
+    fn sample(_bytes_sent: u64) -> CompletionSample {
+        CompletionSample { error: None }
     }
 
     // -- Bootstrap --

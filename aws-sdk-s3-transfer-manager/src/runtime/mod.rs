@@ -14,11 +14,9 @@ mod managed;
 pub(crate) use managed::ManagedThreadRuntime;
 
 mod topology;
-pub(crate) use topology::{Cpu, NumaNode, Topology};
+pub(crate) use topology::Topology;
 
 pub(crate) mod sync;
-
-use std::sync::Arc;
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
