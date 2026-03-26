@@ -99,8 +99,15 @@ impl DownloadHandle {
             return Ok(meta);
         }
 
-        // Wait for discovery to complete
-        self.transfer.discovery_notify().notified().await;
+        // Register interest before checking again
+        let notified = self.transfer.discovery_notify().notified();
+
+        // Double-check after registering
+        if let Some(meta) = self.transfer.object_meta() {
+            return Ok(meta);
+        }
+
+        notified.await;
 
         // Check result
         self.transfer.object_meta().ok_or_else(|| {

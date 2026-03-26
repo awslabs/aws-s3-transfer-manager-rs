@@ -158,6 +158,15 @@ impl BodySlot {
     }
 }
 
+impl Drop for BodySlot {
+    fn drop(&mut self) {
+        // Slot was claimed but never filled (task cancelled). Wake the
+        // consumer so it can check terminal status instead of parking
+        // forever waiting for this slot.
+        self.buffer.notify.notify_one();
+    }
+}
+
 impl BodyWriter {
     /// Try to claim the next slot for work generation.
     ///
@@ -213,14 +222,15 @@ impl SlotBodyConsumer {
     /// otherwise the consumer may block indefinitely.
     pub(crate) async fn next(&self, is_terminal: impl Fn() -> bool) -> Option<ChunkOutput> {
         loop {
+            // Register interest before checking state
+            let notified = self.buffer.notify.notified();
             if let Some(chunk) = self.buffer.try_take_next() {
                 return Some(chunk);
             }
             if is_terminal() {
-                // Drain any slot filled between our check and here.
                 return self.buffer.try_take_next();
             }
-            self.buffer.notify.notified().await;
+            notified.await;
         }
     }
 

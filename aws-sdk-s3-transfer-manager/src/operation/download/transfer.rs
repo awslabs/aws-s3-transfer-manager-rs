@@ -424,7 +424,7 @@ impl DownloadTransfer {
             .get_object()
             .bucket(input.bucket().unwrap_or_default())
             .key(input.key().unwrap_or_default())
-            .range(range_header);
+            .range(&range_header);
 
         if let Some(ref etag) = etag {
             req = req.if_match(etag.as_ref());
@@ -436,6 +436,10 @@ impl DownloadTransfer {
         };
 
         bail_if_terminal!(self);
+
+        if let Err(e) = validate_content_range(seq, &range_header, resp.content_range()) {
+            return self.fail_range(seq, e);
+        }
 
         // Extract body before consuming resp for metadata
         let mut resp = resp;
@@ -456,6 +460,11 @@ impl DownloadTransfer {
             };
             bytes_received += data.len() as u64;
             segmented.push(data);
+
+            if !self.inner.ctx.is_active() {
+                self.decrement_in_flight();
+                return WorkOutcome::Cancelled;
+            }
         }
 
         bail_if_terminal!(self);
@@ -546,6 +555,32 @@ impl Transfer for DownloadTransfer {
         work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(DownloadTransfer::execute(self, work))
+    }
+}
+
+/// Validate that the response Content-Range matches the requested range.
+fn validate_content_range(
+    seq: u64,
+    requested_range: &str,
+    response_content_range: Option<&str>,
+) -> Result<(), Error> {
+    let normalized = requested_range
+        .strip_prefix("bytes=")
+        .unwrap_or(requested_range);
+
+    if response_content_range
+        .map(|range| range.contains(normalized))
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err(error::chunk_failed(
+            ChunkId::Download(seq),
+            format!(
+                "content range mismatch: requested {}, response {:?}",
+                requested_range, response_content_range
+            ),
+        ))
     }
 }
 
@@ -1034,5 +1069,23 @@ mod tests {
                 part_size,
             )
         }
+    }
+
+    #[test]
+    fn test_validate_content_range_success() {
+        assert!(validate_content_range(0, "bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range(0, "1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_mismatch() {
+        assert!(
+            validate_content_range(0, "bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_content_range_missing() {
+        assert!(validate_content_range(0, "bytes=1024-2047", None).is_err());
     }
 }
