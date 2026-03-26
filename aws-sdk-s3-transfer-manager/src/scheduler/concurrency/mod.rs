@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+mod adaptive;
+pub(crate) use adaptive::{AdaptiveConcurrencyController, AdaptiveConfig};
+
 use std::fmt;
 
 use aws_sdk_s3::error::SdkError;
