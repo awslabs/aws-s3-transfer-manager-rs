@@ -75,6 +75,7 @@ impl Client {
         let controller: Arc<dyn crate::scheduler::ConcurrencyController> =
             match config.concurrency() {
                 ConcurrencyMode::Explicit(c) => Arc::new(FixedConcurrency::new(*c)),
+                // TODO(vnext): implement support for target throughput
                 _ => Arc::new(AdaptiveConcurrencyController::new(
                     AdaptiveConfig::default(),
                     io_counters.clone(),

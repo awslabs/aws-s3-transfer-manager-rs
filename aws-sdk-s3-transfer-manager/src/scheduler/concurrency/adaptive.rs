@@ -45,21 +45,21 @@ use crate::metrics::IOCounters;
 /// Configuration for the adaptive concurrency controller.
 #[derive(Debug, Clone)]
 pub(crate) struct AdaptiveConfig {
-    pub initial_concurrency: usize,
-    pub max_concurrency: Option<usize>,
-    pub window: WindowConfig,
-    pub slow_start: SlowStartConfig,
-    pub stable: StableConfig,
+    pub(crate) initial_concurrency: usize,
+    pub(crate) max_concurrency: Option<usize>,
+    pub(crate) window: WindowConfig,
+    pub(crate) slow_start: SlowStartConfig,
+    pub(crate) stable: StableConfig,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowConfig {
     /// Evaluation interval. The controller checks throughput this often.
-    pub duration: Duration,
+    pub(crate) duration: Duration,
     /// Number of raw measurements to retain for windowed-max smoothing.
     /// The algorithm sees the max of the last N measurements, filtering
     /// transient drops (transfer boundary gaps, warmup noise).
-    pub smoothing_window: usize,
+    pub(crate) smoothing_window: usize,
 }
 
 /// SlowStart phase settings.
@@ -67,30 +67,30 @@ pub(crate) struct WindowConfig {
 pub(crate) struct SlowStartConfig {
     /// Evaluation interval during SlowStart. Shorter than the stable phase
     /// interval to ramp concurrency faster while connections are warming up.
-    pub evaluation_interval: Duration,
+    pub(crate) evaluation_interval: Duration,
     /// Throughput must improve by this ratio to accept a growth step.
-    pub acceptance_margin: f64,
+    pub(crate) acceptance_margin: f64,
     /// Additive growth per accepted window.
-    pub max_growth: usize,
+    pub(crate) max_growth: usize,
     /// Consecutive rejections required before exiting SlowStart.
-    pub exit_threshold: usize,
+    pub(crate) exit_threshold: usize,
 }
 
 /// StableProbing and StableShedding settings.
 #[derive(Debug, Clone)]
 pub(crate) struct StableConfig {
     /// Acceptance threshold for probing (improvement) and shedding (degradation).
-    pub acceptance_margin: f64,
+    pub(crate) acceptance_margin: f64,
     /// Probe size as fraction of current concurrency.
-    pub probe_pct: f64,
+    pub(crate) probe_pct: f64,
     /// Minimum change per probe step.
-    pub min_probe_size: usize,
+    pub(crate) min_probe_size: usize,
     /// Maximum change per probe step.
-    pub max_probe_size: usize,
+    pub(crate) max_probe_size: usize,
     /// Recent goodput measurements to retain.
-    pub history_size: usize,
+    pub(crate) history_size: usize,
     /// Consecutive rejections before transitioning to StableShedding.
-    pub shedding_transition_threshold: usize,
+    pub(crate) shedding_transition_threshold: usize,
 }
 
 impl Default for AdaptiveConfig {
@@ -147,9 +147,9 @@ enum Phase {
 
 impl Phase {
     fn from_usize(v: usize) -> Self {
+        debug_assert!(v <= 2, "invalid phase value: {v}");
         match v {
             0 => Phase::SlowStart,
-            1 => Phase::StableProbing,
             2 => Phase::StableShedding,
             _ => Phase::StableProbing,
         }
@@ -489,7 +489,10 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 
     fn on_completion(&self, sample: &CompletionSample) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
 
         // Throttle error: immediate transition to shedding
         if sample.error == Some(ErrorKind::Throttle) {
