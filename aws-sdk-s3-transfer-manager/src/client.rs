@@ -13,6 +13,7 @@ use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -91,16 +92,23 @@ impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(mut config: Config) -> Client {
         // 1. Create runtime (spawns threads, creates per-thread state)
-        let adaptive_config = AdaptiveConfig::default();
-        let telemetry = Telemetry::new(adaptive_config.window.duration);
-        let controller: Arc<dyn ConcurrencyController> = match config.concurrency() {
-            ConcurrencyMode::Explicit(n) => Arc::new(FixedConcurrency::new(*n)),
-            // TODO: target throughput -- adaptive with max constraint?
-            _ => Arc::new(AdaptiveConcurrencyController::new(
-                adaptive_config,
-                Arc::clone(&telemetry.io_counters),
-            )),
-        };
+        let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) =
+            match config.concurrency() {
+                ConcurrencyMode::Explicit(n) => (
+                    Arc::new(FixedConcurrency::new(*n)),
+                    Telemetry::new(Duration::from_millis(500)),
+                ),
+                // TODO(vnext): implement support for target throughput
+                _ => {
+                    let adaptive_config = AdaptiveConfig::default();
+                    let telemetry = Telemetry::new(adaptive_config.window.duration);
+                    let controller = Arc::new(AdaptiveConcurrencyController::new(
+                        adaptive_config,
+                        Arc::clone(&telemetry.io_counters),
+                    ));
+                    (controller, telemetry)
+                }
+            };
         let scheduler = SchedulerBuilder::new(controller)
             // .build(|scheduler| Arc::new(TokioMultiThreadRuntime::new(scheduler)));
             .build(|scheduler| Arc::new(ManagedThreadRuntime::builder(scheduler).build()));
