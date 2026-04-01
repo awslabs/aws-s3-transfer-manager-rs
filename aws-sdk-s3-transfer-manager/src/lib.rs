@@ -107,6 +107,7 @@ pub mod metrics;
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::Config;
+pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader
 pub fn from_env() -> ConfigLoader {

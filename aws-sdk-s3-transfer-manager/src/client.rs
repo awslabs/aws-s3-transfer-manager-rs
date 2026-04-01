@@ -64,13 +64,32 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        use crate::scheduler::FixedConcurrency;
-        let new_scheduler = crate::scheduler::Scheduler::with_controller(Arc::new(
-            FixedConcurrency::new(match config.concurrency() {
-                ConcurrencyMode::Explicit(c) => *c,
-                _ => crate::DEFAULT_CONCURRENCY,
-            }),
-        ));
+        use crate::metrics::IOCounters;
+        use crate::scheduler::{
+            AdaptiveConcurrencyController, AdaptiveConfig, FixedConcurrency, SchedulerBuilder,
+        };
+        use std::time::Duration;
+
+        let (controller, io_counters): (Arc<dyn crate::scheduler::ConcurrencyController>, _) =
+            match config.concurrency() {
+                ConcurrencyMode::Explicit(c) => (
+                    Arc::new(FixedConcurrency::new(*c)),
+                    Arc::new(IOCounters::new(Duration::from_millis(500))),
+                ),
+                // TODO(vnext): implement support for target throughput
+                _ => {
+                    let adaptive_config = AdaptiveConfig::default();
+                    let io_counters = Arc::new(IOCounters::new(adaptive_config.window.duration));
+                    let controller = Arc::new(AdaptiveConcurrencyController::new(
+                        adaptive_config,
+                        io_counters.clone(),
+                    ));
+                    (controller, io_counters)
+                }
+            };
+
+        let new_scheduler = SchedulerBuilder::new(controller, io_counters)
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)));
         let legacy_scheduler = LegacyScheduler::new(config.concurrency().clone());
         let handle = Arc::new(Handle {
             config,
