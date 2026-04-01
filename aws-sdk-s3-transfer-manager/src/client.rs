@@ -70,16 +70,22 @@ impl Client {
         };
         use std::time::Duration;
 
-        let io_counters = Arc::new(IOCounters::new(Duration::from_millis(500)));
-
-        let controller: Arc<dyn crate::scheduler::ConcurrencyController> =
+        let (controller, io_counters): (Arc<dyn crate::scheduler::ConcurrencyController>, _) =
             match config.concurrency() {
-                ConcurrencyMode::Explicit(c) => Arc::new(FixedConcurrency::new(*c)),
+                ConcurrencyMode::Explicit(c) => (
+                    Arc::new(FixedConcurrency::new(*c)),
+                    Arc::new(IOCounters::new(Duration::from_millis(500))),
+                ),
                 // TODO(vnext): implement support for target throughput
-                _ => Arc::new(AdaptiveConcurrencyController::new(
-                    AdaptiveConfig::default(),
-                    io_counters.clone(),
-                )),
+                _ => {
+                    let adaptive_config = AdaptiveConfig::default();
+                    let io_counters = Arc::new(IOCounters::new(adaptive_config.window.duration));
+                    let controller = Arc::new(AdaptiveConcurrencyController::new(
+                        adaptive_config,
+                        io_counters.clone(),
+                    ));
+                    (controller, io_counters)
+                }
             };
 
         let new_scheduler = SchedulerBuilder::new(controller, io_counters)
