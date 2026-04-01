@@ -9,6 +9,7 @@ mod checksum_strategy;
 mod input;
 mod output;
 
+pub(crate) mod context;
 mod handle;
 mod transfer;
 

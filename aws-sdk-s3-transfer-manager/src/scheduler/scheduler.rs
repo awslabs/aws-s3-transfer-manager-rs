@@ -51,9 +51,9 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{CompletionSample, ConcurrencyController};
-use crate::transfer::{BoxTransfer, IoKind, IoRequest, PollWork, TransferId, WorkOutcome};
+use crate::transfer::{BoxTransfer, IoRequest, PollWork, TransferId, WorkOutcome};
 
-use crate::metrics::{IOCounters, IoSample};
+use crate::metrics::IOCounters;
 use crate::runtime::{ExecutionRuntime, ScheduledWork};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -243,17 +243,17 @@ impl Scheduler {
         self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
 
         // Report to concurrency controller
-        let (mut io_sample, classification) = match &outcome {
-            WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
-            WorkOutcome::Failed { classification } => (IoSample::default(), *classification),
-            WorkOutcome::Cancelled => (IoSample::default(), None),
+        let classification = match &outcome {
+            WorkOutcome::Failed { classification } => *classification,
+            _ => None,
         };
-        io_sample.duration = elapsed;
+        let io_sample = crate::metrics::IoSample {
+            duration: elapsed,
+            ..Default::default()
+        };
         self.0.io_counters.record(&io_sample);
         let sample = CompletionSample {
-            io: io_sample,
             error: classification,
-            kind: work.item.kind,
         };
         self.0.controller.on_completion(&sample);
 
@@ -269,20 +269,6 @@ impl Scheduler {
                 self.0.transfers.write().unwrap().remove(&desc.id());
             }
             return;
-        }
-
-        // handle any follow-on work
-        if let WorkOutcome::Success {
-            schedule_next: Some(kind),
-            data,
-            ..
-        } = outcome
-        {
-            let next = ScheduledWork {
-                item: IoRequest { kind, data },
-                descriptor: desc.clone(),
-            };
-            self.dispatch_single(next);
         }
 
         // capacity has freed try to queue up more work
@@ -378,7 +364,7 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::scheduler::test_util::{FixedWorkCount, MockStateMachine, WithDelay, WithExecute};
-    use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+    use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
@@ -528,10 +514,7 @@ mod tests {
             if self.done.load(Ordering::Acquire) {
                 return PollWork::Done;
             }
-            PollWork::Ready(IoRequest {
-                kind: IoKind::Network,
-                data: None,
-            })
+            PollWork::Ready(IoRequest { data: None })
         }
 
         fn execute<'a>(
@@ -541,11 +524,7 @@ mod tests {
             Box::pin(async move {
                 self.executions.fetch_add(1, Ordering::Relaxed);
                 tokio::task::yield_now().await;
-                WorkOutcome::Success {
-                    schedule_next: None,
-                    data: None,
-                    metrics: None,
-                }
+                WorkOutcome::Success { data: None }
             })
         }
     }

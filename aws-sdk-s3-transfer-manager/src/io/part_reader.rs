@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use std::cmp;
+use std::fs::File;
 use std::ops::DerefMut;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
 
@@ -173,20 +174,33 @@ impl BytesPartReader {
     }
 }
 
-/// Implementation for path based input streams
+/// Implementation for path based input streams.
+///
+/// Opens the file once at construction and shares the fd (`Arc<File>`) across
+/// concurrent part reads. Each read uses positional I/O (`pread` / `read_exact_at`)
+/// so no seeking is needed and the shared fd is safe for concurrent access.
 #[derive(Debug)]
 struct PathBodyPartReader {
     body: PathBody,
-    state: Mutex<PartReaderState>, // std Mutex
+    state: Mutex<PartReaderState>,
+    file: Arc<File>,
 }
 
 impl PathBodyPartReader {
     fn new(body: PathBody) -> Self {
         let offset = body.offset;
         let content_length = body.length;
+        // Open the file eagerly so all part reads share a single fd.
+        // Panics if the file cannot be opened — callers should validate paths
+        // before constructing an InputStream.
+        let file = Arc::new(
+            File::open(&body.path)
+                .unwrap_or_else(|e| panic!("failed to open {}: {e}", body.path.display())),
+        );
         Self {
             body,
-            state: Mutex::new(PartReaderState::new(content_length).with_offset(offset)), // std Mutex
+            state: Mutex::new(PartReaderState::new(content_length).with_offset(offset)),
+            file,
         }
     }
 }
@@ -202,28 +216,26 @@ impl PathBodyPartReader {
             }) => (offset, part_number, part_size, is_last),
             None => return Ok(None),
         };
-        let path = self.body.path.clone();
         // grab a buffer to fill from the context
         let mut dst = stream_cx.new_buffer(part_size as usize);
-        let handle = tokio::task::spawn_blocking(move || {
-            // SAFETY:  std::io::Read and FileExt traits take `&mut [u8]` buffer arguments (i.e.
-            // initialized). The `Deref` and `DerefMut` implementations of `Buffer`
-            // only return a slice of the _initialized_ portion of the buffer though.
-            // We need to set the length so that the raw `&[u8]` slice has the correct
-            // size. We are guaranteed to read exactly part_size data from file on success so
-            // any read of that slice after `read_file_chunk_sync` returns successfully will have
-            // been initialized.
-            unsafe { dst.set_len(dst.capacity()) }
-            file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
-            Ok::<PartData, Error>(PartData::new(part_number, dst).mark_last(is_last))
-        });
+        // SAFETY: We set the length to capacity so the read has a full slice to fill.
+        // read_file_chunk reads exactly part_size bytes on success, so the buffer
+        // will be fully initialized after a successful read.
+        unsafe { dst.set_len(dst.capacity()) }
 
-        handle.await?.map(Some)
+        let fd = Arc::clone(&self.file);
+        dst = tokio::task::spawn_blocking(move || {
+            file_util::read_file_chunk(&fd, dst.deref_mut(), offset)?;
+            Ok::<_, std::io::Error>(dst)
+        })
+        .await??;
+
+        Ok(Some(PartData::new(part_number, dst).mark_last(is_last)))
     }
 
     // Advances the `PartReaderState` to the next state and returns `PathBodyReadCursor`
     // (offset, part_number, part_size, is_last), which will be used in the upcoming
-    // `read_file_chunk_sync` execution.
+    // `read_file_chunk` execution.
     fn advance(&self, stream_cx: &StreamContext) -> Result<Option<PathBodyReadCursor>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
@@ -263,23 +275,21 @@ struct PathBodyReadCursor {
 
 mod file_util {
     #[cfg(unix)]
-    pub(super) use unix::read_file_chunk_sync;
+    pub(super) use unix::read_file_chunk;
     #[cfg(windows)]
-    pub(super) use windows::read_file_chunk_sync;
+    pub(super) use windows::read_file_chunk;
 
     #[cfg(unix)]
     mod unix {
         use std::fs::File;
         use std::io;
         use std::os::unix::fs::FileExt;
-        use std::path::Path;
 
-        pub(crate) fn read_file_chunk_sync(
+        pub(crate) fn read_file_chunk(
+            file: &File,
             dst: &mut [u8],
-            path: impl AsRef<Path>,
             offset: u64,
         ) -> Result<(), io::Error> {
-            let file = File::open(path)?;
             file.read_exact_at(dst, offset)
         }
     }
@@ -288,17 +298,25 @@ mod file_util {
     mod windows {
         use std::fs::File;
         use std::io;
-        use std::io::{Read, Seek, SeekFrom};
-        use std::path::Path;
+        use std::os::windows::fs::FileExt;
 
-        pub(crate) fn read_file_chunk_sync(
+        pub(crate) fn read_file_chunk(
+            file: &File,
             dst: &mut [u8],
-            path: impl AsRef<Path>,
             offset: u64,
         ) -> Result<(), io::Error> {
-            let mut file = File::open(path)?;
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(dst)
+            let mut pos = 0;
+            while pos < dst.len() {
+                let n = file.seek_read(&mut dst[pos..], offset + pos as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected end of file",
+                    ));
+                }
+                pos += n;
+            }
+            Ok(())
         }
     }
 }
@@ -333,7 +351,6 @@ impl DynPartReader {
 #[cfg(test)]
 mod test {
     use std::io::Write;
-    use std::path::PathBuf;
     use std::task::Poll;
 
     use bytes::{Buf, Bytes};
@@ -499,8 +516,11 @@ mod test {
 
     #[test]
     fn test_path_body_part_reader_advance() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 30]).unwrap();
+
         let path_body = PathBody {
-            path: PathBuf::from("test"),
+            path: tmp.path().to_path_buf(),
             offset: 10,
             length: 20,
         };
@@ -534,8 +554,11 @@ mod test {
 
     #[test]
     fn test_path_body_part_reader_advance_detects_last_part() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 3]).unwrap();
+
         let path_body = PathBody {
-            path: PathBuf::from("test"),
+            path: tmp.path().to_path_buf(),
             offset: 0,
             length: 3,
         };

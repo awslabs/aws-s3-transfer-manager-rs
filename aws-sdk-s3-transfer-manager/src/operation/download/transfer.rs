@@ -14,56 +14,19 @@ use bytes_utils::SegmentedBuf;
 
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
-use crate::metrics::IoSample;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
+use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::transfer::{
-    IoKind, IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
-};
+use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
-
-/// Mutable state for tracking download work progress
-#[derive(Debug)]
-pub(crate) enum DownloadState {
-    /// Waiting to start discovery
-    PendingDiscovery,
-
-    /// Discovery request in flight
-    DiscoveryInFlight,
-
-    /// Data transfer in progress (downloading ranges)
-    Transferring {
-        /// Remaining byte range to fetch (None if all ranges generated)
-        remaining: Option<std::ops::RangeInclusive<u64>>,
-        /// Number of ranges currently in flight
-        ranges_in_flight: usize,
-        /// ETag for consistency (shared across all range requests)
-        etag: Option<Arc<str>>,
-    },
-
-    /// Terminal state - transfer ended (success, failure, or cancelled)
-    /// TransferContext status holds final result
-    Terminal,
-}
-
-impl DownloadState {
-    pub(crate) fn new() -> Self {
-        DownloadState::PendingDiscovery
-    }
-}
 
 /// Download-specific work data.
 #[derive(Debug)]
 pub(crate) enum DownloadWork {
     Discovery,
-    ReadDiscoveryBody {
-        stream: aws_sdk_s3::primitives::ByteStream,
-        slot: Option<BodySlot>,
-        chunk_meta: ChunkMetadata,
-    },
     GetObjectRange {
         range: std::ops::RangeInclusive<u64>,
         slot: Option<BodySlot>,
@@ -77,8 +40,7 @@ impl DownloadWork {
     fn take_slot(&mut self) -> Option<BodySlot> {
         match self {
             DownloadWork::Discovery => None,
-            DownloadWork::ReadDiscoveryBody { slot, .. }
-            | DownloadWork::GetObjectRange { slot, .. } => slot.take(),
+            DownloadWork::GetObjectRange { slot, .. } => slot.take(),
         }
     }
 }
@@ -207,7 +169,6 @@ impl DownloadTransfer {
             DownloadState::PendingDiscovery => {
                 *state = DownloadState::DiscoveryInFlight {};
                 PollWork::Ready(IoRequest {
-                    kind: IoKind::Network,
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
@@ -241,7 +202,6 @@ impl DownloadTransfer {
                     *ranges_in_flight += 1;
 
                     PollWork::Ready(IoRequest {
-                        kind: IoKind::Network,
                         data: Some(Box::new(DownloadWork::GetObjectRange {
                             range: chunk_range,
                             slot: Some(slot),
@@ -267,18 +227,6 @@ impl DownloadTransfer {
         let data = work.data_mut::<DownloadWork>();
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
-            DownloadWork::ReadDiscoveryBody {
-                stream,
-                slot,
-                chunk_meta,
-            } => {
-                self.execute_read_discovery_body(
-                    std::mem::take(stream),
-                    slot.take().expect("slot already consumed"),
-                    std::mem::take(chunk_meta),
-                )
-                .await
-            }
             DownloadWork::GetObjectRange { range, slot, etag } => {
                 self.execute_get_range(
                     range.clone(),
@@ -345,65 +293,41 @@ impl DownloadTransfer {
         // State changed from DiscoveryInFlight - try to wake
         self.inner.ctx.try_wake();
 
-        // If discovery returned an initial chunk, schedule work to read it
+        // If discovery returned an initial chunk, read the body inline
         match initial_work {
-            Some((stream, chunk_meta, slot)) => WorkOutcome::Success {
-                schedule_next: Some(IoKind::Network),
-                data: Some(Box::new(DownloadWork::ReadDiscoveryBody {
-                    stream,
-                    slot: Some(slot),
-                    chunk_meta,
-                })),
-                metrics: None,
-            },
-            None => WorkOutcome::Success {
-                schedule_next: None,
-                data: None,
-                metrics: None,
-            },
-        }
-    }
-
-    async fn execute_read_discovery_body(
-        &self,
-        stream: aws_sdk_s3::primitives::ByteStream,
-        slot: BodySlot,
-        chunk_meta: ChunkMetadata,
-    ) -> WorkOutcome {
-        let seq = slot.seq();
-        // Read the body from the discovery response
-        let mut segmented = SegmentedBuf::new();
-        let mut bytes_received: u64 = 0;
-        let mut body_stream = stream;
-        while let Some(result) = body_stream.next().await {
-            let data = match result {
-                Ok(data) => data,
-                Err(e) => {
-                    self.decrement_in_flight();
-                    let guard = self.inner.state.lock().unwrap();
-                    return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+            Some((stream, chunk_meta, slot)) => {
+                let seq = slot.seq();
+                let mut segmented = SegmentedBuf::new();
+                let mut body_stream = stream;
+                while let Some(result) = body_stream.next().await {
+                    let data = match result {
+                        Ok(data) => data,
+                        Err(e) => {
+                            self.decrement_in_flight();
+                            let guard = self.inner.state.lock().unwrap();
+                            return self
+                                .fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+                        }
+                    };
+                    segmented.push(data);
+                    if !self.inner.ctx.is_active() {
+                        self.decrement_in_flight();
+                        return WorkOutcome::Cancelled;
+                    }
                 }
-            };
-            bytes_received += data.len() as u64;
-            segmented.push(data);
-        }
 
-        let chunk = ChunkOutput {
-            seq,
-            data: AggregatedBytes(segmented),
-            metadata: chunk_meta,
-        };
+                let chunk = ChunkOutput {
+                    seq,
+                    data: AggregatedBytes(segmented),
+                    metadata: chunk_meta,
+                };
 
-        slot.fill(chunk);
-        self.decrement_in_flight();
+                slot.fill(chunk);
+                self.decrement_in_flight();
 
-        WorkOutcome::Success {
-            schedule_next: None,
-            data: None,
-            metrics: Some(IoSample {
-                network_rx: bytes_received,
-                ..Default::default()
-            }),
+                WorkOutcome::Success { data: None }
+            }
+            None => WorkOutcome::Success { data: None },
         }
     }
 
@@ -451,14 +375,12 @@ impl DownloadTransfer {
 
         // TODO: Handle ByteStreamError with retry (SDK doesn't retry these)
         let mut segmented = SegmentedBuf::new();
-        let mut bytes_received: u64 = 0;
         let mut body_stream = body_stream;
         while let Some(result) = body_stream.next().await {
             let data = match result {
                 Ok(data) => data,
                 Err(e) => return self.fail_range(seq, e),
             };
-            bytes_received += data.len() as u64;
             segmented.push(data);
 
             if !self.inner.ctx.is_active() {
@@ -477,14 +399,7 @@ impl DownloadTransfer {
         slot.fill(chunk);
         self.decrement_in_flight();
 
-        WorkOutcome::Success {
-            schedule_next: None,
-            data: None,
-            metrics: Some(IoSample {
-                network_rx: bytes_received,
-                ..Default::default()
-            }),
-        }
+        WorkOutcome::Success { data: None }
     }
 
     /// Fail a range request with an error.
@@ -643,20 +558,9 @@ mod tests {
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
 
-    /// Execute and handle follow-on work (e.g., ReadDiscoveryBody).
-    /// Uses DownloadTransfer directly for type-specific behavior.
+    /// Execute work using DownloadTransfer directly.
     async fn execute(transfer: &DownloadTransfer, work: &mut IoRequest) -> WorkOutcome {
-        let outcome = transfer.execute(work).await;
-        if let WorkOutcome::Success {
-            schedule_next: Some(kind),
-            data,
-            ..
-        } = outcome
-        {
-            let mut follow_on = IoRequest { kind, data };
-            return transfer.execute(&mut follow_on).await;
-        }
-        outcome
+        transfer.execute(work).await
     }
 
     /// Run discovery to completion
@@ -798,9 +702,7 @@ mod tests {
         let transfer = create_download(12 * MB, 8 * MB);
         skip_discovery(&transfer).await;
 
-        // generate range work but don't complete
         let _range = assert_ready(transfer.poll_work());
-        // transfer is considered active and shouldn't transition to done until all in-flight work is complete and handle is joined/dropped
         assert_pending(transfer.poll_work());
     }
 
@@ -820,8 +722,8 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         skip_discovery(&transfer).await;
 
-        let mut range1 = assert_ready(transfer.poll_work()); // seq=1
-        let mut range2 = assert_ready(transfer.poll_work()); // seq=2
+        let mut range1 = assert_ready(transfer.poll_work());
+        let mut range2 = assert_ready(transfer.poll_work());
 
         // Complete in reverse order
         execute(&transfer, &mut range2).await;
@@ -833,7 +735,6 @@ mod tests {
     #[tokio::test]
     async fn test_failure_transitions_to_failed() {
         let _logs = show_test_logs();
-        // Fail seq 1 (first range after discovery)
         let transfer = FailureConfig::new(24 * MB, 8 * MB).fail(1).build();
 
         skip_discovery(&transfer).await;
@@ -903,18 +804,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_seq_window_limits_work_generation() {
-        // Create download with many parts but small slot buffer capacity
         let (transfer, _consumer) = create_download_with_capacity(128 * MB, 8 * MB, 3);
 
         skip_discovery(&transfer).await;
-        // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
-        // Capacity=3 means: claimed < consumed + capacity → claimed < 3
-        // So we can claim seq 1, 2 (claimed becomes 2, then 3)
 
-        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
-        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
+        let _w1 = assert_ready(transfer.poll_work());
+        let _w2 = assert_ready(transfer.poll_work());
 
-        // Window exhausted (claimed=3, consumed=0, capacity=3: 3 >= 0+3)
         assert_pending(transfer.poll_work());
     }
 
@@ -923,17 +819,15 @@ mod tests {
         let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
 
         skip_discovery(&transfer).await;
-        // After discovery: seq 0 claimed and filled by discovery, consumed=0
-        // Capacity=2 means: claimed < consumed + 2
 
-        let mut w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
-        assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
+        let mut w1 = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
 
         // Consume seq 0 (filled by discovery) to open the window
-        consumer.try_take_next(); // consume seq 0, consumed=1
+        consumer.try_take_next();
 
-        let mut w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
-        assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
+        let mut w2 = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
 
         // Fill seq 1 from its work item, then consume it
         let slot1 = w1.data_mut::<DownloadWork>().take_slot().expect("has slot");
@@ -944,9 +838,9 @@ mod tests {
             data: crate::io::AggregatedBytes(seg),
             metadata: Default::default(),
         });
-        consumer.try_take_next(); // consume seq 1, consumed=2
+        consumer.try_take_next();
 
-        let mut w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
+        let w3 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
 
         // Fill seq 2 from its work item, then consume it
@@ -958,12 +852,11 @@ mod tests {
             data: crate::io::AggregatedBytes(seg),
             metadata: Default::default(),
         });
-        consumer.try_take_next(); // consume seq 2
+        consumer.try_take_next();
 
-        let _w4 = assert_ready(transfer.poll_work()); // seq=4
+        let _w4 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
 
-        // Clean up remaining slots
         drop(w3);
     }
 
@@ -988,8 +881,7 @@ mod tests {
     ///
     /// Parses the Range header on each request to determine the seq number,
     /// then checks the failures map to decide whether to return a 500 or
-    /// a successful response. Supports per-seq, per-attempt control for
-    /// testing retry behavior.
+    /// a successful response.
     struct FailureConfig {
         object_size: u64,
         part_size: u64,
@@ -1029,12 +921,10 @@ mod tests {
                     })
                     .unwrap_or(0);
 
-                // Track calls per seq
                 let mut counts = call_counts.lock().unwrap();
                 let call_num = *counts.entry(seq).and_modify(|c| *c += 1).or_insert(1);
                 drop(counts);
 
-                // Check failure config
                 let should_fail = match failures.get(&seq) {
                     Some(FailureBehavior::Always) => true,
                     Some(FailureBehavior::Times(n)) => call_num <= *n,

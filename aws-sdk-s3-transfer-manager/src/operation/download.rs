@@ -17,6 +17,8 @@ pub use body::{Body, ChunkOutput};
 
 pub(crate) mod discovery;
 
+pub(crate) mod context;
+
 mod handle;
 pub use handle::DownloadHandle;
 

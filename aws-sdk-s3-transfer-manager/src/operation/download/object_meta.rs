@@ -9,7 +9,6 @@ use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
 use std::ops::RangeInclusive;
-use std::str::FromStr;
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 /// In the case of GetObject, some data will be duplicated as part of the first chunk.
@@ -112,7 +111,7 @@ pub struct ObjectMetadata {
 
 impl ObjectMetadata {
     /// <p>Size of the object in bytes.</p>
-    pub fn content_length(&self) -> u64 {
+    pub fn total_object_size(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
             (_, Some(range)) => {
                 let total = range.split_once('/').map(|x| x.1).expect("content range total");
@@ -128,20 +127,9 @@ impl ObjectMetadata {
 
     /// <p>Parse the content-range header to the inclusive range..</p>
     pub(crate) fn range_from_content_range(&self) -> Option<RangeInclusive<u64>> {
-        match self.content_length().checked_sub(1) {
-            Some(object_end) => match self.content_range.as_ref() {
-                Some(range) => {
-                    let byte_range_str = range
-                        .strip_prefix("bytes ")
-                        .expect("content range bytes-unit recognized")
-                        .split_once("/")
-                        .map(|x| x.0)
-                        .expect("content range valid");
-                    match header::ByteRange::from_str(byte_range_str).expect("valid byte range") {
-                        header::ByteRange::Inclusive(start, end) => Some(start..=end),
-                        _ => unreachable!("Content-Range header invalid"),
-                    }
-                }
+        match self.total_object_size().checked_sub(1) {
+            Some(object_end) => match self.content_range.as_deref() {
+                Some(range) => header::parse_content_range(range),
                 // When S3 doesn't provide a content-range header, we can infer the total size from the content-length header.
                 None => Some(0..=object_end),
             },
@@ -295,14 +283,14 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(15, meta.content_length());
+        assert_eq!(15, meta.total_object_size());
 
         let meta = ObjectMetadata {
             content_range: Some("bytes 0-499/900".to_owned()),
             content_length: Some(500),
             ..Default::default()
         };
-        assert_eq!(900, meta.content_length());
+        assert_eq!(900, meta.total_object_size());
     }
 
     #[test]
