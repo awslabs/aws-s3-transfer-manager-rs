@@ -76,6 +76,10 @@ pub struct Args {
     /// Directory to write output files (e.g. iterations.json)
     #[arg(long)]
     output_dir: Option<String>,
+
+    /// Path to manifest JSON for concurrent transfers
+    #[arg(long)]
+    manifest: Option<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -168,6 +172,14 @@ struct IterationResult {
     duration_secs: f64,
     bytes_transferred: u64,
     throughput_gbps: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestEntry {
+    key: String,
+    local: String,
+    #[allow(dead_code)]
+    size: u64,
 }
 
 fn invalid_arg(message: &str) -> ! {
@@ -278,6 +290,59 @@ async fn do_recursive_upload(
     Ok(transfer_size_bytes)
 }
 
+async fn do_manifest_download(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    entries: &[ManifestEntry],
+    dest_dir: &Path,
+) -> Result<u64, BoxError> {
+    use tokio::task::JoinSet;
+    let mut set = JoinSet::new();
+    for entry in entries {
+        let tm = tm.clone();
+        let bucket = bucket.to_string();
+        let key = entry.key.clone();
+        let dest = if dest_dir == Path::new("/dev/null") {
+            PathBuf::from("/dev/null")
+        } else {
+            let p = dest_dir.join(&entry.local);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            p
+        };
+        set.spawn(async move { do_single_download(&tm, &bucket, &key, &dest).await });
+    }
+    let mut total = 0u64;
+    while let Some(result) = set.join_next().await {
+        total += result??;
+    }
+    Ok(total)
+}
+
+async fn do_manifest_upload(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    key_prefix: &str,
+    entries: &[ManifestEntry],
+    source_dir: &Path,
+) -> Result<u64, BoxError> {
+    use tokio::task::JoinSet;
+    let mut set = JoinSet::new();
+    for entry in entries {
+        let tm = tm.clone();
+        let bucket = bucket.to_string();
+        let upload_key = format!("{key_prefix}/{}", entry.local);
+        let source = source_dir.join(&entry.local);
+        set.spawn(async move { do_single_upload(&tm, &bucket, &upload_key, &source).await });
+    }
+    let mut total = 0u64;
+    while let Some(result) = set.join_next().await {
+        total += result??;
+    }
+    Ok(total)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
@@ -316,7 +381,19 @@ async fn main() -> Result<(), BoxError> {
         let start = SystemTime::now();
         let wall_start = time::Instant::now();
 
-        let bytes = if is_download {
+        let bytes = if let Some(ref manifest_path) = args.manifest {
+            let content = fs::read_to_string(manifest_path).await?;
+            let entries: Vec<ManifestEntry> = serde_json::from_str(&content)?;
+            if is_download {
+                let (bucket, _key) = args.source.expect_s3().parts();
+                let dest = args.dest.expect_local();
+                do_manifest_download(&tm, bucket, &entries, dest).await?
+            } else {
+                let (bucket, key) = args.dest.expect_s3().parts();
+                let source = args.source.expect_local();
+                do_manifest_upload(&tm, bucket, key, &entries, source).await?
+            }
+        } else if is_download {
             let (bucket, key) = args.source.expect_s3().parts();
             let dest = args.dest.expect_local();
             if args.recursive {
@@ -357,14 +434,6 @@ async fn main() -> Result<(), BoxError> {
             bytes_transferred: bytes,
             throughput_gbps,
         });
-
-        // Clean up dest file between download iterations (not needed for /dev/null or uploads)
-        if is_download && !args.recursive && i < args.iterations {
-            let dest = args.dest.expect_local();
-            if dest != Path::new("/dev/null") {
-                let _ = fs::remove_file(dest).await;
-            }
-        }
     }
 
     if json_output {
