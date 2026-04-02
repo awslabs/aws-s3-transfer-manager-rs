@@ -308,12 +308,14 @@ impl UploadTransfer {
 
         tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
 
-        let part_reader = Arc::new(
-            PartReaderBuilder::new()
-                .stream(stream)
-                .part_size(part_size.try_into().expect("valid part size"))
-                .build(),
-        );
+        let part_reader = match PartReaderBuilder::new()
+            .stream(stream)
+            .part_size(part_size.try_into().expect("valid part size"))
+            .build()
+        {
+            Ok(reader) => Arc::new(reader),
+            Err(e) => return self.fail(e),
+        };
 
         {
             let mut state = self.inner.state.lock().expect("upload state lock poisoned");

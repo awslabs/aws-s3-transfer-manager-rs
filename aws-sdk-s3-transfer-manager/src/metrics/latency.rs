@@ -89,8 +89,8 @@ impl LatencyTracker {
     /// Record a completed request duration.
     pub(crate) fn record(&self, duration: Duration) {
         let mut hist = self.hist.lock().unwrap();
-        // Clamp to histogram range; values outside are recorded at the boundary.
-        let _ = hist.record(duration.as_micros() as u64);
+        let micros = (duration.as_micros() as u64).min(HISTOGRAM_MAX_US);
+        let _ = hist.record(micros);
         self.sample_count.fetch_add(1, Ordering::Relaxed);
     }
 

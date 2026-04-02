@@ -47,7 +47,7 @@ impl Builder {
         self
     }
 
-    pub(crate) fn build(self) -> PartReader {
+    pub(crate) fn build(self) -> Result<PartReader, crate::error::Error> {
         let stream = self.stream.expect("input stream set");
         PartReader::new(stream, self.part_size)
     }
@@ -60,15 +60,15 @@ pub(crate) struct PartReader {
 }
 
 impl PartReader {
-    fn new(raw: RawInputStream, part_size: usize) -> Self {
+    fn new(raw: RawInputStream, part_size: usize) -> Result<Self, crate::error::Error> {
         let inner = match raw {
             RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
-            RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)),
+            RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)?),
             RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
         };
 
         let stream_cx = StreamContext::new(part_size);
-        Self { inner, stream_cx }
+        Ok(Self { inner, stream_cx })
     }
 
     pub(crate) fn part_size(&self) -> usize {
@@ -187,21 +187,20 @@ struct PathBodyPartReader {
 }
 
 impl PathBodyPartReader {
-    fn new(body: PathBody) -> Self {
+    fn new(body: PathBody) -> Result<Self, crate::error::Error> {
         let offset = body.offset;
         let content_length = body.length;
-        // Open the file eagerly so all part reads share a single fd.
-        // Panics if the file cannot be opened — callers should validate paths
-        // before constructing an InputStream.
-        let file = Arc::new(
-            File::open(&body.path)
-                .unwrap_or_else(|e| panic!("failed to open {}: {e}", body.path.display())),
-        );
-        Self {
+        let file = Arc::new(File::open(&body.path).map_err(|e| {
+            crate::error::Error::new(
+                crate::error::ErrorKind::IOError,
+                format!("failed to open {}: {e}", body.path.display()),
+            )
+        })?);
+        Ok(Self {
             body,
             state: Mutex::new(PartReaderState::new(content_length).with_offset(offset)),
             file,
-        }
+        })
     }
 }
 
@@ -379,7 +378,7 @@ mod test {
         let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
         let stream = InputStream::from(data.clone());
         let expected = data.chunks(5).collect::<Vec<_>>();
-        let reader = Builder::new().part_size(5).stream(stream).build();
+        let reader = Builder::new().part_size(5).stream(stream).build().unwrap();
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
 
@@ -406,7 +405,7 @@ mod test {
         let expected = data.chunks(part_size).collect::<Vec<_>>();
 
         let stream = builder.build().unwrap();
-        let reader = Builder::new().part_size(part_size).stream(stream).build();
+        let reader = Builder::new().part_size(part_size).stream(stream).build().unwrap();
 
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
@@ -477,7 +476,7 @@ mod test {
                 .collect::<Vec<_>>(),
         );
         let stream = InputStream::from_part_stream(stream);
-        let reader = Builder::new().part_size(5).stream(stream).build();
+        let reader = Builder::new().part_size(5).stream(stream).build().unwrap();
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
         assert_eq!(expected, actual);
@@ -524,7 +523,7 @@ mod test {
             offset: 10,
             length: 20,
         };
-        let reader = PathBodyPartReader::new(path_body);
+        let reader = PathBodyPartReader::new(path_body).unwrap();
         let stream_cx = StreamContext::new(5);
 
         // First advance should succeed
@@ -562,7 +561,7 @@ mod test {
             offset: 0,
             length: 3,
         };
-        let reader = PathBodyPartReader::new(path_body);
+        let reader = PathBodyPartReader::new(path_body).unwrap();
         let stream_cx = StreamContext::new(10);
 
         let result = reader.advance(&stream_cx).unwrap().unwrap();
