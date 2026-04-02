@@ -54,10 +54,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
         let input = req.input;
+        let bucket = &input.bucket;
         let key = &input.key;
 
         // Get metadata first to validate range
-        let metadata = match self.storage.head_object(key).await? {
+        let metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
@@ -75,6 +76,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Get object stream with validated range
         let request = crate::storage::GetObjectRequest {
+            bucket,
             key,
             range: range.clone(),
         };
@@ -136,10 +138,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::HeadObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::HeadObjectOutput>> {
         let input = req.input;
+        let bucket = &input.bucket;
         let key = &input.key;
 
         // Get object metadata from storage
-        let metadata = match self.storage.head_object(key).await? {
+        let metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
@@ -264,6 +267,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             ..Default::default()
         };
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: &input.bucket,
             key,
             upload_id: &upload_id,
             metadata,
@@ -378,6 +382,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Complete the multipart upload
         let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: &bucket,
             upload_id,
             parts,
             client_checksums: if client_checksums.has_any() {
@@ -432,7 +437,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let continuation_token = input.continuation_token.as_deref();
 
         // List objects from storage
-        let request = crate::storage::ListObjectsRequest { prefix };
+        let request = crate::storage::ListObjectsRequest {
+            bucket: &input.bucket,
+            prefix,
+        };
         let mut response = self.storage.list_objects(request).await?;
 
         // Apply start_after or continuation token if specified
@@ -532,7 +540,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             max_keys: Some(max_keys as i32),
             prefix: prefix.map(|s| s.to_string()),
             delimiter: delimiter.map(|s| s.to_string()),
-            name: Some("mock-bucket".to_string()),
+            name: Some(input.bucket.to_string()),
             next_continuation_token,
             ..Default::default()
         };
@@ -542,9 +550,66 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
     async fn head_bucket(
         &self,
-        _req: S3Request<HeadBucketInput>,
+        req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        Ok(S3Response::new(HeadBucketOutput::default()))
+        let input = req.input;
+        if self.storage.head_bucket(&input.bucket).await? {
+            Ok(S3Response::new(HeadBucketOutput::default()))
+        } else {
+            Err(s3s::s3_error!(NoSuchBucket))
+        }
+    }
+
+    async fn delete_object(
+        &self,
+        req: S3Request<s3s::dto::DeleteObjectInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteObjectOutput>> {
+        let input = req.input;
+        self.storage
+            .delete_object(&input.bucket, &input.key)
+            .await?;
+        Ok(S3Response::new(s3s::dto::DeleteObjectOutput::default()))
+    }
+
+    async fn create_bucket(
+        &self,
+        req: S3Request<s3s::dto::CreateBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
+        let input = req.input;
+        self.storage.create_bucket(&input.bucket).await?;
+        let output = s3s::dto::CreateBucketOutput {
+            location: Some(format!("/{}", input.bucket)),
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
+        let input = req.input;
+        self.storage.delete_bucket(&input.bucket).await?;
+        Ok(S3Response::new(s3s::dto::DeleteBucketOutput::default()))
+    }
+
+    async fn list_buckets(
+        &self,
+        _req: S3Request<s3s::dto::ListBucketsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
+        let buckets = self.storage.list_buckets().await?;
+        let bucket_list: Vec<s3s::dto::Bucket> = buckets
+            .into_iter()
+            .map(|b| s3s::dto::Bucket {
+                name: Some(b.name),
+                creation_date: Some(Timestamp::from(b.creation_date)),
+                ..Default::default()
+            })
+            .collect();
+        let output = s3s::dto::ListBucketsOutput {
+            buckets: Some(bucket_list),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
 }
 

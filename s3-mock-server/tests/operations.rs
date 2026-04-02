@@ -584,3 +584,167 @@ async fn test_concurrent_operations() -> Result<()> {
     handle.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_delete_object() -> Result<()> {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("Failed to build server");
+
+    let handle = server.start().await.expect("Failed to start mock server");
+    let s3 = handle.client().await;
+    let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    let key = "delete-me.txt";
+
+    // Put an object
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"to be deleted"))
+        .send()
+        .await
+        .expect("Failed to put object");
+
+    // Verify it exists
+    s3.head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("Object should exist before delete");
+
+    // Delete it
+    s3.delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("Failed to delete object");
+
+    // Verify it's gone
+    let result = s3.head_object().bucket(&bucket).key(key).send().await;
+    assert!(result.is_err(), "Object should not exist after delete");
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_and_delete_bucket() -> Result<()> {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("Failed to build server");
+
+    let handle = server.start().await.expect("Failed to start mock server");
+    let s3 = handle.client().await;
+    let bucket = format!("test-bucket-{}", Uuid::new_v4());
+
+    // Create bucket
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("Failed to create bucket");
+
+    // Verify head_bucket succeeds
+    s3.head_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("Bucket should exist after create");
+
+    // Delete bucket (empty)
+    s3.delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("Failed to delete empty bucket");
+
+    // Verify head_bucket fails
+    let result = s3.head_bucket().bucket(&bucket).send().await;
+    assert!(result.is_err(), "Bucket should not exist after delete");
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_buckets() -> Result<()> {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("Failed to build server");
+
+    let handle = server.start().await.expect("Failed to start mock server");
+    let s3 = handle.client().await;
+
+    // Create two buckets by putting objects into them (auto-create)
+    let bucket_a = format!("bucket-a-{}", Uuid::new_v4());
+    let bucket_b = format!("bucket-b-{}", Uuid::new_v4());
+
+    s3.put_object()
+        .bucket(&bucket_a)
+        .key("obj1.txt")
+        .body(ByteStream::from_static(b"a"))
+        .send()
+        .await
+        .expect("Failed to put object in bucket_a");
+
+    s3.put_object()
+        .bucket(&bucket_b)
+        .key("obj2.txt")
+        .body(ByteStream::from_static(b"b"))
+        .send()
+        .await
+        .expect("Failed to put object in bucket_b");
+
+    let resp = s3
+        .list_buckets()
+        .send()
+        .await
+        .expect("Failed to list buckets");
+
+    let names: Vec<&str> = resp.buckets().iter().filter_map(|b| b.name()).collect();
+
+    assert!(
+        names.contains(&bucket_a.as_str()),
+        "bucket_a not found in list"
+    );
+    assert!(
+        names.contains(&bucket_b.as_str()),
+        "bucket_b not found in list"
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_nonempty_bucket() -> Result<()> {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("Failed to build server");
+
+    let handle = server.start().await.expect("Failed to start mock server");
+    let s3 = handle.client().await;
+    let bucket = format!("test-bucket-{}", Uuid::new_v4());
+
+    // Put an object (auto-creates bucket)
+    s3.put_object()
+        .bucket(&bucket)
+        .key("still-here.txt")
+        .body(ByteStream::from_static(b"data"))
+        .send()
+        .await
+        .expect("Failed to put object");
+
+    // Try to delete non-empty bucket — should fail
+    let result = s3.delete_bucket().bucket(&bucket).send().await;
+    assert!(result.is_err(), "Deleting a non-empty bucket should fail");
+
+    handle.shutdown().await?;
+    Ok(())
+}

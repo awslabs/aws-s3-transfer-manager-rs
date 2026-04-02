@@ -53,7 +53,7 @@ async fn setup_test(
 
     let data = Bytes::from(vec![0u8; size]);
     mock_server
-        .add_object("test-key", data, None)
+        .add_object("test-bucket", "test-key", data, None)
         .await
         .unwrap();
 

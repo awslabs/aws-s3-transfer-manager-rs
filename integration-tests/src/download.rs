@@ -94,7 +94,7 @@ async fn test_download_basic() {
     let expected = content.clone();
 
     server
-        .add_object("test-key", content, None)
+        .add_object("test-bucket", "test-key", content, None)
         .await
         .expect("add object");
 
@@ -120,7 +120,7 @@ async fn test_download_body_not_consumed() {
 
     let content = vec![0u8; 16 * ByteUnit::Mebibyte.as_bytes_usize()];
     server
-        .add_object("test-key", content, None)
+        .add_object("test-bucket", "test-key", content, None)
         .await
         .expect("add object");
 
@@ -147,7 +147,7 @@ async fn test_download_abort() {
 
     let content = vec![0u8; 25 * ByteUnit::Mebibyte.as_bytes_usize()];
     server
-        .add_object("test-key", content, None)
+        .add_object("test-bucket", "test-key", content, None)
         .await
         .expect("add object");
 
@@ -193,7 +193,7 @@ async fn test_download_object_meta() {
 
     let content = vec![42u8; ByteUnit::Mebibyte.as_bytes_usize()];
     server
-        .add_object("test-key", content.clone(), None)
+        .add_object("test-bucket", "test-key", content.clone(), None)
         .await
         .expect("add object");
 
@@ -225,7 +225,7 @@ async fn test_download_concurrent() {
             .map(|j| ((i + j) % 256) as u8)
             .collect();
         server
-            .add_object(&format!("concurrent-key-{}", i), content, None)
+            .add_object("test-bucket", &format!("concurrent-key-{}", i), content, None)
             .await
             .expect("add object");
     }
@@ -271,7 +271,7 @@ async fn test_download_write_to_path() {
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
     server
-        .add_object("write-to-path-key", content.clone(), None)
+        .add_object("test-bucket", "write-to-path-key", content.clone(), None)
         .await
         .expect("add object");
 
@@ -313,7 +313,7 @@ async fn test_download_write_to_file() {
     let size = 50 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
     server
-        .add_object("write-to-file-key", content.clone(), None)
+        .add_object("test-bucket", "write-to-file-key", content.clone(), None)
         .await
         .expect("add object");
 
@@ -347,7 +347,7 @@ async fn test_download_write_to_path_ranged() {
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
     server
-        .add_object("ranged-key", content.clone(), None)
+        .add_object("test-bucket", "ranged-key", content.clone(), None)
         .await
         .expect("add object");
 
@@ -387,7 +387,7 @@ async fn test_download_write_to_path_single_part() {
     let size = 2 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
     server
-        .add_object("single-part-key", content.clone(), None)
+        .add_object("test-bucket", "single-part-key", content.clone(), None)
         .await
         .expect("add object");
 
@@ -422,7 +422,7 @@ async fn test_download_write_to_path_integrity() {
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
     server
-        .add_object("integrity-key", content.clone(), None)
+        .add_object("test-bucket", "integrity-key", content.clone(), None)
         .await
         .expect("add object");
 

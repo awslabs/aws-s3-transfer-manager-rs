@@ -154,6 +154,34 @@ impl S3MockServerBuilder {
     }
 }
 
+/// Object data returned from direct storage inspection.
+pub struct ObjectData {
+    /// The object body.
+    pub body: bytes::Bytes,
+    /// Content type of the object.
+    pub content_type: Option<String>,
+    /// Size of the object in bytes.
+    pub content_length: u64,
+    /// ETag of the object.
+    pub etag: String,
+    /// Last modified time.
+    pub last_modified: std::time::SystemTime,
+    /// User-defined metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Summary information about an object in a listing.
+pub struct ObjectListEntry {
+    /// The object key.
+    pub key: String,
+    /// Size of the object in bytes.
+    pub size: u64,
+    /// Last modified time.
+    pub last_modified: std::time::SystemTime,
+    /// ETag of the object.
+    pub etag: String,
+}
+
 /// S3 Mock Server.
 pub struct S3MockServer {
     /// Storage backend.
@@ -172,6 +200,7 @@ impl S3MockServer {
     /// Add an object to the mock server storage.
     pub async fn add_object(
         &self,
+        bucket: &str,
         key: &str,
         content: impl Into<bytes::Bytes>,
         metadata: Option<std::collections::HashMap<String, String>>,
@@ -184,12 +213,90 @@ impl S3MockServer {
         let stream = stream::once(async move { Ok(bytes) });
         let boxed_stream = Box::pin(stream);
 
-        let request =
-            StoreObjectRequest::new(key.to_string(), boxed_stream, ObjectIntegrityChecks::new())
-                .with_user_metadata(metadata.unwrap_or_default());
+        let request = StoreObjectRequest::new(
+            bucket,
+            key.to_string(),
+            boxed_stream,
+            ObjectIntegrityChecks::new(),
+        )
+        .with_user_metadata(metadata.unwrap_or_default());
 
         self.storage.put_object(request).await?;
         Ok(())
+    }
+
+    /// Create a bucket in the mock server.
+    pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        self.storage.create_bucket(bucket).await
+    }
+
+    /// Check if an object exists.
+    pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        Ok(self.storage.head_object(bucket, key).await?.is_some())
+    }
+
+    /// Get object content and metadata directly from storage.
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectData>> {
+        use crate::storage::GetObjectRequest;
+        use futures::StreamExt;
+
+        let request = GetObjectRequest {
+            bucket,
+            key,
+            range: None,
+        };
+        let response = match self.storage.get_object(request).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let mut body = Vec::new();
+        let mut stream = response.stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(Some(ObjectData {
+            body: bytes::Bytes::from(body),
+            content_type: response.metadata.content_type,
+            content_length: response.metadata.content_length,
+            etag: response.metadata.etag,
+            last_modified: response.metadata.last_modified,
+            metadata: response.metadata.user_metadata,
+        }))
+    }
+
+    /// List objects in a bucket with optional prefix.
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ObjectListEntry>> {
+        use crate::storage::ListObjectsRequest;
+
+        let request = ListObjectsRequest { bucket, prefix };
+        let response = self.storage.list_objects(request).await?;
+        Ok(response
+            .objects
+            .into_iter()
+            .map(|o| ObjectListEntry {
+                key: o.key,
+                size: o.metadata.content_length,
+                last_modified: o.metadata.last_modified,
+                etag: o.metadata.etag,
+            })
+            .collect())
+    }
+
+    /// Delete an object.
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.storage.delete_object(bucket, key).await
+    }
+
+    /// Reset all state (clear all buckets, objects, and in-flight uploads).
+    pub async fn reset(&self) -> Result<()> {
+        self.storage.reset().await
     }
 
     /// Start the server.

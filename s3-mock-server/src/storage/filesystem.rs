@@ -97,86 +97,68 @@ where
 ///
 /// ```text
 /// root/
-/// ├── objects/
-/// │   ├── my-file.txt              # Object data
-/// │   └── my-file.txt.metadata     # Object metadata (JSON)
-/// ├── uploads/
-/// │   ├── upload-123/
-/// │   │   ├── metadata.json        # Upload metadata
-/// │   │   ├── part-1.dat          # Part data
-/// │   │   └── part-1.metadata     # Part metadata
-/// │   └── ...
+/// ├── my-bucket/
+/// │   ├── objects/
+/// │   │   ├── my-file.txt              # Object data
+/// │   │   └── my-file.txt.metadata     # Object metadata (JSON)
+/// │   └── uploads/
+/// │       ├── upload-123/
+/// │       │   ├── metadata.json        # Upload metadata
+/// │       │   ├── part-1.dat          # Part data
+/// │       │   └── part-1.metadata     # Part metadata
+/// │       └── ...
 /// ```
 #[derive(Debug)]
 pub(crate) struct FilesystemStorage {
-    objects_dir: PathBuf,
-    uploads_dir: PathBuf,
+    root_dir: PathBuf,
 }
 
 impl FilesystemStorage {
     /// Create a new filesystem storage backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `root_dir` - The root directory for storing objects and uploads
-    ///
-    /// # Returns
-    ///
-    /// A new FilesystemStorage instance
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the directories cannot be created
     pub(crate) async fn new(root_dir: impl AsRef<Path>) -> Result<Self> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        let objects_dir = root_dir.join("objects");
-        let uploads_dir = root_dir.join("uploads");
-
-        // Create directories if they don't exist
-        fs::create_dir_all(&objects_dir).await?;
-        fs::create_dir_all(&uploads_dir).await?;
-
-        Ok(Self {
-            objects_dir,
-            uploads_dir,
-        })
+        fs::create_dir_all(&root_dir).await?;
+        Ok(Self { root_dir })
     }
 
-    // Helper method to get the path for an object's data
-    fn get_object_path(&self, key: &str) -> PathBuf {
-        // Handle empty key as a special case
+    fn objects_dir(&self, bucket: &str) -> PathBuf {
+        self.root_dir.join(bucket).join("objects")
+    }
+
+    /// Ensure bucket directories exist (auto-create for backward compat).
+    async fn ensure_bucket(&self, bucket: &str) -> Result<()> {
+        fs::create_dir_all(self.objects_dir(bucket)).await?;
+        fs::create_dir_all(self.root_dir.join("uploads")).await?;
+        Ok(())
+    }
+
+    fn get_object_path(&self, bucket: &str, key: &str) -> PathBuf {
         if key.is_empty() {
-            return self.objects_dir.join("empty_key");
+            return self.objects_dir(bucket).join("empty_key");
         }
-        object_key_to_path(&self.objects_dir, key)
+        object_key_to_path(&self.objects_dir(bucket), key)
     }
 
-    // Helper method to get the path for an object's metadata
-    fn get_object_metadata_path(&self, key: &str) -> PathBuf {
-        // Handle empty key as a special case
+    fn get_object_metadata_path(&self, bucket: &str, key: &str) -> PathBuf {
         if key.is_empty() {
-            return self.objects_dir.join("empty_key.metadata");
+            return self.objects_dir(bucket).join("empty_key.metadata");
         }
-        object_key_to_path(&self.objects_dir, &format!("{}.metadata", key))
+        object_key_to_path(&self.objects_dir(bucket), &format!("{}.metadata", key))
     }
 
-    // Helper method to get the directory for an upload
     fn get_upload_dir(&self, upload_id: &str) -> PathBuf {
-        self.uploads_dir.join(upload_id)
+        self.root_dir.join("uploads").join(upload_id)
     }
 
-    // Helper method to get the path for an upload's metadata
     fn get_upload_metadata_path(&self, upload_id: &str) -> PathBuf {
         self.get_upload_dir(upload_id).join("metadata.json")
     }
 
-    // Helper method to get the path for a part's data
     fn get_part_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
         self.get_upload_dir(upload_id)
             .join(format!("part-{}.dat", part_number))
     }
 
-    // Helper method to get the path for a part's metadata
     fn get_part_metadata_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
         self.get_upload_dir(upload_id)
             .join(format!("part-{}.metadata", part_number))
@@ -209,28 +191,30 @@ impl FilesystemStorage {
         }
     }
 
-    // Helper method to list all objects in a directory
-    // Helper method to list all objects in a directory recursively
     fn list_directory<'a>(
         &'a self,
         dir: &'a Path,
+        objects_dir: &'a Path,
         prefix: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<PathBuf>>> + Send + 'a>>
     {
         Box::pin(async move {
             let mut entries = Vec::new();
-            let mut read_dir = fs::read_dir(dir).await?;
+            let mut read_dir = match fs::read_dir(dir).await {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+                Err(e) => return Err(e.into()),
+            };
 
             while let Some(entry) = read_dir.next_entry().await? {
                 let path = entry.path();
                 let metadata = fs::metadata(&path).await?;
 
                 if metadata.is_dir() {
-                    // Recursively list subdirectories
-                    let mut sub_entries = self.list_directory(&path, prefix).await?;
+                    let mut sub_entries = self.list_directory(&path, objects_dir, prefix).await?;
                     entries.append(&mut sub_entries);
                 } else if path.extension().is_none_or(|ext| ext != "metadata") {
-                    if let Some(key) = path_to_object_key(&self.objects_dir, &path) {
+                    if let Some(key) = path_to_object_key(objects_dir, &path) {
                         if let Some(prefix) = prefix {
                             if !key.starts_with(prefix) {
                                 continue;
@@ -268,9 +252,12 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::StoreObjectRequest,
     ) -> Result<StoredObjectMetadata> {
+        // Auto-create bucket directories
+        self.ensure_bucket(&request.bucket).await?;
+
         let mut body = request.body;
         let mut integrity_checks = request.integrity_checks;
-        let path = self.get_object_path(&request.key);
+        let path = self.get_object_path(&request.bucket, &request.key);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -302,7 +289,7 @@ impl StorageBackend for FilesystemStorage {
             sha1: object_integrity.sha1.clone(),
             sha256: object_integrity.sha256.clone(),
         };
-        let metadata_path = self.get_object_metadata_path(&request.key);
+        let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
 
         Ok(StoredObjectMetadata { object_integrity })
@@ -312,8 +299,8 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::GetObjectRequest<'_>,
     ) -> Result<Option<crate::storage::GetObjectResponse>> {
-        let path = self.get_object_path(request.key);
-        let metadata_path = self.get_object_metadata_path(request.key);
+        let path = self.get_object_path(request.bucket, request.key);
+        let metadata_path = self.get_object_metadata_path(request.bucket, request.key);
 
         // Load metadata first to check if object exists
         let metadata: ObjectMetadata = match Self::load_metadata(&metadata_path).await? {
@@ -369,9 +356,9 @@ impl StorageBackend for FilesystemStorage {
         }))
     }
 
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        let path = self.get_object_path(key);
-        let metadata_path = self.get_object_metadata_path(key);
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        let path = self.get_object_path(bucket, key);
+        let metadata_path = self.get_object_metadata_path(bucket, key);
 
         // Delete both data and metadata files
         match fs::remove_file(&path).await {
@@ -391,16 +378,15 @@ impl StorageBackend for FilesystemStorage {
         request: crate::storage::ListObjectsRequest<'_>,
     ) -> Result<crate::storage::ListObjectsResponse> {
         let mut matching_objects = Vec::new();
+        let objects_dir = self.objects_dir(request.bucket);
 
-        // List all objects in the directory
         let entries = self
-            .list_directory(&self.objects_dir, request.prefix)
+            .list_directory(&objects_dir, &objects_dir, request.prefix)
             .await?;
 
-        // Load metadata for each object
         for path in entries {
-            if let Some(key) = path_to_object_key(&self.objects_dir, &path) {
-                let metadata_path = self.get_object_metadata_path(&key);
+            if let Some(key) = path_to_object_key(&objects_dir, &path) {
+                let metadata_path = self.get_object_metadata_path(request.bucket, &key);
                 if let Some(metadata) = Self::load_metadata(&metadata_path).await? {
                     matching_objects.push(crate::storage::ObjectInfo { key, metadata });
                 }
@@ -416,6 +402,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::CreateMultipartUploadRequest<'_>,
     ) -> Result<()> {
+        self.ensure_bucket(request.bucket).await?;
         let upload_dir = self.get_upload_dir(request.upload_id);
         fs::create_dir_all(&upload_dir).await?;
 
@@ -425,6 +412,7 @@ impl StorageBackend for FilesystemStorage {
             metadata: request.metadata,
             parts: Default::default(),
             checksum_type: Some(request.checksum_type),
+            bucket: Some(request.bucket.to_string()),
         };
 
         let metadata_path = self.get_upload_metadata_path(request.upload_id);
@@ -437,7 +425,6 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::UploadPartRequest<'_>,
     ) -> Result<crate::storage::UploadPartResponse> {
-        // Verify the upload exists and get checksum algorithm
         let metadata_path = self.get_upload_metadata_path(request.upload_id);
         let mut upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
             .await?
@@ -533,6 +520,7 @@ impl StorageBackend for FilesystemStorage {
             .await?
             .ok_or(Error::NoSuchUpload)?;
 
+        let bucket = upload_metadata.bucket.as_deref().unwrap_or(request.bucket);
         let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
         let checksum_type = upload_metadata.checksum_type;
 
@@ -631,8 +619,8 @@ impl StorageBackend for FilesystemStorage {
 
         // Save the final object
         let combined_data = combined.freeze();
-        let object_path = self.get_object_path(&upload_metadata.key);
-        let metadata_path = self.get_object_metadata_path(&upload_metadata.key);
+        let object_path = self.get_object_path(bucket, &upload_metadata.key);
+        let obj_metadata_path = self.get_object_metadata_path(bucket, &upload_metadata.key);
 
         // Ensure parent directory exists
         if let Some(parent) = object_path.parent() {
@@ -643,7 +631,7 @@ impl StorageBackend for FilesystemStorage {
         fs::write(&object_path, &combined_data).await?;
         let metadata_json = serde_json::to_string_pretty(&final_metadata)
             .map_err(|e| Error::Internal(format!("Failed to serialize metadata: {}", e)))?;
-        fs::write(&metadata_path, metadata_json).await?;
+        fs::write(&obj_metadata_path, metadata_json).await?;
 
         // Clean up the multipart upload
         let _ = fs::remove_dir_all(self.get_upload_dir(request.upload_id)).await;
@@ -655,15 +643,64 @@ impl StorageBackend for FilesystemStorage {
         })
     }
 
-    async fn head_object(&self, key: &str) -> Result<Option<ObjectMetadata>> {
-        let metadata_path = self.get_object_metadata_path(key);
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMetadata>> {
+        let metadata_path = self.get_object_metadata_path(bucket, key);
         Self::load_metadata(&metadata_path).await
+    }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        self.ensure_bucket(bucket).await
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        let bucket_dir = self.root_dir.join(bucket);
+        if !bucket_dir.exists() {
+            return Err(Error::NoSuchBucket);
+        }
+        // Check if objects dir has any entries
+        let objects_dir = self.objects_dir(bucket);
+        if objects_dir.exists() {
+            let mut rd = fs::read_dir(&objects_dir).await?;
+            if rd.next_entry().await?.is_some() {
+                return Err(Error::Internal("bucket is not empty".to_string()));
+            }
+        }
+        fs::remove_dir_all(&bucket_dir).await?;
+        Ok(())
+    }
+
+    async fn head_bucket(&self, bucket: &str) -> Result<bool> {
+        Ok(self.root_dir.join(bucket).exists())
+    }
+
+    async fn list_buckets(&self) -> Result<Vec<crate::storage::BucketInfo>> {
+        let mut result = Vec::new();
+        let mut rd = fs::read_dir(&self.root_dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip the global uploads directory
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name != "uploads" {
+                        let creation_date = fs::metadata(&path)
+                            .await
+                            .and_then(|m| m.created().or_else(|_| m.modified()))
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        result.push(crate::storage::BucketInfo {
+                            name: name.to_string(),
+                            creation_date,
+                        });
+                    }
+                }
+            }
+        }
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
     }
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         let upload_dir = self.get_upload_dir(upload_id);
 
-        // Verify the upload exists
         let metadata_path = self.get_upload_metadata_path(upload_id);
         if !metadata_path.exists() {
             return Err(Error::NoSuchUpload);
@@ -672,6 +709,13 @@ impl StorageBackend for FilesystemStorage {
         // Remove the entire upload directory
         fs::remove_dir_all(upload_dir).await?;
 
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<()> {
+        // Remove everything under root and recreate it
+        fs::remove_dir_all(&self.root_dir).await?;
+        fs::create_dir_all(&self.root_dir).await?;
         Ok(())
     }
 }
@@ -683,6 +727,8 @@ mod tests {
     use futures::StreamExt;
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    const TEST_BUCKET: &str = "test-bucket";
 
     // Helper function to collect stream data into bytes
     async fn collect_stream_data(
@@ -724,10 +770,10 @@ mod tests {
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content.clone());
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -735,18 +781,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Get object
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
-        let retrieved_stream = response.stream;
-        let retrieved_metadata = response.metadata;
-        let retrieved_content = collect_stream_data(retrieved_stream).await;
+        let retrieved_content = collect_stream_data(response.stream).await;
         assert_eq!(retrieved_content, content);
-        assert_eq!(retrieved_metadata.content_length, content.len() as u64);
-        // Content type is not preserved in the new streaming API
-        assert_eq!(retrieved_metadata.content_type, None);
+        assert_eq!(response.metadata.content_length, content.len() as u64);
+        assert_eq!(response.metadata.content_type, None);
     }
 
     #[tokio::test]
@@ -757,10 +803,10 @@ mod tests {
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content);
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -768,14 +814,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Get range
-        let range = Some(2..5);
-        let request = crate::storage::GetObjectRequest { key, range };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: Some(2..5),
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
-        let retrieved_stream = response.stream;
-        let retrieved_content = collect_stream_data(retrieved_stream).await;
+        let retrieved_content = collect_stream_data(response.stream).await;
         assert_eq!(retrieved_content, Bytes::from("234"));
     }
 
@@ -787,10 +834,10 @@ mod tests {
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content);
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -798,16 +845,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify it exists
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
 
-        // Delete object
-        storage.delete_object(key).await.unwrap();
+        storage.delete_object(TEST_BUCKET, key).await.unwrap();
 
-        // Verify it's gone
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_none());
     }
@@ -818,13 +870,13 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let content = Bytes::from("test content");
 
-        // Put multiple objects
         for i in 0..3 {
             let key = format!("test-key-{}", i);
             let integrity_checks = ObjectIntegrityChecks::new().with_md5();
             let stream = bytes_to_stream(content.clone());
             storage
                 .put_object(crate::storage::StoreObjectRequest::new(
+                    TEST_BUCKET,
                     &key,
                     stream,
                     integrity_checks,
@@ -833,13 +885,15 @@ mod tests {
                 .unwrap();
         }
 
-        // List all objects
-        let request = crate::storage::ListObjectsRequest { prefix: None };
+        let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
+            prefix: None,
+        };
         let objects = storage.list_objects(request).await.unwrap();
         assert_eq!(objects.objects.len(), 3);
 
-        // List with prefix
         let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
             prefix: Some("test-key-1"),
         };
         let objects = storage.list_objects(request).await.unwrap();
@@ -853,10 +907,10 @@ mod tests {
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
-        let metadata = create_test_metadata(0); // Will be updated on completion
+        let metadata = create_test_metadata(0);
 
-        // Create multipart upload
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             key,
             upload_id,
             metadata,
@@ -864,7 +918,6 @@ mod tests {
         };
         storage.create_multipart_upload(request).await.unwrap();
 
-        // Upload parts
         let part1 = Bytes::from("part1");
         let part2 = Bytes::from("part2");
 
@@ -881,14 +934,13 @@ mod tests {
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
-        // List parts
         let parts = storage.list_parts(upload_id).await.unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].part_number, 1); // part number
+        assert_eq!(parts[0].part_number, 1);
 
-        // Complete multipart upload
         let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
         let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
@@ -897,8 +949,11 @@ mod tests {
 
         assert_eq!(response.key, key);
 
-        // Verify the final object exists and has correct content length
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
@@ -906,8 +961,7 @@ mod tests {
             response.metadata.content_length,
             (part1.len() + part2.len()) as u64
         );
-        let final_stream = response.stream;
-        let final_content = collect_stream_data(final_stream).await;
+        let final_content = collect_stream_data(response.stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
     }
 
@@ -919,8 +973,8 @@ mod tests {
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
 
-        // Create multipart upload
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             key,
             upload_id,
             metadata,
@@ -928,7 +982,6 @@ mod tests {
         };
         storage.create_multipart_upload(request).await.unwrap();
 
-        // Upload only one part
         let part1 = Bytes::from("part1");
         let request = crate::storage::UploadPartRequest {
             upload_id,
@@ -937,9 +990,9 @@ mod tests {
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
-        // Try to complete with a missing part
         let parts_to_complete = vec![(1, etag1.etag), (2, "missing-etag".to_string())];
         let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
@@ -956,8 +1009,8 @@ mod tests {
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
 
-        // Create multipart upload
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             key,
             upload_id,
             metadata,
@@ -965,7 +1018,6 @@ mod tests {
         };
         storage.create_multipart_upload(request).await.unwrap();
 
-        // Upload a part
         let part1 = Bytes::from("part1");
         let request = crate::storage::UploadPartRequest {
             upload_id,
@@ -974,10 +1026,8 @@ mod tests {
         };
         storage.upload_part(request).await.unwrap();
 
-        // Abort the upload
         storage.abort_multipart_upload(upload_id).await.unwrap();
 
-        // Verify we can't list parts anymore
         let result = storage.list_parts(upload_id).await;
         assert!(result.is_err());
     }
@@ -990,10 +1040,10 @@ mod tests {
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content.clone());
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -1001,17 +1051,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Get object
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
-        let retrieved_stream = response.stream;
-        let retrieved_content = collect_stream_data(retrieved_stream).await;
+        let retrieved_content = collect_stream_data(response.stream).await;
         assert_eq!(retrieved_content, content);
 
-        // List objects
         let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
             prefix: Some("nested/"),
         };
         let objects = storage.list_objects(request).await.unwrap();
@@ -1027,10 +1079,10 @@ mod tests {
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content.clone());
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -1038,13 +1090,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Get object
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
-        let retrieved_stream = response.stream;
-        let retrieved_content = collect_stream_data(retrieved_stream).await;
+        let retrieved_content = collect_stream_data(response.stream).await;
         assert_eq!(retrieved_content, content);
     }
 }

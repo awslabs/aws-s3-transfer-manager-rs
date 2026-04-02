@@ -152,6 +152,10 @@ pub(crate) struct PartMetadata {
 /// Metadata for a multipart upload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MultipartUploadMetadata {
+    /// Bucket the completed object belongs to.
+    #[serde(default)]
+    pub bucket: Option<String>,
+
     /// Key of the object being uploaded.
     pub key: String,
 
