@@ -277,24 +277,16 @@ impl Scheduler {
             desc.notify_idle();
         }
 
-        // Terminal transfer: no further work to generate. Clean up when fully drained.
+        // Terminal transfer: no further work from THIS transfer. Clean up when fully drained.
         if desc.is_terminal() {
             if is_idle {
                 self.0.transfers.write().unwrap().remove(&desc.id());
             }
-            return;
         }
 
-        // capacity has freed try to queue up more work
-        tracing::trace!(
-            target: telemetry::TARGET_SCHEDULING,
-            "entering generate_work from on_completion",
-        );
+        // A concurrency slot was freed — always generate work. Other transfers
+        // may be waiting for capacity.
         self.generate_work();
-        tracing::trace!(
-            target: telemetry::TARGET_SCHEDULING,
-            "generate_work returned",
-        );
     }
 
     /// Handle a panic during work execution. The transfer's internal state is
@@ -517,6 +509,41 @@ mod tests {
         for (i, sm) in state_machines.iter().enumerate() {
             assert!(sm.is_complete(), "transfer {} should be complete", i);
             assert_eq!(sm.completed_count(), 4);
+        }
+        scheduler.shutdown();
+    }
+
+    /// Regression test: many single-work-item transfers with concurrency target
+    /// lower than the transfer count. Each transfer generates exactly one work
+    /// item (like a single PutObject upload). All must complete — if on_completion
+    /// doesn't call generate_work() for terminal transfers, only the first
+    /// `concurrency` transfers complete and the rest hang forever.
+    #[tokio::test]
+    async fn test_single_work_transfers_exceed_concurrency() {
+        let scheduler = Scheduler::new(2);
+        let mut state_machines = Vec::new();
+
+        for i in 0..10u64 {
+            let id = TransferId {
+                id: i,
+                parent: None,
+            };
+            let sm = Arc::new(FixedWorkCount::new(1));
+            state_machines.push(sm.clone());
+            scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all 10 transfers should complete — scheduler must generate work after terminal completions");
+
+        for (i, sm) in state_machines.iter().enumerate() {
+            assert!(sm.is_complete(), "transfer {} should be complete", i);
+            assert_eq!(sm.completed_count(), 1);
         }
         scheduler.shutdown();
     }

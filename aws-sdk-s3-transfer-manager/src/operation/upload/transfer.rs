@@ -503,6 +503,11 @@ impl UploadTransfer {
             .take()
             .expect("stream should be present for PutObject");
 
+        let content_length = stream
+            .size_hint()
+            .upper()
+            .expect("content length must be known for PutObject");
+
         // TODO: PutObject streams data lazily through the SDK — the actual
         // source I/O happens when the SDK consumes the ByteStream during send.
         // For scheduler control over source I/O (important for many small files),
@@ -533,6 +538,16 @@ impl UploadTransfer {
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
+
+        self.inner
+            .ctx
+            .handle
+            .telemetry
+            .io_counters
+            .record(&crate::metrics::IoSample {
+                network_tx: content_length,
+                ..Default::default()
+            });
 
         WorkOutcome::Success { data: None }
     }
@@ -799,6 +814,12 @@ mod tests {
         assert!(matches!(outcome, WorkOutcome::Success { .. }));
 
         assert!(transfer.take_result().is_some());
+
+        // PutObject must record network_tx so the adaptive controller sees throughput
+        assert!(
+            !transfer.ctx().handle.telemetry.io_counters.is_idle(),
+            "PutObject should record network_tx to IOCounters"
+        );
     }
 
     #[tokio::test]
