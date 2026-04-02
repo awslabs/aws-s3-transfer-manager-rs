@@ -219,7 +219,7 @@ impl S3MockServer {
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-                b.build().into_shared()
+                b.build()
             };
             loop {
                 let (socket, _) = tokio::select! {

@@ -15,9 +15,19 @@ use base64::Engine;
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use s3s::dto::Timestamp;
-use s3s::dto::{HeadBucketInput, HeadBucketOutput, StreamingBlob};
+use s3s::dto::{ETag, HeadBucketInput, HeadBucketOutput, StreamingBlob};
 use s3s::{S3Request, S3Response, S3Result};
 use std::str::FromStr;
+
+/// Convert a quoted etag string (e.g. `"\"abc123\""`) to `ETag::Strong("abc123")`.
+fn etag_from_quoted(s: &str) -> ETag {
+    ETag::Strong(s.trim_matches('"').to_owned())
+}
+
+/// Convert a quoted etag string to `Option<ETag::Strong>`.
+fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
+    s.map(|v| etag_from_quoted(&v))
+}
 
 /// Inner implementation of the s3s::S3 trait.
 ///
@@ -97,7 +107,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Use the stream directly
         output.body = Some(StreamingBlob::wrap(stream));
 
-        output.e_tag = Some(stream_metadata.etag);
+        output.e_tag = Some(etag_from_quoted(&stream_metadata.etag));
 
         let timestamp = Timestamp::from(stream_metadata.last_modified);
         output.last_modified = Some(timestamp);
@@ -138,7 +148,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let content_type = metadata.content_type.and_then(|ct| ct.parse().ok());
         let mut output = s3s::dto::HeadObjectOutput {
             content_length: Some(metadata.content_length as i64),
-            e_tag: Some(metadata.etag),
+            e_tag: Some(etag_from_quoted(&metadata.etag)),
             last_modified: Some(Timestamp::from(metadata.last_modified)),
             content_type,
             metadata: Some(metadata.user_metadata),
@@ -180,7 +190,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         let output = s3s::dto::PutObjectOutput {
-            e_tag: stored_meta.object_integrity.etag(),
+            e_tag: opt_etag_from_quoted(stored_meta.object_integrity.etag()),
             checksum_crc32: stored_meta.object_integrity.crc32,
             checksum_crc32c: stored_meta.object_integrity.crc32c,
             checksum_sha1: stored_meta.object_integrity.sha1,
@@ -320,7 +330,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Build response with checksums
         let output = s3s::dto::UploadPartOutput {
-            e_tag: Some(response.etag),
+            e_tag: Some(etag_from_quoted(&response.etag)),
             checksum_crc32: calculated_integrity.crc32,
             checksum_crc32c: calculated_integrity.crc32c,
             checksum_sha1: calculated_integrity.sha1,
@@ -352,7 +362,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                     .part_number
                     .ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
                 let etag = part.e_tag.ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
-                parts.push((part_number, etag));
+                parts.push((part_number, format!("\"{}\"", etag.value())));
             }
         }
 
@@ -380,7 +390,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         let output = s3s::dto::CompleteMultipartUploadOutput {
             key: Some(response.key),
-            e_tag: Some(response.etag),
+            e_tag: Some(etag_from_quoted(&response.etag)),
             bucket: Some(bucket),
             checksum_crc32: response.object_integrity.crc32,
             checksum_crc32c: response.object_integrity.crc32c,
@@ -472,7 +482,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 let object = s3s::dto::Object {
                     key: Some(obj.key),
                     size: Some(obj.metadata.content_length as i64),
-                    e_tag: Some(obj.metadata.etag),
+                    e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
                     last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
                     ..Default::default()
                 };
@@ -485,7 +495,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 let object = s3s::dto::Object {
                     key: Some(obj.key),
                     size: Some(obj.metadata.content_length as i64),
-                    e_tag: Some(obj.metadata.etag),
+                    e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
                     last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
                     ..Default::default()
                 };
@@ -587,6 +597,20 @@ mod tests {
     use futures::stream;
     use s3s::S3;
 
+    fn s3_request<T>(input: T) -> S3Request<T> {
+        S3Request {
+            input,
+            method: http::Method::GET,
+            uri: http::Uri::default(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
     fn create_get_object_input(bucket: &str, key: &str) -> s3s::dto::GetObjectInput {
         s3s::dto::GetObjectInput::builder()
             .bucket(s3s::dto::BucketName::from(bucket))
@@ -614,7 +638,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         inner.put_object(req).await.expect("Failed to put object")
     }
 
@@ -629,7 +653,7 @@ mod tests {
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=0-49").unwrap());
 
-        let req = S3Request::new(input);
+        let req = s3_request(input);
 
         // Call the method
         let result = inner.get_object(req).await.expect("Get object failed");
@@ -642,8 +666,8 @@ mod tests {
         assert_eq!(output.content_range, Some("bytes 0-49/100".to_string()));
 
         // The etag should be the MD5 hash of the content (calculated during put_object)
-        let expected_etag = format!("\"{}\"", hex::encode(md5::compute(content).0));
-        assert_eq!(output.e_tag.unwrap().as_str(), &expected_etag);
+        let expected_etag = hex::encode(md5::compute(content).0);
+        assert_eq!(output.e_tag.unwrap().value(), &expected_etag);
 
         let mut body = output.body.unwrap();
 
@@ -670,7 +694,7 @@ mod tests {
         // Test case 1: Range at the beginning
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=0-4").unwrap());
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         let result = inner.get_object(req).await.expect("Get object failed");
         let output = result.output;
 
@@ -680,7 +704,7 @@ mod tests {
         // Test case 2: Range at the end
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=5-9").unwrap());
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         let result = inner.get_object(req).await.expect("Get object failed");
         let output = result.output;
 
@@ -690,7 +714,7 @@ mod tests {
         // Test case 3: Single byte range
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=3-3").unwrap());
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         let result = inner.get_object(req).await.expect("Get object failed");
         let output = result.output;
 
@@ -725,7 +749,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .put_object(S3Request::new(input))
+            .put_object(s3_request(input))
             .await
             .expect("Put should succeed");
         assert_eq!(result.output.checksum_crc32, Some(expected_crc32));
@@ -743,7 +767,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result_wrong = inner.put_object(S3Request::new(input_wrong)).await;
+        let result_wrong = inner.put_object(s3_request(input_wrong)).await;
         assert!(result_wrong.is_err());
     }
 
@@ -767,7 +791,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .put_object(S3Request::new(input))
+            .put_object(s3_request(input))
             .await
             .expect("Put should succeed");
 
@@ -791,7 +815,7 @@ mod tests {
             .unwrap();
 
         let create_result = inner
-            .create_multipart_upload(S3Request::new(create_input))
+            .create_multipart_upload(s3_request(create_input))
             .await
             .expect("Create multipart upload failed");
         let upload_id = create_result.output.upload_id.unwrap();
@@ -820,7 +844,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .upload_part(S3Request::new(input))
+            .upload_part(s3_request(input))
             .await
             .expect("Upload part should succeed");
         assert_eq!(result.output.checksum_crc32, Some(expected_crc32));
@@ -840,7 +864,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result_wrong = inner.upload_part(S3Request::new(input_wrong)).await;
+        let result_wrong = inner.upload_part(s3_request(input_wrong)).await;
         assert!(result_wrong.is_err());
     }
 
@@ -857,7 +881,7 @@ mod tests {
             .unwrap();
 
         let create_result = inner
-            .create_multipart_upload(S3Request::new(create_input))
+            .create_multipart_upload(s3_request(create_input))
             .await
             .expect("Create multipart upload failed");
         let upload_id = create_result.output.upload_id.unwrap();
@@ -880,7 +904,7 @@ mod tests {
                 .unwrap();
 
             let result = inner
-                .upload_part(S3Request::new(input))
+                .upload_part(s3_request(input))
                 .await
                 .expect("Upload part failed");
             part_etags.push(result.output.e_tag.unwrap());
@@ -910,7 +934,7 @@ mod tests {
             .unwrap();
 
         let valid_result = inner
-            .complete_multipart_upload(S3Request::new(valid_input))
+            .complete_multipart_upload(s3_request(valid_input))
             .await;
         assert!(valid_result.is_ok());
 
@@ -922,7 +946,7 @@ mod tests {
             .unwrap();
 
         let create_result2 = inner
-            .create_multipart_upload(S3Request::new(create_input2))
+            .create_multipart_upload(s3_request(create_input2))
             .await
             .expect("Create multipart upload failed");
         let upload_id2 = create_result2.output.upload_id.unwrap();
@@ -931,12 +955,12 @@ mod tests {
         let invalid_parts = vec![
             s3s::dto::CompletedPart {
                 part_number: Some(1),
-                e_tag: Some("etag1".to_string()),
+                e_tag: Some(ETag::Strong("etag1".to_string())),
                 ..Default::default()
             },
             s3s::dto::CompletedPart {
                 part_number: Some(3),
-                e_tag: Some("etag3".to_string()),
+                e_tag: Some(ETag::Strong("etag3".to_string())),
                 ..Default::default()
             },
         ];
@@ -951,7 +975,7 @@ mod tests {
             .unwrap();
 
         let invalid_result = inner
-            .complete_multipart_upload(S3Request::new(invalid_input))
+            .complete_multipart_upload(s3_request(invalid_input))
             .await;
         assert!(invalid_result.is_err());
     }
@@ -968,7 +992,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = inner.create_multipart_upload(S3Request::new(input)).await;
+        let result = inner.create_multipart_upload(s3_request(input)).await;
         assert!(result.is_ok());
 
         // The response should include the default CRC64NVME algorithm
@@ -1000,7 +1024,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .create_multipart_upload(S3Request::new(invalid_input))
+            .create_multipart_upload(s3_request(invalid_input))
             .await;
         assert!(result.is_err());
 
@@ -1016,7 +1040,7 @@ mod tests {
             .unwrap();
 
         let result2 = inner
-            .create_multipart_upload(S3Request::new(invalid_input2))
+            .create_multipart_upload(s3_request(invalid_input2))
             .await;
         assert!(result2.is_err());
 
@@ -1029,9 +1053,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result3 = inner
-            .create_multipart_upload(S3Request::new(valid_input))
-            .await;
+        let result3 = inner.create_multipart_upload(s3_request(valid_input)).await;
         assert!(result3.is_ok());
         let output = result3.unwrap().output;
         assert_eq!(
