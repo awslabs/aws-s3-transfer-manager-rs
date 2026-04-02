@@ -3,16 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Tracing target constants for structured log filtering.
+//! Tracing target constants and observability surface for transfer operations.
 //!
 //! These targets allow filtering logs by concern rather than module path:
 //!
 //! ```text
-//! RUST_LOG=aws_s3_transfer_manager::concurrency=debug    # concurrency decisions
-//! RUST_LOG=aws_s3_transfer_manager::scheduling=debug     # scheduling decisions
+//! RUST_LOG=aws_s3_transfer_manager::concurrency=debug   # adaptive algorithm decisions
+//! RUST_LOG=aws_s3_transfer_manager::scheduling=debug     # scheduler capacity, worker pool
 //! RUST_LOG=aws_s3_transfer_manager::execution=trace      # per-work-item execute/complete
 //! RUST_LOG=aws_s3_transfer_manager::transfer=debug       # transfer lifecycle events
 //! ```
+
+use crate::metrics::latency::LatencyTracker;
+use crate::metrics::IOCounters;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Adaptive concurrency controller: phase transitions, target changes, probe results.
 pub(crate) const TARGET_CONCURRENCY: &str = "aws_s3_transfer_manager::concurrency";
@@ -25,3 +30,36 @@ pub(crate) const TARGET_EXECUTION: &str = "aws_s3_transfer_manager::execution";
 
 /// Transfer lifecycle: enqueue, complete, cancel, fail, state transitions.
 pub(crate) const TARGET_TRANSFER: &str = "aws_s3_transfer_manager::transfer";
+
+/// Observability surface for transfer operations.
+///
+/// Groups latency tracking and throughput counters. Transfers record
+/// directly; the adaptive concurrency controller reads aggregated views.
+pub(crate) struct Telemetry {
+    /// Latency tracking for outbound data plane (upload part sends).
+    pub(crate) send_latencies: LatencyTracker,
+    /// Latency tracking for inbound data plane (download range receives).
+    pub(crate) recv_latencies: LatencyTracker,
+    /// Throughput counters (network tx/rx, disk read/write).
+    pub(crate) io_counters: Arc<IOCounters>,
+}
+
+impl Telemetry {
+    /// Create telemetry with the given window duration for throughput counters.
+    pub(crate) fn new(counter_window: Duration) -> Self {
+        Self {
+            send_latencies: LatencyTracker::new(),
+            recv_latencies: LatencyTracker::new(),
+            io_counters: Arc::new(IOCounters::new(counter_window)),
+        }
+    }
+}
+
+impl std::fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telemetry")
+            .field("send_latencies", &self.send_latencies)
+            .field("recv_latencies", &self.recv_latencies)
+            .finish()
+    }
+}

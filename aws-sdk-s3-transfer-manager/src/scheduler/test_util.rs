@@ -53,6 +53,7 @@ impl MockTransfer {
             legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
             ),
+            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
         });
 
         let (ctx, _completion_rx) = TransferContext::with_id(id, handle);

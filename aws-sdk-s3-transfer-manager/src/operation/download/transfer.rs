@@ -298,6 +298,7 @@ impl DownloadTransfer {
             Some((stream, chunk_meta, slot)) => {
                 let seq = slot.seq();
                 let mut segmented = SegmentedBuf::new();
+                let mut bytes_received: u64 = 0;
                 let mut body_stream = stream;
                 while let Some(result) = body_stream.next().await {
                     let data = match result {
@@ -309,6 +310,7 @@ impl DownloadTransfer {
                                 .fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
                         }
                     };
+                    bytes_received += data.len() as u64;
                     segmented.push(data);
                     if !self.inner.ctx.is_active() {
                         self.decrement_in_flight();
@@ -324,6 +326,16 @@ impl DownloadTransfer {
 
                 slot.fill(chunk);
                 self.decrement_in_flight();
+
+                self.inner
+                    .ctx
+                    .handle
+                    .telemetry
+                    .io_counters
+                    .record(&crate::metrics::IoSample {
+                        network_rx: bytes_received,
+                        ..Default::default()
+                    });
 
                 WorkOutcome::Success { data: None }
             }
@@ -341,53 +353,65 @@ impl DownloadTransfer {
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
-        let mut req = self
+        let result = self
             .inner
             .ctx
-            .s3_client()
-            .get_object()
-            .bucket(input.bucket().unwrap_or_default())
-            .key(input.key().unwrap_or_default())
-            .range(&range_header);
+            .handle
+            .telemetry
+            .recv_latencies
+            .guarded(|| {
+                let rh = range_header.clone();
+                let etag = etag.clone();
+                let ctx = self.inner.ctx.clone();
+                let mut req = self
+                    .inner
+                    .ctx
+                    .s3_client()
+                    .get_object()
+                    .bucket(input.bucket().unwrap_or_default())
+                    .key(input.key().unwrap_or_default())
+                    .range(rh.clone());
 
-        if let Some(ref etag) = etag {
-            req = req.if_match(etag.as_ref());
-        }
+                if let Some(ref etag) = etag {
+                    req = req.if_match(etag.as_ref());
+                }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
+                async move {
+                    let resp = req.send().await.map_err(crate::error::Error::from)?;
+                    validate_content_range(seq, &rh, resp.content_range())?;
+                    let mut resp = resp;
+                    let body_stream = std::mem::replace(
+                        &mut resp.body,
+                        aws_sdk_s3::primitives::ByteStream::new(
+                            aws_smithy_types::body::SdkBody::empty(),
+                        ),
+                    );
+                    let chunk_meta = ChunkMetadata::from(resp);
+                    let mut segmented = SegmentedBuf::new();
+                    let mut bytes_received: u64 = 0;
+                    let mut body_stream = body_stream;
+                    while let Some(result) = body_stream.next().await {
+                        let data = result.map_err(|e| {
+                            crate::error::Error::new(crate::error::ErrorKind::IOError, e)
+                        })?;
+                        bytes_received += data.len() as u64;
+                        segmented.push(data);
+                        if !ctx.is_active() {
+                            return Err(crate::error::Error::new(
+                                crate::error::ErrorKind::OperationCancelled,
+                                "transfer cancelled during body read",
+                            ));
+                        }
+                    }
+                    Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
+                }
+            })
+            .await;
+
+        let (chunk_meta, segmented, bytes_received) = match result {
+            Ok(val) => val,
             Err(e) => return self.fail_range(seq, e),
         };
-
-        bail_if_terminal!(self);
-
-        if let Err(e) = validate_content_range(seq, &range_header, resp.content_range()) {
-            return self.fail_range(seq, e);
-        }
-
-        // Extract body before consuming resp for metadata
-        let mut resp = resp;
-        let body_stream = std::mem::replace(
-            &mut resp.body,
-            aws_sdk_s3::primitives::ByteStream::new(aws_smithy_types::body::SdkBody::empty()),
-        );
-        let chunk_meta = ChunkMetadata::from(resp);
-
-        // TODO: Handle ByteStreamError with retry (SDK doesn't retry these)
-        let mut segmented = SegmentedBuf::new();
-        let mut body_stream = body_stream;
-        while let Some(result) = body_stream.next().await {
-            let data = match result {
-                Ok(data) => data,
-                Err(e) => return self.fail_range(seq, e),
-            };
-            segmented.push(data);
-
-            if !self.inner.ctx.is_active() {
-                self.decrement_in_flight();
-                return WorkOutcome::Cancelled;
-            }
-        }
 
         bail_if_terminal!(self);
         let chunk = ChunkOutput {
@@ -398,6 +422,16 @@ impl DownloadTransfer {
 
         slot.fill(chunk);
         self.decrement_in_flight();
+
+        self.inner
+            .ctx
+            .handle
+            .telemetry
+            .io_counters
+            .record(&crate::metrics::IoSample {
+                network_rx: bytes_received,
+                ..Default::default()
+            });
 
         WorkOutcome::Success { data: None }
     }
@@ -542,6 +576,7 @@ mod tests {
             legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
             ),
+            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
         });
 
         let input = DownloadInput::builder()
@@ -642,6 +677,7 @@ mod tests {
             legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
             ),
+            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
         });
 
         let input = DownloadInput::builder()
@@ -788,6 +824,7 @@ mod tests {
             legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
             ),
+            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
         });
 
         let input = DownloadInput::builder()
@@ -804,32 +841,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_seq_window_limits_work_generation() {
+        // capacity=3: discovery claims seq 0, leaving room for 2 more
         let (transfer, _consumer) = create_download_with_capacity(128 * MB, 8 * MB, 3);
 
         skip_discovery(&transfer).await;
 
+        // seq 1, seq 2 — fills the window (claimed=3, consumed=0, capacity=3)
         let _w1 = assert_ready(transfer.poll_work());
         let _w2 = assert_ready(transfer.poll_work());
 
+        // Window full: claimed - consumed >= capacity
         assert_pending(transfer.poll_work());
     }
 
     #[tokio::test]
     async fn test_seq_window_consume_enables_more_work() {
+        // capacity=2: discovery claims seq 0, leaving room for 1 more
         let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
 
         skip_discovery(&transfer).await;
 
+        // seq 1 — window full (claimed=2, consumed=0)
         let mut w1 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
 
-        // Consume seq 0 (filled by discovery) to open the window
+        // Consumer reads seq 0 (discovery chunk) → consumed=1, window opens
         consumer.try_take_next();
 
+        // seq 2 — window full again (claimed=3, consumed=1)
         let mut w2 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
 
-        // Fill seq 1 from its work item, then consume it
+        // Fill seq 1, consumer reads it → consumed=2, window opens
         let slot1 = w1.data_mut::<DownloadWork>().take_slot().expect("has slot");
         let mut seg = bytes_utils::SegmentedBuf::new();
         seg.push(bytes::Bytes::from("data"));
@@ -840,10 +883,11 @@ mod tests {
         });
         consumer.try_take_next();
 
+        // seq 3 — window full (claimed=4, consumed=2)
         let w3 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
 
-        // Fill seq 2 from its work item, then consume it
+        // Fill seq 2, consumer reads it → consumed=3, window opens
         let slot2 = w2.data_mut::<DownloadWork>().take_slot().expect("has slot");
         let mut seg = bytes_utils::SegmentedBuf::new();
         seg.push(bytes::Bytes::from("data"));
@@ -854,6 +898,7 @@ mod tests {
         });
         consumer.try_take_next();
 
+        // seq 4 — window full (claimed=5, consumed=3)
         let _w4 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
 

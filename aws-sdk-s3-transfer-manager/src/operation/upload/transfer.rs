@@ -370,29 +370,43 @@ impl UploadTransfer {
 
         let part_num_i32 = part_number as i32;
         let content_length = data.data.remaining() as i64;
+        let bytes_sent = content_length as u64;
 
-        let req = copy_fields_to_upload_part_request(
-            &self.inner.request,
-            self.inner
-                .ctx
-                .s3_client()
-                .upload_part()
-                .upload_id(&upload_id)
-                .part_number(part_num_i32)
-                .content_length(content_length)
-                .body(ByteStream::from(data.data)),
-            data.checksum.as_ref(),
-        );
+        let data_bytes = data.data;
+        let checksum = data.checksum;
 
-        let resp = match req
-            .customize()
-            .disable_payload_signing()
-            .send()
-            .instrument(tracing::debug_span!("send-upload-part", part_number))
+        let resp = match self
+            .inner
+            .ctx
+            .handle
+            .telemetry
+            .send_latencies
+            .guarded(|| {
+                let body = ByteStream::from(data_bytes.clone());
+                let req = copy_fields_to_upload_part_request(
+                    &self.inner.request,
+                    self.inner
+                        .ctx
+                        .s3_client()
+                        .upload_part()
+                        .upload_id(&upload_id)
+                        .part_number(part_num_i32)
+                        .content_length(content_length)
+                        .body(body),
+                    checksum.as_ref(),
+                );
+                async move {
+                    req.customize()
+                        .disable_payload_signing()
+                        .send()
+                        .instrument(tracing::debug_span!("send-upload-part", part_number))
+                        .await
+                }
+            })
             .await
         {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => return self.fail(e),
         };
 
         let completed = CompletedPart::builder()
@@ -416,6 +430,16 @@ impl UploadTransfer {
         }
 
         self.maybe_transition_to_completing();
+
+        self.inner
+            .ctx
+            .handle
+            .telemetry
+            .io_counters
+            .record(&crate::metrics::IoSample {
+                network_tx: bytes_sent,
+                ..Default::default()
+            });
 
         WorkOutcome::Success { data: None }
     }
@@ -617,6 +641,7 @@ mod tests {
             legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
                 crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
             ),
+            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
         });
 
         let input = UploadInput::builder()

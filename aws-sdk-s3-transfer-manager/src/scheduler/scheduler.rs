@@ -51,9 +51,8 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{CompletionSample, ConcurrencyController};
-use crate::transfer::{BoxTransfer, IoRequest, PollWork, TransferId, WorkOutcome};
+use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
 
-use crate::metrics::IOCounters;
 use crate::runtime::{ExecutionRuntime, ScheduledWork};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -74,7 +73,6 @@ struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     controller: Arc<dyn ConcurrencyController>,
-    io_counters: Arc<IOCounters>,
     runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
     dispatched: AtomicUsize,
 }
@@ -88,18 +86,11 @@ impl std::fmt::Debug for Scheduler {
 /// Builder for constructing a [`Scheduler`] with its runtime.
 pub(crate) struct SchedulerBuilder {
     controller: Arc<dyn ConcurrencyController>,
-    io_counters: Arc<IOCounters>,
 }
 
 impl SchedulerBuilder {
-    pub(crate) fn new(
-        controller: Arc<dyn ConcurrencyController>,
-        io_counters: Arc<IOCounters>,
-    ) -> Self {
-        Self {
-            controller,
-            io_counters,
-        }
+    pub(crate) fn new(controller: Arc<dyn ConcurrencyController>) -> Self {
+        Self { controller }
     }
 
     /// Build the scheduler with its runtime.
@@ -117,7 +108,6 @@ impl SchedulerBuilder {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
             controller: self.controller,
-            io_counters: self.io_counters,
             runtime: OnceLock::new(),
             dispatched: AtomicUsize::new(0),
         }));
@@ -134,19 +124,13 @@ impl SchedulerBuilder {
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
-        SchedulerBuilder::new(
-            Arc::new(super::FixedConcurrency::new(concurrency)),
-            Arc::new(IOCounters::new(Duration::from_millis(500))),
-        )
-        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency)))
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
     pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
-        SchedulerBuilder::new(
-            controller,
-            Arc::new(IOCounters::new(Duration::from_millis(500))),
-        )
-        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+        SchedulerBuilder::new(controller)
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
     pub(crate) fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
@@ -238,7 +222,7 @@ impl Scheduler {
         &self,
         work: ScheduledWork,
         outcome: WorkOutcome,
-        elapsed: Duration,
+        _elapsed: Duration,
     ) {
         self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
 
@@ -247,11 +231,6 @@ impl Scheduler {
             WorkOutcome::Failed { classification } => *classification,
             _ => None,
         };
-        let io_sample = crate::metrics::IoSample {
-            duration: elapsed,
-            ..Default::default()
-        };
-        self.0.io_counters.record(&io_sample);
         let sample = CompletionSample {
             error: classification,
         };

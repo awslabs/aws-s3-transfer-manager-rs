@@ -722,6 +722,7 @@ mod tests {
             config,
             scheduler,
             legacy_scheduler,
+            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
         });
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
