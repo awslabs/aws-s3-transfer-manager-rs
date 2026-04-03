@@ -383,7 +383,7 @@ impl DownloadTransfer {
                     let body_stream = std::mem::replace(
                         &mut resp.body,
                         aws_sdk_s3::primitives::ByteStream::new(
-                            aws_smithy_types::body::SdkBody::empty(),
+                            aws_smithy_types::body::SdkBody::taken(),
                         ),
                     );
                     let chunk_meta = ChunkMetadata::from(resp);
