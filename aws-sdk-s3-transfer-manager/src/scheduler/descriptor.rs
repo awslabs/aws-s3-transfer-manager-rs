@@ -46,7 +46,7 @@ impl std::fmt::Debug for TransferDescriptor {
 }
 
 impl TransferDescriptor {
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(crate) fn new(transfer: BoxTransfer) -> Self {
         Self::new_with_vruntime(transfer, 0)
     }
@@ -81,7 +81,7 @@ impl TransferDescriptor {
         self.0.vruntime.load(Ordering::Acquire)
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(crate) fn set_vruntime(&self, vruntime: u64) {
         self.0.vruntime.store(vruntime, Ordering::Release);
     }
@@ -147,12 +147,12 @@ impl TransferDescriptor {
 }
 
 /// Packed atomic counter for queued + executing counts.
-/// Layout: `[queued: u32][executing: u32]`
 ///
-/// Packed into a single AtomicU64 so transitions (queued-to-executing, read both)
-/// are a single atomic operation. Two separate AtomicU32s would require two loads
-/// to read both counts, with a possible inconsistent snapshot between them, and
-/// two CAS operations for the queued-to-executing transition.
+/// A single `AtomicU64` instead of two `AtomicU32`s so that `start_executing`
+/// (queued-1, executing+1) is a single CAS — no window where the counts are
+/// inconsistent and `is_idle()` could return a false positive.
+///
+/// Layout: `[queued: u32][executing: u32]`
 #[derive(Debug, Default)]
 struct QueuedExecuting(AtomicU64);
 
@@ -194,13 +194,13 @@ impl QueuedExecuting {
         self.0.load(Ordering::Acquire) == 0
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     fn get(&self) -> (u32, u32) {
         let val = self.0.load(Ordering::Acquire);
         ((val >> 32) as u32, val as u32)
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     fn outstanding(&self) -> u64 {
         let (q, e) = self.get();
         q as u64 + e as u64
@@ -299,7 +299,8 @@ mod tests {
 
     mod priority_vruntime {
         use super::*;
-        use crate::scheduler::test_util::{FixedWorkCount, MockTransfer};
+        use crate::scheduler::transfer::mock::FixedWorkCount;
+        use crate::scheduler::MockTransfer;
         use std::sync::Arc;
 
         fn test_descriptor(id: u64) -> TransferDescriptor {

@@ -83,22 +83,19 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
-/// Tower related middleware and components
-pub(crate) mod middleware;
-
 /// HTTP related components and utils
 pub(crate) mod http;
-
-/// Internal runtime components
-pub(crate) mod runtime;
-
-/// Scheduler for coordinating transfer execution
-pub(crate) mod scheduler;
 
 /// Transfer types
 pub(crate) mod transfer;
 
-/// Telemetry: tracing targets, latency tracking, and throughput counters
+/// Work scheduler
+pub(crate) mod scheduler;
+
+/// Execution runtime
+pub(crate) mod runtime;
+
+/// Telemetry target constants
 pub(crate) mod telemetry;
 
 /// Metrics
@@ -107,6 +104,7 @@ pub mod metrics;
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::Config;
+pub use self::config::S3ClientConfig;
 pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader

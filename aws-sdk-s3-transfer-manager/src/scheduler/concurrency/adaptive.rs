@@ -489,7 +489,8 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 
     fn on_completion(&self, sample: &CompletionSample) {
-        self.in_flight
+        let _ = self
+            .in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
@@ -556,7 +557,7 @@ mod tests {
         /// Returns with accepted = initial_concurrency, history cleared.
         fn exit_slow_start(&self) {
             self.record_goodput(1000.0); // bootstrap
-                                         // Need exit_threshold consecutive rejections (default 4)
+                                         // Need exit_threshold consecutive rejections (default 3)
             let threshold = self.0.config.slow_start.exit_threshold;
             for _ in 0..threshold {
                 self.record_goodput(1000.0);

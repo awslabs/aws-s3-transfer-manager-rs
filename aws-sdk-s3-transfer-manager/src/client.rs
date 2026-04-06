@@ -3,11 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::runtime::scheduler::Scheduler as LegacyScheduler;
+use crate::runtime::ManagedThreadRuntime;
+use crate::scheduler::{
+    AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
+    Scheduler, SchedulerBuilder,
+};
+use crate::telemetry::Telemetry;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
 use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -19,9 +25,9 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
-    pub(crate) scheduler: crate::scheduler::Scheduler,
-    pub(crate) legacy_scheduler: LegacyScheduler,
-    pub(crate) telemetry: crate::telemetry::Telemetry,
+    pub(crate) s3_client: aws_sdk_s3::Client,
+    pub(crate) scheduler: Scheduler,
+    pub(crate) telemetry: Telemetry,
 }
 
 impl Handle {
@@ -60,42 +66,71 @@ impl Handle {
             PartSize::Target(explicit) => *explicit,
         }
     }
+
+    /// Create a Handle from a Config and Scheduler, resolving the S3 client.
+    #[cfg(test)]
+    pub(crate) fn with_config_and_scheduler(
+        mut config: crate::Config,
+        scheduler: Scheduler,
+    ) -> Self {
+        let s3_client = match config.take_s3_client_source() {
+            crate::config::S3ClientSource::Provided(client) => client,
+            crate::config::S3ClientSource::FromConfig(s3_config) => {
+                aws_sdk_s3::Client::from_conf(s3_config.builder.build())
+            }
+        };
+        Self {
+            config,
+            s3_client,
+            scheduler,
+            telemetry: Telemetry::new(std::time::Duration::from_millis(500)),
+        }
+    }
 }
 
 impl Client {
     /// Creates a new client from a transfer manager config.
-    pub fn new(config: Config) -> Client {
-        use crate::scheduler::{
-            AdaptiveConcurrencyController, AdaptiveConfig, FixedConcurrency, SchedulerBuilder,
-        };
-        use std::time::Duration;
-
-        let (controller, telemetry): (Arc<dyn crate::scheduler::ConcurrencyController>, _) =
+    pub fn new(mut config: Config) -> Client {
+        // 1. Create runtime (spawns threads, creates per-thread state)
+        let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) =
             match config.concurrency() {
-                ConcurrencyMode::Explicit(c) => (
-                    Arc::new(FixedConcurrency::new(*c)),
-                    crate::telemetry::Telemetry::new(Duration::from_millis(500)),
+                ConcurrencyMode::Explicit(n) => (
+                    Arc::new(FixedConcurrency::new(*n)),
+                    Telemetry::new(Duration::from_millis(500)),
                 ),
                 // TODO(vnext): implement support for target throughput
                 _ => {
                     let adaptive_config = AdaptiveConfig::default();
-                    let telemetry =
-                        crate::telemetry::Telemetry::new(adaptive_config.window.duration);
+                    let telemetry = Telemetry::new(adaptive_config.window.duration);
                     let controller = Arc::new(AdaptiveConcurrencyController::new(
                         adaptive_config,
-                        telemetry.io_counters.clone(),
+                        Arc::clone(&telemetry.io_counters),
                     ));
                     (controller, telemetry)
                 }
             };
+        let scheduler = SchedulerBuilder::new(controller)
+            // .build(|scheduler| Arc::new(TokioMultiThreadRuntime::new(scheduler)));
+            .build(|scheduler| Arc::new(ManagedThreadRuntime::builder(scheduler).build()));
 
-        let new_scheduler = SchedulerBuilder::new(controller)
-            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)));
-        let legacy_scheduler = LegacyScheduler::new(config.concurrency().clone());
+        // 2. Build S3 client, injecting runtime transport when appropriate
+        let s3_client = match config.take_s3_client_source() {
+            crate::config::S3ClientSource::Provided(client) => client,
+            crate::config::S3ClientSource::FromConfig(s3_config) => {
+                let mut builder = s3_config.builder;
+                if s3_config.enable_runtime_http {
+                    if let Some(http_client) = scheduler.runtime().components().http_client() {
+                        builder = builder.http_client(http_client.clone());
+                    }
+                }
+                aws_sdk_s3::Client::from_conf(builder.build())
+            }
+        };
+
         let handle = Arc::new(Handle {
             config,
-            scheduler: new_scheduler,
-            legacy_scheduler,
+            s3_client,
+            scheduler,
             telemetry,
         });
         Client { handle }

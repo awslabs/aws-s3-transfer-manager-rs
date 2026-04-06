@@ -145,11 +145,22 @@ pub(super) enum RawInputStream {
 #[derive(Debug)]
 pub struct StreamContext {
     part_size: usize,
+    /// When true, file I/O runs directly on the calling thread.
+    direct_io: bool,
+    io_counters: std::sync::Arc<crate::metrics::IOCounters>,
 }
 
 impl StreamContext {
-    pub(super) fn new(part_size: usize) -> Self {
-        Self { part_size }
+    pub(super) fn new(
+        part_size: usize,
+        direct_io: bool,
+        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+    ) -> Self {
+        Self {
+            part_size,
+            direct_io,
+            io_counters,
+        }
     }
 
     /// The part size to use when yielding parts.
@@ -157,6 +168,16 @@ impl StreamContext {
     /// result in exceeding the maximum number of parts allowed).
     pub fn part_size(&self) -> usize {
         self.part_size
+    }
+
+    /// Whether file I/O should run directly on the calling thread.
+    pub(crate) fn direct_io(&self) -> bool {
+        self.direct_io
+    }
+
+    /// Throughput counters for recording I/O metrics at the source.
+    pub(crate) fn io_counters(&self) -> &crate::metrics::IOCounters {
+        &self.io_counters
     }
 
     // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.
@@ -170,7 +191,7 @@ impl StreamContext {
 /// Contents and (optional) metadata for a single part of a [multipart upload].
 ///
 /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
@@ -179,11 +200,23 @@ pub struct PartData {
     pub(crate) is_last: Option<bool>,
 }
 
+impl std::fmt::Debug for PartData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartData")
+            .field("part_number", &self.part_number)
+            .field("data_len", &self.data.len())
+            .field("checksum", &self.checksum)
+            .field("is_last", &self.is_last)
+            .finish()
+    }
+}
+
 impl PartData {
     // Check if this is the last part
     //
     // It is `Option` because it's not always possible to determine
     // whether the just-yielded part is the last one, e.g., streaming cases.
+    #[allow(dead_code)] // TODO(phase3): re-wire upload part validation
     pub(crate) fn is_last(&self) -> Option<bool> {
         self.is_last
     }

@@ -14,6 +14,7 @@ mod stream;
 
 /// Error types related to I/O abstractions
 pub mod error;
+pub(crate) mod fs;
 mod size_hint;
 
 // re-exports

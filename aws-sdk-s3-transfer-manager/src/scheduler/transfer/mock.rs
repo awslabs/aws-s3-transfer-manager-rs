@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Shared test utilities for scheduler and transfer state machine tests.
+//! Mock transfer implementations for testing scheduler behavior.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -45,16 +45,15 @@ impl MockTransfer {
         state_machine: Arc<S>,
     ) -> Self {
         use crate::DEFAULT_CONCURRENCY;
+        use std::sync::Arc;
 
+        // Create a minimal handle for testing
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let handle = Arc::new(crate::client::Handle {
-            config: crate::Config::builder().client(s3_client).build(),
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-            legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
-            ),
-            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
-        });
+        let config = crate::Config::builder().client(s3_client).build();
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
+            config,
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let (ctx, _completion_rx) = TransferContext::with_id(id, handle);
 
@@ -71,6 +70,8 @@ impl MockTransfer {
 
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let outcome = self.state_machine.execute(work).await;
+        // Mirror real transfer behavior: Failed means the transfer transitions
+        // itself to terminal state before returning.
         if matches!(outcome, WorkOutcome::Failed { .. }) {
             self.ctx.set_failed(crate::error::from_kind(
                 crate::error::ErrorKind::RuntimeError,
@@ -213,33 +214,6 @@ where
         let outcome = (self.execute_fn)(work);
         Box::pin(async move { outcome })
     }
-}
-
-/// Assert poll returns Ready and extract the work item.
-pub(crate) fn assert_ready(poll: PollWork) -> IoRequest {
-    match poll {
-        PollWork::Ready(w) => w,
-        PollWork::Pending => panic!("expected Ready, got Pending"),
-        PollWork::Done => panic!("expected Ready, got Done"),
-    }
-}
-
-/// Assert poll returns Pending.
-pub(crate) fn assert_pending(poll: PollWork) {
-    assert!(
-        matches!(poll, PollWork::Pending),
-        "expected Pending, got {:?}",
-        poll
-    );
-}
-
-/// Assert poll returns Done.
-pub(crate) fn assert_done(poll: PollWork) {
-    assert!(
-        matches!(poll, PollWork::Done),
-        "expected Done, got {:?}",
-        poll
-    );
 }
 
 #[cfg(test)]

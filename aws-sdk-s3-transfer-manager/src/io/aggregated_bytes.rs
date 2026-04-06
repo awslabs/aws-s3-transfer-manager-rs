@@ -5,7 +5,6 @@
 
 use std::io::IoSlice;
 
-use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 use bytes_utils::SegmentedBuf;
 
@@ -40,19 +39,6 @@ impl AggregatedBytes {
     /// Convert this buffer into a `Vec<u8>`
     pub fn to_vec(self) -> Vec<u8> {
         self.0.into_inner().into_iter().flatten().collect()
-    }
-
-    /// Make this buffer from a ByteStream
-    pub(crate) async fn from_byte_stream(
-        value: ByteStream,
-    ) -> Result<Self, aws_smithy_types::byte_stream::error::Error> {
-        let mut value = value;
-        let mut output = SegmentedBuf::new();
-        while let Some(buf) = value.next().await {
-            let buf = buf?;
-            output.push(buf);
-        }
-        Ok(AggregatedBytes(output))
     }
 }
 

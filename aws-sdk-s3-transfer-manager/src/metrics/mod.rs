@@ -328,7 +328,7 @@ pub(crate) struct IoSample {
 
 impl IoSample {
     /// Sample for a network send.
-    pub fn network_tx(bytes: u64, duration: Duration) -> Self {
+    pub(crate) fn network_tx(bytes: u64, duration: Duration) -> Self {
         Self {
             network_tx: bytes,
             duration,
@@ -337,7 +337,7 @@ impl IoSample {
     }
 
     /// Sample for a network receive.
-    pub fn network_rx(bytes: u64, duration: Duration) -> Self {
+    pub(crate) fn network_rx(bytes: u64, duration: Duration) -> Self {
         Self {
             network_rx: bytes,
             duration,
@@ -356,18 +356,16 @@ struct Bucket {
     epoch: AtomicUsize,
 }
 
-/// Rolling window for measuring recent throughput.
+/// Bucketed sliding window for throughput measurement.
 ///
-/// Tracks bytes over a short, fixed-duration window (e.g. 500ms) to provide
-/// a smoothed estimate of current throughput. The window is divided into
-/// equal-duration buckets arranged in a ring — each bucket accumulates bytes
-/// during its time slice, and stale buckets age out automatically.
+/// Divides the measurement window into `IO_WINDOW_BUCKETS` equal-duration
+/// buckets arranged in a ring. Each bucket accumulates bytes during its time
+/// slice. Stale buckets are identified by comparing their epoch against the
+/// current monotonic index — no per-bucket timestamps needed.
 ///
-/// `throughput()` returns bytes/sec over the full window duration. During
-/// ramp-up or after idle gaps, partially-filled windows naturally report
-/// lower values (fixed denominator, not per-bucket averaging).
-///
-/// `add()` uses `try_lock` so producers never block waiting for rotation.
+/// `throughput()` sums live buckets and divides by `window_duration` (fixed
+/// denominator), so partially-filled windows during ramp-up or after gaps
+/// naturally report lower throughput.
 pub(crate) struct IOWindow {
     buckets: [Bucket; IO_WINDOW_BUCKETS],
     /// Monotonic counter. `current_idx % IO_WINDOW_BUCKETS` is the active slot.
@@ -415,7 +413,7 @@ impl IOWindow {
                 bucket.bytes.store(0, Ordering::Release);
                 bucket.epoch.store(current, Ordering::Release);
             }
-            **guard = **guard + self.bucket_duration * steps as u32;
+            **guard += self.bucket_duration * steps as u32;
             current
         } else {
             let mut current = self.current_idx.load(Ordering::Acquire);
@@ -424,7 +422,7 @@ impl IOWindow {
                 let slot = current % IO_WINDOW_BUCKETS;
                 self.buckets[slot].bytes.store(0, Ordering::Release);
                 self.buckets[slot].epoch.store(current, Ordering::Release);
-                **guard = **guard + self.bucket_duration;
+                **guard += self.bucket_duration;
             }
             current
         }
@@ -475,10 +473,10 @@ impl fmt::Debug for IOWindow {
     }
 }
 
-/// Rolling throughput counters broken down by I/O direction.
+/// Sliding window throughput counters broken down by I/O direction.
 ///
-/// Wraps four [`IOWindow`]s — network sent/received and disk read/written —
-/// to provide per-direction and aggregate throughput measurements.
+/// Tracks network (sent/received) and disk (read/written) bytes in
+/// separate sliding windows.
 pub(crate) struct IOCounters {
     network_tx: IOWindow,
     network_rx: IOWindow,
