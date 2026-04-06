@@ -489,9 +489,10 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 
     fn on_completion(&self, sample: &CompletionSample) {
-        self.in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
+        self.in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
 
         // Throttle error: immediate transition to shedding
         if sample.error == Some(ErrorKind::Throttle) {

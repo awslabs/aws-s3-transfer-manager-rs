@@ -101,6 +101,10 @@ impl SchedulerBuilder {
         Self { controller }
     }
 
+    /// Build the scheduler, using `runtime_factory` to break the circular dependency:
+    /// the scheduler needs a runtime to dispatch work, and the runtime needs the
+    /// scheduler to call back into on completion. The factory receives the constructed
+    /// scheduler and returns the runtime; the scheduler stores it via `OnceLock`.
     pub(crate) fn build(
         self,
         runtime_factory: impl FnOnce(Scheduler) -> Arc<dyn ExecutionRuntime>,

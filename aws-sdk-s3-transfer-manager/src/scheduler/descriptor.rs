@@ -147,6 +147,11 @@ impl TransferDescriptor {
 }
 
 /// Packed atomic counter for queued + executing counts.
+///
+/// A single `AtomicU64` instead of two `AtomicU32`s so that `start_executing`
+/// (queued-1, executing+1) is a single CAS — no window where the counts are
+/// inconsistent and `is_idle()` could return a false positive.
+///
 /// Layout: `[queued: u32][executing: u32]`
 #[derive(Debug, Default)]
 struct QueuedExecuting(AtomicU64);

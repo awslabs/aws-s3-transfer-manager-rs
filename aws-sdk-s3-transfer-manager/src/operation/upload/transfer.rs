@@ -523,6 +523,8 @@ impl UploadTransfer {
         );
 
         let resp = match put_req
+            .customize()
+            .disable_payload_signing()
             .send()
             .instrument(tracing::debug_span!("send-put-object"))
             .await
