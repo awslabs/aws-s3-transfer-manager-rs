@@ -60,6 +60,6 @@ impl std::fmt::Debug for Telemetry {
         f.debug_struct("Telemetry")
             .field("send_latencies", &self.send_latencies)
             .field("recv_latencies", &self.recv_latencies)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

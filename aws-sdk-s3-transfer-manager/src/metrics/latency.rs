@@ -122,6 +122,10 @@ impl LatencyTracker {
         let hist = self.hist.lock().unwrap();
         let avg = Duration::from_micros(hist.mean() as u64);
         if avg > RETRY_COST_THRESHOLD {
+            tracing::debug!(
+                avg_ms = avg.as_millis() as u64,
+                "adaptive timeout disabled: average latency exceeds retry cost threshold"
+            );
             return None;
         }
 
