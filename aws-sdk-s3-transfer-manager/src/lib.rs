@@ -98,7 +98,7 @@ pub(crate) mod scheduler;
 /// Transfer types
 pub(crate) mod transfer;
 
-/// Telemetry target constants
+/// Telemetry: tracing targets, latency tracking, and throughput counters
 pub(crate) mod telemetry;
 
 /// Metrics

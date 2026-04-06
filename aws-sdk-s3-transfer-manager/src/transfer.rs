@@ -6,7 +6,6 @@
 //! Transfer types that define what a transfer is and what it produces.
 
 use crate::error;
-use crate::metrics::IoSample;
 use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
 use std::fmt;
@@ -58,15 +57,6 @@ impl<T: Any + Send + std::fmt::Debug> WorkData for T {
     }
 }
 
-/// The kind of I/O to be executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IoKind {
-    /// Disk I/O (read for uploads, write for downloads)
-    Disk,
-    /// HTTP request (uploads and downloads)
-    Network,
-}
-
 /// Unique identifier for a transfer, with optional parent for hierarchy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TransferId {
@@ -86,7 +76,6 @@ impl std::fmt::Display for TransferId {
 /// A unit of I/O to be scheduled and executed by the runtime.
 #[derive(Debug)]
 pub(crate) struct IoRequest {
-    pub(crate) kind: IoKind,
     pub(crate) data: Option<Box<dyn WorkData>>,
 }
 
@@ -115,18 +104,14 @@ pub(crate) enum PollWork {
 /// Result of executing a work item.
 ///
 /// Contract between transfer state machines and the scheduler:
-/// - `Success`: Transfer is still active. Scheduler handles follow-on work and continues polling.
+/// - `Success`: Work completed. Scheduler continues polling the transfer for more work.
 /// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
 ///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
 /// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
 ///   Same cleanup as `Failed`.
 pub(crate) enum WorkOutcome {
-    /// Work completed successfully. Optionally schedule follow-on work.
-    Success {
-        schedule_next: Option<IoKind>,
-        data: Option<Box<dyn WorkData>>,
-        metrics: Option<IoSample>,
-    },
+    /// Work completed successfully.
+    Success { data: Option<Box<dyn WorkData>> },
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
@@ -136,15 +121,9 @@ pub(crate) enum WorkOutcome {
 impl std::fmt::Debug for WorkOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorkOutcome::Success {
-                schedule_next,
-                data,
-                metrics,
-            } => f
+            WorkOutcome::Success { data } => f
                 .debug_struct("Success")
-                .field("schedule_next", schedule_next)
-                .field("data", data)
-                .field("metrics", metrics)
+                .field("has_data", &data.is_some())
                 .finish(),
             WorkOutcome::Failed { classification } => f
                 .debug_struct("Failed")
@@ -187,6 +166,12 @@ pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()
 /// Terminal states: Completed, Failed, Cancelled
 /// ```
 ///
+/// ## Transitions
+///
+/// - `Active → Completed`: All work finished successfully, output available
+/// - `Active → Failed`: A work item failed, error stored in context
+/// - `Active → Cancelled`: User requested cancellation or handle dropped
+///
 /// ## First-Write-Wins Semantics
 ///
 /// Only one transition from `Active` succeeds. Concurrent failures, cancellations,
@@ -209,6 +194,7 @@ pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()
 #[derive(Clone)]
 pub(crate) struct StateMachineStatus(Arc<AtomicU8>);
 
+// Status constants
 const STATUS_ACTIVE: u8 = 0;
 const STATUS_COMPLETED: u8 = 1;
 const STATUS_FAILED: u8 = 2;
@@ -580,6 +566,7 @@ mod tests {
         fn only_first_transition_wins() {
             let s = StateMachineStatus::new();
             assert!(s.set_failed());
+            // second transition fails — already terminal
             assert!(!s.set_completed());
             assert!(!s.set_cancelled());
             assert!(s.is_failed());

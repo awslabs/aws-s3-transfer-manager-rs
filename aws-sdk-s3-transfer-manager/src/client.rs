@@ -21,6 +21,7 @@ pub(crate) struct Handle {
     pub(crate) config: crate::Config,
     pub(crate) scheduler: crate::scheduler::Scheduler,
     pub(crate) legacy_scheduler: LegacyScheduler,
+    pub(crate) telemetry: crate::telemetry::Telemetry,
 }
 
 impl Handle {
@@ -64,37 +65,38 @@ impl Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(config: Config) -> Client {
-        use crate::metrics::IOCounters;
         use crate::scheduler::{
             AdaptiveConcurrencyController, AdaptiveConfig, FixedConcurrency, SchedulerBuilder,
         };
         use std::time::Duration;
 
-        let (controller, io_counters): (Arc<dyn crate::scheduler::ConcurrencyController>, _) =
+        let (controller, telemetry): (Arc<dyn crate::scheduler::ConcurrencyController>, _) =
             match config.concurrency() {
                 ConcurrencyMode::Explicit(c) => (
                     Arc::new(FixedConcurrency::new(*c)),
-                    Arc::new(IOCounters::new(Duration::from_millis(500))),
+                    crate::telemetry::Telemetry::new(Duration::from_millis(500)),
                 ),
                 // TODO(vnext): implement support for target throughput
                 _ => {
                     let adaptive_config = AdaptiveConfig::default();
-                    let io_counters = Arc::new(IOCounters::new(adaptive_config.window.duration));
+                    let telemetry =
+                        crate::telemetry::Telemetry::new(adaptive_config.window.duration);
                     let controller = Arc::new(AdaptiveConcurrencyController::new(
                         adaptive_config,
-                        io_counters.clone(),
+                        telemetry.io_counters.clone(),
                     ));
-                    (controller, io_counters)
+                    (controller, telemetry)
                 }
             };
 
-        let new_scheduler = SchedulerBuilder::new(controller, io_counters)
+        let new_scheduler = SchedulerBuilder::new(controller)
             .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)));
         let legacy_scheduler = LegacyScheduler::new(config.concurrency().clone());
         let handle = Arc::new(Handle {
             config,
             scheduler: new_scheduler,
             legacy_scheduler,
+            telemetry,
         });
         Client { handle }
     }

@@ -186,7 +186,7 @@ fn first_chunk_response_handler(
         .ok_or_else(|| error::discovery_failed("response missing content-length"))?
         as u64;
     let remaining = object_meta
-        .content_length()
+        .total_object_size()
         .checked_sub(1)
         .and_then(|object_end| {
             // Calculate start and end based on user range (if any)

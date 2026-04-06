@@ -209,7 +209,7 @@ async fn do_download(args: Args) -> Result<(), BoxError> {
         .await?;
 
     let elapsed = start.elapsed();
-    let obj_size_bytes = handle.object_meta().await?.content_length();
+    let obj_size_bytes = handle.object_meta().await?.total_object_size();
     let throughput = Throughput::new(obj_size_bytes, elapsed);
 
     println!(

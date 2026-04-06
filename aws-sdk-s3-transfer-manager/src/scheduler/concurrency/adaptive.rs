@@ -570,11 +570,7 @@ mod tests {
     }
 
     fn sample(_bytes_sent: u64) -> CompletionSample {
-        CompletionSample {
-            io: IoSample::default(),
-            error: None,
-            kind: crate::transfer::IoKind::Network,
-        }
+        CompletionSample { error: None }
     }
 
     // -- Bootstrap --

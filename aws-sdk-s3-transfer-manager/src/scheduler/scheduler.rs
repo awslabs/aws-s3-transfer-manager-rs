@@ -51,9 +51,8 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{CompletionSample, ConcurrencyController};
-use crate::transfer::{BoxTransfer, IoKind, IoRequest, PollWork, TransferId, WorkOutcome};
+use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
 
-use crate::metrics::{IOCounters, IoSample};
 use crate::runtime::{ExecutionRuntime, ScheduledWork};
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
@@ -74,7 +73,6 @@ struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     controller: Arc<dyn ConcurrencyController>,
-    io_counters: Arc<IOCounters>,
     runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
     dispatched: AtomicUsize,
 }
@@ -88,18 +86,11 @@ impl std::fmt::Debug for Scheduler {
 /// Builder for constructing a [`Scheduler`] with its runtime.
 pub(crate) struct SchedulerBuilder {
     controller: Arc<dyn ConcurrencyController>,
-    io_counters: Arc<IOCounters>,
 }
 
 impl SchedulerBuilder {
-    pub(crate) fn new(
-        controller: Arc<dyn ConcurrencyController>,
-        io_counters: Arc<IOCounters>,
-    ) -> Self {
-        Self {
-            controller,
-            io_counters,
-        }
+    pub(crate) fn new(controller: Arc<dyn ConcurrencyController>) -> Self {
+        Self { controller }
     }
 
     /// Build the scheduler with its runtime.
@@ -117,7 +108,6 @@ impl SchedulerBuilder {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
             controller: self.controller,
-            io_counters: self.io_counters,
             runtime: OnceLock::new(),
             dispatched: AtomicUsize::new(0),
         }));
@@ -134,19 +124,13 @@ impl SchedulerBuilder {
 impl Scheduler {
     #[cfg(test)]
     pub(crate) fn new(concurrency: usize) -> Self {
-        SchedulerBuilder::new(
-            Arc::new(super::FixedConcurrency::new(concurrency)),
-            Arc::new(IOCounters::new(Duration::from_millis(500))),
-        )
-        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency)))
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
     pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
-        SchedulerBuilder::new(
-            controller,
-            Arc::new(IOCounters::new(Duration::from_millis(500))),
-        )
-        .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+        SchedulerBuilder::new(controller)
+            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
     }
 
     pub(crate) fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
@@ -238,22 +222,17 @@ impl Scheduler {
         &self,
         work: ScheduledWork,
         outcome: WorkOutcome,
-        elapsed: Duration,
+        _elapsed: Duration,
     ) {
         self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
 
         // Report to concurrency controller
-        let (mut io_sample, classification) = match &outcome {
-            WorkOutcome::Success { metrics, .. } => (metrics.unwrap_or_default(), None),
-            WorkOutcome::Failed { classification } => (IoSample::default(), *classification),
-            WorkOutcome::Cancelled => (IoSample::default(), None),
+        let classification = match &outcome {
+            WorkOutcome::Failed { classification } => *classification,
+            _ => None,
         };
-        io_sample.duration = elapsed;
-        self.0.io_counters.record(&io_sample);
         let sample = CompletionSample {
-            io: io_sample,
             error: classification,
-            kind: work.item.kind,
         };
         self.0.controller.on_completion(&sample);
 
@@ -269,20 +248,6 @@ impl Scheduler {
                 self.0.transfers.write().unwrap().remove(&desc.id());
             }
             return;
-        }
-
-        // handle any follow-on work
-        if let WorkOutcome::Success {
-            schedule_next: Some(kind),
-            data,
-            ..
-        } = outcome
-        {
-            let next = ScheduledWork {
-                item: IoRequest { kind, data },
-                descriptor: desc.clone(),
-            };
-            self.dispatch_single(next);
         }
 
         // capacity has freed try to queue up more work
@@ -378,7 +343,7 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::scheduler::test_util::{FixedWorkCount, MockStateMachine, WithDelay, WithExecute};
-    use crate::transfer::{IoKind, IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+    use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
@@ -528,10 +493,7 @@ mod tests {
             if self.done.load(Ordering::Acquire) {
                 return PollWork::Done;
             }
-            PollWork::Ready(IoRequest {
-                kind: IoKind::Network,
-                data: None,
-            })
+            PollWork::Ready(IoRequest { data: None })
         }
 
         fn execute<'a>(
@@ -541,11 +503,7 @@ mod tests {
             Box::pin(async move {
                 self.executions.fetch_add(1, Ordering::Relaxed);
                 tokio::task::yield_now().await;
-                WorkOutcome::Success {
-                    schedule_next: None,
-                    data: None,
-                    metrics: None,
-                }
+                WorkOutcome::Success { data: None }
             })
         }
     }
