@@ -48,7 +48,6 @@ impl<S: StorageBackend + 'static> Inner<S> {
 
 #[async_trait]
 impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
-    #[tracing::instrument(level = "debug")]
     async fn get_object(
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
@@ -56,6 +55,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         let bucket = &input.bucket;
         let key = &input.key;
+        tracing::trace!(%bucket, %key, "GetObject");
 
         // Get metadata first to validate range
         let metadata = match self.storage.head_object(bucket, key).await? {
@@ -132,7 +132,6 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn head_object(
         &self,
         req: S3Request<s3s::dto::HeadObjectInput>,
@@ -140,6 +139,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         let bucket = &input.bucket;
         let key = &input.key;
+        tracing::trace!(%bucket, %key, "HeadObject");
 
         // Get object metadata from storage
         let metadata = match self.storage.head_object(bucket, key).await? {
@@ -168,12 +168,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn put_object(
         &self,
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
         if input.key.is_empty() {
             return Err(s3s::s3_error!(InvalidRequest));
         }
@@ -205,12 +205,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn create_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
         let key = &input.key;
 
         // Extract checksum algorithm if provided, default to CRC64NVME
@@ -291,7 +291,6 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn upload_part(
         &self,
         req: S3Request<s3s::dto::UploadPartInput>,
@@ -299,6 +298,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
+        tracing::trace!(%upload_id, part_number, "UploadPart");
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -346,12 +346,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "CompleteMultipartUpload");
         let bucket = input.bucket.clone();
         let upload_id = &input.upload_id;
 
@@ -408,12 +408,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<s3s::dto::AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "AbortMultipartUpload");
         let upload_id = &input.upload_id;
 
         // Abort the multipart upload
@@ -424,12 +424,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         ))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn list_objects_v2(
         &self,
         req: S3Request<s3s::dto::ListObjectsV2Input>,
     ) -> S3Result<S3Response<s3s::dto::ListObjectsV2Output>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
         let prefix = input.prefix.as_deref();
         let delimiter = input.delimiter.as_deref();
         let max_keys = input.max_keys.unwrap_or(1000).min(1000) as usize;
@@ -553,6 +553,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, "HeadBucket");
         if self.storage.head_bucket(&input.bucket).await? {
             Ok(S3Response::new(HeadBucketOutput::default()))
         } else {
@@ -565,6 +566,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::DeleteObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::DeleteObjectOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
         self.storage
             .delete_object(&input.bucket, &input.key)
             .await?;
@@ -576,6 +578,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::CreateBucketInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, "CreateBucket");
         self.storage.create_bucket(&input.bucket).await?;
         let output = s3s::dto::CreateBucketOutput {
             location: Some(format!("/{}", input.bucket)),
@@ -588,6 +591,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::DeleteBucketInput>,
     ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, "DeleteBucket");
         self.storage.delete_bucket(&input.bucket).await?;
         Ok(S3Response::new(s3s::dto::DeleteBucketOutput::default()))
     }
@@ -596,6 +600,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         _req: S3Request<s3s::dto::ListBucketsInput>,
     ) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
+        tracing::trace!("ListBuckets");
         let buckets = self.storage.list_buckets().await?;
         let bucket_list: Vec<s3s::dto::Bucket> = buckets
             .into_iter()

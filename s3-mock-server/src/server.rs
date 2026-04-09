@@ -66,6 +66,7 @@ impl ServerHandle {
 
     /// Shutdown the server.
     pub async fn shutdown(self) -> Result<()> {
+        tracing::debug!(addr = %self.address, "shutting down mock server");
         let _ = self.shutdown_tx.send(());
         match self.server_task.await {
             Ok(result) => result,
