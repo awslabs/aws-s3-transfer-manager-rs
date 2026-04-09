@@ -65,7 +65,6 @@ serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 jemallocator = "0.5.4"
-mimalloc = { version = "*", features = ["v3"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)'] }

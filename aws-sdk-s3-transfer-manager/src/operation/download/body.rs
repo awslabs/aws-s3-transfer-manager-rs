@@ -205,6 +205,7 @@ impl SlotBuffer {
             }
 
             // Start a new run with the first FILLED slot
+            // Safety: state is FILLED and flush holds exclusive consumer access via CAS lock.
             let first_chunk = unsafe { (*self.slots[idx].data.get()).take().unwrap() };
             let file_pos = first_chunk.offset - sink.object_range_start;
             let mut run_end_offset = file_pos + first_chunk.data.remaining() as u64;
@@ -223,10 +224,12 @@ impl SlotBuffer {
                 if self.slots[jdx].state.load(AtomicOrdering::Acquire) != SLOT_FILLED {
                     break;
                 }
+                // Safety: state is FILLED and flush holds exclusive consumer access via CAS lock.
                 let chunk = unsafe { (*self.slots[jdx].data.get()).take().unwrap() };
                 let chunk_file_pos = chunk.offset - sink.object_range_start;
                 if chunk_file_pos != run_end_offset {
                     // Not file-contiguous — put it back for the next iteration
+                    // Safety: same CAS lock exclusion; no other thread accesses this slot.
                     unsafe {
                         *self.slots[jdx].data.get() = Some(chunk);
                     }
