@@ -30,10 +30,13 @@ pub(crate) type CancelBroadcastSender = tokio::sync::watch::Sender<()>;
 pub(crate) type CancelBroadcastReceiver = tokio::sync::watch::Receiver<()>;
 
 // Keep the old generic version temporarily for migration
-// TODO(vnext): Remove after all transfers migrated
+// TODO(phase3): Remove after all transfers migrated
+
 /// Container for maintaining context required to carry out a single operation/transfer.
 ///
 /// `State` is whatever additional operation specific state is required for the operation.
+///
+/// DEPRECATED: Use non-generic `TransferContext` instead. This will be removed.
 #[derive(Debug)]
 pub(crate) struct LegacyTransferContext<State> {
     /// Access to client handle (scheduler, S3 client, config)
@@ -65,7 +68,7 @@ impl<State> LegacyTransferContext<State> {
 
     /// The S3 client to use for SDK operations
     pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
-        self.handle.config.client()
+        &self.handle.s3_client
     }
 }
 

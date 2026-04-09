@@ -10,7 +10,8 @@ use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
 use crate::transfer::StateMachineTerminalReceiver;
-use crate::types::{AbortedUpload, FailedMultipartUploadPolicy};
+use crate::types::AbortedUpload;
+use crate::types::FailedMultipartUploadPolicy;
 
 /// Handle to an in-progress upload operation.
 ///

@@ -51,9 +51,13 @@
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
 use super::{CompletionSample, ConcurrencyController};
+use crate::telemetry;
 use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
 
-use crate::runtime::{ExecutionRuntime, ScheduledWork};
+use crate::runtime::ExecutionRuntime;
+
+use crate::runtime::sync::{Submission, SubmissionQueue};
+use crate::runtime::ScheduledWork;
 use crate::scheduler::descriptor::TransferDescriptor;
 use crate::scheduler::ready_set::ReadySet;
 use std::collections::HashMap;
@@ -62,6 +66,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
+
+/// Batch size for work generated and submitted in a single round
+const SUBMISSION_QUEUE_SIZE: usize = 64;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -75,6 +82,7 @@ struct SchedulerInner {
     controller: Arc<dyn ConcurrencyController>,
     runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
     dispatched: AtomicUsize,
+    submission_queue: SubmissionQueue<ScheduledWork>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -93,13 +101,10 @@ impl SchedulerBuilder {
         Self { controller }
     }
 
-    /// Build the scheduler with its runtime.
-    ///
-    /// Takes a factory that receives the scheduler and returns a runtime.
-    /// This breaks the circular dependency: the scheduler needs the runtime
-    /// to dispatch work, and the runtime needs the scheduler to report
-    /// completions. The factory creates the runtime with a scheduler
-    /// reference, then the scheduler stores the runtime via `OnceLock`.
+    /// Build the scheduler, using `runtime_factory` to break the circular dependency:
+    /// the scheduler needs a runtime to dispatch work, and the runtime needs the
+    /// scheduler to call back into on completion. The factory receives the constructed
+    /// scheduler and returns the runtime; the scheduler stores it via `OnceLock`.
     pub(crate) fn build(
         self,
         runtime_factory: impl FnOnce(Scheduler) -> Arc<dyn ExecutionRuntime>,
@@ -110,6 +115,7 @@ impl SchedulerBuilder {
             controller: self.controller,
             runtime: OnceLock::new(),
             dispatched: AtomicUsize::new(0),
+            submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
         }));
         let runtime = runtime_factory(scheduler.clone());
         scheduler
@@ -126,6 +132,19 @@ impl Scheduler {
     pub(crate) fn new(concurrency: usize) -> Self {
         SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency)))
             .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_managed_runtime(concurrency: usize) -> Self {
+        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency))).build(
+            |scheduler| {
+                Arc::new(
+                    crate::runtime::ManagedThreadRuntime::builder(scheduler)
+                        .topology(crate::runtime::Topology::uniform(4))
+                        .build(),
+                )
+            },
+        )
     }
 
     pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
@@ -153,12 +172,14 @@ impl Scheduler {
         // playing aggressive catchup over already in-flight transfers
         let desc = TransferDescriptor::new_with_vruntime(transfer, self.0.ready_set.min_vruntime());
 
+        let id = desc.id();
         {
             let mut transfers = self.0.transfers.write().unwrap();
-            transfers.insert(desc.id(), desc.clone());
+            transfers.insert(id, desc.clone());
             self.0.ready_set.insert(desc);
         }
 
+        tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, "transfer enqueued");
         self.generate_work();
     }
 
@@ -178,16 +199,20 @@ impl Scheduler {
     }
 
     /// Cancel a transfer, removing it from the scheduler.
-    /// Purges queued work for this transfer, any in-flight work may complete naturally.
-    /// Use [`Scheduler::wait_for_idle`] to wait for all outstanding work to finish
+    ///
+    /// - Removes from transfers map
+    /// - Purges queued work for this transfer from pools
+    /// - Outstanding work being executed will complete naturally
+    /// - Use `wait_for_idle(id)` to wait for all outstanding work to finish
+    ///
+    /// TODO: When upload_objects/download_objects use the new scheduler,
+    /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
     pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
-        // TODO(vnext): When upload_objects/download_objects use the new scheduler,
-        //       this needs to cancel child transfers too (where tid.parent == Some(id.id)).
         let desc = self.0.transfers.write().unwrap().remove(&id);
         if let Some(desc) = desc {
             let ctx = desc.transfer().ctx();
             // Ensure transfer is terminal so ready_set and workers skip it.
-            // May already be set by the handle (set_cancelled/set_failed) that's fine.
+            // May already be set by the handle (set_cancelled/set_failed) — that's fine.
             if ctx.is_active() {
                 ctx.set_cancelled();
             }
@@ -196,6 +221,7 @@ impl Scheduler {
             self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
             desc.work_purged(purged);
             desc.notify_idle();
+            tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, purged, "transfer cancelled");
             true
         } else {
             false
@@ -222,8 +248,20 @@ impl Scheduler {
         &self,
         work: ScheduledWork,
         outcome: WorkOutcome,
-        _elapsed: Duration,
+        elapsed: Duration,
     ) {
+        let outcome_tag = match &outcome {
+            WorkOutcome::Success { .. } => "success",
+            WorkOutcome::Failed { .. } => "failed",
+            WorkOutcome::Cancelled => "cancelled",
+        };
+        tracing::trace!(
+            target: telemetry::TARGET_SCHEDULING,
+            id = %work.descriptor.id(),
+            ?elapsed,
+            outcome = outcome_tag,
+            "work completed",
+        );
         self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
 
         // Report to concurrency controller
@@ -242,15 +280,13 @@ impl Scheduler {
             desc.notify_idle();
         }
 
-        // Terminal transfer: no further work to generate. Clean up when fully drained.
-        if desc.is_terminal() {
-            if is_idle {
-                self.0.transfers.write().unwrap().remove(&desc.id());
-            }
-            return;
+        // Terminal transfer: no further work from THIS transfer. Clean up when fully drained.
+        if desc.is_terminal() && is_idle {
+            self.0.transfers.write().unwrap().remove(&desc.id());
         }
 
-        // capacity has freed try to queue up more work
+        // A concurrency slot was freed — always generate work. Other transfers
+        // may be waiting for capacity.
         self.generate_work();
     }
 
@@ -279,43 +315,86 @@ impl Scheduler {
         self.0.dispatched.load(Ordering::Relaxed) < self.0.controller.target()
     }
 
+    /// Flush the current submission and re-enter for the next batch.
+    fn submit_and_reenter<'a>(
+        &'a self,
+        sub: Submission<'a, ScheduledWork>,
+    ) -> Submission<'a, ScheduledWork> {
+        if let Some(mut guard) = sub.submit() {
+            self.runtime().dispatch(&mut guard);
+        }
+        self.0.submission_queue.enter()
+    }
+
+    /// Push work into the submission, flushing and retrying on contention.
+    fn enqueue<'a>(
+        &'a self,
+        mut sub: Submission<'a, ScheduledWork>,
+        work: ScheduledWork,
+    ) -> Submission<'a, ScheduledWork> {
+        let mut pending = work;
+        loop {
+            match sub.push(pending) {
+                Ok(()) => return sub,
+                Err(returned) => {
+                    sub = self.submit_and_reenter(sub);
+                    pending = returned;
+                }
+            }
+        }
+    }
+
     /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
+        let mut sub = self.0.submission_queue.enter();
+        let mut generated = 0usize;
         while self.has_capacity() {
             let Some(desc) = self.0.ready_set.pop() else {
                 break;
             };
 
+            // Skip cancelled/failed transfers still in the ready set
             if desc.is_terminal() {
                 continue;
             }
 
             match desc.transfer().poll_work() {
                 PollWork::Ready(item) => {
+                    generated += 1;
                     desc.work_generated();
                     self.0.ready_set.insert(desc.clone());
-                    self.dispatch_single(ScheduledWork {
+                    self.0.dispatched.fetch_add(1, Ordering::Relaxed);
+                    desc.work_queued();
+                    let work = ScheduledWork {
                         item,
                         descriptor: desc,
-                    });
+                    };
+                    sub = self.enqueue(sub, work);
                 }
                 PollWork::Pending => {
-                    // re-added on wake
+                    // re-added on wake as state machine progresses
                 }
                 PollWork::Done => {
+                    // done generating work, remove from transfers
                     self.0.transfers.write().unwrap().remove(&desc.id());
                 }
             }
         }
+        if let Some(mut guard) = sub.submit() {
+            self.runtime().dispatch(&mut guard);
+        }
+        if generated > 0 {
+            tracing::trace!(
+                target: telemetry::TARGET_SCHEDULING,
+                generated,
+                dispatched = self.0.dispatched.load(Ordering::Relaxed),
+                target = self.0.controller.target(),
+                "work generated",
+            );
+        }
     }
 
-    fn dispatch_single(&self, work: ScheduledWork) {
-        self.0.dispatched.fetch_add(1, Ordering::Relaxed);
-        work.descriptor.work_queued();
-        self.runtime().dispatch(work);
-    }
-
-    #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown
+    #[allow(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
             && self.0.dispatched.load(Ordering::Relaxed) == 0
@@ -332,17 +411,19 @@ impl Scheduler {
         }
     }
 
-    /// Shutdown the scheduler.
-    #[allow(dead_code)] // TODO: wire into Handle::drop
+    /// Shutdown the scheduler. Workers will exit after completing current work.
+    #[allow(dead_code)]
     pub(crate) fn shutdown(&self) {
         self.runtime().shutdown();
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::test_util::{FixedWorkCount, MockStateMachine, WithDelay, WithExecute};
+    use crate::scheduler::transfer::mock::{
+        FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
+    };
+    use crate::scheduler::MockTransfer;
     use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
@@ -351,12 +432,36 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::scheduler::test_util::MockTransfer;
-
     #[tokio::test]
     async fn test_single_transfer_completes() {
         let _logs = show_test_logs();
         let scheduler = Scheduler::new(4);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+
+        let sm = Arc::new(FixedWorkCount::new(5));
+        let transfer = Box::new(MockTransfer::new(id, sm.clone()));
+        scheduler.enqueue_transfer(transfer);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle");
+
+        assert!(sm.is_complete());
+        assert_eq!(sm.completed_count(), 5);
+        scheduler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_single_transfer_completes_managed_runtime() {
+        let _logs = show_test_logs();
+        let scheduler = Scheduler::with_managed_runtime(4);
         let id = TransferId {
             id: 1,
             parent: None,
@@ -409,6 +514,41 @@ mod tests {
         scheduler.shutdown();
     }
 
+    /// Regression test: many single-work-item transfers with concurrency target
+    /// lower than the transfer count. Each transfer generates exactly one work
+    /// item (like a single PutObject upload). All must complete — if on_completion
+    /// doesn't call generate_work() for terminal transfers, only the first
+    /// `concurrency` transfers complete and the rest hang forever.
+    #[tokio::test]
+    async fn test_single_work_transfers_exceed_concurrency() {
+        let scheduler = Scheduler::new(2);
+        let mut state_machines = Vec::new();
+
+        for i in 0..10u64 {
+            let id = TransferId {
+                id: i,
+                parent: None,
+            };
+            let sm = Arc::new(FixedWorkCount::new(1));
+            state_machines.push(sm.clone());
+            scheduler.enqueue_transfer(Box::new(MockTransfer::new(id, sm)));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all 10 transfers should complete — scheduler must generate work after terminal completions");
+
+        for (i, sm) in state_machines.iter().enumerate() {
+            assert!(sm.is_complete(), "transfer {} should be complete", i);
+            assert_eq!(sm.completed_count(), 1);
+        }
+        scheduler.shutdown();
+    }
+
     #[test]
     fn test_new_does_not_require_runtime() {
         let _scheduler = Scheduler::new(4);
@@ -422,16 +562,19 @@ mod tests {
             parent: None,
         };
 
+        // Use a mock that returns Pending so it doesn't complete immediately
         let sm = Arc::new(PendingForever);
         let transfer = Box::new(MockTransfer::new(id, sm));
         scheduler.enqueue_transfer(transfer);
 
+        // Default priority is 128
         {
             let transfers = scheduler.0.transfers.read().unwrap();
             let desc = transfers.get(&id).expect("transfer should exist");
             assert_eq!(desc.priority(), 128);
         }
 
+        // Change priority
         scheduler.set_priority(id, 255);
 
         {
@@ -440,15 +583,17 @@ mod tests {
             assert_eq!(desc.priority(), 255);
         }
 
+        // Setting priority on non-existent transfer is a no-op
         let fake_id = TransferId {
             id: 999,
             parent: None,
         };
-        scheduler.set_priority(fake_id, 100);
+        scheduler.set_priority(fake_id, 100); // Should not panic
 
         scheduler.shutdown();
     }
 
+    /// Mock that always returns Pending (never generates work, never completes)
     #[derive(Debug)]
     struct PendingForever;
 
@@ -465,6 +610,8 @@ mod tests {
         }
     }
 
+    /// Mock that generates infinite work and counts executions.
+    /// Can be stopped by calling `set_done()`.
     #[derive(Debug)]
     struct CountingInfinite {
         executions: AtomicUsize,
@@ -502,7 +649,10 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.executions.fetch_add(1, Ordering::Relaxed);
+                // Yield to prevent starving other tasks on single-threaded runtimes
                 tokio::task::yield_now().await;
+                // No schedule_next — let generate_work() pull from ready set
+                // where CFS priority ordering applies
                 WorkOutcome::Success { data: None }
             })
         }
@@ -530,6 +680,7 @@ mod tests {
         scheduler.enqueue_transfer(high_transfer);
         scheduler.enqueue_transfer(low_transfer);
 
+        // Set priorities: high=255, low=64 (4x difference)
         scheduler.set_priority(high_id, 255);
         scheduler.set_priority(low_id, 64);
 
@@ -587,7 +738,7 @@ mod tests {
         scheduler.enqueue_transfer(Box::new(MockTransfer::new(a_id, a_mock.clone())));
         scheduler.enqueue_transfer(Box::new(MockTransfer::new(b_id, b_mock.clone())));
 
-        // Both at default priority (128) -- let them run equally
+        // Both at default priority (128) — let them run equally
         while a_mock.count() + b_mock.count() < 100 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -610,7 +761,7 @@ mod tests {
         let a_after = a_mock.count() - a_before;
         let b_after = b_mock.count() - b_before;
 
-        // 255:1 priority ratio -- A should get the vast majority of work
+        // 255:1 priority ratio — A should get the vast majority of work
         let ratio = a_after as f64 / b_after.max(1) as f64;
         assert!(
             ratio > 3.0,

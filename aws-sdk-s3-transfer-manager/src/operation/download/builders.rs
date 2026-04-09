@@ -4,7 +4,7 @@
  */
 use std::sync::Arc;
 
-use super::{DownloadHandle, DownloadInputBuilder};
+use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
 
 /// Fluent builder for constructing a single object upload transfer
 #[derive(Debug)]
@@ -29,6 +29,35 @@ impl DownloadFluentBuilder {
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input, false)
+    }
+
+    /// Download the object and write it to the given file path.
+    ///
+    /// Data is written to a temporary file in the same directory, then
+    /// atomically renamed to the destination on success. The temporary file
+    /// is deleted on failure, cancellation, or drop.
+    #[cfg(any(unix, windows))]
+    pub async fn write_to_path(
+        self,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<ManagedDownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
+        crate::operation::download::Download::orchestrate_to_path(self.handle, input, path.into())
+            .await
+    }
+
+    /// Download the object and write it to the given open file.
+    ///
+    /// The caller is responsible for the file lifecycle (creation, cleanup).
+    /// The transfer manager writes to the file using positioned writes at
+    /// offsets starting from 0.
+    #[cfg(any(unix, windows))]
+    pub fn write_to_file(
+        self,
+        file: std::fs::File,
+    ) -> Result<ManagedDownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
+        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file)
     }
 
     /// <p>The bucket name containing the object.</p>

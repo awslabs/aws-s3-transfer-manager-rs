@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-pub(crate) mod adaptive;
+mod adaptive;
+
 pub(crate) use adaptive::{AdaptiveConcurrencyController, AdaptiveConfig};
 
 use std::fmt;
@@ -53,7 +54,7 @@ pub(crate) struct FixedConcurrency(usize);
 
 impl FixedConcurrency {
     pub(crate) fn new(target: usize) -> Self {
-        assert!(target > 0, "concurrency target must be at least 1");
+        assert!(target > 0, "concurrency target must be > 0");
         Self(target)
     }
 }
@@ -87,7 +88,7 @@ where
         SdkError::ServiceError(ctx) => {
             // Check error code first (most specific signal)
             if let Some(code) = ctx.err().code() {
-                if THROTTLING_CODES.iter().any(|&c| c == code) {
+                if THROTTLING_CODES.contains(&code) {
                     return ErrorKind::Throttle;
                 }
             }

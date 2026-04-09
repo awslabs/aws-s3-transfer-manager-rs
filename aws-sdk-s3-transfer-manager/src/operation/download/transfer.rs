@@ -73,7 +73,7 @@ struct DownloadTransferInner {
     /// The original request
     request: Arc<DownloadInput>,
     /// Type of S3 bucket targeted by this operation
-    #[allow(dead_code)] // TODO(phase4): hedging/routing
+    #[allow(dead_code)] // used for hedging/routing decisions
     bucket_type: BucketType,
     /// Sequence window for backpressure control
     writer: BodyWriter,
@@ -113,13 +113,13 @@ impl DownloadTransfer {
     }
 
     /// The original request.
-    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
+    #[allow(dead_code)] // exposed for handle/execution layer integration
     pub(crate) fn request(&self) -> &DownloadInput {
         &self.inner.request
     }
 
     /// Type of S3 bucket targeted by this operation.
-    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
+    #[allow(dead_code)] // exposed for handle/execution layer integration
     pub(crate) fn bucket_type(&self) -> BucketType {
         self.inner.bucket_type
     }
@@ -140,7 +140,7 @@ impl DownloadTransfer {
     }
 
     /// Get the cancellation token for this transfer.
-    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
+    #[allow(dead_code)] // exposed for handle/execution layer integration
     pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
         self.inner.ctx.cancellation_token()
     }
@@ -167,12 +167,12 @@ impl DownloadTransfer {
 
         match &mut *state {
             DownloadState::PendingDiscovery => {
-                *state = DownloadState::DiscoveryInFlight {};
+                *state = DownloadState::DiscoveryInFlight;
                 PollWork::Ready(IoRequest {
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
-            DownloadState::DiscoveryInFlight { .. } => {
+            DownloadState::DiscoveryInFlight => {
                 self.inner.ctx.set_pending();
                 PollWork::Pending
             }
@@ -263,6 +263,17 @@ impl DownloadTransfer {
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
+        // Optimization: Preallocate space for the full object/download size if there is a
+        // destination/sink and it supports it. e.g. pre-allocate disk space for the full
+        // download to avoid per-write metadata updates and late ENOSPC errors.
+        let chunk_content_len = chunk_meta
+            .as_ref()
+            .and_then(|m| m.content_length)
+            .unwrap_or(0) as u64;
+        let total_size =
+            chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
+        self.inner.writer.preallocate(total_size);
+
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
@@ -293,54 +304,75 @@ impl DownloadTransfer {
         // State changed from DiscoveryInFlight - try to wake
         self.inner.ctx.try_wake();
 
-        // If discovery returned an initial chunk, read the body inline
+        // If discovery returned an initial chunk, process it
         match initial_work {
             Some((stream, chunk_meta, slot)) => {
-                let seq = slot.seq();
-                let mut segmented = SegmentedBuf::new();
-                let mut bytes_received: u64 = 0;
-                let mut body_stream = stream;
-                while let Some(result) = body_stream.next().await {
-                    let data = match result {
-                        Ok(data) => data,
-                        Err(e) => {
-                            self.decrement_in_flight();
-                            let guard = self.inner.state.lock().unwrap();
-                            return self
-                                .fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
-                        }
-                    };
-                    bytes_received += data.len() as u64;
-                    segmented.push(data);
-                    if !self.inner.ctx.is_active() {
-                        self.decrement_in_flight();
-                        return WorkOutcome::Cancelled;
-                    }
-                }
-
-                let chunk = ChunkOutput {
-                    seq,
-                    data: AggregatedBytes(segmented),
-                    metadata: chunk_meta,
-                };
-
-                slot.fill(chunk);
-                self.decrement_in_flight();
-
-                self.inner
-                    .ctx
-                    .handle
-                    .telemetry
-                    .io_counters
-                    .record(&crate::metrics::IoSample {
-                        network_rx: bytes_received,
-                        ..Default::default()
-                    });
-
-                WorkOutcome::Success { data: None }
+                self.execute_read_discovery_body(stream, slot, chunk_meta)
+                    .await
             }
             None => WorkOutcome::Success { data: None },
         }
+    }
+
+    async fn execute_read_discovery_body(
+        &self,
+        stream: aws_sdk_s3::primitives::ByteStream,
+        slot: BodySlot,
+        chunk_meta: ChunkMetadata,
+    ) -> WorkOutcome {
+        let seq = slot.seq();
+        // Read the body from the discovery response
+        let mut segmented = SegmentedBuf::new();
+        let mut bytes_received: u64 = 0;
+        let mut body_stream = stream;
+        while let Some(result) = body_stream.next().await {
+            let data = match result {
+                Ok(data) => data,
+                Err(e) => {
+                    self.decrement_in_flight();
+                    let guard = self.inner.state.lock().unwrap();
+                    return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+                }
+            };
+            bytes_received += data.len() as u64;
+            segmented.push(data);
+            if !self.inner.ctx.is_active() {
+                self.decrement_in_flight();
+                return WorkOutcome::Cancelled;
+            }
+        }
+
+        let chunk = ChunkOutput {
+            seq,
+            offset: chunk_meta
+                .content_range
+                .as_deref()
+                .and_then(crate::http::header::parse_content_range)
+                .map(|r| *r.start())
+                .unwrap_or(0),
+            data: AggregatedBytes(segmented),
+            metadata: chunk_meta,
+        };
+
+        slot.fill(chunk);
+        if let Err(e) = self.inner.writer.try_flush() {
+            self.decrement_in_flight();
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        }
+        self.decrement_in_flight();
+
+        self.inner
+            .ctx
+            .handle
+            .telemetry
+            .io_counters
+            .record(&crate::metrics::IoSample {
+                network_rx: bytes_received,
+                ..Default::default()
+            });
+
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_get_range(
@@ -379,17 +411,10 @@ impl DownloadTransfer {
                 async move {
                     let resp = req.send().await.map_err(crate::error::Error::from)?;
                     validate_content_range(seq, &rh, resp.content_range())?;
-                    let mut resp = resp;
-                    let body_stream = std::mem::replace(
-                        &mut resp.body,
-                        aws_sdk_s3::primitives::ByteStream::new(
-                            aws_smithy_types::body::SdkBody::taken(),
-                        ),
-                    );
-                    let chunk_meta = ChunkMetadata::from(resp);
+                    let chunk_meta = ChunkMetadata::from(&resp);
                     let mut segmented = SegmentedBuf::new();
                     let mut bytes_received: u64 = 0;
-                    let mut body_stream = body_stream;
+                    let mut body_stream = resp.body;
                     while let Some(result) = body_stream.next().await {
                         let data = result.map_err(|e| {
                             crate::error::Error::new(crate::error::ErrorKind::IOError, e)
@@ -416,12 +441,25 @@ impl DownloadTransfer {
         bail_if_terminal!(self);
         let chunk = ChunkOutput {
             seq,
+            offset: *range.start(),
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
         };
 
         slot.fill(chunk);
+        if let Err(e) = self.inner.writer.try_flush() {
+            self.decrement_in_flight();
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        }
         self.decrement_in_flight();
+
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            seq,
+            offset = *range.start(),
+            "chunk downloaded",
+        );
 
         self.inner
             .ctx
@@ -467,6 +505,10 @@ impl DownloadTransfer {
         mut guard: std::sync::MutexGuard<'_, DownloadState>,
         error: Error,
     ) -> WorkOutcome {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download failed",
+        );
         let classification = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
         self.inner.ctx.set_failed(error);
@@ -475,6 +517,7 @@ impl DownloadTransfer {
         drop(guard); // release lock before signaling waiters
                      // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
+        let _ = self.inner.writer.finalize();
         self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
@@ -482,6 +525,10 @@ impl DownloadTransfer {
 
     /// Transition to terminal success state. Requires holding the work lock.
     fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadState>) {
+        if let Err(e) = self.inner.writer.finalize() {
+            self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            return;
+        }
         self.inner.ctx.set_completed();
         *guard = DownloadState::Terminal;
         drop(guard); // release lock before signaling waiters
@@ -570,14 +617,10 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = Arc::new(crate::client::Handle {
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             config,
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-            legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
-            ),
-            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
-        });
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -609,7 +652,7 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
-        assert!(matches!(data, DownloadWork::Discovery { .. }));
+        assert!(matches!(data, DownloadWork::Discovery));
     }
 
     #[test]
@@ -671,14 +714,10 @@ mod tests {
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
-        let handle = Arc::new(crate::client::Handle {
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             config,
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-            legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
-            ),
-            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
-        });
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -715,15 +754,10 @@ mod tests {
         skip_discovery(&transfer).await;
 
         let mut seqs = Vec::new();
-        loop {
-            match transfer.poll_work() {
-                PollWork::Ready(mut w) => {
-                    let data = w.data_mut::<DownloadWork>();
-                    if let DownloadWork::GetObjectRange { slot, .. } = data {
-                        seqs.push(slot.as_ref().unwrap().seq());
-                    }
-                }
-                _ => break,
+        while let PollWork::Ready(mut w) = transfer.poll_work() {
+            let data = w.data_mut::<DownloadWork>();
+            if let DownloadWork::GetObjectRange { slot, .. } = data {
+                seqs.push(slot.as_ref().unwrap().seq());
             }
         }
 
@@ -738,7 +772,9 @@ mod tests {
         let transfer = create_download(12 * MB, 8 * MB);
         skip_discovery(&transfer).await;
 
+        // generate range work but don't complete
         let _range = assert_ready(transfer.poll_work());
+        // transfer is considered active and shouldn't transition to done until all in-flight work is complete and handle is joined/dropped
         assert_pending(transfer.poll_work());
     }
 
@@ -758,8 +794,8 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         skip_discovery(&transfer).await;
 
-        let mut range1 = assert_ready(transfer.poll_work());
-        let mut range2 = assert_ready(transfer.poll_work());
+        let mut range1 = assert_ready(transfer.poll_work()); // seq=1
+        let mut range2 = assert_ready(transfer.poll_work()); // seq=2
 
         // Complete in reverse order
         execute(&transfer, &mut range2).await;
@@ -771,6 +807,7 @@ mod tests {
     #[tokio::test]
     async fn test_failure_transitions_to_failed() {
         let _logs = show_test_logs();
+        // Fail seq 1 (first range after discovery)
         let transfer = FailureConfig::new(24 * MB, 8 * MB).fail(1).build();
 
         skip_discovery(&transfer).await;
@@ -818,14 +855,10 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = Arc::new(crate::client::Handle {
+        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
             config,
-            scheduler: crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-            legacy_scheduler: crate::runtime::scheduler::Scheduler::new(
-                crate::types::ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
-            ),
-            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
-        });
+            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
+        ));
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -841,67 +874,69 @@ mod tests {
 
     #[tokio::test]
     async fn test_seq_window_limits_work_generation() {
-        // capacity=3: discovery claims seq 0, leaving room for 2 more
+        // Create download with many parts but small slot buffer capacity
         let (transfer, _consumer) = create_download_with_capacity(128 * MB, 8 * MB, 3);
 
         skip_discovery(&transfer).await;
+        // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
+        // Capacity=3 means: claimed < consumed + capacity → claimed < 3
+        // So we can claim seq 1, 2 (claimed becomes 2, then 3)
 
-        // seq 1, seq 2 — fills the window (claimed=3, consumed=0, capacity=3)
-        let _w1 = assert_ready(transfer.poll_work());
-        let _w2 = assert_ready(transfer.poll_work());
+        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
+        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
 
-        // Window full: claimed - consumed >= capacity
+        // Window exhausted (claimed=3, consumed=0, capacity=3: 3 >= 0+3)
         assert_pending(transfer.poll_work());
     }
 
     #[tokio::test]
     async fn test_seq_window_consume_enables_more_work() {
-        // capacity=2: discovery claims seq 0, leaving room for 1 more
         let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
 
         skip_discovery(&transfer).await;
+        // After discovery: seq 0 claimed and filled by discovery, consumed=0
+        // Capacity=2 means: claimed < consumed + 2
 
-        // seq 1 — window full (claimed=2, consumed=0)
-        let mut w1 = assert_ready(transfer.poll_work());
-        assert_pending(transfer.poll_work());
+        let mut w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
+        assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
 
-        // Consumer reads seq 0 (discovery chunk) → consumed=1, window opens
-        consumer.try_take_next();
+        // Consume seq 0 (filled by discovery) to open the window
+        consumer.try_take_next(); // consume seq 0, consumed=1
 
-        // seq 2 — window full again (claimed=3, consumed=1)
-        let mut w2 = assert_ready(transfer.poll_work());
-        assert_pending(transfer.poll_work());
+        let mut w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
+        assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
 
-        // Fill seq 1, consumer reads it → consumed=2, window opens
+        // Fill seq 1 from its work item, then consume it
         let slot1 = w1.data_mut::<DownloadWork>().take_slot().expect("has slot");
         let mut seg = bytes_utils::SegmentedBuf::new();
         seg.push(bytes::Bytes::from("data"));
         slot1.fill(ChunkOutput {
             seq: 1,
+            offset: 0,
             data: crate::io::AggregatedBytes(seg),
             metadata: Default::default(),
         });
-        consumer.try_take_next();
+        consumer.try_take_next(); // consume seq 1, consumed=2
 
-        // seq 3 — window full (claimed=4, consumed=2)
-        let w3 = assert_ready(transfer.poll_work());
+        let w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
         assert_pending(transfer.poll_work());
 
-        // Fill seq 2, consumer reads it → consumed=3, window opens
+        // Fill seq 2 from its work item, then consume it
         let slot2 = w2.data_mut::<DownloadWork>().take_slot().expect("has slot");
         let mut seg = bytes_utils::SegmentedBuf::new();
         seg.push(bytes::Bytes::from("data"));
         slot2.fill(ChunkOutput {
             seq: 2,
+            offset: 0,
             data: crate::io::AggregatedBytes(seg),
             metadata: Default::default(),
         });
-        consumer.try_take_next();
+        consumer.try_take_next(); // consume seq 2
 
-        // seq 4 — window full (claimed=5, consumed=3)
-        let _w4 = assert_ready(transfer.poll_work());
+        let _w4 = assert_ready(transfer.poll_work()); // seq=4
         assert_pending(transfer.poll_work());
 
+        // Clean up remaining slots
         drop(w3);
     }
 
@@ -918,15 +953,11 @@ mod tests {
         /// Always fail
         Always,
         /// Fail first N attempts, then succeed
-        #[allow(dead_code)] // TODO: re-enable with retry tests
+        #[allow(dead_code)] // TODO(phase3): re-enable with retry tests
         Times(usize),
     }
 
-    /// Builder for downloads with configurable failure injection.
-    ///
-    /// Parses the Range header on each request to determine the seq number,
-    /// then checks the failures map to decide whether to return a 500 or
-    /// a successful response.
+    /// Builder for downloads with configurable failure injection
     struct FailureConfig {
         object_size: u64,
         part_size: u64,
@@ -966,10 +997,12 @@ mod tests {
                     })
                     .unwrap_or(0);
 
+                // Track calls per seq
                 let mut counts = call_counts.lock().unwrap();
                 let call_num = *counts.entry(seq).and_modify(|c| *c += 1).or_insert(1);
                 drop(counts);
 
+                // Check failure config
                 let should_fail = match failures.get(&seq) {
                     Some(FailureBehavior::Always) => true,
                     Some(FailureBehavior::Times(n)) => call_num <= *n,

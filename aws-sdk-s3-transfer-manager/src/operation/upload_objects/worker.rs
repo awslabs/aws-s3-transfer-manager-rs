@@ -327,7 +327,6 @@ mod tests {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use bytes::Bytes;
-    use std::sync::Arc;
 
     use crate::{
         client::Handle,
@@ -336,8 +335,6 @@ mod tests {
             worker::{upload_single_obj, UploadObjectJob},
             UploadObjectsContext, UploadObjectsInputBuilder,
         },
-        runtime::scheduler::Scheduler,
-        types::ConcurrencyMode,
         DEFAULT_CONCURRENCY,
     };
 
@@ -711,19 +708,9 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let legacy_scheduler = crate::runtime::scheduler::Scheduler::new(
-            ConcurrencyMode::Explicit(DEFAULT_CONCURRENCY),
-        );
-        let scheduler = crate::scheduler::Scheduler::with_controller(Arc::new(
-            crate::scheduler::FixedConcurrency::new(DEFAULT_CONCURRENCY),
-        ));
+        let scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
 
-        let handle = std::sync::Arc::new(Handle {
-            config,
-            scheduler,
-            legacy_scheduler,
-            telemetry: crate::telemetry::Telemetry::new(std::time::Duration::from_secs(1)),
-        });
+        let handle = std::sync::Arc::new(Handle::with_config_and_scheduler(config, scheduler));
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)

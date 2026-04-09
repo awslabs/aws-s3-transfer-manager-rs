@@ -5,10 +5,11 @@
 
 pub(crate) mod concurrency;
 mod scheduler;
+mod transfer;
 
 pub(crate) use concurrency::{
     classify_error, AdaptiveConcurrencyController, AdaptiveConfig, CompletionSample,
-    ConcurrencyController, ErrorKind, FixedConcurrency,
+    ConcurrencyController, FixedConcurrency,
 };
 pub(crate) use scheduler::{Scheduler, SchedulerBuilder};
 
@@ -16,4 +17,9 @@ pub(crate) mod descriptor;
 mod ready_set;
 
 #[cfg(test)]
-pub(crate) mod test_util;
+pub(crate) use transfer::MockTransfer;
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    pub(crate) use super::transfer::test_util::*;
+}

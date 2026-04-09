@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::http::header;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
@@ -110,7 +109,11 @@ pub struct ObjectMetadata {
 }
 
 impl ObjectMetadata {
-    /// <p>Size of the object in bytes.</p>
+    /// Total size of the S3 object in bytes.
+    ///
+    /// When a `Content-Range` header is present (e.g. `bytes 0-8388607/34359738368`),
+    /// returns the total object size from the range denominator, NOT the response
+    /// body length. Falls back to the `Content-Length` header when no range is present.
     pub fn total_object_size(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
             (_, Some(range)) => {
@@ -128,8 +131,8 @@ impl ObjectMetadata {
     /// <p>Parse the content-range header to the inclusive range..</p>
     pub(crate) fn range_from_content_range(&self) -> Option<RangeInclusive<u64>> {
         match self.total_object_size().checked_sub(1) {
-            Some(object_end) => match self.content_range.as_deref() {
-                Some(range) => header::parse_content_range(range),
+            Some(object_end) => match self.content_range.as_ref() {
+                Some(range) => crate::http::header::parse_content_range(range),
                 // When S3 doesn't provide a content-range header, we can infer the total size from the content-length header.
                 None => Some(0..=object_end),
             },

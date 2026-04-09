@@ -84,11 +84,10 @@ impl ReadySet {
 
     /// Add a transfer to the ready set.
     ///
-    /// INVARIANT: Callers must ensure a transfer is not inserted twice. Duplicate
-    /// insertion causes the same transfer to be polled multiple times per scheduling
-    /// round, generating more work than intended and skewing CFS fairness (the
-    /// transfer accumulates vruntime once per poll, so duplicates get double the
-    /// scheduling share).
+    /// INVARIANT: Callers must ensure a transfer is not inserted twice. This happens
+    /// naturally if: (1) `poll_work()` returning `Ready` is immediately followed by
+    /// re-insert, and (2) `wake()` is only called when the transfer returned `Pending`.
+    /// Violating this invariant causes duplicate polling.
     pub(super) fn insert(&self, descriptor: TransferDescriptor) {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
@@ -109,18 +108,18 @@ impl ReadySet {
         Some(descriptor)
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn remove(&self, id: TransferId, vruntime: u64) {
         let key = ReadyKey::new(vruntime, id);
         self.inner.remove(&key);
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
     pub(super) fn len(&self) -> usize {
         self.inner.len()
     }
@@ -135,7 +134,8 @@ impl ReadySet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::test_util::{FixedWorkCount, MockTransfer};
+    use crate::scheduler::transfer::mock::FixedWorkCount;
+    use crate::scheduler::MockTransfer;
     use std::sync::Arc;
 
     fn make_descriptor(id: u64, priority: u8, vruntime: u64) -> TransferDescriptor {
