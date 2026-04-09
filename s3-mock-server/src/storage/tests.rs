@@ -178,6 +178,7 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             integrity_checks: ObjectIntegrityChecks::new().with_md5(),
             content_type: Some("text/plain".to_string()),
             user_metadata: HashMap::new(),
+            last_modified: None,
         };
 
         storage.put_object(request).await.unwrap();
@@ -235,6 +236,7 @@ async fn test_storage_backend_consistency() {
             integrity_checks: ObjectIntegrityChecks::new().with_md5(),
             content_type: Some("text/plain".to_string()),
             user_metadata: HashMap::new(),
+            last_modified: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 

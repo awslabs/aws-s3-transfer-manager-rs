@@ -225,7 +225,12 @@ async fn test_download_concurrent() {
             .map(|j| ((i + j) % 256) as u8)
             .collect();
         server
-            .add_object("test-bucket", &format!("concurrent-key-{}", i), content, None)
+            .add_object(
+                "test-bucket",
+                &format!("concurrent-key-{}", i),
+                content,
+                None,
+            )
             .await
             .expect("add object");
     }

@@ -182,6 +182,40 @@ pub struct ObjectListEntry {
     pub etag: String,
 }
 
+/// Request for adding an object via the direct (non-S3-protocol) API.
+pub struct AddObjectRequest {
+    pub content: bytes::Bytes,
+    pub content_type: Option<String>,
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+    pub last_modified: Option<std::time::SystemTime>,
+}
+
+impl AddObjectRequest {
+    pub fn new(content: impl Into<bytes::Bytes>) -> Self {
+        Self {
+            content: content.into(),
+            content_type: None,
+            metadata: None,
+            last_modified: None,
+        }
+    }
+
+    pub fn content_type(mut self, ct: impl Into<String>) -> Self {
+        self.content_type = Some(ct.into());
+        self
+    }
+
+    pub fn metadata(mut self, meta: std::collections::HashMap<String, String>) -> Self {
+        self.metadata = Some(meta);
+        self
+    }
+
+    pub fn last_modified(mut self, time: std::time::SystemTime) -> Self {
+        self.last_modified = Some(time);
+        self
+    }
+}
+
 /// S3 Mock Server.
 pub struct S3MockServer {
     /// Storage backend.
@@ -205,23 +239,37 @@ impl S3MockServer {
         content: impl Into<bytes::Bytes>,
         metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Result<()> {
+        let mut req = AddObjectRequest::new(content);
+        req.metadata = metadata;
+        self.add_object_with(bucket, key, req).await
+    }
+
+    /// Add an object with full control over metadata fields.
+    pub async fn add_object_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        request: AddObjectRequest,
+    ) -> Result<()> {
         use crate::storage::StoreObjectRequest;
         use crate::types::ObjectIntegrityChecks;
         use futures::stream;
 
-        let bytes = content.into();
+        let bytes = request.content;
         let stream = stream::once(async move { Ok(bytes) });
         let boxed_stream = Box::pin(stream);
 
-        let request = StoreObjectRequest::new(
+        let mut store_req = StoreObjectRequest::new(
             bucket,
             key.to_string(),
             boxed_stream,
             ObjectIntegrityChecks::new(),
         )
-        .with_user_metadata(metadata.unwrap_or_default());
+        .with_user_metadata(request.metadata.unwrap_or_default());
+        store_req.content_type = request.content_type;
+        store_req.last_modified = request.last_modified;
 
-        self.storage.put_object(request).await?;
+        self.storage.put_object(store_req).await?;
         Ok(())
     }
 

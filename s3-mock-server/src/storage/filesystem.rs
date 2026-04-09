@@ -274,7 +274,7 @@ impl StorageBackend for FilesystemStorage {
         file.flush().await?;
 
         let object_integrity = integrity_checks.finalize();
-        let last_modified = SystemTime::now();
+        let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
             content_type: request.content_type,

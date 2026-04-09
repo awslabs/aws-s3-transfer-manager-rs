@@ -36,6 +36,10 @@ pub struct StoreObjectRequest {
     pub integrity_checks: ObjectIntegrityChecks,
     pub content_type: Option<String>,
     pub user_metadata: HashMap<String, String>,
+    /// Override the stored last-modified timestamp. When `None`, backends use
+    /// `SystemTime::now()`. This is only useful for the direct (non-S3-protocol)
+    /// seeding API — the S3 PutObject operation never sets this.
+    pub last_modified: Option<SystemTime>,
 }
 
 /// Request for retrieving an object.
@@ -134,6 +138,7 @@ impl StoreObjectRequest {
             integrity_checks,
             content_type: None,
             user_metadata: HashMap::new(),
+            last_modified: None,
         }
     }
 
@@ -162,6 +167,7 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
             integrity_checks: ObjectIntegrityChecks::new().with_md5(),
             content_type: input.content_type.map(|mime| mime.to_string()),
             user_metadata: input.metadata.unwrap_or_default(),
+            last_modified: None,
         }
     }
 }

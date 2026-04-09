@@ -86,7 +86,7 @@ impl StorageBackend for InMemoryStorage {
         let content = content.freeze();
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
-        let last_modified = SystemTime::now();
+        let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
             content_type: request.content_type,
