@@ -147,7 +147,6 @@ impl Scheduler {
         )
     }
 
-    #[allow(dead_code)] // TODO(phase3): evaluate removing in favor of SchedulerBuilder
     pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
         SchedulerBuilder::new(controller)
             .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
@@ -282,10 +281,8 @@ impl Scheduler {
         }
 
         // Terminal transfer: no further work from THIS transfer. Clean up when fully drained.
-        if desc.is_terminal() {
-            if is_idle {
-                self.0.transfers.write().unwrap().remove(&desc.id());
-            }
+        if desc.is_terminal() && is_idle {
+            self.0.transfers.write().unwrap().remove(&desc.id());
         }
 
         // A concurrency slot was freed — always generate work. Other transfers
@@ -397,7 +394,7 @@ impl Scheduler {
         }
     }
 
-    #[allow(dead_code)] // TODO: wire into Handle for graceful shutdown
+    #[allow(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
             && self.0.dispatched.load(Ordering::Relaxed) == 0
@@ -415,7 +412,7 @@ impl Scheduler {
     }
 
     /// Shutdown the scheduler. Workers will exit after completing current work.
-    #[allow(dead_code)] // TODO(phase3): wire into Handle::drop
+    #[allow(dead_code)]
     pub(crate) fn shutdown(&self) {
         self.runtime().shutdown();
     }

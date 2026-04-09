@@ -489,7 +489,7 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 
     fn on_completion(&self, sample: &CompletionSample) {
-        self.in_flight
+        let _ = self.in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });

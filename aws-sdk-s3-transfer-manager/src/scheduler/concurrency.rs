@@ -88,7 +88,7 @@ where
         SdkError::ServiceError(ctx) => {
             // Check error code first (most specific signal)
             if let Some(code) = ctx.err().code() {
-                if THROTTLING_CODES.iter().any(|&c| c == code) {
+                if THROTTLING_CODES.contains(&code) {
                     return ErrorKind::Throttle;
                 }
             }

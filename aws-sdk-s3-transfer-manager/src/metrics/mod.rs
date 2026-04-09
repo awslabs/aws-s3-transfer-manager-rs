@@ -328,7 +328,7 @@ pub(crate) struct IoSample {
 
 impl IoSample {
     /// Sample for a network send.
-    pub fn network_tx(bytes: u64, duration: Duration) -> Self {
+    pub(crate) fn network_tx(bytes: u64, duration: Duration) -> Self {
         Self {
             network_tx: bytes,
             duration,
@@ -337,7 +337,7 @@ impl IoSample {
     }
 
     /// Sample for a network receive.
-    pub fn network_rx(bytes: u64, duration: Duration) -> Self {
+    pub(crate) fn network_rx(bytes: u64, duration: Duration) -> Self {
         Self {
             network_rx: bytes,
             duration,
@@ -413,7 +413,7 @@ impl IOWindow {
                 bucket.bytes.store(0, Ordering::Release);
                 bucket.epoch.store(current, Ordering::Release);
             }
-            **guard = **guard + self.bucket_duration * steps as u32;
+            **guard += self.bucket_duration * steps as u32;
             current
         } else {
             let mut current = self.current_idx.load(Ordering::Acquire);
@@ -422,7 +422,7 @@ impl IOWindow {
                 let slot = current % IO_WINDOW_BUCKETS;
                 self.buckets[slot].bytes.store(0, Ordering::Release);
                 self.buckets[slot].epoch.store(current, Ordering::Release);
-                **guard = **guard + self.bucket_duration;
+                **guard += self.bucket_duration;
             }
             current
         }

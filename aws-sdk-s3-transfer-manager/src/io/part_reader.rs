@@ -215,7 +215,9 @@ impl PathBodyPartReader {
         // order is sequential so kernel readahead would help, but concurrent execution creates
         // some scatter. Benchmark before adding.
         // TODO(vnext): does this need to be async now?
-        let file = Arc::new(File::open(&body.path)?);
+        let file = Arc::new(File::open(&body.path).map_err(|e| {
+            Error::from(std::io::Error::new(e.kind(), format!("failed to open {}: {e}", body.path.display())))
+        })?);
         let offset = body.offset;
         let content_length = body.length;
         Ok(Self {
@@ -258,7 +260,7 @@ impl PathBodyPartReader {
         }
 
         stream_cx.io_counters().record(&crate::metrics::IoSample {
-            disk_read: part_size as u64,
+            disk_read: part_size,
             ..Default::default()
         });
 

@@ -108,7 +108,6 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
-    use std::io::Read;
 
     #[test]
     fn write_all_at_single_segment() {

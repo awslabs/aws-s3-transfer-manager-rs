@@ -55,15 +55,14 @@ impl TokioMultiThreadRuntime {
     fn ensure_worker_capacity(&self) {
         let target = self.scheduler.controller_target();
         let current = self.worker_count.load(Ordering::Relaxed);
-        if target > current {
-            if self
+        if target > current
+            && self
                 .worker_count
                 .compare_exchange(current, target, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
-            {
-                self.spawn_workers(target - current);
-                tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING, old = current, new = target, "spawning additional workers");
-            }
+        {
+            self.spawn_workers(target - current);
+            tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING, old = current, new = target, "spawning additional workers");
         }
     }
 

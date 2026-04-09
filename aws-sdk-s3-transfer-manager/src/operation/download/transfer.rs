@@ -73,7 +73,7 @@ struct DownloadTransferInner {
     /// The original request
     request: Arc<DownloadInput>,
     /// Type of S3 bucket targeted by this operation
-    #[allow(dead_code)] // TODO(phase4): hedging/routing
+    #[allow(dead_code)] // used for hedging/routing decisions
     bucket_type: BucketType,
     /// Sequence window for backpressure control
     writer: BodyWriter,
@@ -113,13 +113,13 @@ impl DownloadTransfer {
     }
 
     /// The original request.
-    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
+    #[allow(dead_code)] // exposed for handle/execution layer integration
     pub(crate) fn request(&self) -> &DownloadInput {
         &self.inner.request
     }
 
     /// Type of S3 bucket targeted by this operation.
-    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
+    #[allow(dead_code)] // exposed for handle/execution layer integration
     pub(crate) fn bucket_type(&self) -> BucketType {
         self.inner.bucket_type
     }
@@ -140,7 +140,7 @@ impl DownloadTransfer {
     }
 
     /// Get the cancellation token for this transfer.
-    #[allow(dead_code)] // TODO(phase3): wire into handle/execution
+    #[allow(dead_code)] // exposed for handle/execution layer integration
     pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
         self.inner.ctx.cancellation_token()
     }
@@ -167,12 +167,12 @@ impl DownloadTransfer {
 
         match &mut *state {
             DownloadState::PendingDiscovery => {
-                *state = DownloadState::DiscoveryInFlight {};
+                *state = DownloadState::DiscoveryInFlight;
                 PollWork::Ready(IoRequest {
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
-            DownloadState::DiscoveryInFlight { .. } => {
+            DownloadState::DiscoveryInFlight => {
                 self.inner.ctx.set_pending();
                 PollWork::Pending
             }
@@ -410,7 +410,7 @@ impl DownloadTransfer {
 
                 async move {
                     let resp = req.send().await.map_err(crate::error::Error::from)?;
-                    validate_content_range(seq, &rh, resp.content_range().as_deref())?;
+                    validate_content_range(seq, &rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let mut segmented = SegmentedBuf::new();
                     let mut bytes_received: u64 = 0;
@@ -652,7 +652,7 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
-        assert!(matches!(data, DownloadWork::Discovery { .. }));
+        assert!(matches!(data, DownloadWork::Discovery));
     }
 
     #[test]
@@ -754,15 +754,10 @@ mod tests {
         skip_discovery(&transfer).await;
 
         let mut seqs = Vec::new();
-        loop {
-            match transfer.poll_work() {
-                PollWork::Ready(mut w) => {
-                    let data = w.data_mut::<DownloadWork>();
-                    if let DownloadWork::GetObjectRange { slot, .. } = data {
-                        seqs.push(slot.as_ref().unwrap().seq());
-                    }
-                }
-                _ => break,
+        while let PollWork::Ready(mut w) = transfer.poll_work() {
+            let data = w.data_mut::<DownloadWork>();
+            if let DownloadWork::GetObjectRange { slot, .. } = data {
+                seqs.push(slot.as_ref().unwrap().seq());
             }
         }
 
@@ -923,7 +918,7 @@ mod tests {
         });
         consumer.try_take_next(); // consume seq 1, consumed=2
 
-        let mut w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
+        let w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
         assert_pending(transfer.poll_work());
 
         // Fill seq 2 from its work item, then consume it

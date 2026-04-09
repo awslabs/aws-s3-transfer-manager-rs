@@ -57,7 +57,7 @@ struct UploadTransferInner {
     /// The original request (body taken for processing)
     request: Arc<UploadInput>,
     /// Type of S3 bucket targeted by this operation
-    #[allow(dead_code)] // TODO(phase4): hedging/routing
+    #[allow(dead_code)] // used for hedging/routing decisions
     bucket_type: BucketType,
     /// Notified when CreateMPU completes (success or failure)
     create_mpu_complete: tokio::sync::Notify,
@@ -161,7 +161,7 @@ impl UploadTransfer {
                     return PollWork::Pending;
                 }
 
-                let use_mpu = stream.as_ref().map_or(false, |s| s.is_mpu_only())
+                let use_mpu = stream.as_ref().is_some_and(|s| s.is_mpu_only())
                     || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
@@ -229,7 +229,7 @@ impl UploadTransfer {
                     data: Some(Box::new(UploadWork::CompleteMPU)),
                 })
             }
-            UploadState::PutObjectInFlight { .. } => {
+            UploadState::PutObjectInFlight => {
                 self.inner.ctx.set_pending();
                 PollWork::Pending
             }
@@ -514,7 +514,7 @@ impl UploadTransfer {
         // InputStream internals will need tighter integration with the execution layer.
         let byte_stream = match stream.into_byte_stream().await {
             Ok(bs) => bs,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => return self.fail(e),
         };
 
         let put_req = copy_fields_to_put_object_request(

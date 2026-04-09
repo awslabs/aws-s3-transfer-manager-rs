@@ -158,9 +158,9 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
 /// current-thread runtime.
 pub(crate) struct ManagedThreadRuntime {
     scheduler: Scheduler,
-    #[allow(dead_code)] // TODO(phase3): used for topology-aware routing
+    #[allow(dead_code)] // used for topology-aware routing when wired
     topology: Topology,
-    #[allow(dead_code)] // TODO(phase3): used for thread pinning
+    #[allow(dead_code)] // used for core pinning when wired
     pin_threads: bool,
     threads: Vec<ThreadHandle>,
     shutdown_token: CancellationToken,
@@ -296,7 +296,7 @@ impl ManagedThreadRuntimeBuilder {
     }
 
     /// Enable thread pinning to cores. Default: false.
-    #[allow(dead_code)] // TODO(phase3): not yet wired
+    #[allow(dead_code)]
     pub(crate) fn pin_threads(mut self, pin: bool) -> Self {
         self.pin_threads = pin;
         self
