@@ -38,12 +38,13 @@
 //!  └─────────────────────────────────────────────────────────┘
 //! ```
 
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
-use parking_lot::{Condvar, Mutex};
+
+use super::cell::UnsafeCell;
+use super::sync::atomic::{AtomicUsize, Ordering};
+use super::sync::{Condvar, Mutex};
 
 /// Multi-producer submission queue backed by a fixed-capacity array.
 ///
@@ -119,7 +120,7 @@ impl<T> SubmissionQueue<T> {
     pub(crate) fn enter(&self) -> Submission<'_, T> {
         let mut state = self.state.lock();
         while state.flushing {
-            self.not_flushing.wait(&mut state);
+            state = self.not_flushing.wait(state);
         }
         state.pending += 1;
         Submission { sq: self }
@@ -146,9 +147,7 @@ impl<'a, T> Submission<'a, T> {
             return Err(item);
         }
         // Safety: this slot was uniquely claimed via atomic fetch_add.
-        unsafe {
-            (*self.sq.slots[idx].get()).write(item);
-        }
+        self.sq.slots[idx].with_mut(|ptr| unsafe { (*ptr).write(item) });
         Ok(())
     }
 
@@ -183,9 +182,7 @@ impl<T> Drop for Submission<'_, T> {
             for i in 0..count {
                 // Safety: slots 0..count were filled by producers and no
                 // SubmissionGuard exists, so we have exclusive access.
-                unsafe {
-                    (*self.sq.slots[i].get()).assume_init_drop();
-                }
+                self.sq.slots[i].with_mut(|ptr| unsafe { (*ptr).assume_init_drop() });
             }
         }
     }
@@ -212,9 +209,9 @@ impl<T> SubmissionGuard<'_, T> {
     pub(crate) fn as_slice(&self) -> &[T] {
         // Safety: flushing is true so no producers are writing. All slots in
         // next..count were initialized by producers. UnsafeCell<MaybeUninit<T>>
-        // has the same layout as T.
+        // has the same layout as T (#[repr(transparent)]).
         unsafe {
-            let ptr = self.sq.slots[self.next..self.count].as_ptr() as *const T;
+            let ptr = self.sq.slots[self.next].with(|p| p as *const T);
             std::slice::from_raw_parts(ptr, self.count - self.next)
         }
     }
@@ -227,7 +224,7 @@ impl<T> SubmissionGuard<'_, T> {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // Safety: same as as_slice, plus we have exclusive &mut access.
         unsafe {
-            let ptr = self.sq.slots[self.next..self.count].as_ptr() as *mut T;
+            let ptr = self.sq.slots[self.next].with_mut(|p| p as *mut T);
             std::slice::from_raw_parts_mut(ptr, self.count - self.next)
         }
     }
@@ -238,7 +235,7 @@ impl<T> SubmissionGuard<'_, T> {
             self.next = i + 1;
             // Safety: the flusher has exclusive access — all producers have
             // exited and flushing is true, blocking new entrants.
-            unsafe { (*self.sq.slots[i].get()).assume_init_read() }
+            self.sq.slots[i].with_mut(|ptr| unsafe { (*ptr).assume_init_read() })
         })
     }
 }
@@ -246,9 +243,7 @@ impl<T> SubmissionGuard<'_, T> {
 impl<T> Drop for SubmissionGuard<'_, T> {
     fn drop(&mut self) {
         for i in self.next..self.count {
-            unsafe {
-                (*self.sq.slots[i].get()).assume_init_drop();
-            }
+            self.sq.slots[i].with_mut(|ptr| unsafe { (*ptr).assume_init_drop() });
         }
         let mut state = self.sq.state.lock();
         state.flushing = false;
@@ -258,11 +253,9 @@ impl<T> Drop for SubmissionGuard<'_, T> {
 
 impl<T> Drop for SubmissionQueue<T> {
     fn drop(&mut self) {
-        let count = (*self.tail.get_mut()).min(self.capacity);
+        let count = self.tail.load(Ordering::Relaxed).min(self.capacity);
         for i in 0..count {
-            unsafe {
-                self.slots[i].get_mut().assume_init_drop();
-            }
+            self.slots[i].with_mut(|ptr| unsafe { (*ptr).assume_init_drop() });
         }
     }
 }
@@ -545,5 +538,113 @@ mod tests {
         }
 
         assert_eq!(total.load(Ordering::Relaxed), 3);
+    }
+}
+
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests {
+    use super::super::sync::atomic::AtomicUsize as LoomAtomicUsize;
+    use super::super::sync::Arc;
+    use super::super::thread;
+    use super::*;
+
+    #[test]
+    fn two_producers_both_flushed() {
+        loom::model(|| {
+            let q = Arc::new(SubmissionQueue::new(4));
+            let total = Arc::new(LoomAtomicUsize::new(0));
+
+            let q2 = Arc::clone(&q);
+            let t2 = Arc::clone(&total);
+            let h = thread::spawn(move || {
+                let s = q2.enter();
+                s.push(1).unwrap();
+                if let Some(mut guard) = s.submit() {
+                    t2.fetch_add(guard.drain().count(), Ordering::Relaxed);
+                }
+            });
+
+            let s = q.enter();
+            s.push(2).unwrap();
+            if let Some(mut guard) = s.submit() {
+                total.fetch_add(guard.drain().count(), Ordering::Relaxed);
+            }
+
+            h.join().unwrap();
+            assert_eq!(total.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    #[test]
+    fn enter_blocks_during_flush() {
+        loom::model(|| {
+            let q = Arc::new(SubmissionQueue::new(4));
+
+            // Thread 1: enter, push, submit, drain, drop guard
+            let q2 = Arc::clone(&q);
+            let h = thread::spawn(move || {
+                let s = q2.enter();
+                s.push(10).unwrap();
+                if let Some(mut guard) = s.submit() {
+                    let _: Vec<_> = guard.drain().collect();
+                    // guard dropped here, unblocking enter()
+                }
+            });
+
+            // Thread 2: enter (may block if thread 1 holds guard), push, submit
+            let s = q.enter();
+            s.push(20).unwrap();
+            if let Some(mut guard) = s.submit() {
+                let _: Vec<_> = guard.drain().collect();
+            }
+
+            h.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn capacity_exhaustion() {
+        loom::model(|| {
+            let q = Arc::new(SubmissionQueue::new(1));
+
+            let q2 = Arc::clone(&q);
+            let h = thread::spawn(move || {
+                let s = q2.enter();
+                let _ = s.push(1);
+                if let Some(mut guard) = s.submit() {
+                    let _: Vec<_> = guard.drain().collect();
+                }
+            });
+
+            let s = q.enter();
+            let _ = s.push(2);
+            if let Some(mut guard) = s.submit() {
+                let _: Vec<_> = guard.drain().collect();
+            }
+
+            h.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn drop_without_submit() {
+        loom::model(|| {
+            let q = Arc::new(SubmissionQueue::new(4));
+
+            let q2 = Arc::clone(&q);
+            let h = thread::spawn(move || {
+                let s = q2.enter();
+                s.push(1).unwrap();
+                // drop without submit — exercises the panic/cleanup path
+            });
+
+            h.join().unwrap();
+
+            let s = q.enter();
+            s.push(2).unwrap();
+            let mut guard = s.submit().unwrap();
+            let items: Vec<_> = guard.drain().collect();
+            assert_eq!(items, vec![2]);
+        });
     }
 }
