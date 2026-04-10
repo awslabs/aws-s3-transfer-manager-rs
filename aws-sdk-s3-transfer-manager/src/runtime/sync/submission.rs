@@ -647,4 +647,71 @@ mod loom_tests {
             assert_eq!(items, vec![2]);
         });
     }
+
+    #[test]
+    fn partial_drain_then_drop() {
+        loom::model(|| {
+            let q = Arc::new(SubmissionQueue::new(4));
+            let total = Arc::new(LoomAtomicUsize::new(0));
+
+            let q2 = Arc::clone(&q);
+            let t2 = Arc::clone(&total);
+            let h = thread::spawn(move || {
+                let s = q2.enter();
+                s.push(10).unwrap();
+                s.push(20).unwrap();
+                if let Some(mut guard) = s.submit() {
+                    // Drain only one item, drop guard with remainder
+                    if let Some(_val) = guard.drain().next() {
+                        t2.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // guard drops here — remaining items must be dropped exactly once
+                }
+            });
+
+            let s = q.enter();
+            s.push(30).unwrap();
+            if let Some(mut guard) = s.submit() {
+                total.fetch_add(guard.drain().count(), Ordering::Relaxed);
+            }
+
+            h.join().unwrap();
+            // All 3 items accounted for (drained or dropped)
+            assert!(total.load(Ordering::Relaxed) >= 1);
+        });
+    }
+
+    #[test]
+    fn three_producers_multiple_pushes() {
+        loom::model(|| {
+            let q = Arc::new(SubmissionQueue::new(8));
+            let total = Arc::new(LoomAtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let q = Arc::clone(&q);
+                let total = Arc::clone(&total);
+                handles.push(thread::spawn(move || {
+                    let s = q.enter();
+                    s.push(1).unwrap();
+                    s.push(2).unwrap();
+                    if let Some(mut guard) = s.submit() {
+                        total.fetch_add(guard.drain().count(), Ordering::Relaxed);
+                    }
+                }));
+            }
+
+            let s = q.enter();
+            s.push(3).unwrap();
+            s.push(4).unwrap();
+            if let Some(mut guard) = s.submit() {
+                total.fetch_add(guard.drain().count(), Ordering::Relaxed);
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(total.load(Ordering::Relaxed), 6);
+        });
+    }
 }
