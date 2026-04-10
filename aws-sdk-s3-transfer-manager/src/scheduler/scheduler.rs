@@ -147,6 +147,7 @@ impl Scheduler {
         )
     }
 
+    #[allow(dead_code)] // TODO: expose runtime selection on public config
     pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
         SchedulerBuilder::new(controller)
             .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))

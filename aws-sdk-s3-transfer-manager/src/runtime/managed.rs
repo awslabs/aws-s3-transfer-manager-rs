@@ -290,6 +290,7 @@ impl ManagedThreadRuntimeBuilder {
 
     /// Set the hardware topology. Defaults to `Topology::uniform(num_cpus)`
     /// where `num_cpus` is detected at build time.
+    #[allow(dead_code)] // TODO: expose on public config
     pub(crate) fn topology(mut self, topology: Topology) -> Self {
         self.topology = Some(topology);
         self

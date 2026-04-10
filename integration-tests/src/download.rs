@@ -236,7 +236,7 @@ async fn test_download_concurrent() {
         let handle = tm
             .download()
             .bucket("test-bucket")
-            .key(&format!("concurrent-key-{}", i))
+            .key(format!("concurrent-key-{}", i))
             .initiate()
             .expect("initiate download");
         handles.push((i, handle));

@@ -126,6 +126,7 @@ impl<T> SubmissionQueue<T> {
     }
 
     /// Number of items the queue can hold per round.
+    #[allow(dead_code)] // TODO: runtime observability
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -192,11 +193,13 @@ impl<T> Drop for Submission<'_, T> {
 
 impl<T> SubmissionGuard<'_, T> {
     /// Number of items in this batch.
+    #[allow(dead_code)] // TODO: runtime observability
     pub(crate) fn len(&self) -> usize {
         self.count - self.next
     }
 
     /// Whether the batch is empty.
+    #[allow(dead_code)] // TODO: runtime observability
     pub(crate) fn is_empty(&self) -> bool {
         self.next >= self.count
     }
@@ -205,6 +208,7 @@ impl<T> SubmissionGuard<'_, T> {
     ///
     /// Safety relies on flushing being true (no producers are writing) and all
     /// slots in `next..count` being initialized.
+    #[allow(dead_code)] // TODO: runtime observability
     pub(crate) fn as_slice(&self) -> &[T] {
         // Safety: flushing is true so no producers are writing. All slots in
         // next..count were initialized by producers. UnsafeCell<MaybeUninit<T>>
@@ -219,6 +223,7 @@ impl<T> SubmissionGuard<'_, T> {
     ///
     /// Safety relies on flushing being true (no producers are writing) and all
     /// slots in `next..count` being initialized.
+    #[allow(dead_code)] // TODO: runtime observability
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // Safety: same as as_slice, plus we have exclusive &mut access.
         unsafe {

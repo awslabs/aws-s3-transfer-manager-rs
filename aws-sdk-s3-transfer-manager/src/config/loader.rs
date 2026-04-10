@@ -33,7 +33,6 @@ impl Intercept for S3TransferManagerInterceptor {
         cfg.interceptor_state()
             .store_append(AwsSdkFeature::S3Transfer);
         let api_metadata = cfg.load::<ApiMetadata>().unwrap();
-        // TODO: maybe APP Name someday
         let mut ua = AwsUserAgent::new_from_environment(Env::real(), api_metadata.clone());
         if let Some(framework_metadata) = self.frame_work_meta_data.clone() {
             ua = ua.with_framework_metadata(framework_metadata);

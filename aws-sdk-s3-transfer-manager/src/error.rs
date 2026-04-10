@@ -62,12 +62,12 @@ pub struct ChunkFailed {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ChunkId {
     Download(u64),
-    #[allow(dead_code)] // TODO(milestone1): wire upload error reporting
+    #[allow(dead_code)] // TODO: wire upload error reporting
     Upload(String),
 }
 
 impl ChunkFailed {
-    #[allow(dead_code)] // TODO(milestone1): wire upload error reporting
+    #[allow(dead_code)] // TODO: wire upload error reporting
                         // The sequence number of the chunk for download operation
     pub(crate) fn download_seq(&self) -> Option<u64> {
         match self.id {

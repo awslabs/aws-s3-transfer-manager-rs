@@ -24,6 +24,7 @@ use worker_pool::WorkerPool;
 ///
 /// Assumes it is running within an existing tokio multi-threaded runtime context.
 /// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
+#[allow(dead_code)] // TODO: expose runtime selection on public config
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
@@ -32,6 +33,7 @@ pub(crate) struct TokioMultiThreadRuntime {
     components: RuntimeComponents,
 }
 
+#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl TokioMultiThreadRuntime {
     pub(crate) fn new(scheduler: Scheduler) -> Self {
         Self {

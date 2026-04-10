@@ -37,7 +37,6 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
-        // TODO: we were getting checksum behavior for free from SDK, moving to presigning and dedicated HTTP stack requires us to consider that
         if input.checksum_strategy.is_none() {
             // User didn't explicitly set checksum strategy.
             // If SDK is configured to send checksums: use default checksum strategy.

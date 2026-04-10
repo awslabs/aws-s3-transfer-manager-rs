@@ -33,9 +33,6 @@ pub(crate) struct Handle {
 impl Handle {
     /// Get the concrete number of workers to use based on the concurrency setting.
     pub(crate) fn num_workers(&self) -> usize {
-        // FIXME - update logic for auto/target throughput or delegate to scheduler?
-        // FIXME - this applies per/transfer!! the concurrency setting probably shouldn't map 1-1
-        // like this as it's meant to be concurrency across operations
         match self.config.concurrency() {
             ConcurrencyMode::Explicit(concurrency) => *concurrency,
             _ => DEFAULT_CONCURRENCY,
@@ -98,7 +95,7 @@ impl Client {
                     Arc::new(FixedConcurrency::new(*n)),
                     Telemetry::new(Duration::from_millis(500)),
                 ),
-                // TODO(vnext): implement support for target throughput
+                // TODO: implement support for target throughput
                 _ => {
                     let adaptive_config = AdaptiveConfig::default();
                     let telemetry = Telemetry::new(adaptive_config.window.duration);

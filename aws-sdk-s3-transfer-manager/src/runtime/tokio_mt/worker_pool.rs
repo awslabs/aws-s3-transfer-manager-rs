@@ -20,6 +20,7 @@ struct WorkQueue {
     in_flight: usize,
 }
 
+#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl WorkQueue {
     fn new() -> Self {
         Self {
@@ -44,12 +45,12 @@ impl WorkQueue {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
-    #[allow(dead_code)] // TODO(phase3): runtime observability
+    #[allow(dead_code)] // TODO: runtime observability
     fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    #[allow(dead_code)] // TODO(phase3): runtime observability
+    #[allow(dead_code)] // TODO: runtime observability
     fn in_flight_count(&self) -> usize {
         self.in_flight
     }
@@ -71,6 +72,7 @@ pub(super) struct WorkerPool {
     started: AtomicBool,
 }
 
+#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl WorkerPool {
     pub(super) fn new() -> Self {
         Self {
@@ -112,7 +114,7 @@ impl WorkerPool {
     }
 
     /// Signal shutdown. Workers will exit after current work.
-    #[allow(dead_code)] // TODO(phase3): scheduler observability + lifecycle
+    #[allow(dead_code)] // TODO: scheduler observability + lifecycle
     pub(super) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         // Wake all waiting workers so they can exit
@@ -127,13 +129,13 @@ impl WorkerPool {
     }
 
     /// Number of pending work items.
-    #[allow(dead_code)] // TODO(phase3): runtime observability
+    #[allow(dead_code)] // TODO: runtime observability
     pub(super) fn pending_count(&self) -> usize {
         self.queue.lock().unwrap().pending_count()
     }
 
     /// Number of in-flight work items.
-    #[allow(dead_code)] // TODO(phase3): runtime observability
+    #[allow(dead_code)] // TODO: runtime observability
     pub(super) fn in_flight_count(&self) -> usize {
         self.queue.lock().unwrap().in_flight_count()
     }

@@ -953,7 +953,7 @@ mod tests {
         /// Always fail
         Always,
         /// Fail first N attempts, then succeed
-        #[allow(dead_code)] // TODO(phase3): re-enable with retry tests
+        #[allow(dead_code)] // TODO: re-enable with retry tests
         Times(usize),
     }
 
