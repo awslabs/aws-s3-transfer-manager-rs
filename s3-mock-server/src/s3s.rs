@@ -115,9 +115,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.last_modified = Some(timestamp);
 
         if let Some(content_type) = stream_metadata.content_type {
-            if let Ok(mime) = content_type.parse() {
-                output.content_type = Some(mime);
-            }
+            let mime = content_type
+                .parse()
+                .expect("stored content_type should be valid");
+            output.content_type = Some(mime);
         }
 
         output.metadata = Some(stream_metadata.user_metadata);
@@ -430,6 +431,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
     ) -> S3Result<S3Response<s3s::dto::ListObjectsV2Output>> {
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
+
+        // Real S3 returns NoSuchBucket if the bucket doesn't exist
+        if !self.storage.head_bucket(&input.bucket).await? {
+            return Err(s3s::s3_error!(NoSuchBucket));
+        }
+
         let prefix = input.prefix.as_deref();
         let delimiter = input.delimiter.as_deref();
         let max_keys = input.max_keys.unwrap_or(1000).min(1000) as usize;
