@@ -26,7 +26,7 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     sys::preallocate(file, len)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 mod sys {
     use bytes::Buf;
     use std::fs::File;
@@ -56,6 +56,31 @@ mod sys {
     }
 
     #[cfg(not(target_os = "linux"))]
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        file.set_len(len)
+    }
+}
+
+// Under miri, use simple seek+pwrite to avoid unsupported pwritev FFI.
+// The buffer chunking logic is still exercised by the same tests.
+#[cfg(all(unix, miri))]
+mod sys {
+    use bytes::Buf;
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::fs::FileExt;
+
+    pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
+        let mut pos = offset;
+        while buf.has_remaining() {
+            let chunk = buf.chunk();
+            let written = file.write_at(chunk, pos)?;
+            pos += written as u64;
+            buf.advance(written);
+        }
+        Ok(())
+    }
+
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
     }
@@ -230,6 +255,7 @@ mod tests {
     }
 
     /// Two 8MB writes at different offsets, each composed of many small segments.
+    #[cfg_attr(miri, ignore)] // 16MB through miri's interpreter is too slow
     #[test]
     fn write_all_at_large_parts_at_offsets() {
         let dir = tempfile::tempdir().unwrap();

@@ -188,7 +188,7 @@ jobs:
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v2
         with:
-          tool: cargo-check-external-types@0.3.0
+          tool: cargo-check-external-types@0.4.0
       - name: check-external-types
         run: cargo check-external-types --all-features --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
