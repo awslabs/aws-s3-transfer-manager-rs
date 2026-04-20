@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::TryStreamExt;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
@@ -40,6 +41,12 @@ pub struct StoreObjectRequest {
     /// `SystemTime::now()`. This is only useful for the direct (non-S3-protocol)
     /// seeding API — the S3 PutObject operation never sets this.
     pub last_modified: Option<SystemTime>,
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
 }
 
 /// Request for retrieving an object.
@@ -139,6 +146,12 @@ impl StoreObjectRequest {
             content_type: None,
             user_metadata: HashMap::new(),
             last_modified: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
         }
     }
 
@@ -168,6 +181,24 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
             content_type: input.content_type.map(|mime| mime.to_string()),
             user_metadata: input.metadata.unwrap_or_default(),
             last_modified: None,
+            storage_class: input
+                .storage_class
+                .map(|s| Cow::<str>::from(s).into_owned()),
+            server_side_encryption: input
+                .server_side_encryption
+                .map(|s| Cow::<str>::from(s).into_owned()),
+            cache_control: input
+                .cache_control
+                .map(|s| Cow::<str>::from(s).into_owned()),
+            content_encoding: input
+                .content_encoding
+                .map(|s| Cow::<str>::from(s).into_owned()),
+            content_disposition: input
+                .content_disposition
+                .map(|s| Cow::<str>::from(s).into_owned()),
+            content_language: input
+                .content_language
+                .map(|s| Cow::<str>::from(s).into_owned()),
         }
     }
 }

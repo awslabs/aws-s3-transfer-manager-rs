@@ -179,6 +179,12 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             content_type: Some("text/plain".to_string()),
             user_metadata: HashMap::new(),
             last_modified: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
         };
 
         storage.put_object(request).await.unwrap();
@@ -237,6 +243,12 @@ async fn test_storage_backend_consistency() {
             content_type: Some("text/plain".to_string()),
             user_metadata: HashMap::new(),
             last_modified: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 

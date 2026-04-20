@@ -288,6 +288,12 @@ impl StorageBackend for FilesystemStorage {
             crc64nvme: object_integrity.crc64nvme.clone(),
             sha1: object_integrity.sha1.clone(),
             sha256: object_integrity.sha256.clone(),
+            storage_class: request.storage_class,
+            server_side_encryption: request.server_side_encryption,
+            cache_control: request.cache_control,
+            content_encoding: request.content_encoding,
+            content_disposition: request.content_disposition,
+            content_language: request.content_language,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;

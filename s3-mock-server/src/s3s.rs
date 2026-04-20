@@ -130,6 +130,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_sha256 = stream_metadata.sha256;
         output.checksum_crc64nvme = stream_metadata.crc64nvme;
 
+        // Return stored HTTP headers
+        output.storage_class = stream_metadata.storage_class.map(|s| s.parse().unwrap());
+        output.cache_control = stream_metadata.cache_control.map(|s| s.parse().unwrap());
+        output.content_encoding = stream_metadata.content_encoding.map(|s| s.parse().unwrap());
+        output.content_disposition = stream_metadata
+            .content_disposition
+            .map(|s| s.parse().unwrap());
+        output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
+
         Ok(S3Response::new(output))
     }
 
@@ -165,6 +174,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_sha1 = metadata.sha1;
         output.checksum_sha256 = metadata.sha256;
         output.checksum_crc64nvme = metadata.crc64nvme;
+
+        // Return stored HTTP headers
+        output.storage_class = metadata.storage_class.map(|s| s.parse().unwrap());
+        output.cache_control = metadata.cache_control.map(|s| s.parse().unwrap());
+        output.content_encoding = metadata.content_encoding.map(|s| s.parse().unwrap());
+        output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
+        output.content_language = metadata.content_language.map(|s| s.parse().unwrap());
 
         Ok(S3Response::new(output))
     }
@@ -434,7 +450,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Real S3 returns NoSuchBucket if the bucket doesn't exist
         if !self.storage.head_bucket(&input.bucket).await? {
-            return Err(s3s::s3_error!(NoSuchBucket));
+            return Err(s3s::s3_error!(
+                NoSuchBucket,
+                "The specified bucket does not exist"
+            ));
         }
 
         let prefix = input.prefix.as_deref();
@@ -564,7 +583,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if self.storage.head_bucket(&input.bucket).await? {
             Ok(S3Response::new(HeadBucketOutput::default()))
         } else {
-            Err(s3s::s3_error!(NoSuchBucket))
+            Err(s3s::s3_error!(
+                NoSuchBucket,
+                "The specified bucket does not exist"
+            ))
         }
     }
 
