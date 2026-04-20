@@ -147,7 +147,6 @@ jobs:
         run: |
           cargo doc --lib --no-deps --all-features --document-private-items
         env:
-          RUSTFLAGS: --cfg docsrs
           RUSTDOCFLAGS: --cfg docsrs
 
   minrust:
