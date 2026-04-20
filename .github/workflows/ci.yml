@@ -10,8 +10,7 @@ concurrency:
 
 
 env:
-  # TODO: restore -Dwarnings after dead code cleanup from runtime/topology/metrics
-  RUSTFLAGS: ""
+  RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
   # Change to specific Rust release to pin
   rust_stable: stable
@@ -46,6 +45,8 @@ jobs:
       - check-deny
       - sanitizers
       - features
+      - miri
+      - loom
     steps:
       - run: exit 0
 
@@ -261,6 +262,55 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
         run: cargo hack check --all --feature-powerset
+
+  miri:
+    name: miri
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Run miri on sync tests that exercise unsafe code.
+      # TODO: migrate #[tokio::test] to miri-compatible runtimes (no I/O driver)
+      # so the full lib suite can run under miri. Currently only sync tests work
+      # because #[tokio::test] calls enable_all() which needs epoll/kqueue FFI.
+      - name: miri
+        run: |
+          cargo miri test -p aws-sdk-s3-transfer-manager --lib -- \
+            runtime::sync::submission::tests \
+            runtime::topology::tests \
+            http::header::tests \
+            metrics::tests \
+            metrics::latency::tests \
+            operation::download::chunk_meta::tests \
+            operation::download::object_meta::tests
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+
+  loom:
+    name: loom
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: loom
+        run: |
+          RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
+            --lib --release -- loom_tests --nocapture
+        env:
+          LOOM_MAX_PREEMPTIONS: 2
+          LOOM_MAX_BRANCHES: 10000
+          RUST_BACKTRACE: 1
 
   # TODO - get cross check working
   # cross-check:

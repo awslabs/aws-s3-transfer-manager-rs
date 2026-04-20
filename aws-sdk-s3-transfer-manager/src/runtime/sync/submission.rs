@@ -205,14 +205,18 @@ impl<T> SubmissionGuard<'_, T> {
     ///
     /// Safety relies on flushing being true (no producers are writing) and all
     /// slots in `next..count` being initialized.
-    #[allow(dead_code)] // TODO: runtime observability
+    #[allow(dead_code)] // TODO: wire into runtime dispatch
     pub(crate) fn as_slice(&self) -> &[T] {
         // Safety: flushing is true so no producers are writing. All slots in
-        // next..count were initialized by producers. UnsafeCell<MaybeUninit<T>>
-        // has the same layout as T (#[repr(transparent)]).
+        // next..count were initialized by producers.
+        //
+        // We derive the pointer from the boxed slice (a single allocation),
+        // not from an individual UnsafeCell, so the provenance covers the
+        // entire range. UnsafeCell<MaybeUninit<T>> is #[repr(transparent)]
+        // through both layers, so the cast is layout-correct.
         unsafe {
-            let ptr = self.sq.slots[self.next].with(|p| p as *const T);
-            std::slice::from_raw_parts(ptr, self.count - self.next)
+            let base = self.sq.slots.as_ptr().add(self.next) as *const T;
+            std::slice::from_raw_parts(base, self.count - self.next)
         }
     }
 
@@ -220,12 +224,12 @@ impl<T> SubmissionGuard<'_, T> {
     ///
     /// Safety relies on flushing being true (no producers are writing) and all
     /// slots in `next..count` being initialized.
-    #[allow(dead_code)] // TODO: runtime observability
+    #[allow(dead_code)] // TODO: wire into runtime dispatch
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // Safety: same as as_slice, plus we have exclusive &mut access.
         unsafe {
-            let ptr = self.sq.slots[self.next].with_mut(|p| p as *mut T);
-            std::slice::from_raw_parts_mut(ptr, self.count - self.next)
+            let base = self.sq.slots.as_ptr().add(self.next) as *mut T;
+            std::slice::from_raw_parts_mut(base, self.count - self.next)
         }
     }
 
