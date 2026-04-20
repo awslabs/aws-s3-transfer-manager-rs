@@ -723,6 +723,7 @@ mod tests {
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_poll_work_generates_parts_after_create_mpu() {
         let s3_client = mock_s3_client_for_mpu();
@@ -749,6 +750,7 @@ mod tests {
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_execute_create_mpu_transitions_to_transferring() {
         let s3_client = mock_s3_client_for_mpu();
@@ -765,6 +767,7 @@ mod tests {
         assert!(matches!(data, UploadWork::UploadPart { .. }));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_execute_full_mpu_flow() {
         let s3_client = mock_s3_client_for_mpu();
@@ -798,6 +801,7 @@ mod tests {
         assert!(result.is_some());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_basic_upload_object() {
         use aws_sdk_s3::operation::put_object::PutObjectOutput;
@@ -824,6 +828,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_basic_mpu() {
         let s3_client = mock_s3_client_for_mpu();

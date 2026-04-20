@@ -432,6 +432,7 @@ mod tests {
             (successes, errors)
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_list_directory_contents_should_send_upload_object_jobs_from_traversed_path_entries(
         ) {
@@ -519,6 +520,7 @@ mod tests {
             }
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_list_directory_contents_with_symlinks() {
             let files1 = vec![("sample.jpg", 1)];
@@ -600,6 +602,7 @@ mod tests {
             }
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_list_directory_contents_should_send_both_upload_object_jobs_and_errors() {
             let recursion_root = "test";
@@ -650,6 +653,7 @@ mod tests {
             );
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_upload_filter() {
             let recursion_root = "test";
@@ -698,6 +702,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_cancel_single_upload_via_put_object() {
         let bucket = "doesnotmatter";

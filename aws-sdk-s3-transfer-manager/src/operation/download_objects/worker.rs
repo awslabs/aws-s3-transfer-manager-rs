@@ -472,6 +472,7 @@ mod tests {
         assert_eq!(*test.expected.as_ref().unwrap(), actual_str);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_skip_folder_objects() {
         let list_objects_rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -523,6 +524,7 @@ mod tests {
         assert_eq!(keys, vec!["key1", "key2"]);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_user_filter() {
         let list_objects_rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {

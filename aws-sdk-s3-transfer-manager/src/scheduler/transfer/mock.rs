@@ -99,6 +99,12 @@ impl Transfer for MockTransfer {
     }
 }
 
+impl Drop for MockTransfer {
+    fn drop(&mut self) {
+        self.ctx.handle.scheduler.shutdown();
+    }
+}
+
 /// Simple state machine that generates N Network work items.
 #[derive(Debug)]
 pub(crate) struct FixedWorkCount {
@@ -227,6 +233,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_fixed_work_count() {
         let sm = FixedWorkCount::new(3);
@@ -238,6 +245,7 @@ mod tests {
         assert!(matches!(sm.poll_work(id), PollWork::Done));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_with_delay() {
         let sm = WithDelay::new(FixedWorkCount::new(1), Duration::from_millis(50));

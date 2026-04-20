@@ -4,8 +4,11 @@
  */
 
 //! Production wrappers that present a loom-compatible API over `std` and
-//! `parking_lot` primitives. Under `cfg(loom)` the sibling `loom` module
+//! `parking_lot` primitives. Under `cfg(s3_tm_loom)` the sibling `loom` module
 //! provides the same API surface backed by `loom` types.
+//!
+//! Under `cfg(miri)`, Mutex/Condvar fall back to `std::sync` because
+//! `parking_lot` uses integer-to-pointer casts that violate strict provenance.
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -34,16 +37,23 @@ impl<T> UnsafeCell<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Mutex / MutexGuard — parking_lot with PhantomData to suppress send_guard
+// Mutex / MutexGuard
+//
+// Production: parking_lot (faster Condvar, no poisoning).
+// Miri: std::sync (parking_lot uses integer-to-pointer casts that violate
+//        strict provenance — that's a parking_lot concern, not ours).
 // ---------------------------------------------------------------------------
 
+#[cfg(not(miri))]
 pub(crate) struct Mutex<T>(PhantomData<std::sync::Mutex<T>>, parking_lot::Mutex<T>);
 
+#[cfg(not(miri))]
 pub(crate) struct MutexGuard<'a, T>(
     PhantomData<std::sync::MutexGuard<'a, T>>,
     parking_lot::MutexGuard<'a, T>,
 );
 
+#[cfg(not(miri))]
 impl<T> Mutex<T> {
     pub(crate) fn new(val: T) -> Self {
         Self(PhantomData, parking_lot::Mutex::new(val))
@@ -54,6 +64,7 @@ impl<T> Mutex<T> {
     }
 }
 
+#[cfg(not(miri))]
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -61,9 +72,42 @@ impl<T> Deref for MutexGuard<'_, T> {
     }
 }
 
+#[cfg(not(miri))]
 impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.1
+    }
+}
+
+#[cfg(miri)]
+pub(crate) struct Mutex<T>(std::sync::Mutex<T>);
+
+#[cfg(miri)]
+pub(crate) struct MutexGuard<'a, T>(std::sync::MutexGuard<'a, T>);
+
+#[cfg(miri)]
+impl<T> Mutex<T> {
+    pub(crate) fn new(val: T) -> Self {
+        Self(std::sync::Mutex::new(val))
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+        MutexGuard(self.0.lock().expect("poisoned"))
+    }
+}
+
+#[cfg(miri)]
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+#[cfg(miri)]
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
     }
 }
 
@@ -71,8 +115,10 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 // Condvar — ownership-based wait matching loom/std (not parking_lot's &mut)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(miri))]
 pub(crate) struct Condvar(PhantomData<std::sync::Condvar>, parking_lot::Condvar);
 
+#[cfg(not(miri))]
 impl Condvar {
     pub(crate) fn new() -> Self {
         Self(PhantomData, parking_lot::Condvar::new())
@@ -89,6 +135,28 @@ impl Condvar {
 
     pub(crate) fn notify_all(&self) {
         self.1.notify_all();
+    }
+}
+
+#[cfg(miri)]
+pub(crate) struct Condvar(std::sync::Condvar);
+
+#[cfg(miri)]
+impl Condvar {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Condvar::new())
+    }
+
+    pub(crate) fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        MutexGuard(self.0.wait(guard.0).expect("poisoned"))
+    }
+
+    pub(crate) fn notify_one(&self) {
+        self.0.notify_one();
+    }
+
+    pub(crate) fn notify_all(&self) {
+        self.0.notify_all();
     }
 }
 

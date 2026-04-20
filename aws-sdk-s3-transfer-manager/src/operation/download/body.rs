@@ -654,6 +654,7 @@ mod tests {
         (Body::new(consumer, transfer.clone()), transfer, writer)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next() {
         let (mut body, transfer, writer) = test_body();
@@ -695,6 +696,7 @@ mod tests {
         assert_eq!(expected, received);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next_on_failed_transfer() {
         let (mut body, transfer, writer) = test_body();
@@ -721,6 +723,7 @@ mod tests {
         assert!(matches!(err.kind(), error::ErrorKind::ChildOperationFailed));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next_on_cancelled_transfer() {
         let (mut body, transfer, _writer) = test_body();
@@ -733,6 +736,7 @@ mod tests {
         assert!(matches!(err.kind(), error::ErrorKind::OperationCancelled));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next_unblocks_on_cancel() {
         let (mut body, transfer, _writer) = test_body();
@@ -847,6 +851,7 @@ mod tests {
         assert_eq!(consumer.try_take_next().unwrap().seq, 3);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_next() {
         let (writer, consumer) = new_slot_body(4);
@@ -859,6 +864,7 @@ mod tests {
         assert_eq!(chunk.unwrap().seq, 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_returns_none_when_complete() {
         let (_writer, consumer) = new_slot_body(4);
@@ -867,6 +873,7 @@ mod tests {
         assert!(chunk.is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_waits_for_producer() {
         let (writer, consumer) = new_slot_body(4);
@@ -934,6 +941,7 @@ mod tests {
         assert_eq!(chunk.data.to_vec(), b"hello world");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_buffer_concurrent_producers() {
         let (writer, consumer) = new_slot_body(64);
@@ -969,6 +977,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_completion_race() {
         let (writer, consumer) = new_slot_body(4);
@@ -1139,6 +1148,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_sink_concurrent_fill() {
         let dir = tempfile::tempdir().unwrap();

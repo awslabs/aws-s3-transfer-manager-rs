@@ -275,6 +275,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_all_fields_copied_to_put_object_request() {
         let upload_req = Arc::new(upload_request_for_tests());
@@ -409,6 +410,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_all_fields_copied_to_upload_part_request() {
         let upload_req = Arc::new(upload_request_for_tests());
@@ -456,6 +458,7 @@ mod tests {
         let _ = upload_part_builder.send().await.unwrap();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_copy_fields_to_complete_mpu_request() {
         let config = Config::builder().build();

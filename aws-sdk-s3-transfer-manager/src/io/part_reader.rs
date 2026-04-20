@@ -421,6 +421,7 @@ mod test {
         parts
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader() {
         let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
@@ -471,21 +472,25 @@ mod test {
         assert_eq!(expected, actual);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader() {
         path_reader_test(None, None).await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader_with_offset() {
         path_reader_test(None, Some(8)).await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader_with_explicit_length() {
         path_reader_test(Some(12), None).await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader_with_length_and_offset() {
         path_reader_test(Some(23), Some(4)).await;
@@ -524,6 +529,7 @@ mod test {
     }
 
     // sanity test custom PollPart is wired up and can be supplied to input stream
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_dyn_reader() {
         let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
@@ -545,6 +551,7 @@ mod test {
         assert_eq!(expected, actual);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader_offset_not_aligned_error() {
         let data = Bytes::from("test data for alignment error");
@@ -566,6 +573,7 @@ mod test {
         assert!(result.is_err());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader_detects_last_true() {
         let data = Bytes::from("test");

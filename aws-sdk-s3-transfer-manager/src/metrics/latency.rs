@@ -332,6 +332,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn test_cold_no_timeout() {
         let tracker = LatencyTracker::new();
@@ -348,6 +349,7 @@ mod tests {
         assert_eq!(tracker.sample_count.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn test_guarded_success() {
         let tracker = LatencyTracker::new();
@@ -363,6 +365,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn test_guarded_timeout_then_success() {
         let tracker = LatencyTracker::new();
@@ -387,6 +390,7 @@ mod tests {
         assert_eq!(tracker.timeout_count.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn test_guarded_all_attempts_exhausted() {
         let tracker = LatencyTracker::new();
@@ -412,6 +416,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn test_guarded_sdk_error_no_retry() {
         let tracker = LatencyTracker::new();

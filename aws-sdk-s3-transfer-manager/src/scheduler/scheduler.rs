@@ -433,6 +433,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_transfer_completes() {
         let _logs = show_test_logs();
@@ -459,6 +460,7 @@ mod tests {
         scheduler.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_transfer_completes_managed_runtime() {
         let _logs = show_test_logs();
@@ -485,6 +487,7 @@ mod tests {
         scheduler.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_multiple_transfers_complete() {
         let scheduler = Scheduler::new(4);
@@ -520,6 +523,7 @@ mod tests {
     /// item (like a single PutObject upload). All must complete — if on_completion
     /// doesn't call generate_work() for terminal transfers, only the first
     /// `concurrency` transfers complete and the rest hang forever.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_work_transfers_exceed_concurrency() {
         let scheduler = Scheduler::new(2);
@@ -555,6 +559,7 @@ mod tests {
         let _scheduler = Scheduler::new(4);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_set_priority() {
         let scheduler = Scheduler::new(2);
@@ -659,6 +664,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_priority_affects_work_distribution() {
         let scheduler = Scheduler::new(2);
@@ -720,6 +726,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_priority_change_mid_flight() {
         let scheduler = Scheduler::new(2);
@@ -773,6 +780,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_failed_transfer_cleaned_up() {
         let _logs = show_test_logs();
@@ -801,6 +809,7 @@ mod tests {
         scheduler.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_panic_transfer_cleaned_up_and_error_propagated() {
         let _logs = show_test_logs();
@@ -851,6 +860,7 @@ mod tests {
         scheduler.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_cancel_transfer_stops_work() {
         let scheduler = Scheduler::new(2);

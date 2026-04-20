@@ -156,6 +156,7 @@ mod tests {
     use tokio_test::io::Builder;
     use tokio_test::{assert_pending, assert_ready};
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_tokio_adapter_e2e() {
         let (mock, mut handle) = Builder::new().build_with_handle();
@@ -197,6 +198,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_tokio_adapter_partial_reads() {
         let (mock, mut handle) = Builder::new().build_with_handle();
