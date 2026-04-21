@@ -178,7 +178,7 @@ jobs:
           # `check-external-types` requires a specific Rust nightly version. See
           # the README for details: https://github.com/awslabs/cargo-check-external-types
           # v0.4.0 needs rustdoc JSON format v56 (rustdoc-types 0.56.0)
-          - nightly-2026-02-15
+          - nightly-2025-08-06
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -189,7 +189,7 @@ jobs:
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v2
         with:
-          tool: cargo-check-external-types@0.4.0
+          tool: cargo-check-external-types@0.3.0
       - name: check-external-types
         run: cargo check-external-types --all-features --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
