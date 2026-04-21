@@ -12,7 +12,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -157,7 +157,7 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
 /// Execution runtime backed by per-core OS threads, each running a tokio
 /// current-thread runtime.
 pub(crate) struct ManagedThreadRuntime {
-    scheduler: Scheduler,
+    handle: Weak<crate::client::Handle>,
     #[allow(dead_code)] // used for topology-aware routing when wired
     topology: Topology,
     #[allow(dead_code)] // used for core pinning when wired
@@ -179,8 +179,8 @@ impl std::fmt::Debug for ManagedThreadRuntime {
 
 impl ManagedThreadRuntime {
     /// Create a [`ManagedThreadRuntimeBuilder`].
-    pub(crate) fn builder(scheduler: Scheduler) -> ManagedThreadRuntimeBuilder {
-        ManagedThreadRuntimeBuilder::new(scheduler)
+    pub(crate) fn builder(handle: Weak<crate::client::Handle>) -> ManagedThreadRuntimeBuilder {
+        ManagedThreadRuntimeBuilder::new(handle)
     }
 
     /// Create a new managed thread runtime.
@@ -188,7 +188,7 @@ impl ManagedThreadRuntime {
     /// Spawns one OS thread per core in the topology. Each thread creates its
     /// own tokio current-thread runtime (the I/O driver binds to the creating
     /// thread).
-    fn new(scheduler: Scheduler, topology: Topology, pin_threads: bool) -> Self {
+    fn new(handle: Weak<crate::client::Handle>, topology: Topology, pin_threads: bool) -> Self {
         let shutdown_token = CancellationToken::new();
 
         let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
@@ -261,7 +261,7 @@ impl ManagedThreadRuntime {
         components.set_direct_io(true);
 
         Self {
-            scheduler,
+            handle,
             topology,
             pin_threads,
             threads,
@@ -274,15 +274,15 @@ impl ManagedThreadRuntime {
 
 /// Builder for [`ManagedThreadRuntime`].
 pub(crate) struct ManagedThreadRuntimeBuilder {
-    scheduler: Scheduler,
+    handle: Weak<crate::client::Handle>,
     topology: Option<Topology>,
     pin_threads: bool,
 }
 
 impl ManagedThreadRuntimeBuilder {
-    fn new(scheduler: Scheduler) -> Self {
+    fn new(handle: Weak<crate::client::Handle>) -> Self {
         Self {
-            scheduler,
+            handle,
             topology: None,
             pin_threads: false,
         }
@@ -313,7 +313,7 @@ impl ManagedThreadRuntimeBuilder {
                     .unwrap_or(1),
             )
         });
-        ManagedThreadRuntime::new(self.scheduler, topology, self.pin_threads)
+        ManagedThreadRuntime::new(self.handle, topology, self.pin_threads)
     }
 }
 
@@ -324,7 +324,7 @@ impl ExecutionRuntime for ManagedThreadRuntime {
             let th = &self.threads[thread_id.0];
             th.in_flight.fetch_add(1, Ordering::Relaxed);
 
-            let scheduler = self.scheduler.clone();
+            let handle = self.handle.clone();
             let in_flight = Arc::clone(&th.in_flight);
             let tid = work.descriptor.id();
 
@@ -336,12 +336,15 @@ impl ExecutionRuntime for ManagedThreadRuntime {
             );
 
             th.runtime_handle.spawn(async move {
+                let Some(h) = handle.upgrade() else {
+                    return;
+                };
                 tracing::trace!(
                     target: crate::telemetry::TARGET_EXECUTION,
                     %tid,
                     "execute starting",
                 );
-                let result = execute_work(&mut work, &scheduler).await;
+                let result = execute_work(&mut work, &h.scheduler).await;
                 tracing::trace!(
                     target: crate::telemetry::TARGET_EXECUTION,
                     %tid,
@@ -350,10 +353,10 @@ impl ExecutionRuntime for ManagedThreadRuntime {
                 in_flight.fetch_sub(1, Ordering::Relaxed);
                 match result {
                     ExecuteResult::Completed(outcome, elapsed) => {
-                        scheduler.on_completion(work, outcome, elapsed);
+                        h.scheduler.on_completion(work, outcome, elapsed);
                     }
                     ExecuteResult::Panicked => {
-                        scheduler.on_panic(work);
+                        h.scheduler.on_panic(work);
                     }
                 }
                 tracing::trace!(
@@ -392,7 +395,7 @@ impl Drop for ManagedThreadRuntime {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::runtime::Topology;
@@ -415,32 +418,50 @@ mod tests {
         }
     }
 
-    fn test_runtime(num_cores: usize) -> ManagedThreadRuntime {
-        let scheduler = Scheduler::new(num_cores);
-        ManagedThreadRuntime::builder(scheduler)
-            .topology(Topology::uniform(num_cores))
-            .build()
+    fn test_handle(num_cores: usize) -> (Arc<crate::client::Handle>, Arc<ManagedThreadRuntime>) {
+        let rt_holder: Arc<std::sync::OnceLock<Arc<ManagedThreadRuntime>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let rt_holder2 = rt_holder.clone();
+        let handle = crate::client::Handle::new_for_test_with_runtime(
+            crate::Config::builder()
+                .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+                .build(),
+            num_cores,
+            move |weak| {
+                let rt = Arc::new(
+                    ManagedThreadRuntime::builder(weak)
+                        .topology(Topology::uniform(num_cores))
+                        .build(),
+                );
+                rt_holder2.set(rt.clone()).ok();
+                rt
+            },
+        );
+        let rt = rt_holder.get().unwrap().clone();
+        (handle, rt)
     }
 
     #[test]
     fn threads_start_and_shutdown() {
-        let rt = test_runtime(4);
+        let (handle, rt) = test_handle(4);
         assert_eq!(rt.threads.len(), 4);
         rt.shutdown();
         drop(rt);
+        drop(handle);
     }
 
     #[test]
     fn shutdown_is_idempotent() {
-        let rt = test_runtime(2);
+        let (handle, rt) = test_handle(2);
         rt.shutdown();
         rt.shutdown();
         drop(rt);
+        drop(handle);
     }
 
     #[test]
     fn drop_without_shutdown() {
-        let rt = test_runtime(3);
+        let (_handle, rt) = test_handle(3);
         drop(rt);
     }
 

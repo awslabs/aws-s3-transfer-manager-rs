@@ -329,7 +329,6 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        client::Handle,
         io::InputStream,
         operation::upload_objects::{
             worker::{upload_single_obj, UploadObjectJob},
@@ -713,9 +712,7 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
-
-        let handle = std::sync::Arc::new(Handle::with_config_and_scheduler(config, scheduler));
+        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)

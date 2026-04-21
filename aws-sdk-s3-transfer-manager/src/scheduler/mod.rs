@@ -12,7 +12,7 @@ pub(crate) use concurrency::{
     classify_error, AdaptiveConcurrencyController, AdaptiveConfig, CompletionSample,
     ConcurrencyController, FixedConcurrency,
 };
-pub(crate) use scheduler::{Scheduler, SchedulerBuilder};
+pub(crate) use scheduler::Scheduler;
 
 pub(crate) mod descriptor;
 mod ready_set;

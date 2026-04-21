@@ -302,15 +302,7 @@ impl UploadTransfer {
             match PartReaderBuilder::new()
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
-                .direct_io(
-                    self.inner
-                        .ctx
-                        .handle
-                        .scheduler
-                        .runtime()
-                        .components()
-                        .direct_io(),
-                )
+                .direct_io(self.inner.ctx.handle.runtime.components().direct_io())
                 .io_counters(std::sync::Arc::clone(
                     &self.inner.ctx.handle.telemetry.io_counters,
                 ))
@@ -662,10 +654,10 @@ mod tests {
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
-        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
+        let handle = crate::client::Handle::new_for_test(
             crate::Config::builder().client(s3_client).build(),
-            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        ));
+            DEFAULT_CONCURRENCY,
+        );
 
         let input = UploadInput::builder()
             .bucket("test-bucket")

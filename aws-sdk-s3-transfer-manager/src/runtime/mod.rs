@@ -8,6 +8,7 @@
 //! The scheduler decides WHAT to run and WHEN. The runtime decides WHERE and HOW.
 
 mod tokio_mt;
+#[cfg(test)]
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
 mod managed;
