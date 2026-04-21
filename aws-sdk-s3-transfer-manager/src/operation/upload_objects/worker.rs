@@ -692,6 +692,8 @@ mod tests {
     mod windows {
         use crate::operation::upload_objects::worker::*;
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn test_derive_object_key() {
             assert_eq!(

@@ -337,8 +337,7 @@ mod tests {
     fn test_all_fields_copied_to_mpu_request() {
         let upload_req = upload_request_for_tests();
 
-        let config = aws_sdk_s3::Config::builder().build();
-        let client = aws_sdk_s3::Client::from_conf(config);
+        let client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let mpu_builder = copy_fields_to_mpu_request(&upload_req, client.create_multipart_upload());
         let mpu_req = mpu_builder.as_input().clone().build().unwrap();
 
@@ -513,8 +512,7 @@ mod tests {
 
     #[test]
     fn test_copy_fields_to_abort_mpu_request() {
-        let config = Config::builder().build();
-        let client = Client::from_conf(config);
+        let client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
 
         let upload_req = upload_request_for_tests();
 

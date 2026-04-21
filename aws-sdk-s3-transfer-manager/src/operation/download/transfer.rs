@@ -644,6 +644,8 @@ mod tests {
         execute(transfer, &mut work).await;
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_initial_poll_returns_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -652,6 +654,8 @@ mod tests {
         assert!(matches!(data, DownloadWork::Discovery));
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_pending_while_discovery_in_flight() {
         let transfer = create_download(24 * MB, 8 * MB);

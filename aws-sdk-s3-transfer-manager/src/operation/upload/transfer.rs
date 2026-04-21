@@ -694,6 +694,8 @@ mod tests {
         )
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_poll_work_initial_state_returns_create_mpu() {
         let s3_client = mock_client!(aws_sdk_s3, []);
@@ -705,6 +707,8 @@ mod tests {
         assert!(matches!(data, UploadWork::CreateMPU));
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_poll_work_pending_while_init_in_flight() {
         let s3_client = mock_client!(aws_sdk_s3, []);

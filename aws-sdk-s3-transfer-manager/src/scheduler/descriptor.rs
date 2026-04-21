@@ -261,6 +261,8 @@ mod tests {
             assert_eq!(qe.get(), (1, 0));
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn test_full_lifecycle() {
             let qe = QueuedExecuting::new();
@@ -275,6 +277,8 @@ mod tests {
             assert!(qe.is_idle());
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         #[should_panic(expected = "queued underflow")]
         #[cfg(debug_assertions)]
@@ -282,6 +286,8 @@ mod tests {
             QueuedExecuting::new().decrement_queued(1);
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         #[should_panic(expected = "executing underflow")]
         #[cfg(debug_assertions)]
@@ -289,6 +295,8 @@ mod tests {
             QueuedExecuting::new().finish_executing();
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         #[should_panic(expected = "queued underflow in start_executing")]
         #[cfg(debug_assertions)]
@@ -310,6 +318,8 @@ mod tests {
             TransferDescriptor::new(transfer)
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn test_priority_affects_vruntime_accumulation() {
             let high = test_descriptor(1);
@@ -337,6 +347,8 @@ mod tests {
             );
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn test_max_priority_still_accumulates_vruntime() {
             let desc = test_descriptor(1);
@@ -353,6 +365,8 @@ mod tests {
             );
         }
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn test_priority_ratio_reflected_in_vruntime() {
             let high = test_descriptor(1);
