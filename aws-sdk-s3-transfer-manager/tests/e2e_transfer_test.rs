@@ -43,9 +43,10 @@ async fn test_tm() -> (aws_sdk_s3_transfer_manager::Client, aws_sdk_s3::Client) 
         .part_size(PartSize::Target(8 * ByteUnit::Mebibyte.as_bytes_u64()))
         .load()
         .await;
-    let client = tm_config.client().clone();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-    (tm, client)
+    let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let s3_client = aws_sdk_s3::Client::new(&sdk_config);
+    (tm, s3_client)
 }
 
 fn create_input_stream(size: usize) -> InputStream {
