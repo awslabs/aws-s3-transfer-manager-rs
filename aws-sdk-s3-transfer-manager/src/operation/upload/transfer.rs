@@ -754,7 +754,7 @@ mod tests {
 
         let mut next = assert_ready(transfer.poll_work());
         let data = next.data_mut::<UploadWork>();
-        assert!(matches!(data, UploadWork::UploadPart { .. }));
+        assert!(matches!(data, UploadWork::UploadPart));
     }
 
     #[cfg_attr(miri, ignore)]
