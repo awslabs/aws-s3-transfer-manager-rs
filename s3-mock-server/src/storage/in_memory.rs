@@ -159,10 +159,9 @@ impl StorageBackend for InMemoryStorage {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         let mut buckets = self.buckets.write().await;
-        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchKey)?;
-        if bucket_state.objects.remove(key).is_none() {
-            return Err(Error::NoSuchKey);
-        }
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        // DeleteObject is idempotent: deleting a non-existent key is not an error.
+        bucket_state.objects.remove(key);
         Ok(())
     }
 

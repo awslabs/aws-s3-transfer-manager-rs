@@ -29,6 +29,51 @@ fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
     s.map(|v| etag_from_quoted(&v))
 }
 
+/// Apply defaults to a HeadObject response matching post-2023 prod S3
+/// behavior on a fresh bucket: SSE-S3 (AES256) default encryption, and
+/// `ChecksumType::FullObject` whenever any checksum is present.
+fn apply_response_defaults_head(output: &mut s3s::dto::HeadObjectOutput) {
+    if output.server_side_encryption.is_none() {
+        output.server_side_encryption = Some(s3s::dto::ServerSideEncryption::from_static(
+            s3s::dto::ServerSideEncryption::AES256,
+        ));
+    }
+    if output.checksum_type.is_none() && has_any_checksum_head(output) {
+        output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
+            s3s::dto::ChecksumType::FULL_OBJECT,
+        ));
+    }
+}
+
+fn apply_response_defaults_get(output: &mut s3s::dto::GetObjectOutput) {
+    if output.server_side_encryption.is_none() {
+        output.server_side_encryption = Some(s3s::dto::ServerSideEncryption::from_static(
+            s3s::dto::ServerSideEncryption::AES256,
+        ));
+    }
+    if output.checksum_type.is_none() && has_any_checksum_get(output) {
+        output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
+            s3s::dto::ChecksumType::FULL_OBJECT,
+        ));
+    }
+}
+
+fn has_any_checksum_head(o: &s3s::dto::HeadObjectOutput) -> bool {
+    o.checksum_crc32.is_some()
+        || o.checksum_crc32c.is_some()
+        || o.checksum_crc64nvme.is_some()
+        || o.checksum_sha1.is_some()
+        || o.checksum_sha256.is_some()
+}
+
+fn has_any_checksum_get(o: &s3s::dto::GetObjectOutput) -> bool {
+    o.checksum_crc32.is_some()
+        || o.checksum_crc32c.is_some()
+        || o.checksum_crc64nvme.is_some()
+        || o.checksum_sha1.is_some()
+        || o.checksum_sha256.is_some()
+}
+
 /// Inner implementation of the s3s::S3 trait.
 ///
 /// This struct implements the s3s::S3 trait, delegating all operations to the storage backend.
@@ -139,6 +184,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .map(|s| s.parse().unwrap());
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
 
+        apply_response_defaults_get(&mut output);
         Ok(S3Response::new(output))
     }
 
@@ -182,6 +228,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
         output.content_language = metadata.content_language.map(|s| s.parse().unwrap());
 
+        apply_response_defaults_head(&mut output);
         Ok(S3Response::new(output))
     }
 

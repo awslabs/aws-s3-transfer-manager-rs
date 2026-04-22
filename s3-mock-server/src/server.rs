@@ -260,13 +260,14 @@ impl S3MockServer {
         let stream = stream::once(async move { Ok(bytes) });
         let boxed_stream = Box::pin(stream);
 
-        let mut store_req = StoreObjectRequest::new(
-            bucket,
-            key.to_string(),
-            boxed_stream,
-            ObjectIntegrityChecks::new(),
-        )
-        .with_user_metadata(request.metadata.unwrap_or_default());
+        // Match HTTP PutObject path's default integrity checks so seeded
+        // objects have the same HeadObject state (ETag via md5, default
+        // CRC64NVME checksum) as objects uploaded via the S3 API.
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5().with_crc64nvme();
+
+        let mut store_req =
+            StoreObjectRequest::new(bucket, key.to_string(), boxed_stream, integrity_checks)
+                .with_user_metadata(request.metadata.unwrap_or_default());
         store_req.content_type = request.content_type;
         store_req.last_modified = request.last_modified;
 
@@ -378,7 +379,7 @@ impl S3MockServer {
                 b.build()
             };
             loop {
-                let (socket, _) = tokio::select! {
+                let (socket, peer) = tokio::select! {
                         res =  listener.accept() => {
                             match res {
                                 Ok(conn) => conn,
@@ -389,14 +390,20 @@ impl S3MockServer {
                             }
                         }
                         _ =  &mut shutdown_rx => {
+                            tracing::debug!("shutdown signal received, breaking accept loop");
                             break;
                         }
                 };
+                tracing::trace!(port = %addr.port(), %peer, "accepted connection");
 
-                let conn = http_server.serve_connection(TokioIo::new(socket), service.clone());
-                let conn = graceful.watch(conn.into_owned());
+                let conn = http_server
+                    .serve_connection(TokioIo::new(socket), service.clone())
+                    .into_owned();
+                let conn = graceful.watch(conn);
                 tokio::spawn(async move {
-                    let _ = conn.await;
+                    if let Err(e) = conn.await {
+                        tracing::trace!("connection error: {e}");
+                    }
                 });
             }
 

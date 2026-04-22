@@ -366,10 +366,10 @@ impl StorageBackend for FilesystemStorage {
         let path = self.get_object_path(bucket, key);
         let metadata_path = self.get_object_metadata_path(bucket, key);
 
-        // Delete both data and metadata files
+        // DeleteObject is idempotent: deleting a non-existent key is not an error.
         match fs::remove_file(&path).await {
             Ok(()) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NoSuchKey),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(Error::Io(e)),
         }
 
