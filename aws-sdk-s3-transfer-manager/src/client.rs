@@ -327,3 +327,61 @@ impl Client {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> crate::Config {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        crate::Config::builder().client(s3_client).build()
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn handle_drop_shuts_down_runtime() {
+        let handle = Handle::new_for_test(test_config(), 2);
+        let weak = Arc::downgrade(&handle);
+        drop(handle);
+        assert!(weak.upgrade().is_none(), "Handle should be fully dropped");
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn client_clone_shares_handle() {
+        let client = Client::new(test_config());
+        let client2 = client.clone();
+        assert!(Arc::ptr_eq(&client.handle, &client2.handle));
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn last_client_drop_releases_handle() {
+        let client = Client::new(test_config());
+        let weak = Arc::downgrade(&client.handle);
+        let client2 = client.clone();
+        drop(client);
+        assert!(
+            weak.upgrade().is_some(),
+            "Handle alive while client2 exists"
+        );
+        drop(client2);
+        assert!(weak.upgrade().is_none(), "Handle dropped after last client");
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn handle_drop_invalidates_weak_references() {
+        let handle = Handle::new_for_test(test_config(), 2);
+        let weak = Arc::downgrade(&handle);
+        drop(handle);
+        assert!(
+            weak.upgrade().is_none(),
+            "Weak should be invalid after Handle drop"
+        );
+    }
+}
