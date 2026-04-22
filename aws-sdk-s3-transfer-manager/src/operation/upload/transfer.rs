@@ -31,7 +31,7 @@ use crate::types::BucketType;
 #[derive(Debug)]
 pub(crate) enum UploadWork {
     CreateMPU,
-    UploadPart { part_number: u64 },
+    UploadPart,
     CompleteMPU,
     PutObject { stream: Option<InputStream> },
 }
@@ -179,12 +179,12 @@ impl UploadTransfer {
                 }
             }
             UploadState::Transferring {
-                next_part,
+                parts_dispatched,
                 total_parts,
                 parts_in_flight,
                 ..
             } => {
-                if *next_part > *total_parts {
+                if *parts_dispatched >= *total_parts {
                     if *parts_in_flight > 0 {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
@@ -210,11 +210,10 @@ impl UploadTransfer {
                     self.inner.ctx.try_wake();
                     return PollWork::Pending;
                 }
-                let part_number = *next_part;
-                *next_part += 1;
+                *parts_dispatched += 1;
                 *parts_in_flight += 1;
                 PollWork::Ready(IoRequest {
-                    data: Some(Box::new(UploadWork::UploadPart { part_number })),
+                    data: Some(Box::new(UploadWork::UploadPart)),
                 })
             }
             UploadState::Completing {
@@ -241,7 +240,7 @@ impl UploadTransfer {
         let data = work.data_mut::<UploadWork>();
         match data {
             UploadWork::CreateMPU => self.execute_create_mpu().await,
-            UploadWork::UploadPart { part_number } => self.execute_upload_part(*part_number).await,
+            UploadWork::UploadPart => self.execute_upload_part().await,
             UploadWork::CompleteMPU => self.execute_complete_mpu().await,
             UploadWork::PutObject { stream } => self.execute_put_object(stream).await,
         }
@@ -318,7 +317,7 @@ impl UploadTransfer {
             *state = UploadState::Transferring {
                 upload_id,
                 part_reader,
-                next_part: 1,
+                parts_dispatched: 0,
                 total_parts,
                 parts_in_flight: 0,
                 completed_parts: Vec::with_capacity(total_parts as usize),
@@ -336,7 +335,7 @@ impl UploadTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    async fn execute_upload_part(&self, part_number: u64) -> WorkOutcome {
+    async fn execute_upload_part(&self) -> WorkOutcome {
         let part_reader = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
@@ -352,7 +351,7 @@ impl UploadTransfer {
         {
             Ok(Some(data)) => data,
             Ok(None) => {
-                tracing::trace!("part_reader returned None for part {}", part_number);
+                tracing::trace!("part_reader exhausted");
                 self.maybe_transition_to_completing();
                 return WorkOutcome::Success { data: None };
             }
@@ -368,6 +367,7 @@ impl UploadTransfer {
             }
         };
 
+        let part_number = data.part_number;
         let part_num_i32 = part_number as i32;
         let content_length = data.data.remaining() as i64;
         let bytes_sent = content_length as u64;
@@ -455,13 +455,13 @@ impl UploadTransfer {
         let mut state = self.inner.state.lock().expect("lock poisoned");
         let should_complete = if let UploadState::Transferring {
             parts_in_flight,
-            next_part,
+            parts_dispatched,
             total_parts,
             ..
         } = &mut *state
         {
             *parts_in_flight -= 1;
-            *next_part > *total_parts && *parts_in_flight == 0
+            *parts_dispatched >= *total_parts && *parts_in_flight == 0
         } else {
             false
         };
@@ -731,17 +731,11 @@ mod tests {
 
         let mut work1 = assert_ready(transfer.poll_work());
         let data1 = work1.data_mut::<UploadWork>();
-        assert!(matches!(
-            data1,
-            UploadWork::UploadPart { part_number: 1, .. }
-        ));
+        assert!(matches!(data1, UploadWork::UploadPart));
 
         let mut work2 = assert_ready(transfer.poll_work());
         let data2 = work2.data_mut::<UploadWork>();
-        assert!(matches!(
-            data2,
-            UploadWork::UploadPart { part_number: 2, .. }
-        ));
+        assert!(matches!(data2, UploadWork::UploadPart));
 
         assert_pending(transfer.poll_work());
     }
