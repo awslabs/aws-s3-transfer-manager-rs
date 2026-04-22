@@ -286,10 +286,10 @@ impl DownloadTransfer {
                     .expect("seq window should have capacity at start");
                 Some((stream, meta, slot))
             }
-            (None, None) => None,
-            _ => panic!(
-                "invalid discovery state: initial_chunk and chunk_meta must both be Some or None"
-            ),
+            (None, _) => None,
+            (Some(_), None) => {
+                panic!("invalid discovery state: initial_chunk present without chunk_meta")
+            }
         };
 
         {
@@ -551,6 +551,12 @@ impl Transfer for DownloadTransfer {
         work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(DownloadTransfer::execute(self, work))
+    }
+
+    fn on_terminal(&self) {
+        self.inner.discovery_notify.notify_waiters();
+        let _ = self.inner.writer.finalize();
+        self.inner.writer.notify_consumer();
     }
 }
 

@@ -161,6 +161,7 @@ impl Scheduler {
                 ctx.set_cancelled();
             }
             ctx.signal_terminal();
+            desc.transfer().on_terminal();
             let purged = self.handle().runtime.remove_pending_for_transfer(id);
             self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
             desc.work_purged(purged);
@@ -247,6 +248,7 @@ impl Scheduler {
         );
         ctx.set_failed(err);
         ctx.signal_terminal();
+        desc.transfer().on_terminal();
 
         let is_idle = desc.work_finished();
         if is_idle {

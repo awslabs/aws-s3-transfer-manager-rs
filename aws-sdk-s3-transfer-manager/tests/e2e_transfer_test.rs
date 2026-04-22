@@ -12,6 +12,7 @@ use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHin
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::{DownloadFilter, PartSize};
+use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
@@ -98,6 +99,7 @@ async fn round_trip_helper(file_size: usize, bucket_name: &str, object_key: &str
 
 #[tokio::test]
 async fn test_single_part_file_round_trip() {
+    let _logs = show_test_logs();
     let file_size = 1024 * 1024; // 1MB
     let object_key = generate_key("1MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
@@ -107,6 +109,7 @@ async fn test_single_part_file_round_trip() {
 
 #[tokio::test]
 async fn test_multi_part_file_round_trip() {
+    let _logs = show_test_logs();
     let file_size = 20 * 1024 * 1024; // 20MB
     let object_key = generate_key("20MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
@@ -200,11 +203,13 @@ async fn checksum_test_helper(size_mb: usize, key_suffix: &str, is_multi_part: b
 
 #[tokio::test]
 async fn test_multi_part_file_checksum_upload() {
+    let _logs = show_test_logs();
     checksum_test_helper(20, "20MB-crc32", true).await;
 }
 
 #[tokio::test]
 async fn test_single_part_file_checksum_upload() {
+    let _logs = show_test_logs();
     checksum_test_helper(1, "1MB-crc32", false).await;
 }
 
@@ -278,6 +283,7 @@ impl PartStream for DelayStream {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn test_upload_with_long_running_stream() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
     let num_uploads = 10;
@@ -307,6 +313,7 @@ async fn test_upload_with_long_running_stream() {
 
 #[tokio::test]
 async fn test_empty_object_download() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -353,6 +360,7 @@ async fn range_download_helper(
 
 #[tokio::test]
 async fn test_object_download_range() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -405,6 +413,7 @@ async fn test_object_download_range() {
 
 #[tokio::test]
 async fn test_object_download_range_failures() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -431,6 +440,7 @@ async fn test_object_download_range_failures() {
 
 #[tokio::test]
 async fn test_objects_transfer() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
