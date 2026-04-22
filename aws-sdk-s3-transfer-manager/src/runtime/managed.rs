@@ -403,19 +403,21 @@ mod tests {
     /// Create a [`ThreadHandle`] with a preset in-flight count for testing
     /// router selection. No real work is spawned — only `id` and `in_flight`
     /// are meaningful.
-    fn test_thread_handle(id: Cpu, in_flight_count: usize) -> ThreadHandle {
-        let rt = Box::leak(Box::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap(),
-        ));
-        ThreadHandle {
+    fn test_thread_handle(
+        id: Cpu,
+        in_flight_count: usize,
+    ) -> (ThreadHandle, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let th = ThreadHandle {
             id,
             runtime_handle: rt.handle().clone(),
             join_handle: Mutex::new(None),
             in_flight: Arc::new(AtomicUsize::new(in_flight_count)),
             http_client: http_client_fn(|_, _| unreachable!("test http client")),
-        }
+        };
+        (th, rt)
     }
 
     fn test_handle(num_cores: usize) -> (Arc<crate::client::Handle>, Arc<ManagedThreadRuntime>) {
@@ -468,12 +470,11 @@ mod tests {
     #[test]
     fn router_selects_least_loaded() {
         let router = DispatchRouter;
-        let handles = vec![
-            test_thread_handle(Cpu(0), 5),
-            test_thread_handle(Cpu(1), 2),
-            test_thread_handle(Cpu(2), 8),
-            test_thread_handle(Cpu(3), 3),
-        ];
+        let (h0, _r0) = test_thread_handle(Cpu(0), 5);
+        let (h1, _r1) = test_thread_handle(Cpu(1), 2);
+        let (h2, _r2) = test_thread_handle(Cpu(2), 8);
+        let (h3, _r3) = test_thread_handle(Cpu(3), 3);
+        let handles = vec![h0, h1, h2, h3];
         // Power-of-two: picks 2 random threads, returns least loaded.
         // Over many iterations, should never pick the most loaded (Cpu(2)=8)
         // when a lighter option exists.
@@ -493,17 +494,17 @@ mod tests {
     #[test]
     fn router_single_thread() {
         let router = DispatchRouter;
-        let handles = vec![test_thread_handle(Cpu(0), 5)];
+        let (h0, _r0) = test_thread_handle(Cpu(0), 5);
+        let handles = vec![h0];
         assert_eq!(router.select(&handles), Cpu(0));
     }
 
     #[test]
     fn router_two_threads_prefers_lighter() {
         let router = DispatchRouter;
-        let handles = vec![
-            test_thread_handle(Cpu(0), 10),
-            test_thread_handle(Cpu(1), 0),
-        ];
+        let (h0, _r0) = test_thread_handle(Cpu(0), 10);
+        let (h1, _r1) = test_thread_handle(Cpu(1), 0);
+        let handles = vec![h0, h1];
         // With only 2 threads, power-of-two always picks both, returns lighter
         for _ in 0..100 {
             assert_eq!(router.select(&handles), Cpu(1));
