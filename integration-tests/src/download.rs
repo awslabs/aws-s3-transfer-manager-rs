@@ -236,7 +236,7 @@ async fn test_download_concurrent() {
         let handle = tm
             .download()
             .bucket("test-bucket")
-            .key(&format!("concurrent-key-{}", i))
+            .key(format!("concurrent-key-{}", i))
             .initiate()
             .expect("initiate download");
         handles.push((i, handle));
@@ -473,3 +473,31 @@ async fn test_download_write_to_path_integrity() {
 // - Switch all large data assertions from assert_eq! to checksum comparison
 //   (e.g. aws-smithy-checksums CRC32) for better failure output and efficiency.
 // - Add priority change tests when priority API is exposed on handles.
+
+/// Test downloading an empty (0-byte) object completes without hanging.
+#[tokio::test]
+async fn test_download_empty_object() {
+    let (server, server_handle, tm) = setup().await;
+
+    server
+        .add_object("empty-key", vec![], None)
+        .await
+        .expect("add object");
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("empty-key")
+        .initiate()
+        .expect("initiate download");
+
+    let body = handle.body_mut();
+    let mut data = Vec::new();
+    while let Some(chunk) = body.next().await {
+        data.extend_from_slice(&chunk.unwrap().data.into_bytes());
+    }
+
+    assert_eq!(data.len(), 0);
+    handle.join().await.expect("join should succeed");
+    server_handle.shutdown().await.expect("shutdown");
+}

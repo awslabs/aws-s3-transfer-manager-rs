@@ -31,7 +31,7 @@ use crate::types::BucketType;
 #[derive(Debug)]
 pub(crate) enum UploadWork {
     CreateMPU,
-    UploadPart { part_number: u64 },
+    UploadPart,
     CompleteMPU,
     PutObject { stream: Option<InputStream> },
 }
@@ -179,12 +179,12 @@ impl UploadTransfer {
                 }
             }
             UploadState::Transferring {
-                next_part,
+                parts_dispatched,
                 total_parts,
                 parts_in_flight,
                 ..
             } => {
-                if *next_part > *total_parts {
+                if *parts_dispatched >= *total_parts {
                     if *parts_in_flight > 0 {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
@@ -210,11 +210,10 @@ impl UploadTransfer {
                     self.inner.ctx.try_wake();
                     return PollWork::Pending;
                 }
-                let part_number = *next_part;
-                *next_part += 1;
+                *parts_dispatched += 1;
                 *parts_in_flight += 1;
                 PollWork::Ready(IoRequest {
-                    data: Some(Box::new(UploadWork::UploadPart { part_number })),
+                    data: Some(Box::new(UploadWork::UploadPart)),
                 })
             }
             UploadState::Completing {
@@ -241,7 +240,7 @@ impl UploadTransfer {
         let data = work.data_mut::<UploadWork>();
         match data {
             UploadWork::CreateMPU => self.execute_create_mpu().await,
-            UploadWork::UploadPart { part_number } => self.execute_upload_part(*part_number).await,
+            UploadWork::UploadPart => self.execute_upload_part().await,
             UploadWork::CompleteMPU => self.execute_complete_mpu().await,
             UploadWork::PutObject { stream } => self.execute_put_object(stream).await,
         }
@@ -302,15 +301,7 @@ impl UploadTransfer {
             match PartReaderBuilder::new()
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
-                .direct_io(
-                    self.inner
-                        .ctx
-                        .handle
-                        .scheduler
-                        .runtime()
-                        .components()
-                        .direct_io(),
-                )
+                .direct_io(self.inner.ctx.handle.runtime.components().direct_io())
                 .io_counters(std::sync::Arc::clone(
                     &self.inner.ctx.handle.telemetry.io_counters,
                 ))
@@ -326,7 +317,7 @@ impl UploadTransfer {
             *state = UploadState::Transferring {
                 upload_id,
                 part_reader,
-                next_part: 1,
+                parts_dispatched: 0,
                 total_parts,
                 parts_in_flight: 0,
                 completed_parts: Vec::with_capacity(total_parts as usize),
@@ -344,7 +335,7 @@ impl UploadTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    async fn execute_upload_part(&self, part_number: u64) -> WorkOutcome {
+    async fn execute_upload_part(&self) -> WorkOutcome {
         let part_reader = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
@@ -360,7 +351,7 @@ impl UploadTransfer {
         {
             Ok(Some(data)) => data,
             Ok(None) => {
-                tracing::trace!("part_reader returned None for part {}", part_number);
+                tracing::trace!("part_reader exhausted");
                 self.maybe_transition_to_completing();
                 return WorkOutcome::Success { data: None };
             }
@@ -376,6 +367,7 @@ impl UploadTransfer {
             }
         };
 
+        let part_number = data.part_number;
         let part_num_i32 = part_number as i32;
         let content_length = data.data.remaining() as i64;
         let bytes_sent = content_length as u64;
@@ -463,13 +455,13 @@ impl UploadTransfer {
         let mut state = self.inner.state.lock().expect("lock poisoned");
         let should_complete = if let UploadState::Transferring {
             parts_in_flight,
-            next_part,
+            parts_dispatched,
             total_parts,
             ..
         } = &mut *state
         {
             *parts_in_flight -= 1;
-            *next_part > *total_parts && *parts_in_flight == 0
+            *parts_dispatched >= *total_parts && *parts_in_flight == 0
         } else {
             false
         };
@@ -662,10 +654,10 @@ mod tests {
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
-        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
+        let handle = crate::client::Handle::new_for_test(
             crate::Config::builder().client(s3_client).build(),
-            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        ));
+            DEFAULT_CONCURRENCY,
+        );
 
         let input = UploadInput::builder()
             .bucket("test-bucket")
@@ -702,6 +694,8 @@ mod tests {
         )
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_poll_work_initial_state_returns_create_mpu() {
         let s3_client = mock_client!(aws_sdk_s3, []);
@@ -713,6 +707,8 @@ mod tests {
         assert!(matches!(data, UploadWork::CreateMPU));
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_poll_work_pending_while_init_in_flight() {
         let s3_client = mock_client!(aws_sdk_s3, []);
@@ -723,6 +719,7 @@ mod tests {
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_poll_work_generates_parts_after_create_mpu() {
         let s3_client = mock_s3_client_for_mpu();
@@ -734,21 +731,16 @@ mod tests {
 
         let mut work1 = assert_ready(transfer.poll_work());
         let data1 = work1.data_mut::<UploadWork>();
-        assert!(matches!(
-            data1,
-            UploadWork::UploadPart { part_number: 1, .. }
-        ));
+        assert!(matches!(data1, UploadWork::UploadPart));
 
         let mut work2 = assert_ready(transfer.poll_work());
         let data2 = work2.data_mut::<UploadWork>();
-        assert!(matches!(
-            data2,
-            UploadWork::UploadPart { part_number: 2, .. }
-        ));
+        assert!(matches!(data2, UploadWork::UploadPart));
 
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_execute_create_mpu_transitions_to_transferring() {
         let s3_client = mock_s3_client_for_mpu();
@@ -762,9 +754,10 @@ mod tests {
 
         let mut next = assert_ready(transfer.poll_work());
         let data = next.data_mut::<UploadWork>();
-        assert!(matches!(data, UploadWork::UploadPart { .. }));
+        assert!(matches!(data, UploadWork::UploadPart));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_execute_full_mpu_flow() {
         let s3_client = mock_s3_client_for_mpu();
@@ -798,6 +791,7 @@ mod tests {
         assert!(result.is_some());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_basic_upload_object() {
         use aws_sdk_s3::operation::put_object::PutObjectOutput;
@@ -824,6 +818,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_basic_mpu() {
         let s3_client = mock_s3_client_for_mpu();

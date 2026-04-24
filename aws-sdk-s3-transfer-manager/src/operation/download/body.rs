@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use crate::runtime::sync::cell::UnsafeCell;
+use crate::runtime::sync::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering,
+};
+use crate::runtime::sync::sync::Arc;
 
 use bytes::Buf;
 
@@ -16,6 +18,24 @@ use super::transfer::DownloadTransfer;
 
 /// Default slot buffer capacity for download body delivery.
 pub(crate) const DEFAULT_BODY_SLOT_CAPACITY: usize = 512;
+
+/// Wakeup signal wrapper. Under loom, tokio::sync::Notify is unavailable,
+/// but the Notify doesn't participate in safety invariants — it's just a
+/// hint to the consumer. A no-op stub is sufficient for loom tests.
+#[cfg(not(all(test, s3_tm_loom)))]
+use tokio::sync::Notify as WakeNotify;
+
+#[cfg(all(test, s3_tm_loom))]
+struct WakeNotify;
+
+#[cfg(all(test, s3_tm_loom))]
+impl WakeNotify {
+    fn new() -> Self {
+        Self
+    }
+    fn notify_one(&self) {}
+    async fn notified(&self) {}
+}
 
 /// Slot has no data and is available for reuse.
 const SLOT_EMPTY: u8 = 0;
@@ -78,7 +98,7 @@ struct SlotBuffer {
     /// Next seq to be claimed by a producer. Advanced via CAS in `try_claim`.
     claimed: AtomicU64,
     /// Wakes the consumer when a producer fills a slot.
-    notify: tokio::sync::Notify,
+    notify: WakeNotify,
     /// Optional file sink. When present, filled slots are batched and
     /// flushed to disk periodically instead of being consumed through
     /// `Body::next()`.
@@ -116,7 +136,7 @@ impl SlotBuffer {
             capacity: capacity as u64,
             consumed: AtomicU64::new(0),
             claimed: AtomicU64::new(0),
-            notify: tokio::sync::Notify::new(),
+            notify: WakeNotify::new(),
             sink: None,
         }
     }
@@ -133,9 +153,9 @@ impl SlotBuffer {
     fn fill(&self, seq: u64, chunk: ChunkOutput) {
         let idx = (seq % self.capacity) as usize;
         // Safety: seq window guarantees exclusive access to this slot index.
-        unsafe {
-            *self.slots[idx].data.get() = Some(chunk);
-        }
+        self.slots[idx]
+            .data
+            .with_mut(|ptr| unsafe { *ptr = Some(chunk) });
         self.slots[idx]
             .state
             .store(SLOT_FILLED, AtomicOrdering::Release);
@@ -206,7 +226,9 @@ impl SlotBuffer {
 
             // Start a new run with the first FILLED slot
             // Safety: state is FILLED and flush holds exclusive consumer access via CAS lock.
-            let first_chunk = unsafe { (*self.slots[idx].data.get()).take().unwrap() };
+            let first_chunk = self.slots[idx]
+                .data
+                .with_mut(|ptr| unsafe { (*ptr).take().unwrap() });
             let file_pos = first_chunk.offset - sink.object_range_start;
             let mut run_end_offset = file_pos + first_chunk.data.remaining() as u64;
             let mut combined = bytes_utils::SegmentedBuf::new();
@@ -225,14 +247,16 @@ impl SlotBuffer {
                     break;
                 }
                 // Safety: state is FILLED and flush holds exclusive consumer access via CAS lock.
-                let chunk = unsafe { (*self.slots[jdx].data.get()).take().unwrap() };
+                let chunk = self.slots[jdx]
+                    .data
+                    .with_mut(|ptr| unsafe { (*ptr).take().unwrap() });
                 let chunk_file_pos = chunk.offset - sink.object_range_start;
                 if chunk_file_pos != run_end_offset {
                     // Not file-contiguous — put it back for the next iteration
                     // Safety: same CAS lock exclusion; no other thread accesses this slot.
-                    unsafe {
-                        *self.slots[jdx].data.get() = Some(chunk);
-                    }
+                    self.slots[jdx]
+                        .data
+                        .with_mut(|ptr| unsafe { *ptr = Some(chunk) });
                     break;
                 }
                 run_end_offset += chunk.data.remaining() as u64;
@@ -285,7 +309,9 @@ impl SlotBuffer {
             return None;
         }
         // Safety: state is FILLED and only one consumer calls this.
-        let chunk = unsafe { (*self.slots[idx].data.get()).take() };
+        let chunk = self.slots[idx]
+            .data
+            .with_mut(|ptr| unsafe { (*ptr).take() });
         self.slots[idx]
             .state
             .store(SLOT_EMPTY, AtomicOrdering::Release);
@@ -628,6 +654,7 @@ mod tests {
         (Body::new(consumer, transfer.clone()), transfer, writer)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next() {
         let (mut body, transfer, writer) = test_body();
@@ -669,6 +696,7 @@ mod tests {
         assert_eq!(expected, received);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next_on_failed_transfer() {
         let (mut body, transfer, writer) = test_body();
@@ -695,6 +723,7 @@ mod tests {
         assert!(matches!(err.kind(), error::ErrorKind::ChildOperationFailed));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next_on_cancelled_transfer() {
         let (mut body, transfer, _writer) = test_body();
@@ -707,6 +736,7 @@ mod tests {
         assert!(matches!(err.kind(), error::ErrorKind::OperationCancelled));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next_unblocks_on_cancel() {
         let (mut body, transfer, _writer) = test_body();
@@ -821,6 +851,7 @@ mod tests {
         assert_eq!(consumer.try_take_next().unwrap().seq, 3);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_next() {
         let (writer, consumer) = new_slot_body(4);
@@ -833,6 +864,7 @@ mod tests {
         assert_eq!(chunk.unwrap().seq, 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_returns_none_when_complete() {
         let (_writer, consumer) = new_slot_body(4);
@@ -841,6 +873,7 @@ mod tests {
         assert!(chunk.is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_waits_for_producer() {
         let (writer, consumer) = new_slot_body(4);
@@ -908,6 +941,7 @@ mod tests {
         assert_eq!(chunk.data.to_vec(), b"hello world");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_buffer_concurrent_producers() {
         let (writer, consumer) = new_slot_body(64);
@@ -943,6 +977,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_slot_body_consumer_completion_race() {
         let (writer, consumer) = new_slot_body(4);
@@ -1113,6 +1148,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_sink_concurrent_fill() {
         let dir = tempfile::tempdir().unwrap();
@@ -1149,5 +1185,200 @@ mod tests {
                 "mismatch at seq {seq}"
             );
         }
+    }
+}
+
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests {
+    use super::*;
+    use crate::runtime::sync::thread;
+
+    fn dummy_chunk(seq: u64) -> ChunkOutput {
+        ChunkOutput {
+            seq,
+            offset: seq * 1024,
+            data: AggregatedBytes(bytes_utils::SegmentedBuf::new()),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn two_producers_claim_unique_seqs() {
+        loom::model(|| {
+            let (writer, _consumer) = new_slot_body(4);
+            let writer2 = writer.clone();
+
+            let h = thread::spawn(move || {
+                if let Some(slot) = writer2.try_claim() {
+                    let seq = slot.seq();
+                    slot.fill(dummy_chunk(seq));
+                    seq
+                } else {
+                    u64::MAX
+                }
+            });
+
+            let seq1 = if let Some(slot) = writer.try_claim() {
+                let seq = slot.seq();
+                slot.fill(dummy_chunk(seq));
+                seq
+            } else {
+                u64::MAX
+            };
+
+            let seq2 = h.join().unwrap();
+
+            // Both should succeed and get different seqs
+            assert_ne!(seq1, seq2);
+            assert!(seq1 <= 1);
+            assert!(seq2 <= 1);
+        });
+    }
+
+    #[test]
+    fn fill_then_take() {
+        loom::model(|| {
+            let (writer, consumer) = new_slot_body(4);
+
+            let h = thread::spawn(move || {
+                let slot = writer.try_claim().unwrap();
+                slot.fill(dummy_chunk(0));
+            });
+
+            h.join().unwrap();
+
+            // Consumer should see the filled chunk
+            let chunk = consumer.try_take_next().unwrap();
+            assert_eq!(chunk.seq, 0);
+        });
+    }
+
+    #[test]
+    fn window_pressure() {
+        // capacity=1, so after one claim the window is full
+        loom::model(|| {
+            let (writer, _consumer) = new_slot_body(1);
+
+            let slot = writer.try_claim().unwrap();
+            // Window full — next claim should fail
+            assert!(writer.try_claim().is_none());
+
+            slot.fill(dummy_chunk(0));
+            // Still full until consumed
+            assert!(writer.try_claim().is_none());
+        });
+    }
+
+    #[test]
+    fn concurrent_claim_fill_take() {
+        loom::model(|| {
+            let (writer, consumer) = new_slot_body(2);
+            let writer2 = writer.clone();
+
+            // Producer 1
+            let h = thread::spawn(move || {
+                if let Some(slot) = writer2.try_claim() {
+                    let seq = slot.seq();
+                    slot.fill(dummy_chunk(seq));
+                }
+            });
+
+            // Producer 2
+            if let Some(slot) = writer.try_claim() {
+                let seq = slot.seq();
+                slot.fill(dummy_chunk(seq));
+            }
+
+            h.join().unwrap();
+
+            // Consumer takes in order
+            let mut taken = 0;
+            while let Some(_chunk) = consumer.try_take_next() {
+                taken += 1;
+            }
+            assert_eq!(taken, 2);
+        });
+    }
+
+    /// Producer fills while consumer concurrently polls try_take_next.
+    /// This is the core production pattern.
+    #[test]
+    fn concurrent_fill_and_take() {
+        loom::model(|| {
+            let (writer, consumer) = new_slot_body(2);
+
+            // Producer claims and fills on a separate thread
+            let h = thread::spawn(move || {
+                let slot = writer.try_claim().unwrap();
+                slot.fill(dummy_chunk(0));
+            });
+
+            // Consumer spins until it gets the chunk
+            // (producer must complete since we join)
+            h.join().unwrap();
+            let chunk = consumer.try_take_next().unwrap();
+            assert_eq!(chunk.seq, 0);
+        });
+    }
+
+    /// Fill, consume, then reclaim the same slot index — tests wrap-around.
+    #[test]
+    fn claim_fill_take_reclaim() {
+        loom::model(|| {
+            let (writer, consumer) = new_slot_body(1);
+
+            // Round 1: claim, fill, consume
+            let slot = writer.try_claim().unwrap();
+            assert_eq!(slot.seq(), 0);
+            slot.fill(dummy_chunk(0));
+            let chunk = consumer.try_take_next().unwrap();
+            assert_eq!(chunk.seq, 0);
+
+            // Round 2: same slot index (seq 1 % capacity 1 == 0)
+            let slot = writer.try_claim().unwrap();
+            assert_eq!(slot.seq(), 1);
+            slot.fill(dummy_chunk(1));
+            let chunk = consumer.try_take_next().unwrap();
+            assert_eq!(chunk.seq, 1);
+        });
+    }
+
+    /// Two producers + concurrent consumer — the full production pattern.
+    #[test]
+    fn two_producers_concurrent_consumer() {
+        loom::model(|| {
+            let (writer, consumer) = new_slot_body(4);
+            let writer2 = writer.clone();
+            use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
+            let taken = Arc::new(AtomicUsize::new(0));
+
+            let taken2 = Arc::clone(&taken);
+            // Consumer thread
+            let consumer_handle = thread::spawn(move || loop {
+                if let Some(_chunk) = consumer.try_take_next() {
+                    taken2.fetch_add(1, Ordering::Relaxed);
+                    if taken2.load(Ordering::Relaxed) == 2 {
+                        break;
+                    }
+                }
+                loom::thread::yield_now();
+            });
+
+            // Producer 1
+            let h = thread::spawn(move || {
+                let slot = writer2.try_claim().unwrap();
+                let seq = slot.seq();
+                slot.fill(dummy_chunk(seq));
+            });
+
+            // Producer 2
+            let slot = writer.try_claim().unwrap();
+            let seq = slot.seq();
+            slot.fill(dummy_chunk(seq));
+
+            h.join().unwrap();
+            consumer_handle.join().unwrap();
+            assert_eq!(taken.load(Ordering::Relaxed), 2);
+        });
     }
 }

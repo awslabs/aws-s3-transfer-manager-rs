@@ -148,6 +148,8 @@ mod tests {
         desc
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_empty_set() {
         let set = ReadySet::new();
@@ -157,6 +159,8 @@ mod tests {
         assert_eq!(set.min_vruntime(), 0);
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_insert_and_pop() {
         let set = ReadySet::new();
@@ -172,6 +176,8 @@ mod tests {
         assert_eq!(set.min_vruntime(), 100);
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_vruntime_ordering_lowest_first() {
         let set = ReadySet::new();
@@ -191,6 +197,8 @@ mod tests {
         assert!(set.pop().is_none());
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_same_vruntime_ordered_by_id() {
         let set = ReadySet::new();
@@ -209,6 +217,8 @@ mod tests {
         assert_eq!(set.pop().unwrap().id().id, 15);
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_min_vruntime_tracks_minimum() {
         let set = ReadySet::new();
@@ -229,6 +239,8 @@ mod tests {
         assert_eq!(set.min_vruntime(), 200);
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_min_vruntime_monotonic() {
         let set = ReadySet::new();
@@ -244,6 +256,8 @@ mod tests {
         assert_eq!(set.min_vruntime(), 200);
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_remove() {
         let set = ReadySet::new();
@@ -257,6 +271,8 @@ mod tests {
         assert!(set.is_empty());
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_remove_nonexistent_is_noop() {
         let set = ReadySet::new();
@@ -268,6 +284,8 @@ mod tests {
         assert!(set.is_empty());
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_concurrent_pop() {
         use std::sync::atomic::AtomicUsize;
@@ -307,6 +325,8 @@ mod tests {
         assert!(set.is_empty());
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_fairness_simulation() {
         // Simulate 3 transfers with different priorities competing

@@ -144,7 +144,7 @@ pub mod unit {
 
     impl fmt::Display for ByteCountDisplayContext {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            if self.total_bytes % self.unit.as_bytes_u64() == 0 {
+            if self.total_bytes.is_multiple_of(self.unit.as_bytes_u64()) {
                 let converted = self.total_bytes / self.unit.as_bytes_u64();
                 return write!(f, "{converted} {}", self.unit.as_str());
             }
@@ -309,9 +309,14 @@ impl fmt::Display for ThroughputDisplayContext<'_> {
     }
 }
 
-/// I/O measurement from a completed work item.
+/// I/O bytes transferred from a completed work item.
 ///
-/// Captures bytes transferred in each direction and the wall-clock duration.
+/// Records bytes moved in each direction. Does not carry timing — the time
+/// dimension is provided by [`IOWindow`] bucketing: bytes are attributed to
+/// the bucket current when `record()` is called (i.e. operation completion
+/// time, not spread across the operation's actual duration). At high
+/// concurrency this averages out; at low concurrency a single long request
+/// may skew the bucket it lands in.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IoSample {
     /// Bytes sent over network (upload)
@@ -322,28 +327,6 @@ pub(crate) struct IoSample {
     pub disk_read: u64,
     /// Bytes written to disk (download sink)
     pub disk_write: u64,
-    /// Wall-clock duration of the operation
-    pub duration: Duration,
-}
-
-impl IoSample {
-    /// Sample for a network send.
-    pub(crate) fn network_tx(bytes: u64, duration: Duration) -> Self {
-        Self {
-            network_tx: bytes,
-            duration,
-            ..Default::default()
-        }
-    }
-
-    /// Sample for a network receive.
-    pub(crate) fn network_rx(bytes: u64, duration: Duration) -> Self {
-        Self {
-            network_rx: bytes,
-            duration,
-            ..Default::default()
-        }
-    }
 }
 
 /// Number of buckets to use for calculating IO windows
@@ -503,29 +486,19 @@ impl IOCounters {
         self.disk_write.add(sample.disk_write);
     }
 
-    /// Record network bytes (sent + received).
-    pub(crate) fn record_network(&self, bytes_sent: u64, bytes_received: u64) {
-        self.network_tx.add(bytes_sent);
-        self.network_rx.add(bytes_received);
-    }
-
-    /// Record disk bytes (read + written).
-    pub(crate) fn record_disk(&self, bytes_read: u64, bytes_written: u64) {
-        self.disk_read.add(bytes_read);
-        self.disk_write.add(bytes_written);
-    }
-
     /// Network throughput (sent + received) in bytes/sec.
     pub(crate) fn network_throughput(&self) -> f64 {
         self.network_tx.throughput() + self.network_rx.throughput()
     }
 
     /// Disk throughput (read + written) in bytes/sec.
+    #[allow(dead_code)] // TODO: telemetry observability
     pub(crate) fn disk_throughput(&self) -> f64 {
         self.disk_read.throughput() + self.disk_write.throughput()
     }
 
     /// Total throughput across all directions in bytes/sec.
+    #[allow(dead_code)] // TODO: telemetry observability
     pub(crate) fn total_throughput(&self) -> f64 {
         self.network_throughput() + self.disk_throughput()
     }
@@ -722,11 +695,16 @@ mod tests {
     // --- IOCounters tests ---
 
     use super::IOCounters;
+    use super::IoSample;
 
     #[test]
     fn io_counters_network_throughput() {
         let c = IOCounters::new(Duration::from_secs(1));
-        c.record_network(1_000_000, 2_000_000);
+        c.record(&IoSample {
+            network_tx: 1_000_000,
+            network_rx: 2_000_000,
+            ..Default::default()
+        });
         let tp = c.network_throughput();
         assert!((tp - 3_000_000.0).abs() < 1.0, "expected ~3MB/s, got {tp}");
     }
@@ -734,7 +712,11 @@ mod tests {
     #[test]
     fn io_counters_disk_throughput() {
         let c = IOCounters::new(Duration::from_secs(1));
-        c.record_disk(4_000_000, 1_000_000);
+        c.record(&IoSample {
+            disk_read: 4_000_000,
+            disk_write: 1_000_000,
+            ..Default::default()
+        });
         let tp = c.disk_throughput();
         assert!((tp - 5_000_000.0).abs() < 1.0, "expected ~5MB/s, got {tp}");
     }
@@ -742,8 +724,16 @@ mod tests {
     #[test]
     fn io_counters_total_throughput() {
         let c = IOCounters::new(Duration::from_secs(1));
-        c.record_network(1_000_000, 2_000_000);
-        c.record_disk(3_000_000, 4_000_000);
+        c.record(&IoSample {
+            network_tx: 1_000_000,
+            network_rx: 2_000_000,
+            ..Default::default()
+        });
+        c.record(&IoSample {
+            disk_read: 3_000_000,
+            disk_write: 4_000_000,
+            ..Default::default()
+        });
         let tp = c.total_throughput();
         assert!(
             (tp - 10_000_000.0).abs() < 1.0,
@@ -755,11 +745,14 @@ mod tests {
     fn io_counters_is_idle_when_all_idle() {
         let c = IOCounters::new(Duration::from_millis(100));
         assert!(c.is_idle());
-        c.record_network(1_000, 0);
+        c.record(&IoSample {
+            network_tx: 1_000,
+            ..Default::default()
+        });
         assert!(!c.is_idle());
         std::thread::sleep(Duration::from_millis(150));
         // Trigger rotation on the window that has data
-        c.record_network(0, 0);
+        c.record(&IoSample::default());
         assert!(c.is_idle());
     }
 }

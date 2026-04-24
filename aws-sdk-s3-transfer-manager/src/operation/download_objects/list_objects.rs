@@ -314,6 +314,7 @@ mod tests {
         assert_eq!(state6, State::Done);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_object_stream() {
         let resp1 = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {

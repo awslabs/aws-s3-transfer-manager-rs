@@ -40,6 +40,12 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
         &'a self,
         work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
+
+    /// Called when the transfer is forced into a terminal state from outside
+    /// (e.g. worker panic, external cancellation). Allows the transfer to
+    /// clean up resources and notify waiters that would otherwise block
+    /// indefinitely.
+    fn on_terminal(&self) {}
 }
 
 pub(crate) type BoxTransfer = Box<dyn Transfer>;

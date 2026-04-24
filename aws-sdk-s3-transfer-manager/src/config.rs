@@ -61,7 +61,7 @@ pub(crate) enum S3ClientSource {
     /// User provided a finished S3 client. Use as-is.
     Provided(aws_sdk_s3::Client),
     /// Build the S3 client from config, injecting runtime components.
-    FromConfig(S3ClientConfig),
+    FromConfig(Box<S3ClientConfig>),
 }
 
 /// Configuration for a [`Client`](crate::client::Client)
@@ -221,7 +221,7 @@ impl Builder {
     pub fn build(self) -> Config {
         let s3_client_source = match (self.client, self.s3_client_config) {
             (Some(client), _) => S3ClientSource::Provided(client),
-            (None, Some(config)) => S3ClientSource::FromConfig(config),
+            (None, Some(config)) => S3ClientSource::FromConfig(Box::new(config)),
             (None, None) => panic!("either client() or s3_config() must be set"),
         };
         Config {

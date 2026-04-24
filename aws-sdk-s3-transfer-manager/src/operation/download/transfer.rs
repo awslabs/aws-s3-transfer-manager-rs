@@ -286,10 +286,10 @@ impl DownloadTransfer {
                     .expect("seq window should have capacity at start");
                 Some((stream, meta, slot))
             }
-            (None, None) => None,
-            _ => panic!(
-                "invalid discovery state: initial_chunk and chunk_meta must both be Some or None"
-            ),
+            (None, _) => None,
+            (Some(_), None) => {
+                panic!("invalid discovery state: initial_chunk present without chunk_meta")
+            }
         };
 
         {
@@ -552,6 +552,12 @@ impl Transfer for DownloadTransfer {
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(DownloadTransfer::execute(self, work))
     }
+
+    fn on_terminal(&self) {
+        self.inner.discovery_notify.notify_waiters();
+        let _ = self.inner.writer.finalize();
+        self.inner.writer.notify_consumer();
+    }
 }
 
 /// Validate that the response Content-Range matches the requested range.
@@ -617,10 +623,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
-            config,
-            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        ));
+        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -647,6 +650,8 @@ mod tests {
         execute(transfer, &mut work).await;
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_initial_poll_returns_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -655,6 +660,8 @@ mod tests {
         assert!(matches!(data, DownloadWork::Discovery));
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_pending_while_discovery_in_flight() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -662,6 +669,7 @@ mod tests {
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_generates_ranges_after_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -672,6 +680,7 @@ mod tests {
         assert!(matches!(data, DownloadWork::GetObjectRange { .. }));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_seq_starts_at_one_with_initial_chunk() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -691,6 +700,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_seq_starts_at_zero_without_initial_chunk() {
         let head_obj = mock!(aws_sdk_s3::Client::head_object).then_output(|| {
@@ -714,10 +724,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
-        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
-            config,
-            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        ));
+        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -748,6 +755,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_seq_increments_sequentially() {
         let transfer = create_download(32 * MB, 8 * MB);
@@ -767,6 +775,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_pending_when_range_in_flight() {
         let transfer = create_download(12 * MB, 8 * MB);
@@ -778,6 +787,7 @@ mod tests {
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_done_when_all_complete() {
         let transfer = create_download(12 * MB, 8 * MB);
@@ -789,6 +799,7 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_out_of_order_completion() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -804,6 +815,7 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_failure_transitions_to_failed() {
         let _logs = show_test_logs();
@@ -819,6 +831,7 @@ mod tests {
         assert!(transfer.ctx().is_failed());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_cancellation_transitions_to_cancelled() {
         let transfer = create_download(24 * MB, 8 * MB);
@@ -855,10 +868,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
-            config,
-            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        ));
+        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -872,6 +882,7 @@ mod tests {
         (transfer, consumer)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_seq_window_limits_work_generation() {
         // Create download with many parts but small slot buffer capacity
@@ -889,6 +900,7 @@ mod tests {
         assert_pending(transfer.poll_work());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_seq_window_consume_enables_more_work() {
         let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
@@ -953,7 +965,7 @@ mod tests {
         /// Always fail
         Always,
         /// Fail first N attempts, then succeed
-        #[allow(dead_code)] // TODO(phase3): re-enable with retry tests
+        #[allow(dead_code)] // TODO: re-enable with retry tests
         Times(usize),
     }
 

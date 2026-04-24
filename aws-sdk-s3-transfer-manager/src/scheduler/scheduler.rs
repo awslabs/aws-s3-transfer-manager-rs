@@ -50,11 +50,9 @@
 //! - **Pending/wake obligation**: every `Pending` must have a future wake path.
 //! - **Panic safety**: handled by the scheduler via `catch_unwind`.
 
-use super::{CompletionSample, ConcurrencyController};
+use super::CompletionSample;
 use crate::telemetry;
 use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
-
-use crate::runtime::ExecutionRuntime;
 
 use crate::runtime::sync::{Submission, SubmissionQueue};
 use crate::runtime::ScheduledWork;
@@ -63,8 +61,7 @@ use crate::scheduler::ready_set::ReadySet;
 use std::collections::HashMap;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 /// Batch size for work generated and submitted in a single round
@@ -79,8 +76,7 @@ pub(crate) struct Scheduler(Arc<SchedulerInner>);
 struct SchedulerInner {
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
-    controller: Arc<dyn ConcurrencyController>,
-    runtime: OnceLock<Arc<dyn ExecutionRuntime>>,
+    handle: Weak<crate::client::Handle>,
     dispatched: AtomicUsize,
     submission_queue: SubmissionQueue<ScheduledWork>,
 }
@@ -91,79 +87,27 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
-/// Builder for constructing a [`Scheduler`] with its runtime.
-pub(crate) struct SchedulerBuilder {
-    controller: Arc<dyn ConcurrencyController>,
-}
-
-impl SchedulerBuilder {
-    pub(crate) fn new(controller: Arc<dyn ConcurrencyController>) -> Self {
-        Self { controller }
-    }
-
-    /// Build the scheduler, using `runtime_factory` to break the circular dependency:
-    /// the scheduler needs a runtime to dispatch work, and the runtime needs the
-    /// scheduler to call back into on completion. The factory receives the constructed
-    /// scheduler and returns the runtime; the scheduler stores it via `OnceLock`.
-    pub(crate) fn build(
-        self,
-        runtime_factory: impl FnOnce(Scheduler) -> Arc<dyn ExecutionRuntime>,
-    ) -> Scheduler {
-        let scheduler = Scheduler(Arc::new(SchedulerInner {
+impl Scheduler {
+    pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
+        Scheduler(Arc::new(SchedulerInner {
             transfers: RwLock::new(HashMap::new()),
             ready_set: ReadySet::new(),
-            controller: self.controller,
-            runtime: OnceLock::new(),
+            handle,
             dispatched: AtomicUsize::new(0),
             submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
-        }));
-        let runtime = runtime_factory(scheduler.clone());
-        scheduler
-            .0
-            .runtime
-            .set(runtime)
-            .expect("runtime already set");
-        scheduler
-    }
-}
-
-impl Scheduler {
-    #[cfg(test)]
-    pub(crate) fn new(concurrency: usize) -> Self {
-        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency)))
-            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
+        }))
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_managed_runtime(concurrency: usize) -> Self {
-        SchedulerBuilder::new(Arc::new(super::FixedConcurrency::new(concurrency))).build(
-            |scheduler| {
-                Arc::new(
-                    crate::runtime::ManagedThreadRuntime::builder(scheduler)
-                        .topology(crate::runtime::Topology::uniform(4))
-                        .build(),
-                )
-            },
-        )
-    }
-
-    pub(crate) fn with_controller(controller: Arc<dyn ConcurrencyController>) -> Self {
-        SchedulerBuilder::new(controller)
-            .build(|scheduler| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(scheduler)))
-    }
-
-    pub(crate) fn runtime(&self) -> &Arc<dyn ExecutionRuntime> {
-        self.0.runtime.get().expect("runtime not initialized")
-    }
-
-    /// Returns the concurrency controller's current target.
-    pub(crate) fn controller_target(&self) -> usize {
-        self.0.controller.target()
+    fn handle(&self) -> Arc<crate::client::Handle> {
+        self.0
+            .handle
+            .upgrade()
+            .expect("Handle dropped while scheduler active")
     }
 
     /// Called by the runtime when a worker picks up work.
     pub(crate) fn on_dispatch(&self) {
-        self.0.controller.on_dispatch();
+        self.handle().controller.on_dispatch();
     }
 
     /// Add a transfer and start generating work.
@@ -217,7 +161,8 @@ impl Scheduler {
                 ctx.set_cancelled();
             }
             ctx.signal_terminal();
-            let purged = self.runtime().remove_pending_for_transfer(id);
+            desc.transfer().on_terminal();
+            let purged = self.handle().runtime.remove_pending_for_transfer(id);
             self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
             desc.work_purged(purged);
             desc.notify_idle();
@@ -272,7 +217,7 @@ impl Scheduler {
         let sample = CompletionSample {
             error: classification,
         };
-        self.0.controller.on_completion(&sample);
+        self.handle().controller.on_completion(&sample);
 
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
@@ -303,6 +248,7 @@ impl Scheduler {
         );
         ctx.set_failed(err);
         ctx.signal_terminal();
+        desc.transfer().on_terminal();
 
         let is_idle = desc.work_finished();
         if is_idle {
@@ -312,7 +258,7 @@ impl Scheduler {
     }
 
     fn has_capacity(&self) -> bool {
-        self.0.dispatched.load(Ordering::Relaxed) < self.0.controller.target()
+        self.0.dispatched.load(Ordering::Relaxed) < self.handle().controller.target()
     }
 
     /// Flush the current submission and re-enter for the next batch.
@@ -321,7 +267,7 @@ impl Scheduler {
         sub: Submission<'a, ScheduledWork>,
     ) -> Submission<'a, ScheduledWork> {
         if let Some(mut guard) = sub.submit() {
-            self.runtime().dispatch(&mut guard);
+            self.handle().runtime.dispatch(&mut guard);
         }
         self.0.submission_queue.enter()
     }
@@ -381,14 +327,14 @@ impl Scheduler {
             }
         }
         if let Some(mut guard) = sub.submit() {
-            self.runtime().dispatch(&mut guard);
+            self.handle().runtime.dispatch(&mut guard);
         }
         if generated > 0 {
             tracing::trace!(
                 target: telemetry::TARGET_SCHEDULING,
                 generated,
                 dispatched = self.0.dispatched.load(Ordering::Relaxed),
-                target = self.0.controller.target(),
+                target = self.handle().controller.target(),
                 "work generated",
             );
         }
@@ -410,16 +356,10 @@ impl Scheduler {
             desc.wait_for_idle().await;
         }
     }
-
-    /// Shutdown the scheduler. Workers will exit after completing current work.
-    #[allow(dead_code)]
-    pub(crate) fn shutdown(&self) {
-        self.runtime().shutdown();
-    }
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::client::Handle;
     use crate::scheduler::transfer::mock::{
         FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
     };
@@ -432,10 +372,30 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    fn test_handle(concurrency: usize) -> Arc<Handle> {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder().client(s3_client).build();
+        Handle::new_for_test(config, concurrency)
+    }
+
+    fn test_handle_managed(concurrency: usize) -> Arc<Handle> {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder().client(s3_client).build();
+        Handle::new_for_test_with_runtime(config, concurrency, |weak| {
+            Arc::new(
+                crate::runtime::ManagedThreadRuntime::builder(weak)
+                    .topology(crate::runtime::Topology::uniform(4))
+                    .build(),
+            )
+        })
+    }
+
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_transfer_completes() {
         let _logs = show_test_logs();
-        let scheduler = Scheduler::new(4);
+        let handle = test_handle(4);
+        let scheduler = &handle.scheduler;
         let id = TransferId {
             id: 1,
             parent: None,
@@ -455,13 +415,15 @@ mod tests {
 
         assert!(sm.is_complete());
         assert_eq!(sm.completed_count(), 5);
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_transfer_completes_managed_runtime() {
         let _logs = show_test_logs();
-        let scheduler = Scheduler::with_managed_runtime(4);
+        let handle = test_handle_managed(4);
+        let scheduler = &handle.scheduler;
         let id = TransferId {
             id: 1,
             parent: None,
@@ -481,12 +443,14 @@ mod tests {
 
         assert!(sm.is_complete());
         assert_eq!(sm.completed_count(), 5);
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_multiple_transfers_complete() {
-        let scheduler = Scheduler::new(4);
+        let handle = test_handle(4);
+        let scheduler = &handle.scheduler;
         let mut state_machines = Vec::new();
 
         for i in 0..3u64 {
@@ -511,7 +475,7 @@ mod tests {
             assert!(sm.is_complete(), "transfer {} should be complete", i);
             assert_eq!(sm.completed_count(), 4);
         }
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
     /// Regression test: many single-work-item transfers with concurrency target
@@ -519,9 +483,11 @@ mod tests {
     /// item (like a single PutObject upload). All must complete — if on_completion
     /// doesn't call generate_work() for terminal transfers, only the first
     /// `concurrency` transfers complete and the rest hang forever.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_work_transfers_exceed_concurrency() {
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
         let mut state_machines = Vec::new();
 
         for i in 0..10u64 {
@@ -546,17 +512,21 @@ mod tests {
             assert!(sm.is_complete(), "transfer {} should be complete", i);
             assert_eq!(sm.completed_count(), 1);
         }
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_new_does_not_require_runtime() {
-        let _scheduler = Scheduler::new(4);
+        let _handle = test_handle(4);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_set_priority() {
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
         let id = TransferId {
             id: 1,
             parent: None,
@@ -590,7 +560,7 @@ mod tests {
         };
         scheduler.set_priority(fake_id, 100); // Should not panic
 
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
     /// Mock that always returns Pending (never generates work, never completes)
@@ -658,9 +628,11 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_priority_affects_work_distribution() {
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
 
         let high_id = TransferId {
             id: 1,
@@ -694,7 +666,7 @@ mod tests {
         high_mock.set_done();
         low_mock.set_done();
 
-        scheduler.shutdown();
+        handle.runtime.shutdown();
 
         let high_count = high_mock.count();
         let low_count = low_mock.count();
@@ -719,9 +691,11 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_priority_change_mid_flight() {
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
 
         let a_id = TransferId {
             id: 1,
@@ -756,7 +730,7 @@ mod tests {
 
         a_mock.set_done();
         b_mock.set_done();
-        scheduler.shutdown();
+        handle.runtime.shutdown();
 
         let a_after = a_mock.count() - a_before;
         let b_after = b_mock.count() - b_before;
@@ -772,10 +746,12 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_failed_transfer_cleaned_up() {
         let _logs = show_test_logs();
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
 
         let id = TransferId {
             id: 1,
@@ -797,13 +773,15 @@ mod tests {
         .expect("scheduler should become idle after failed transfer");
 
         assert!(!scheduler.0.transfers.read().unwrap().contains_key(&id));
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_panic_transfer_cleaned_up_and_error_propagated() {
         let _logs = show_test_logs();
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
 
         let panic_id = TransferId {
             id: 1,
@@ -847,12 +825,14 @@ mod tests {
         assert!(ok_sm.is_complete());
         assert_eq!(ok_sm.completed_count(), 3);
 
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_cancel_transfer_stops_work() {
-        let scheduler = Scheduler::new(2);
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
         let id = TransferId {
             id: 1,
             parent: None,
@@ -888,6 +868,6 @@ mod tests {
             completed
         );
 
-        scheduler.shutdown();
+        handle.runtime.shutdown();
     }
 }

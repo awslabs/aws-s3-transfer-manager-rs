@@ -46,7 +46,7 @@ nix = { version = "0.31", features = ["uio", "fs"] }
 aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
 aws-smithy-checksums = "0.64.6"
 aws-smithy-mocks = "0.2.6"
-aws-smithy-runtime = { version = "1.10.3", features = ["client", "test-util"] }
+aws-smithy-runtime = { version = "1.11.1", features = ["client", "test-util"] }
 aws-smithy-http-client = { version = "1.1.12", features = ["test-util", "wire-mock", "rustls-aws-lc", "s2n-tls"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.4.0"
@@ -63,8 +63,11 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 
+[target.'cfg(s3_tm_loom)'.dev-dependencies]
+loom = { version = "0.7", features = ["checkpoint"] }
+
 [target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 jemallocator = "0.5.4"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)'] }

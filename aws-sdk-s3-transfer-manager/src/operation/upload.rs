@@ -37,7 +37,6 @@ impl Upload {
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
     ) -> Result<UploadHandle, error::Error> {
-        // TODO: we were getting checksum behavior for free from SDK, moving to presigning and dedicated HTTP stack requires us to consider that
         if input.checksum_strategy.is_none() {
             // User didn't explicitly set checksum strategy.
             // If SDK is configured to send checksums: use default checksum strategy.
@@ -91,6 +90,7 @@ mod test {
     use crate::operation::upload::UploadInput;
     use crate::types::{ConcurrencyMode, PartSize};
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_abort_upload() {
         let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
@@ -158,6 +158,7 @@ mod retry_tests {
     }
 
     /// Test that SDK retries transient errors for upload_part.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_upload_part_retry() {
         // Responses in order: CreateMPU, UploadPart (500), UploadPart (200 retry), CompleteMPU

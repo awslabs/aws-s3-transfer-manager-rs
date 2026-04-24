@@ -33,7 +33,6 @@ impl Intercept for S3TransferManagerInterceptor {
         cfg.interceptor_state()
             .store_append(AwsSdkFeature::S3Transfer);
         let api_metadata = cfg.load::<ApiMetadata>().unwrap();
-        // TODO: maybe APP Name someday
         let mut ua = AwsUserAgent::new_from_environment(Env::real(), api_metadata.clone());
         if let Some(framework_metadata) = self.frame_work_meta_data.clone() {
             ua = ua.with_framework_metadata(framework_metadata);
@@ -127,6 +126,7 @@ mod tests {
     use aws_sdk_s3::config::Intercept;
     use aws_smithy_runtime::client::http::test_util::capture_request;
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn load_with_interceptor() {
         let config = crate::from_env()
@@ -141,6 +141,7 @@ mod tests {
         assert!(tm_interceptor_exists);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn load_with_interceptor_and_framework_metadata() {
         let (http_client, captured_request) = capture_request(None);

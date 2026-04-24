@@ -8,6 +8,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
@@ -16,7 +17,6 @@ mod worker_pool;
 
 use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
 use crate::runtime::sync::SubmissionGuard;
-use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
 use worker_pool::WorkerPool;
 
@@ -24,19 +24,21 @@ use worker_pool::WorkerPool;
 ///
 /// Assumes it is running within an existing tokio multi-threaded runtime context.
 /// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
+#[allow(dead_code)] // TODO: expose runtime selection on public config
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
-    scheduler: Scheduler,
+    handle: Weak<crate::client::Handle>,
     worker_count: AtomicUsize,
     components: RuntimeComponents,
 }
 
+#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl TokioMultiThreadRuntime {
-    pub(crate) fn new(scheduler: Scheduler) -> Self {
+    pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
         Self {
             pool: Arc::new(WorkerPool::new()),
-            scheduler,
+            handle,
             worker_count: AtomicUsize::new(0),
             components: RuntimeComponents::default(),
         }
@@ -45,7 +47,12 @@ impl TokioMultiThreadRuntime {
     /// Ensure workers are spawned. Called lazily on first dispatch.
     fn ensure_workers_started(&self) {
         if self.pool.mark_started() {
-            let target = self.scheduler.controller_target();
+            let target = self
+                .handle
+                .upgrade()
+                .expect("Handle dropped")
+                .controller
+                .target();
             self.spawn_workers(target);
         }
     }
@@ -53,7 +60,12 @@ impl TokioMultiThreadRuntime {
     /// Spawn additional workers if the concurrency target has grown beyond
     /// the current worker count.
     fn ensure_worker_capacity(&self) {
-        let target = self.scheduler.controller_target();
+        let target = self
+            .handle
+            .upgrade()
+            .expect("Handle dropped")
+            .controller
+            .target();
         let current = self.worker_count.load(Ordering::Relaxed);
         if target > current
             && self
@@ -69,9 +81,9 @@ impl TokioMultiThreadRuntime {
     fn spawn_workers(&self, count: usize) {
         for _ in 0..count {
             let pool = Arc::clone(&self.pool);
-            let scheduler = self.scheduler.clone();
+            let handle = self.handle.clone();
             tokio::spawn(async move {
-                worker_loop(pool, scheduler).await;
+                worker_loop(pool, handle).await;
             });
         }
         self.worker_count.fetch_add(count, Ordering::Relaxed);
@@ -101,7 +113,7 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
 }
 
 /// Worker loop — pulls work from pool and executes it.
-async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
+async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>) {
     static WORKER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let wid = WORKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -110,7 +122,10 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             tracing::debug!(target: crate::telemetry::TARGET_EXECUTION, wid, "shutdown");
             break;
         };
-        scheduler.on_dispatch();
+        let Some(h) = handle.upgrade() else {
+            break;
+        };
+        h.scheduler.on_dispatch();
 
         let tid = work.descriptor.id();
         work.descriptor.work_started();
@@ -119,7 +134,8 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
         if work.descriptor.is_terminal() {
             tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "skipped (terminal)");
             pool.complete();
-            scheduler.on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
+            h.scheduler
+                .on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
@@ -143,7 +159,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
             Err(_panic) => {
                 tracing::error!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "panic in transfer execute");
                 pool.complete();
-                scheduler.on_panic(work);
+                h.scheduler.on_panic(work);
                 continue;
             }
         };
@@ -152,6 +168,6 @@ async fn worker_loop(pool: Arc<WorkerPool>, scheduler: Scheduler) {
 
         let elapsed = started.elapsed();
         pool.complete();
-        scheduler.on_completion(work, outcome, elapsed);
+        h.scheduler.on_completion(work, outcome, elapsed);
     }
 }

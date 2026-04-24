@@ -285,6 +285,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_head() {
         // Returns the first 500 bytes from a 10MB object
@@ -313,6 +314,7 @@ mod tests {
         assert_eq!(0..=499, remaining);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_full_range() {
         let target_part_size = 500;
@@ -350,6 +352,7 @@ mod tests {
         assert_eq!(500, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_single_part() {
         let target_part_size = 500;
@@ -385,6 +388,7 @@ mod tests {
         assert_eq!(400, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_partial_range() {
         let target_part_size = 100;
@@ -423,6 +427,7 @@ mod tests {
         assert_eq!(100, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_over_range() {
         let target_part_size = 100;
@@ -459,6 +464,7 @@ mod tests {
         assert_eq!(50, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_empty_object() {
         let target_part_size = 500;

@@ -24,6 +24,7 @@ impl fmt::Display for Cpu {
 /// A NUMA node with its assigned cores.
 #[derive(Debug, Clone)]
 pub(crate) struct NumaNode {
+    #[allow(dead_code)] // TODO: used by buffer pool NUMA partitioning
     pub(crate) id: usize,
     pub(crate) cores: Vec<usize>,
 }
@@ -35,13 +36,18 @@ pub(crate) struct NumaNode {
 /// node 1 has cores 4,5, the thread ids are 0,1 (node 0) and 2,3 (node 1).
 #[derive(Debug, Clone)]
 pub(crate) struct Topology {
+    #[allow(dead_code)] // TODO: used by buffer pool NUMA partitioning
     nodes: Vec<NumaNode>,
     /// Pre-computed: thread_id.0 to (node index, core id)
     thread_map: Vec<(usize, usize)>,
     /// Pre-computed: node index to thread ids
+    #[allow(dead_code)] // TODO: used by buffer pool NUMA partitioning
     node_threads: Vec<Vec<Cpu>>,
 }
 
+// Most Topology methods are used only in tests today but are the planned API
+// surface for buffer pool NUMA partitioning, core pinning, and dispatch routing.
+#[allow(dead_code)]
 impl Topology {
     /// Single NUMA node with cores `0..num_cores`. No affinity, works everywhere.
     pub(crate) fn uniform(num_cores: usize) -> Self {
@@ -67,11 +73,6 @@ impl Topology {
             thread_map,
             node_threads,
         }
-    }
-
-    /// Total threads (one per core).
-    pub(crate) fn num_threads(&self) -> usize {
-        self.thread_map.len()
     }
 
     /// All thread ids.
@@ -112,7 +113,7 @@ mod tests {
     #[test]
     fn uniform_single_node() {
         let topo = Topology::uniform(4);
-        assert_eq!(topo.num_threads(), 4);
+        assert_eq!(topo.thread_ids().count(), 4);
         assert_eq!(topo.num_nodes(), 1);
         assert_eq!(topo.threads_on_node(0).len(), 4);
         for i in 0..4 {
@@ -133,7 +134,7 @@ mod tests {
                 cores: vec![4, 5, 6, 7],
             },
         ]);
-        assert_eq!(topo.num_threads(), 8);
+        assert_eq!(topo.thread_ids().count(), 8);
         assert_eq!(topo.num_nodes(), 2);
         assert_eq!(topo.threads_on_node(0).len(), 4);
         assert_eq!(topo.threads_on_node(1).len(), 4);
@@ -159,7 +160,7 @@ mod tests {
                 cores: vec![1, 3, 5, 7],
             },
         ]);
-        assert_eq!(topo.num_threads(), 8);
+        assert_eq!(topo.thread_ids().count(), 8);
         // Thread 0 → core 0, thread 1 → core 2, thread 2 → core 4, thread 3 → core 6
         assert_eq!(topo.core_for_thread(Cpu(0)), 0);
         assert_eq!(topo.core_for_thread(Cpu(1)), 2);

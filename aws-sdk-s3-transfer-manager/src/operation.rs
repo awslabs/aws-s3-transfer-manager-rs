@@ -30,7 +30,7 @@ pub(crate) type CancelBroadcastSender = tokio::sync::watch::Sender<()>;
 pub(crate) type CancelBroadcastReceiver = tokio::sync::watch::Receiver<()>;
 
 // Keep the old generic version temporarily for migration
-// TODO(phase3): Remove after all transfers migrated
+// TODO: Remove after upload_objects/download_objects migrated to new scheduler
 
 /// Container for maintaining context required to carry out a single operation/transfer.
 ///

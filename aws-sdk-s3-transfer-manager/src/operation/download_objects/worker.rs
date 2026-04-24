@@ -443,19 +443,21 @@ mod tests {
         for test in tests {
             let root_dir = PathBuf::from("test");
             let actual = local_key_path(&root_dir, test.key, test.prefix, test.delimiter);
-            if test.expected.is_ok() {
-                let actual = actual.expect("expected success");
-                let actual_str = actual.to_str().expect("valid utf-8 path");
-                assert_eq!(*test.expected.as_ref().unwrap(), actual_str);
-            } else {
-                let err =
-                    actual.expect_err("path resolves outside of parent folder, expected error");
-                let actual_err = format!("{}", DisplayErrorContext(err));
-                let expected_err_substr = test.expected.as_ref().unwrap_err();
-                assert!(
-                    actual_err.contains(expected_err_substr),
-                    "'{actual_err}' does not contain '{expected_err_substr}'"
-                );
+            match &test.expected {
+                Ok(expected_path) => {
+                    let actual = actual.expect("expected success");
+                    let actual_str = actual.to_str().expect("valid utf-8 path");
+                    assert_eq!(*expected_path, actual_str);
+                }
+                Err(expected_err_substr) => {
+                    let err =
+                        actual.expect_err("path resolves outside of parent folder, expected error");
+                    let actual_err = format!("{}", DisplayErrorContext(err));
+                    assert!(
+                        actual_err.contains(expected_err_substr),
+                        "'{actual_err}' does not contain '{expected_err_substr}'"
+                    );
+                }
             }
         }
     }
@@ -470,6 +472,7 @@ mod tests {
         assert_eq!(*test.expected.as_ref().unwrap(), actual_str);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_skip_folder_objects() {
         let list_objects_rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -521,6 +524,7 @@ mod tests {
         assert_eq!(keys, vec!["key1", "key2"]);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_user_filter() {
         let list_objects_rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {

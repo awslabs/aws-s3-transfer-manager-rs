@@ -329,7 +329,6 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        client::Handle,
         io::InputStream,
         operation::upload_objects::{
             worker::{upload_single_obj, UploadObjectJob},
@@ -432,6 +431,7 @@ mod tests {
             (successes, errors)
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_list_directory_contents_should_send_upload_object_jobs_from_traversed_path_entries(
         ) {
@@ -519,6 +519,7 @@ mod tests {
             }
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_list_directory_contents_with_symlinks() {
             let files1 = vec![("sample.jpg", 1)];
@@ -600,6 +601,7 @@ mod tests {
             }
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_list_directory_contents_should_send_both_upload_object_jobs_and_errors() {
             let recursion_root = "test";
@@ -650,6 +652,7 @@ mod tests {
             );
         }
 
+        #[cfg_attr(miri, ignore)]
         #[tokio::test]
         async fn test_upload_filter() {
             let recursion_root = "test";
@@ -689,6 +692,8 @@ mod tests {
     mod windows {
         use crate::operation::upload_objects::worker::*;
 
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn test_derive_object_key() {
             assert_eq!(
@@ -698,6 +703,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_cancel_single_upload_via_put_object() {
         let bucket = "doesnotmatter";
@@ -708,9 +714,7 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = crate::Config::builder().client(s3_client).build();
 
-        let scheduler = crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY);
-
-        let handle = std::sync::Arc::new(Handle::with_config_and_scheduler(config, scheduler));
+        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
         let input = UploadObjectsInputBuilder::default()
             .source("doesnotmatter")
             .bucket(bucket)

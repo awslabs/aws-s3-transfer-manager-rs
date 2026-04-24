@@ -25,7 +25,7 @@ pub(crate) enum UploadState {
     Transferring {
         upload_id: String,
         part_reader: Arc<PartReader>,
-        next_part: u64,
+        parts_dispatched: u64,
         total_parts: u64,
         parts_in_flight: usize,
         completed_parts: Vec<CompletedPart>,

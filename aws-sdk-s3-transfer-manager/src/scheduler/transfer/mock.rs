@@ -44,16 +44,9 @@ impl MockTransfer {
         id: TransferId,
         state_machine: Arc<S>,
     ) -> Self {
-        use crate::DEFAULT_CONCURRENCY;
-        use std::sync::Arc;
-
-        // Create a minimal handle for testing
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = Arc::new(crate::client::Handle::with_config_and_scheduler(
-            config,
-            crate::scheduler::Scheduler::new(DEFAULT_CONCURRENCY),
-        ));
+        let handle = crate::client::Handle::new_for_test(config, 1);
 
         let (ctx, _completion_rx) = TransferContext::with_id(id, handle);
 
@@ -227,6 +220,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_fixed_work_count() {
         let sm = FixedWorkCount::new(3);
@@ -238,6 +232,7 @@ mod tests {
         assert!(matches!(sm.poll_work(id), PollWork::Done));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_with_delay() {
         let sm = WithDelay::new(FixedWorkCount::new(1), Duration::from_millis(50));
