@@ -313,6 +313,7 @@ fn handle_failed_upload(
                     None => None,
                 },
                 error: err,
+                source_path: None,
             };
 
             failures.push(failed_transfer);

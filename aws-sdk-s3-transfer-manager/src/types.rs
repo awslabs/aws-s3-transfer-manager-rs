@@ -308,6 +308,8 @@ impl<'a> UploadFilterItemBuilder<'a> {
 pub struct FailedUpload {
     pub(crate) input: Option<crate::operation::upload::UploadInput>,
     pub(crate) error: crate::error::Error,
+    /// Local filesystem path of the source file that failed to upload.
+    pub(crate) source_path: Option<std::path::PathBuf>,
 }
 
 impl FailedUpload {
@@ -319,6 +321,11 @@ impl FailedUpload {
     /// The error encountered uploading the object
     pub fn error(&self) -> &crate::error::Error {
         &self.error
+    }
+
+    /// Local filesystem path of the source file that failed to upload.
+    pub fn source_path(&self) -> Option<&std::path::Path> {
+        self.source_path.as_deref()
     }
 }
 
