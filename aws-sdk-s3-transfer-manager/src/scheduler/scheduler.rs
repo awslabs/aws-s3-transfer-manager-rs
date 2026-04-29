@@ -142,35 +142,57 @@ impl Scheduler {
         }
     }
 
-    /// Cancel a transfer, removing it from the scheduler.
+    /// Cancel a transfer and any child transfers, removing them from the scheduler.
     ///
-    /// - Removes from transfers map
-    /// - Purges queued work for this transfer from pools
-    /// - Outstanding work being executed will complete naturally
-    /// - Use `wait_for_idle(id)` to wait for all outstanding work to finish
+    /// Cancels the target transfer first, then cancels all transfers whose
+    /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each cancelled
+    /// transfer has its status set to cancelled, pending work purged, and idle
+    /// notification sent. Outstanding work already being executed will complete
+    /// naturally — use `wait_for_idle(id)` to wait for draining.
     ///
-    /// TODO: When upload_objects/download_objects use the new scheduler,
-    /// this needs to cancel child transfers too (where tid.parent == Some(id.id)).
+    /// Returns `true` if the target transfer existed in the map, `false` otherwise.
+    /// The return value does not reflect whether any children were found or cancelled.
     pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
-        let desc = self.0.transfers.write().unwrap().remove(&id);
-        if let Some(desc) = desc {
-            let ctx = desc.transfer().ctx();
-            // Ensure transfer is terminal so ready_set and workers skip it.
-            // May already be set by the handle (set_cancelled/set_failed) — that's fine.
-            if ctx.is_active() {
-                ctx.set_cancelled();
-            }
-            ctx.signal_terminal();
-            desc.transfer().on_terminal();
-            let purged = self.handle().runtime.remove_pending_for_transfer(id);
-            self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
-            desc.work_purged(purged);
-            desc.notify_idle();
-            tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, purged, "transfer cancelled");
-            true
-        } else {
-            false
+        let (target, children) = {
+            let mut transfers = self.0.transfers.write().unwrap();
+            let target = transfers.remove(&id);
+            let child_keys: Vec<TransferId> = transfers
+                .keys()
+                .filter(|tid| tid.parent == Some(id.id))
+                .copied()
+                .collect();
+            let children: Vec<TransferDescriptor> = child_keys
+                .iter()
+                .filter_map(|k| transfers.remove(k))
+                .collect();
+            (target, children)
+        };
+
+        let found = target.is_some();
+        if let Some(desc) = target {
+            self.cancel_descriptor(desc);
         }
+        for desc in children {
+            self.cancel_descriptor(desc);
+        }
+        found
+    }
+
+    /// Cancel a single transfer descriptor: set cancelled, signal terminal,
+    /// clean up on_terminal, purge pending work, and notify idle.
+    fn cancel_descriptor(&self, desc: TransferDescriptor) {
+        let id = desc.id();
+        let ctx = desc.transfer().ctx();
+        if ctx.is_active() {
+            ctx.set_cancelled();
+        }
+        ctx.signal_terminal();
+        desc.transfer().on_terminal();
+        let purged = self.handle().runtime.remove_pending_for_transfer(id);
+        self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
+        desc.work_purged(purged);
+        desc.notify_idle();
+        tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, purged, "transfer cancelled");
     }
 
     /// Set the priority of a transfer.
@@ -867,6 +889,166 @@ mod tests {
             "expected fewer than 20 completions, got {}",
             completed
         );
+
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_cancel_parent_cascades_to_children() {
+        let handle = test_handle(4);
+        let scheduler = &handle.scheduler;
+
+        let parent_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let child_ids: Vec<TransferId> = (2..=4)
+            .map(|i| TransferId {
+                id: i,
+                parent: Some(1),
+            })
+            .collect();
+
+        let parent_sm = Arc::new(WithDelay::new(
+            FixedWorkCount::new(20),
+            Duration::from_millis(50),
+        ));
+        let parent_transfer = MockTransfer::new(parent_id, parent_sm);
+        let parent_ctx = parent_transfer.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(parent_transfer));
+
+        let mut child_ctxs = Vec::new();
+        for &cid in &child_ids {
+            let sm = Arc::new(WithDelay::new(
+                FixedWorkCount::new(20),
+                Duration::from_millis(50),
+            ));
+            let transfer = MockTransfer::new(cid, sm);
+            child_ctxs.push(transfer.ctx().clone());
+            scheduler.enqueue_transfer(Box::new(transfer));
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(scheduler.cancel_transfer(parent_id));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle after cascade cancel");
+
+        assert!(!parent_ctx.is_active(), "parent should not be active");
+        for (i, ctx) in child_ctxs.iter().enumerate() {
+            assert!(!ctx.is_active(), "child {} should not be active", i + 2);
+        }
+
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_cancel_parent_with_no_children_still_works() {
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let sm = Arc::new(WithDelay::new(
+            FixedWorkCount::new(20),
+            Duration::from_millis(50),
+        ));
+        let transfer = MockTransfer::new(id, sm);
+        let ctx = transfer.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(transfer));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(scheduler.cancel_transfer(id));
+        assert!(!scheduler.cancel_transfer(id));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle after cancel");
+
+        assert!(!ctx.is_active(), "parent should not be active");
+
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_cancel_child_does_not_affect_siblings_or_parent() {
+        let handle = test_handle(4);
+        let scheduler = &handle.scheduler;
+
+        let parent_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let child_a = TransferId {
+            id: 2,
+            parent: Some(1),
+        };
+        let child_b = TransferId {
+            id: 3,
+            parent: Some(1),
+        };
+
+        let parent_sm = Arc::new(WithDelay::new(
+            FixedWorkCount::new(20),
+            Duration::from_millis(50),
+        ));
+        let parent_transfer = MockTransfer::new(parent_id, parent_sm);
+        let parent_ctx = parent_transfer.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(parent_transfer));
+
+        let sm_a = Arc::new(WithDelay::new(
+            FixedWorkCount::new(20),
+            Duration::from_millis(50),
+        ));
+        let transfer_a = MockTransfer::new(child_a, sm_a);
+        let ctx_a = transfer_a.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(transfer_a));
+
+        let sm_b = Arc::new(WithDelay::new(
+            FixedWorkCount::new(20),
+            Duration::from_millis(50),
+        ));
+        let transfer_b = MockTransfer::new(child_b, sm_b);
+        let ctx_b = transfer_b.ctx().clone();
+        scheduler.enqueue_transfer(Box::new(transfer_b));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(scheduler.cancel_transfer(child_a));
+        assert!(ctx_a.is_cancelled(), "child A should be cancelled");
+        assert!(parent_ctx.is_active(), "parent should still be active");
+        assert!(ctx_b.is_active(), "sibling B should still be active");
+
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_cancel_nonexistent_transfer_returns_false() {
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let fake_id = TransferId {
+            id: 999,
+            parent: None,
+        };
+        assert!(!scheduler.cancel_transfer(fake_id));
 
         handle.runtime.shutdown();
     }
