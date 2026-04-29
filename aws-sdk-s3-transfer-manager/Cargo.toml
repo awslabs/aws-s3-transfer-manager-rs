@@ -38,6 +38,7 @@ aws-smithy-http-client = { version = "1.1.12", features = ["rustls-aws-lc"] }
 aws-smithy-dns = { version = "0.1.12", features = ["hickory-dns"] }
 fastrand = "2.4"
 hdrhistogram = "7"
+same-file = "1.0.6"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs"] }

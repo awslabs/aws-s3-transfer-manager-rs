@@ -16,6 +16,8 @@ mod stream;
 pub mod error;
 pub(crate) mod fs;
 mod size_hint;
+/// Walker types for traversing filesystems and S3 buckets.
+pub mod walk;
 
 // re-exports
 pub use self::aggregated_bytes::AggregatedBytes;
