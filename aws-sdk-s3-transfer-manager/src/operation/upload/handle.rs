@@ -177,6 +177,16 @@ impl UploadHandle {
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }
+
+    /// Current status of this transfer.
+    pub fn status(&self) -> crate::types::TransferStatus {
+        self.transfer.ctx().transfer_status()
+    }
+
+    /// Snapshot of current transfer metrics.
+    pub fn metrics(&self) -> crate::types::TransferMetrics {
+        self.transfer.ctx().metrics()
+    }
 }
 
 impl Drop for UploadHandle {

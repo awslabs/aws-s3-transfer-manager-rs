@@ -10,9 +10,14 @@ use aws_sdk_s3::operation::{
 use std::fmt::{Debug, Formatter};
 
 /// Common response fields for uploading an object to Amazon S3
+// FIXME: join() should return a wrapper type that always carries TransferMetrics
+// regardless of success/failure. For now, metrics are only available on success.
 #[non_exhaustive]
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct UploadOutput {
+    /// Snapshot of transfer metrics at completion.
+    pub metrics: crate::types::TransferMetrics,
+
     /// <p>If the expiration is configured for the object (see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html">PutBucketLifecycleConfiguration</a>) in the <i>Amazon S3 User Guide</i>, the response includes this header. It includes the <code>expiry-date</code> and <code>rule-id</code> key-value pairs that provide information about object expiration. The value of the <code>rule-id</code> is URL-encoded.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -184,6 +189,7 @@ impl UploadOutput {
 impl Debug for UploadOutput {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut formatter = f.debug_struct("UploadOutput");
+        formatter.field("metrics", &self.metrics);
         formatter.field("expiration", &self.expiration);
         formatter.field("e_tag", &self.e_tag);
         formatter.field("checksum_crc32", &self.checksum_crc32);
@@ -212,6 +218,7 @@ impl Debug for UploadOutput {
 #[non_exhaustive]
 #[derive(Default)]
 pub struct UploadOutputBuilder {
+    pub(crate) metrics: Option<crate::types::TransferMetrics>,
     pub(crate) expiration: Option<String>,
     pub(crate) e_tag: Option<String>,
     pub(crate) checksum_crc32: Option<String>,
@@ -541,9 +548,16 @@ impl UploadOutputBuilder {
         self.upload_id.as_deref()
     }
 
+    /// Set the transfer metrics snapshot.
+    pub(crate) fn metrics(mut self, val: crate::types::TransferMetrics) -> Self {
+        self.metrics = Some(val);
+        self
+    }
+
     /// Consumes the builder and constructs a [`UploadOutput`]
     pub fn build(self) -> Result<UploadOutput, ::aws_smithy_types::error::operation::BuildError> {
         Ok(UploadOutput {
+            metrics: self.metrics.expect("metrics must be set"),
             expiration: self.expiration,
             e_tag: self.e_tag,
             checksum_crc32: self.checksum_crc32,
@@ -568,6 +582,7 @@ impl UploadOutputBuilder {
 impl From<PutObjectOutput> for UploadOutputBuilder {
     fn from(value: PutObjectOutput) -> Self {
         UploadOutputBuilder {
+            metrics: None,
             bucket_key_enabled: value.bucket_key_enabled,
             checksum_crc32: value.checksum_crc32,
             checksum_crc32_c: value.checksum_crc32_c,
@@ -642,6 +657,7 @@ impl UploadOutputBuilder {
 impl From<CreateMultipartUploadOutput> for UploadOutputBuilder {
     fn from(value: CreateMultipartUploadOutput) -> Self {
         UploadOutputBuilder {
+            metrics: None,
             upload_id: value.upload_id,
             server_side_encryption: value.server_side_encryption,
             sse_customer_algorithm: value.sse_customer_algorithm,

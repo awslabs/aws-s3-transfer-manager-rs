@@ -11,4 +11,6 @@
 #[cfg(test)]
 mod download;
 #[cfg(test)]
+mod metrics;
+#[cfg(test)]
 mod upload;

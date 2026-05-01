@@ -292,6 +292,77 @@ impl fmt::Debug for StateMachineStatus {
     }
 }
 
+/// Per-transfer metrics backing store.
+pub(crate) struct MetricsState {
+    network_tx: AtomicU64,
+    network_rx: AtomicU64,
+    disk_read: AtomicU64,
+    disk_write: AtomicU64,
+    total_bytes: std::sync::OnceLock<u64>,
+    started_at: std::time::Instant,
+    finished_at: std::sync::OnceLock<std::time::Instant>,
+}
+
+impl MetricsState {
+    fn new() -> Self {
+        Self {
+            network_tx: AtomicU64::new(0),
+            network_rx: AtomicU64::new(0),
+            disk_read: AtomicU64::new(0),
+            disk_write: AtomicU64::new(0),
+            total_bytes: std::sync::OnceLock::new(),
+            started_at: std::time::Instant::now(),
+            finished_at: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Record an IO sample (cumulative).
+    pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
+        self.network_tx
+            .fetch_add(sample.network_tx, Ordering::Relaxed);
+        self.network_rx
+            .fetch_add(sample.network_rx, Ordering::Relaxed);
+        self.disk_read
+            .fetch_add(sample.disk_read, Ordering::Relaxed);
+        self.disk_write
+            .fetch_add(sample.disk_write, Ordering::Relaxed);
+    }
+
+    /// Set the expected total payload bytes. No-op if already set.
+    pub(crate) fn set_total_bytes(&self, n: u64) {
+        let _ = self.total_bytes.set(n);
+    }
+
+    /// Mark the transfer as finished. No-op if already set.
+    pub(crate) fn set_finished(&self) {
+        let _ = self.finished_at.set(std::time::Instant::now());
+    }
+
+    /// Snapshot current metrics into the public type.
+    pub(crate) fn snapshot(&self) -> crate::types::TransferMetrics {
+        crate::types::TransferMetrics {
+            network_tx: self.network_tx.load(Ordering::Relaxed),
+            network_rx: self.network_rx.load(Ordering::Relaxed),
+            disk_read: self.disk_read.load(Ordering::Relaxed),
+            disk_write: self.disk_write.load(Ordering::Relaxed),
+            total_bytes: self.total_bytes.get().copied(),
+            started_at: self.started_at,
+            finished_at: self.finished_at.get().copied(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MetricsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsState")
+            .field("network_tx", &self.network_tx.load(Ordering::Relaxed))
+            .field("network_rx", &self.network_rx.load(Ordering::Relaxed))
+            .field("disk_read", &self.disk_read.load(Ordering::Relaxed))
+            .field("disk_write", &self.disk_write.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// Common lifecycle management for transfer state machines.
 ///
 /// Handles status tracking, error storage, completion signaling, and scheduler
@@ -315,6 +386,8 @@ pub(crate) struct TransferContext {
     pending: Arc<std::sync::atomic::AtomicBool>,
     /// Cancellation token for cooperative cancellation
     cancellation_token: tokio_util::sync::CancellationToken,
+    /// Per-transfer metrics backing store
+    pub(crate) metrics: Arc<MetricsState>,
 }
 
 impl fmt::Display for TransferContext {
@@ -346,6 +419,7 @@ impl TransferContext {
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
+            metrics: Arc::new(MetricsState::new()),
         };
         (ctx, completion_rx)
     }
@@ -366,6 +440,7 @@ impl TransferContext {
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
+            metrics: Arc::new(MetricsState::new()),
         };
         (ctx, completion_rx)
     }
@@ -469,9 +544,40 @@ impl TransferContext {
     /// Wakes any waiters (e.g., `join()`). Note: in-flight work may still
     /// be draining when this is called.
     pub(crate) fn signal_terminal(&self) {
+        self.metrics.set_finished();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
+    }
+
+    /// Record an IO sample into per-transfer counters AND global telemetry.
+    pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
+        self.metrics.record_io(sample);
+        self.handle.telemetry.io_counters.record(sample);
+    }
+
+    /// Set the expected total payload bytes for this transfer.
+    pub(crate) fn set_total_bytes(&self, n: u64) {
+        self.metrics.set_total_bytes(n);
+    }
+
+    /// Get current transfer status as a public enum.
+    pub(crate) fn transfer_status(&self) -> crate::types::TransferStatus {
+        use crate::types::TransferStatus;
+        if self.status.is_cancelled() {
+            TransferStatus::Cancelled
+        } else if self.is_failed() {
+            TransferStatus::Failed
+        } else if !self.is_active() {
+            TransferStatus::Completed
+        } else {
+            TransferStatus::Active
+        }
+    }
+
+    /// Snapshot current transfer metrics.
+    pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
+        self.metrics.snapshot()
     }
 
     /// Get scheduling controls for this transfer.
@@ -592,6 +698,123 @@ mod tests {
             assert_eq!(s.to_string(), "Active");
             s.set_failed();
             assert_eq!(s.to_string(), "Failed");
+        }
+    }
+
+    mod transfer_status {
+        use crate::types::TransferStatus;
+
+        #[test]
+        fn is_terminal() {
+            assert!(!TransferStatus::Active.is_terminal());
+            assert!(TransferStatus::Completed.is_terminal());
+            assert!(TransferStatus::Failed.is_terminal());
+            assert!(TransferStatus::Cancelled.is_terminal());
+        }
+    }
+
+    mod transfer_context_status_and_metrics {
+        use super::*;
+        use std::sync::Arc;
+
+        fn test_handle() -> Arc<crate::client::Handle> {
+            let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+            let config = crate::Config::builder().client(s3_client).build();
+            crate::client::Handle::new_for_test(config, 4)
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn status_transitions() {
+            let handle = test_handle();
+
+            // Completed
+            let (ctx, _rx) = TransferContext::new(handle.clone());
+            assert_eq!(ctx.transfer_status(), crate::types::TransferStatus::Active);
+            ctx.set_completed();
+            ctx.signal_terminal();
+            assert_eq!(
+                ctx.transfer_status(),
+                crate::types::TransferStatus::Completed
+            );
+
+            // Failed
+            let (ctx, _rx) = TransferContext::new(handle.clone());
+            ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::InputInvalid,
+                "test",
+            ));
+            ctx.signal_terminal();
+            assert_eq!(ctx.transfer_status(), crate::types::TransferStatus::Failed);
+
+            // Cancelled
+            let (ctx, _rx) = TransferContext::new(handle);
+            ctx.set_cancelled();
+            ctx.signal_terminal();
+            assert_eq!(
+                ctx.transfer_status(),
+                crate::types::TransferStatus::Cancelled
+            );
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn stats_initial_values() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            let stats = ctx.metrics();
+            assert_eq!(stats.network_tx, 0);
+            assert_eq!(stats.network_rx, 0);
+            assert_eq!(stats.disk_read, 0);
+            assert_eq!(stats.disk_write, 0);
+            assert_eq!(stats.total_bytes, None);
+            assert!(stats.started_at.elapsed().as_secs() < 1);
+            assert!(stats.finished_at.is_none());
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn stats_record_io() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            ctx.record_io(&crate::metrics::IoSample {
+                network_tx: 100,
+                network_rx: 200,
+                disk_read: 300,
+                disk_write: 400,
+            });
+            ctx.record_io(&crate::metrics::IoSample {
+                network_tx: 10,
+                network_rx: 20,
+                disk_read: 30,
+                disk_write: 40,
+            });
+            let stats = ctx.metrics();
+            assert_eq!(stats.network_tx, 110);
+            assert_eq!(stats.network_rx, 220);
+            assert_eq!(stats.disk_read, 330);
+            assert_eq!(stats.disk_write, 440);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_set_on_terminal() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            assert!(ctx.metrics().finished_at.is_none());
+            ctx.set_completed();
+            ctx.signal_terminal();
+            assert!(ctx.metrics().finished_at.is_some());
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn set_total_bytes() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            assert_eq!(ctx.metrics().total_bytes, None);
+            ctx.set_total_bytes(42);
+            assert_eq!(ctx.metrics().total_bytes, Some(42));
         }
     }
 }

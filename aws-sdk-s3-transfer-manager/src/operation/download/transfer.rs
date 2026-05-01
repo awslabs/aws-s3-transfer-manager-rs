@@ -273,6 +273,7 @@ impl DownloadTransfer {
         let total_size =
             chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
         self.inner.writer.preallocate(total_size);
+        self.inner.ctx.set_total_bytes(total_size);
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
@@ -362,15 +363,10 @@ impl DownloadTransfer {
         }
         self.decrement_in_flight();
 
-        self.inner
-            .ctx
-            .handle
-            .telemetry
-            .io_counters
-            .record(&crate::metrics::IoSample {
-                network_rx: bytes_received,
-                ..Default::default()
-            });
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_rx: bytes_received,
+            ..Default::default()
+        });
 
         WorkOutcome::Success { data: None }
     }
@@ -461,15 +457,10 @@ impl DownloadTransfer {
             "chunk downloaded",
         );
 
-        self.inner
-            .ctx
-            .handle
-            .telemetry
-            .io_counters
-            .record(&crate::metrics::IoSample {
-                network_rx: bytes_received,
-                ..Default::default()
-            });
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_rx: bytes_received,
+            ..Default::default()
+        });
 
         WorkOutcome::Success { data: None }
     }
