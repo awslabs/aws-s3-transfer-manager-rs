@@ -492,7 +492,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_single_page() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -518,7 +517,6 @@ mod tests {
         assert_eq!(keys, vec!["a.txt", "b.txt", "c.txt"]);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_with_pagination() {
@@ -549,7 +547,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_with_filter() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -576,7 +573,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_empty_prefix() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2)
@@ -590,7 +586,6 @@ mod tests {
         assert!(walk.next().await.is_none());
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_with_common_prefixes() {
@@ -632,7 +627,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_service_error_terminates_walk() {
         use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
@@ -650,7 +644,6 @@ mod tests {
         assert!(walk.next().await.is_none());
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_pagination_across_common_prefix() {
@@ -697,7 +690,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_delimiter_without_common_prefixes() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -723,7 +715,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_no_delimiter_no_recursion() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -748,7 +739,6 @@ mod tests {
 
     // --- NEW TESTS ---
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_start_after() {
@@ -777,7 +767,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_page_size() {
         // page_size propagates as max_keys; mock returns a single-item page
@@ -800,7 +789,6 @@ mod tests {
         assert_eq!(keys, vec!["only.txt"]);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_expected_bucket_owner() {
@@ -825,7 +813,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_is_directory_bucket() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2)
@@ -847,7 +834,6 @@ mod tests {
     /// the first request. On pagination, subsequent requests must use the
     /// server's continuation token, not the original one (which would cause
     /// an infinite loop).
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_continuation_token_only_on_first_page() {
@@ -885,7 +871,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_prefix_propagates() {
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2)
@@ -909,7 +894,6 @@ mod tests {
         assert_eq!(keys, vec!["my-prefix/a.txt"]);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_request_payer_propagates() {
@@ -936,7 +920,6 @@ mod tests {
         assert_eq!(keys, vec!["a.txt"]);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_delimiter_propagates_on_recursed_prefixes() {
@@ -990,7 +973,6 @@ mod tests {
         assert_eq!(keys, vec!["a/file.txt", "a/b/file.txt", "a/b/c/file.txt"]);
     }
 
-    #[cfg_attr(miri, ignore)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_s3walker_empty_contents_none() {
