@@ -361,7 +361,6 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        self.decrement_in_flight();
 
         // disk_write reflects bytes committed to the file sink buffer.
         // Actual disk flushes are batched; disk_write may lead physical
@@ -375,6 +374,8 @@ impl DownloadTransfer {
             },
             ..Default::default()
         });
+
+        self.decrement_in_flight();
 
         WorkOutcome::Success { data: None }
     }
@@ -456,14 +457,6 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        self.decrement_in_flight();
-
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            seq,
-            offset = *range.start(),
-            "chunk downloaded",
-        );
 
         // disk_write reflects bytes committed to the file sink buffer.
         // Actual disk flushes are batched; disk_write may lead physical
@@ -477,6 +470,15 @@ impl DownloadTransfer {
             },
             ..Default::default()
         });
+
+        self.decrement_in_flight();
+
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            seq,
+            offset = *range.start(),
+            "chunk downloaded",
+        );
 
         WorkOutcome::Success { data: None }
     }

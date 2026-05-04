@@ -437,12 +437,12 @@ impl UploadTransfer {
             "part uploaded",
         );
 
-        self.maybe_transition_to_completing();
-
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: bytes_sent,
             ..Default::default()
         });
+
+        self.maybe_transition_to_completing();
 
         WorkOutcome::Success { data: None }
     }
@@ -527,13 +527,14 @@ impl UploadTransfer {
             .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
-        self.inner.ctx.set_completed();
-        self.inner.ctx.signal_terminal();
 
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
             ..Default::default()
         });
+
+        self.inner.ctx.set_completed();
+        self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
     }
