@@ -304,9 +304,8 @@ impl UploadTransfer {
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
                 .direct_io(self.inner.ctx.handle.runtime.components().direct_io())
-                .io_counters(std::sync::Arc::clone(
-                    &self.inner.ctx.handle.telemetry.io_counters,
-                ))
+                .metrics(std::sync::Arc::clone(&self.inner.ctx.metrics))
+                .telemetry(std::sync::Arc::clone(&self.inner.ctx.handle.telemetry))
                 .build()
             {
                 Ok(reader) => reader,

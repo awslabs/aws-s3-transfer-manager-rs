@@ -368,6 +368,10 @@ impl Drop for BodySlot {
 }
 
 impl BodyWriter {
+    pub(crate) fn has_sink(&self) -> bool {
+        self.buffer.sink.is_some()
+    }
+
     /// Try to claim the next slot for work generation.
     ///
     /// Returns `None` if the seq window is exhausted

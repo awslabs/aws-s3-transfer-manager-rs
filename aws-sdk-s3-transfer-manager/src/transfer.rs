@@ -292,7 +292,7 @@ impl fmt::Debug for StateMachineStatus {
     }
 }
 
-/// Per-transfer metrics backing store.
+/// Per-transfer cumulative metrics.
 pub(crate) struct MetricsState {
     network_tx: AtomicU64,
     network_rx: AtomicU64,
@@ -304,7 +304,7 @@ pub(crate) struct MetricsState {
 }
 
 impl MetricsState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             network_tx: AtomicU64::new(0),
             network_rx: AtomicU64::new(0),
@@ -316,7 +316,7 @@ impl MetricsState {
         }
     }
 
-    /// Record an IO sample (cumulative).
+    /// Record an IO sample (per-transfer cumulative counters only).
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
         self.network_tx
             .fetch_add(sample.network_tx, Ordering::Relaxed);
@@ -413,13 +413,13 @@ impl TransferContext {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let ctx = Self {
             id,
+            metrics: Arc::new(MetricsState::new()),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
-            metrics: Arc::new(MetricsState::new()),
         };
         (ctx, completion_rx)
     }
@@ -434,13 +434,13 @@ impl TransferContext {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let ctx = Self {
             id,
+            metrics: Arc::new(MetricsState::new()),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
-            metrics: Arc::new(MetricsState::new()),
         };
         (ctx, completion_rx)
     }
@@ -550,7 +550,7 @@ impl TransferContext {
         }
     }
 
-    /// Record an IO sample into per-transfer counters AND global telemetry.
+    /// Record an IO sample to per-transfer metrics and per-client telemetry.
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
         self.metrics.record_io(sample);
         self.handle.telemetry.io_counters.record(sample);

@@ -363,8 +363,16 @@ impl DownloadTransfer {
         }
         self.decrement_in_flight();
 
+        // disk_write reflects bytes committed to the file sink buffer.
+        // Actual disk flushes are batched; disk_write may lead physical
+        // I/O at any snapshot but converges on transfer completion.
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
+            disk_write: if self.inner.writer.has_sink() {
+                bytes_received
+            } else {
+                0
+            },
             ..Default::default()
         });
 
@@ -457,8 +465,16 @@ impl DownloadTransfer {
             "chunk downloaded",
         );
 
+        // disk_write reflects bytes committed to the file sink buffer.
+        // Actual disk flushes are batched; disk_write may lead physical
+        // I/O at any snapshot but converges on transfer completion.
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
+            disk_write: if self.inner.writer.has_sink() {
+                bytes_received
+            } else {
+                0
+            },
             ..Default::default()
         });
 

@@ -101,12 +101,12 @@ async fn test_upload_from_file_metrics() {
     wait_for_terminal(|| handle.status()).await;
 
     let metrics = handle.metrics();
-    // NOTE: disk_read is tracked in global io_counters, not per-transfer metrics
     assert_eq!(metrics.network_tx, size as u64);
     assert_eq!(metrics.total_bytes, Some(size as u64));
 
     let output = handle.join().await.expect("join");
     assert_eq!(output.metrics.network_tx, size as u64);
+    assert_eq!(output.metrics.disk_read, size as u64);
 
     server_handle.shutdown().await.expect("shutdown");
 }
@@ -170,7 +170,7 @@ async fn test_download_to_file_metrics() {
         .expect("join");
 
     assert_eq!(output.metrics.network_rx, size as u64);
-    // NOTE: disk_write is tracked in global io_counters, not per-transfer metrics
+    assert_eq!(output.metrics.disk_write, size as u64);
     assert_eq!(output.metrics.total_bytes, Some(size as u64));
 
     server_handle.shutdown().await.expect("shutdown");
