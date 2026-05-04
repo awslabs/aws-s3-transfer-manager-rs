@@ -633,6 +633,12 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Normalize path separators to `/` for cross-platform test assertions.
+    fn norm(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+    }
+
     async fn collect_entries(mut walk: FsWalk) -> (Vec<DirEntry>, Vec<WalkError>) {
         let mut entries = Vec::new();
         let mut errors = Vec::new();
@@ -653,6 +659,7 @@ mod tests {
         FsWalkContext::builder().root(root).build()
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_flat_directory() {
         let dir = tempdir().unwrap();
@@ -680,6 +687,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_recursive() {
         let dir = tempdir().unwrap();
@@ -694,10 +702,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(entries.len(), 3);
 
-        let mut names: Vec<_> = entries
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let mut names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         names.sort();
         assert_eq!(
             names,
@@ -705,6 +710,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_non_recursive_skips_subdirs() {
         let dir = tempdir().unwrap();
@@ -719,6 +725,7 @@ mod tests {
         assert_eq!(entries[0].relative_path(), Path::new("top.txt"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_filter() {
         let dir = tempdir().unwrap();
@@ -742,6 +749,7 @@ mod tests {
         assert_eq!(names, vec![PathBuf::from("a.txt"), PathBuf::from("c.txt")]);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_empty_directory() {
         let dir = tempdir().unwrap();
@@ -751,6 +759,7 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_max_depth() {
         let dir = tempdir().unwrap();
@@ -767,14 +776,12 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(entries.len(), 3);
 
-        let mut names: Vec<_> = entries
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let mut names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         names.sort();
         assert_eq!(names, vec!["a/b/d2.txt", "a/d1.txt", "d0.txt"]);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_relative_path_correctness() {
         let dir = tempdir().unwrap();
@@ -789,6 +796,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_follow_symlinks() {
         let dir = tempdir().unwrap();
@@ -803,6 +811,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_no_follow_symlinks() {
         let dir = tempdir().unwrap();
@@ -821,6 +830,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_cycle_detection() {
         use tokio::time::{timeout, Duration};
@@ -851,6 +861,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_root_does_not_exist() {
         let mut walk = walker()
@@ -871,6 +882,7 @@ mod tests {
         assert!(walk.next().await.is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_recursive_false_equals_max_depth_zero() {
         let dir = tempdir().unwrap();
@@ -890,6 +902,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_broken_symlink_follow() {
         let dir = tempdir().unwrap();
@@ -906,6 +919,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_broken_symlink_no_follow() {
         let dir = tempdir().unwrap();
@@ -924,6 +938,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_to_file() {
         let dir = tempdir().unwrap();
@@ -941,6 +956,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_chain() {
         let dir = tempdir().unwrap();
@@ -968,6 +984,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_skips_special_files() {
         use std::os::unix::net::UnixListener;
@@ -985,6 +1002,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_subdirectory_permission_denied() {
         use std::os::unix::fs::PermissionsExt;
@@ -1016,6 +1034,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_source_is_file() {
         let dir = tempdir().unwrap();
@@ -1032,6 +1051,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_source_is_symlink_follow_enabled() {
         let dir = tempdir().unwrap();
@@ -1051,6 +1071,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_source_is_symlink_follow_disabled() {
         let dir = tempdir().unwrap();
@@ -1071,6 +1092,7 @@ mod tests {
         assert_eq!(errors[0].kind(), WalkErrorKind::NotADirectory);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_lexicographic_sort() {
         let dir = tempdir().unwrap();
@@ -1080,13 +1102,11 @@ mod tests {
 
         let walk = walker().sort(true).build().walk(ctx(dir.path()));
         let (entries, _) = collect_entries(walk).await;
-        let names: Vec<_> = entries
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         assert_eq!(names, vec!["apple.txt", "mango.txt", "zebra.txt"]);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_recursive_sort_is_depth_first_per_dir() {
         let dir = tempdir().unwrap();
@@ -1102,16 +1122,14 @@ mod tests {
             .build()
             .walk(ctx(dir.path()));
         let (entries, _) = collect_entries(walk).await;
-        let names: Vec<_> = entries
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         assert_eq!(
             names,
             vec!["b-file.txt", "c-file.txt", "a-dir/y.txt", "a-dir/z.txt"]
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_unsorted_by_default() {
         let dir = tempdir().unwrap();
@@ -1136,6 +1154,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_unicode_filenames() {
         let dir = tempdir().unwrap();
@@ -1152,16 +1171,14 @@ mod tests {
         );
         assert_eq!(entries.len(), 4);
 
-        let names: Vec<_> = entries
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         assert!(names.contains(&"café.txt".to_string()));
         assert!(names.contains(&"日本語.txt".to_string()));
         assert!(names.contains(&"🦀.txt".to_string()));
         assert!(names.contains(&"file with spaces.txt".to_string()));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_large_directory() {
         let dir = tempdir().unwrap();
@@ -1175,6 +1192,7 @@ mod tests {
         assert_eq!(entries.len(), 10_000);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_error_kind_not_a_directory() {
         let dir = tempdir().unwrap();
@@ -1193,6 +1211,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_error_kind_symlink_cycle() {
         use tokio::time::{timeout, Duration};
@@ -1224,6 +1243,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_error_kind_broken_symlink() {
         let dir = tempdir().unwrap();
@@ -1239,6 +1259,7 @@ mod tests {
     // --- NEW TESTS ---
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_fswalker_canonicalize_root() {
         let dir = tempdir().unwrap();
@@ -1258,6 +1279,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_fswalker_canonicalize_root_nonexistent() {
         let mut walk = walker()
@@ -1272,6 +1294,7 @@ mod tests {
         assert!(walk.next().await.is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_fswalker_is_done() {
         let dir = tempdir().unwrap();
@@ -1286,6 +1309,7 @@ mod tests {
     // --- Symlink scenario tests ---
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_self_loop() {
         let dir = tempdir().unwrap();
@@ -1316,6 +1340,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_siblings_same_target_both_traversed() {
         let dir = tempdir().unwrap();
@@ -1348,6 +1373,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_chain_not_cycle() {
         let dir = tempdir().unwrap();
@@ -1376,6 +1402,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_deeper_cycle() {
         use tokio::time::{timeout, Duration};
@@ -1408,6 +1435,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_real_dir_reachable_via_symlink_yields_twice() {
         let dir = tempdir().unwrap();
@@ -1438,6 +1466,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_cycle_deep_in_subtree() {
         use tokio::time::{timeout, Duration};
@@ -1477,6 +1506,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_broken_symlink_at_root_with_follow() {
         let dir = tempdir().unwrap();
@@ -1496,6 +1526,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_broken_symlink_at_root_with_canonicalize() {
         let dir = tempdir().unwrap();
@@ -1517,6 +1548,7 @@ mod tests {
         assert!(walk.next().await.is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_filter_receives_correct_relative_path() {
         let dir = tempdir().unwrap();
@@ -1550,6 +1582,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_symlink_metadata_is_target() {
         let dir = tempdir().unwrap();
@@ -1577,6 +1610,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_max_depth_explicit_boundaries() {
         let dir = tempdir().unwrap();
@@ -1597,10 +1631,7 @@ mod tests {
                 .walk(ctx(dir.path())),
         )
         .await;
-        let names: Vec<_> = e
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let names: Vec<_> = e.iter().map(|e| norm(e.relative_path())).collect();
         assert_eq!(names, vec!["top.txt"]);
 
         // max_depth(1): root + one level
@@ -1612,10 +1643,7 @@ mod tests {
                 .walk(ctx(dir.path())),
         )
         .await;
-        let mut names: Vec<_> = e
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let mut names: Vec<_> = e.iter().map(|e| norm(e.relative_path())).collect();
         names.sort();
         assert_eq!(names, vec!["a/mid.txt", "top.txt"]);
 
@@ -1628,10 +1656,7 @@ mod tests {
                 .walk(ctx(dir.path())),
         )
         .await;
-        let mut names: Vec<_> = e
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let mut names: Vec<_> = e.iter().map(|e| norm(e.relative_path())).collect();
         names.sort();
         assert_eq!(names, vec!["a/b/deep.txt", "a/mid.txt", "top.txt"]);
 
@@ -1644,10 +1669,7 @@ mod tests {
                 .walk(ctx(dir.path())),
         )
         .await;
-        let mut names: Vec<_> = e
-            .iter()
-            .map(|e| e.relative_path().to_string_lossy().to_string())
-            .collect();
+        let mut names: Vec<_> = e.iter().map(|e| norm(e.relative_path())).collect();
         names.sort();
         assert_eq!(
             names,
@@ -1655,6 +1677,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_fswalker_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
