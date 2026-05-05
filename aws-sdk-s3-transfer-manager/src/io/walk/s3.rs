@@ -97,6 +97,14 @@ impl S3Walker {
         }
 
         let initial_prefix = self.prefix.clone().unwrap_or_default();
+
+        tracing::debug!(
+            bucket = %ctx.bucket.name(),
+            kind = ?ctx.bucket.kind(),
+            prefix = %initial_prefix,
+            delimiter = ?self.delimiter,
+            "s3 walk started",
+        );
         let mut pending_prefixes = VecDeque::new();
         pending_prefixes.push_back(initial_prefix);
 
@@ -231,9 +239,7 @@ impl S3WalkerBuilder {
     }
 }
 
-/// Execution context for an [`S3Walker`], providing the client and bucket.
-///
-/// Separates the "where" (client + bucket) from the "how" (walker config).
+/// The S3 client and bucket for an S3 walk.
 pub struct S3WalkContext {
     client: aws_sdk_s3::Client,
     bucket: crate::types::Bucket,
@@ -350,8 +356,16 @@ impl S3Walk {
                 let first_page = self.initial_first_page_pending;
                 match self.list_page(&prefix, token.as_deref(), first_page).await {
                     Ok(page) => {
-                        // Any subsequent call is no longer the first page.
                         self.initial_first_page_pending = false;
+
+                        tracing::trace!(
+                            %prefix,
+                            objects = page.objects.len(),
+                            common_prefixes = page.common_prefixes.len(),
+                            has_next = page.next_token.is_some(),
+                            "page listed",
+                        );
+
                         self.ready_objects.extend(page.objects);
                         for cp in page.common_prefixes {
                             self.pending_prefixes.push_back(cp);

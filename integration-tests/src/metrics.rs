@@ -129,6 +129,15 @@ async fn test_download_metrics_and_status() {
         .initiate()
         .expect("initiate download");
 
+    wait_for_terminal(|| handle.status()).await;
+
+    assert_eq!(handle.status(), TransferStatus::Completed);
+    let metrics = handle.metrics();
+    assert_eq!(metrics.network_rx, size as u64);
+    assert_eq!(metrics.total_bytes, Some(size as u64));
+    assert!(metrics.finished_at.is_some());
+    assert!(metrics.started_at <= metrics.finished_at.unwrap());
+
     let output = timeout(Duration::from_secs(30), handle.join())
         .await
         .expect("join timed out")

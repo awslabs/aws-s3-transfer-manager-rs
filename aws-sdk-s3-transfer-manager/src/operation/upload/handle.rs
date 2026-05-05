@@ -114,7 +114,7 @@ impl UploadHandle {
     /// When this method returns, all work for this transfer has been
     /// cancelled or completed. No further work will be executed.
     ///
-    /// TODO(aws-sdk-rust#1159): Handle already completed upload
+    // TODO(aws-sdk-rust#1159): Handle already completed upload
     pub async fn abort(self) -> Result<AbortedUpload, Error> {
         let ctx = self.transfer.ctx();
 

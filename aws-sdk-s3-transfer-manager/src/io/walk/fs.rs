@@ -198,6 +198,14 @@ impl FsWalker {
             });
         }
 
+        tracing::debug!(
+            ?root,
+            follow_symlinks = self.follow_symlinks,
+            max_depth = self.max_depth,
+            sort = self.sort,
+            "fs walk started",
+        );
+
         FsWalk {
             config: self,
             root,
@@ -280,10 +288,8 @@ impl FsWalkerBuilder {
     /// - `max_depth(1)` yields `top.txt, a/mid.txt`
     /// - `max_depth(2)` yields `top.txt, a/mid.txt, a/b/deep.txt`
     ///
-    /// This matches the convention where depth counts subdirectory levels
-    /// below the root, but differs from Java's NIO `Files.walk(maxDepth)`
-    /// which counts the root as depth 1
-    /// (so Java's `maxDepth=1` is our `max_depth(0)`).
+    /// Depth counts subdirectory levels below the root. The root's
+    /// immediate contents are always yielded regardless of this setting.
     #[must_use]
     pub fn max_depth(mut self, depth: usize) -> Self {
         self.max_depth = depth;
@@ -355,9 +361,6 @@ impl FsWalkerBuilder {
 }
 
 /// Execution context for an [`FsWalker`], providing the walk root.
-///
-/// Separates the "where" (root directory) from the "how" (walker config),
-/// allowing the same walker configuration to be reused with different roots.
 #[derive(Debug, Clone)]
 pub struct FsWalkContext {
     root: PathBuf,
@@ -441,6 +444,13 @@ impl FsWalk {
                 return Some(Ok(entry));
             }
             if let Some(err) = self.pending_errors.pop_front() {
+                if !err.is_fatal() {
+                    tracing::warn!(
+                        path = ?err.path(),
+                        kind = ?err.kind(),
+                        "skipping entry",
+                    );
+                }
                 return Some(Err(err));
             }
             if self.done {
@@ -606,6 +616,14 @@ impl FsWalk {
             result.files.sort_by(|a, b| a.path.cmp(&b.path));
             result.subdirs.sort_by(|a, b| a.path.cmp(&b.path));
         }
+
+        tracing::trace!(
+            ?dir,
+            files = result.files.len(),
+            subdirs = result.subdirs.len(),
+            errors = result.errors.len(),
+            "directory read",
+        );
 
         Ok(result)
     }
