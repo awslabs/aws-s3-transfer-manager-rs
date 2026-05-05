@@ -51,7 +51,7 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
 pub(crate) type BoxTransfer = Box<dyn Transfer>;
 
 /// Opaque work data carried by work items. Each state machine defines its own type.
-/// The scheduler never inspects this — it ferries it across the scheduling boundary
+/// The scheduler never inspects this; it ferries it across the scheduling boundary
 /// for the transfer to reclaim via `IoRequest::data_mut::<T>()`.
 pub(crate) trait WorkData: Any + Send + std::fmt::Debug {
     fn as_any_mut(&mut self) -> &mut dyn Any;

@@ -5,12 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// Classifies a [`WalkError`] for consumer-side branching.
+/// Classifies a [`WalkError`].
 ///
-/// Separates fatal failures (walk cannot continue) from per-entry
-/// failures (individual entry failed, walk continues). State machines
-/// use [`WalkError::is_fatal`] to decide whether to abort the
-/// directory transfer or to apply the `FailedTransferPolicy`.
+/// Errors are either fatal (the walk cannot continue and no further entries
+/// will be produced) or non-fatal (the affected entry is skipped but the
+/// walk continues). Use [`WalkError::is_fatal`] to distinguish them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
     /// Generic I/O failure reading a directory or entry.
@@ -23,8 +22,8 @@ pub enum WalkErrorKind {
     BrokenSymlink,
     /// Symlink whose target is a directory already on the current descent
     /// path (a cycle). Non-cyclic duplicate symlinks (two different symlinks
-    /// to the same target) are NOT reported under this kind — they are
-    /// traversed normally.
+    /// to the same target) are not reported as cycles and are traversed
+    /// normally.
     SymlinkCycle,
     /// S3 service error from `ListObjectsV2` or related call.
     Service,
@@ -32,17 +31,11 @@ pub enum WalkErrorKind {
     Other,
 }
 
-/// Error reported by the walker for either fatal traversal failures or
-/// per-entry failures encountered during a directory read.
+/// An error encountered during a directory walk.
 ///
-/// A `WalkError` wraps an optional path (the entry or directory the error
-/// pertains to), a kind classifier, a fatal flag, and a boxed source
-/// error. Users can:
-/// - Access the path via [`WalkError::path`]
-/// - Get the kind via [`WalkError::kind`]
-/// - Check if the walk will continue via [`WalkError::is_fatal`]
-/// - Access the underlying error via the [`std::error::Error`] trait's
-///   `source()` method
+/// Wraps an optional path, a [`WalkErrorKind`] classifier, a fatal flag,
+/// and a source error. Check [`is_fatal`](Self::is_fatal) to determine
+/// whether the walk will continue producing entries after this error.
 #[derive(Debug)]
 pub struct WalkError {
     path: Option<PathBuf>,
@@ -54,10 +47,10 @@ pub struct WalkError {
 impl WalkError {
     /// The path associated with this error, if any.
     ///
-    /// For per-entry errors, this is the entry path. For fatal errors
-    /// (e.g. the root directory is unreadable), this is the directory that
-    /// could not be read. May be `None` for errors that don't correspond
-    /// to a single path (e.g. an S3 service error).
+    /// For non-fatal errors this is typically the entry that failed (a file
+    /// or symlink). For fatal errors it may be the directory that could not
+    /// be read. `None` for errors not tied to a specific path (e.g. S3
+    /// service errors).
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }

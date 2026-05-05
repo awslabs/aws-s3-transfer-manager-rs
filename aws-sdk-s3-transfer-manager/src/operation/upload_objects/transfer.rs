@@ -61,7 +61,7 @@ pub(crate) struct ChildMeta {
 /// children over the scheduler. Each walker entry becomes one child upload
 /// transfer, registered and tracked until terminal.
 ///
-/// Cheap to clone — all state behind `Arc`.
+/// Cheap to clone; all state behind `Arc`.
 #[derive(Clone)]
 #[allow(dead_code)] // wired up by the operation orchestrator
 pub(crate) struct UploadObjectsTransfer {

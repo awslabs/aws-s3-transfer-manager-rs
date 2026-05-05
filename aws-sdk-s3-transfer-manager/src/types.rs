@@ -387,3 +387,25 @@ impl BucketType {
         }
     }
 }
+
+/// Internal bucket representation carrying the name and resolved kind.
+#[derive(Debug, Clone)]
+pub(crate) struct Bucket {
+    name: String,
+    kind: BucketType,
+}
+
+impl Bucket {
+    pub(crate) fn new(name: String) -> Self {
+        let kind = BucketType::from_bucket_name(&name);
+        Self { name, kind }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn kind(&self) -> BucketType {
+        self.kind
+    }
+}

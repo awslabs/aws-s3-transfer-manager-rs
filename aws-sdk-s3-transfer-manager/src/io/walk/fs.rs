@@ -28,7 +28,7 @@ struct PendingDir {
 ///
 /// Contains all files discovered in the directory (after filter application),
 /// subdirectories to recurse into (subject to `max_depth`), and any non-fatal
-/// per-entry errors encountered during the read.
+/// non-fatal errors encountered during the read.
 struct ReadDirResult {
     /// Files discovered in the directory, after filter application.
     files: Vec<DirEntry>,
@@ -79,11 +79,11 @@ type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 
 /// Configuration for walking a local filesystem directory.
 ///
-/// An `FsWalker` is pure configuration — it describes *what* to look for
-/// and *how* (depth, symlink policy, sorting, filtering) but not *where*.
-/// The walk root is supplied separately via [`FsWalkContext`] when starting
-/// a walk. This separation allows the same configuration to be reused
-/// across multiple walks with different roots.
+/// Configuration for walking a local directory tree.
+///
+/// Describes what to look for and how (depth, symlink policy, sorting,
+/// filtering). The walk root is supplied separately via [`FsWalkContext`]
+/// when starting a walk.
 ///
 /// Use [`FsWalker::builder`] to construct an instance.
 ///
@@ -100,12 +100,12 @@ type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 /// When `follow_symlinks` is enabled, the walker detects symlink cycles
 /// by tracking the chain of directories on the current descent path. A
 /// symlink whose target resolves to a directory already on that path
-/// (including the current directory itself) is reported as a per-entry
+/// (including the current directory itself) is reported as a non-fatal
 /// error with kind `SymlinkCycle` and the walk continues without entering
 /// the cyclic link.
 ///
 /// Non-cyclic duplicate symlinks (two different symlinks pointing to the
-/// same target) are NOT deduplicated. Both are followed and the target's
+/// same target) are not deduplicated. Both are followed and the target's
 /// content is yielded twice. If deduplication is desired, apply it at a
 /// higher layer.
 // TODO(walker): `dir_filter: Option<Box<dyn Fn(&DirEntry) -> bool>>` — subtree
@@ -239,7 +239,7 @@ impl FsWalkerBuilder {
     /// When `false` (default), symlinks are skipped entirely. When `true`,
     /// symlinks are resolved: file symlinks yield entries, directory
     /// symlinks are traversed (subject to `max_depth` and cycle detection),
-    /// and broken symlinks produce per-entry errors.
+    /// and broken symlinks produce non-fatal errors.
     #[must_use]
     pub fn follow_symlinks(mut self, follow: bool) -> Self {
         self.follow_symlinks = follow;
@@ -294,7 +294,7 @@ impl FsWalkerBuilder {
     ///
     /// When `true`, files and subdirectories from each directory read are
     /// sorted by full path. Entries are sorted *within* a directory level
-    /// but not globally — depth-first traversal produces entries
+    /// but not globally. Depth-first traversal produces entries
     /// level-by-level.
     ///
     /// When `false` (default), entries are returned in OS-native order.
@@ -327,7 +327,7 @@ impl FsWalkerBuilder {
     ///
     /// The predicate is called after a file's metadata has been read but
     /// before it is yielded. Returning `false` drops the entry silently.
-    /// The filter does not apply to directories — directory traversal is
+    /// The filter does not apply to directories. Directory traversal is
     /// controlled by `max_depth` and `follow_symlinks`.
     ///
     /// **The filter does not prune subtrees.** A file-level filter that
@@ -407,7 +407,7 @@ impl FsWalkContextBuilder {
 /// needed and buffering discovered files.
 ///
 /// Errors encountered during the walk are interleaved with successful
-/// entries. Fatal errors terminate the walk; per-entry errors do not.
+/// entries. Fatal errors terminate the walk; non-fatal errors do not.
 pub struct FsWalk {
     config: FsWalker,
     root: PathBuf,
@@ -431,14 +431,10 @@ impl FsWalk {
     ///
     /// Returns:
     /// - `Some(Ok(entry))` for a file that passed the filter.
-    /// - `Some(Err(err))` for a fatal or per-entry error. Fatal errors
-    ///   are followed by `None` on the next call; per-entry errors are
+    /// - `Some(Err(err))` for a fatal or non-fatal error. Fatal errors
+    ///   are followed by `None` on the next call; non-fatal errors are
     ///   followed by more results as the walk continues.
     /// - `None` when the walk is complete.
-    ///
-    /// `next` is `async` for API consistency with
-    /// [`S3Walk::next`](super::s3::S3Walk::next); the filesystem
-    /// operations themselves are synchronous.
     pub async fn next(&mut self) -> Option<Result<DirEntry, WalkError>> {
         loop {
             if let Some(entry) = self.ready_files.pop_front() {

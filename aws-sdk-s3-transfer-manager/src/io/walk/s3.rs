@@ -19,18 +19,17 @@ type FilterFn = Box<dyn Fn(&Object) -> bool + Send + Sync>;
 /// page.
 pub(crate) struct ListPageResult {
     /// Objects returned in this page, after filter application.
-    pub objects: Vec<Object>,
+    pub(crate) objects: Vec<Object>,
     /// Common prefixes from the response (populated when a delimiter is set).
-    pub common_prefixes: Vec<String>,
+    pub(crate) common_prefixes: Vec<String>,
     /// Continuation token for the next page, or `None` if this is the last.
-    pub next_token: Option<String>,
+    pub(crate) next_token: Option<String>,
 }
 
 /// Configuration for walking an S3 bucket by listing objects under a prefix.
 ///
-/// An `S3Walker` is pure configuration — it describes *what* to list and
-/// *how* (prefix, delimiter, filter, pagination) but not *where* or *with
-/// what client*. The client and bucket are supplied separately via
+/// Describes what to list and how (prefix, delimiter, filter, pagination).
+/// The S3 client and bucket name are supplied separately via
 /// [`S3WalkContext`] when starting a walk.
 ///
 /// Use [`S3Walker::builder`] to construct an instance.
@@ -45,7 +44,7 @@ pub(crate) struct ListPageResult {
 /// # Error handling
 ///
 /// Service errors from `ListObjectsV2` terminate the walk. There are no
-/// per-entry errors — either the page succeeds or the entire page fails.
+/// non-fatal errors; either the page succeeds or the entire walk fails.
 // TODO(walker): bucket-kind refuse/warn policy — we detect directory buckets
 //   but don't yet have a configurable refuse policy for sync operations.
 // TODO(walker): resume token persistence — save/restore continuation state
@@ -89,11 +88,11 @@ impl S3Walker {
     /// since they may not return lexicographically sorted listing results.
     #[must_use]
     pub fn walk(self, ctx: S3WalkContext) -> S3Walk {
-        let bucket_type = BucketType::from_bucket_name(&ctx.bucket);
-        if bucket_type == BucketType::Express {
+        if ctx.bucket.kind() == BucketType::Express {
             tracing::warn!(
-                bucket = %ctx.bucket,
-                "directory bucket (S3 Express) detected; listing results may not be lexicographically sorted"
+                bucket = %ctx.bucket.name(),
+                kind = ?ctx.bucket.kind(),
+                "directory bucket detected; listing results may not be lexicographically sorted"
             );
         }
 
@@ -105,7 +104,6 @@ impl S3Walker {
             config: self,
             client: ctx.client,
             bucket: ctx.bucket,
-            bucket_type,
             pending_prefixes,
             ready_objects: VecDeque::new(),
             current_prefix: None,
@@ -238,7 +236,7 @@ impl S3WalkerBuilder {
 /// Separates the "where" (client + bucket) from the "how" (walker config).
 pub struct S3WalkContext {
     client: aws_sdk_s3::Client,
-    bucket: String,
+    bucket: crate::types::Bucket,
 }
 
 impl std::fmt::Debug for S3WalkContext {
@@ -293,9 +291,10 @@ impl S3WalkContextBuilder {
     /// Panics if `client` or `bucket` has not been set.
     #[must_use]
     pub fn build(self) -> S3WalkContext {
+        let bucket_name = self.bucket.expect("required field `bucket` should be set");
         S3WalkContext {
             client: self.client.expect("required field `client` should be set"),
-            bucket: self.bucket.expect("required field `bucket` should be set"),
+            bucket: crate::types::Bucket::new(bucket_name),
         }
     }
 }
@@ -307,8 +306,7 @@ impl S3WalkContextBuilder {
 pub struct S3Walk {
     config: S3Walker,
     client: aws_sdk_s3::Client,
-    bucket: String,
-    bucket_type: BucketType,
+    bucket: crate::types::Bucket,
     pending_prefixes: VecDeque<String>,
     ready_objects: VecDeque<Object>,
     current_prefix: Option<String>,
@@ -335,7 +333,7 @@ impl S3Walk {
     /// Returns:
     /// - `Some(Ok(object))` for an object that passed the filter.
     /// - `Some(Err(err))` when a `ListObjectsV2` request fails. The walk
-    ///   terminates after an error — subsequent calls return `None`.
+    ///   terminates after an error; subsequent calls return `None`.
     /// - `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<Object, WalkError>> {
         loop {
@@ -395,7 +393,7 @@ impl S3Walk {
     /// Directory buckets may not return lexicographically sorted listing
     /// results, which can affect sync operations that depend on key ordering.
     pub fn is_directory_bucket(&self) -> bool {
-        self.bucket_type == BucketType::Express
+        self.bucket.kind() == BucketType::Express
     }
 
     async fn list_page(
@@ -407,7 +405,7 @@ impl S3Walk {
         let mut req = self
             .client
             .list_objects_v2()
-            .bucket(&self.bucket)
+            .bucket(self.bucket.name())
             .prefix(prefix);
 
         // Runtime pagination token for this page. When a caller-supplied
