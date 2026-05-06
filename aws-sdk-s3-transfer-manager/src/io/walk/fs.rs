@@ -161,11 +161,9 @@ impl FsWalker {
             match std::fs::canonicalize(&root) {
                 Ok(canonical) => root = canonical,
                 Err(e) => {
-                    let kind = WalkError::classify_io(&e);
                     pending_errors.push_back(WalkError::new(
                         Some(root.clone()),
-                        kind,
-                        true,
+                        WalkErrorKind::SourceUnreadable,
                         Box::new(e),
                     ));
                     done = true;
@@ -177,7 +175,6 @@ impl FsWalker {
                     pending_errors.push_back(WalkError::new(
                         Some(root.clone()),
                         WalkErrorKind::NotADirectory,
-                        true,
                         Box::from("source root is a symlink; enable follow_symlinks or canonicalize_root to walk through it"),
                     ));
                     done = true;
@@ -494,13 +491,27 @@ impl FsWalk {
     ) -> Result<ReadDirResult, WalkError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
             let kind = WalkError::classify_io(&e);
-            WalkError::new(Some(dir.to_path_buf()), kind, depth == 0, Box::new(e))
+            let kind = if depth == 0
+                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
+            {
+                WalkErrorKind::SourceUnreadable
+            } else {
+                kind
+            };
+            WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
         // Build the ancestor chain for children of this directory.
         let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
             let kind = WalkError::classify_io(&e);
-            WalkError::new(Some(dir.to_path_buf()), kind, depth == 0, Box::new(e))
+            let kind = if depth == 0
+                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
+            {
+                WalkErrorKind::SourceUnreadable
+            } else {
+                kind
+            };
+            WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?);
         let mut next_ancestors = ancestor_handles.to_vec();
         next_ancestors.push(Arc::clone(&self_handle));
@@ -516,12 +527,9 @@ impl FsWalk {
                 Ok(e) => e,
                 Err(e) => {
                     let kind = WalkError::classify_io(&e);
-                    result.errors.push(WalkError::new(
-                        Some(dir.to_path_buf()),
-                        kind,
-                        false,
-                        Box::new(e),
-                    ));
+                    result
+                        .errors
+                        .push(WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e)));
                     continue;
                 }
             };
@@ -533,7 +541,7 @@ impl FsWalk {
                     let kind = WalkError::classify_io(&e);
                     result
                         .errors
-                        .push(WalkError::new(Some(path), kind, false, Box::new(e)));
+                        .push(WalkError::new(Some(path), kind, Box::new(e)));
                     continue;
                 }
             };
@@ -551,7 +559,7 @@ impl FsWalk {
                         };
                         result
                             .errors
-                            .push(WalkError::new(Some(path), kind, false, Box::new(e)));
+                            .push(WalkError::new(Some(path), kind, Box::new(e)));
                         continue;
                     }
                 };
@@ -565,7 +573,6 @@ impl FsWalk {
                                 result.errors.push(WalkError::new(
                                     Some(path),
                                     WalkErrorKind::SymlinkCycle,
-                                    false,
                                     Box::from("symlink target is an ancestor of the current path"),
                                 ));
                                 continue;
@@ -580,12 +587,9 @@ impl FsWalk {
                         }
                         Err(e) => {
                             let kind = WalkError::classify_io(&e);
-                            result.errors.push(WalkError::new(
-                                Some(path),
-                                kind,
-                                false,
-                                Box::new(e),
-                            ));
+                            result
+                                .errors
+                                .push(WalkError::new(Some(path), kind, Box::new(e)));
                         }
                     }
                 } else if metadata.is_file() {
@@ -598,7 +602,7 @@ impl FsWalk {
                         let kind = WalkError::classify_io(&e);
                         result
                             .errors
-                            .push(WalkError::new(Some(path), kind, false, Box::new(e)));
+                            .push(WalkError::new(Some(path), kind, Box::new(e)));
                         continue;
                     }
                 };
@@ -887,8 +891,8 @@ mod tests {
                 assert!(err.is_fatal(), "expected fatal error for missing root");
                 assert_eq!(
                     err.kind(),
-                    WalkErrorKind::Io,
-                    "NotFound on a non-symlink path should map to Io, not BrokenSymlink"
+                    WalkErrorKind::SourceUnreadable,
+                    "NotFound at the walk root should map to SourceUnreadable"
                 );
             }
             other => panic!("expected fatal error for missing root, got {other:?}"),

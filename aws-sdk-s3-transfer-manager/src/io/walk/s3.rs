@@ -463,7 +463,7 @@ impl S3Walk {
         let output = req
             .send()
             .await
-            .map_err(|e| WalkError::new(None, WalkErrorKind::Service, true, Box::new(e)))?;
+            .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
 
         let mut objects: Vec<Object> = output.contents.unwrap_or_default();
         if let Some(ref filter) = self.config.filter {
