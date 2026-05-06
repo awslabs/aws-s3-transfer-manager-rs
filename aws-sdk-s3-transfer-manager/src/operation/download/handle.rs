@@ -78,7 +78,7 @@ impl DownloadHandleInner {
             .object_meta()
             .expect("object_meta must be set on successful completion")
             .clone();
-        Ok(DownloadOutput::new(object_meta))
+        Ok(DownloadOutput::new(object_meta, ctx.metrics()))
     }
 
     /// Core abort logic: cancel transfer, notify consumer, and wait for idle.
@@ -236,6 +236,16 @@ impl DownloadHandle {
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.inner.scheduling()
     }
+
+    /// Current status of this transfer.
+    pub fn status(&self) -> crate::types::TransferStatus {
+        self.inner.transfer.ctx().transfer_status()
+    }
+
+    /// Snapshot of current transfer metrics.
+    pub fn metrics(&self) -> crate::types::TransferMetrics {
+        self.inner.transfer.ctx().metrics()
+    }
 }
 
 impl Drop for DownloadHandle {
@@ -334,6 +344,16 @@ impl ManagedDownloadHandle {
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.inner.scheduling()
+    }
+
+    /// Current status of this transfer.
+    pub fn status(&self) -> crate::types::TransferStatus {
+        self.inner.transfer.ctx().transfer_status()
+    }
+
+    /// Snapshot of current transfer metrics.
+    pub fn metrics(&self) -> crate::types::TransferMetrics {
+        self.inner.transfer.ctx().metrics()
     }
 
     async fn finalize(&self) -> std::io::Result<()> {

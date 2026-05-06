@@ -293,6 +293,7 @@ dependencies = [
  "parking_lot",
  "path-clean",
  "pin-project-lite",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",

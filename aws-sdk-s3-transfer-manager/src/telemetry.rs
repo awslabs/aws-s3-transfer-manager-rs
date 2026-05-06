@@ -20,16 +20,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Adaptive concurrency controller: phase transitions, target changes, probe results.
-pub(crate) const TARGET_CONCURRENCY: &str = "aws_s3_transfer_manager::concurrency";
+pub(crate) const TARGET_CONCURRENCY: &str = "aws_sdk_s3_transfer_manager::concurrency";
 
 /// Scheduler capacity decisions, worker pool growth.
-pub(crate) const TARGET_SCHEDULING: &str = "aws_s3_transfer_manager::scheduling";
+pub(crate) const TARGET_SCHEDULING: &str = "aws_sdk_s3_transfer_manager::scheduling";
 
 /// Per-work-item execution: dispatch, complete, skip, panic.
-pub(crate) const TARGET_EXECUTION: &str = "aws_s3_transfer_manager::execution";
+pub(crate) const TARGET_EXECUTION: &str = "aws_sdk_s3_transfer_manager::execution";
 
 /// Transfer lifecycle: enqueue, complete, cancel, fail, state transitions.
-pub(crate) const TARGET_TRANSFER: &str = "aws_s3_transfer_manager::transfer";
+pub(crate) const TARGET_TRANSFER: &str = "aws_sdk_s3_transfer_manager::transfer";
 
 /// Observability surface for transfer operations.
 ///

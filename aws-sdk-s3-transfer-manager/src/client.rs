@@ -31,7 +31,7 @@ pub(crate) struct Handle {
     pub(crate) scheduler: Scheduler,
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
     pub(crate) controller: Arc<dyn ConcurrencyController>,
-    pub(crate) telemetry: Telemetry,
+    pub(crate) telemetry: Arc<Telemetry>,
 }
 
 impl Handle {
@@ -87,7 +87,7 @@ impl Handle {
                 scheduler,
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-                telemetry: Telemetry::new(std::time::Duration::from_millis(500)),
+                telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
             }
         })
     }
@@ -114,7 +114,7 @@ impl Handle {
                 scheduler,
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-                telemetry: Telemetry::new(std::time::Duration::from_millis(500)),
+                telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
             }
         })
     }
@@ -134,12 +134,12 @@ impl Client {
             match config.concurrency() {
                 ConcurrencyMode::Explicit(n) => (
                     Arc::new(FixedConcurrency::new(*n)),
-                    Telemetry::new(Duration::from_millis(500)),
+                    Arc::new(Telemetry::new(Duration::from_millis(500))),
                 ),
                 // TODO: implement support for target throughput
                 _ => {
                     let adaptive_config = AdaptiveConfig::default();
-                    let telemetry = Telemetry::new(adaptive_config.window.duration);
+                    let telemetry = Arc::new(Telemetry::new(adaptive_config.window.duration));
                     let controller = Arc::new(AdaptiveConcurrencyController::new(
                         adaptive_config,
                         Arc::clone(&telemetry.io_counters),

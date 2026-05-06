@@ -308,6 +308,8 @@ impl<'a> UploadFilterItemBuilder<'a> {
 pub struct FailedUpload {
     pub(crate) input: Option<crate::operation::upload::UploadInput>,
     pub(crate) error: crate::error::Error,
+    /// Local filesystem path of the source file that failed to upload.
+    pub(crate) source_path: Option<std::path::PathBuf>,
 }
 
 impl FailedUpload {
@@ -320,6 +322,52 @@ impl FailedUpload {
     pub fn error(&self) -> &crate::error::Error {
         &self.error
     }
+
+    /// Local filesystem path of the source file that failed to upload.
+    pub fn source_path(&self) -> Option<&std::path::Path> {
+        self.source_path.as_deref()
+    }
+}
+
+/// Status of a transfer operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransferStatus {
+    /// Transfer is actively running.
+    Active,
+    /// Transfer completed successfully.
+    Completed,
+    /// Transfer failed with an error.
+    Failed,
+    /// Transfer was cancelled.
+    Cancelled,
+}
+
+impl TransferStatus {
+    /// Returns true if the transfer has reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
+/// Snapshot of transfer progress and IO metrics.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct TransferMetrics {
+    /// Bytes sent over network (upload payload).
+    pub network_tx: u64,
+    /// Bytes received from network (download payload).
+    pub network_rx: u64,
+    /// Bytes read from disk.
+    pub disk_read: u64,
+    /// Bytes written to disk.
+    pub disk_write: u64,
+    /// Expected total payload bytes, if known.
+    pub total_bytes: Option<u64>,
+    /// When the transfer was initiated.
+    pub started_at: std::time::Instant,
+    /// When the transfer reached a terminal state, if it has.
+    pub finished_at: Option<std::time::Instant>,
 }
 
 /// Type of the bucket for the transfer
@@ -337,5 +385,27 @@ impl BucketType {
         } else {
             BucketType::Standard
         }
+    }
+}
+
+/// Internal bucket representation carrying the name and resolved kind.
+#[derive(Debug, Clone)]
+pub(crate) struct Bucket {
+    name: String,
+    kind: BucketType,
+}
+
+impl Bucket {
+    pub(crate) fn new(name: String) -> Self {
+        let kind = BucketType::from_bucket_name(&name);
+        Self { name, kind }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn kind(&self) -> BucketType {
+        self.kind
     }
 }

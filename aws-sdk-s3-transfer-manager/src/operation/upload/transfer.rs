@@ -78,6 +78,8 @@ impl UploadTransfer {
             .upper()
             .expect("content_length required; unknown length not yet supported");
 
+        ctx.set_total_bytes(content_length);
+
         let inner = Arc::new(UploadTransferInner {
             ctx,
             state: Mutex::new(UploadState::PendingInit {
@@ -302,9 +304,8 @@ impl UploadTransfer {
                 .stream(stream)
                 .part_size(part_size.try_into().expect("valid part size"))
                 .direct_io(self.inner.ctx.handle.runtime.components().direct_io())
-                .io_counters(std::sync::Arc::clone(
-                    &self.inner.ctx.handle.telemetry.io_counters,
-                ))
+                .metrics(std::sync::Arc::clone(&self.inner.ctx.metrics))
+                .telemetry(std::sync::Arc::clone(&self.inner.ctx.handle.telemetry))
                 .build()
             {
                 Ok(reader) => reader,
@@ -436,17 +437,12 @@ impl UploadTransfer {
             "part uploaded",
         );
 
-        self.maybe_transition_to_completing();
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_tx: bytes_sent,
+            ..Default::default()
+        });
 
-        self.inner
-            .ctx
-            .handle
-            .telemetry
-            .io_counters
-            .record(&crate::metrics::IoSample {
-                network_tx: bytes_sent,
-                ..Default::default()
-            });
+        self.maybe_transition_to_completing();
 
         WorkOutcome::Success { data: None }
     }
@@ -526,22 +522,19 @@ impl UploadTransfer {
         };
 
         let result = UploadOutputBuilder::from(resp)
+            .metrics(self.inner.ctx.metrics())
             .build()
             .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
+
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_tx: content_length,
+            ..Default::default()
+        });
+
         self.inner.ctx.set_completed();
         self.inner.ctx.signal_terminal();
-
-        self.inner
-            .ctx
-            .handle
-            .telemetry
-            .io_counters
-            .record(&crate::metrics::IoSample {
-                network_tx: content_length,
-                ..Default::default()
-            });
 
         WorkOutcome::Success { data: None }
     }
@@ -602,6 +595,7 @@ impl UploadTransfer {
 
         let result = response_builder
             .update_from_complete_mpu(&resp)
+            .metrics(self.inner.ctx.metrics())
             .build()
             .expect("valid response");
 

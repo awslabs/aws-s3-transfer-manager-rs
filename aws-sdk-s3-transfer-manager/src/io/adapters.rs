@@ -168,7 +168,8 @@ mod tests {
         let stream_cx = StreamContext::new(
             part_size,
             false,
-            std::sync::Arc::new(crate::metrics::IOCounters::new(
+            std::sync::Arc::new(crate::transfer::MetricsState::new()),
+            std::sync::Arc::new(crate::telemetry::Telemetry::new(
                 std::time::Duration::from_secs(1),
             )),
         );
@@ -210,7 +211,8 @@ mod tests {
         let stream_cx = StreamContext::new(
             part_size,
             false,
-            std::sync::Arc::new(crate::metrics::IOCounters::new(
+            std::sync::Arc::new(crate::transfer::MetricsState::new()),
+            std::sync::Arc::new(crate::telemetry::Telemetry::new(
                 std::time::Duration::from_secs(1),
             )),
         );

@@ -21,6 +21,10 @@ use tracing::Instrument;
 
 mod worker;
 
+mod transfer;
+#[allow(unused_imports)] // wired up by the operation orchestrator
+pub(crate) use transfer::{UploadObjectsTransfer, UploadObjectsWork};
+
 use crate::{error, types::FailedUpload};
 
 use super::{

@@ -147,19 +147,24 @@ pub struct StreamContext {
     part_size: usize,
     /// When true, file I/O runs directly on the calling thread.
     direct_io: bool,
-    io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+    /// Per-transfer cumulative metrics.
+    metrics: std::sync::Arc<crate::transfer::MetricsState>,
+    /// Per-client telemetry (windowed throughput, latency tracking).
+    telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
 }
 
 impl StreamContext {
     pub(super) fn new(
         part_size: usize,
         direct_io: bool,
-        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+        telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
     ) -> Self {
         Self {
             part_size,
             direct_io,
-            io_counters,
+            metrics,
+            telemetry,
         }
     }
 
@@ -175,9 +180,10 @@ impl StreamContext {
         self.direct_io
     }
 
-    /// Throughput counters for recording I/O metrics at the source.
-    pub(crate) fn io_counters(&self) -> &crate::metrics::IOCounters {
-        &self.io_counters
+    /// Record an IO sample to per-transfer metrics and per-client telemetry.
+    pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
+        self.metrics.record_io(sample);
+        self.telemetry.io_counters.record(sample);
     }
 
     // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.

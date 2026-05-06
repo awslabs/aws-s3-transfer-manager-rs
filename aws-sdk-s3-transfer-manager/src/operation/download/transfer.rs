@@ -273,6 +273,7 @@ impl DownloadTransfer {
         let total_size =
             chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
         self.inner.writer.preallocate(total_size);
+        self.inner.ctx.set_total_bytes(total_size);
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
@@ -360,17 +361,21 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        self.decrement_in_flight();
 
-        self.inner
-            .ctx
-            .handle
-            .telemetry
-            .io_counters
-            .record(&crate::metrics::IoSample {
-                network_rx: bytes_received,
-                ..Default::default()
-            });
+        // disk_write reflects bytes committed to the file sink buffer.
+        // Actual disk flushes are batched; disk_write may lead physical
+        // I/O at any snapshot but converges on transfer completion.
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_rx: bytes_received,
+            disk_write: if self.inner.writer.has_sink() {
+                bytes_received
+            } else {
+                0
+            },
+            ..Default::default()
+        });
+
+        self.decrement_in_flight();
 
         WorkOutcome::Success { data: None }
     }
@@ -452,6 +457,20 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+
+        // disk_write reflects bytes committed to the file sink buffer.
+        // Actual disk flushes are batched; disk_write may lead physical
+        // I/O at any snapshot but converges on transfer completion.
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_rx: bytes_received,
+            disk_write: if self.inner.writer.has_sink() {
+                bytes_received
+            } else {
+                0
+            },
+            ..Default::default()
+        });
+
         self.decrement_in_flight();
 
         tracing::trace!(
@@ -460,16 +479,6 @@ impl DownloadTransfer {
             offset = *range.start(),
             "chunk downloaded",
         );
-
-        self.inner
-            .ctx
-            .handle
-            .telemetry
-            .io_counters
-            .record(&crate::metrics::IoSample {
-                network_rx: bytes_received,
-                ..Default::default()
-            });
 
         WorkOutcome::Success { data: None }
     }

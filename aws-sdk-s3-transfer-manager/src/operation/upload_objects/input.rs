@@ -35,6 +35,12 @@ pub struct UploadObjectsInput {
 
     /// The failure policy to use when any individual object upload fails.
     pub failure_policy: FailedTransferPolicy,
+
+    /// Maximum number of concurrent child upload transfers.
+    ///
+    /// Controls how many individual object uploads run simultaneously.
+    /// Defaults to 100.
+    pub pipeline_depth: usize,
 }
 
 impl UploadObjectsInput {
@@ -77,6 +83,14 @@ impl UploadObjectsInput {
     pub fn failure_policy(&self) -> &FailedTransferPolicy {
         &self.failure_policy
     }
+
+    /// Maximum number of concurrent child upload transfers.
+    ///
+    /// Controls how many individual object uploads run simultaneously.
+    /// Defaults to 100.
+    pub fn pipeline_depth(&self) -> usize {
+        self.pipeline_depth
+    }
 }
 
 /// A builder for [`UploadObjectsInput`]
@@ -91,6 +105,7 @@ pub struct UploadObjectsInputBuilder {
     pub(crate) key_prefix: Option<String>,
     pub(crate) delimiter: Option<String>,
     pub(crate) failure_policy: FailedTransferPolicy,
+    pub(crate) pipeline_depth: Option<usize>,
 }
 
 impl UploadObjectsInputBuilder {
@@ -118,6 +133,7 @@ impl UploadObjectsInputBuilder {
             key_prefix: self.key_prefix,
             delimiter: self.delimiter,
             failure_policy: self.failure_policy,
+            pipeline_depth: self.pipeline_depth.unwrap_or(100),
         })
     }
 
@@ -237,5 +253,31 @@ impl UploadObjectsInputBuilder {
     /// The failure policy to use when any individual object upload fails.
     pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
         &self.failure_policy
+    }
+
+    /// Maximum number of concurrent child upload transfers.
+    ///
+    /// Controls how many individual object uploads run simultaneously.
+    /// Defaults to 100.
+    pub fn pipeline_depth(mut self, input: usize) -> Self {
+        self.pipeline_depth = Some(input);
+        self
+    }
+
+    /// Maximum number of concurrent child upload transfers.
+    ///
+    /// Controls how many individual object uploads run simultaneously.
+    /// Defaults to 100.
+    pub fn set_pipeline_depth(mut self, input: Option<usize>) -> Self {
+        self.pipeline_depth = input;
+        self
+    }
+
+    /// Maximum number of concurrent child upload transfers.
+    ///
+    /// Controls how many individual object uploads run simultaneously.
+    /// Defaults to 100.
+    pub fn get_pipeline_depth(&self) -> Option<usize> {
+        self.pipeline_depth
     }
 }

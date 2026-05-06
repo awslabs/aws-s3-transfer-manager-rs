@@ -24,7 +24,8 @@ pub(crate) struct Builder {
     stream: Option<RawInputStream>,
     part_size: usize,
     direct_io: bool,
-    io_counters: Option<std::sync::Arc<crate::metrics::IOCounters>>,
+    metrics: Option<std::sync::Arc<crate::transfer::MetricsState>>,
+    telemetry: Option<std::sync::Arc<crate::telemetry::Telemetry>>,
 }
 
 impl Builder {
@@ -33,7 +34,8 @@ impl Builder {
             stream: None,
             part_size: 5 * ByteUnit::Mebibyte.as_bytes_u64() as usize,
             direct_io: false,
-            io_counters: None,
+            metrics: None,
+            telemetry: None,
         }
     }
 
@@ -57,19 +59,29 @@ impl Builder {
         self
     }
 
-    /// Set the I/O counters for recording throughput metrics.
-    pub(crate) fn io_counters(
+    /// Set the metrics state for recording I/O metrics.
+    pub(crate) fn metrics(
         mut self,
-        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
     ) -> Self {
-        self.io_counters = Some(io_counters);
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Set the per-client telemetry for forwarding I/O samples.
+    pub(crate) fn telemetry(
+        mut self,
+        telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 
     pub(crate) fn build(self) -> Result<PartReader, Error> {
         let stream = self.stream.expect("input stream set");
-        let io_counters = self.io_counters.expect("io_counters set");
-        PartReader::new(stream, self.part_size, self.direct_io, io_counters)
+        let metrics = self.metrics.expect("metrics set");
+        let telemetry = self.telemetry.expect("telemetry set");
+        PartReader::new(stream, self.part_size, self.direct_io, metrics, telemetry)
     }
 }
 
@@ -84,7 +96,8 @@ impl PartReader {
         raw: RawInputStream,
         part_size: usize,
         direct_io: bool,
-        io_counters: std::sync::Arc<crate::metrics::IOCounters>,
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+        telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
     ) -> Result<Self, Error> {
         let inner = match raw {
             RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
@@ -92,7 +105,7 @@ impl PartReader {
             RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
         };
 
-        let stream_cx = StreamContext::new(part_size, direct_io, io_counters);
+        let stream_cx = StreamContext::new(part_size, direct_io, metrics, telemetry);
         Ok(Self { inner, stream_cx })
     }
 
@@ -262,7 +275,7 @@ impl PathBodyPartReader {
             .await??;
         }
 
-        stream_cx.io_counters().record(&crate::metrics::IoSample {
+        stream_cx.record_io(&crate::metrics::IoSample {
             disk_read: part_size,
             ..Default::default()
         });
@@ -401,11 +414,15 @@ mod test {
     use crate::io::InputStream;
 
     fn test_stream_cx(part_size: usize) -> StreamContext {
-        StreamContext::new(part_size, false, test_io_counters())
+        StreamContext::new(part_size, false, test_metrics(), test_telemetry())
     }
 
-    fn test_io_counters() -> std::sync::Arc<crate::metrics::IOCounters> {
-        std::sync::Arc::new(crate::metrics::IOCounters::new(
+    fn test_metrics() -> std::sync::Arc<crate::transfer::MetricsState> {
+        std::sync::Arc::new(crate::transfer::MetricsState::new())
+    }
+
+    fn test_telemetry() -> std::sync::Arc<crate::telemetry::Telemetry> {
+        std::sync::Arc::new(crate::telemetry::Telemetry::new(
             std::time::Duration::from_secs(1),
         ))
     }
@@ -430,7 +447,8 @@ mod test {
         let reader = Builder::new()
             .part_size(5)
             .stream(stream)
-            .io_counters(test_io_counters())
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
             .build()
             .unwrap();
         let parts = collect_parts(reader).await;
@@ -462,7 +480,8 @@ mod test {
         let reader = Builder::new()
             .part_size(part_size)
             .stream(stream)
-            .io_counters(test_io_counters())
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
             .build()
             .unwrap();
 
@@ -543,7 +562,8 @@ mod test {
         let reader = Builder::new()
             .part_size(5)
             .stream(stream)
-            .io_counters(test_io_counters())
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
             .build()
             .unwrap();
         let parts = collect_parts(reader).await;
