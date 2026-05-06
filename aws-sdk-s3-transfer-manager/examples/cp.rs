@@ -267,14 +267,18 @@ async fn do_recursive_upload(
         .source(source)
         .bucket(bucket)
         .key_prefix(key_prefix)
-        .recursive(true)
+        .walker(
+            aws_sdk_s3_transfer_manager::io::walk::FsWalker::builder()
+                .recursive(true)
+                .build(),
+        )
         .send()
         .await?;
 
     let output = handle.join().await?;
     tracing::info!("recursive upload output: {output:?}");
 
-    let transfer_size_bytes = output.total_bytes_transferred();
+    let transfer_size_bytes = output.metrics.network_tx;
     println!(
         "uploaded {} objects totalling {transfer_size_bytes} bytes ({})",
         output.objects_uploaded(),

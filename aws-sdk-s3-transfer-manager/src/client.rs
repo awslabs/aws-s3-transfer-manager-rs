@@ -298,6 +298,7 @@ impl Client {
     /// ```no_run
     /// use std::path::Path;
     /// use aws_sdk_s3_transfer_manager::error::Error;
+    /// use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
     ///
     /// async fn upload_directory(
     ///     client: &aws_sdk_s3_transfer_manager::Client,
@@ -308,7 +309,7 @@ impl Client {
     ///         .upload_objects()
     ///         .source(source)
     ///         .bucket("my-bucket")
-    ///         .recursive(true)
+    ///         .walker(FsWalker::builder().recursive(true).build())
     ///         .send()
     ///         .await?;
     ///

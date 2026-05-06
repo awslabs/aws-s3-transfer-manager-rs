@@ -3,113 +3,93 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::UploadObjectsState;
-use crate::types::FailedUpload;
-use std::sync::atomic::Ordering;
+use crate::types::{FailedUpload, TransferMetrics};
 
-/// Output type for uploading multiple objects
+/// Output type for uploading multiple objects.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct UploadObjectsOutput {
-    /// The number of objects successfully uploaded
-    objects_uploaded: u64,
+    /// Number of objects successfully uploaded.
+    pub objects_uploaded: u64,
 
-    /// The list of failed uploads
-    failed_transfers: Vec<FailedUpload>,
+    /// Details for each upload that failed. Empty on a fully successful transfer.
+    pub failed_transfers: Vec<FailedUpload>,
 
-    // FIXME - likely remove when progress is implemented (let's be consistent with downloads for now)?
-    /// Total number of bytes transferred
-    total_bytes_transferred: u64,
+    /// Aggregated metrics across every completed child upload: network and
+    /// disk byte counters plus start/finish timestamps. See
+    /// [`TransferMetrics`] for the full set of fields.
+    pub metrics: TransferMetrics,
 }
 
 impl UploadObjectsOutput {
-    /// Creates a new builder-style object to manufacture [`UploadObjectsOutput`]
+    /// Creates a new builder-style object to manufacture an [`UploadObjectsOutput`].
     pub fn builder() -> UploadObjectsOutputBuilder {
         UploadObjectsOutputBuilder::default()
     }
 
-    /// The number of objects successfully uploaded
+    /// Number of objects successfully uploaded.
     pub fn objects_uploaded(&self) -> u64 {
         self.objects_uploaded
     }
 
-    /// The list of failed uploads
+    /// Details for each upload that failed. Empty on a fully successful transfer.
     pub fn failed_transfers(&self) -> &[FailedUpload] {
         self.failed_transfers.as_slice()
     }
 
-    /// The number of bytes successfully transferred (uploaded)
-    pub fn total_bytes_transferred(&self) -> u64 {
-        self.total_bytes_transferred
+    /// Aggregated transfer metrics across all completed child uploads.
+    pub fn metrics(&self) -> &TransferMetrics {
+        &self.metrics
     }
 }
 
-impl From<&UploadObjectsState> for UploadObjectsOutput {
-    fn from(state: &UploadObjectsState) -> Self {
-        let failed_uploads = std::mem::take(&mut *state.failed_uploads.lock().unwrap());
-        let successful_uploads = state.successful_uploads.load(Ordering::SeqCst);
-        let total_bytes_transferred = state.total_bytes_transferred.load(Ordering::SeqCst);
-
-        UploadObjectsOutput::builder()
-            .objects_uploaded(successful_uploads)
-            .set_failed_transfers(failed_uploads)
-            .total_bytes_transferred(total_bytes_transferred)
-            .build()
-    }
-}
-
-/// Builder for [`UploadObjectsOutput`]
+/// Builder for [`UploadObjectsOutput`].
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct UploadObjectsOutputBuilder {
     pub(crate) objects_uploaded: u64,
     pub(crate) failed_transfers: Vec<FailedUpload>,
-    pub(crate) total_bytes_transferred: u64,
+    pub(crate) metrics: Option<TransferMetrics>,
 }
 
 impl UploadObjectsOutputBuilder {
-    /// The number of objects successfully uploaded
+    /// Set the number of objects successfully uploaded.
     pub fn objects_uploaded(mut self, input: u64) -> Self {
         self.objects_uploaded = input;
         self
     }
 
-    /// The number of objects successfully uploaded
+    /// Get the number of objects successfully uploaded.
     pub fn get_objects_uploaded(&self) -> u64 {
         self.objects_uploaded
     }
 
-    /// Append a failed transfer.
-    ///
-    /// To override the contents of this collection use [`set_failed_transfers`](Self::set_failed_transfers)
+    /// Append a failed transfer. Use [`set_failed_transfers`](Self::set_failed_transfers)
+    /// to replace the whole collection.
     pub fn failed_transfers(mut self, input: FailedUpload) -> Self {
         self.failed_transfers.push(input);
         self
     }
 
-    /// Set a list of failed uploads
+    /// Replace the list of failed uploads.
     pub fn set_failed_transfers(mut self, input: Vec<FailedUpload>) -> Self {
         self.failed_transfers = input;
         self
     }
 
-    /// The number of bytes successfully transferred (uploaded)
-    pub fn total_bytes_transferred(mut self, input: u64) -> Self {
-        self.total_bytes_transferred = input;
+    /// Set the aggregated transfer metrics.
+    pub fn metrics(mut self, input: TransferMetrics) -> Self {
+        self.metrics = Some(input);
         self
     }
 
-    /// The number of bytes successfully transferred (uploaded)
-    pub fn get_total_bytes_transferred(&self) -> u64 {
-        self.total_bytes_transferred
-    }
-
-    /// Consume the builder and return the output
+    /// Consume the builder and return the output. Panics if `metrics` has
+    /// not been set.
     pub fn build(self) -> UploadObjectsOutput {
         UploadObjectsOutput {
             objects_uploaded: self.objects_uploaded,
             failed_transfers: self.failed_transfers,
-            total_bytes_transferred: self.total_bytes_transferred,
+            metrics: self.metrics.expect("metrics must be set"),
         }
     }
 }

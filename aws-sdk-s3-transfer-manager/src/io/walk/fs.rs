@@ -75,7 +75,7 @@ impl DirEntry {
     }
 }
 
-type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
+type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 
 /// Configuration for walking a local filesystem directory.
 ///
@@ -118,6 +118,7 @@ type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 //   normalization of filenames before deriving relative paths / S3 keys.
 // TODO(walker): `same_file_system: bool` — refuse to cross filesystem
 //   boundaries during recursion.
+#[derive(Clone)]
 pub struct FsWalker {
     follow_symlinks: bool,
     max_depth: usize,
@@ -220,7 +221,7 @@ impl FsWalker {
 ///
 /// All fields have sensible defaults: non-recursive, symlinks not followed,
 /// unsorted, no filter, `canonicalize_root` disabled.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct FsWalkerBuilder {
     follow_symlinks: bool,
     max_depth: usize,
@@ -342,7 +343,7 @@ impl FsWalkerBuilder {
     /// `node_modules/`), compose multiple walks rooted at smaller subtrees.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&DirEntry) -> bool + Send + Sync + 'static) -> Self {
-        self.filter = Some(Box::new(f));
+        self.filter = Some(Arc::new(f));
         self
     }
 
@@ -356,6 +357,14 @@ impl FsWalkerBuilder {
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
         }
+    }
+}
+
+impl Default for FsWalker {
+    /// A default walker: non-recursive, does not follow symlinks, no filter.
+    /// Equivalent to `FsWalker::builder().build()`.
+    fn default() -> Self {
+        FsWalker::builder().build()
     }
 }
 

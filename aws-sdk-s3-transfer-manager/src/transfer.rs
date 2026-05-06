@@ -409,7 +409,28 @@ impl TransferContext {
     /// Create a new transfer context.
     /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
-        let id = next_transfer_id();
+        Self::new_inner(handle, next_transfer_id())
+    }
+
+    /// Returns a context + receiver for a child transfer linked to `parent_id`.
+    ///
+    /// Child transfers share the scheduler with their parent. `signal_terminal`
+    /// on the child wakes the parent so the parent state machine can reap it.
+    /// `scheduler.cancel_transfer(parent_id)` cascades to children via the
+    /// parent linkage.
+    pub(crate) fn new_child(
+        handle: Arc<crate::client::Handle>,
+        parent_id: u64,
+    ) -> (Self, StateMachineTerminalReceiver) {
+        let mut id = next_transfer_id();
+        id.parent = Some(parent_id);
+        Self::new_inner(handle, id)
+    }
+
+    fn new_inner(
+        handle: Arc<crate::client::Handle>,
+        id: TransferId,
+    ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let ctx = Self {
             id,

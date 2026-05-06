@@ -43,7 +43,7 @@ pub(crate) enum UploadObjectsWork {
     },
 }
 
-struct ChildTransfer {
+pub(crate) struct ChildTransfer {
     source_path: PathBuf,
     key: String,
     handle: UploadHandle,
@@ -64,6 +64,13 @@ struct State {
     in_flight_walks: usize,
     pending_entries: VecDeque<DirEntry>,
     children: HashMap<TransferId, ChildTransfer>,
+    /// Children that have been drained from `children` into a `JoinChildren`
+    /// work item but whose `execute_join_children` has not yet finished
+    /// updating counters / failed list. `check_terminal` must wait for these
+    /// to drop to zero before signalling completion — otherwise the parent
+    /// can terminate with stale `successful_uploads == 0` while results are
+    /// still being tallied.
+    reaping_in_flight: usize,
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
 }
@@ -97,6 +104,7 @@ impl UploadObjectsTransfer {
                 in_flight_walks: 0,
                 pending_entries: VecDeque::new(),
                 children: HashMap::new(),
+                reaping_in_flight: 0,
                 failed: Vec::new(),
                 successful_uploads: 0,
             }),
@@ -124,18 +132,6 @@ impl UploadObjectsTransfer {
         self.inner.request.failure_policy()
     }
 
-    /// Cancel all in-flight child transfers.
-    ///
-    /// Explicit cancellation is used for internal aborts (child failure with
-    /// Abort policy, fatal walk errors) because these paths set the parent's
-    /// status to Failed rather than Cancelled. The scheduler's cancel cascade
-    /// only triggers on external `cancel_transfer` calls.
-    fn cancel_all_children(state: &mut State, ctx: &TransferContext) {
-        for child in state.children.values() {
-            ctx.handle.scheduler.cancel_transfer(child.handle.id());
-        }
-    }
-
     pub(crate) fn poll_work(&self) -> PollWork {
         let active = self.inner.ctx.is_active();
         let mut state = self.inner.state.lock();
@@ -159,11 +155,10 @@ impl UploadObjectsTransfer {
         }
 
         // 2. No more terminal children to reap. If we are inactive (cancelled
-        //    or failed), cancel any remaining in-flight children and signal
-        //    terminal. Children continue to cancel themselves in the
-        //    scheduler after the parent is gone.
+        //    or failed), signal terminal and exit. Children are cancelled
+        //    via `scheduler.cancel_transfer(parent_id)` from the handle's
+        //    abort/drop/join paths, which cascade outside the state lock.
         if !active {
-            Self::cancel_all_children(&mut state, &self.inner.ctx);
             self.inner.ctx.signal_terminal();
             return PollWork::Done;
         }
@@ -185,21 +180,15 @@ impl UploadObjectsTransfer {
         self.dispatch_walk(&mut state)
     }
 
-    /// Internal abort: cancel children explicitly (scheduler cascade only
-    /// fires on external cancel_transfer), record failure, signal terminal.
-    ///
-    /// `cause` is formatted into `"upload_objects aborted: {cause}"` and
-    /// stored on the parent context as a new error. The caller is expected
-    /// to have already preserved the originating error (if any) on the
-    /// failed-uploads list.
-    fn abort(&self, state: &mut State, cause: impl Into<String>) -> PollWork {
+    /// Record the failure cause and signal terminal. Children are cancelled
+    /// when the handle's cancel path runs `scheduler.cancel_transfer(parent_id)`.
+    fn abort(&self, _state: &mut State, cause: impl Into<String>) -> PollWork {
         let cause = cause.into();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             transfer_id = ?self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
-        Self::cancel_all_children(state, &self.inner.ctx);
         self.inner.ctx.set_failed(crate::error::Error::new(
             crate::error::ErrorKind::ChildOperationFailed,
             format!("upload_objects aborted: {cause}"),
@@ -209,7 +198,9 @@ impl UploadObjectsTransfer {
     }
 
     /// Remove every child that has reached a terminal status and return
-    /// them. Returns an empty vec when every child is still in progress.
+    /// them. Increments `reaping_in_flight` by the number returned so that
+    /// `check_terminal` does not signal completion while the resulting
+    /// `execute_join_children` is still updating counters.
     fn drain_terminal_children(state: &mut State) -> Vec<ChildTransfer> {
         let terminal_ids: Vec<TransferId> = state
             .children
@@ -217,10 +208,12 @@ impl UploadObjectsTransfer {
             .filter(|(_, c)| c.handle.status().is_terminal())
             .map(|(id, _)| *id)
             .collect();
-        terminal_ids
+        let drained: Vec<ChildTransfer> = terminal_ids
             .into_iter()
             .map(|id| state.children.remove(&id).expect("id from current map"))
-            .collect()
+            .collect();
+        state.reaping_in_flight += drained.len();
+        drained
     }
 
     fn spawn_children(&self, state: &mut State) -> Option<PollWork> {
@@ -278,7 +271,11 @@ impl UploadObjectsTransfer {
                 .build()
                 .unwrap();
 
-            match Upload::orchestrate(self.inner.ctx.handle.clone(), input) {
+            match Upload::orchestrate_child(
+                self.inner.ctx.handle.clone(),
+                input,
+                self.inner.ctx.id.id,
+            ) {
                 Ok(handle) => {
                     let child_id = handle.id();
                     tracing::trace!(
@@ -348,6 +345,7 @@ impl UploadObjectsTransfer {
             && state.in_flight_walks == 0
             && state.pending_entries.is_empty()
             && state.children.is_empty()
+            && state.reaping_in_flight == 0
         {
             let m = self.inner.ctx.metrics();
             tracing::debug!(
@@ -539,6 +537,7 @@ impl UploadObjectsTransfer {
 
         // Phase 2: update state once with all outcomes.
         let mut state = self.inner.state.lock();
+        let reaped = results.len();
         let mut aborted_in_batch = false;
 
         for (result, metrics, source_path, key) in results {
@@ -588,6 +587,13 @@ impl UploadObjectsTransfer {
                 }
             }
         }
+
+        // Release the reap counts now that all results have been tallied
+        // into the state. This must happen before dropping the lock so that
+        // a concurrent `check_terminal` does not see
+        // `children.is_empty() && reaping_in_flight == 0` while results are
+        // still being applied.
+        state.reaping_in_flight -= reaped;
 
         drop(state);
         self.inner.ctx.try_wake();
@@ -779,8 +785,6 @@ mod tests {
             .bucket("test-bucket")
             .source(source)
             .failure_policy(policy)
-            .recursive(recursive)
-            .follow_symlinks(true)
             .build()
             .unwrap();
 
@@ -894,8 +898,6 @@ mod tests {
             .bucket("test-bucket")
             .source(dir.path())
             .failure_policy(FailedTransferPolicy::Continue)
-            .recursive(true)
-            .follow_symlinks(true)
             .key_prefix("photos/2024")
             .build()
             .unwrap();
