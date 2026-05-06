@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::borrow::Cow;
-use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -18,9 +16,10 @@ use walkdir::WalkDir;
 use crate::error::ErrorKind;
 use crate::io::InputStream;
 use crate::operation::upload::UploadInputBuilder;
-use crate::operation::DEFAULT_DELIMITER;
 use crate::types::{FailedTransferPolicy, FailedUpload, UploadFilter};
 use crate::{error, types::UploadFilterItem};
+
+use super::transfer::derive_object_key;
 
 #[derive(Debug)]
 pub(super) struct UploadObjectJob {
@@ -149,40 +148,6 @@ fn walker(input: &UploadObjectsInput) -> WalkDir {
         walker = walker.max_depth(1);
     }
     walker
-}
-
-fn derive_object_key<'a>(
-    relative_filename: &'a str,
-    object_key_prefix: Option<&str>,
-    object_key_delimiter: Option<&str>,
-) -> Result<Cow<'a, str>, error::Error> {
-    if let Some(delim) = object_key_delimiter {
-        if delim != DEFAULT_DELIMITER && relative_filename.contains(delim) {
-            return Err(error::invalid_input(format!(
-                "a custom delimiter `{delim}` should not appear in `{relative_filename}`"
-            )));
-        }
-    }
-
-    let delim = object_key_delimiter.unwrap_or(DEFAULT_DELIMITER);
-
-    let relative_filename = if delim == MAIN_SEPARATOR_STR {
-        Cow::Borrowed(relative_filename)
-    } else {
-        Cow::Owned(relative_filename.replace(MAIN_SEPARATOR, delim))
-    };
-
-    let object_key = if let Some(prefix) = object_key_prefix {
-        if prefix.ends_with(delim) {
-            Cow::Owned(format!("{prefix}{relative_filename}"))
-        } else {
-            Cow::Owned(format!("{prefix}{delim}{relative_filename}"))
-        }
-    } else {
-        relative_filename
-    };
-
-    Ok(object_key)
 }
 
 pub(super) async fn upload_objects(
@@ -347,63 +312,6 @@ mod tests {
         use test_common::create_test_dir;
         use tokio::fs::symlink;
         use tokio::sync::watch;
-
-        #[test]
-        fn test_derive_object_key() {
-            assert_eq!(
-                "2023/Jan/1.png",
-                derive_object_key("2023/Jan/1.png", None, None).unwrap()
-            );
-            assert_eq!(
-                "foobar/2023/Jan/1.png",
-                derive_object_key("2023/Jan/1.png", Some("foobar"), None).unwrap()
-            );
-            assert_eq!(
-                "foobar/2023/Jan/1.png",
-                derive_object_key("2023/Jan/1.png", Some("foobar/"), None).unwrap()
-            );
-            assert_eq!(
-                "2023-Jan-1.png",
-                derive_object_key("2023/Jan/1.png", None, Some("-")).unwrap()
-            );
-            assert_eq!(
-                "foobar-2023-Jan-1.png",
-                derive_object_key("2023/Jan/1.png", Some("foobar"), Some("-")).unwrap()
-            );
-            assert_eq!(
-                "foobar-2023-Jan-1.png",
-                derive_object_key("2023/Jan/1.png", Some("foobar-"), Some("-")).unwrap()
-            );
-            assert_eq!(
-                "foobar--2023-Jan-1.png",
-                derive_object_key("2023/Jan/1.png", Some("foobar--"), Some("-")).unwrap()
-            );
-            assert_eq!(
-                "2023/MYLONGDELIMJan/MYLONGDELIM1.png",
-                derive_object_key("2023/Jan/1.png", None, Some("/MYLONGDELIM")).unwrap()
-            );
-            {
-                let err = derive_object_key("2023/Jan-1.png", None, Some("-"))
-                    .err()
-                    .unwrap();
-                assert_eq!(
-                    "a custom delimiter `-` should not appear in `2023/Jan-1.png`",
-                    format!("{}", err.source().unwrap())
-                );
-            }
-
-            // Should not replace the path separator in prefix with a custom delimiter
-            assert_eq!(
-                "foo/bar-2023-Jan-1.png",
-                derive_object_key("2023/Jan/1.png", Some("foo/bar"), Some("-")).unwrap()
-            );
-
-            // Should not fail if the user specifies the default delimiter as a custom delimiter
-            assert_eq!(
-                "2023/Jan/1.png",
-                derive_object_key("2023/Jan/1.png", None, Some(DEFAULT_DELIMITER)).unwrap()
-            );
-        }
 
         async fn exercise_list_directory_contents(
             input: UploadObjectsInput,
@@ -686,21 +594,6 @@ mod tests {
 
             assert_eq!(expected, actual);
             assert!(errors.is_empty());
-        }
-    }
-
-    #[cfg(target_family = "windows")]
-    mod windows {
-        use crate::operation::upload_objects::worker::*;
-
-        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
-        #[cfg_attr(miri, ignore)]
-        #[test]
-        fn test_derive_object_key() {
-            assert_eq!(
-                "2023/Jan/1.png",
-                derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
-            );
         }
     }
 

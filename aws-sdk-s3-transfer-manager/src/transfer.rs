@@ -548,6 +548,13 @@ impl TransferContext {
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
+        // Wake the parent transfer (if any) so it can reap this child.
+        if let Some(parent_id) = self.id.parent {
+            self.handle.scheduler.wake(TransferId {
+                id: parent_id,
+                parent: None,
+            });
+        }
     }
 
     /// Record an IO sample to per-transfer metrics and per-client telemetry.
