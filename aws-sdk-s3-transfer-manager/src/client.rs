@@ -150,10 +150,20 @@ impl Client {
 
         // 2. Build Handle with Arc::new_cyclic so scheduler and runtime
         //    can hold Weak<Handle> without creating a reference cycle.
+        #[cfg(feature = "dial9")]
+        let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
+
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
-            let runtime: Arc<dyn ExecutionRuntime> =
-                Arc::new(ManagedThreadRuntime::builder(weak_handle.clone()).build());
+            let runtime: Arc<dyn ExecutionRuntime> = {
+                #[allow(unused_mut)]
+                let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
+                #[cfg(feature = "dial9")]
+                if let Some(guard) = telemetry_guard {
+                    builder = builder.telemetry_guard(guard);
+                }
+                Arc::new(builder.build())
+            };
 
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => client,

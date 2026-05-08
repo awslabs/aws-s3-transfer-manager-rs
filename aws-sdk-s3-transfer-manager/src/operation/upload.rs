@@ -10,6 +10,7 @@ mod input;
 mod output;
 
 mod context;
+pub(crate) mod file_body;
 mod handle;
 mod transfer;
 

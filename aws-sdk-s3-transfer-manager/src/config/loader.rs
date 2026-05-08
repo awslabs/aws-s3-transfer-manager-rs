@@ -96,6 +96,16 @@ impl ConfigLoader {
         self
     }
 
+    /// Set a dial9 telemetry guard for runtime tracing.
+    #[cfg(feature = "dial9")]
+    pub fn telemetry_guard(
+        mut self,
+        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
+    ) -> Self {
+        self.builder = self.builder.telemetry_guard(guard);
+        self
+    }
+
     /// Load the default configuration
     ///
     /// If fields have been overridden during builder construction, the override values will be

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_smithy_types::timeout::TimeoutConfig;
 use bytes::Buf;
 use tracing::Instrument;
 
@@ -39,23 +40,22 @@ pub(crate) enum UploadWork {
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
-/// Upper bound on a single `PutObject` attempt at the transfer-manager
-/// layer. Wraps the SDK `send()` future in `tokio::time::timeout`. Any
-/// caller-provided `TimeoutConfig` on the SDK client fires first; this
-/// is a backstop that prevents a request from hanging indefinitely when
-/// the underlying HTTP layer does not surface an error.
+/// Bound on "time to first response byte" for a `PutObject` call. Applied
+/// per-operation via [`TimeoutConfig::read_timeout`] through a
+/// `.config_override(...)`; leaves any caller-provided `TimeoutConfig`
+/// fields on the client (connect / operation / operation-attempt) intact.
+///
+/// S3 typically responds within a few seconds under load. The EC2hang
+/// we're defending against is an unbounded wait on the response — payload
+/// was fully sent, S3 silent. 30s is wide enough for slow networks and
+/// tight enough to surface a stuck connection quickly so the SDK's retry
+/// strategy can retry on a fresh connection with a rebuilt body (see
+/// `SdkBody::retryable` wiring in `InputStream::into_sdk_body`).
 ///
 /// Scoped to `PutObject` only. `UploadPart` uses the adaptive
-/// `LatencyTracker::guarded` wrapper (which has its own escape hatch for
-/// legitimately long GB-sized part uploads). Control-plane operations
-/// (`CreateMultipartUpload`, `CompleteMultipartUpload`, etc.) rely on SDK
-/// or caller configuration.
-const PUT_OBJECT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Maximum attempts at the transfer-manager layer for a single `PutObject`.
-/// Each attempt is bounded by [`PUT_OBJECT_ATTEMPT_TIMEOUT`] and rebuilds
-/// the body from its source. Exhausting attempts fails the child transfer.
-const PUT_OBJECT_MAX_ATTEMPTS: usize = 3;
+/// `LatencyTracker::guarded` wrapper; control-plane operations rely on
+/// SDK or caller configuration.
+const PUT_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Upload transfer that generates and executes upload work.
 ///
@@ -515,109 +515,77 @@ impl UploadTransfer {
             .expect("content length must be known for PutObject");
 
         let is_file_backed = stream.is_file_backed();
+        let direct_io = self.inner.ctx.handle.runtime.components().direct_io();
 
-        // Consume into a rebuildable source so each retry attempt can build
-        // a fresh `ByteStream`. The SDK handles retries internal to a single
-        // `send()` call on its own, but TM-level retry (on timeout) starts a
-        // new top-level call that needs a new unconsumed body.
-        let rebuildable = match stream.into_rebuildable() {
-            Ok(r) => r,
-            Err(e) => return self.fail(e),
+        // Hand the request body off to the SDK as a retryable `SdkBody`:
+        // in-memory sources ride `SdkBody::from(Bytes)`'s built-in rebuild
+        // path; file-backed sources go through our `DirectFileBody` or
+        // `OffloadedFileBody` so that (a) retries get a fresh file
+        // descriptor and read cursor, (b) the read path stays on the TM's
+        // own I/O machinery rather than the SDK's `FsBuilder` +
+        // `tokio::fs` path, and (c) peak memory is bounded by the chunk
+        // size regardless of how large the object is.
+        let sdk_body = stream.into_sdk_body(direct_io);
+        let byte_stream = ByteStream::new(sdk_body);
+
+        let put_req = copy_fields_to_put_object_request(
+            &self.inner.request,
+            self.inner.ctx.s3_client().put_object().body(byte_stream),
+        );
+
+        // Per-operation `read_timeout` override bounds the time between
+        // "request initiated" and "first response byte received". The
+        // observed EC2 hang matched this window (payload fully sent, S3
+        // silent on response). Leaves any caller-provided `TimeoutConfig`
+        // fields on the client (connect / operation / operation-attempt)
+        // intact; only `read_timeout` is overridden for this call.
+        //
+        // Timeouts and transient errors feed the SDK's standard retry
+        // strategy, which with `SdkBody::retryable` can rebuild the body
+        // cleanly on each attempt (fresh fd, fresh reader task) and use
+        // exponential backoff + jitter.
+        let timeout_cfg = TimeoutConfig::builder()
+            .read_timeout(PUT_OBJECT_READ_TIMEOUT)
+            .build();
+        let config_override = aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
+
+        let resp = match put_req
+            .customize()
+            .config_override(config_override)
+            .disable_payload_signing()
+            .send()
+            .instrument(tracing::debug_span!("send-put-object"))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return self.fail(e.into()),
         };
 
-        for attempt in 1..=PUT_OBJECT_MAX_ATTEMPTS {
-            let byte_stream = match rebuildable.build_byte_stream().await {
-                Ok(bs) => bs,
-                Err(e) => return self.fail(e),
-            };
+        let result = UploadOutputBuilder::from(resp)
+            .metrics(self.inner.ctx.metrics())
+            .build()
+            .expect("valid response");
 
-            let put_req = copy_fields_to_put_object_request(
-                &self.inner.request,
-                self.inner.ctx.s3_client().put_object().body(byte_stream),
-            );
+        *self.inner.result.lock().expect("lock poisoned") = Some(result);
 
-            tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
-                content_length,
-                attempt,
-                "put_object send starting"
-            );
+        // A successful response means the SDK fully read the body and
+        // the bytes made it to the wire. For file-backed sources, the
+        // body implementations above have therefore read `content_length`
+        // bytes from disk. We attribute the metric here (rather than
+        // per-chunk inside the body) so that there is a single semantic
+        // anchor — "recorded when the SDK confirms success" — consistent
+        // with how `network_tx` is attributed.
+        let disk_read = if is_file_backed { content_length } else { 0 };
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_tx: content_length,
+            disk_read,
+            ..Default::default()
+        });
 
-            let send_fut = put_req
-                .customize()
-                .disable_payload_signing()
-                .send()
-                .instrument(tracing::debug_span!("send-put-object", attempt));
-            let timeout_result = tokio::time::timeout(PUT_OBJECT_ATTEMPT_TIMEOUT, send_fut).await;
+        self.inner.ctx.set_completed();
+        self.inner.ctx.signal_terminal();
 
-            match timeout_result {
-                Ok(Ok(resp)) => {
-                    tracing::trace!(
-                        target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
-                        attempt,
-                        "put_object send returned ok"
-                    );
-
-                    let result = UploadOutputBuilder::from(resp)
-                        .metrics(self.inner.ctx.metrics())
-                        .build()
-                        .expect("valid response");
-
-                    *self.inner.result.lock().expect("lock poisoned") = Some(result);
-
-                    // For file-backed sources the SDK has read the full payload from
-                    // disk by the time the request completes. In-memory or custom dyn
-                    // streams don't hit the disk so we don't inflate `disk_read` there.
-                    let disk_read = if is_file_backed { content_length } else { 0 };
-                    self.inner.ctx.record_io(&crate::metrics::IoSample {
-                        network_tx: content_length,
-                        disk_read,
-                        ..Default::default()
-                    });
-
-                    self.inner.ctx.set_completed();
-                    self.inner.ctx.signal_terminal();
-
-                    return WorkOutcome::Success { data: None };
-                }
-                Ok(Err(e)) => {
-                    // SDK returned an error (including its own timeout). Do
-                    // not retry at the TM layer; the SDK's retry policy has
-                    // already had its chance.
-                    tracing::trace!(
-                        target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
-                        attempt,
-                        error = %e,
-                        "put_object send returned err"
-                    );
-                    return self.fail(e.into());
-                }
-                Err(_elapsed) => {
-                    // Dropping `send_fut` cancels the in-flight request.
-                    // hyper's pool observes the drop and discards the
-                    // connection so the next attempt gets a fresh one.
-                    tracing::warn!(
-                        target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
-                        attempt,
-                        timeout_secs = PUT_OBJECT_ATTEMPT_TIMEOUT.as_secs(),
-                        "put_object attempt timed out, retrying"
-                    );
-                    // fall through to next attempt or post-loop failure
-                }
-            }
-        }
-
-        self.fail(crate::error::Error::new(
-            crate::error::ErrorKind::IOError,
-            format!(
-                "put_object timed out after {PUT_OBJECT_MAX_ATTEMPTS} attempts of {}s each",
-                PUT_OBJECT_ATTEMPT_TIMEOUT.as_secs()
-            ),
-        ))
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {

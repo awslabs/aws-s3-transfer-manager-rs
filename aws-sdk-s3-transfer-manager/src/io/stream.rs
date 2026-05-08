@@ -9,10 +9,8 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::pin::Pin;
 
-use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 
-use crate::error;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
@@ -93,30 +91,61 @@ impl InputStream {
         Self::read_from().path(path).build()
     }
 
-    /// Consumes the stream into a source that can produce a fresh
-    /// [`ByteStream`] on each call to
-    /// [`RebuildableSource::build_byte_stream`]. Used by the TM-level retry
-    /// wrapper around `PutObject`: each retry attempt is a new top-level
-    /// SDK call and needs an unconsumed body, which the SDK's own internal
-    /// retries do not provide.
+    /// Returns `true` when this `InputStream` reads from a local file.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self.inner, RawInputStream::Fs(_))
+    }
+
+    /// Convert this input stream into an [`SdkBody`] suitable for a top-level
+    /// retryable SDK call (e.g. `PutObject`). The returned body is retryable
+    /// at the SDK layer:
     ///
-    /// `Dyn` (user-provided custom) streams cannot be rewound and are
-    /// rejected. By contract, streams that report
-    /// [`is_mpu_only`](Self::is_mpu_only) are routed through the multipart
-    /// path before reaching `PutObject`, so this error is defense-in-depth
-    /// rather than an expected outcome.
-    pub(crate) fn into_rebuildable(self) -> Result<RebuildableSource, error::Error> {
+    /// * In-memory (`Buf`) streams go through [`SdkBody::from`] whose
+    ///   rebuild path is a cheap `Bytes` clone.
+    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each
+    ///   retry constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`]
+    ///   with its own open file descriptor and read cursor.
+    ///
+    /// `direct_io` selects between the two file-body implementations:
+    /// `true` when the caller owns the polling thread (managed-thread
+    /// direct I/O), `false` when the body may be polled by the shared
+    /// tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `Dyn` streams. Dyn sources cannot be rewound and must
+    /// route through the multipart upload path (see [`is_mpu_only`]).
+    ///
+    /// [`SdkBody`]: aws_smithy_types::body::SdkBody
+    /// [`SdkBody::from`]: aws_smithy_types::body::SdkBody::from
+    /// [`SdkBody::retryable`]: aws_smithy_types::body::SdkBody::retryable
+    /// [`DirectFileBody`]: crate::operation::upload::file_body::DirectFileBody
+    /// [`OffloadedFileBody`]: crate::operation::upload::file_body::OffloadedFileBody
+    /// [`is_mpu_only`]: Self::is_mpu_only
+    pub(crate) fn into_sdk_body(self, direct_io: bool) -> aws_smithy_types::body::SdkBody {
+        use crate::operation::upload::file_body::{DirectFileBody, OffloadedFileBody};
+        use aws_smithy_types::body::SdkBody;
         match self.inner {
-            RawInputStream::Fs(path_body) => Ok(RebuildableSource::File {
-                path: path_body.path,
-                offset: path_body.offset,
-                length: path_body.length,
-            }),
-            RawInputStream::Buf(bytes) => Ok(RebuildableSource::Bytes(bytes)),
-            RawInputStream::Dyn(_) => Err(error::Error::new(
-                error::ErrorKind::InputInvalid,
-                "dyn InputStream cannot be used with PutObject (must use multipart)",
-            )),
+            RawInputStream::Buf(bytes) => SdkBody::from(bytes),
+            RawInputStream::Fs(path_body) => {
+                let path = path_body.path;
+                let offset = path_body.offset;
+                let length = path_body.length;
+                if direct_io {
+                    SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(DirectFileBody::new(path.clone(), offset, length))
+                    })
+                } else {
+                    SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(OffloadedFileBody::new(path.clone(), offset, length))
+                    })
+                }
+            }
+            RawInputStream::Dyn(_) => panic!(
+                "InputStream::into_sdk_body called on Dyn stream; \
+                 Dyn sources must route through the multipart upload path \
+                 (is_mpu_only() should have been checked upstream)"
+            ),
         }
     }
 
@@ -126,11 +155,6 @@ impl InputStream {
     pub(crate) fn is_mpu_only(&self) -> bool {
         // TODO - for our own wrappers we can probably be smarter
         matches!(self.inner, RawInputStream::Dyn(_))
-    }
-
-    /// Returns `true` when this `InputStream` reads from a local file.
-    pub(crate) fn is_file_backed(&self) -> bool {
-        matches!(self.inner, RawInputStream::Fs(_))
     }
 
     /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation
@@ -154,45 +178,6 @@ pub(super) enum RawInputStream {
     Fs(PathBody),
     /// User provided custom stream
     Dyn(BoxStream),
-}
-
-/// Source data in a form that can produce a fresh `ByteStream` on each
-/// invocation. Used by `PutObject` execution to rebuild the body between
-/// TM-level retry attempts (top-level retries create new SDK calls, each of
-/// which needs its own unconsumed body).
-#[derive(Debug)]
-pub(crate) enum RebuildableSource {
-    /// File-backed body. Each build reopens the file at the recorded
-    /// offset and reads `length` bytes.
-    File {
-        path: std::path::PathBuf,
-        offset: u64,
-        length: u64,
-    },
-    /// In-memory body. Each build clones the `Bytes` handle (ref-count
-    /// bump, no copy).
-    Bytes(Bytes),
-}
-
-impl RebuildableSource {
-    /// Build a fresh [`ByteStream`] from this source. May be called multiple
-    /// times; each call yields an unconsumed stream at the start of the body.
-    pub(crate) async fn build_byte_stream(&self) -> Result<ByteStream, error::Error> {
-        match self {
-            Self::File {
-                path,
-                offset,
-                length,
-            } => ByteStream::read_from()
-                .path(path)
-                .offset(*offset)
-                .length(aws_sdk_s3::primitives::Length::Exact(*length))
-                .build()
-                .await
-                .map_err(error::from_kind(error::ErrorKind::IOError)),
-            Self::Bytes(bytes) => Ok(ByteStream::from(bytes.clone())),
-        }
-    }
 }
 
 /// The context of an input stream.
