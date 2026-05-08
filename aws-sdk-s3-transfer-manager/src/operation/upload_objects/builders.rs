@@ -145,6 +145,26 @@ impl UploadObjectsFluentBuilder {
     pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
         self.inner.get_failure_policy()
     }
+
+    /// Maximum number of concurrent child upload transfers.
+    ///
+    /// Controls how many individual object uploads run simultaneously.
+    /// Defaults to 100.
+    pub fn pipeline_depth(mut self, input: usize) -> Self {
+        self.inner = self.inner.pipeline_depth(input);
+        self
+    }
+
+    /// Maximum number of concurrent child upload transfers.
+    pub fn set_pipeline_depth(mut self, input: Option<usize>) -> Self {
+        self.inner = self.inner.set_pipeline_depth(input);
+        self
+    }
+
+    /// Maximum number of concurrent child upload transfers.
+    pub fn get_pipeline_depth(&self) -> Option<usize> {
+        self.inner.get_pipeline_depth()
+    }
 }
 
 impl crate::operation::upload_objects::input::UploadObjectsInputBuilder {

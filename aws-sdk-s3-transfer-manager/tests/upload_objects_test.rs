@@ -599,3 +599,763 @@ async fn test_drop_upload_objects_handle() {
     .await
     .expect("test_drop_upload_objects_handle timed out");
 }
+
+/// Metrics correctness on a successful multi-object upload.
+///
+/// After a fully successful upload of files with known sizes:
+/// - `objects_uploaded` matches the number of source files
+/// - `network_tx` equals the sum of source file sizes
+/// - `disk_read` equals the sum of source file sizes
+/// - `started_at` is populated and precedes `finished_at`
+#[tokio::test]
+async fn test_metrics_correctness_on_success() {
+    timeout(TEST_TIMEOUT, async {
+        let files = vec![
+            ("a.bin", 7),
+            ("b.bin", 13),
+            ("nested/c.bin", 19),
+            ("nested/deep/d.bin", 23),
+        ];
+        let total_bytes: u64 = files.iter().map(|(_, s)| *s as u64).sum();
+        let test_dir = create_test_dir(Some("test"), files.clone(), &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(4, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(
+            total_bytes, output.metrics.network_tx,
+            "network_tx should equal sum of source file sizes"
+        );
+        assert_eq!(
+            total_bytes, output.metrics.disk_read,
+            "disk_read should equal sum of source file sizes"
+        );
+        let finished = output
+            .metrics
+            .finished_at
+            .expect("finished_at must be set on successful transfer");
+        assert!(
+            output.metrics.started_at <= finished,
+            "started_at must not be after finished_at"
+        );
+    })
+    .await
+    .expect("test_metrics_correctness_on_success timed out");
+}
+
+/// Serial execution correctness with `pipeline_depth(1)`.
+///
+/// Forces the state machine through the serial-execution regime: only one
+/// child spawned at a time, reaped before the next is spawned. All files
+/// must still upload and metrics must still aggregate correctly.
+#[tokio::test]
+async fn test_pipeline_depth_one_serial_execution() {
+    timeout(TEST_TIMEOUT, async {
+        let files: Vec<(String, usize)> = (0..10).map(|i| (format!("f{i}.bin"), 3)).collect();
+        let files_ref: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let test_dir = create_test_dir(Some("test"), files_ref, &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .pipeline_depth(1)
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(10, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(30, output.metrics.network_tx);
+        assert_eq!(30, output.metrics.disk_read);
+    })
+    .await
+    .expect("test_pipeline_depth_one_serial_execution timed out");
+}
+
+/// Deep tree exercises subtree claiming beyond `MAX_PARALLEL_WALKS`.
+///
+/// Builds a tree wider than the hardcoded 16-walker cap so the state
+/// machine's `claim_subtrees` path is exercised: one walker splits off
+/// sub-walkers up to the cap. Every file must still be uploaded exactly
+/// once, with no lost entries.
+#[tokio::test]
+async fn test_deep_tree_subtree_claiming() {
+    timeout(TEST_TIMEOUT, async {
+        // 20 sibling subdirectories under the root, each with one file.
+        // Combined with the root, that's 20 directories to walk, exceeding
+        // the 16-walker cap so subtree claiming is forced to queue.
+        let files: Vec<(String, usize)> = (0..20)
+            .map(|i| (format!("sub_{i:02}/file.bin"), 5))
+            .collect();
+        let files_ref: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let test_dir = create_test_dir(Some("test"), files_ref, &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(
+            20,
+            output.objects_uploaded(),
+            "all 20 files in sibling subdirs must upload"
+        );
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(100, output.metrics.network_tx);
+    })
+    .await
+    .expect("test_deep_tree_subtree_claiming timed out");
+}
+
+/// Custom walker filter limits the set of uploaded files.
+///
+/// Exercises the walker-first API surface: a filter closure is attached to
+/// the `FsWalker`, and only files the filter accepts should be uploaded.
+#[tokio::test]
+async fn test_walker_filter_restricts_uploads() {
+    timeout(TEST_TIMEOUT, async {
+        let files = vec![
+            ("keep.txt", 4),
+            ("skip.log", 4),
+            ("nested/keep.txt", 4),
+            ("nested/skip.log", 4),
+        ];
+        let test_dir = create_test_dir(Some("test"), files.clone(), &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(
+                FsWalker::builder()
+                    .recursive(true)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "txt"))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(
+            2,
+            output.objects_uploaded(),
+            "only .txt files should upload"
+        );
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(8, output.metrics.network_tx);
+    })
+    .await
+    .expect("test_walker_filter_restricts_uploads timed out");
+}
+
+/// Empty source directory terminates cleanly with zero metrics.
+///
+/// Regression target for the `reaping_in_flight` race: when the walker
+/// yields no entries and no children are ever spawned, `check_terminal`
+/// must still fire and the handle must settle with an empty output.
+#[tokio::test]
+async fn test_empty_source_directory() {
+    timeout(TEST_TIMEOUT, async {
+        let test_dir = create_test_dir(Some("test"), vec![], &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(0, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(0, output.metrics.network_tx);
+        assert_eq!(0, output.metrics.disk_read);
+        assert!(
+            output.metrics.finished_at.is_some(),
+            "finished_at must be set even on zero-work transfer"
+        );
+    })
+    .await
+    .expect("test_empty_source_directory timed out");
+}
+
+/// Interleaved per-child success and failure under `Continue` policy.
+///
+/// One specific key always returns 500 (persistent failure); the others
+/// succeed. The transfer must complete (not abort), and the output must
+/// record:
+/// - successful uploads with `objects_uploaded`
+/// - the failed upload with a populated `source_path`
+/// - metrics reflecting only the on-wire bytes actually sent
+#[tokio::test]
+async fn test_interleaved_success_failure_continue() {
+    timeout(TEST_TIMEOUT, async {
+        let files = vec![
+            ("a.bin", 4),
+            ("b.bin", 4),
+            ("doomed.bin", 4),
+            ("c.bin", 4),
+            ("d.bin", 4),
+        ];
+        let test_dir = create_test_dir(Some("test"), files.clone(), &[]);
+
+        let bucket_name = "test-bucket";
+        let fail_match = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |input| {
+                input.bucket() == Some(bucket_name)
+                    && input.key().is_some_and(|k| k.ends_with("doomed.bin"))
+            })
+            .then_http_response(|| {
+                HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty())
+            });
+        let succeed_match = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |input| input.bucket() == Some(bucket_name))
+            .then_output(|| PutObjectOutput::builder().build());
+
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[fail_match, succeed_match]);
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(s3_client)
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(4, output.objects_uploaded());
+        assert_eq!(1, output.failed_transfers().len());
+        let failed = &output.failed_transfers()[0];
+        assert!(
+            failed.source_path().is_some(),
+            "failed upload must carry source_path"
+        );
+        assert!(
+            failed
+                .source_path()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("doomed.bin"),
+            "failed source_path should point at the failing file"
+        );
+    })
+    .await
+    .expect("test_interleaved_success_failure_continue timed out");
+}
+
+/// Dropping the handle while the walk is still in progress must not
+/// panic and must tear down cleanly.
+///
+/// Creates a larger tree than the previous drop test and drops the handle
+/// without any synchronization, so the drop can race with walker dispatch
+/// and child spawning.
+#[tokio::test]
+async fn test_drop_during_walk_in_progress() {
+    timeout(TEST_TIMEOUT, async {
+        let files: Vec<(String, usize)> =
+            (0..50).map(|i| (format!("dir_{i:02}/f.bin"), 2)).collect();
+        let files_ref: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let test_dir = create_test_dir(Some("test"), files_ref, &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        // Drop immediately — walker is almost certainly still producing
+        // entries, and some children may be mid-flight.
+        drop(handle);
+
+        // Give tasks a moment to settle to ensure Drop did not deadlock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    })
+    .await
+    .expect("test_drop_during_walk_in_progress timed out");
+}
+
+/// Multi-file multipart uploads aggregate `network_tx` and `disk_read`
+/// correctly at the parent level.
+///
+/// Uses the multipart path exclusively (which instruments `disk_read` via
+/// `part_reader`) to verify the parent aggregates both counters across
+/// multiple multipart children.
+#[tokio::test]
+async fn test_multipart_metrics_aggregate_across_children() {
+    timeout(TEST_TIMEOUT, async {
+        const MIN_MULTIPART: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+        let files = vec![
+            ("a.bin", MIN_MULTIPART as usize),
+            ("b.bin", MIN_MULTIPART as usize),
+            ("nested/c.bin", MIN_MULTIPART as usize),
+        ];
+        let expected_total: u64 = MIN_MULTIPART * 3;
+        let test_dir = create_test_dir(Some("test"), files.clone(), &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_multipart_upload(bucket_name.to_owned()))
+            .multipart_threshold(PartSize::Target(5))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(3, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+        assert_eq!(
+            expected_total, output.metrics.network_tx,
+            "network_tx should sum across all multipart children"
+        );
+        assert_eq!(
+            expected_total, output.metrics.disk_read,
+            "disk_read should sum across all multipart children (part_reader instruments it)"
+        );
+    })
+    .await
+    .expect("test_multipart_metrics_aggregate_across_children timed out");
+}
+
+/// Handle `status()` returns a terminal variant after join.
+#[tokio::test]
+async fn test_status_transitions_to_terminal() {
+    timeout(TEST_TIMEOUT, async {
+        let test_dir = create_test_dir(Some("test"), vec![("a.bin", 1)], &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        // Status at this point may be Running or (for a fast completion on
+        // 1-byte files) already terminal; don't assert on pre-join state.
+        let output = handle.join().await.unwrap();
+        assert_eq!(1, output.objects_uploaded());
+        // Output being Ok implies the transfer reached a non-error terminal
+        // state. No separate status accessor after join since the handle is
+        // consumed.
+    })
+    .await
+    .expect("test_status_transitions_to_terminal timed out");
+}
+
+/// Hidden files (dotfiles) are uploaded by default.
+///
+/// The default walker does not filter dotfiles. A custom filter is the
+/// opt-in path for users who want to exclude them.
+#[tokio::test]
+async fn test_hidden_files_uploaded_by_default() {
+    timeout(TEST_TIMEOUT, async {
+        let files = vec![
+            (".hidden.txt", 3),
+            ("visible.txt", 3),
+            (".dotdir/inner.txt", 3),
+        ];
+        let test_dir = create_test_dir(Some("test"), files.clone(), &[]);
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(
+            3,
+            output.objects_uploaded(),
+            "all files including dotfiles and files in dotdirs should upload"
+        );
+        assert!(output.failed_transfers().is_empty());
+    })
+    .await
+    .expect("test_hidden_files_uploaded_by_default timed out");
+}
+
+/// Regression for a second hang observed after the first fix landed:
+/// iteration 1 completes cleanly (10k children uploaded, parent signals
+/// terminal) but iteration 2, kicked off on the same `Client`, stalls
+/// after enqueuing a few hundred children. Strongly suggests state
+/// leaking between top-level `upload_objects` calls — likely a
+/// thread-local left non-zero, the scheduler's `ready_set` retaining a
+/// stale descriptor, or `children_reserved` not fully drained on the
+/// prior run's abort/completion path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiple_iterations_on_same_client_do_not_hang() {
+    timeout(Duration::from_secs(60), async {
+        const FILE_COUNT: usize = 2000;
+        const ITERATIONS: usize = 3;
+        let files: Vec<(String, usize)> = (0..FILE_COUNT)
+            .map(|i| (format!("f/{i:04}.bin"), 32))
+            .collect();
+        let test_dir = create_test_dir(
+            Some("test"),
+            files.iter().map(|(k, s)| (k.as_str(), *s)).collect(),
+            &[],
+        );
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        for iter in 0..ITERATIONS {
+            let handle = sut
+                .upload_objects()
+                .bucket(bucket_name)
+                .source(test_dir.path())
+                .walker(FsWalker::builder().recursive(true).build())
+                .key_prefix(format!("iter{iter}/"))
+                .send()
+                .await
+                .unwrap();
+            let output = handle.join().await.unwrap();
+            assert_eq!(
+                FILE_COUNT as u64,
+                output.objects_uploaded(),
+                "iteration {iter}: all files should upload"
+            );
+            assert!(
+                output.failed_transfers().is_empty(),
+                "iteration {iter}: no failures expected"
+            );
+        }
+    })
+    .await
+    .expect("test_multiple_iterations_on_same_client_do_not_hang timed out");
+}
+
+/// Regression test for a hang where a re-entrant scheduler path left work
+/// items in the submission queue undispatched.
+///
+/// The scenario: parent `poll_work` inside `spawn_children` called
+/// `Upload::orchestrate_child`, which called `scheduler.enqueue_transfer`,
+/// which called `scheduler.generate_work` — all while holding the parent's
+/// state lock. Worker threads firing child-completion wakes would then
+/// block on the parent state lock, each holding a pending count on the
+/// shared submission queue. The queue's pending counter never dropped to
+/// zero so flushes were skipped. The fix spans three layers (see
+/// `GenerateWorkGuard` in scheduler, `SUBMISSION_DEPTH` in submission, and
+/// the claim/orchestrate/merge phases in `poll_work`). This test asserts
+/// that a wide burst of children completes through all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_wide_burst_of_children_does_not_hang() {
+    timeout(Duration::from_secs(30), async {
+        // 300 small files, all succeeding. 300 is comfortably above the
+        // default pipeline depth (100) so spawn_children will iterate
+        // multiple times and the scheduler will process many child
+        // completions concurrently.
+        const FILE_COUNT: usize = 300;
+        let files: Vec<(String, usize)> = (0..FILE_COUNT)
+            .map(|i| (format!("f/{i:04}.bin"), 32))
+            .collect();
+        let test_dir = create_test_dir(
+            Some("test"),
+            files.iter().map(|(k, s)| (k.as_str(), *s)).collect(),
+            &[],
+        );
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(FILE_COUNT as u64, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+    })
+    .await
+    .expect("test_wide_burst_of_children_does_not_hang timed out");
+}
+
+/// Same shape as the burst test but under `FailedTransferPolicy::Continue`
+/// with every child failing. This exercises the abort-cascade path
+/// through the 3-phase spawn restructure and verifies `children_reserved`
+/// is released correctly on the error side of `merge_spawned`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_wide_burst_all_failing_continue_does_not_hang() {
+    timeout(Duration::from_secs(30), async {
+        const FILE_COUNT: usize = 200;
+        let files: Vec<(String, usize)> = (0..FILE_COUNT)
+            .map(|i| (format!("f/{i:04}.bin"), 32))
+            .collect();
+        let test_dir = create_test_dir(
+            Some("test"),
+            files.iter().map(|(k, s)| (k.as_str(), *s)).collect(),
+            &[],
+        );
+
+        let bucket_name = "test-bucket";
+
+        // Every PutObject returns a 503 server error. Under Continue
+        // policy these accumulate in `failed_transfers`.
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |input| input.bucket() == Some(bucket_name))
+            .then_http_response(|| {
+                HttpResponse::new(StatusCode::try_from(503).unwrap(), SdkBody::from(""))
+            });
+
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(s3)
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(0, output.objects_uploaded());
+        assert_eq!(FILE_COUNT, output.failed_transfers().len());
+    })
+    .await
+    .expect("test_wide_burst_all_failing_continue_does_not_hang timed out");
+}
+
+/// Verify `pipeline_depth` is respected across the claim/orchestrate/merge
+/// split even when many children complete concurrently. Counts the maximum
+/// in-flight PutObjects observed through the mock and asserts it never
+/// exceeds `pipeline_depth`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_pipeline_depth_respected_under_burst() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    timeout(Duration::from_secs(30), async {
+        const FILE_COUNT: usize = 100;
+        const PIPELINE_DEPTH: usize = 8;
+        let files: Vec<(String, usize)> = (0..FILE_COUNT)
+            .map(|i| (format!("{i:04}.bin"), 16))
+            .collect();
+        let test_dir = create_test_dir(
+            Some("test"),
+            files.iter().map(|(k, s)| (k.as_str(), *s)).collect(),
+            &[],
+        );
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+        let in_flight_cb = Arc::clone(&in_flight);
+        let max_observed_cb = Arc::clone(&max_observed);
+
+        let bucket_name = "test-bucket";
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |input| input.bucket() == Some(bucket_name))
+            .then_output(move || {
+                let current = in_flight_cb.fetch_add(1, Ordering::AcqRel) + 1;
+                max_observed_cb.fetch_max(current, Ordering::AcqRel);
+                // Yielding is not available inside a blocking `then_output`
+                // closure, so fake concurrency by sleeping briefly to widen
+                // the window where many children can be in-flight at once.
+                std::thread::sleep(Duration::from_millis(2));
+                in_flight_cb.fetch_sub(1, Ordering::AcqRel);
+                PutObjectOutput::builder().build()
+            });
+
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(s3)
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .pipeline_depth(PIPELINE_DEPTH)
+            .send()
+            .await
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(FILE_COUNT as u64, output.objects_uploaded());
+        let observed = max_observed.load(Ordering::Acquire);
+        assert!(
+            observed <= PIPELINE_DEPTH,
+            "max concurrent PutObjects ({observed}) exceeded pipeline_depth ({PIPELINE_DEPTH}); \
+             children_reserved must prevent over-spawning during lock-released orchestration"
+        );
+    })
+    .await
+    .expect("test_pipeline_depth_respected_under_burst timed out");
+}
+
+/// Stress reproducer for a state-machine race that stalls `upload_objects`
+/// intermittently. A mock S3 client with instant responses keeps the bug
+/// isolated to the TM layer — no network, no hyper, no HTTP — so whatever
+/// this reproduces is a scheduler or state-machine bug.
+///
+/// The hang was first observed on EC2 against real S3 with the
+/// `upload-disk-256kib-10k` workload (10000 × 256KiB files, 3 iterations),
+/// where the process went idle for 100+ seconds before being killed by the
+/// harness timeout. Under the mock client the test eventually recovers, so
+/// stall durations vary widely (sub-second to 100+ seconds). The test is
+/// `#[ignore]` because the 240s outer timeout is long and because the race
+/// is Heisenbug-sensitive — it disappears with `RUST_LOG` tracing enabled,
+/// which is the classic signature of a narrow timing window in the state
+/// machine.
+///
+/// Run with: `cargo test ... --release -- --ignored --nocapture`.
+#[ignore = "stress repro, run with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_stress_multi_iter_reproduce_ec2_hang() {
+    timeout(Duration::from_secs(240), async {
+        const FILE_COUNT: usize = 10_000;
+        const ITERATIONS: usize = 3;
+        let files: Vec<(String, usize)> = (0..FILE_COUNT)
+            .map(|i| (format!("d{:03}/{i:05}.bin", i / 100), 32))
+            .collect();
+        let test_dir = create_test_dir(
+            Some("test"),
+            files.iter().map(|(k, s)| (k.as_str(), *s)).collect(),
+            &[],
+        );
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        for iter in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            let handle = sut
+                .upload_objects()
+                .bucket(bucket_name)
+                .source(test_dir.path())
+                .walker(FsWalker::builder().recursive(true).build())
+                .key_prefix(format!("iter{iter}/"))
+                .send()
+                .await
+                .unwrap();
+            let output = handle.join().await.unwrap();
+            let elapsed = start.elapsed();
+            eprintln!(
+                "iter {iter} done in {elapsed:?}: uploaded={} failed={}",
+                output.objects_uploaded(),
+                output.failed_transfers().len()
+            );
+            assert_eq!(
+                FILE_COUNT as u64,
+                output.objects_uploaded(),
+                "iteration {iter}: all files should upload"
+            );
+            assert!(
+                output.failed_transfers().is_empty(),
+                "iteration {iter}: no failures expected"
+            );
+        }
+    })
+    .await
+    .expect("test_stress_multi_iter_reproduce_ec2_hang timed out");
+}

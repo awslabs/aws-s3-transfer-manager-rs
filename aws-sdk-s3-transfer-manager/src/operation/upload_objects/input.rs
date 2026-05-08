@@ -9,6 +9,14 @@ use aws_smithy_types::error::operation::BuildError;
 
 use std::path::{Path, PathBuf};
 
+/// Default maximum number of concurrent child upload transfers.
+///
+/// Users can override via [`UploadObjectsInputBuilder::pipeline_depth`]
+/// or the corresponding fluent builder method.
+// FIXME - likely too small (e.g. 10k small files -> all put_object (1 req) -> 100 transfers
+// we probably need to weigh this by put/mpu and content length
+const DEFAULT_PIPELINE_DEPTH: usize = 100;
+
 /// Input type for uploading multiple objects.
 ///
 /// Walk behavior (recursion, symbolic link handling, file filtering, sort
@@ -117,7 +125,7 @@ impl UploadObjectsInputBuilder {
             key_prefix: self.key_prefix,
             delimiter: self.delimiter,
             failure_policy: self.failure_policy,
-            pipeline_depth: self.pipeline_depth.unwrap_or(100),
+            pipeline_depth: self.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH),
         })
     }
 

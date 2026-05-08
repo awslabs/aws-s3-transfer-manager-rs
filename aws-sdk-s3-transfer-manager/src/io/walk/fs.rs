@@ -108,6 +108,13 @@ type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 /// same target) are not deduplicated. Both are followed and the target's
 /// content is yielded twice. If deduplication is desired, apply it at a
 /// higher layer.
+///
+/// # Cloning
+///
+/// `FsWalker` is cheap to clone: all configuration fields are small values
+/// and the optional filter is stored as `Arc<dyn Fn>`. Clone a configured
+/// walker to reuse it across multiple operations without re-specifying the
+/// configuration.
 // TODO(walker): `dir_filter: Option<Box<dyn Fn(&DirEntry) -> bool>>` — subtree
 //   prune predicate. Biggest perf improvement for bulk ops on trees with large
 //   excluded subtrees (.git/, node_modules/).
@@ -541,6 +548,16 @@ impl FsWalk {
             || (self.pending_dirs.is_empty()
                 && self.ready_files.is_empty()
                 && self.pending_errors.is_empty())
+    }
+
+    /// Number of files already read and queued for yield. Diagnostic accessor.
+    pub(crate) fn ready_files_len(&self) -> usize {
+        self.ready_files.len()
+    }
+
+    /// Number of directories queued for read. Diagnostic accessor.
+    pub(crate) fn pending_dirs_len(&self) -> usize {
+        self.pending_dirs.len()
     }
 
     fn read_dir(

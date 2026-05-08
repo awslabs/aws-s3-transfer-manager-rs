@@ -67,6 +67,41 @@ use std::time::Duration;
 /// Batch size for work generated and submitted in a single round
 const SUBMISSION_QUEUE_SIZE: usize = 64;
 
+thread_local! {
+    /// True while this thread is inside [`Scheduler::generate_work`]. Used
+    /// by [`Scheduler::enqueue_transfer`] to skip driving the scheduler
+    /// when called from inside a `poll_work` frame.
+    ///
+    /// Defense in depth against re-entrancy: both the submission queue
+    /// (see [`SubmissionQueue`] in `runtime::sync`) and the upload_objects
+    /// state machine (see `poll_work` in `upload_objects::transfer`) are
+    /// individually re-entrancy-safe, but making the re-entrant
+    /// `generate_work` call a no-op at the scheduler boundary is cheaper
+    /// than letting the call propagate all the way through the scheduler
+    /// to discover there's no work to do. The outer `generate_work` frame
+    /// will drive the newly-inserted transfer on its next `ready_set.pop`
+    /// iteration.
+    static IN_GENERATE_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard that clears [`IN_GENERATE_WORK`] on drop. Constructed at the
+/// top of [`Scheduler::generate_work`] so the flag is unset even if a nested
+/// `poll_work` panics.
+struct GenerateWorkGuard;
+
+impl GenerateWorkGuard {
+    fn enter() -> Self {
+        IN_GENERATE_WORK.with(|f| f.set(true));
+        Self
+    }
+}
+
+impl Drop for GenerateWorkGuard {
+    fn drop(&mut self) {
+        IN_GENERATE_WORK.with(|f| f.set(false));
+    }
+}
+
 /// Event-driven scheduler for coordinating transfer work.
 ///
 /// Clone is cheap (Arc).
@@ -124,7 +159,18 @@ impl Scheduler {
         }
 
         tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, "transfer enqueued");
-        self.generate_work();
+        // Only drive `generate_work` from the top level. When we are already
+        // inside a `generate_work` frame on this thread (the parent's
+        // `poll_work` called `spawn_children` → `enqueue_transfer`), the
+        // outer frame will pick up the newly-inserted transfer on its next
+        // loop iteration. Re-entering `generate_work` here would deadlock:
+        // the re-entrant frame increments `SubmissionQueue::pending` and
+        // leaves it live until the outer frame finishes, which prevents
+        // `submit_and_reenter` from ever flushing work to the runtime.
+        let reentrant = IN_GENERATE_WORK.with(|f| f.get());
+        if !reentrant {
+            self.generate_work();
+        }
     }
 
     /// Wake a transfer, moving it from pending to ready.
@@ -314,6 +360,7 @@ impl Scheduler {
 
     /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
+        let _guard = GenerateWorkGuard::enter();
         let mut sub = self.0.submission_queue.enter();
         let mut generated = 0usize;
         while self.has_capacity() {

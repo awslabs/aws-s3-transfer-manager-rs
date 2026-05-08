@@ -6,18 +6,58 @@
 use crate::types::{FailedUpload, TransferMetrics};
 
 /// Output type for uploading multiple objects.
+///
+/// Produced by [`UploadObjectsHandle::join`](crate::operation::upload_objects::UploadObjectsHandle::join)
+/// when the transfer reaches a non-error terminal state. Under
+/// [`FailedTransferPolicy::Abort`](crate::types::FailedTransferPolicy::Abort),
+/// `join()` returns an error instead when a child fails, so this output
+/// is only produced on full success or under
+/// [`FailedTransferPolicy::Continue`](crate::types::FailedTransferPolicy::Continue)
+/// (in which case partial failures are recorded in
+/// [`failed_transfers`](Self::failed_transfers)).
+///
+/// # Relationship between fields
+///
+/// For a fully successful transfer, `objects_uploaded` equals the number
+/// of files the walker yielded and `metrics.network_tx` equals the sum of
+/// their on-wire sizes. For a partial-success transfer under
+/// `Continue` policy, the counts diverge:
+///
+/// - `objects_uploaded` counts only children whose
+///   [`UploadHandle::join`](crate::operation::upload::UploadHandle) returned `Ok`.
+/// - `failed_transfers.len()` includes child upload failures and per-entry
+///   walker errors (e.g. an unreadable subdirectory).
+/// - `metrics.network_tx` counts wire bytes including partial bytes sent
+///   by children that ultimately failed. It is not a bytes-per-successful-
+///   object figure.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct UploadObjectsOutput {
     /// Number of objects successfully uploaded.
+    ///
+    /// May be less than the number of entries yielded by the walker when
+    /// per-entry walker errors or child upload failures were recorded. See
+    /// [`failed_transfers`](Self::failed_transfers) for failure details.
     pub objects_uploaded: u64,
 
-    /// Details for each upload that failed. Empty on a fully successful transfer.
+    /// Details for each upload that failed. Empty on a fully successful
+    /// transfer.
+    ///
+    /// Includes both child upload failures (S3 errors, SDK errors) and
+    /// per-entry walker errors (e.g. a subdirectory that could not be
+    /// read while the rest of the tree was enumerable).
     pub failed_transfers: Vec<FailedUpload>,
 
     /// Aggregated metrics across every completed child upload: network and
     /// disk byte counters plus start/finish timestamps. See
     /// [`TransferMetrics`] for the full set of fields.
+    ///
+    /// `network_tx` counts all wire bytes sent during the transfer,
+    /// including partial bytes from children that ultimately failed.
+    /// `disk_read` counts bytes read from local files during upload. Use
+    /// [`objects_uploaded`](Self::objects_uploaded) for the count of
+    /// successful objects; do not derive a bytes-per-object figure from
+    /// the ratio.
     pub metrics: TransferMetrics,
 }
 

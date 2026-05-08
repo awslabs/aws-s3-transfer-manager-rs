@@ -47,8 +47,13 @@ use crate::transfer::StateMachineTerminalReceiver;
 /// When the handle is dropped without calling `join()` or `abort()`:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - In-flight child uploads may be interrupted at await points
-/// - Drop returns immediately without waiting for in-flight work
+/// - In-flight child uploads may be interrupted at their next await point
+/// - Drop returns immediately without waiting for in-flight work to settle
+///
+/// Because `Drop` cannot be async, any child uploads that are mid-HTTP-
+/// request when the handle is dropped will continue briefly until they
+/// reach a cancellation point. For a clean shutdown that blocks until all
+/// cleanup is complete, call [`abort`](Self::abort) instead of dropping.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct UploadObjectsHandle {

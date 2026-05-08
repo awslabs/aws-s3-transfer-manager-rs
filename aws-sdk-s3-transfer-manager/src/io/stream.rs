@@ -93,20 +93,30 @@ impl InputStream {
         Self::read_from().path(path).build()
     }
 
-    /// Converts `InputStream` to ByteStream that can be used in PutObject.
-    pub(crate) async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
+    /// Consumes the stream into a source that can produce a fresh
+    /// [`ByteStream`] on each call to
+    /// [`RebuildableSource::build_byte_stream`]. Used by the TM-level retry
+    /// wrapper around `PutObject`: each retry attempt is a new top-level
+    /// SDK call and needs an unconsumed body, which the SDK's own internal
+    /// retries do not provide.
+    ///
+    /// `Dyn` (user-provided custom) streams cannot be rewound and are
+    /// rejected. By contract, streams that report
+    /// [`is_mpu_only`](Self::is_mpu_only) are routed through the multipart
+    /// path before reaching `PutObject`, so this error is defense-in-depth
+    /// rather than an expected outcome.
+    pub(crate) fn into_rebuildable(self) -> Result<RebuildableSource, error::Error> {
         match self.inner {
-            RawInputStream::Fs(path_body) => ByteStream::read_from()
-                .path(&path_body.path)
-                .offset(path_body.offset)
-                .length(aws_sdk_s3::primitives::Length::Exact(path_body.length))
-                .build()
-                .await
-                .map_err(error::from_kind(error::ErrorKind::IOError)),
-            RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
-            RawInputStream::Dyn(_) => {
-                unreachable!("dyn InputStream should not have into_byte_stream called on it!")
-            }
+            RawInputStream::Fs(path_body) => Ok(RebuildableSource::File {
+                path: path_body.path,
+                offset: path_body.offset,
+                length: path_body.length,
+            }),
+            RawInputStream::Buf(bytes) => Ok(RebuildableSource::Bytes(bytes)),
+            RawInputStream::Dyn(_) => Err(error::Error::new(
+                error::ErrorKind::InputInvalid,
+                "dyn InputStream cannot be used with PutObject (must use multipart)",
+            )),
         }
     }
 
@@ -116,6 +126,11 @@ impl InputStream {
     pub(crate) fn is_mpu_only(&self) -> bool {
         // TODO - for our own wrappers we can probably be smarter
         matches!(self.inner, RawInputStream::Dyn(_))
+    }
+
+    /// Returns `true` when this `InputStream` reads from a local file.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self.inner, RawInputStream::Fs(_))
     }
 
     /// Create a new `InputStream` that reads data from the given [`PartStream`] implementation
@@ -139,6 +154,45 @@ pub(super) enum RawInputStream {
     Fs(PathBody),
     /// User provided custom stream
     Dyn(BoxStream),
+}
+
+/// Source data in a form that can produce a fresh `ByteStream` on each
+/// invocation. Used by `PutObject` execution to rebuild the body between
+/// TM-level retry attempts (top-level retries create new SDK calls, each of
+/// which needs its own unconsumed body).
+#[derive(Debug)]
+pub(crate) enum RebuildableSource {
+    /// File-backed body. Each build reopens the file at the recorded
+    /// offset and reads `length` bytes.
+    File {
+        path: std::path::PathBuf,
+        offset: u64,
+        length: u64,
+    },
+    /// In-memory body. Each build clones the `Bytes` handle (ref-count
+    /// bump, no copy).
+    Bytes(Bytes),
+}
+
+impl RebuildableSource {
+    /// Build a fresh [`ByteStream`] from this source. May be called multiple
+    /// times; each call yields an unconsumed stream at the start of the body.
+    pub(crate) async fn build_byte_stream(&self) -> Result<ByteStream, error::Error> {
+        match self {
+            Self::File {
+                path,
+                offset,
+                length,
+            } => ByteStream::read_from()
+                .path(path)
+                .offset(*offset)
+                .length(aws_sdk_s3::primitives::Length::Exact(*length))
+                .build()
+                .await
+                .map_err(error::from_kind(error::ErrorKind::IOError)),
+            Self::Bytes(bytes) => Ok(ByteStream::from(bytes.clone())),
+        }
+    }
 }
 
 /// The context of an input stream.
