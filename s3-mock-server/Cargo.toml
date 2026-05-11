@@ -10,7 +10,7 @@ description = "A mock S3 server for testing and benchmarking the AWS S3 Transfer
 [dependencies]
 async-trait = "0.1.83"
 aws-config = "1.6.3"
-aws-sdk-s3 = "1.86.0"
+aws-sdk-s3 = { version = "1.86.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-checksums = "0.63.7"
 base64 = "0.22.1"
 bytes = "1"

@@ -17,7 +17,7 @@ keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 async-channel = "2.3.1"
 async-trait = "0.1.88"
 aws-config = { version = "1.8.2", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.97.0", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.97.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-async = "1.2.5"
 aws-smithy-runtime-api = "1.8.3"
 aws-runtime = "1.5.9"
@@ -36,7 +36,7 @@ walkdir = "2"
 tokio-util = "0.7.13"
 
 [dev-dependencies]
-aws-sdk-s3 = { version = "1.97.0", features = ["behavior-version-latest", "test-util"] }
+aws-sdk-s3 = { version = "1.97.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a", "test-util"] }
 aws-smithy-checksums = "0.63.4"
 aws-smithy-mocks = "0.1.1"
 aws-smithy-runtime = { version = "1.8.4", features = ["client", "test-util"] }
