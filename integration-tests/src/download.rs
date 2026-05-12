@@ -485,7 +485,7 @@ async fn test_download_empty_object() {
     let (server, server_handle, tm) = setup().await;
 
     server
-        .add_object("empty-key", vec![], None)
+        .add_object("test-bucket", "empty-key", vec![], None)
         .await
         .expect("add object");
 
