@@ -100,7 +100,8 @@ fn download_throughput_benchmark(c: &mut Criterion) {
                                 .key("test-key")
                                 .initiate()
                                 .expect("successful transfer initiate");
-                            black_box(drain(&mut dl_handle).await.unwrap());
+                            drain(&mut dl_handle).await.unwrap();
+                            black_box(&dl_handle);
                         }
                         let elapsed = start.elapsed();
 

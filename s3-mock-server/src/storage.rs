@@ -288,6 +288,7 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     async fn upload_part(&self, request: UploadPartRequest<'_>) -> Result<UploadPartResponse>;
 
     /// List all parts for a multipart upload.
+    #[allow(dead_code)]
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>>;
 
     /// Complete a multipart upload by combining parts into a final object.
