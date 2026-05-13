@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// A stream that yields bytes from a Vec<Bytes> in memory.
+/// A stream that yields bytes from a `Vec<Bytes>` in memory.
 ///
 /// This is similar to s3s::stream::VecByteStream but adapted for our needs.
 /// It's useful for implementing streaming GetObject for in-memory storage.
