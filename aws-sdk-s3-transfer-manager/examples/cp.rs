@@ -77,6 +77,10 @@ pub struct Args {
     /// Directory to write dial9 runtime traces (enables tracing when set)
     #[arg(long)]
     trace_dir: Option<String>,
+
+    /// Enable CPU profiling in dial9 traces (Linux only, requires --trace-dir)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    cpu_profiling: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -381,9 +385,15 @@ async fn main() -> Result<(), BoxError> {
             .max_total_size(512 * 1024 * 1024)
             .build()
             .expect("failed to create trace writer");
+        let cpu_profiling = if args.cpu_profiling {
+            Some(dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig::default())
+        } else {
+            None
+        };
         let guard = TelemetryCore::builder()
             .writer(writer)
             .trace_path(format!("{trace_dir}/trace.bin"))
+            .maybe_cpu_profiling(cpu_profiling)
             .build()
             .expect("failed to create telemetry session");
         guard.enable();
