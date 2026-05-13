@@ -101,6 +101,13 @@ pub(crate) struct ObjectMetadata {
     pub crc64nvme: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
+
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
 }
 
 impl ObjectMetadata {
@@ -128,6 +135,12 @@ impl Default for ObjectMetadata {
             crc64nvme: None,
             sha1: None,
             sha256: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
         }
     }
 }
@@ -152,6 +165,10 @@ pub(crate) struct PartMetadata {
 /// Metadata for a multipart upload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MultipartUploadMetadata {
+    /// Bucket the completed object belongs to.
+    #[serde(default)]
+    pub bucket: Option<String>,
+
     /// Key of the object being uploaded.
     pub key: String,
 

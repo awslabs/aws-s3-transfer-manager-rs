@@ -66,6 +66,7 @@ impl ServerHandle {
 
     /// Shutdown the server.
     pub async fn shutdown(self) -> Result<()> {
+        tracing::debug!(addr = %self.address, "shutting down mock server");
         let _ = self.shutdown_tx.send(());
         match self.server_task.await {
             Ok(result) => result,
@@ -154,6 +155,68 @@ impl S3MockServerBuilder {
     }
 }
 
+/// Object data returned from direct storage inspection.
+pub struct ObjectData {
+    /// The object body.
+    pub body: bytes::Bytes,
+    /// Content type of the object.
+    pub content_type: Option<String>,
+    /// Size of the object in bytes.
+    pub content_length: u64,
+    /// ETag of the object.
+    pub etag: String,
+    /// Last modified time.
+    pub last_modified: std::time::SystemTime,
+    /// User-defined metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Summary information about an object in a listing.
+pub struct ObjectListEntry {
+    /// The object key.
+    pub key: String,
+    /// Size of the object in bytes.
+    pub size: u64,
+    /// Last modified time.
+    pub last_modified: std::time::SystemTime,
+    /// ETag of the object.
+    pub etag: String,
+}
+
+/// Request for adding an object via the direct (non-S3-protocol) API.
+pub struct AddObjectRequest {
+    pub content: bytes::Bytes,
+    pub content_type: Option<String>,
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+    pub last_modified: Option<std::time::SystemTime>,
+}
+
+impl AddObjectRequest {
+    pub fn new(content: impl Into<bytes::Bytes>) -> Self {
+        Self {
+            content: content.into(),
+            content_type: None,
+            metadata: None,
+            last_modified: None,
+        }
+    }
+
+    pub fn content_type(mut self, ct: impl Into<String>) -> Self {
+        self.content_type = Some(ct.into());
+        self
+    }
+
+    pub fn metadata(mut self, meta: std::collections::HashMap<String, String>) -> Self {
+        self.metadata = Some(meta);
+        self
+    }
+
+    pub fn last_modified(mut self, time: std::time::SystemTime) -> Self {
+        self.last_modified = Some(time);
+        self
+    }
+}
+
 /// S3 Mock Server.
 pub struct S3MockServer {
     /// Storage backend.
@@ -172,24 +235,118 @@ impl S3MockServer {
     /// Add an object to the mock server storage.
     pub async fn add_object(
         &self,
+        bucket: &str,
         key: &str,
         content: impl Into<bytes::Bytes>,
         metadata: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<()> {
+        let mut req = AddObjectRequest::new(content);
+        req.metadata = metadata;
+        self.add_object_with(bucket, key, req).await
+    }
+
+    /// Add an object with full control over metadata fields.
+    pub async fn add_object_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        request: AddObjectRequest,
     ) -> Result<()> {
         use crate::storage::StoreObjectRequest;
         use crate::types::ObjectIntegrityChecks;
         use futures::stream;
 
-        let bytes = content.into();
+        let bytes = request.content;
         let stream = stream::once(async move { Ok(bytes) });
         let boxed_stream = Box::pin(stream);
 
-        let request =
-            StoreObjectRequest::new(key.to_string(), boxed_stream, ObjectIntegrityChecks::new())
-                .with_user_metadata(metadata.unwrap_or_default());
+        // Match HTTP PutObject path's default integrity checks so seeded
+        // objects have the same HeadObject state (ETag via md5, default
+        // CRC64NVME checksum) as objects uploaded via the S3 API.
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5().with_crc64nvme();
 
-        self.storage.put_object(request).await?;
+        let mut store_req =
+            StoreObjectRequest::new(bucket, key.to_string(), boxed_stream, integrity_checks)
+                .with_user_metadata(request.metadata.unwrap_or_default());
+        store_req.content_type = request.content_type;
+        store_req.last_modified = request.last_modified;
+
+        self.storage.put_object(store_req).await?;
         Ok(())
+    }
+
+    /// Create a bucket in the mock server.
+    pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        self.storage.create_bucket(bucket).await
+    }
+
+    /// Check if an object exists.
+    pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        Ok(self.storage.head_object(bucket, key).await?.is_some())
+    }
+
+    /// Get object content and metadata directly from storage.
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectData>> {
+        use crate::storage::GetObjectRequest;
+        use futures::StreamExt;
+
+        let request = GetObjectRequest {
+            bucket,
+            key,
+            range: None,
+        };
+        let response = match self.storage.get_object(request).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let mut body = Vec::new();
+        let mut stream = response.stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(Some(ObjectData {
+            body: bytes::Bytes::from(body),
+            content_type: response.metadata.content_type,
+            content_length: response.metadata.content_length,
+            etag: response.metadata.etag,
+            last_modified: response.metadata.last_modified,
+            metadata: response.metadata.user_metadata,
+        }))
+    }
+
+    /// List objects in a bucket with optional prefix.
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ObjectListEntry>> {
+        use crate::storage::ListObjectsRequest;
+
+        let request = ListObjectsRequest { bucket, prefix };
+        let response = self.storage.list_objects(request).await?;
+        Ok(response
+            .objects
+            .into_iter()
+            .map(|o| ObjectListEntry {
+                key: o.key,
+                size: o.metadata.content_length,
+                last_modified: o.metadata.last_modified,
+                etag: o.metadata.etag,
+            })
+            .collect())
+    }
+
+    /// Delete an object.
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.storage.delete_object(bucket, key).await
+    }
+
+    /// Reset all state (clear all buckets, objects, and in-flight uploads).
+    pub async fn reset(&self) -> Result<()> {
+        self.storage.reset().await
     }
 
     /// Start the server.
@@ -219,10 +376,10 @@ impl S3MockServer {
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-                b.build().into_shared()
+                b.build()
             };
             loop {
-                let (socket, _) = tokio::select! {
+                let (socket, peer) = tokio::select! {
                         res =  listener.accept() => {
                             match res {
                                 Ok(conn) => conn,
@@ -233,14 +390,20 @@ impl S3MockServer {
                             }
                         }
                         _ =  &mut shutdown_rx => {
+                            tracing::debug!("shutdown signal received, breaking accept loop");
                             break;
                         }
                 };
+                tracing::trace!(port = %addr.port(), %peer, "accepted connection");
 
-                let conn = http_server.serve_connection(TokioIo::new(socket), service.clone());
-                let conn = graceful.watch(conn.into_owned());
+                let conn = http_server
+                    .serve_connection(TokioIo::new(socket), service.clone())
+                    .into_owned();
+                let conn = graceful.watch(conn);
                 tokio::spawn(async move {
-                    let _ = conn.await;
+                    if let Err(e) = conn.await {
+                        tracing::trace!("connection error: {e}");
+                    }
                 });
             }
 

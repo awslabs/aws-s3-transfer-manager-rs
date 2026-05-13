@@ -118,7 +118,7 @@ async fn test_download_metrics_and_status() {
     let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
     server
-        .add_object("metrics-download", content, None)
+        .add_object("test-bucket", "metrics-download", content, None)
         .await
         .expect("add object");
 
@@ -158,7 +158,7 @@ async fn test_download_to_file_metrics() {
     let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
     server
-        .add_object("metrics-file-download", content, None)
+        .add_object("test-bucket", "metrics-file-download", content, None)
         .await
         .expect("add object");
 
@@ -221,7 +221,7 @@ async fn test_download_abort_status() {
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
     server
-        .add_object("metrics-abort-download", content, None)
+        .add_object("test-bucket", "metrics-abort-download", content, None)
         .await
         .expect("add object");
 

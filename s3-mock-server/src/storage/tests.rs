@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use tempfile::tempdir;
 
+const TEST_BUCKET: &str = "test-bucket";
+
 /// Helper function to collect stream data into bytes
 async fn collect_stream_data(
     mut stream: Box<
@@ -46,8 +48,8 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         ..Default::default()
     };
 
-    // Create multipart upload
     let request = CreateMultipartUploadRequest {
+        bucket: TEST_BUCKET,
         key,
         upload_id,
         metadata,
@@ -83,6 +85,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
 
     // Complete multipart upload
     let complete_request = CompleteMultipartUploadRequest {
+        bucket: TEST_BUCKET,
         upload_id,
         parts: vec![(1, etag1), (2, etag2), (3, etag3)],
         client_checksums: None,
@@ -106,6 +109,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
 
     for (range, expected_size) in test_cases {
         let get_request = GetObjectRequest {
+            bucket: TEST_BUCKET,
             key,
             range: range.clone(),
         };
@@ -156,42 +160,45 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
     }
 
     // Clean up
-    storage.delete_object(key).await.unwrap();
+    storage.delete_object(TEST_BUCKET, key).await.unwrap();
 }
 
 /// Test concurrent operations to ensure thread safety
 async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
-    let tasks = (0..10).map(|i| {
-        async move {
-            let key = format!("concurrent-object-{}", i);
-            let content = Bytes::from(format!("Content for object {}", i));
+    let tasks = (0..10).map(|i| async move {
+        let key = format!("concurrent-object-{}", i);
+        let content = Bytes::from(format!("Content for object {}", i));
 
-            // Create a streaming request
-            let content_for_stream = content.clone();
-            let stream = futures::stream::once(async move { Ok(content_for_stream) });
-            let request = StoreObjectRequest {
-                key: key.clone(),
-                body: Box::pin(stream),
-                integrity_checks: ObjectIntegrityChecks::new().with_md5(),
-                content_type: Some("text/plain".to_string()),
-                user_metadata: HashMap::new(),
-            };
+        let content_for_stream = content.clone();
+        let stream = futures::stream::once(async move { Ok(content_for_stream) });
+        let request = StoreObjectRequest {
+            bucket: TEST_BUCKET.to_string(),
+            key: key.clone(),
+            body: Box::pin(stream),
+            integrity_checks: ObjectIntegrityChecks::new().with_md5(),
+            content_type: Some("text/plain".to_string()),
+            user_metadata: HashMap::new(),
+            last_modified: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
+        };
 
-            // Put object
-            storage.put_object(request).await.unwrap();
+        storage.put_object(request).await.unwrap();
 
-            // Get object
-            let get_request = GetObjectRequest {
-                key: &key,
-                range: None,
-            };
-            let response = storage.get_object(get_request).await.unwrap().unwrap();
-            let retrieved_content = collect_stream_data(response.stream).await.unwrap();
-            assert_eq!(retrieved_content, content);
+        let get_request = GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key: &key,
+            range: None,
+        };
+        let response = storage.get_object(get_request).await.unwrap().unwrap();
+        let retrieved_content = collect_stream_data(response.stream).await.unwrap();
+        assert_eq!(retrieved_content, content);
 
-            // Delete object
-            storage.delete_object(&key).await.unwrap();
-        }
+        storage.delete_object(TEST_BUCKET, &key).await.unwrap();
     });
 
     futures::future::join_all(tasks).await;
@@ -222,36 +229,42 @@ async fn test_storage_backend_consistency() {
     let key = "consistency-test";
     let content = Bytes::from("Test content for consistency");
 
-    // Test both storages with the same operations
     for storage in [
         &fs_storage as &dyn StorageBackend,
         &mem_storage as &dyn StorageBackend,
     ] {
-        // Store object
         let content_for_stream = content.clone();
         let stream = futures::stream::once(async move { Ok(content_for_stream) });
         let request = StoreObjectRequest {
+            bucket: TEST_BUCKET.to_string(),
             key: key.to_string(),
             body: Box::pin(stream),
             integrity_checks: ObjectIntegrityChecks::new().with_md5(),
             content_type: Some("text/plain".to_string()),
             user_metadata: HashMap::new(),
+            last_modified: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 
-        // Retrieve object
-        let get_request = GetObjectRequest { key, range: None };
+        let get_request = GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let response = storage.get_object(get_request).await.unwrap().unwrap();
         let retrieved_content = collect_stream_data(response.stream).await.unwrap();
 
-        // Verify consistency
         assert_eq!(retrieved_content, content);
         assert_eq!(response.metadata.content_length, content.len() as u64);
-        // Verify object integrity was calculated
         assert!(stored_metadata.object_integrity.etag().is_some());
 
-        // Clean up
-        storage.delete_object(key).await.unwrap();
+        storage.delete_object(TEST_BUCKET, key).await.unwrap();
     }
 }
 
@@ -270,27 +283,26 @@ async fn test_checksum_storage_backend<S: StorageBackend + ?Sized>(storage: &S) 
     let key = "test-checksum-object";
     let test_data = Bytes::from("Hello, checksum world!");
 
-    // Create integrity checks with multiple algorithms
     let integrity_checks = ObjectIntegrityChecks::new()
         .with_md5()
         .with_crc32()
         .with_sha256();
 
     let stream = Box::pin(futures::stream::once(async move { Ok(test_data) }));
-    let request = StoreObjectRequest::new(key, stream, integrity_checks);
+    let request = StoreObjectRequest::new(TEST_BUCKET, key, stream, integrity_checks);
 
-    // Store the object
     let stored_meta = storage.put_object(request).await.unwrap();
 
-    // Verify checksums were calculated
     assert!(stored_meta.object_integrity.etag().is_some());
     assert!(stored_meta.object_integrity.crc32.is_some());
     assert!(stored_meta.object_integrity.sha256.is_some());
 
-    // Retrieve object metadata
-    let retrieved_meta = storage.head_object(key).await.unwrap().unwrap();
+    let retrieved_meta = storage
+        .head_object(TEST_BUCKET, key)
+        .await
+        .unwrap()
+        .unwrap();
 
-    // Verify checksums are stored in metadata
     assert!(retrieved_meta.crc32.is_some());
     assert!(retrieved_meta.sha256.is_some());
     assert_eq!(

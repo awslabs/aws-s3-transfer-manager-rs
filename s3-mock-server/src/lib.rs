@@ -19,4 +19,7 @@ mod types;
 
 pub use error::Error;
 pub use error::Result;
-pub use server::{S3MockServer, S3MockServerBuilder, ServerConfig, ServerHandle};
+pub use server::{
+    AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
+    ServerHandle,
+};

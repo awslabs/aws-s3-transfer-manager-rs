@@ -23,6 +23,22 @@ use crate::types::StoredObjectMetadata;
 /// Type alias for complex part storage structure
 type PartStorage = HashMap<i32, (Bytes, PartMetadata)>;
 
+/// State for a single bucket, including its creation time and objects.
+#[derive(Debug)]
+struct BucketState {
+    created_at: SystemTime,
+    objects: HashMap<String, (Bytes, ObjectMetadata)>,
+}
+
+impl BucketState {
+    fn new() -> Self {
+        Self {
+            created_at: SystemTime::now(),
+            objects: HashMap::new(),
+        }
+    }
+}
+
 /// An in-memory implementation of the StorageBackend trait.
 ///
 /// This implementation stores all objects, metadata, and multipart uploads in memory,
@@ -30,8 +46,8 @@ type PartStorage = HashMap<i32, (Bytes, PartMetadata)>;
 /// instance is dropped.
 #[derive(Debug)]
 pub(crate) struct InMemoryStorage {
-    /// Objects stored as (key -> (data, metadata))
-    objects: RwLock<HashMap<String, (Bytes, ObjectMetadata)>>,
+    /// Objects stored as bucket_name → BucketState { created_at, objects: key → (data, metadata) }
+    buckets: RwLock<HashMap<String, BucketState>>,
 
     /// Active multipart uploads stored as (upload_id -> upload_metadata)
     multipart_uploads: RwLock<HashMap<String, MultipartUploadMetadata>>,
@@ -44,7 +60,7 @@ impl InMemoryStorage {
     /// Create a new in-memory storage backend.
     pub(crate) fn new() -> Self {
         Self {
-            objects: RwLock::new(HashMap::new()),
+            buckets: RwLock::new(HashMap::new()),
             multipart_uploads: RwLock::new(HashMap::new()),
             parts: RwLock::new(HashMap::new()),
         }
@@ -70,9 +86,8 @@ impl StorageBackend for InMemoryStorage {
         let content = content.freeze();
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
-        let last_modified = SystemTime::now();
+        let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
-        // Store with checksum metadata
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
@@ -85,10 +100,22 @@ impl StorageBackend for InMemoryStorage {
             crc64nvme: object_integrity.crc64nvme.clone(),
             sha1: object_integrity.sha1.clone(),
             sha256: object_integrity.sha256.clone(),
+            storage_class: request.storage_class,
+            server_side_encryption: request.server_side_encryption,
+            cache_control: request.cache_control,
+            content_encoding: request.content_encoding,
+            content_disposition: request.content_disposition,
+            content_language: request.content_language,
         };
 
-        let mut objects = self.objects.write().await;
-        objects.insert(request.key.clone(), (content, metadata));
+        let mut buckets = self.buckets.write().await;
+        // Auto-create bucket if it doesn't exist (backward compatibility)
+        let bucket_state = buckets
+            .entry(request.bucket)
+            .or_insert_with(BucketState::new);
+        bucket_state
+            .objects
+            .insert(request.key.clone(), (content, metadata));
 
         Ok(StoredObjectMetadata { object_integrity })
     }
@@ -97,9 +124,13 @@ impl StorageBackend for InMemoryStorage {
         &self,
         request: crate::storage::GetObjectRequest<'_>,
     ) -> Result<Option<crate::storage::GetObjectResponse>> {
-        let objects = self.objects.read().await;
-        let (data, metadata) = match objects.get(request.key) {
-            Some((data, metadata)) => (data, metadata),
+        let buckets = self.buckets.read().await;
+        let bucket_state = match buckets.get(request.bucket) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let (data, metadata) = match bucket_state.objects.get(request.key) {
+            Some(entry) => entry,
             None => return Ok(None),
         };
 
@@ -115,7 +146,6 @@ impl StorageBackend for InMemoryStorage {
             dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
         > = Box::new(stream);
 
-        // Clear checksums for range requests since they apply to full object
         let mut response_metadata = metadata.clone();
         if is_range_request {
             response_metadata.clear_checksums();
@@ -127,11 +157,11 @@ impl StorageBackend for InMemoryStorage {
         }))
     }
 
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        let mut objects = self.objects.write().await;
-        if objects.remove(key).is_none() {
-            return Err(Error::NoSuchKey);
-        }
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        // DeleteObject is idempotent: deleting a non-existent key is not an error.
+        bucket_state.objects.remove(key);
         Ok(())
     }
 
@@ -139,10 +169,18 @@ impl StorageBackend for InMemoryStorage {
         &self,
         request: crate::storage::ListObjectsRequest<'_>,
     ) -> Result<crate::storage::ListObjectsResponse> {
-        let objects = self.objects.read().await;
-        let mut matching_objects = Vec::new();
+        let buckets = self.buckets.read().await;
+        let bucket_state = match buckets.get(request.bucket) {
+            Some(s) => s,
+            None => {
+                return Ok(crate::storage::ListObjectsResponse {
+                    objects: Vec::new(),
+                })
+            }
+        };
 
-        for (key, (_, metadata)) in objects.iter() {
+        let mut matching_objects = Vec::new();
+        for (key, (_, metadata)) in bucket_state.objects.iter() {
             if let Some(prefix) = request.prefix {
                 if !key.starts_with(prefix) {
                     continue;
@@ -154,12 +192,63 @@ impl StorageBackend for InMemoryStorage {
             });
         }
 
-        // Sort by key for consistent ordering
         matching_objects.sort_by(|a, b| a.key.cmp(&b.key));
 
         Ok(crate::storage::ListObjectsResponse {
             objects: matching_objects,
         })
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMetadata>> {
+        let buckets = self.buckets.read().await;
+        let bucket_state = match buckets.get(bucket) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        Ok(bucket_state
+            .objects
+            .get(key)
+            .map(|(_, metadata)| metadata.clone()))
+    }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        buckets
+            .entry(bucket.to_string())
+            .or_insert_with(BucketState::new);
+        Ok(())
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        match buckets.get(bucket) {
+            Some(state) if !state.objects.is_empty() => {
+                Err(Error::Internal("bucket is not empty".to_string()))
+            }
+            Some(_) => {
+                buckets.remove(bucket);
+                Ok(())
+            }
+            None => Err(Error::NoSuchBucket),
+        }
+    }
+
+    async fn head_bucket(&self, bucket: &str) -> Result<bool> {
+        let buckets = self.buckets.read().await;
+        Ok(buckets.contains_key(bucket))
+    }
+
+    async fn list_buckets(&self) -> Result<Vec<crate::storage::BucketInfo>> {
+        let buckets = self.buckets.read().await;
+        let mut result: Vec<crate::storage::BucketInfo> = buckets
+            .iter()
+            .map(|(name, state)| crate::storage::BucketInfo {
+                name: name.clone(),
+                creation_date: state.created_at,
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
     }
 
     async fn create_multipart_upload(
@@ -173,6 +262,7 @@ impl StorageBackend for InMemoryStorage {
             metadata: request.metadata,
             parts: HashMap::new(),
             checksum_type: Some(request.checksum_type),
+            bucket: Some(request.bucket.to_string()),
         };
         uploads.insert(request.upload_id.to_string(), upload_metadata);
 
@@ -277,12 +367,13 @@ impl StorageBackend for InMemoryStorage {
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
     ) -> Result<crate::storage::CompleteMultipartUploadResponse> {
         // Get the upload metadata
-        let (key, mut final_metadata, checksum_algorithm, checksum_type) = {
+        let (bucket, key, mut final_metadata, checksum_algorithm, checksum_type) = {
             let mut uploads = self.multipart_uploads.write().await;
             let upload = uploads
                 .remove(request.upload_id)
                 .ok_or(Error::NoSuchUpload)?;
             (
+                upload.bucket.unwrap_or_else(|| request.bucket.to_string()),
                 upload.key,
                 upload.metadata.clone(),
                 upload.metadata.checksum_algorithm,
@@ -428,8 +519,12 @@ impl StorageBackend for InMemoryStorage {
 
         // Store the final object
         let combined_data = combined.freeze();
-        let mut objects = self.objects.write().await;
-        objects.insert(key.clone(), (combined_data, final_metadata.clone()));
+        let mut buckets = self.buckets.write().await;
+        // Auto-create bucket if it doesn't exist
+        let bucket_state = buckets.entry(bucket).or_insert_with(BucketState::new);
+        bucket_state
+            .objects
+            .insert(key.clone(), (combined_data, final_metadata.clone()));
 
         Ok(crate::storage::CompleteMultipartUploadResponse {
             key: key.clone(),
@@ -456,9 +551,11 @@ impl StorageBackend for InMemoryStorage {
         Ok(())
     }
 
-    async fn head_object(&self, key: &str) -> Result<Option<ObjectMetadata>> {
-        let objects = self.objects.read().await;
-        Ok(objects.get(key).map(|(_, metadata)| metadata.clone()))
+    async fn reset(&self) -> Result<()> {
+        self.buckets.write().await.clear();
+        self.multipart_uploads.write().await.clear();
+        self.parts.write().await.clear();
+        Ok(())
     }
 }
 
@@ -469,6 +566,8 @@ mod tests {
     use futures::StreamExt;
     use std::collections::HashMap;
     use std::pin::Pin;
+
+    const TEST_BUCKET: &str = "test-bucket";
 
     // Helper function to collect stream data into bytes
     async fn collect_stream_data(
@@ -495,7 +594,6 @@ mod tests {
         }
     }
 
-    // Helper function to convert Bytes to a stream for testing
     fn bytes_to_stream(
         data: Bytes,
     ) -> Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>> {
@@ -513,6 +611,7 @@ mod tests {
         let stream = bytes_to_stream(content.clone());
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -521,17 +620,18 @@ mod tests {
             .unwrap();
 
         // Get object
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
-        let retrieved_stream = response.stream;
-        let retrieved_metadata = response.metadata;
-        let retrieved_content = collect_stream_data(retrieved_stream).await;
+        let retrieved_content = collect_stream_data(response.stream).await;
         assert_eq!(retrieved_content, content);
-        assert_eq!(retrieved_metadata.content_length, content.len() as u64);
-        // Content type is not preserved in the new streaming API
-        assert_eq!(retrieved_metadata.content_type, None);
+        assert_eq!(response.metadata.content_length, content.len() as u64);
+        assert_eq!(response.metadata.content_type, None);
     }
 
     #[tokio::test]
@@ -541,10 +641,10 @@ mod tests {
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content);
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -552,14 +652,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Get range
-        let range = Some(2..5);
-        let request = crate::storage::GetObjectRequest { key, range };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: Some(2..5),
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
-        let retrieved_stream = response.stream;
-        let retrieved_content = collect_stream_data(retrieved_stream).await;
+        let retrieved_content = collect_stream_data(response.stream).await;
         assert_eq!(retrieved_content, Bytes::from("234"));
     }
 
@@ -570,10 +671,10 @@ mod tests {
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
 
-        // Put object
         let stream = bytes_to_stream(content);
         storage
             .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
                 key,
                 stream,
                 integrity_checks,
@@ -581,16 +682,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify it exists
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
 
-        // Delete object
-        storage.delete_object(key).await.unwrap();
+        storage.delete_object(TEST_BUCKET, key).await.unwrap();
 
-        // Verify it's gone
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_none());
     }
@@ -600,13 +706,13 @@ mod tests {
         let storage = InMemoryStorage::new();
         let content = Bytes::from("test content");
 
-        // Put multiple objects
         for i in 0..3 {
             let key = format!("test-key-{}", i);
             let integrity_checks = ObjectIntegrityChecks::new().with_md5();
             let stream = bytes_to_stream(content.clone());
             storage
                 .put_object(crate::storage::StoreObjectRequest::new(
+                    TEST_BUCKET,
                     &key,
                     stream,
                     integrity_checks,
@@ -615,13 +721,15 @@ mod tests {
                 .unwrap();
         }
 
-        // List all objects
-        let request = crate::storage::ListObjectsRequest { prefix: None };
+        let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
+            prefix: None,
+        };
         let objects = storage.list_objects(request).await.unwrap();
         assert_eq!(objects.objects.len(), 3);
 
-        // List with prefix
         let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
             prefix: Some("test-key-1"),
         };
         let objects = storage.list_objects(request).await.unwrap();
@@ -634,10 +742,10 @@ mod tests {
         let storage = InMemoryStorage::new();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
-        let metadata = create_test_metadata(0); // Will be updated on completion
+        let metadata = create_test_metadata(0);
 
-        // Create multipart upload
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             key,
             upload_id,
             metadata,
@@ -645,7 +753,6 @@ mod tests {
         };
         storage.create_multipart_upload(request).await.unwrap();
 
-        // Upload parts
         let part1 = Bytes::from("part1");
         let part2 = Bytes::from("part2");
 
@@ -662,14 +769,13 @@ mod tests {
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
-        // List parts
         let parts = storage.list_parts(upload_id).await.unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].part_number, 1); // part number
+        assert_eq!(parts[0].part_number, 1);
 
-        // Complete multipart upload
         let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
         let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
@@ -678,8 +784,11 @@ mod tests {
 
         assert_eq!(response.key, key);
 
-        // Verify the final object exists and has correct content length
-        let request = crate::storage::GetObjectRequest { key, range: None };
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
         let result = storage.get_object(request).await.unwrap();
         assert!(result.is_some());
         let response = result.unwrap();
@@ -687,8 +796,7 @@ mod tests {
             response.metadata.content_length,
             (part1.len() + part2.len()) as u64
         );
-        let final_stream = response.stream;
-        let final_content = collect_stream_data(final_stream).await;
+        let final_content = collect_stream_data(response.stream).await;
         assert_eq!(final_content, Bytes::from("part1part2"));
     }
 
@@ -699,8 +807,8 @@ mod tests {
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
 
-        // Create multipart upload
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             key,
             upload_id,
             metadata,
@@ -708,7 +816,6 @@ mod tests {
         };
         storage.create_multipart_upload(request).await.unwrap();
 
-        // Upload only one part
         let part1 = Bytes::from("part1");
         let request = crate::storage::UploadPartRequest {
             upload_id,
@@ -717,9 +824,9 @@ mod tests {
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
-        // Try to complete with a missing part
         let parts_to_complete = vec![(1, etag1.etag), (2, "missing-etag".to_string())];
         let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
@@ -735,8 +842,8 @@ mod tests {
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
 
-        // Create multipart upload
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
             key,
             upload_id,
             metadata,
@@ -744,7 +851,6 @@ mod tests {
         };
         storage.create_multipart_upload(request).await.unwrap();
 
-        // Upload a part
         let part1 = Bytes::from("part1");
         let request = crate::storage::UploadPartRequest {
             upload_id,
@@ -753,10 +859,8 @@ mod tests {
         };
         storage.upload_part(request).await.unwrap();
 
-        // Abort the upload
         storage.abort_multipart_upload(upload_id).await.unwrap();
 
-        // Verify we can't list parts anymore
         let result = storage.list_parts(upload_id).await;
         assert!(result.is_err());
     }
