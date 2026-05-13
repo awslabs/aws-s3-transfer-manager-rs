@@ -42,13 +42,51 @@
 //! until `wake()` is called, which re-inserts the transfer into the ready set and
 //! triggers work generation.
 //!
+//! # Threading and Cost
+//!
+//! Scheduler work runs on the caller's thread. `on_completion` and `wake` drive
+//! `generate_work` synchronously on whatever thread invoked them — typically a
+//! managed execution thread. This is a deliberate choice for hot-path throughput
+//! (no channel hop, warm caches, parallel drive across transfers), gated on the
+//! constraints below holding.
+//!
+//! - **`poll_work` is synchronous and short.** No `.await`, no blocking I/O, no
+//!   unbounded loops. Cost is O(1) per call with a bounded critical section on
+//!   state. Long `poll_work` calls pin the caller's runtime, preventing it from
+//!   polling its own async tasks (including in-flight SDK requests).
+//! - **At most one thread is inside `poll_work(desc)` at a time.** Enforced by a
+//!   claim atom on [`descriptor::TransferDescriptor`]. The ready set's insert is
+//!   CAS-gated on this claim, and the claim is held through `pop` and `poll_work`
+//!   until the scheduler has finished handling the outcome. This keeps the
+//!   per-transfer state mutex effectively uncontended in steady state.
+//! - **Ready set entries are unique per transfer id.** Duplicates re-open the
+//!   single-poll invariant and produce lock-contention storms under burst
+//!   completions.
+//! - **Composite transfers pay their own per-call cost.** A composite's
+//!   `poll_work` may recursively call [`Scheduler::enqueue_transfer`] to spawn
+//!   children. The per-call fan-out must be bounded — cost is
+//!   `O(batch × enqueue_cost)`.
+//! - **`execute` is the only async surface.** State locks must not be held across
+//!   `.await`. Mid-execution the transfer may call `scheduler.wake(id)` to
+//!   re-queue itself if intra-execute state changes unblock work.
+//!
 //! # State Machine Contracts
 //!
 //! A [`Transfer`] implementation must uphold:
 //! - **Failed lifecycle**: record the error and signal termination before returning
 //!   a failure outcome.
 //! - **Pending/wake obligation**: every `Pending` must have a future wake path.
-//! - **Panic safety**: handled by the scheduler via `catch_unwind`.
+//!   The wake primitive is edge-triggered; the mutator pattern is
+//!   `lock → mutate → unlock → try_wake`. See [`crate::transfer::TransferContext`]
+//!   for the protocol.
+//! - **Panic safety**: `execute` panics are caught by the runtime's
+//!   `catch_unwind` wrapper and converted to a terminal transition.
+//!   `poll_work` panics are caught by the scheduler itself inside
+//!   `generate_work`, which force-terminates the panicking transfer
+//!   (cascading to children) and continues processing other transfers.
+//!
+//! See `docs/design/scheduler.md` for the long-form design discussion,
+//! invariants, and case studies.
 
 use super::CompletionSample;
 use crate::telemetry;
@@ -56,7 +94,7 @@ use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
 
 use crate::runtime::sync::{Submission, SubmissionQueue};
 use crate::runtime::ScheduledWork;
-use crate::scheduler::descriptor::TransferDescriptor;
+use crate::scheduler::descriptor::{ClaimGuard, TransferDescriptor};
 use crate::scheduler::ready_set::ReadySet;
 use std::collections::HashMap;
 
@@ -182,9 +220,29 @@ impl Scheduler {
             let transfers = self.0.transfers.read().unwrap();
             transfers.get(&id).cloned()
         };
-        if let Some(desc) = desc {
-            self.0.ready_set.insert(desc);
-            self.generate_work();
+        match desc {
+            Some(desc) => {
+                // Mark wake_requested before insert: if a poll is in
+                // flight, it will observe the flag in the release-and-
+                // recheck path. Otherwise the insert (or no-op if
+                // already queued) puts the descriptor back in the
+                // ready set.
+                desc.mark_wake_requested();
+                self.0.ready_set.insert(desc);
+                tracing::trace!(
+                    target: telemetry::TARGET_SCHEDULING,
+                    id = %id,
+                    "wake",
+                );
+                self.generate_work();
+            }
+            None => {
+                tracing::trace!(
+                    target: telemetry::TARGET_SCHEDULING,
+                    id = %id,
+                    "wake.not_found",
+                );
+            }
         }
     }
 
@@ -363,21 +421,53 @@ impl Scheduler {
         let _guard = GenerateWorkGuard::enter();
         let mut sub = self.0.submission_queue.enter();
         let mut generated = 0usize;
-        while self.has_capacity() {
+        let mut polled = 0usize;
+        let mut pending_count = 0usize;
+        let mut done_count = 0usize;
+        let mut terminal_skipped = 0usize;
+        tracing::trace!(
+            target: telemetry::TARGET_SCHEDULING,
+            has_capacity = self.has_capacity(),
+            dispatched = self.0.dispatched.load(Ordering::Relaxed),
+            target = self.handle().controller.target(),
+            "generate_work.enter",
+        );
+        let break_reason = loop {
+            if !self.has_capacity() {
+                break "no_capacity";
+            }
             let Some(desc) = self.0.ready_set.pop() else {
-                break;
+                break "ready_set_empty";
             };
 
-            // Skip cancelled/failed transfers still in the ready set
+            // Skip cancelled/failed transfers still in the ready set.
+            // Release the claim explicitly since we won't call poll_work.
             if desc.is_terminal() {
+                terminal_skipped += 1;
+                let claim = ClaimGuard::new(&desc);
+                claim.release();
                 continue;
             }
 
-            match desc.transfer().poll_work() {
-                PollWork::Ready(item) => {
+            polled += 1;
+            let id = desc.id();
+            // Consume any pre-existing wake signal so we only observe
+            // wakes that arrive DURING the poll below.
+            desc.take_wake_requested();
+
+            let claim = ClaimGuard::new(&desc);
+            let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                desc.transfer().poll_work()
+            }));
+
+            match poll_result {
+                Ok(PollWork::Ready(item)) => {
                     generated += 1;
                     desc.work_generated();
-                    self.0.ready_set.insert(desc.clone());
+                    // Re-insert under the still-held claim — bypasses the
+                    // CAS gate that `insert` would otherwise apply.
+                    claim.hold();
+                    self.0.ready_set.reinsert_under_claim(desc.clone());
                     self.0.dispatched.fetch_add(1, Ordering::Relaxed);
                     desc.work_queued();
                     let work = ScheduledWork {
@@ -386,27 +476,61 @@ impl Scheduler {
                     };
                     sub = self.enqueue(sub, work);
                 }
-                PollWork::Pending => {
-                    // re-added on wake as state machine progresses
+                Ok(PollWork::Pending) => {
+                    pending_count += 1;
+                    tracing::trace!(
+                        target: telemetry::TARGET_SCHEDULING,
+                        id = %id,
+                        "poll_work.pending",
+                    );
+                    // Release-and-recheck. A wake arriving in this
+                    // window either takes the claim itself (its CAS
+                    // succeeds) or sets wake_requested for us to
+                    // observe. See the `claim` module for the protocol.
+                    claim.release();
+                    if desc.take_wake_requested() {
+                        self.0.ready_set.insert(desc);
+                    }
                 }
-                PollWork::Done => {
-                    // done generating work, remove from transfers
+                Ok(PollWork::Done) => {
+                    done_count += 1;
+                    tracing::trace!(
+                        target: telemetry::TARGET_SCHEDULING,
+                        id = %id,
+                        "poll_work.done",
+                    );
+                    claim.release();
                     self.0.transfers.write().unwrap().remove(&desc.id());
                 }
+                Err(_panic_payload) => {
+                    // ClaimGuard's Drop releases the claim. cancel_transfer
+                    // handles terminal transition + child cascade.
+                    tracing::error!(
+                        target: telemetry::TARGET_SCHEDULING,
+                        id = %id,
+                        "panic in poll_work, forcing terminal",
+                    );
+                    drop(claim);
+                    drop(desc);
+                    self.cancel_transfer(id);
+                }
             }
-        }
+        };
         if let Some(mut guard) = sub.submit() {
             self.handle().runtime.dispatch(&mut guard);
         }
-        if generated > 0 {
-            tracing::trace!(
-                target: telemetry::TARGET_SCHEDULING,
-                generated,
-                dispatched = self.0.dispatched.load(Ordering::Relaxed),
-                target = self.handle().controller.target(),
-                "work generated",
-            );
-        }
+        tracing::trace!(
+            target: telemetry::TARGET_SCHEDULING,
+            generated,
+            polled,
+            pending_count,
+            done_count,
+            terminal_skipped,
+            break_reason,
+            dispatched = self.0.dispatched.load(Ordering::Relaxed),
+            target = self.handle().controller.target(),
+            "generate_work.exit",
+        );
     }
 
     #[allow(dead_code)]

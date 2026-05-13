@@ -320,7 +320,7 @@ impl UploadObjectsTransfer {
         let delimiter = self.inner.request.delimiter().map(|s| s.to_string());
 
         let mut batch: Vec<ClaimedEntry> = Vec::new();
-        while state.children.len() + state.children_reserved < pipeline_depth {
+        while state.children.len() + state.children_reserved + batch.len() < pipeline_depth {
             let entry = match state.pending_entries.pop_front() {
                 Some(e) => e,
                 None => break,
@@ -493,14 +493,35 @@ impl UploadObjectsTransfer {
     fn dispatch_walk(&self, state: &mut State) -> PollWork {
         let pipeline_depth = self.pipeline_depth();
         if state.children.len() + state.children_reserved >= pipeline_depth {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                transfer_id = ?self.inner.ctx.id,
+                children = state.children.len(),
+                children_reserved = state.children_reserved,
+                pipeline_depth,
+                "dispatch_walk.pending.pipeline_full"
+            );
             self.inner.ctx.set_pending();
             return PollWork::Pending;
         }
         if state.walks.is_empty() && state.in_flight_walks > 0 {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                transfer_id = ?self.inner.ctx.id,
+                in_flight_walks = state.in_flight_walks,
+                "dispatch_walk.pending.walks_in_flight"
+            );
             self.inner.ctx.set_pending();
             return PollWork::Pending;
         }
         if state.in_flight_walks >= MAX_PARALLEL_WALKS {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                transfer_id = ?self.inner.ctx.id,
+                in_flight_walks = state.in_flight_walks,
+                MAX_PARALLEL_WALKS,
+                "dispatch_walk.pending.walks_saturated"
+            );
             self.inner.ctx.set_pending();
             return PollWork::Pending;
         }
@@ -521,6 +542,14 @@ impl UploadObjectsTransfer {
                 })),
             })
         } else {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                transfer_id = ?self.inner.ctx.id,
+                children = state.children.len(),
+                children_reserved = state.children_reserved,
+                in_flight_walks = state.in_flight_walks,
+                "dispatch_walk.pending.no_walks_no_work"
+            );
             self.inner.ctx.set_pending();
             PollWork::Pending
         }

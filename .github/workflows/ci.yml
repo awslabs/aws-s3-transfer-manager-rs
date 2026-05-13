@@ -306,6 +306,25 @@ jobs:
           LOOM_MAX_BRANCHES: 10000
           RUST_BACKTRACE: 1
 
+  stress:
+    name: stress
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: stress tests
+        run: |
+          cargo test -p aws-sdk-s3-transfer-manager --release \
+            --test upload_objects_test \
+            -- --ignored --nocapture test_stress
+        env:
+          RUST_BACKTRACE: 1
+
   # TODO - get cross check working
   # cross-check:
   #   name: cross-check

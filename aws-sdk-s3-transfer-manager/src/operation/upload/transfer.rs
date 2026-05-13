@@ -549,6 +549,17 @@ impl UploadTransfer {
             .build();
         let config_override = aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
 
+        // Per-call SDK telemetry: latency + error attribution.
+        let transfer_id = self.inner.ctx.id;
+        let send_start = std::time::Instant::now();
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            ?transfer_id,
+            content_length,
+            is_file_backed,
+            "put_object.send_enter",
+        );
+
         let resp = match put_req
             .customize()
             .config_override(config_override)
@@ -557,8 +568,25 @@ impl UploadTransfer {
             .instrument(tracing::debug_span!("send-put-object"))
             .await
         {
-            Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Ok(resp) => {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    ?transfer_id,
+                    elapsed_ms = send_start.elapsed().as_millis() as u64,
+                    "put_object.send_exit_ok",
+                );
+                resp
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    ?transfer_id,
+                    elapsed_ms = send_start.elapsed().as_millis() as u64,
+                    error = %e,
+                    "put_object.send_exit_err",
+                );
+                return self.fail(e.into());
+            }
         };
 
         let result = UploadOutputBuilder::from(resp)

@@ -1290,20 +1290,21 @@ async fn test_pipeline_depth_respected_under_burst() {
     .expect("test_pipeline_depth_respected_under_burst timed out");
 }
 
-/// Stress reproducer for a state-machine race that stalls `upload_objects`
-/// intermittently. A mock S3 client with instant responses keeps the bug
-/// isolated to the TM layer — no network, no hyper, no HTTP — so whatever
-/// this reproduces is a scheduler or state-machine bug.
+/// Multi-iteration upload_objects stress test exercising the state machine's
+/// re-entrancy guards.
 ///
-/// The hang was first observed on EC2 against real S3 with the
-/// `upload-disk-256kib-10k` workload (10000 × 256KiB files, 3 iterations),
-/// where the process went idle for 100+ seconds before being killed by the
-/// harness timeout. Under the mock client the test eventually recovers, so
-/// stall durations vary widely (sub-second to 100+ seconds). The test is
-/// `#[ignore]` because the 240s outer timeout is long and because the race
-/// is Heisenbug-sensitive — it disappears with `RUST_LOG` tracing enabled,
-/// which is the classic signature of a narrow timing window in the state
-/// machine.
+/// Runs three iterations of a 10 000-file upload back-to-back on a single
+/// client. Each iteration uses a fresh key prefix so nothing is shared
+/// between runs except the scheduler, its thread-local re-entry guards
+/// (`IN_GENERATE_WORK`, `SUBMISSION_DEPTH`), and the submission queue.
+///
+/// The purpose is to catch re-entrancy defects that only manifest when
+/// scheduler state persists across transfer boundaries — for example a
+/// guard that is cleared on the happy path but not on an early return,
+/// or a thread-local that accumulates across iterations. Instant-response
+/// mocks keep the test isolated to the TM layer (no network, no hyper, no
+/// HTTP) so any stall is attributable to scheduler or state-machine
+/// behaviour.
 ///
 /// Run with: `cargo test ... --release -- --ignored --nocapture`.
 #[ignore = "stress repro, run with --ignored"]
@@ -1358,4 +1359,124 @@ async fn test_stress_multi_iter_reproduce_ec2_hang() {
     })
     .await
     .expect("test_stress_multi_iter_reproduce_ec2_hang timed out");
+}
+
+/// Mock S3 `PutObject` that introduces a small, evenly-distributed delay
+/// before returning success.
+///
+/// Instant-response mocks don't build up enough concurrent in-flight work
+/// to stress the scheduler's ready-set and per-descriptor claim mechanism
+/// — dispatches complete faster than new ones can be produced. A small
+/// sleep per response lets dispatches saturate target concurrency
+/// (~128–160 in-flight) and then releases that cohort all at once, which
+/// is the completion pattern that stresses single-poll exclusivity and
+/// the release-and-recheck wake path in `generate_work`.
+///
+/// The sleep is intentionally synchronous (`std::thread::sleep`) rather
+/// than `tokio::time::sleep` so it blocks the tokio worker thread while
+/// the "request" is outstanding. This mimics the real SDK path, where
+/// `.send().await` hands the calling worker over to network I/O for the
+/// duration of the request and prevents it from polling its other tasks.
+fn mock_s3_client_for_put_object_with_latency(bucket_name: String, latency: Duration) -> Client {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(move |input| input.bucket() == Some(&bucket_name))
+        .then_compute_output(move |_input| {
+            std::thread::sleep(latency);
+            PutObjectOutput::builder().build()
+        });
+
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object])
+}
+
+/// Stress test for single-poll exclusivity on a composite transfer's
+/// descriptor under burst child completions.
+///
+/// **What this verifies.** The scheduler guarantees that at most one
+/// thread is inside `poll_work(desc)` for a given descriptor at a time.
+/// This test exercises the code paths that uphold that invariant under a
+/// realistic pressure pattern for composite transfers (`upload_objects`
+/// in particular): many child uploads completing within a narrow time
+/// window each fire `on_completion` on their dispatching managed thread,
+/// which calls `scheduler.generate_work()` synchronously on that thread.
+/// Without the single-poll guarantee, several of those threads can enter
+/// the composite's `poll_work` concurrently, contend on its state mutex,
+/// and — since they are running synchronous scheduler code on managed
+/// thread tokio runtimes — starve those runtimes of the async task
+/// polling they need to drive the remaining in-flight work. The system
+/// then has no path back to forward progress.
+///
+/// **Test shape.** 10 000 small files (32 bytes each, enough to exercise
+/// one PutObject per file without making the test dataset expensive) are
+/// uploaded through a mock S3 client that returns successfully after a
+/// ~10 ms synchronous sleep. The sleep is what allows dispatches to
+/// saturate target concurrency (~128) with in-flight work; the first
+/// wave of responses then completes in a tight burst that stresses the
+/// contention window. The assertion is simply that the upload completes
+/// within the test timeout — failure to uphold the invariant manifests
+/// as an indefinite stall.
+///
+/// **Why `#[ignore]`.** ~2 min happy-path runtime keeps it out of
+/// routine CI. Run explicitly as part of scheduler-regression
+/// validation:
+///
+/// ```text
+/// cargo test -p aws-sdk-s3-transfer-manager --release --test upload_objects_test \
+///     -- --ignored --nocapture test_stress_parent_lock_contention
+/// ```
+#[ignore = "stress repro (~2 min), run with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_stress_parent_lock_contention() {
+    timeout(Duration::from_secs(180), async {
+        const FILE_COUNT: usize = 10_000;
+        const PUT_LATENCY: Duration = Duration::from_millis(10);
+
+        // 32 bytes per file: dataset cost is trivial while every file
+        // still produces one PutObject. The contention pattern we care
+        // about scales with completion count, not per-object size.
+        let files: Vec<(String, usize)> = (0..FILE_COUNT)
+            .map(|i| (format!("d{:03}/{i:05}.bin", i / 100), 32))
+            .collect();
+        let test_dir = create_test_dir(
+            Some("test"),
+            files.iter().map(|(k, s)| (k.as_str(), *s)).collect(),
+            &[],
+        );
+
+        let bucket_name = "test-bucket";
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_s3_client_for_put_object_with_latency(
+                bucket_name.to_owned(),
+                PUT_LATENCY,
+            ))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let start = std::time::Instant::now();
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .send()
+            .await
+            .unwrap();
+        let output = handle.join().await.unwrap();
+        let elapsed = start.elapsed();
+        eprintln!(
+            "upload done in {elapsed:?}: uploaded={} failed={}",
+            output.objects_uploaded(),
+            output.failed_transfers().len()
+        );
+        assert_eq!(
+            FILE_COUNT as u64,
+            output.objects_uploaded(),
+            "all files should upload — a stall here indicates the scheduler is not draining in-flight work, which usually means single-poll exclusivity has broken",
+        );
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no failures expected under happy-path mock",
+        );
+    })
+    .await
+    .expect("test_stress_parent_lock_contention timed out — single-poll exclusivity on the composite descriptor is likely broken");
 }

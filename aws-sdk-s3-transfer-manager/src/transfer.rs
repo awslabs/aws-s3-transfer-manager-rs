@@ -14,6 +14,40 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Edge-triggered wake flag for transfer state machines.
+///
+/// Scoped to a sub-module so the underlying atomic is sourced from the
+/// `runtime/sync` compat layer (loom under `cfg(s3_tm_loom)`, std otherwise)
+/// without forcing the rest of this file's atomics onto the same path.
+///
+/// See [`TransferContext::set_pending`] for the wake primitive protocol —
+/// the discipline the poller and mutator must follow to avoid lost wakes.
+pub(crate) mod wake_flag {
+    use crate::runtime::sync::sync::atomic::{AtomicBool, Ordering};
+
+    pub(crate) struct WakeFlag {
+        pending: AtomicBool,
+    }
+
+    impl WakeFlag {
+        pub(crate) fn new() -> Self {
+            Self {
+                pending: AtomicBool::new(false),
+            }
+        }
+
+        /// Set the pending flag.
+        pub(crate) fn set_pending(&self) {
+            self.pending.store(true, Ordering::Release);
+        }
+
+        /// Atomically clear the flag and return whether it was set.
+        pub(crate) fn take_pending(&self) -> bool {
+            self.pending.swap(false, Ordering::AcqRel)
+        }
+    }
+}
+
 /// A transfer operation that the scheduler polls for work and the runtime executes.
 ///
 /// Each transfer (upload, download) is a state machine that produces IO requests
@@ -21,21 +55,64 @@ use std::sync::{Arc, Mutex};
 /// calls `poll_work()` when capacity is available; the runtime calls `execute()`
 /// on whatever thread or executor it manages.
 ///
+/// # Contracts
+///
 /// Implementations must uphold:
 /// - **Failed lifecycle**: record the error and signal termination before returning
 ///   `WorkOutcome::Failed`.
 /// - **Pending/wake obligation**: every `PollWork::Pending` must have a corresponding
-///   future call to `scheduler.wake(id)`.
-/// - **Panic safety**: handled externally by the runtime via `catch_unwind`.
+///   future call to `scheduler.wake(id)`. See [`TransferContext`] for the wake
+///   primitive protocol.
+/// - **Panic safety**: `execute` panics are caught by the runtime's
+///   `catch_unwind` wrapper and converted to a terminal transition. `poll_work`
+///   panics are caught by the scheduler inside `generate_work`, which
+///   force-terminates the panicking transfer (cascading to children).
+///   Implementations SHOULD NOT rely on panic recovery — a caught panic still
+///   corrupts the transfer's internal state and forces termination.
+///
+/// # Per-method expectations
+///
+/// ## `poll_work` — synchronous, short, bounded
+/// - No `.await`, no blocking I/O, no unbounded loops.
+/// - Cost is O(1) per call with a bounded critical section on state. Long
+///   `poll_work` calls pin the caller's runtime and starve its other async tasks.
+/// - At most one thread is inside `poll_work` for a given transfer at a time
+///   (scheduler-enforced). Per-transfer state mutexes are therefore
+///   effectively uncontended in steady state.
+/// - Composite transfers whose `poll_work` recursively calls
+///   `scheduler.enqueue_transfer` to spawn children must bound the per-call
+///   fan-out: cost becomes `O(batch × enqueue_cost)` and a single unbounded
+///   call can starve the rest of the scheduler.
+///
+/// ## `execute` — the async surface
+/// - The only place `.await` is permitted. All blocking or long-running work
+///   belongs here.
+/// - State locks MUST NOT be held across `.await`. Acquire the lock, mutate,
+///   drop it, then await.
+/// - May call `scheduler.wake(id)` (via `ctx.try_wake()`) mid-execution to
+///   re-queue the transfer if intra-execute state changes unblock work.
+/// - The concurrency slot is held for the duration of this future; the
+///   scheduler only decrements its dispatched counter after `execute` returns.
+///
+/// ## `on_terminal` — external termination hook
+/// - Called from outside the normal lifecycle (panic, cancellation, drop) to
+///   let the transfer release held resources and notify waiters.
+/// - Must be short and must not block.
 pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
     /// The transfer's shared context (id, handle, status, cancellation).
     fn ctx(&self) -> &TransferContext;
 
     /// Poll for the next IO request. Returns `Ready` with work, `Pending` if
     /// blocked, or `Done` when all work has been generated.
+    ///
+    /// See the trait-level "Per-method expectations" for the cost and threading
+    /// contracts this call must respect.
     fn poll_work(&self) -> PollWork;
 
     /// Execute an IO request. Called by the runtime, not the scheduler.
+    ///
+    /// The only async surface on a transfer. State locks must not be held
+    /// across `.await` points.
     fn execute<'a>(
         &'a self,
         work: &'a mut IoRequest,
@@ -45,6 +122,8 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
     /// (e.g. worker panic, external cancellation). Allows the transfer to
     /// clean up resources and notify waiters that would otherwise block
     /// indefinitely.
+    ///
+    /// Must be short and non-blocking.
     fn on_terminal(&self) {}
 }
 
@@ -383,7 +462,7 @@ pub(crate) struct TransferContext {
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
     /// Set when poll_work returns Pending, cleared on try_wake
-    pending: Arc<std::sync::atomic::AtomicBool>,
+    wake_flag: Arc<wake_flag::WakeFlag>,
     /// Cancellation token for cooperative cancellation
     cancellation_token: tokio_util::sync::CancellationToken,
     /// Per-transfer metrics backing store
@@ -439,7 +518,7 @@ impl TransferContext {
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
-            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
         (ctx, completion_rx)
@@ -460,27 +539,95 @@ impl TransferContext {
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
-            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
         (ctx, completion_rx)
     }
 
-    /// Mark that poll_work returned Pending. Call while holding state lock.
+    /// Record that `poll_work` is about to return `Pending`.
+    ///
+    /// # Wake primitive protocol
+    ///
+    /// The wake primitive is edge-triggered: a wake only fires if the
+    /// pending flag is set at the moment the mutator calls `try_wake`. Lost-
+    /// wake avoidance is a cooperation between two sides.
+    ///
+    /// ## The race this protocol prevents
+    ///
+    /// Suppose the poller naively set pending *after* checking the gating
+    /// condition, and the mutator simply fired `try_wake` after its update.
+    /// Two threads can interleave like this:
+    ///
+    /// ```text
+    /// Poller:                              Mutator:
+    ///   check condition -> blocked
+    ///                                        mutate state (now unblocking)
+    ///                                        try_wake -> sees pending=false
+    ///                                                 -> no-op
+    ///   set_pending(true)
+    ///   return Pending
+    /// ```
+    ///
+    /// The state is unblocked, the poller is pending, and nothing else will
+    /// wake it. The transfer is stuck.
+    ///
+    /// ## The two disciplines
+    ///
+    /// 1. **Poller**: call `set_pending()` *before* evaluating the gating
+    ///    condition, both inside the same critical section that the mutator
+    ///    takes. If the mutator runs first, `set_pending` has not happened
+    ///    yet — but then the poller's check will observe the mutation and
+    ///    return `Ready`, not `Pending`. If the poller runs first, pending
+    ///    is true when the check returns blocked, and the mutator's later
+    ///    `try_wake` observes it and fires.
+    ///
+    /// 2. **Mutator**: follow `lock → mutate → unlock → try_wake`. Dropping
+    ///    the lock before the wake lets the woken poller acquire the lock
+    ///    immediately. Calling `try_wake` unconditionally is cheap — it is
+    ///    a single atomic swap when no wake is pending.
+    ///
+    /// Because the poller's `set_pending` and condition check are under the
+    /// same lock as the mutator's mutate step, the two cannot interleave
+    /// inside the critical section. Either the mutator's mutation is
+    /// visible to the poller's check (so the poller returns `Ready`), or
+    /// the mutator runs after the poller and `try_wake` observes the
+    /// pending flag that `set_pending` wrote.
+    ///
+    /// Spurious wakes (mutator fires when no poll was actually pending)
+    /// are harmless — `wake` on a descriptor not in pending state is a
+    /// no-op.
     #[inline]
     pub(crate) fn set_pending(&self) {
-        self.pending
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_flag.set_pending();
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            id = %self.id,
+            "ctx.set_pending",
+        );
     }
 
-    /// Wake scheduler if we were pending. Call after state mutation that may unblock.
+    /// Wake the scheduler if this transfer was marked `Pending`.
+    ///
+    /// Call after any state mutation that might unblock a pending poll,
+    /// following the mutator pattern `lock → mutate → unlock → try_wake`.
+    /// Idempotent: spurious calls cost only an atomic swap. See
+    /// [`Self::set_pending`] for the full wake primitive protocol.
     #[inline]
     pub(crate) fn try_wake(&self) {
-        if self
-            .pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.wake_flag.take_pending() {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                id = %self.id,
+                "ctx.try_wake.fired",
+            );
             self.handle.scheduler.wake(self.id);
+        } else {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                id = %self.id,
+                "ctx.try_wake.skipped",
+            );
         }
     }
 
@@ -844,5 +991,89 @@ mod tests {
             ctx.set_total_bytes(42);
             assert_eq!(ctx.metrics().total_bytes, Some(42));
         }
+    }
+}
+
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests {
+    use super::wake_flag::WakeFlag;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+
+    /// Harness wrapping the real `WakeFlag` with a simulated gated
+    /// resource (a `Mutex<u32>` where 0 = blocked and non-zero = unblocked).
+    struct Harness {
+        flag: WakeFlag,
+        state: Mutex<u32>,
+        wake_fired: AtomicBool,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                flag: WakeFlag::new(),
+                state: Mutex::new(0),
+                wake_fired: AtomicBool::new(false),
+            }
+        }
+
+        /// Deliver a wake iff the flag was pending. Mirrors the production
+        /// `TransferContext::try_wake` pattern without dragging the full
+        /// scheduler into the test.
+        fn try_wake(&self) {
+            if self.flag.take_pending() {
+                self.wake_fired.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// If the mutator runs after the poller set the pending flag, the
+    /// poller's later return of `PollWork::Pending` must be matched by a
+    /// delivered wake. Verifies the poller+mutator disciplines prevent
+    /// the lost-wake state.
+    #[test]
+    fn set_pending_then_try_wake_no_lost_wake() {
+        loom::model(|| {
+            let harness = Arc::new(Harness::new());
+
+            let h2 = harness.clone();
+            let poller = thread::spawn(move || {
+                // Poller discipline: inside the critical section, set
+                // pending first, then check the gating condition.
+                let guard = h2.state.lock().unwrap();
+                h2.flag.set_pending();
+                let blocked = *guard == 0;
+                drop(guard);
+                // Returns true if the poller would have returned Pending.
+                blocked
+            });
+
+            let h3 = harness.clone();
+            let mutator = thread::spawn(move || {
+                // Mutator discipline: lock, mutate, unlock, try_wake.
+                {
+                    let mut guard = h3.state.lock().unwrap();
+                    *guard = 1;
+                }
+                h3.try_wake();
+            });
+
+            let poller_returned_pending = poller.join().unwrap();
+            mutator.join().unwrap();
+
+            let mutated = *harness.state.lock().unwrap() == 1;
+            let wake_fired = harness.wake_fired.load(Ordering::Acquire);
+
+            // If the poller committed to Pending and the mutator unblocked
+            // the state, a wake must have been delivered. Otherwise the
+            // poller is stuck forever.
+            if poller_returned_pending && mutated {
+                assert!(
+                    wake_fired,
+                    "lost wake: poller returned Pending, state was mutated, but wake did not fire"
+                );
+            }
+        });
     }
 }

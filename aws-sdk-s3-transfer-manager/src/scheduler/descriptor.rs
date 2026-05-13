@@ -4,6 +4,9 @@
  */
 
 //! Transfer descriptor and related types for scheduler-managed transfer state.
+//!
+//! See the [`scheduler`](super) module docs for the threading and cost
+//! model that the descriptor's claim protocol enforces.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -11,6 +14,78 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use crate::transfer::{BoxTransfer, Transfer, TransferId};
+
+/// Claim + wake-requested protocol primitives.
+///
+/// Scoped to a sub-module so the underlying atomics are sourced from the
+/// `runtime/sync` compat layer (loom under `cfg(s3_tm_loom)`, std otherwise)
+/// without forcing the rest of this file's atomics onto the same path.
+///
+/// # Protocol
+///
+/// The claim flag tracks whether a descriptor is queued in the ready set
+/// or currently being polled. Asserted by [`ClaimState::try_claim`], cleared
+/// by [`ClaimState::release_claim`]. The flag is held continuously from
+/// ready-set insert through `pop` through `poll_work` until `generate_work`
+/// finishes handling the outcome — this is what serializes `poll_work` to
+/// one worker per descriptor at a time.
+///
+/// The wake-requested flag is set unconditionally by `Scheduler::wake`
+/// whether or not the claim CAS succeeded, and consumed by `generate_work`
+/// in a release-and-recheck pattern. The pairing closes the lost-wake race
+/// where a wake arrives between `release_claim` and the descriptor leaving
+/// the ready set.
+///
+/// All four operations are `SeqCst` so the release-and-recheck of the claim
+/// flag composes correctly with the mark-and-try-claim of the wake flag.
+/// These two pairs operate on independent atomics; without a global total
+/// order, a schedule exists on weak memory models where neither side
+/// observes the other and the wake is lost.
+pub(super) mod claim {
+    use crate::runtime::sync::sync::atomic::{AtomicBool, Ordering};
+
+    pub(in crate::scheduler) struct ClaimState {
+        claimed: AtomicBool,
+        wake_requested: AtomicBool,
+    }
+
+    impl ClaimState {
+        pub(in crate::scheduler) fn new() -> Self {
+            Self {
+                claimed: AtomicBool::new(false),
+                wake_requested: AtomicBool::new(false),
+            }
+        }
+
+        /// Atomically take the claim if it is currently free. Returns
+        /// `true` on success.
+        pub(in crate::scheduler) fn try_claim(&self) -> bool {
+            // compare_exchange rather than swap: on failure we must NOT
+            // overwrite the existing `true`. A bare swap loses ownership
+            // information when two callers race.
+            self.claimed
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        }
+
+        /// Release the claim. Pairs with `try_claim`.
+        pub(in crate::scheduler) fn release_claim(&self) {
+            self.claimed.store(false, Ordering::SeqCst);
+        }
+
+        /// Mark that a wake has been requested.
+        pub(in crate::scheduler) fn mark_wake_requested(&self) {
+            self.wake_requested.store(true, Ordering::SeqCst);
+        }
+
+        /// Atomically clear and return the wake-requested flag.
+        pub(in crate::scheduler) fn take_wake_requested(&self) -> bool {
+            self.wake_requested.swap(false, Ordering::SeqCst)
+        }
+    }
+}
+
+use claim::ClaimState;
 
 /// Default priority assigned to new transfers
 const DEFAULT_PRIORITY: u8 = 128;
@@ -33,6 +108,7 @@ struct Inner {
     queued_executing: QueuedExecuting,
     transfer: BoxTransfer,
     idle_notify: Notify,
+    claim_state: ClaimState,
 }
 
 impl std::fmt::Debug for TransferDescriptor {
@@ -58,7 +134,28 @@ impl TransferDescriptor {
             queued_executing: QueuedExecuting::new(),
             transfer,
             idle_notify: Notify::new(),
+            claim_state: ClaimState::new(),
         }))
+    }
+
+    /// Atomically take the claim if free. Returns `true` on success.
+    pub(super) fn try_claim(&self) -> bool {
+        self.0.claim_state.try_claim()
+    }
+
+    /// Release the claim.
+    pub(super) fn release_claim(&self) {
+        self.0.claim_state.release_claim()
+    }
+
+    /// Mark that a wake has been requested.
+    pub(super) fn mark_wake_requested(&self) {
+        self.0.claim_state.mark_wake_requested()
+    }
+
+    /// Atomically clear and return the wake-requested flag.
+    pub(super) fn take_wake_requested(&self) -> bool {
+        self.0.claim_state.take_wake_requested()
     }
 
     pub(crate) fn transfer(&self) -> &dyn Transfer {
@@ -81,7 +178,7 @@ impl TransferDescriptor {
         self.0.vruntime.load(Ordering::Acquire)
     }
 
-    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
+    #[cfg(test)] // TODO: evaluate for public scheduling API
     pub(crate) fn set_vruntime(&self, vruntime: u64) {
         self.0.vruntime.store(vruntime, Ordering::Release);
     }
@@ -204,6 +301,47 @@ impl QueuedExecuting {
     fn outstanding(&self) -> u64 {
         let (q, e) = self.get();
         q as u64 + e as u64
+    }
+}
+
+/// RAII guard for a descriptor's claim. On drop, releases the claim
+/// unless [`hold`](Self::hold) was called to consume the guard without
+/// releasing. Used by the scheduler's `generate_work` to ensure the
+/// claim is released on every exit path, including panic.
+pub(super) struct ClaimGuard<'a> {
+    desc: &'a TransferDescriptor,
+    released: bool,
+}
+
+impl<'a> ClaimGuard<'a> {
+    /// Wrap a descriptor whose claim is currently held. The caller is
+    /// responsible for having taken the claim (via `try_claim` or `pop`).
+    pub(super) fn new(desc: &'a TransferDescriptor) -> Self {
+        Self {
+            desc,
+            released: false,
+        }
+    }
+
+    /// Explicit release now; subsequent drop is a no-op.
+    pub(super) fn release(mut self) {
+        self.desc.release_claim();
+        self.released = true;
+    }
+
+    /// Consume the guard without releasing — the claim stays asserted.
+    /// Used by the `PollWork::Ready` path which keeps the claim held
+    /// across re-insert.
+    pub(super) fn hold(mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.desc.release_claim();
+        }
     }
 }
 
@@ -395,5 +533,78 @@ mod tests {
                 ratio
             );
         }
+    }
+}
+
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests {
+    use super::claim::ClaimState;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// After any interleaving of the release-and-recheck pattern with a
+    /// concurrent wake arrival, at least one of the two threads must own
+    /// the re-insert. If neither does, a wake is outstanding but the
+    /// descriptor is absent from the ready set and the transfer is stuck.
+    #[test]
+    fn release_recheck_no_lost_wake() {
+        loom::model(|| {
+            // Start state: claim held by A (simulating post-poll_work Pending).
+            let state = Arc::new(ClaimState::new());
+            assert!(state.try_claim());
+
+            let inserted = Arc::new(AtomicBool::new(false));
+
+            let s2 = state.clone();
+            let i2 = inserted.clone();
+            let a = thread::spawn(move || {
+                s2.release_claim();
+                if s2.take_wake_requested() {
+                    // generate_work sees wake; tries to reclaim + insert.
+                    if s2.try_claim() {
+                        i2.store(true, Ordering::SeqCst);
+                    }
+                }
+            });
+
+            let s3 = state.clone();
+            let i3 = inserted.clone();
+            let b = thread::spawn(move || {
+                s3.mark_wake_requested();
+                if s3.try_claim() {
+                    i3.store(true, Ordering::SeqCst);
+                }
+            });
+
+            a.join().unwrap();
+            b.join().unwrap();
+
+            assert!(
+                inserted.load(Ordering::SeqCst),
+                "lost wake: neither A nor B claimed the descriptor to re-insert it"
+            );
+        });
+    }
+
+    /// Single-poll exclusivity: two threads concurrently calling
+    /// `ClaimState::try_claim` must never both succeed. The ready-set uses
+    /// this to guarantee at most one thread inside `poll_work(desc)` at a
+    /// time.
+    #[test]
+    fn try_claim_is_exclusive() {
+        loom::model(|| {
+            let state = Arc::new(ClaimState::new());
+
+            let s2 = state.clone();
+            let a = thread::spawn(move || s2.try_claim());
+            let s3 = state.clone();
+            let b = thread::spawn(move || s3.try_claim());
+
+            let got_a = a.join().unwrap();
+            let got_b = b.join().unwrap();
+
+            assert!(got_a ^ got_b, "try_claim was not exclusive");
+        });
     }
 }

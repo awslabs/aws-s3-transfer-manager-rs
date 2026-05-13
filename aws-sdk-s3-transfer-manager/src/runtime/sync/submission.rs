@@ -65,22 +65,33 @@ struct State {
     flushing: bool,
 }
 
-thread_local! {
-    /// Number of currently-live [`Submission`] handles held by this thread
-    /// across nested [`SubmissionQueue::enter`] calls.
-    ///
-    /// The first `enter()` on a thread takes the shared-state path (grabs the
-    /// state lock, increments `pending`, blocks on `not_flushing` if a flush
-    /// is in progress). Subsequent re-entrant `enter()` calls on the same
-    /// thread skip that path and participate as nested producers — they can
-    /// still [`push`](Submission::push) items, but they don't bump `pending`
-    /// and won't deadlock waiting for a flush that the outer frame owns.
-    ///
-    /// The counter is per-thread because `pending` is a global count of
-    /// distinct producers, not a count of `Submission` handles. A single
-    /// thread that re-enters via scheduler recursion is still one producer
-    /// from the queue's perspective.
+// Number of currently-live `Submission` handles held by this thread
+// across nested `SubmissionQueue::enter` calls.
+//
+// The first `enter()` on a thread takes the shared-state path (grabs
+// the state lock, increments `pending`, blocks on `not_flushing` if a
+// flush is in progress). Subsequent re-entrant `enter()` calls on the
+// same thread skip that path and participate as nested producers — they
+// can still `push` items, but they don't bump `pending` and won't
+// deadlock waiting for a flush that the outer frame owns.
+//
+// The counter is per-thread because `pending` is a global count of
+// distinct producers, not a count of `Submission` handles. A single
+// thread that re-enters via scheduler recursion is still one producer
+// from the queue's perspective.
+//
+// The `loom::thread_local!` variant under `cfg(s3_tm_loom)` is per-
+// loom-thread; `std::thread_local!` would be shared across all loom-
+// simulated threads (they run on a single OS thread) and mis-classify
+// separate loom threads as nested re-entries.
+#[cfg(not(all(test, s3_tm_loom)))]
+std::thread_local! {
     static SUBMISSION_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, s3_tm_loom))]
+loom::thread_local! {
+    static SUBMISSION_DEPTH: core::cell::Cell<u32> = core::cell::Cell::new(0);
 }
 
 fn incr_depth() -> u32 {

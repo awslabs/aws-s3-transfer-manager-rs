@@ -89,6 +89,24 @@ impl ReadySet {
     /// re-insert, and (2) `wake()` is only called when the transfer returned `Pending`.
     /// Violating this invariant causes duplicate polling.
     pub(super) fn insert(&self, descriptor: TransferDescriptor) {
+        // CAS-gate the insert. `try_claim` returns true only if
+        // the descriptor is not already claimed (not queued AND not
+        // being polled). If the descriptor is already claimed, drop
+        // this insert — wake_requested (set by the caller) handles the
+        // re-queue requirement for the currently-polling thread.
+        if !descriptor.try_claim() {
+            return;
+        }
+        let vruntime = descriptor.vruntime();
+        let key = ReadyKey::new(vruntime, descriptor.id());
+        self.inner.insert(key, descriptor);
+    }
+
+    /// Re-insert a descriptor that already holds its claim (i.e., the
+    /// current thread popped it, polled it, and got `Ready`). Bypasses
+    /// the CAS gate in [`Self::insert`] because we know `claimed` is
+    /// already `true` and we are the single owner of the claim.
+    pub(super) fn reinsert_under_claim(&self, descriptor: TransferDescriptor) {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
         self.inner.insert(key, descriptor);
@@ -97,6 +115,11 @@ impl ReadySet {
     /// Pop the transfer with lowest vruntime (highest scheduling priority).
     ///
     /// Updates min_vruntime to the popped transfer's vruntime.
+    ///
+    /// Does **not** release the descriptor's claim — the claim is held
+    /// through `poll_work` and released by `generate_work` after the
+    /// poll outcome is handled. This is what guarantees at most one
+    /// worker is inside `poll_work` for any given transfer at a time.
     pub(super) fn pop(&self) -> Option<TransferDescriptor> {
         let entry = self.inner.pop_front()?;
         let descriptor = entry.value().clone();
@@ -356,9 +379,13 @@ mod tests {
         normal.work_generated();
         low.work_generated();
 
-        set.insert(high);
-        set.insert(normal);
-        set.insert(low);
+        // In production, between `pop` (which does not release the
+        // claim) and re-insert, `generate_work` either releases the
+        // claim (Pending/Done) or re-inserts under the held claim
+        // (Ready). This simulates the Ready path.
+        set.reinsert_under_claim(high);
+        set.reinsert_under_claim(normal);
+        set.reinsert_under_claim(low);
 
         // Now ordered by vruntime: high(0) < normal(1) < low(2)
         assert_eq!(set.pop().unwrap().id().id, 1); // high, vruntime 0
