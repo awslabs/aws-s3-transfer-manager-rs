@@ -94,8 +94,8 @@ use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
 
 use crate::runtime::sync::{Submission, SubmissionQueue};
 use crate::runtime::ScheduledWork;
-use crate::scheduler::descriptor::{ClaimGuard, TransferDescriptor};
-use crate::scheduler::ready_set::ReadySet;
+use crate::scheduler::descriptor::{ClaimGuard, TransferDescriptor, WORK_COST};
+use crate::scheduler::ready_set::{OrphanedChild, ReadySet};
 use std::collections::HashMap;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,13 +187,41 @@ impl Scheduler {
     pub(crate) fn enqueue_transfer(&self, transfer: BoxTransfer) {
         // start with lowest current vruntime to avoid new transfer
         // playing aggressive catchup over already in-flight transfers
+        let parent_id_opt = transfer.ctx().id.parent;
         let desc = TransferDescriptor::new_with_vruntime(transfer, self.0.ready_set.min_vruntime());
 
         let id = desc.id();
+
+        // Spawn cost accounting: if this is a child, advance parent's
+        // individual vruntime AND parent's group_vruntime by one work unit.
+        // Ensures composites pay vruntime cost proportional to children spawned.
+        if let Some(parent_id) = parent_id_opt {
+            let transfers = self.0.transfers.read().unwrap();
+            let parent_tid = TransferId {
+                id: parent_id,
+                parent: None,
+            };
+            if let Some(parent_desc) = transfers.get(&parent_tid) {
+                parent_desc.work_generated();
+                self.0
+                    .ready_set
+                    .advance_group_vruntime(parent_id, WORK_COST);
+            }
+        }
+
         {
             let mut transfers = self.0.transfers.write().unwrap();
             transfers.insert(id, desc.clone());
-            self.0.ready_set.insert(desc);
+        }
+
+        match self.0.ready_set.insert(desc) {
+            Ok(()) => {}
+            Err(OrphanedChild) => {
+                // Parent group gone (cancelled mid-spawn). Cancel the new transfer
+                // so its handle resolves to a cancelled state, no leaked oneshot.
+                self.cancel_transfer(id);
+                return;
+            }
         }
 
         tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, "transfer enqueued");
@@ -228,7 +256,8 @@ impl Scheduler {
                 // already queued) puts the descriptor back in the
                 // ready set.
                 desc.mark_wake_requested();
-                self.0.ready_set.insert(desc);
+                // OrphanedChild: parent's group was removed; wake is moot.
+                let _ = self.0.ready_set.insert(desc);
                 tracing::trace!(
                     target: telemetry::TARGET_SCHEDULING,
                     id = %id,
@@ -275,6 +304,11 @@ impl Scheduler {
         let found = target.is_some();
         if let Some(desc) = target {
             self.cancel_descriptor(desc);
+            // Top-level transfer owns a group; remove it so future child
+            // enqueues return OrphanedChild.
+            if id.parent.is_none() {
+                self.0.ready_set.remove_group(id.id);
+            }
         }
         for desc in children {
             self.cancel_descriptor(desc);
@@ -353,7 +387,11 @@ impl Scheduler {
 
         // Terminal transfer: no further work from THIS transfer. Clean up when fully drained.
         if desc.is_terminal() && is_idle {
-            self.0.transfers.write().unwrap().remove(&desc.id());
+            let tid = desc.id();
+            self.0.transfers.write().unwrap().remove(&tid);
+            if tid.parent.is_none() {
+                self.0.ready_set.remove_group(tid.id);
+            }
         }
 
         // A concurrency slot was freed — always generate work. Other transfers
@@ -378,7 +416,11 @@ impl Scheduler {
 
         let is_idle = desc.work_finished();
         if is_idle {
-            self.0.transfers.write().unwrap().remove(&desc.id());
+            let tid = desc.id();
+            self.0.transfers.write().unwrap().remove(&tid);
+            if tid.parent.is_none() {
+                self.0.ready_set.remove_group(tid.id);
+            }
         }
         desc.notify_idle();
     }
@@ -489,7 +531,8 @@ impl Scheduler {
                     // observe. See the `claim` module for the protocol.
                     claim.release();
                     if desc.take_wake_requested() {
-                        self.0.ready_set.insert(desc);
+                        // OrphanedChild: parent's group was removed; wake is moot.
+                        let _ = self.0.ready_set.insert(desc);
                     }
                 }
                 Ok(PollWork::Done) => {
@@ -500,7 +543,11 @@ impl Scheduler {
                         "poll_work.done",
                     );
                     claim.release();
-                    self.0.transfers.write().unwrap().remove(&desc.id());
+                    let desc_id = desc.id();
+                    self.0.transfers.write().unwrap().remove(&desc_id);
+                    if desc_id.parent.is_none() {
+                        self.0.ready_set.remove_group(desc_id.id);
+                    }
                 }
                 Err(_panic_payload) => {
                     // ClaimGuard's Drop releases the claim. cancel_transfer
@@ -548,6 +595,13 @@ impl Scheduler {
         if let Some(desc) = desc {
             desc.wait_for_idle().await;
         }
+    }
+
+    /// Pre-register an empty group for `group_id`. See
+    /// [`crate::scheduler::ready_set::ReadySet::register_empty_group_for_test`].
+    #[cfg(test)]
+    pub(crate) fn register_empty_group_for_test(&self, group_id: u64) {
+        self.0.ready_set.register_empty_group_for_test(group_id);
     }
 }
 #[cfg(test)]

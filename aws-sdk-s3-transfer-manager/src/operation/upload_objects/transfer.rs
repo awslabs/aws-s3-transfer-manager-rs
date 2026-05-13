@@ -984,6 +984,16 @@ mod tests {
 
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        // Register the parent group so children spawned via the scheduler
+        // can find it. The composite is driven directly via `drive_transfer`
+        // rather than enqueued, so we set up only the group entry, not the
+        // descriptor in `transfers`.
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
         (transfer, completion_rx)
     }
 
@@ -1098,6 +1108,12 @@ mod tests {
 
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
 
         timeout(Duration::from_secs(5), async {
             drive_transfer(&transfer).await;

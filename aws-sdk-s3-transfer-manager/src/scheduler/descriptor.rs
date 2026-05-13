@@ -89,8 +89,8 @@ use claim::ClaimState;
 
 /// Default priority assigned to new transfers
 const DEFAULT_PRIORITY: u8 = 128;
-/// Fixed work cost
-const WORK_COST: u64 = 128;
+/// Fixed work cost per unit of generated work
+pub(super) const WORK_COST: u64 = 128;
 
 /// The scheduler's handle to a transfer.
 ///
