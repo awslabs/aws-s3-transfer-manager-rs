@@ -9,13 +9,13 @@ use aws_smithy_types::error::operation::BuildError;
 
 use std::path::{Path, PathBuf};
 
-/// Default maximum number of concurrent child upload transfers.
+/// Default per-request memory cap on concurrently-materialized child upload transfers.
 ///
-/// Users can override via [`UploadObjectsInputBuilder::pipeline_depth`]
-/// or the corresponding fluent builder method.
-// FIXME - likely too small (e.g. 10k small files -> all put_object (1 req) -> 100 transfers
-// we probably need to weigh this by put/mpu and content length
-const DEFAULT_PIPELINE_DEPTH: usize = 100;
+/// Acts as a backstop on memory growth; the scheduler's hierarchical
+/// CFS handles fairness and rate. Users can override via
+/// [`UploadObjectsInputBuilder::max_concurrent_uploads`] or the
+/// corresponding fluent builder method.
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 10000;
 
 /// Input type for uploading multiple objects.
 ///
@@ -46,11 +46,13 @@ pub struct UploadObjectsInput {
     /// The failure policy to use when any individual object upload fails.
     pub failure_policy: FailedTransferPolicy,
 
-    /// Maximum number of concurrent child upload transfers.
+    /// Per-request cap on concurrently-materialized child upload transfers.
     ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub pipeline_depth: usize,
+    /// Acts as a memory backstop: the scheduler's hierarchical fair-share
+    /// scheduling drives throughput and rate-limits the walker naturally,
+    /// so this knob primarily bounds the working-set size of in-flight
+    /// child handles. Defaults to 10000.
+    pub max_concurrent_uploads: usize,
 }
 
 impl UploadObjectsInput {
@@ -85,9 +87,10 @@ impl UploadObjectsInput {
         &self.failure_policy
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    pub fn pipeline_depth(&self) -> usize {
-        self.pipeline_depth
+    /// Returns the per-request cap on concurrently-materialized child
+    /// upload transfers.
+    pub fn max_concurrent_uploads(&self) -> usize {
+        self.max_concurrent_uploads
     }
 }
 
@@ -101,7 +104,7 @@ pub struct UploadObjectsInputBuilder {
     pub(crate) key_prefix: Option<String>,
     pub(crate) delimiter: Option<String>,
     pub(crate) failure_policy: FailedTransferPolicy,
-    pub(crate) pipeline_depth: Option<usize>,
+    pub(crate) max_concurrent_uploads: Option<usize>,
 }
 
 impl UploadObjectsInputBuilder {
@@ -125,7 +128,9 @@ impl UploadObjectsInputBuilder {
             key_prefix: self.key_prefix,
             delimiter: self.delimiter,
             failure_policy: self.failure_policy,
-            pipeline_depth: self.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH),
+            max_concurrent_uploads: self
+                .max_concurrent_uploads
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS),
         })
     }
 
@@ -229,23 +234,27 @@ impl UploadObjectsInputBuilder {
         &self.failure_policy
     }
 
-    /// Maximum number of concurrent child upload transfers.
+    /// Per-request cap on concurrently-materialized child upload transfers.
     ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub fn pipeline_depth(mut self, input: usize) -> Self {
-        self.pipeline_depth = Some(input);
+    /// Acts as a memory backstop: the scheduler's hierarchical fair-share
+    /// scheduling drives throughput and rate-limits the walker naturally,
+    /// so this knob primarily bounds the working-set size of in-flight
+    /// child handles. Defaults to 10000.
+    pub fn max_concurrent_uploads(mut self, input: usize) -> Self {
+        self.max_concurrent_uploads = Some(input);
         self
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    pub fn set_pipeline_depth(mut self, input: Option<usize>) -> Self {
-        self.pipeline_depth = input;
+    /// Per-request cap on concurrently-materialized child upload transfers.
+    /// See [`max_concurrent_uploads`](Self::max_concurrent_uploads).
+    pub fn set_max_concurrent_uploads(mut self, input: Option<usize>) -> Self {
+        self.max_concurrent_uploads = input;
         self
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    pub fn get_pipeline_depth(&self) -> Option<usize> {
-        self.pipeline_depth
+    /// Returns the configured per-request cap on concurrently-materialized
+    /// child upload transfers, if any.
+    pub fn get_max_concurrent_uploads(&self) -> Option<usize> {
+        self.max_concurrent_uploads
     }
 }

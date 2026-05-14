@@ -35,6 +35,14 @@ const MAX_PARALLEL_WALKS: usize = 16;
 /// entries added to `State::pending_entries` in one pass.
 const WALK_BATCH_SIZE: usize = 64;
 
+/// Maximum number of children spawned per `poll_work` pass before yielding
+/// back to the scheduler. Bounds the time spent in a single composite poll
+/// (each spawn calls `Upload::orchestrate_child` and `enqueue_transfer`)
+/// independently of `max_concurrent_uploads`. The scheduler's hierarchical
+/// fair-share keeps the spawn rate matched to consumption; this constant
+/// primarily caps per-poll latency, not steady-state concurrency.
+const SPAWN_BATCH_SIZE: usize = 32;
+
 /// Work data variants for the UploadObjectsTransfer state machine.
 #[derive(Debug)]
 pub(crate) enum UploadObjectsWork {
@@ -101,13 +109,13 @@ struct State {
     /// Entries that have been claimed from `pending_entries` by a `poll_work`
     /// frame that has released the state lock to run `orchestrate_child`, but
     /// have not yet been inserted into `children` or `failed`. Concurrent
-    /// `poll_work` calls must not overshoot `pipeline_depth` or signal
+    /// `poll_work` calls must not overshoot `max_concurrent_uploads` or signal
     /// termination while these are in flight.
     children_reserved: usize,
     /// Children that have been drained from `children` into a `JoinChildren`
     /// work item but whose `execute_join_children` has not yet finished
     /// updating counters / failed list. `check_terminal` must wait for these
-    /// to drop to zero before signalling completion — otherwise the parent
+    /// to drop to zero before signalling completion - otherwise the parent
     /// can terminate with stale `successful_uploads == 0` while results are
     /// still being tallied.
     reaping_in_flight: usize,
@@ -165,8 +173,8 @@ impl UploadObjectsTransfer {
         std::mem::take(&mut self.inner.state.lock().failed)
     }
 
-    fn pipeline_depth(&self) -> usize {
-        self.inner.request.pipeline_depth()
+    fn max_concurrent_uploads(&self) -> usize {
+        self.inner.request.max_concurrent_uploads()
     }
 
     fn failure_policy(&self) -> &FailedTransferPolicy {
@@ -208,8 +216,8 @@ impl UploadObjectsTransfer {
             // 1c. Claim a batch of entries to orchestrate as children. This
             //     does all the side-effect-free work under the lock (key
             //     derivation, stream creation, `UploadInput` build). The
-            //     heavyweight step — `Upload::orchestrate_child`, which
-            //     recurses into the scheduler — runs in phase 2 with the
+            //     heavyweight step - `Upload::orchestrate_child`, which
+            //     recurses into the scheduler - runs in phase 2 with the
             //     lock released.
             self.claim_spawn_batch(&mut state)
         };
@@ -309,7 +317,7 @@ impl UploadObjectsTransfer {
     /// [`PollWork::Done`] without orchestrating anything. Otherwise returns
     /// [`SpawnDecision::Batch`] with the prepared entries.
     fn claim_spawn_batch(&self, state: &mut State) -> SpawnDecision {
-        let pipeline_depth = self.pipeline_depth();
+        let max_concurrent_uploads = self.max_concurrent_uploads();
         let bucket = self
             .inner
             .request
@@ -320,7 +328,9 @@ impl UploadObjectsTransfer {
         let delimiter = self.inner.request.delimiter().map(|s| s.to_string());
 
         let mut batch: Vec<ClaimedEntry> = Vec::new();
-        while state.children.len() + state.children_reserved + batch.len() < pipeline_depth {
+        while state.children.len() + state.children_reserved + batch.len() < max_concurrent_uploads
+            && batch.len() < SPAWN_BATCH_SIZE
+        {
             let entry = match state.pending_entries.pop_front() {
                 Some(e) => e,
                 None => break,
@@ -491,15 +501,15 @@ impl UploadObjectsTransfer {
     }
 
     fn dispatch_walk(&self, state: &mut State) -> PollWork {
-        let pipeline_depth = self.pipeline_depth();
-        if state.children.len() + state.children_reserved >= pipeline_depth {
+        let max_concurrent_uploads = self.max_concurrent_uploads();
+        if state.children.len() + state.children_reserved >= max_concurrent_uploads {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 transfer_id = ?self.inner.ctx.id,
                 children = state.children.len(),
                 children_reserved = state.children_reserved,
-                pipeline_depth,
-                "dispatch_walk.pending.pipeline_full"
+                max_concurrent_uploads,
+                "dispatch_walk.pending.cap_full"
             );
             self.inner.ctx.set_pending();
             return PollWork::Pending;

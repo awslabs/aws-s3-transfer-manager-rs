@@ -658,13 +658,13 @@ async fn test_metrics_correctness_on_success() {
     .expect("test_metrics_correctness_on_success timed out");
 }
 
-/// Serial execution correctness with `pipeline_depth(1)`.
+/// Serial execution correctness with `max_concurrent_uploads(1)`.
 ///
 /// Forces the state machine through the serial-execution regime: only one
 /// child spawned at a time, reaped before the next is spawned. All files
 /// must still upload and metrics must still aggregate correctly.
 #[tokio::test]
-async fn test_pipeline_depth_one_serial_execution() {
+async fn test_max_concurrent_uploads_one_serial_execution() {
     timeout(TEST_TIMEOUT, async {
         let files: Vec<(String, usize)> = (0..10).map(|i| (format!("f{i}.bin"), 3)).collect();
         let files_ref: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
@@ -681,7 +681,7 @@ async fn test_pipeline_depth_one_serial_execution() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .pipeline_depth(1)
+            .max_concurrent_uploads(1)
             .send()
             .await
             .unwrap();
@@ -693,7 +693,7 @@ async fn test_pipeline_depth_one_serial_execution() {
         assert_eq!(30, output.metrics.disk_read);
     })
     .await
-    .expect("test_pipeline_depth_one_serial_execution timed out");
+    .expect("test_max_concurrent_uploads_one_serial_execution timed out");
 }
 
 /// Deep tree exercises subtree claiming beyond `MAX_PARALLEL_WALKS`.
@@ -1221,18 +1221,18 @@ async fn test_wide_burst_all_failing_continue_does_not_hang() {
     .expect("test_wide_burst_all_failing_continue_does_not_hang timed out");
 }
 
-/// Verify `pipeline_depth` is respected across the claim/orchestrate/merge
+/// Verify `max_concurrent_uploads` is respected across the claim/orchestrate/merge
 /// split even when many children complete concurrently. Counts the maximum
 /// in-flight PutObjects observed through the mock and asserts it never
-/// exceeds `pipeline_depth`.
+/// exceeds `max_concurrent_uploads`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_pipeline_depth_respected_under_burst() {
+async fn test_max_concurrent_uploads_respected_under_burst() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     timeout(Duration::from_secs(30), async {
         const FILE_COUNT: usize = 100;
-        const PIPELINE_DEPTH: usize = 8;
+        const MAX_CONCURRENT: usize = 8;
         let files: Vec<(String, usize)> = (0..FILE_COUNT)
             .map(|i| (format!("{i:04}.bin"), 16))
             .collect();
@@ -1272,7 +1272,7 @@ async fn test_pipeline_depth_respected_under_burst() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .pipeline_depth(PIPELINE_DEPTH)
+            .max_concurrent_uploads(MAX_CONCURRENT)
             .send()
             .await
             .unwrap();
@@ -1281,13 +1281,13 @@ async fn test_pipeline_depth_respected_under_burst() {
         assert_eq!(FILE_COUNT as u64, output.objects_uploaded());
         let observed = max_observed.load(Ordering::Acquire);
         assert!(
-            observed <= PIPELINE_DEPTH,
-            "max concurrent PutObjects ({observed}) exceeded pipeline_depth ({PIPELINE_DEPTH}); \
+            observed <= MAX_CONCURRENT,
+            "max concurrent PutObjects ({observed}) exceeded max_concurrent_uploads ({MAX_CONCURRENT}); \
              children_reserved must prevent over-spawning during lock-released orchestration"
         );
     })
     .await
-    .expect("test_pipeline_depth_respected_under_burst timed out");
+    .expect("test_max_concurrent_uploads_respected_under_burst timed out");
 }
 
 /// Multi-iteration upload_objects stress test exercising the state machine's

@@ -146,24 +146,28 @@ impl UploadObjectsFluentBuilder {
         self.inner.get_failure_policy()
     }
 
-    /// Maximum number of concurrent child upload transfers.
+    /// Per-request cap on concurrently-materialized child upload transfers.
     ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub fn pipeline_depth(mut self, input: usize) -> Self {
-        self.inner = self.inner.pipeline_depth(input);
+    /// Acts as a memory backstop: the scheduler's hierarchical fair-share
+    /// scheduling drives throughput and rate-limits the walker naturally,
+    /// so this knob primarily bounds the working-set size of in-flight
+    /// child handles. Defaults to 10000.
+    pub fn max_concurrent_uploads(mut self, input: usize) -> Self {
+        self.inner = self.inner.max_concurrent_uploads(input);
         self
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    pub fn set_pipeline_depth(mut self, input: Option<usize>) -> Self {
-        self.inner = self.inner.set_pipeline_depth(input);
+    /// Per-request cap on concurrently-materialized child upload transfers.
+    /// See [`max_concurrent_uploads`](Self::max_concurrent_uploads).
+    pub fn set_max_concurrent_uploads(mut self, input: Option<usize>) -> Self {
+        self.inner = self.inner.set_max_concurrent_uploads(input);
         self
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    pub fn get_pipeline_depth(&self) -> Option<usize> {
-        self.inner.get_pipeline_depth()
+    /// Returns the configured per-request cap on concurrently-materialized
+    /// child upload transfers, if any.
+    pub fn get_max_concurrent_uploads(&self) -> Option<usize> {
+        self.inner.get_max_concurrent_uploads()
     }
 }
 

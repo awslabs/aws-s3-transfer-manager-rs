@@ -91,6 +91,25 @@ use claim::ClaimState;
 const DEFAULT_PRIORITY: u8 = 128;
 /// Fixed work cost per unit of generated work
 pub(super) const WORK_COST: u64 = 128;
+/// Precision-preserving scale factor for priority-weighted vruntime deltas.
+///
+/// `delta = (WORK_COST * PRIORITY_SCALE) / priority`. Without scaling, integer
+/// division would collapse to zero for priorities above `WORK_COST` (e.g.,
+/// priority 200 with `WORK_COST = 128` would yield `delta = 0`, starving all
+/// peers). Scaling by 256 keeps the formula resolution-correct across the
+/// full `u8` priority range (1..=255). Mirrors the role of `NICE_0_LOAD` in
+/// Linux CFS.
+pub(super) const PRIORITY_SCALE: u64 = 256;
+
+/// Compute the vruntime delta for a given priority.
+///
+/// Higher priority yields a smaller delta, so the descriptor accumulates
+/// vruntime more slowly and wins more dispatch share. Used both for an
+/// individual transfer's vruntime ([`TransferDescriptor::work_generated`])
+/// and for its group's vruntime when popped from the ready set.
+pub(super) fn vruntime_delta_for_priority(priority: u8) -> u64 {
+    (WORK_COST * PRIORITY_SCALE) / (priority as u64).max(1)
+}
 
 /// The scheduler's handle to a transfer.
 ///
@@ -190,10 +209,7 @@ impl TransferDescriptor {
     /// Record work generation and update vruntime based on priority.
     /// Higher priority = slower vruntime accumulation = more work share.
     pub(crate) fn work_generated(&self) {
-        let priority = self.priority() as u64;
-        // Scale up before dividing to avoid integer division truncating to zero.
-        // Multiplying by 256 ensures max priority (255) still yields delta >= 1.
-        let delta = (WORK_COST * 256) / priority.max(1);
+        let delta = vruntime_delta_for_priority(self.priority());
         self.add_vruntime(delta);
     }
 

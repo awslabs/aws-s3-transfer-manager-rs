@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock};
 
 use crossbeam_skiplist::SkipMap;
 
-use super::descriptor::TransferDescriptor;
+use super::descriptor::{vruntime_delta_for_priority, TransferDescriptor};
 use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::transfer::TransferId;
 
@@ -188,15 +188,15 @@ impl ReadySet {
     /// Add a transfer to the ready set.
     ///
     /// Dispatches on `descriptor.id().parent`:
-    /// - `parent = None` — creates a new group and inserts the descriptor as its first member.
-    /// - `parent = Some(pid)` — routes the descriptor into the existing group for `pid`.
+    /// - `parent = None` - creates a new group and inserts the descriptor as its first member.
+    /// - `parent = Some(pid)` - routes the descriptor into the existing group for `pid`.
     ///
     /// Returns `Err(OrphanedChild)` if `parent` is `Some(pid)` but no group with that id exists
     /// (the parent was cancelled between spawn and enqueue).
     ///
     /// Idempotent against double-insert: gated by a compare-and-swap on
     /// the descriptor's claim flag. A descriptor that is already claimed
-    /// (queued or being polled) silently returns `Ok(())` — the existing
+    /// (queued or being polled) silently returns `Ok(())` - the existing
     /// presence in the ready set or the in-flight poll is the canonical
     /// one.
     pub(super) fn insert(&self, descriptor: TransferDescriptor) -> Result<(), OrphanedChild> {
@@ -230,7 +230,7 @@ impl ReadySet {
             let group = Arc::clone(group);
             drop(by_group);
             let prev_count = group.insert(descriptor);
-            // If we transitioned from 0→1, group was not in root tree — re-add it
+            // If we transitioned from 0→1, group was not in root tree - re-add it
             if prev_count == 0 {
                 let gv = group.group_vruntime();
                 let key = GroupKey {
@@ -249,7 +249,7 @@ impl ReadySet {
     ///
     /// Updates min_vruntime to the popped group's group_vruntime.
     ///
-    /// Does **not** release the descriptor's claim — the claim is held
+    /// Does **not** release the descriptor's claim - the claim is held
     /// through `poll_work` and released by `generate_work` after the
     /// poll outcome is handled. This is what guarantees at most one
     /// worker is inside `poll_work` for any given transfer at a time.
@@ -264,6 +264,24 @@ impl ReadySet {
         self.min_vruntime
             .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
 
+        // Advance the group's vruntime by the popped descriptor's
+        // upcoming work cost. Mirrors Linux CFS group-entity accounting:
+        // when a member of a group runs, the group itself runs. Without
+        // this, groups whose members never call `work_generated` (e.g.,
+        // composites that always return Pending), or groups with equal
+        // spawn cost, stay tied on group_vruntime forever and tie-breaks
+        // by `group_id` would starve higher-id groups at the root tree.
+        //
+        // Delta uses the same priority-scaled formula as
+        // [`TransferDescriptor::work_generated`], so a higher-priority
+        // descriptor (e.g., a high-priority single transfer that is its
+        // own group of one) advances its group's vruntime more slowly
+        // and thus wins more dispatch share at the root.
+        let group_delta = vruntime_delta_for_priority(descriptor.priority());
+        group
+            .group_vruntime
+            .fetch_add(group_delta, Ordering::SeqCst);
+
         // Re-insert group if it still has members
         if group.nr_queued() > 0 {
             let new_key = GroupKey {
@@ -276,10 +294,13 @@ impl ReadySet {
         Some(descriptor)
     }
 
-    /// Advance a group's group_vruntime by `units`.
+    /// Test-only helper: advance a group's `group_vruntime` by `units`.
     ///
-    /// Used to charge spawn cost when a child is enqueued under a parent group.
-    /// No-op if `group_id` is not found (parent already cancelled).
+    /// Useful when a test wants to set up a specific gv state without
+    /// running through pop. Production code does not need to call this:
+    /// `pop` advances gv as part of running-cost accounting.
+    /// No-op if `group_id` is not found.
+    #[cfg(test)]
     pub(super) fn advance_group_vruntime(&self, group_id: u64, units: u64) {
         let by_group = self.by_group.read().unwrap();
         if let Some(group) = by_group.get(&group_id) {
@@ -412,7 +433,7 @@ impl ReadySet {
 
         let prev_count = group.insert(descriptor);
 
-        // If we transitioned from 0→1, group was not in root tree — re-add it
+        // If we transitioned from 0→1, group was not in root tree - re-add it
         if prev_count == 0 {
             let root_min = self.min_vruntime();
             group.group_vruntime.store(root_min, Ordering::SeqCst);
@@ -591,7 +612,7 @@ mod tests {
         // popped, root_min stays X. To advance further, we need advance_group_vruntime
         // to change the gv BEFORE the group is popped... but the SkipMap key is fixed.
 
-        // Actually wait — let me re-read my pop implementation. The pop uses
+        // Actually wait - let me re-read my pop implementation. The pop uses
         // `group.group_vruntime()` for re-insert, but `group_key.group_vruntime`
         // for updating root min_vruntime. So root_min advances to the KEY's gv,
         // not the atomic's current value.
@@ -614,8 +635,8 @@ mod tests {
 
         // Strategy:
         // 1. Insert group A (id=1) with 2 members. gv=0 in root tree.
-        // 2. advance_group_vruntime(1, 100) — atomic is now 100, but key is still 0.
-        // 3. Pop from group A — pops one member. Group still has 1 member.
+        // 2. advance_group_vruntime(1, 100) - atomic is now 100, but key is still 0.
+        // 3. Pop from group A - pops one member. Group still has 1 member.
         //    Re-inserts group A with key gv=100 (reads atomic). root_min advances to 0.
         // 4. Insert group B (id=2). gv = root_min = 0.
         // 5. Now root tree has: group B (gv=0, id=2) and group A (gv=100, id=1).
@@ -675,7 +696,7 @@ mod tests {
         assert!(set.root_contains_group(1));
         assert_eq!(set.member_count(1), Some(1));
 
-        // Pop second member — group should leave root
+        // Pop second member - group should leave root
         set.pop().unwrap();
         assert!(!set.root_contains_group(1));
         assert_eq!(set.member_count(1), Some(0));
@@ -687,49 +708,29 @@ mod tests {
     #[test]
     fn group_rejoins_root_on_next_insert() {
         let set = ReadySet::new();
-        // Create group 1 and drain it
+        // Create group 1 and drain it.
         set.insert(make_descriptor(1, None, 128, 0)).unwrap();
         set.pop().unwrap();
         assert!(!set.root_contains_group(1));
 
-        // Advance root min_vruntime: insert group 2 with 2 members,
-        // advance its gv, pop one (re-inserts with new gv), then pop again.
+        // Advance the root floor by exercising group 2: insert two members,
+        // bump its group_vruntime via spawn cost, then pop both. Each pop
+        // advances root_min via fetch_max with the popped key's gv, so by
+        // the end root_min is strictly greater than zero.
         set.insert(make_descriptor(2, None, 128, 0)).unwrap();
         set.insert(make_descriptor(22, Some(2), 128, 0)).unwrap();
         set.advance_group_vruntime(2, 50);
-        // Pop first member: group 2 re-inserted with gv=50. root_min advances to 0.
         set.pop().unwrap();
-        // Pop second member: group 2 removed. root_min advances to 50.
         set.pop().unwrap();
-        assert_eq!(set.min_vruntime(), 50);
+        let floor = set.min_vruntime();
+        assert!(floor > 0, "root floor should have advanced past 0");
 
-        // Insert child into group 1 — should rejoin at root floor (50)
+        // Inserting a new child into the now-empty group 1 should rejoin
+        // it at the current root floor (not at 0, which would let it
+        // unfairly outpace other groups).
         set.insert(make_descriptor(11, Some(1), 128, 0)).unwrap();
         assert!(set.root_contains_group(1));
-        assert_eq!(set.group_vruntime(1), Some(50));
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[test]
-    fn enqueue_with_parent_advances_parent_vruntime() {
-        let set = ReadySet::new();
-        let parent = make_descriptor(1, None, 128, 0);
-        set.insert(parent.clone()).unwrap();
-
-        assert_eq!(set.group_vruntime(1), Some(0));
-
-        // Simulate spawn cost: advance group vruntime per child
-        set.insert(make_descriptor(11, Some(1), 128, 0)).unwrap();
-        set.advance_group_vruntime(1, 128);
-        assert_eq!(set.group_vruntime(1), Some(128));
-
-        set.insert(make_descriptor(12, Some(1), 128, 0)).unwrap();
-        set.advance_group_vruntime(1, 128);
-        assert_eq!(set.group_vruntime(1), Some(256));
-
-        set.insert(make_descriptor(13, Some(1), 128, 0)).unwrap();
-        set.advance_group_vruntime(1, 128);
-        assert_eq!(set.group_vruntime(1), Some(384));
+        assert_eq!(set.group_vruntime(1), Some(floor));
     }
 
     #[cfg_attr(miri, ignore)]
@@ -819,7 +820,7 @@ mod tests {
         set.insert(t1.clone()).unwrap();
         set.insert(t2.clone()).unwrap();
 
-        // Simulate work on both — same priority means same vruntime delta
+        // Simulate work on both - same priority means same vruntime delta
         t1.work_generated();
         t2.work_generated();
 

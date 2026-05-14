@@ -363,7 +363,7 @@ async fn test_upload_objects_pipeline_depth_one_over_http() {
             .source(dataset.path())
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("serial/")
-            .pipeline_depth(1)
+            .max_concurrent_uploads(1)
             .send()
             .await
             .expect("initiate upload_objects");
@@ -391,6 +391,10 @@ async fn test_upload_objects_empty_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bucket = "test-bucket";
 
+        // Create the bucket upfront since no PutObject will fire to
+        // auto-create it (empty directory = zero uploads).
+        _server.create_bucket(bucket).await.expect("create bucket");
+
         let handle = tm
             .upload_objects()
             .bucket(bucket)
@@ -410,6 +414,8 @@ async fn test_upload_objects_empty_source() {
             "finished_at must be set even on zero-work transfer"
         );
 
+        // Create the bucket so count_objects can list it (no PutObject was
+        // issued, so the mock server's auto-create-on-put never fired).
         let landed = count_objects(&server_handle, bucket, "empty/").await;
         assert_eq!(0, landed);
 
