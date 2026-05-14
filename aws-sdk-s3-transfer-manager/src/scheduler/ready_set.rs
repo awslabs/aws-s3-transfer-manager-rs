@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use crossbeam_skiplist::SkipMap;
 
 use super::descriptor::{vruntime_delta_for_priority, TransferDescriptor};
-use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::transfer::TransferId;
 
 /// Key for ordering transfers in the ready set.
@@ -100,6 +100,11 @@ struct GroupQueue {
     /// Member count. Drives root-tree presence: 0 means the group is not in
     /// the root tree; >0 means it is.
     nr_queued: AtomicUsize,
+    /// CAS flag coordinating root-tree insertion between pop (re-insert
+    /// path) and insert (0->1 transition path). Only the thread that
+    /// wins `compare_exchange(false, true)` may add the group to the
+    /// root SkipMap. Prevents duplicate entries.
+    in_root: AtomicBool,
 }
 
 impl GroupQueue {
@@ -109,6 +114,7 @@ impl GroupQueue {
             min_vruntime: AtomicU64::new(0),
             group_vruntime: AtomicU64::new(initial_group_vruntime),
             nr_queued: AtomicUsize::new(0),
+            in_root: AtomicBool::new(false),
         }
     }
 
@@ -230,8 +236,12 @@ impl ReadySet {
             let group = Arc::clone(group);
             drop(by_group);
             let prev_count = group.insert(descriptor);
-            // If we transitioned from 0→1, group was not in root tree - re-add it
-            if prev_count == 0 {
+            if prev_count == 0
+                && group
+                    .in_root
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
                 let gv = group.group_vruntime();
                 let key = GroupKey {
                     group_vruntime: gv,
@@ -260,6 +270,9 @@ impl ReadySet {
 
         let descriptor = group.pop()?;
 
+        // Mark group as not in root tree (we just popped it out).
+        group.in_root.store(false, Ordering::SeqCst);
+
         // Update root min_vruntime (monotonically increasing)
         self.min_vruntime
             .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
@@ -282,8 +295,16 @@ impl ReadySet {
             .group_vruntime
             .fetch_add(group_delta, Ordering::SeqCst);
 
-        // Re-insert group if it still has members
-        if group.nr_queued() > 0 {
+        // Re-insert group if it still has members, using CAS to
+        // coordinate with concurrent insert_child's 0->1 path.
+        // Only the thread that wins the CAS adds the group to the
+        // root tree, preventing duplicate entries.
+        if group.nr_queued() > 0
+            && group
+                .in_root
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
             let new_key = GroupKey {
                 group_vruntime: group.group_vruntime(),
                 group_id: group_key.group_id,
@@ -390,7 +411,12 @@ impl ReadySet {
             let group = Arc::clone(group);
             drop(by_group);
             let prev_count = group.insert(descriptor);
-            if prev_count == 0 {
+            if prev_count == 0
+                && group
+                    .in_root
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
                 let root_min = self.min_vruntime();
                 group.group_vruntime.store(root_min, Ordering::SeqCst);
                 let key = GroupKey {
@@ -406,6 +432,7 @@ impl ReadySet {
         let root_min = self.min_vruntime();
         let group = Arc::new(GroupQueue::new(root_min));
         group.insert(descriptor);
+        group.in_root.store(true, Ordering::SeqCst);
 
         let key = GroupKey {
             group_vruntime: root_min,
@@ -433,8 +460,13 @@ impl ReadySet {
 
         let prev_count = group.insert(descriptor);
 
-        // If we transitioned from 0→1, group was not in root tree - re-add it
-        if prev_count == 0 {
+        // If we transitioned from 0->1, try to claim root-tree insertion.
+        if prev_count == 0
+            && group
+                .in_root
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
             let root_min = self.min_vruntime();
             group.group_vruntime.store(root_min, Ordering::SeqCst);
             let key = GroupKey {
@@ -880,6 +912,15 @@ mod loom_tests {
     /// The group-in-root invariant depends on nr_queued being accurate.
     struct GroupState {
         nr_queued: AtomicUsize,
+        /// Models root-tree presence as a counter rather than a bool.
+        /// In the real implementation, the root tree is a SkipMap that
+        /// admits duplicate entries for the same group_id. A counter > 1
+        /// means the group has duplicate entries - a correctness violation
+        /// that causes double-popping and transient unfairness.
+        root_entries: AtomicUsize,
+        /// CAS flag that coordinates the 0->1 inserter with pop's
+        /// re-insert path. Only the thread that wins the CAS may add
+        /// the group to the root tree.
         in_root: AtomicBool,
         group_vruntime: AtomicU64,
     }
@@ -888,35 +929,61 @@ mod loom_tests {
         fn new(initial_count: usize) -> Self {
             Self {
                 nr_queued: AtomicUsize::new(initial_count),
+                root_entries: AtomicUsize::new(if initial_count > 0 { 1 } else { 0 }),
                 in_root: AtomicBool::new(initial_count > 0),
                 group_vruntime: AtomicU64::new(0),
             }
         }
 
         /// Simulate insert_child: increment nr_queued atomically, add to root
-        /// if we transitioned from 0 to non-zero.
+        /// only if we win the in_root CAS (false -> true).
         fn insert(&self) {
             let prev = self.nr_queued.fetch_add(1, Ordering::SeqCst);
             if prev == 0 {
-                // We transitioned 0→1, responsible for adding to root
-                self.in_root.store(true, Ordering::SeqCst);
+                // We transitioned 0->1. Try to claim root-tree insertion.
+                if self
+                    .in_root
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.group_vruntime.store(0, Ordering::SeqCst);
+                    self.root_entries.fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
 
-        /// Simulate pop: remove from root, decrement, conditionally re-add.
+        /// Simulate pop: remove from root (decrement root_entries), decrement
+        /// nr_queued, advance gv, conditionally re-add via in_root CAS.
         fn pop(&self) {
-            // Pop removes group from root tree first
+            // Pop removes group from root tree first (pop_front)
+            self.root_entries.fetch_sub(1, Ordering::SeqCst);
             self.in_root.store(false, Ordering::SeqCst);
-            // Decrement nr_queued
+            // Decrement nr_queued (GroupQueue::pop)
             self.nr_queued.fetch_sub(1, Ordering::SeqCst);
-            // Re-insert if still has members
+            // Advance group_vruntime
+            self.group_vruntime.fetch_add(256, Ordering::SeqCst);
+            // Re-insert only if still has members AND we win the CAS.
+            // If a concurrent insert already set in_root=true (it won
+            // the 0->1 CAS), we don't double-insert.
             if self.nr_queued.load(Ordering::SeqCst) > 0 {
-                self.in_root.store(true, Ordering::SeqCst);
+                if self
+                    .in_root
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.root_entries.fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
 
         fn is_in_root(&self) -> bool {
-            self.in_root.load(Ordering::SeqCst)
+            self.root_entries.load(Ordering::SeqCst) > 0
+        }
+
+        /// Returns true if the group has at most one entry in the root tree.
+        /// More than one entry means duplicate insertion occurred.
+        fn root_entries_valid(&self) -> bool {
+            self.root_entries.load(Ordering::SeqCst) <= 1
         }
 
         fn count(&self) -> usize {
@@ -969,10 +1036,12 @@ mod loom_tests {
             // every interleaving (started at 1).
             assert_eq!(group.count(), 1);
             // With a member present, the group must be in the root tree.
-            // The empty-flag race between in_root.store(false) in pop and
-            // the in_root.store(true) in insert (when prev was 0) must
-            // converge to true regardless of ordering.
             assert!(group.is_in_root());
+            // No duplicate root-tree entries allowed.
+            assert!(
+                group.root_entries_valid(),
+                "duplicate root-tree entry detected"
+            );
         });
     }
 
@@ -1026,6 +1095,10 @@ mod loom_tests {
             // every interleaving (started at 2).
             assert_eq!(group.count(), 2);
             assert!(group.is_in_root());
+            assert!(
+                group.root_entries_valid(),
+                "duplicate root-tree entry detected"
+            );
         });
     }
 
@@ -1047,9 +1120,9 @@ mod loom_tests {
             a.join().unwrap();
             b.join().unwrap();
 
-            // gv is either 100 (advance happened) regardless of pop ordering
+            // gv = 100 (external advance) + 256 (pop's running-cost advance)
             let gv = group.group_vruntime.load(Ordering::SeqCst);
-            assert_eq!(gv, 100);
+            assert_eq!(gv, 356);
             // One member remains
             assert_eq!(group.count(), 1);
             assert!(group.is_in_root());
