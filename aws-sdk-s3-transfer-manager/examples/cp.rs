@@ -340,6 +340,10 @@ async fn write_body(body: &mut Body, mut dest: fs::File) -> Result<(), BoxError>
         }
         tracing::trace!("chunk had {segment_cnt} segments");
     }
+    // Flush tokio's internal write buffer before the file is dropped;
+    // without this the file may still be partially written when this
+    // function returns. See `tokio::fs::File` docs on buffering.
+    dest.shutdown().await?;
     Ok(())
 }
 

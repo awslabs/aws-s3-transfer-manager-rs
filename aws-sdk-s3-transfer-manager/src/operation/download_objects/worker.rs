@@ -200,15 +200,36 @@ async fn download_single_obj(
 
     let parent_dir = key_path.parent().expect("valid parent dir for key");
     fs::create_dir_all(parent_dir).await?;
-    let mut dest = fs::File::create(key_path).await?;
+    write_body_to_file(&mut body, &key_path).await
+}
 
+/// Drain `body` into a new file at `key_path`, ensuring all bytes are
+/// durable before returning.
+async fn write_body_to_file(body: &mut Body, key_path: &Path) -> Result<(), error::Error> {
+    let dest = fs::File::create(key_path).await?;
+    write_body_to_open_file(body, dest).await
+}
+
+/// Drain `body` into the open file `dest`, ensuring all bytes are
+/// durable before returning.
+///
+/// `tokio::fs::File` buffers writes via `spawn_blocking` and does not
+/// drain that work on `Drop`, so the explicit `shutdown` at the end is
+/// load-bearing: without it the function returns while writes may still
+/// be in flight, and callers that stat the file immediately can observe
+/// a short read. See the tokio docs:
+/// <https://docs.rs/tokio/latest/tokio/fs/struct.File.html#in-the-presence-of-buffering>.
+async fn write_body_to_open_file(
+    body: &mut Body,
+    mut dest: fs::File,
+) -> Result<(), error::Error> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
         for segment in chunk.data.into_segments() {
             dest.write_all(segment.as_ref()).await?;
         }
     }
-
+    dest.shutdown().await?;
     Ok(())
 }
 
@@ -580,5 +601,101 @@ mod tests {
         join_handle.await.unwrap().unwrap();
 
         assert_eq!(keys, vec!["key1", "key3"]);
+    }
+
+    /// Regression test for the `tokio::fs::File`-no-shutdown bug in
+    /// `write_body_to_open_file`. Calls the production helper directly.
+    ///
+    /// Strategy: build a runtime with `max_blocking_threads(1)`, pre-open
+    /// the destination file via `std::fs::File` (so file-open doesn't
+    /// need the blocking pool), then *saturate* the single blocking
+    /// thread with a parked task. With the pool starved, every
+    /// `spawn_blocking` from `tokio::fs::File`'s write path is queued
+    /// behind the saturator and physically cannot run.
+    ///
+    /// `write_body_to_open_file` must drive the writes to durable
+    /// completion before returning. With `shutdown().await?` at the end
+    /// of the helper, the call blocks waiting for the queued blocking
+    /// work to drain — `writer.is_finished()` stays false until we
+    /// release the saturator. Remove the `shutdown` line and the helper
+    /// returns immediately (its `write_all` calls have only *dispatched*
+    /// the writes to the queue, they haven't waited for them) —
+    /// `writer.is_finished()` becomes true while the pool is still
+    /// saturated, and this assertion fires.
+    #[test]
+    fn write_body_to_open_file_returns_only_after_bytes_are_durable() {
+        use crate::io::AggregatedBytes;
+        use crate::operation::download::ChunkOutput;
+        use bytes::Bytes;
+        use bytes_utils::SegmentedBuf;
+        use std::fs::File as StdFile;
+        use std::time::Duration;
+        use tokio::runtime::Builder;
+        use tokio::sync::{mpsc, oneshot};
+
+        const PAYLOAD: &[u8] = &[0xab; 5000];
+
+        let rt = Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let key_path = dir.path().join("obj");
+
+            // Pre-open the destination via `std` so we don't need the
+            // blocking pool to do it.
+            let dest = fs::File::from_std(StdFile::create(&key_path).unwrap());
+
+            // Body carrying one synthetic chunk; then channel closes.
+            let (tx, rx) = mpsc::channel(1);
+            let mut aggregated = SegmentedBuf::new();
+            aggregated.push(Bytes::from_static(PAYLOAD));
+            tx.send(Ok(ChunkOutput {
+                seq: 0,
+                data: AggregatedBytes(aggregated),
+                metadata: Default::default(),
+            }))
+            .await
+            .unwrap();
+            drop(tx);
+            let mut body = Body::new(rx);
+
+            // Saturate the single blocking thread.
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.blocking_recv();
+            });
+            started_rx.await.unwrap();
+
+            // Drive the helper. With `shutdown` present, this task is
+            // pending until we release the saturator. Without `shutdown`,
+            // it returns immediately.
+            let writer =
+                tokio::spawn(async move { write_body_to_open_file(&mut body, dest).await });
+
+            // Give the helper enough time to reach `shutdown`. 200 ms is
+            // generous; the relevant work is a single `write_all` plus a
+            // `shutdown`, both of which would be near-instant if the pool
+            // were free.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !writer.is_finished(),
+                "write_body_to_open_file returned while the blocking pool is \
+                 saturated — `dest.shutdown().await?` is missing or non-load-bearing"
+            );
+
+            // Release and let the writer complete.
+            release_tx.send(()).unwrap();
+            writer.await.unwrap().unwrap();
+
+            let on_disk = std::fs::metadata(&key_path).unwrap().len() as usize;
+            assert_eq!(on_disk, PAYLOAD.len());
+        });
     }
 }
