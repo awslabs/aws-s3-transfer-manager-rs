@@ -18,12 +18,13 @@
 //! fairness across top-level transfers regardless of how many children each spawns.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use crossbeam_skiplist::SkipMap;
 
-use super::descriptor::{vruntime_delta_for_priority, TransferDescriptor};
+use super::descriptor::TransferDescriptor;
 use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::runtime::sync::sync::Arc;
 use crate::transfer::TransferId;
 
 /// Key for ordering transfers in the ready set.
@@ -95,8 +96,9 @@ struct GroupQueue {
     /// vruntime from giving late arrivals a head start over current members).
     min_vruntime: AtomicU64,
     /// Group's accumulated vruntime. Sorts the group against peers in the
-    /// root tree.
-    group_vruntime: AtomicU64,
+    /// root tree. Shared with all descriptors in this group so that
+    /// `work_generated` can advance it without a lookup.
+    group_vruntime: Arc<AtomicU64>,
     /// Member count. Drives root-tree presence: 0 means the group is not in
     /// the root tree; >0 means it is.
     nr_queued: AtomicUsize,
@@ -108,14 +110,19 @@ struct GroupQueue {
 }
 
 impl GroupQueue {
-    fn new(initial_group_vruntime: u64) -> Self {
+    fn new(group_vruntime: Arc<AtomicU64>) -> Self {
         Self {
             inner: SkipMap::new(),
             min_vruntime: AtomicU64::new(0),
-            group_vruntime: AtomicU64::new(initial_group_vruntime),
+            group_vruntime,
             nr_queued: AtomicUsize::new(0),
             in_root: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_initial_vruntime(initial: u64) -> Self {
+        Self::new(Arc::new(AtomicU64::new(initial)))
     }
 
     /// Insert a descriptor. Returns the previous nr_queued count (0 means
@@ -147,6 +154,10 @@ impl GroupQueue {
 
     fn group_vruntime(&self) -> u64 {
         self.group_vruntime.load(Ordering::SeqCst)
+    }
+
+    fn group_vruntime_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.group_vruntime)
     }
 }
 
@@ -189,6 +200,32 @@ impl ReadySet {
     /// Get current minimum vruntime for initializing new transfers.
     pub(super) fn min_vruntime(&self) -> u64 {
         self.min_vruntime.load(Ordering::Acquire)
+    }
+
+    /// Resolve the group_vruntime Arc for a transfer about to be enqueued.
+    ///
+    /// - For children: returns the parent group's existing Arc.
+    /// - For top-level: creates a new Arc (will be installed into the
+    ///   GroupQueue during insert_top_level).
+    ///
+    /// Returns None if the parent group has been removed (orphaned child).
+    pub(super) fn resolve_group_vruntime(&self, id: &TransferId) -> Option<Arc<AtomicU64>> {
+        match id.parent {
+            Some(parent_id) => {
+                let by_group = self.by_group.read().unwrap();
+                by_group.get(&parent_id).map(|g| g.group_vruntime_arc())
+            }
+            None => {
+                // Check if group already exists (re-enqueue after Pending/wake)
+                let by_group = self.by_group.read().unwrap();
+                if let Some(group) = by_group.get(&id.id) {
+                    return Some(group.group_vruntime_arc());
+                }
+                drop(by_group);
+                // New top-level: fresh Arc at current floor
+                Some(Arc::new(AtomicU64::new(self.min_vruntime())))
+            }
+        }
     }
 
     /// Add a transfer to the ready set.
@@ -277,24 +314,6 @@ impl ReadySet {
         self.min_vruntime
             .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
 
-        // Advance the group's vruntime by the popped descriptor's
-        // upcoming work cost. Mirrors Linux CFS group-entity accounting:
-        // when a member of a group runs, the group itself runs. Without
-        // this, groups whose members never call `work_generated` (e.g.,
-        // composites that always return Pending), or groups with equal
-        // spawn cost, stay tied on group_vruntime forever and tie-breaks
-        // by `group_id` would starve higher-id groups at the root tree.
-        //
-        // Delta uses the same priority-scaled formula as
-        // [`TransferDescriptor::work_generated`], so a higher-priority
-        // descriptor (e.g., a high-priority single transfer that is its
-        // own group of one) advances its group's vruntime more slowly
-        // and thus wins more dispatch share at the root.
-        let group_delta = vruntime_delta_for_priority(descriptor.priority());
-        group
-            .group_vruntime
-            .fetch_add(group_delta, Ordering::SeqCst);
-
         // Re-insert group if it still has members, using CAS to
         // coordinate with concurrent insert_child's 0->1 path.
         // Only the thread that wins the CAS adds the group to the
@@ -358,7 +377,7 @@ impl ReadySet {
     #[cfg(test)]
     pub(crate) fn register_empty_group_for_test(&self, group_id: u64) {
         let root_min = self.min_vruntime();
-        let group = Arc::new(GroupQueue::new(root_min));
+        let group = Arc::new(GroupQueue::new_with_initial_vruntime(root_min));
         self.by_group.write().unwrap().insert(group_id, group);
     }
 
@@ -430,7 +449,8 @@ impl ReadySet {
         drop(by_group);
 
         let root_min = self.min_vruntime();
-        let group = Arc::new(GroupQueue::new(root_min));
+        let gv_arc = descriptor.group_vruntime_arc();
+        let group = Arc::new(GroupQueue::new(gv_arc));
         group.insert(descriptor);
         group.in_root.store(true, Ordering::SeqCst);
 
@@ -511,7 +531,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn group_queue_insert_pop_single() {
-        let gq = GroupQueue::new(0);
+        let gq = GroupQueue::new_with_initial_vruntime(0);
         let desc = make_descriptor(1, None, 128, 0);
         gq.insert(desc.clone());
         assert_eq!(gq.nr_queued(), 1);
@@ -525,7 +545,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn group_queue_pop_lowest_vruntime() {
-        let gq = GroupQueue::new(0);
+        let gq = GroupQueue::new_with_initial_vruntime(0);
         gq.insert(make_descriptor(10, None, 128, 5));
         gq.insert(make_descriptor(11, None, 128, 1));
         gq.insert(make_descriptor(12, None, 128, 3));
@@ -953,18 +973,14 @@ mod loom_tests {
         }
 
         /// Simulate pop: remove from root (decrement root_entries), decrement
-        /// nr_queued, advance gv, conditionally re-add via in_root CAS.
+        /// nr_queued, conditionally re-add via in_root CAS.
         fn pop(&self) {
             // Pop removes group from root tree first (pop_front)
             self.root_entries.fetch_sub(1, Ordering::SeqCst);
             self.in_root.store(false, Ordering::SeqCst);
             // Decrement nr_queued (GroupQueue::pop)
             self.nr_queued.fetch_sub(1, Ordering::SeqCst);
-            // Advance group_vruntime
-            self.group_vruntime.fetch_add(256, Ordering::SeqCst);
             // Re-insert only if still has members AND we win the CAS.
-            // If a concurrent insert already set in_root=true (it won
-            // the 0->1 CAS), we don't double-insert.
             if self.nr_queued.load(Ordering::SeqCst) > 0 {
                 if self
                     .in_root
@@ -1120,9 +1136,9 @@ mod loom_tests {
             a.join().unwrap();
             b.join().unwrap();
 
-            // gv = 100 (external advance) + 256 (pop's running-cost advance)
+            // Pop no longer advances gv; only the external advance fires.
             let gv = group.group_vruntime.load(Ordering::SeqCst);
-            assert_eq!(gv, 356);
+            assert_eq!(gv, 100);
             // One member remains
             assert_eq!(group.count(), 1);
             assert!(group.is_in_root());

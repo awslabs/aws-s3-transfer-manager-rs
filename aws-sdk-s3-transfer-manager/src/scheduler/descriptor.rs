@@ -8,8 +8,8 @@
 //! See the [`scheduler`](super) module docs for the threading and cost
 //! model that the descriptor's claim protocol enforces.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use crate::runtime::sync::sync::Arc;
 
 use tokio::sync::Notify;
 
@@ -124,6 +124,10 @@ pub(crate) struct TransferDescriptor(Arc<Inner>);
 struct Inner {
     priority: AtomicU8,
     vruntime: AtomicU64,
+    /// Shared with the GroupQueue this descriptor belongs to. When
+    /// `work_generated` fires, both individual vruntime and group
+    /// vruntime advance by the same priority-scaled delta.
+    group_vruntime: Arc<AtomicU64>,
     queued_executing: QueuedExecuting,
     transfer: BoxTransfer,
     idle_notify: Notify,
@@ -141,15 +145,20 @@ impl std::fmt::Debug for TransferDescriptor {
 }
 
 impl TransferDescriptor {
-    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
+    #[cfg(test)]
     pub(crate) fn new(transfer: BoxTransfer) -> Self {
-        Self::new_with_vruntime(transfer, 0)
+        Self::new_with_vruntime(transfer, 0, Arc::new(AtomicU64::new(0)))
     }
 
-    pub(crate) fn new_with_vruntime(transfer: BoxTransfer, initial_vruntime: u64) -> Self {
+    pub(crate) fn new_with_vruntime(
+        transfer: BoxTransfer,
+        initial_vruntime: u64,
+        group_vruntime: Arc<AtomicU64>,
+    ) -> Self {
         Self(Arc::new(Inner {
             priority: AtomicU8::new(DEFAULT_PRIORITY),
             vruntime: AtomicU64::new(initial_vruntime),
+            group_vruntime,
             queued_executing: QueuedExecuting::new(),
             transfer,
             idle_notify: Notify::new(),
@@ -193,6 +202,10 @@ impl TransferDescriptor {
         self.0.priority.store(priority, Ordering::Release);
     }
 
+    pub(super) fn group_vruntime_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.0.group_vruntime)
+    }
+
     pub(crate) fn vruntime(&self) -> u64 {
         self.0.vruntime.load(Ordering::Acquire)
     }
@@ -204,6 +217,7 @@ impl TransferDescriptor {
 
     fn add_vruntime(&self, delta: u64) {
         self.0.vruntime.fetch_add(delta, Ordering::AcqRel);
+        self.0.group_vruntime.fetch_add(delta, Ordering::SeqCst);
     }
 
     /// Record work generation and update vruntime based on priority.

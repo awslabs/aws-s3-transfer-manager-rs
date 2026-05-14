@@ -185,29 +185,31 @@ impl Scheduler {
 
     /// Add a transfer and start generating work.
     pub(crate) fn enqueue_transfer(&self, transfer: BoxTransfer) {
-        // start with lowest current vruntime to avoid new transfer
-        // playing aggressive catchup over already in-flight transfers
-        let parent_id_opt = transfer.ctx().id.parent;
-        let desc = TransferDescriptor::new_with_vruntime(transfer, self.0.ready_set.min_vruntime());
+        let tid = transfer.ctx().id;
 
-        let id = desc.id();
-
-        // Spawn-cost accounting on the parent: when a child is enqueued,
-        // advance the parent's individual vruntime by one work unit. This
-        // bubbles the parent down its own group's inner queue so children
-        // pop first (the parent itself returns Pending most of the time).
-        // The group's group_vruntime is not advanced here; pop's running-
-        // cost accounting handles root-level fairness.
-        if let Some(parent_id) = parent_id_opt {
-            let transfers = self.0.transfers.read().unwrap();
-            let parent_tid = TransferId {
-                id: parent_id,
-                parent: None,
-            };
-            if let Some(parent_desc) = transfers.get(&parent_tid) {
-                parent_desc.work_generated();
+        // Resolve the group's shared vruntime atomic before constructing
+        // the descriptor. Children get their parent's existing Arc;
+        // new top-level transfers get a fresh one.
+        let group_vruntime = match self.0.ready_set.resolve_group_vruntime(&tid) {
+            Some(gv) => gv,
+            None => {
+                // Parent group gone (cancelled mid-spawn). Set the transfer's
+                // context to cancelled and signal terminal so its handle
+                // resolves. No need to insert into the transfers map since
+                // nothing will ever poll or wake this transfer.
+                let ctx = transfer.ctx();
+                ctx.set_cancelled();
+                ctx.signal_terminal();
+                return;
             }
-        }
+        };
+
+        let desc = TransferDescriptor::new_with_vruntime(
+            transfer,
+            self.0.ready_set.min_vruntime(),
+            group_vruntime,
+        );
+        let id = desc.id();
 
         {
             let mut transfers = self.0.transfers.write().unwrap();
