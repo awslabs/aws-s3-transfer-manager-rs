@@ -593,126 +593,26 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn ready_set_pop_returns_lowest_group_lowest_member() {
+        // Set up two groups with different group_vruntimes so pop order
+        // is deterministic: group B (gv=0) should pop before group A (gv=100).
         let set = ReadySet::new();
 
-        // Create group B (id=2) first at root_min=0 (gv=0 in root tree)
-        set.insert(make_descriptor(2, None, 128, 0)).unwrap();
-        set.insert(make_descriptor(21, Some(2), 128, 3)).unwrap();
-
-        // Create group A (id=1) also at root_min=0 (gv=0 in root tree)
-        // With gv tie, group_id breaks it: 1 < 2, so group A pops first.
-        // To make group B pop first, we need group A to have higher gv.
-        // Drain group A, advance root_min, then have A rejoin at higher floor.
-
-        // Instead: insert group A with members that have higher vruntimes.
-        // The group_vruntime in the root tree is set at insert time to root_min.
-        // Both groups get gv=0. Tie-break: lower group_id wins.
-        // To test "lowest group first", we need different gv values.
-
-        // Strategy: insert group A, pop all its members (advancing root_min),
-        // then insert group B which gets gv = new root_min.
-        let set = ReadySet::new();
-
-        // Group A (id=1): insert with vruntime=10
-        set.insert(make_descriptor(1, None, 128, 10)).unwrap();
-        // Pop group A to advance root min_vruntime to 10 (gv of group A was 0)
-        // Actually root min_vruntime advances to group_vruntime of popped group = 0
-        set.pop().unwrap();
-        // root min_vruntime is now 0 (the gv of group A when it was in root tree)
-
-        // Better approach: use the fact that groups are keyed by (gv, group_id).
-        // Insert group A at root_min=0, pop it to advance root_min to 0.
-        // Insert group B at root_min=0. Both start at gv=0.
-        // To get different gv: drain group A, insert group B with high vruntime,
-        // pop B to advance root_min, then have A rejoin at new root_min.
-
-        let set = ReadySet::new();
-
-        // Step 1: Create group B (id=2) with gv=0
-        set.insert(make_descriptor(2, None, 128, 0)).unwrap();
-        set.insert(make_descriptor(21, Some(2), 128, 0)).unwrap();
-
-        // Step 2: Create group A (id=1), drain it, then rejoin at higher root_min
-        // First advance root_min by popping group B temporarily... this is circular.
-
-        // Simplest correct test: two groups with different gv achieved by
-        // having one group drain and rejoin after root_min advances.
-        let set = ReadySet::new();
-
-        // Insert group A (id=1) with high vruntime member to advance root_min on pop
-        set.insert(make_descriptor(1, None, 128, 100)).unwrap();
-        // Pop group A: root_min advances to gv=0 (group A's gv was 0 at insert)
-        let _a = set.pop().unwrap();
-        // root_min is still 0
-
-        // Insert group B (id=2) at root_min=0, gv=0
-        set.insert(make_descriptor(2, None, 128, 50)).unwrap();
-        // Pop group B: root_min advances to 0 (group B's gv was 0)
-        let _b = set.pop().unwrap();
-
-        // Now root_min = 0. We need to get it higher.
-        // The issue: root_min advances to the popped group's group_vruntime,
-        // which is always the value at insert time (root_min at that point).
-
-        // OK, different approach entirely. The root_min only advances when we pop.
-        // It advances to the popped group's gv (which was root_min at insert time).
-        // So root_min can only advance if a group was inserted when root_min was
-        // already > 0. Chicken-and-egg.
-
-        // The way root_min advances in practice: group is inserted at root_min=X,
-        // then popped, advancing root_min to X. Next group inserted at root_min=X,
-        // popped, root_min stays X. To advance further, we need advance_group_vruntime
-        // to change the gv BEFORE the group is popped... but the SkipMap key is fixed.
-
-        // Actually wait - let me re-read my pop implementation. The pop uses
-        // `group.group_vruntime()` for re-insert, but `group_key.group_vruntime`
-        // for updating root min_vruntime. So root_min advances to the KEY's gv,
-        // not the atomic's current value.
-
-        // The only way to get different gv values in the root tree is to have
-        // groups inserted at different root_min values. And root_min only advances
-        // when we pop. So:
-        // 1. Insert group X at root_min=0 with a high-vruntime member
-        // 2. Pop group X → root_min advances to 0 (X's gv was 0)
-        // Hmm, this doesn't help.
-
-        // Actually I realize the issue: root_min advances to the GROUP's gv,
-        // not the member's vruntime. All groups start with gv = root_min at
-        // insert time. So root_min can never advance beyond 0 unless we
-        // advance a group's gv and then somehow get that reflected in the key.
-
-        // The re-insert after pop uses `group.group_vruntime()` (the atomic).
-        // So if we advance_group_vruntime BEFORE a pop that re-inserts the group,
-        // the re-inserted key will have the new gv!
-
-        // Strategy:
-        // 1. Insert group A (id=1) with 2 members. gv=0 in root tree.
-        // 2. advance_group_vruntime(1, 100) - atomic is now 100, but key is still 0.
-        // 3. Pop from group A - pops one member. Group still has 1 member.
-        //    Re-inserts group A with key gv=100 (reads atomic). root_min advances to 0.
-        // 4. Insert group B (id=2). gv = root_min = 0.
-        // 5. Now root tree has: group B (gv=0, id=2) and group A (gv=100, id=1).
-        // 6. Pop → should pick group B (lower gv).
-
-        let set = ReadySet::new();
-
-        // Group A with 2 members
+        // Group A (id=1) with 2 members, then advance its gv to 100.
+        // When pop re-inserts the group, it uses the atomic gv (100).
         set.insert(make_descriptor(1, None, 128, 0)).unwrap();
         set.insert(make_descriptor(11, Some(1), 128, 5)).unwrap();
-
-        // Advance group A's gv so re-insert after pop uses higher key
         set.advance_group_vruntime(1, 100);
 
-        // Pop one member from group A. Group re-inserted with gv=100.
+        // Pop one member from group A. Re-inserts group A with gv=100.
         let first = set.pop().unwrap();
-        assert_eq!(first.id().id, 1); // lowest vruntime member (id=1, vrt=0)
+        assert_eq!(first.id().id, 1);
 
-        // Now insert group B at root_min=0
+        // Group B (id=2) inserted at root_min=0, so gv=0.
         set.insert(make_descriptor(2, None, 128, 0)).unwrap();
         set.insert(make_descriptor(22, Some(2), 128, 3)).unwrap();
 
-        // Root tree: group B (gv=0, id=2), group A (gv=100, id=1)
-        // Pop should pick group B, then lowest member in B (id=2, vrt=0)
+        // Root tree: group B (gv=0), group A (gv=100).
+        // Pop picks group B (lower gv), then its lowest-vruntime member.
         let popped = set.pop().unwrap();
         assert_eq!(popped.id().id, 2);
     }

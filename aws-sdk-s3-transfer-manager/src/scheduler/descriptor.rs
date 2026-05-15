@@ -27,7 +27,7 @@ use crate::transfer::{BoxTransfer, Transfer, TransferId};
 /// or currently being polled. Asserted by [`ClaimState::try_claim`], cleared
 /// by [`ClaimState::release_claim`]. The flag is held continuously from
 /// ready-set insert through `pop` through `poll_work` until `generate_work`
-/// finishes handling the outcome — this is what serializes `poll_work` to
+/// finishes handling the outcome - this is what serializes `poll_work` to
 /// one worker per descriptor at a time.
 ///
 /// The wake-requested flag is set unconditionally by `Scheduler::wake`
@@ -210,7 +210,7 @@ impl TransferDescriptor {
         self.0.vruntime.load(Ordering::Acquire)
     }
 
-    #[cfg(test)] // TODO: evaluate for public scheduling API
+    #[cfg(test)]
     pub(crate) fn set_vruntime(&self, vruntime: u64) {
         self.0.vruntime.store(vruntime, Ordering::Release);
     }
@@ -276,7 +276,7 @@ impl TransferDescriptor {
 /// Packed atomic counter for queued + executing counts.
 ///
 /// A single `AtomicU64` instead of two `AtomicU32`s so that `start_executing`
-/// (queued-1, executing+1) is a single CAS — no window where the counts are
+/// (queued-1, executing+1) is a single CAS - no window where the counts are
 /// inconsistent and `is_idle()` could return a false positive.
 ///
 /// Layout: `[queued: u32][executing: u32]`
@@ -321,13 +321,13 @@ impl QueuedExecuting {
         self.0.load(Ordering::Acquire) == 0
     }
 
-    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
+    #[cfg(test)]
     fn get(&self) -> (u32, u32) {
         let val = self.0.load(Ordering::Acquire);
         ((val >> 32) as u32, val as u32)
     }
 
-    #[cfg(test)] // TODO(phase3): evaluate for public scheduling API
+    #[cfg(test)]
     fn outstanding(&self) -> u64 {
         let (q, e) = self.get();
         q as u64 + e as u64
@@ -359,7 +359,7 @@ impl<'a> ClaimGuard<'a> {
         self.released = true;
     }
 
-    /// Consume the guard without releasing — the claim stays asserted.
+    /// Consume the guard without releasing - the claim stays asserted.
     /// Used by the `PollWork::Ready` path which keeps the claim held
     /// across re-insert.
     pub(super) fn hold(mut self) {
