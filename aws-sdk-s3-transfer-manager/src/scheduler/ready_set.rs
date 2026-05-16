@@ -84,39 +84,115 @@ impl PartialOrd for GroupKey {
     }
 }
 
+/// Atomic coordination state for a group's position in the scheduling
+/// hierarchy. Tracks member count, root-tree presence, and vruntime.
+///
+/// Separated from `GroupQueue` so that loom tests can exercise the
+/// coordination protocol directly without requiring the `SkipMap` member
+/// storage (which loom cannot instrument).
+pub(super) struct GroupState {
+    /// Floor vruntime for new members joining the group. Prevents a late
+    /// arrival from having stale vruntime that gives it a head start over
+    /// current members. Monotonically increasing (advanced on each pop).
+    min_vruntime: AtomicU64,
+    /// Group's accumulated vruntime. Determines the group's position in
+    /// the root tree relative to peer groups. Shared with all descriptors
+    /// in this group so that `work_generated` can advance it without a
+    /// lookup back to the GroupQueue.
+    group_vruntime: Arc<AtomicU64>,
+    /// Number of members currently queued. Drives root-tree presence:
+    /// a group with zero members is removed from the root tree.
+    nr_queued: AtomicUsize,
+    /// CAS flag coordinating root-tree insertion. Only the thread that
+    /// wins `compare_exchange(false, true)` may add the group to the root
+    /// SkipMap. Prevents duplicate entries when pop's re-insert races with
+    /// insert_child's 0->1 transition.
+    in_root: AtomicBool,
+}
+
+impl GroupState {
+    pub(super) fn new(group_vruntime: Arc<AtomicU64>) -> Self {
+        Self {
+            min_vruntime: AtomicU64::new(0),
+            group_vruntime,
+            nr_queued: AtomicUsize::new(0),
+            in_root: AtomicBool::new(false),
+        }
+    }
+
+    /// A member entered the group's queue. Returns previous count.
+    /// A transition from 0 to 1 means the caller should attempt
+    /// `try_enter_root`.
+    pub(super) fn enqueue(&self) -> usize {
+        self.nr_queued.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// A member left the group's queue. Returns previous count.
+    pub(super) fn dequeue(&self) -> usize {
+        self.nr_queued.fetch_sub(1, Ordering::SeqCst)
+    }
+
+    /// Attempt to claim root-tree presence. Returns true if this thread
+    /// won the CAS and is responsible for inserting the group into the
+    /// root tree.
+    pub(super) fn try_enter_root(&self) -> bool {
+        self.in_root
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Clear root-tree presence (group was removed from root tree).
+    pub(super) fn exit_root(&self) {
+        self.in_root.store(false, Ordering::SeqCst);
+    }
+
+    pub(super) fn nr_queued(&self) -> usize {
+        self.nr_queued.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn min_vruntime(&self) -> u64 {
+        self.min_vruntime.load(Ordering::Acquire)
+    }
+
+    pub(super) fn advance_min_vruntime(&self, vruntime: u64) {
+        self.min_vruntime.fetch_max(vruntime, Ordering::AcqRel);
+    }
+
+    pub(super) fn group_vruntime(&self) -> u64 {
+        self.group_vruntime.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn set_group_vruntime(&self, val: u64) {
+        self.group_vruntime.store(val, Ordering::SeqCst);
+    }
+
+    pub(super) fn group_vruntime_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.group_vruntime)
+    }
+}
+
 /// Per-tree CFS queue. Holds the top-level transfer plus all its descendants
-/// in a single SkipMap ordered by individual vruntime. Tracks the group's
-/// own vruntime (used to position the group in the root tree) and a
-/// member counter that gates root-tree presence: a group with zero members
-/// is not present in the root tree.
+/// in a single SkipMap ordered by individual vruntime.
+/// Per-group CFS queue. Holds the top-level transfer plus all its
+/// descendants in a single SkipMap ordered by individual vruntime.
+///
+/// A group with zero members is not present in the root tree. When a
+/// member is inserted into an empty group, the inserting thread claims
+/// root-tree entry via [`GroupState::try_enter_root`]. When the last
+/// member is popped, the group exits the root tree.
 struct GroupQueue {
+    /// Atomic coordination state (member count, root presence, vruntime).
+    state: GroupState,
     /// Members of this group, ordered by individual vruntime.
     inner: SkipMap<ReadyKey, TransferDescriptor>,
-    /// Floor used when a new descendant joins the group (prevents stale
-    /// vruntime from giving late arrivals a head start over current members).
-    min_vruntime: AtomicU64,
-    /// Group's accumulated vruntime. Sorts the group against peers in the
-    /// root tree. Shared with all descriptors in this group so that
-    /// `work_generated` can advance it without a lookup.
-    group_vruntime: Arc<AtomicU64>,
-    /// Member count. Drives root-tree presence: 0 means the group is not in
-    /// the root tree; >0 means it is.
-    nr_queued: AtomicUsize,
-    /// CAS flag coordinating root-tree insertion between pop (re-insert
-    /// path) and insert (0->1 transition path). Only the thread that
-    /// wins `compare_exchange(false, true)` may add the group to the
-    /// root SkipMap. Prevents duplicate entries.
-    in_root: AtomicBool,
 }
 
 impl GroupQueue {
     fn new(group_vruntime: Arc<AtomicU64>) -> Self {
         Self {
+            state: GroupState::new(group_vruntime),
             inner: SkipMap::new(),
-            min_vruntime: AtomicU64::new(0),
-            group_vruntime,
-            nr_queued: AtomicUsize::new(0),
-            in_root: AtomicBool::new(false),
         }
     }
 
@@ -131,33 +207,38 @@ impl GroupQueue {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
         self.inner.insert(key, descriptor);
-        self.nr_queued.fetch_add(1, Ordering::SeqCst)
+        self.state.enqueue()
     }
 
+    /// Pop the member with the lowest vruntime. Returns `None` if the
+    /// group is empty. Advances the group's min_vruntime floor.
     fn pop(&self) -> Option<TransferDescriptor> {
         let entry = self.inner.pop_front()?;
-        self.nr_queued.fetch_sub(1, Ordering::SeqCst);
-        // Update group's min_vruntime (monotonically increasing)
-        self.min_vruntime
-            .fetch_max(entry.key().vruntime, Ordering::AcqRel);
+        self.state.dequeue();
+        self.state.advance_min_vruntime(entry.key().vruntime);
         Some(entry.value().clone())
     }
 
-    fn nr_queued(&self) -> usize {
-        self.nr_queued.load(Ordering::SeqCst)
+    /// Number of members currently queued in this group.
+    fn count(&self) -> usize {
+        self.state.nr_queued()
     }
 
     #[cfg(test)]
+    /// Vruntime floor for new members joining this group.
     fn min_vruntime(&self) -> u64 {
-        self.min_vruntime.load(Ordering::Acquire)
+        self.state.min_vruntime()
     }
 
+    /// The group's accumulated vruntime (its position in the root tree).
     fn group_vruntime(&self) -> u64 {
-        self.group_vruntime.load(Ordering::SeqCst)
+        self.state.group_vruntime()
     }
 
+    /// Shared handle to the group's vruntime atomic. Cloned into each
+    /// descriptor so `work_generated` can advance it without a lookup.
     fn group_vruntime_arc(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.group_vruntime)
+        self.state.group_vruntime_arc()
     }
 }
 
@@ -273,12 +354,7 @@ impl ReadySet {
             let group = Arc::clone(group);
             drop(by_group);
             let prev_count = group.insert(descriptor);
-            if prev_count == 0
-                && group
-                    .in_root
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
+            if prev_count == 0 && group.state.try_enter_root() {
                 let gv = group.group_vruntime();
                 let key = GroupKey {
                     group_vruntime: gv,
@@ -308,7 +384,7 @@ impl ReadySet {
         let descriptor = group.pop()?;
 
         // Mark group as not in root tree (we just popped it out).
-        group.in_root.store(false, Ordering::SeqCst);
+        group.state.exit_root();
 
         // Update root min_vruntime (monotonically increasing)
         self.min_vruntime
@@ -318,12 +394,7 @@ impl ReadySet {
         // coordinate with concurrent insert_child's 0->1 path.
         // Only the thread that wins the CAS adds the group to the
         // root tree, preventing duplicate entries.
-        if group.nr_queued() > 0
-            && group
-                .in_root
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
+        if group.count() > 0 && group.state.try_enter_root() {
             let new_key = GroupKey {
                 group_vruntime: group.group_vruntime(),
                 group_id: group_key.group_id,
@@ -344,7 +415,10 @@ impl ReadySet {
     pub(super) fn advance_group_vruntime(&self, group_id: u64, units: u64) {
         let by_group = self.by_group.read().unwrap();
         if let Some(group) = by_group.get(&group_id) {
-            group.group_vruntime.fetch_add(units, Ordering::SeqCst);
+            group
+                .state
+                .group_vruntime
+                .fetch_add(units, Ordering::SeqCst);
         }
     }
 
@@ -394,7 +468,7 @@ impl ReadySet {
     #[cfg(test)]
     pub(super) fn member_count(&self, group_id: u64) -> Option<usize> {
         let by_group = self.by_group.read().unwrap();
-        by_group.get(&group_id).map(|g| g.nr_queued())
+        by_group.get(&group_id).map(|g| g.count())
     }
 
     #[cfg(test)]
@@ -430,14 +504,9 @@ impl ReadySet {
             let group = Arc::clone(group);
             drop(by_group);
             let prev_count = group.insert(descriptor);
-            if prev_count == 0
-                && group
-                    .in_root
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
+            if prev_count == 0 && group.state.try_enter_root() {
                 let root_min = self.min_vruntime();
-                group.group_vruntime.store(root_min, Ordering::SeqCst);
+                group.state.set_group_vruntime(root_min);
                 let key = GroupKey {
                     group_vruntime: root_min,
                     group_id,
@@ -452,7 +521,9 @@ impl ReadySet {
         let gv_arc = descriptor.group_vruntime_arc();
         let group = Arc::new(GroupQueue::new(gv_arc));
         group.insert(descriptor);
-        group.in_root.store(true, Ordering::SeqCst);
+        // Fresh group with a member goes directly into root tree.
+        // No CAS needed: we just created it, no one else has a reference.
+        group.state.in_root.store(true, Ordering::SeqCst);
 
         let key = GroupKey {
             group_vruntime: root_min,
@@ -481,14 +552,9 @@ impl ReadySet {
         let prev_count = group.insert(descriptor);
 
         // If we transitioned from 0->1, try to claim root-tree insertion.
-        if prev_count == 0
-            && group
-                .in_root
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
+        if prev_count == 0 && group.state.try_enter_root() {
             let root_min = self.min_vruntime();
-            group.group_vruntime.store(root_min, Ordering::SeqCst);
+            group.state.set_group_vruntime(root_min);
             let key = GroupKey {
                 group_vruntime: root_min,
                 group_id: parent_id,
@@ -534,11 +600,11 @@ mod tests {
         let gq = GroupQueue::new_with_initial_vruntime(0);
         let desc = make_descriptor(1, None, 128, 0);
         gq.insert(desc.clone());
-        assert_eq!(gq.nr_queued(), 1);
+        assert_eq!(gq.count(), 1);
 
         let popped = gq.pop().unwrap();
         assert_eq!(popped.id().id, 1);
-        assert_eq!(gq.nr_queued(), 0);
+        assert_eq!(gq.count(), 0);
         assert!(gq.pop().is_none());
     }
 
@@ -824,71 +890,68 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use loom::sync::atomic::{AtomicUsize, Ordering};
     use loom::sync::Arc;
     use loom::thread;
 
-    /// Simulates the nr_queued protocol: increment on insert, decrement on pop.
-    /// The group-in-root invariant depends on nr_queued being accurate.
-    struct GroupState {
-        nr_queued: AtomicUsize,
-        /// Models root-tree presence as a counter rather than a bool.
-        /// In the real implementation, the root tree is a SkipMap that
-        /// admits duplicate entries for the same group_id. A counter > 1
-        /// means the group has duplicate entries - a correctness violation
-        /// that causes double-popping and transient unfairness.
+    // Loom tests for the ready-set's atomic protocols.
+    //
+    // Tests use the real `ClaimState` and `GroupState` types (both
+    // loom-compatible via the compat layer). `LoomGroup` wraps the real
+    // `GroupState` with a `root_entries` counter to detect duplicate
+    // root-tree insertions (a correctness violation the real code prevents
+    // but that loom should verify).
+    //
+    // The scheduler integration tests in `tests/upload_objects_test.rs`
+    // exercise the full `ReadySet` + `GroupQueue` under concurrent load
+    // without loom's exhaustive exploration.
+
+    /// Wraps the real `GroupState` with a root-tree entry counter for
+    /// loom verification. In production, the root SkipMap naturally
+    /// prevents duplicate keys; here we model that as a counter and
+    /// assert it never exceeds 1.
+    struct LoomGroup {
+        state: super::GroupState,
+        /// Tracks how many times this group is "in" the root tree.
+        /// Must never exceed 1.
         root_entries: AtomicUsize,
-        /// CAS flag that coordinates the 0->1 inserter with pop's
-        /// re-insert path. Only the thread that wins the CAS may add
-        /// the group to the root tree.
-        in_root: AtomicBool,
-        group_vruntime: AtomicU64,
     }
 
-    impl GroupState {
+    impl LoomGroup {
         fn new(initial_count: usize) -> Self {
+            let state = super::GroupState::new(Arc::new(
+                crate::runtime::sync::sync::atomic::AtomicU64::new(0),
+            ));
+            // Pre-enqueue `initial_count` members.
+            for _ in 0..initial_count {
+                state.enqueue();
+            }
+            // If starting with members, mark as in root.
+            if initial_count > 0 {
+                state.in_root.store(true, Ordering::SeqCst);
+            }
             Self {
-                nr_queued: AtomicUsize::new(initial_count),
+                state,
                 root_entries: AtomicUsize::new(if initial_count > 0 { 1 } else { 0 }),
-                in_root: AtomicBool::new(initial_count > 0),
-                group_vruntime: AtomicU64::new(0),
             }
         }
 
-        /// Simulate insert_child: increment nr_queued atomically, add to root
-        /// only if we win the in_root CAS (false -> true).
+        /// Mirrors `ReadySet::insert_child` + the 0->1 root-entry path.
         fn insert(&self) {
-            let prev = self.nr_queued.fetch_add(1, Ordering::SeqCst);
-            if prev == 0 {
-                // We transitioned 0->1. Try to claim root-tree insertion.
-                if self
-                    .in_root
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.group_vruntime.store(0, Ordering::SeqCst);
-                    self.root_entries.fetch_add(1, Ordering::SeqCst);
-                }
+            let prev = self.state.enqueue();
+            if prev == 0 && self.state.try_enter_root() {
+                self.state.set_group_vruntime(0);
+                self.root_entries.fetch_add(1, Ordering::SeqCst);
             }
         }
 
-        /// Simulate pop: remove from root (decrement root_entries), decrement
-        /// nr_queued, conditionally re-add via in_root CAS.
+        /// Mirrors `ReadySet::pop` for this group.
         fn pop(&self) {
-            // Pop removes group from root tree first (pop_front)
             self.root_entries.fetch_sub(1, Ordering::SeqCst);
-            self.in_root.store(false, Ordering::SeqCst);
-            // Decrement nr_queued (GroupQueue::pop)
-            self.nr_queued.fetch_sub(1, Ordering::SeqCst);
-            // Re-insert only if still has members AND we win the CAS.
-            if self.nr_queued.load(Ordering::SeqCst) > 0 {
-                if self
-                    .in_root
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.root_entries.fetch_add(1, Ordering::SeqCst);
-                }
+            self.state.exit_root();
+            self.state.dequeue();
+            if self.state.nr_queued() > 0 && self.state.try_enter_root() {
+                self.root_entries.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -896,21 +959,19 @@ mod loom_tests {
             self.root_entries.load(Ordering::SeqCst) > 0
         }
 
-        /// Returns true if the group has at most one entry in the root tree.
-        /// More than one entry means duplicate insertion occurred.
         fn root_entries_valid(&self) -> bool {
             self.root_entries.load(Ordering::SeqCst) <= 1
         }
 
         fn count(&self) -> usize {
-            self.nr_queued.load(Ordering::SeqCst)
+            self.state.nr_queued()
         }
     }
 
     #[test]
     fn concurrent_child_enqueue_under_same_parent() {
         loom::model(|| {
-            let group = Arc::new(GroupState::new(1)); // parent already in group
+            let group = Arc::new(LoomGroup::new(1)); // parent already in group
 
             let g2 = Arc::clone(&group);
             let a = thread::spawn(move || {
@@ -933,7 +994,7 @@ mod loom_tests {
     #[test]
     fn pop_last_member_concurrent_with_insert() {
         loom::model(|| {
-            let group = Arc::new(GroupState::new(1));
+            let group = Arc::new(LoomGroup::new(1));
 
             let g2 = Arc::clone(&group);
             let a = thread::spawn(move || {
@@ -964,8 +1025,8 @@ mod loom_tests {
     #[test]
     fn concurrent_pop_from_different_groups() {
         loom::model(|| {
-            let g1 = Arc::new(GroupState::new(1));
-            let g2 = Arc::new(GroupState::new(1));
+            let g1 = Arc::new(LoomGroup::new(1));
+            let g2 = Arc::new(LoomGroup::new(1));
 
             let g1c = Arc::clone(&g1);
             let a = thread::spawn(move || {
@@ -992,7 +1053,7 @@ mod loom_tests {
             // Start with 2 members so neither thread triggers the
             // empty-transition path. Distinguishes from
             // pop_last_member_concurrent_with_insert (which starts at 1).
-            let group = Arc::new(GroupState::new(2));
+            let group = Arc::new(LoomGroup::new(2));
 
             let g2 = Arc::clone(&group);
             let a = thread::spawn(move || {
@@ -1021,11 +1082,11 @@ mod loom_tests {
     #[test]
     fn group_vruntime_advance_concurrent_with_pop() {
         loom::model(|| {
-            let group = Arc::new(GroupState::new(2)); // two members
+            let group = Arc::new(LoomGroup::new(2)); // two members
 
             let g2 = Arc::clone(&group);
             let a = thread::spawn(move || {
-                g2.group_vruntime.fetch_add(100, Ordering::SeqCst);
+                g2.state.group_vruntime.fetch_add(100, Ordering::SeqCst);
             });
 
             let g3 = Arc::clone(&group);
@@ -1037,7 +1098,7 @@ mod loom_tests {
             b.join().unwrap();
 
             // Pop no longer advances gv; only the external advance fires.
-            let gv = group.group_vruntime.load(Ordering::SeqCst);
+            let gv = group.state.group_vruntime();
             assert_eq!(gv, 100);
             // One member remains
             assert_eq!(group.count(), 1);
@@ -1045,32 +1106,29 @@ mod loom_tests {
         });
     }
 
+    /// Two threads racing to enqueue the same top-level transfer. The
+    /// claim gate (`ClaimState::try_claim`) ensures exactly one succeeds.
+    ///
+    /// Production path: `ReadySet::insert` (ready_set.rs) calls
+    /// `descriptor.try_claim()` before inserting into the group tree.
     #[test]
     fn concurrent_top_level_enqueue_creates_one_group() {
         loom::model(|| {
-            // Simulates the try_claim CAS gate: only one thread wins.
-            let claimed = Arc::new(AtomicBool::new(false));
+            let claim = Arc::new(super::super::descriptor::claim::ClaimState::new());
             let insert_count = Arc::new(AtomicUsize::new(0));
 
-            let c2 = Arc::clone(&claimed);
+            let c2 = Arc::clone(&claim);
             let ic2 = Arc::clone(&insert_count);
             let a = thread::spawn(move || {
-                // try_claim: CAS false -> true
-                if c2
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
+                if c2.try_claim() {
                     ic2.fetch_add(1, Ordering::SeqCst);
                 }
             });
 
-            let c3 = Arc::clone(&claimed);
+            let c3 = Arc::clone(&claim);
             let ic3 = Arc::clone(&insert_count);
             let b = thread::spawn(move || {
-                if c3
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
+                if c3.try_claim() {
                     ic3.fetch_add(1, Ordering::SeqCst);
                 }
             });
@@ -1083,47 +1141,43 @@ mod loom_tests {
         });
     }
 
-    //
-    // Thread A: scheduler released claim on D, about to call take_wake_requested.
-    // Thread B: caller invokes wake(D): mark_wake_requested then ready_set.insert(D).
-    // Assert: D is reachable (in its group) at end of model.
+    /// Models the release-and-recheck protocol between `generate_work`
+    /// (Pending path, scheduler.rs:533-537) and `Scheduler::wake`
+    /// (scheduler.rs:258-262).
+    ///
+    /// Thread A = scheduler worker after poll_work returned Pending
+    /// Thread B = external caller invoking wake(descriptor_id)
+    ///
+    /// Invariant: descriptor is reachable in its group after both complete.
     #[test]
     fn claim_protocol_in_hierarchical_insert() {
         loom::model(|| {
-            // Model the claim + wake_requested + group membership protocol.
-            // claimed=true initially (descriptor was just popped and polled).
-            let claimed = Arc::new(AtomicBool::new(true));
-            let wake_requested = Arc::new(AtomicBool::new(false));
-            let group = Arc::new(GroupState::new(0)); // group exists but D not currently in it
+            let claim = Arc::new(super::super::descriptor::claim::ClaimState::new());
+            // Descriptor starts claimed (just popped and polled).
+            assert!(claim.try_claim());
+            let group = Arc::new(LoomGroup::new(0)); // group exists but D not in it
 
-            let c_a = Arc::clone(&claimed);
-            let w_a = Arc::clone(&wake_requested);
+            let cl_a = Arc::clone(&claim);
             let g_a = Arc::clone(&group);
             let a = thread::spawn(move || {
                 // Thread A: release claim, then check wake_requested.
-                // If wake_requested, try_claim and insert into group.
-                c_a.store(false, Ordering::SeqCst);
-                if w_a.swap(false, Ordering::SeqCst) {
-                    // Re-claim and insert
-                    if c_a
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
+                // Production: ClaimGuard::release() then take_wake_requested()
+                cl_a.release_claim();
+                if cl_a.take_wake_requested() {
+                    if cl_a.try_claim() {
                         g_a.insert();
                     }
                 }
             });
 
-            let c_b = Arc::clone(&claimed);
-            let w_b = Arc::clone(&wake_requested);
+            let cl_b = Arc::clone(&claim);
             let g_b = Arc::clone(&group);
             let b = thread::spawn(move || {
                 // Thread B: mark wake_requested, then try_claim and insert.
-                w_b.store(true, Ordering::SeqCst);
-                if c_b
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
+                // Production: Scheduler::wake() calls mark_wake_requested
+                // then ReadySet::insert() calls try_claim.
+                cl_b.mark_wake_requested();
+                if cl_b.try_claim() {
                     g_b.insert();
                 }
             });
@@ -1131,7 +1185,7 @@ mod loom_tests {
             a.join().unwrap();
             b.join().unwrap();
 
-            // D must be reachable: at least one thread inserted it into the group.
+            // D must be reachable: at least one thread inserted it.
             assert!(
                 group.count() > 0,
                 "descriptor not reachable in group after claim/wake protocol"

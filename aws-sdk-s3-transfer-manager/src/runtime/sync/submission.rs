@@ -255,11 +255,7 @@ impl<'a, T> Submission<'a, T> {
             state.flushing = true;
             drop(state);
             let count = sq.tail.swap(0, Ordering::Relaxed).min(sq.capacity);
-            tracing::trace!(
-                phase = "flush_start",
-                count,
-                "submission flush starting"
-            );
+            tracing::trace!(phase = "flush_start", count, "submission flush starting");
             Some(SubmissionGuard { sq, count, next: 0 })
         } else {
             // Deliberately not logging the no-flush path: it fires on every
@@ -361,10 +357,7 @@ impl<T> Drop for SubmissionGuard<'_, T> {
         let mut state = self.sq.state.lock();
         state.flushing = false;
         self.sq.not_flushing.notify_all();
-        tracing::trace!(
-            phase = "flush_end",
-            "submission flush complete"
-        );
+        tracing::trace!(phase = "flush_end", "submission flush complete");
     }
 }
 
