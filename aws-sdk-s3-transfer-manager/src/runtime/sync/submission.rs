@@ -184,8 +184,7 @@ impl<T> SubmissionQueue<T> {
         let mut parked = false;
         while state.flushing {
             if !parked {
-                tracing::debug!(
-                    target: "aws_sdk_s3_transfer_manager::submission",
+                tracing::trace!(
                     phase = "enter_blocked",
                     pending = state.pending,
                     "enter blocked on flush in progress"
@@ -195,8 +194,7 @@ impl<T> SubmissionQueue<T> {
             state = self.not_flushing.wait(state);
         }
         if parked {
-            tracing::debug!(
-                target: "aws_sdk_s3_transfer_manager::submission",
+            tracing::trace!(
                 phase = "enter_unblocked",
                 pending = state.pending,
                 "enter unblocked"
@@ -257,8 +255,7 @@ impl<'a, T> Submission<'a, T> {
             state.flushing = true;
             drop(state);
             let count = sq.tail.swap(0, Ordering::Relaxed).min(sq.capacity);
-            tracing::debug!(
-                target: "aws_sdk_s3_transfer_manager::submission",
+            tracing::trace!(
                 phase = "flush_start",
                 count,
                 "submission flush starting"
@@ -364,8 +361,7 @@ impl<T> Drop for SubmissionGuard<'_, T> {
         let mut state = self.sq.state.lock();
         state.flushing = false;
         self.sq.not_flushing.notify_all();
-        tracing::debug!(
-            target: "aws_sdk_s3_transfer_manager::submission",
+        tracing::trace!(
             phase = "flush_end",
             "submission flush complete"
         );
