@@ -154,7 +154,7 @@ impl DownloadTransfer {
     ///
     /// Returns:
     /// - `PollWork::Ready(work)` - work available to execute
-    /// - `PollWork::Pending` - blocked waiting for in-flight work
+    /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
     pub(crate) fn poll_work(&self) -> PollWork {

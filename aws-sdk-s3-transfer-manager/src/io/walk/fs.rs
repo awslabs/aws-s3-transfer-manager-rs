@@ -2252,8 +2252,8 @@ mod tests {
         assert!(!errors[0].is_fatal());
         assert_eq!(errors[0].kind(), WalkErrorKind::BrokenSymlink);
 
-        // Parent should be unaffected (already drained above, but verify no errors)
         // Parent has nothing left since we claimed the only subtree
+        assert!(walk.next().await.is_none());
     }
 
     #[cfg_attr(miri, ignore)]

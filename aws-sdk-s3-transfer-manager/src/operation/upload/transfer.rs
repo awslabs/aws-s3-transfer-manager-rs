@@ -161,7 +161,7 @@ impl UploadTransfer {
     ///
     /// Returns:
     /// - `PollWork::Ready(work)` - work available to execute
-    /// - `PollWork::Pending` - blocked waiting for in-flight work
+    /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {

@@ -320,8 +320,7 @@ impl Client {
     ///         .source(source)
     ///         .bucket("my-bucket")
     ///         .walker(FsWalker::builder().recursive(true).build())
-    ///         .send()
-    ///         .await?;
+    ///         .initiate()?;
     ///
     ///     // wait for transfer to complete
     ///     handle.join().await?;

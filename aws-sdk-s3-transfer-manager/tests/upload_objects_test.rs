@@ -105,8 +105,7 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -145,8 +144,7 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -207,8 +205,7 @@ async fn test_successful_multiple_objects_upload_with_symlinks() {
                         .follow_symlinks(true)
                         .build(),
                 )
-                .send()
-                .await
+                .initiate()
                 .unwrap();
 
             let output = handle.join().await.unwrap();
@@ -223,8 +220,7 @@ async fn test_successful_multiple_objects_upload_with_symlinks() {
                 .upload_objects()
                 .bucket(bucket_name)
                 .source(temp_dir1.path())
-                .send()
-                .await
+                .initiate()
                 .unwrap();
 
             let output = handle.join().await.unwrap();
@@ -262,8 +258,7 @@ async fn test_source_dir_is_symlink() {
                 .upload_objects()
                 .bucket(bucket_name)
                 .source(&symlink_path)
-                .send()
-                .await
+                .initiate()
                 .unwrap();
 
             let err = handle.join().await.unwrap_err();
@@ -277,8 +272,7 @@ async fn test_source_dir_is_symlink() {
                 .bucket(bucket_name)
                 .source(symlink_path)
                 .walker(FsWalker::builder().follow_symlinks(true).build())
-                .send()
-                .await
+                .initiate()
                 .unwrap();
 
             let output = handle.join().await.unwrap();
@@ -322,8 +316,7 @@ async fn test_failed_upload_policy_continue() {
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .failure_policy(FailedTransferPolicy::Continue)
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -359,8 +352,7 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .failure_policy(FailedTransferPolicy::Continue)
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -393,8 +385,7 @@ async fn test_source_dir_not_valid() {
             .upload_objects()
             .bucket(bucket_name)
             .source(source.path())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let err = handle.join().await.unwrap_err();
@@ -429,8 +420,7 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .delimiter("-")
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         // Under the default Abort policy, the first key derivation failure aborts
@@ -481,8 +471,7 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         // Release the mock's spin wait so in-flight PutObjects can return.
@@ -531,8 +520,7 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let err = handle.join().await.unwrap_err();
@@ -579,8 +567,7 @@ async fn test_drop_upload_objects_handle() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         // Wait until at least one PutObject has been invoked so drop happens
@@ -630,8 +617,7 @@ async fn test_metrics_correctness_on_success() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -682,8 +668,7 @@ async fn test_max_concurrent_uploads_one_serial_execution() {
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .max_concurrent_uploads(1)
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -725,8 +710,7 @@ async fn test_deep_tree_subtree_claiming() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -773,8 +757,7 @@ async fn test_walker_filter_restricts_uploads() {
                     .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "txt"))
                     .build(),
             )
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -811,8 +794,7 @@ async fn test_empty_source_directory() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -874,8 +856,7 @@ async fn test_interleaved_success_failure_continue() {
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .failure_policy(FailedTransferPolicy::Continue)
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -924,8 +905,7 @@ async fn test_drop_during_walk_in_progress() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         // Drop immediately — walker is almost certainly still producing
@@ -969,8 +949,7 @@ async fn test_multipart_metrics_aggregate_across_children() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -1006,8 +985,7 @@ async fn test_status_transitions_to_terminal() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         // Status at this point may be Running or (for a fast completion on
@@ -1047,8 +1025,7 @@ async fn test_hidden_files_uploaded_by_default() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -1098,8 +1075,7 @@ async fn test_multiple_iterations_on_same_client_do_not_hang() {
                 .source(test_dir.path())
                 .walker(FsWalker::builder().recursive(true).build())
                 .key_prefix(format!("iter{iter}/"))
-                .send()
-                .await
+                .initiate()
                 .unwrap();
             let output = handle.join().await.unwrap();
             assert_eq!(
@@ -1158,8 +1134,7 @@ async fn test_wide_burst_of_children_does_not_hang() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -1209,8 +1184,7 @@ async fn test_wide_burst_all_failing_continue_does_not_hang() {
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .failure_policy(FailedTransferPolicy::Continue)
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -1273,8 +1247,7 @@ async fn test_max_concurrent_uploads_respected_under_burst() {
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .max_concurrent_uploads(MAX_CONCURRENT)
-            .send()
-            .await
+            .initiate()
             .unwrap();
 
         let output = handle.join().await.unwrap();
@@ -1336,8 +1309,7 @@ async fn test_stress_multi_iter_reproduce_ec2_hang() {
                 .source(test_dir.path())
                 .walker(FsWalker::builder().recursive(true).build())
                 .key_prefix(format!("iter{iter}/"))
-                .send()
-                .await
+                .initiate()
                 .unwrap();
             let output = handle.join().await.unwrap();
             let elapsed = start.elapsed();
@@ -1457,8 +1429,7 @@ async fn test_stress_parent_lock_contention() {
             .bucket(bucket_name)
             .source(test_dir.path())
             .walker(FsWalker::builder().recursive(true).build())
-            .send()
-            .await
+            .initiate()
             .unwrap();
         let output = handle.join().await.unwrap();
         let elapsed = start.elapsed();

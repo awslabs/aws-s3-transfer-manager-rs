@@ -280,8 +280,7 @@ async fn do_recursive_upload(
                 .recursive(true)
                 .build(),
         )
-        .send()
-        .await?;
+        .initiate()?;
 
     let output = handle.join().await?;
     tracing::info!("recursive upload output: {output:?}");

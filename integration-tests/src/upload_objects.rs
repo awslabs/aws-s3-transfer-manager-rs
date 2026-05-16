@@ -120,8 +120,7 @@ async fn test_upload_objects_many_small_files() {
             .source(dataset.path())
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("small/")
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");
@@ -166,8 +165,7 @@ async fn test_upload_objects_flat_directory_content_roundtrip() {
             .source(dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("roundtrip/")
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");
@@ -215,8 +213,7 @@ async fn test_upload_objects_nested_tree() {
             .source(dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("tree/")
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");
@@ -255,8 +252,7 @@ async fn test_upload_objects_multipart_children() {
             .source(dataset.path())
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("mpu/")
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");
@@ -308,8 +304,7 @@ async fn test_upload_objects_walker_filter_applied() {
                     .build(),
             )
             .key_prefix("filtered/")
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");
@@ -364,8 +359,7 @@ async fn test_upload_objects_pipeline_depth_one_over_http() {
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("serial/")
             .max_concurrent_uploads(1)
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");
@@ -401,8 +395,7 @@ async fn test_upload_objects_empty_source() {
             .source(dir.path())
             .walker(FsWalker::builder().recursive(true).build())
             .key_prefix("empty/")
-            .send()
-            .await
+            .initiate()
             .expect("initiate upload_objects");
 
         let output = handle.join().await.expect("join upload_objects");

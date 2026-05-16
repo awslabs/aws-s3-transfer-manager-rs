@@ -52,7 +52,7 @@ use crate::transfer::StateMachineTerminalReceiver;
 ///
 /// Because `Drop` cannot be async, any child uploads that are mid-HTTP-
 /// request when the handle is dropped will continue briefly until they
-/// reach a cancellation point. For a clean shutdown that blocks until all
+/// reach a cancellation point. For a clean shutdown that waits until all
 /// cleanup is complete, call [`abort`](Self::abort) instead of dropping.
 #[derive(Debug)]
 #[non_exhaustive]

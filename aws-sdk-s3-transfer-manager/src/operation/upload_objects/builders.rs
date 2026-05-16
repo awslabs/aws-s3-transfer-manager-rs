@@ -39,7 +39,7 @@ impl UploadObjectsFluentBuilder {
         source = self.inner.source.as_deref().map(|p| p.to_str().unwrap_or_default()).unwrap_or_default(),
         key_prefix = self.inner.key_prefix.as_deref().unwrap_or_default(),
     ))]
-    pub async fn send(self) -> Result<UploadObjectsHandle, crate::error::Error> {
+    pub fn initiate(self) -> Result<UploadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input)
     }
@@ -173,12 +173,12 @@ impl UploadObjectsFluentBuilder {
 
 impl crate::operation::upload_objects::input::UploadObjectsInputBuilder {
     /// Initiate upload of multiple objects using the given client.
-    pub async fn send_with(
+    pub fn initiate_with(
         self,
         client: &crate::Client,
     ) -> Result<UploadObjectsHandle, crate::error::Error> {
         let mut fluent_builder = client.upload_objects();
         fluent_builder.inner = self;
-        fluent_builder.send().await
+        fluent_builder.initiate()
     }
 }
