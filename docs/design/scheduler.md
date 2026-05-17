@@ -130,21 +130,56 @@ ready/pending/done lifecycle.
 CRT uses the same pattern: each meta request type (auto_ranged_get, auto_ranged_put, copy,
 default) implements a vtable with `update()` that returns a request or signals work remaining.
 
+**Composite transfers.** A composite transfer's `poll_work` does not produce a
+leaf work item for the execution layer; it recursively calls
+`scheduler.enqueue_transfer` to spawn child transfers that each drive their
+own state machine. Upload of a directory and download of a prefix are the
+current examples. A composite is both a consumer of `poll_work` calls and a
+producer of transfers in the same call stack.
+
+A leaf `poll_work` is O(1); a composite `poll_work` is `O(batch x enqueue_cost)` 
+where the batch is the number of children it spawns per call (`SPAWN_BATCH_SIZE`
+caps this at 32). The scheduler groups a composite and all its descendants into
+a single scheduling entity at the root level (see "Fair Scheduling" below), so
+a composite's fan-out does not affect its share of dispatch relative to peers.
+
+The `max_concurrent_uploads` knob on composite transfers is a per-request
+memory cap: how many children may be simultaneously materialized. It does not
+control scheduling rate (the hierarchical CFS handles that). Memory cost
+scales with this bound; the default (10000) is large enough that the scheduler's
+fair-share rate-limiting naturally keeps the working set well below it for
+typical workloads.
+
 ### Fair Scheduling
 
 When multiple transfers are ready, the scheduler uses Completely Fair Scheduling (CFS), adapted
-from the Linux kernel's process scheduler. Each transfer accumulates virtual runtime as it
-generates work. The ready set is ordered by virtual runtime, so `generate_work()` always selects
-the transfer that has received the least scheduling share.
+from the Linux kernel's process scheduler. The ready set is a two-level hierarchy:
 
-Priority acts as a weight on virtual runtime accumulation. When a transfer generates a work item,
-its virtual runtime increases by `base_cost / priority`. Higher priority means slower accumulation,
-so the transfer generates more work before yielding. A priority-255 transfer gets roughly 256x the
-scheduling share of a priority-1 transfer, but the priority-1 transfer still makes progress because
-its virtual runtime stays low while it waits.
+- **Root tree:** groups sorted by `group_vruntime`. Each top-level transfer owns one group.
+- **Inner tree:** within each group, members (the top-level transfer itself plus all its
+  descendants) are sorted by individual `vruntime`.
 
-New transfers start at the current minimum virtual runtime across all active transfers, preventing
-a newly enqueued transfer from monopolizing the scheduler while it "catches up."
+`generate_work()` pops the group with the lowest `group_vruntime`, then pops the member with the
+lowest individual `vruntime` from that group. This gives each top-level transfer equal scheduling
+share at the root regardless of how many children it has spawned - a composite with 10000 children
+gets the same root-level share as a single-file upload.
+
+**Group-entity accounting.** When a member is popped from a group, the group's `group_vruntime`
+advances by `vruntime_delta_for_priority(member.priority)`. This mirrors Linux CFS group-entity
+accounting: when a task in a cgroup runs, the cgroup entity itself runs. The priority-scaled delta
+means a higher-priority group advances more slowly and wins more dispatch share at the root.
+
+**Priority scaling.** Virtual runtime advances by `(WORK_COST * PRIORITY_SCALE) / priority` per
+unit of work. `WORK_COST = 128` is the base cost; `PRIORITY_SCALE = 256` is a precision-preserving
+multiplier that prevents integer division from collapsing to zero at high priorities. A priority-255
+transfer accumulates vruntime at rate 128 per work unit; a priority-1 transfer at rate 32768.
+The ratio gives priority-255 roughly 256x the scheduling share of priority-1, but priority-1 still
+makes progress because its vruntime stays low while it waits.
+
+New transfers start at the current minimum virtual runtime across all active groups, preventing
+a newly enqueued transfer from monopolizing the scheduler while it "catches up." Groups that
+become empty (all members returned Pending or Done) leave the root tree and rejoin at the current
+root floor when a member is next inserted.
 
 **Alternative: Round-robin.** CRT uses this: each meta request gets one `update()` call per pass
 through a linked list, with no priority weighting. This is simple but provides no mechanism for
@@ -241,6 +276,22 @@ freed, the transfer is woken, and the scheduler polls it for the next piece of w
 In both cases, the scheduler's role is the same: provide the Pending/wake lifecycle. What transfers
 gate on is their own concern.
 
+**Wake primitive protocol.** The Pending/wake handshake is edge-triggered, so
+lost-wake avoidance is split between the poller and the mutator:
+
+- The poller (inside `poll_work`) marks the transfer context pending
+  (`ctx.set_pending`) **before** checking the gating condition. If the
+  condition becomes satisfied in the window between the mark and the check,
+  the next mutator's wake will still fire.
+- Any code path that mutates gating state follows
+  `lock → mutate → unlock → try_wake`. `try_wake` swaps the pending flag and
+  calls `scheduler.wake(id)` only if the flag was set. Spurious calls are
+  cheap: the swap is a single atomic op.
+
+A second layer at the scheduler protects `generate_work` itself against wakes
+that arrive while it is releasing a descriptor's claim after a `Pending`
+return. See "Concurrency and Threading" below.
+
 ### Cancellation
 
 When a transfer is cancelled, its cancellation token is triggered, which sets the terminal flag.
@@ -265,7 +316,84 @@ permanently. This is the correctness obligation of the edge-triggered model: the
 with active transfers rather than total transfer count, but every `Pending` must eventually resolve.
 
 **Panic safety.** If `execute()` panics, the scheduler catches it and forces the terminal
-transition from outside. Execution continues with the next work item.
+transition from outside. Execution continues with the next work item. If `poll_work()` panics,
+the scheduler's `generate_work` catches the panic via `catch_unwind`, releases the descriptor's
+claim, force-terminates the panicking transfer (cascading to children via `cancel_transfer`), and
+continues processing other transfers. Implementations should not rely on panic recovery  - a caught
+panic still corrupts the transfer's internal state and forces termination.
+
+### Concurrency and Threading
+
+Scheduler work runs on the caller's thread. `on_completion` and `wake` drive
+`generate_work` synchronously, typically from a managed execution thread. This
+is a deliberate choice: the hot path has no channel hop, scheduler state is
+touched with warm caches, and many execution threads can drive the scheduler
+in parallel across different transfers. The choice is safe as long as the
+scheduler's per-call cost stays within the constraints below.
+
+**`poll_work` is synchronous and short.** No `.await`, no blocking I/O, no
+unbounded loops. A long `poll_work` pins the caller's runtime and prevents it
+from polling its own async tasks (including the in-flight SDK requests that
+the scheduler depends on to make progress). Cost is O(1) per call for leaf
+transfers; composite transfers bound their fan-out explicitly.
+
+**Single-poll exclusivity.** At most one thread is inside `poll_work(desc)`
+for any given descriptor at a time. The ready set's insert path is CAS-gated
+on a claim flag carried by the descriptor. The claim remains asserted from the
+moment the scheduler decides to poll through `pop` and `poll_work` until
+`generate_work` has finished handling the outcome (`Ready`, `Pending`, or
+`Done`). The Transfer trait's `&self` API forces interior-mutable state
+behind a mutex, so single-poll exclusivity isn't required for correctness  -
+its purpose is performance, keeping that mutex effectively uncontended in
+steady state. Without it, burst completions converge on lock contention
+that pins managed-thread runtimes (see "Invariants and Violations").
+
+**Ready set uniqueness.** The ready set contains at most one entry per
+transfer id. Duplicates re-open the single-poll window and, under bursty
+completions, produce lock-contention storms on the transfer's internal state.
+
+**Edge-triggered wake primitive.** When a transfer returns `Pending`,
+`generate_work` must release its claim so a future wake can re-queue it. Any
+wake that arrives between the claim release and a possible re-insert would
+be lost without additional coordination. A `wake_requested` flag on the
+descriptor is set unconditionally by `wake`. `generate_work`'s release path
+clears the claim, then reads `wake_requested`; if it was set, it re-inserts
+the descriptor itself. The resulting release-and-recheck pattern is race-free
+against concurrent wakes.
+
+**Managed runtime interaction.** Managed execution threads each host a
+current-thread tokio runtime. A current-thread runtime yields only at `.await`
+points  - sync code on a thread blocks the tokio loop entirely. This is the
+complement of the synchronous-scheduler choice: short scheduler calls coexist
+with the runtime's task polling; long ones starve it.
+
+### Cost Model
+
+Every scheduler operation has a cost that is paid on the caller's thread. The
+contracts on `poll_work` and fan-out exist because the scheduler sits in the
+hot path of every execution thread.
+
+**`poll_work` is O(1) per call.** The leaf case (upload, download) touches
+transfer state under a short critical section and returns immediately.
+Composite transfers pay `O(batch × enqueue_cost)` when they spawn children;
+the batch size must be bounded by the composite (e.g. a per-call bound).
+
+**`enqueue_transfer` is O(1) but not free.** Inserts into the ready set,
+writes to the transfers map, and conditionally drives `generate_work`. At
+typical fan-out rates the cost is a few microseconds; at batch scale
+(up to `SPAWN_BATCH_SIZE` per composite `poll_work` call) the aggregate
+cost is still bounded but non-trivial.
+
+**`on_completion` is O(1) + one `generate_work` pass.** The generate_work
+pass pops at most the number of descriptors that fit under the current
+concurrency target, each paying a `poll_work` call. Total cost of one
+`on_completion` is therefore `O(target × poll_work_cost)`.
+
+**What the cost model rules out.** A `poll_work` implementation that
+iterates over an unbounded collection (pending entries, completed children,
+retry queues) violates the O(1) contract and can pin the caller's runtime
+long enough to starve it. Reviewing any `while`/`loop` in a `poll_work`
+implementation against this contract is cheap insurance.
 
 ### Execution Layer
 
@@ -318,6 +446,133 @@ not just changing the capacity gate. Whether this means adding workers or adjust
 **Memory pressure cancellation.** Proactive cancellation of background transfers under memory
 pressure needs design. The seam exists (scheduler has `cancel_transfer`), but the trigger mechanism
 (buffer pool signals to scheduler) is not designed.
+
+---
+
+## Correctness Invariants
+
+The scheduler and transfer state machines coordinate through a handful of
+invariants that the surrounding code must uphold. This section states each
+one, explains what it rules out, and describes the mechanism that enforces
+it. The two design choices that gave the scheduler its shape - running
+scheduler work on the execution thread, and hierarchical CFS grouping for
+composite transfers - are recorded at the end of the section.
+
+### Edge-triggered wake
+
+**Invariant.** Every `PollWork::Pending` creates an obligation: some later
+mutator of the gating state must cause a matching wake to be delivered.
+Without that wake the transfer stalls forever.
+
+**What it rules out.** A mutator that finishes its update, calls
+`try_wake`, and observes the poller has not yet marked itself pending will
+treat the wake as unnecessary. If the poller then marks itself pending and
+returns `Pending`, the wake is already gone  - lost. Two orderings have to
+be defended: inside the transfer's state machine (the poller/mutator
+handshake) and inside the scheduler (the moment `generate_work` transitions
+a descriptor back to idle).
+
+**Mechanism.** On the state-machine side, `TransferContext::set_pending` is
+called by the poller *before* it evaluates the gating condition, and every
+mutator follows `lock → mutate → unlock → try_wake`. `try_wake` only calls
+`scheduler.wake(id)` if the pending flag is set, and either the poller's
+flag-set-before-check or the mutator's post-unlock wake is guaranteed to
+be observed.
+
+On the scheduler side, the descriptor carries a `wake_requested` flag that
+`wake` sets unconditionally, whether or not its `ready_set.insert` succeeds.
+`generate_work`'s post-`poll_work` handling releases the descriptor's claim
+and then reads `wake_requested`; if it is set, `generate_work` re-inserts
+the descriptor itself. A wake that arrives during the release window is
+never lost.
+
+### Single-poll exclusivity
+
+**Invariant.** At most one thread is inside `poll_work(desc)` for a given
+descriptor at a time. State-machine invariants (single-owner mutation,
+ordered phase transitions) are written under this assumption.
+
+**What it rules out.** A ready set keyed on `(vruntime, id)` pairs without
+deduplication admits duplicate entries for the same transfer. Under burst
+completions many execution threads can pop different entries for the same
+parent, enter `poll_work` concurrently, and contend on the transfer's
+state mutex. Lock contention starves the threads' tokio runtimes, so the
+async tasks they host cannot make progress and no further completions
+arrive to resolve the contention.
+
+**Mechanism.** A claim flag on the descriptor is CAS-swapped to true by
+`ReadySet::insert`. A failed CAS indicates the descriptor is already
+queued or being polled, and the insert becomes a no-op. The claim stays
+asserted from insert through `pop` through `poll_work`, and is released
+only by `generate_work` after handling the outcome. Callers that need to
+re-insert after `PollWork::Ready` use `ReadySet::reinsert_under_claim`,
+which bypasses the CAS because the caller still owns the claim.
+
+### Bounded per-call cost
+
+**Invariant.** `poll_work` is O(1) per call with a bounded critical
+section. A composite transfer whose `poll_work` recursively calls
+`enqueue_transfer` pays `O(batch × enqueue_cost)` and must bound `batch`
+explicitly.
+
+**What it rules out.** A loop inside `poll_work` whose termination depends
+on exhausting an input queue (pending directory entries, retry buffer,
+completed-child list) can run for far longer than the scheduler's
+implicit cost model assumes. During that call the caller's thread is
+executing scheduler code and not polling its runtime; other transfers
+cannot be polled. At high concurrency this converges on runtime
+starvation.
+
+**Mechanism.** Composite transfers carry an explicit per-poll batch cap
+(`SPAWN_BATCH_SIZE = 32`) and a per-request memory cap (`max_concurrent_uploads`)
+that together bound the loop. Any `while`/`loop` inside a `poll_work`
+implementation is a place to audit against this invariant.
+
+### Design choice: scheduler work on the execution thread
+
+`on_completion` and `wake` drive `generate_work` synchronously on the
+caller's thread. This is the hot-path choice: no channel hop, warm caches,
+parallel scheduler drive across execution threads. It depends on the
+invariants above holding  - the scheduler stays off the critical path only
+as long as `poll_work` is short, single-polling is enforced, and fan-out
+is bounded.
+
+A dedicated scheduler thread that owns scheduling state and drains
+completion events from a channel is the known alternative. It would
+structurally eliminate runtime starvation at the cost of per-completion
+latency, cache locality, and single-thread serialization of scheduler
+work. The current model is sufficient at today's throughput targets and
+cheaper in the common case; the dedicated-thread design is available as a
+fallback if the invariants above become harder to uphold.
+
+### Design choice: hierarchical CFS for composite transfers
+
+Child transfers enqueued by a composite's `poll_work` are placed into the
+parent's group in the ready set. The group competes as a single entity at
+the root tree, regardless of how many children it contains. This is the
+cgroup-style model from Linux CFS: a task group's aggregate share is
+determined by the group entity's weight, not by the number of tasks inside.
+
+A composite with 10000 children and a single-file upload each get one
+group at the root. Both groups advance `group_vruntime` at the same rate
+(assuming equal priority), so each gets roughly 50% of dispatch share.
+Within the composite's group, children compete against each other and
+against the composite itself via individual vruntime.
+
+**Spawn-cost accounting.** When a composite spawns a child, the parent's
+individual vruntime advances by one work unit. This pushes the parent
+down within its own group's inner queue so children (which have actual
+work to execute) pop before the parent (which would just return Pending).
+The group's `group_vruntime` is not advanced on spawn - only on pop.
+
+**Alternative considered: flat peer model.** The prior design treated
+children as independent peers at the root level. A composite with N
+children claimed N+1 scheduling shares against a single transfer's one.
+This was correct in the sense that the composite genuinely had N units of
+work, but it violated the user's mental model: two `upload_objects` calls
+with different file counts should get equal throughput, not throughput
+proportional to file count. The hierarchical model matches user
+expectations and the Linux cgroup analogy.
 
 ---
 
