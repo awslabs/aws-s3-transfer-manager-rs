@@ -277,12 +277,15 @@ In both cases, the scheduler's role is the same: provide the Pending/wake lifecy
 gate on is their own concern.
 
 **Wake primitive protocol.** The Pending/wake handshake is edge-triggered, so
-lost-wake avoidance is split between the poller and the mutator:
+lost-wake avoidance relies on the transfer's state mutex serializing the
+poller and mutator:
 
-- The poller (inside `poll_work`) marks the transfer context pending
-  (`ctx.set_pending`) **before** checking the gating condition. If the
-  condition becomes satisfied in the window between the mark and the check,
-  the next mutator's wake will still fire.
+- The poller (inside `poll_work`) holds the state lock while checking the
+  gating condition and calling `ctx.set_pending`. The mutator takes the same
+  lock to mutate state. Because both sides hold the lock, they cannot
+  interleave: either the mutator's change is visible to the poller (so it
+  returns Ready), or the poller sets pending first and the mutator's later
+  `try_wake` observes it.
 - Any code path that mutates gating state follows
   `lock → mutate → unlock → try_wake`. `try_wake` swaps the pending flag and
   calls `scheduler.wake(id)` only if the flag was set. Spurious calls are
@@ -472,12 +475,13 @@ be defended: inside the transfer's state machine (the poller/mutator
 handshake) and inside the scheduler (the moment `generate_work` transitions
 a descriptor back to idle).
 
-**Mechanism.** On the state-machine side, `TransferContext::set_pending` is
-called by the poller *before* it evaluates the gating condition, and every
-mutator follows `lock → mutate → unlock → try_wake`. `try_wake` only calls
-`scheduler.wake(id)` if the pending flag is set, and either the poller's
-flag-set-before-check or the mutator's post-unlock wake is guaranteed to
-be observed.
+**Mechanism.** On the state-machine side, the poller's condition check and
+`TransferContext::set_pending` call both happen under the transfer's state
+lock. Every mutator follows `lock → mutate → unlock → try_wake`. Because
+both sides hold the same lock, they are serialized: either the mutator's
+change is visible to the poller's check (so it returns Ready and never sets
+pending), or the poller sets pending first and the mutator's post-unlock
+`try_wake` observes it and fires.
 
 On the scheduler side, the descriptor carries a `wake_requested` flag that
 `wake` sets unconditionally, whether or not its `ready_set.insert` succeeds.
