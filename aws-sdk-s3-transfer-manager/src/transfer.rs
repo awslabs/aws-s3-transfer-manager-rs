@@ -555,9 +555,7 @@ impl TransferContext {
     ///
     /// ## The race this protocol prevents
     ///
-    /// Suppose the poller naively set pending *after* checking the gating
-    /// condition, and the mutator simply fired `try_wake` after its update.
-    /// Two threads can interleave like this:
+    /// Without a shared lock, the poller and mutator can interleave:
     ///
     /// ```text
     /// Poller:                              Mutator:
@@ -569,30 +567,12 @@ impl TransferContext {
     ///   return Pending
     /// ```
     ///
-    /// The state is unblocked, the poller is pending, and nothing else will
+    /// The state is unblocked, the poller is pending, and nothing will
     /// wake it. The transfer is stuck.
     ///
-    /// ## The two disciplines
-    ///
-    /// 1. **Poller**: call `set_pending()` *before* evaluating the gating
-    ///    condition, both inside the same critical section that the mutator
-    ///    takes. If the mutator runs first, `set_pending` has not happened
-    ///    yet — but then the poller's check will observe the mutation and
-    ///    return `Ready`, not `Pending`. If the poller runs first, pending
-    ///    is true when the check returns blocked, and the mutator's later
-    ///    `try_wake` observes it and fires.
-    ///
-    /// 2. **Mutator**: follow `lock → mutate → unlock → try_wake`. Dropping
-    ///    the lock before the wake lets the woken poller acquire the lock
-    ///    immediately. Calling `try_wake` unconditionally is cheap — it is
-    ///    a single atomic swap when no wake is pending.
-    ///
-    /// Because the poller's `set_pending` and condition check are under the
-    /// same lock as the mutator's mutate step, the two cannot interleave
-    /// inside the critical section. Either the mutator's mutation is
-    /// visible to the poller's check (so the poller returns `Ready`), or
-    /// the mutator runs after the poller and `try_wake` observes the
-    /// pending flag that `set_pending` wrote.
+    /// The mutator's discipline is `lock → mutate → unlock → try_wake`.
+    /// Calling `try_wake` after releasing the lock lets the woken poller
+    /// acquire the lock immediately.
     ///
     /// Spurious wakes (mutator fires when no poll was actually pending)
     /// are harmless — `wake` on a descriptor not in pending state is a

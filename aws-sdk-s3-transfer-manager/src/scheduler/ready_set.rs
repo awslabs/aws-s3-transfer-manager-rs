@@ -174,8 +174,6 @@ impl GroupState {
 
 /// Per-tree CFS queue. Holds the top-level transfer plus all its descendants
 /// in a single SkipMap ordered by individual vruntime.
-/// Per-group CFS queue. Holds the top-level transfer plus all its
-/// descendants in a single SkipMap ordered by individual vruntime.
 ///
 /// A group with zero members is not present in the root tree. When a
 /// member is inserted into an empty group, the inserting thread claims
@@ -489,10 +487,6 @@ impl ReadySet {
             .iter()
             .any(|entry| entry.key().group_id == group_id)
     }
-
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
 
     fn insert_top_level(&self, group_id: u64, descriptor: TransferDescriptor) {
         // If a group already exists for this id (re-insert path: top-level
