@@ -376,6 +376,12 @@ pub(crate) struct ChildMockTransfer {
     notify: Option<Arc<tokio::sync::Notify>>,
     /// Lock shared between poll_work and execute for wake protocol.
     state_lock: Mutex<()>,
+    /// If set, incremented when this transfer's `poll_work` returns `Done`.
+    /// Composite parents track child terminations through this so they can
+    /// gate their own `Done` on all children having actually finished
+    /// (not merely on `execute` having run, which fires before the
+    /// child's terminating poll).
+    terminated_counter: Option<Arc<AtomicU64>>,
 }
 
 impl std::fmt::Debug for ChildMockTransfer {
@@ -404,6 +410,7 @@ impl ChildMockTransfer {
             counter,
             notify: None,
             state_lock: Mutex::new(()),
+            terminated_counter: None,
         }
     }
 
@@ -423,7 +430,17 @@ impl ChildMockTransfer {
             counter,
             notify: Some(notify),
             state_lock: Mutex::new(()),
+            terminated_counter: None,
         }
+    }
+
+    /// Set the parent's terminated counter. Incremented by 1 when this
+    /// transfer's `poll_work` returns `Done`. Used by composite parents to
+    /// track child terminations so they can wait for all children to finish
+    /// before returning `Done` themselves.
+    pub(crate) fn with_terminated_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.terminated_counter = Some(counter);
+        self
     }
 }
 
@@ -444,6 +461,15 @@ impl Transfer for ChildMockTransfer {
                 // All completed
                 drop(_guard);
                 self.ctx.set_completed();
+                // Increment terminated_counter BEFORE signal_terminal so the
+                // parent's wake observes the up-to-date count. signal_terminal
+                // calls scheduler.wake(parent), which can synchronously drive
+                // the parent's poll_work via generate_work; the parent must
+                // see this child counted as terminated to make the right
+                // Done/Pending decision.
+                if let Some(ref tc) = self.terminated_counter {
+                    tc.fetch_add(1, Ordering::SeqCst);
+                }
                 self.ctx.signal_terminal();
                 return PollWork::Done;
             }
@@ -489,7 +515,6 @@ impl Transfer for ChildMockTransfer {
 struct CompositeMockState {
     total_children: u64,
     spawned: u64,
-    completed: u64,
 }
 
 /// A composite transfer mock that spawns child transfers into the scheduler.
@@ -500,7 +525,13 @@ struct CompositeMockState {
 ///
 /// Each `poll_work` call spawns children (up to a memory cap) and returns
 /// `Pending` while waiting for children to complete, or `Done` when all
-/// children have finished.
+/// children have terminated. Done is gated on child *termination* (each
+/// child's `poll_work` returning `Done` after its work is complete), not on
+/// the work counter alone. The work counter is incremented inside `execute`,
+/// which fires strictly before the child's terminating poll. Returning
+/// `Done` based only on the work counter is a contract violation: the
+/// parent would dismiss its group while children are still in the middle
+/// of their wake-then-Done sequence, leaving them orphaned in the scheduler.
 pub(crate) struct CompositeMock {
     ctx: TransferContext,
     handle: Arc<crate::client::Handle>,
@@ -512,6 +543,10 @@ pub(crate) struct CompositeMock {
     child_notify: Option<Arc<tokio::sync::Notify>>,
     /// Next child id counter (global atomic to avoid collisions).
     next_child_id: AtomicU64,
+    /// Shared with all children. Incremented when a child's `poll_work`
+    /// returns `Done`. Used to determine when this composite can return
+    /// `Done` without leaking unreaped children.
+    terminated_counter: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for CompositeMock {
@@ -547,13 +582,13 @@ impl CompositeMock {
             state: Mutex::new(CompositeMockState {
                 total_children,
                 spawned: 0,
-                completed: 0,
             }),
             work_per_child,
             memory_cap,
             counter,
             child_notify: None,
             next_child_id: AtomicU64::new(id.id * 1_000_000 + 1),
+            terminated_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -575,13 +610,13 @@ impl CompositeMock {
             state: Mutex::new(CompositeMockState {
                 total_children,
                 spawned: 0,
-                completed: 0,
             }),
             work_per_child: 1,
             memory_cap,
             counter,
             child_notify: Some(notify),
             next_child_id: AtomicU64::new(id.id * 1_000_000 + 1),
+            terminated_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -591,17 +626,18 @@ impl CompositeMock {
         self.state.lock().unwrap().spawned
     }
 
-    /// Total children that have completed.
+    /// Total children that have terminated (their `poll_work` returned `Done`).
     #[allow(dead_code)]
-    pub(crate) fn total_completed(&self) -> u64 {
-        self.state.lock().unwrap().completed
+    pub(crate) fn total_terminated(&self) -> u64 {
+        self.terminated_counter.load(Ordering::SeqCst)
     }
 
-    /// Whether all children have been spawned and completed.
+    /// Whether all children have been spawned and terminated.
     #[allow(dead_code)]
     pub(crate) fn is_complete(&self) -> bool {
         let s = self.state.lock().unwrap();
-        s.completed >= s.total_children && s.spawned >= s.total_children
+        let terminated = self.terminated_counter.load(Ordering::SeqCst);
+        terminated >= s.total_children && s.spawned >= s.total_children
     }
 
     /// The dispatch counter shared with all children.
@@ -611,7 +647,8 @@ impl CompositeMock {
     }
 
     fn spawn_children(&self, state: &mut CompositeMockState) {
-        let in_flight = state.spawned - state.completed;
+        let terminated = self.terminated_counter.load(Ordering::SeqCst);
+        let in_flight = state.spawned.saturating_sub(terminated);
         let available = self.memory_cap.saturating_sub(in_flight);
         let remaining = state.total_children - state.spawned;
         let to_spawn = available.min(remaining).min(32); // SPAWN_BATCH_SIZE cap
@@ -624,19 +661,25 @@ impl CompositeMock {
             };
 
             let child: Box<dyn Transfer> = if let Some(ref notify) = self.child_notify {
-                Box::new(ChildMockTransfer::new_blocking(
-                    child_id,
-                    self.handle.clone(),
-                    self.counter.clone(),
-                    notify.clone(),
-                ))
+                Box::new(
+                    ChildMockTransfer::new_blocking(
+                        child_id,
+                        self.handle.clone(),
+                        self.counter.clone(),
+                        notify.clone(),
+                    )
+                    .with_terminated_counter(self.terminated_counter.clone()),
+                )
             } else {
-                Box::new(ChildMockTransfer::new(
-                    child_id,
-                    self.handle.clone(),
-                    self.work_per_child,
-                    self.counter.clone(),
-                ))
+                Box::new(
+                    ChildMockTransfer::new(
+                        child_id,
+                        self.handle.clone(),
+                        self.work_per_child,
+                        self.counter.clone(),
+                    )
+                    .with_terminated_counter(self.terminated_counter.clone()),
+                )
             };
 
             self.handle.scheduler.enqueue_transfer(child);
@@ -653,12 +696,13 @@ impl Transfer for CompositeMock {
     fn poll_work(&self) -> PollWork {
         let mut state = self.state.lock().unwrap();
 
-        // Track completions via the dispatch counter.
-        let total_dispatches = self.counter.count();
-        state.completed = total_dispatches / self.work_per_child;
-
-        // All done?
-        if state.completed >= state.total_children && state.spawned >= state.total_children {
+        // Done condition: all children spawned AND all children terminated
+        // (their poll_work returned Done). The work counter is NOT used for
+        // termination because it is incremented in execute, which fires
+        // before the child's terminating poll - using it would race against
+        // children mid-wake and orphan them.
+        let terminated = self.terminated_counter.load(Ordering::SeqCst);
+        if terminated >= state.total_children && state.spawned >= state.total_children {
             drop(state);
             self.ctx.set_completed();
             self.ctx.signal_terminal();
