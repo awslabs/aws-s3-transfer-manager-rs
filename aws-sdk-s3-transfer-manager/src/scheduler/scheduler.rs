@@ -184,6 +184,13 @@ impl Scheduler {
     }
 
     /// Add a transfer and start generating work.
+    ///
+    /// Lock-ordering protocol: this method holds `transfers.write` while
+    /// resolving the parent group via `by_group.read`. Together with
+    /// `cancel_transfer` (which holds `transfers.write` across its
+    /// `by_group.write`), the protocol prevents a child being orphaned
+    /// in `transfers` after its parent group is removed. See
+    /// `loom_tests::fixed_dance_no_orphan` at the bottom of this file.
     pub(crate) fn enqueue_transfer(&self, transfer: BoxTransfer) {
         let tid = transfer.ctx().id;
 
@@ -293,6 +300,13 @@ impl Scheduler {
     }
 
     /// Cancel a transfer and any child transfers, removing them from the scheduler.
+    ///
+    /// Lock-ordering protocol: this method holds `transfers.write` across
+    /// its call to `ready_set.remove_group` (which acquires
+    /// `by_group.write` internally). Together with `enqueue_transfer`,
+    /// the protocol prevents a child being orphaned in `transfers` after
+    /// its parent group is removed. See `loom_tests::fixed_dance_no_orphan`
+    /// at the bottom of this file.
     ///
     /// Cancels the target transfer first, then cancels all transfers whose
     /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each cancelled
@@ -1995,5 +2009,194 @@ mod tests {
         assert!(scheduler.is_idle());
 
         handle.runtime.shutdown();
+    }
+}
+
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests {
+    //! Loom verification of the lock-ordering protocol used by
+    //! [`Scheduler::enqueue_transfer`] and [`Scheduler::cancel_transfer`].
+    //!
+    //! The protocol coordinates two independent locks:
+    //!   - `Scheduler.transfers: RwLock<HashMap<TransferId, _>>`
+    //!     — owned by `Scheduler`, tracks every alive transfer.
+    //!   - `ReadySet.by_group: RwLock<HashMap<u64, _>>`
+    //!     — owned by `ReadySet`, tracks which top-level transfers (groups)
+    //!     have an entry in the root tree.
+    //!
+    //! The invariant the protocol must uphold: no entry remains in the
+    //! transfers map whose parent group has been removed from the by_group
+    //! map. A violation means a child has been orphaned in the scheduler,
+    //! leaving its handle hung forever.
+    //!
+    //! Both locks are acquired in a consistent order in production:
+    //! `transfers.write()` first, then `by_group` (read for enqueue,
+    //! write for cancel), with cancel holding `transfers.write` across
+    //! the `by_group.write` so the two map mutations are atomic from any
+    //! observer's perspective.
+    //!
+    //! These tests exercise a faithful shim (`LoomScheduler`) whose
+    //! `enqueue_transfer` and `cancel_transfer` methods mirror the
+    //! production lock dance line-for-line. The shim drops the
+    //! TransferDescriptor / Handle / runtime machinery (none of which
+    //! participate in the lock-ordering protocol). When the production
+    //! methods change, the shim must be kept in sync.
+
+    use loom::sync::{Arc, RwLock};
+    use loom::thread;
+    use std::collections::HashMap;
+
+    /// Mirrors `TransferId`: id + optional parent.
+    #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+    struct TidShim {
+        id: u64,
+        parent: Option<u64>,
+    }
+
+    /// Faithful shim of the FIXED `Scheduler` lock dance for loom
+    /// verification. Lock acquires, drops, and conditional flow mirror
+    /// the production code line-for-line; descriptor construction,
+    /// Handle/runtime calls, and `cancel_descriptor` are stripped
+    /// because they don't participate in the lock-ordering protocol.
+    struct LoomScheduler {
+        // Mirrors `Scheduler.transfers`. Value type stripped to () since
+        // descriptors are irrelevant to the lock-ordering protocol.
+        transfers: RwLock<HashMap<TidShim, ()>>,
+        // Mirrors `ReadySet.by_group`. Value type stripped to () since
+        // group internals (vruntime, queue) are irrelevant to the
+        // existence-tracking protocol.
+        by_group: RwLock<HashMap<u64, ()>>,
+    }
+
+    impl LoomScheduler {
+        fn new() -> Self {
+            Self {
+                transfers: RwLock::new(HashMap::new()),
+                by_group: RwLock::new(HashMap::new()),
+            }
+        }
+
+        /// Pre-register a top-level group for setup. Mirrors the state
+        /// after a successful top-level enqueue: the parent is in both
+        /// `transfers` (so `cancel_transfer` removes it and proceeds to
+        /// remove the group) and `by_group` (so child enqueues find it).
+        fn register_group(&self, group_id: u64) {
+            self.by_group.write().unwrap().insert(group_id, ());
+            self.transfers.write().unwrap().insert(
+                TidShim {
+                    id: group_id,
+                    parent: None,
+                },
+                (),
+            );
+        }
+
+        /// Mirror of FIXED `Scheduler::enqueue_transfer` lock dance.
+        ///
+        /// Lock order: acquire `transfers.write`, hold while taking
+        /// `by_group.read` to check parent existence and inserting,
+        /// then release `transfers.write` and re-check via
+        /// `by_group.read` (the publication step performed by
+        /// `ready_set.insert` in production). Matches
+        /// `Scheduler::enqueue_transfer`'s resolve+insert critical
+        /// section followed by the post-release `ready_set.insert` /
+        /// OrphanedChild fallback.
+        fn enqueue_transfer(&self, tid: TidShim) {
+            let inserted = {
+                let mut transfers = self.transfers.write().unwrap();
+                // resolve_group_vruntime equivalent: by_group.read while
+                // holding transfers.write enforces lock ordering.
+                let parent_exists = match tid.parent {
+                    Some(p) => self.by_group.read().unwrap().contains_key(&p),
+                    None => true,
+                };
+                if !parent_exists {
+                    drop(transfers);
+                    // Production: ctx.set_cancelled() + ctx.signal_terminal().
+                    return;
+                }
+                transfers.insert(tid, ());
+                true
+            };
+            let _ = inserted;
+            // transfers released. ready_set.insert equivalent: by_group.read again.
+            if let Some(p) = tid.parent {
+                let still = self.by_group.read().unwrap().contains_key(&p);
+                if !still {
+                    // OrphanedChild branch: production calls
+                    // cancel_transfer(tid). We inline the relevant cleanup
+                    // (remove from transfers); production also calls
+                    // cancel_descriptor which is outside the protocol.
+                    self.transfers.write().unwrap().remove(&tid);
+                }
+            }
+        }
+
+        /// Mirror of FIXED `Scheduler::cancel_transfer` lock dance.
+        ///
+        /// Single critical section: `transfers.write` held across
+        /// `by_group.write`. Matches the production `cancel_transfer`
+        /// removal block; production also calls `cancel_descriptor` for
+        /// each removed descriptor outside the lock, which is irrelevant
+        /// to the protocol.
+        fn cancel_transfer(&self, id: TidShim) {
+            let mut transfers = self.transfers.write().unwrap();
+            let removed = transfers.remove(&id).is_some();
+            let child_keys: Vec<TidShim> = transfers
+                .keys()
+                .filter(|t| t.parent == Some(id.id))
+                .copied()
+                .collect();
+            for k in &child_keys {
+                transfers.remove(k);
+            }
+            if removed && id.parent.is_none() {
+                // remove_group equivalent: by_group.write while
+                // transfers.write held.
+                self.by_group.write().unwrap().remove(&id.id);
+            }
+        }
+
+        /// Invariant: no transfer remains whose parent group is gone.
+        fn no_orphans(&self) -> bool {
+            let t = self.transfers.read().unwrap();
+            let bg = self.by_group.read().unwrap();
+            t.keys().all(|tid| match tid.parent {
+                Some(p) => bg.contains_key(&p),
+                None => true,
+            })
+        }
+    }
+
+    /// Verification test: the fixed dance produces no orphan in any
+    /// interleaving. Loom panics on the first violation.
+    #[test]
+    fn fixed_dance_no_orphan() {
+        loom::model(|| {
+            let sched = Arc::new(LoomScheduler::new());
+            sched.register_group(1);
+
+            let s1 = sched.clone();
+            let h1 = thread::spawn(move || {
+                s1.enqueue_transfer(TidShim {
+                    id: 100,
+                    parent: Some(1),
+                });
+            });
+            let s2 = sched.clone();
+            let h2 = thread::spawn(move || {
+                s2.cancel_transfer(TidShim {
+                    id: 1,
+                    parent: None,
+                });
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            assert!(
+                sched.no_orphans(),
+                "fixed dance produced an orphan; lock-ordering bug regressed"
+            );
+        });
     }
 }
