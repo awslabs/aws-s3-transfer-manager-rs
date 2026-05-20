@@ -316,33 +316,24 @@ impl Scheduler {
     ///
     /// Returns `true` if the target transfer existed in the map, `false` otherwise.
     /// The return value does not reflect whether any children were found or cancelled.
+    /// Cancel a transfer and any child transfers, removing them from the scheduler.
+    ///
+    /// Lock-ordering protocol: delegates to `remove_transfer_atomic`, which
+    /// holds `transfers.write` across `ready_set.remove_group`. Together
+    /// with `enqueue_transfer`, the protocol prevents a child being
+    /// orphaned in `transfers` after its parent group is removed. See
+    /// `loom_tests::fixed_dance_no_orphan` at the bottom of this file.
+    ///
+    /// Cancels the target transfer first, then cancels all transfers whose
+    /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each cancelled
+    /// transfer has its status set to cancelled, pending work purged, and idle
+    /// notification sent. Outstanding work already being executed will complete
+    /// naturally - use `wait_for_idle(id)` to wait for draining.
+    ///
+    /// Returns `true` if the target transfer existed in the map, `false` otherwise.
+    /// The return value does not reflect whether any children were found or cancelled.
     pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
-        let (target, children) = {
-            let mut transfers = self.0.transfers.write().unwrap();
-            let target = transfers.remove(&id);
-            let child_keys: Vec<TransferId> = transfers
-                .keys()
-                .filter(|tid| tid.parent == Some(id.id))
-                .copied()
-                .collect();
-            let children: Vec<TransferDescriptor> = child_keys
-                .iter()
-                .filter_map(|k| transfers.remove(k))
-                .collect();
-            // Remove the parent's group from ready_set while still holding
-            // transfers.write. This serializes against `enqueue_transfer`,
-            // which acquires transfers.write before resolving the parent
-            // group. After we release transfers.write below, any concurrent
-            // enqueue for a child of this parent observes by_group.read
-            // returning None inside its transfers.write critical section
-            // and short-circuits to set_cancelled/signal_terminal without
-            // inserting into transfers. No orphans possible.
-            if target.is_some() && id.parent.is_none() {
-                self.0.ready_set.remove_group(id.id);
-            }
-            (target, children)
-        };
-
+        let (target, children) = self.remove_transfer_atomic(id);
         let found = target.is_some();
         if let Some(desc) = target {
             self.cancel_descriptor(desc);
@@ -351,6 +342,45 @@ impl Scheduler {
             self.cancel_descriptor(desc);
         }
         found
+    }
+
+    /// Atomic protocol-respecting removal of a transfer and its direct children.
+    ///
+    /// Lock-ordering invariant: `transfers.write` is acquired first and
+    /// held across the call to `ready_set.remove_group` (which takes
+    /// `by_group.write` internally). The two map mutations therefore
+    /// appear atomic to any observer.
+    ///
+    /// Without this ordering, a concurrent `enqueue_transfer` for a child
+    /// of `id` could sneak its child into `transfers` between the parent's
+    /// removal and the group's removal, leaving the child orphaned in
+    /// `transfers` after its parent group is gone — its handle would
+    /// never resolve.
+    ///
+    /// Used by both `cancel_transfer` (caller cancels the returned parent
+    /// descriptor + each child) and `generate_work`'s `Done` branch
+    /// (caller leaves the parent alone since it completed normally, but
+    /// cancels any children defensively — they shouldn't exist if the
+    /// Transfer contract was upheld, but we clean them up if they do).
+    fn remove_transfer_atomic(
+        &self,
+        id: TransferId,
+    ) -> (Option<TransferDescriptor>, Vec<TransferDescriptor>) {
+        let mut transfers = self.0.transfers.write().unwrap();
+        let target = transfers.remove(&id);
+        let child_keys: Vec<TransferId> = transfers
+            .keys()
+            .filter(|tid| tid.parent == Some(id.id))
+            .copied()
+            .collect();
+        let children: Vec<TransferDescriptor> = child_keys
+            .iter()
+            .filter_map(|k| transfers.remove(k))
+            .collect();
+        if target.is_some() && id.parent.is_none() {
+            self.0.ready_set.remove_group(id.id);
+        }
+        (target, children)
     }
 
     /// Cancel a single transfer descriptor: set cancelled, signal terminal,
@@ -581,9 +611,25 @@ impl Scheduler {
                     );
                     claim.release();
                     let desc_id = desc.id();
-                    self.0.transfers.write().unwrap().remove(&desc_id);
-                    if desc_id.parent.is_none() {
-                        self.0.ready_set.remove_group(desc_id.id);
+                    let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
+                    // The parent's `_completed` descriptor is the same one
+                    // we just polled; it terminated normally so we do not
+                    // call `cancel_descriptor` on it. Children should not
+                    // exist if the Transfer contract was upheld; if they
+                    // do, the contract is violated — clean them up
+                    // defensively and surface the violation as a warning.
+                    if !orphans.is_empty() {
+                        tracing::warn!(
+                            target: telemetry::TARGET_SCHEDULING,
+                            parent_id = %desc_id,
+                            child_count = orphans.len(),
+                            "transfer returned PollWork::Done while children \
+                             still alive; cleaning up. This is a Transfer \
+                             trait contract violation."
+                        );
+                        for desc in orphans {
+                            self.cancel_descriptor(desc);
+                        }
                     }
                 }
                 Err(_panic_payload) => {
@@ -659,7 +705,7 @@ impl Scheduler {
 mod tests {
     use crate::client::Handle;
     use crate::scheduler::transfer::mock::{
-        FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
+        BuggyDoneMock, FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
     };
     use crate::scheduler::MockTransfer;
     use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
@@ -2010,6 +2056,92 @@ mod tests {
 
         handle.runtime.shutdown();
     }
+
+    /// Regression test: a composite that violates the Transfer contract
+    /// (returns `Done` while children are still alive) must not hang the
+    /// scheduler. The Done branch in `generate_work` defensively cleans
+    /// up orphaned children rather than leaving them in `transfers` with
+    /// no parent group to schedule them.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_done_with_live_children_does_not_hang() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let parent_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let (mock, _terminals) = BuggyDoneMock::new(parent_id, handle.clone(), 3);
+        scheduler.enqueue_transfer(Box::new(mock));
+
+        // Without defensive cleanup, the orphaned children stay in the
+        // transfers map and the scheduler never reaches idle. The
+        // timeout asserts cleanup actually fired.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should reach idle; orphaned children would hang it");
+
+        handle.runtime.shutdown();
+    }
+
+    /// Verifies the Done-branch defensive cleanup actually cancels the
+    /// orphaned children (calls `cancel_descriptor`), not just removing
+    /// them from the map. Each child's terminal receiver should fire so
+    /// the children's handles resolve as cancelled rather than hanging.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_done_orphans_have_terminal_signaled() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let parent_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let (mock, terminals) = BuggyDoneMock::new(parent_id, handle.clone(), 3);
+        scheduler.enqueue_transfer(Box::new(mock));
+
+        // Wait for the parent to be polled (children get spawned and
+        // terminals filled in during the same poll_work call).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if terminals.lock().unwrap().is_some()
+                    && !terminals.lock().unwrap().as_ref().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("BuggyDoneMock should populate child terminals during poll_work");
+
+        let child_terminals = terminals
+            .lock()
+            .unwrap()
+            .take()
+            .expect("child terminals should be available");
+        assert_eq!(child_terminals.len(), 3, "expected 3 child terminals");
+
+        // Each child should be cancelled by the Done branch's defensive
+        // cleanup; their terminal receivers fire when cancel_descriptor
+        // calls signal_terminal.
+        for term in child_terminals {
+            tokio::time::timeout(Duration::from_secs(2), term)
+                .await
+                .expect("child terminal should fire (cancelled by Done branch)")
+                .expect("terminal sender should not have been dropped");
+        }
+
+        handle.runtime.shutdown();
+    }
 }
 
 #[cfg(all(test, s3_tm_loom))]
@@ -2196,6 +2328,49 @@ mod loom_tests {
             assert!(
                 sched.no_orphans(),
                 "fixed dance produced an orphan; lock-ordering bug regressed"
+            );
+        });
+    }
+
+    /// Verification: two concurrent child enqueues against a single
+    /// concurrent cancel never leave an orphaned child. Exercises the
+    /// protocol with three threads instead of two; verifies the lock
+    /// dance scales beyond the minimal interleaving covered by
+    /// `fixed_dance_no_orphan`.
+    #[test]
+    fn two_enqueues_one_cancel_no_orphan() {
+        loom::model(|| {
+            let sched = Arc::new(LoomScheduler::new());
+            sched.register_group(1);
+
+            let s1 = sched.clone();
+            let h1 = thread::spawn(move || {
+                s1.enqueue_transfer(TidShim {
+                    id: 100,
+                    parent: Some(1),
+                });
+            });
+            let s2 = sched.clone();
+            let h2 = thread::spawn(move || {
+                s2.enqueue_transfer(TidShim {
+                    id: 200,
+                    parent: Some(1),
+                });
+            });
+            let s3 = sched.clone();
+            let h3 = thread::spawn(move || {
+                s3.cancel_transfer(TidShim {
+                    id: 1,
+                    parent: None,
+                });
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+            h3.join().unwrap();
+
+            assert!(
+                sched.no_orphans(),
+                "fixed dance produced an orphan with 2 enqueues + 1 cancel"
             );
         });
     }

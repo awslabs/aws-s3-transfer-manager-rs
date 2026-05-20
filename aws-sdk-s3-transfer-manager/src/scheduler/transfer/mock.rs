@@ -7,11 +7,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
+use crate::transfer::{
+    IoRequest, PollWork, StateMachineTerminalReceiver, Transfer, TransferContext, TransferId,
+    WorkOutcome,
+};
 
 /// Trait for mock state machines that drive transfer behavior.
 pub(crate) trait MockStateMachine: Send + Sync + std::fmt::Debug {
@@ -764,6 +767,139 @@ impl Transfer for PanickingCompositeMock {
         _work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         unreachable!("PanickingCompositeMock never returns PollWork::Ready")
+    }
+}
+
+/// A composite that violates the Transfer contract by returning `Done`
+/// while children are still alive in the scheduler. Used to test the
+/// scheduler's defensive cleanup of orphaned children in
+/// `generate_work`'s Done branch.
+///
+/// On first `poll_work`, spawns `num_children` no-op children whose
+/// `poll_work` returns `Pending` indefinitely. Then signals terminal
+/// and returns `Done`. Without defensive cleanup, the children would
+/// remain in the transfers map forever (their handles never resolving).
+pub(crate) struct BuggyDoneMock {
+    ctx: TransferContext,
+    handle: Arc<crate::client::Handle>,
+    num_children: u64,
+    children_spawned: AtomicBool,
+    /// Senders we hand off to the children via construction. Filled on
+    /// first `poll_work`. The caller holds a clone of this Arc so it
+    /// can take the receivers after enqueue ownership-transfers the
+    /// mock to the scheduler.
+    child_terminals: Arc<std::sync::Mutex<Option<Vec<StateMachineTerminalReceiver>>>>,
+}
+
+/// Handle returned by `BuggyDoneMock::new` so the test can observe each
+/// child's termination after the mock has been moved into the scheduler.
+pub(crate) type BuggyDoneChildTerminals =
+    Arc<std::sync::Mutex<Option<Vec<StateMachineTerminalReceiver>>>>;
+
+impl std::fmt::Debug for BuggyDoneMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuggyDoneMock").finish()
+    }
+}
+
+impl BuggyDoneMock {
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        num_children: u64,
+    ) -> (Self, BuggyDoneChildTerminals) {
+        let (ctx, _rx) = TransferContext::with_id(id, handle.clone());
+        let terminals: BuggyDoneChildTerminals = Arc::new(std::sync::Mutex::new(Some(
+            Vec::with_capacity(num_children as usize),
+        )));
+        let mock = Self {
+            ctx,
+            handle,
+            num_children,
+            children_spawned: AtomicBool::new(false),
+            child_terminals: terminals.clone(),
+        };
+        (mock, terminals)
+    }
+}
+
+impl Transfer for BuggyDoneMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        if !self
+            .children_spawned
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Spawn children with NoopChild::poll_work returning Pending,
+            // so they sit in the transfers map indefinitely until cleaned
+            // up by the Done branch's defensive code.
+            let mut terminals = Vec::with_capacity(self.num_children as usize);
+            for i in 0..self.num_children {
+                let child_id = TransferId {
+                    id: 100_000 + i,
+                    parent: Some(self.ctx.id.id),
+                };
+                let (child, term_rx) = NoopChild::new(child_id, self.handle.clone());
+                terminals.push(term_rx);
+                self.handle.scheduler.enqueue_transfer(Box::new(child));
+            }
+            *self.child_terminals.lock().unwrap() = Some(terminals);
+        }
+        // Contract violation: return Done while children are still alive.
+        self.ctx.set_completed();
+        self.ctx.signal_terminal();
+        PollWork::Done
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("BuggyDoneMock never returns PollWork::Ready")
+    }
+}
+
+/// A child transfer that always returns `Pending` from `poll_work` and
+/// never produces work. Used by `BuggyDoneMock` so children remain in
+/// the transfers map until cancelled.
+pub(crate) struct NoopChild {
+    ctx: TransferContext,
+}
+
+impl std::fmt::Debug for NoopChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoopChild").finish()
+    }
+}
+
+impl NoopChild {
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+    ) -> (Self, StateMachineTerminalReceiver) {
+        let (ctx, rx) = TransferContext::with_id(id, handle);
+        (Self { ctx }, rx)
+    }
+}
+
+impl Transfer for NoopChild {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        self.ctx.set_pending();
+        PollWork::Pending
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("NoopChild never returns PollWork::Ready")
     }
 }
 
