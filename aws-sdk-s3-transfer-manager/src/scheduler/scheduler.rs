@@ -55,10 +55,19 @@
 //!   state. Long `poll_work` calls pin the caller's runtime, preventing it from
 //!   polling its own async tasks (including in-flight SDK requests).
 //! - **At most one thread is inside `poll_work(desc)` at a time.** Enforced by a
-//!   claim atom on [`TransferDescriptor`](super::descriptor::TransferDescriptor). The ready set's insert is
-//!   CAS-gated on this claim, and the claim is held through `pop` and `poll_work`
-//!   until the scheduler has finished handling the outcome. This keeps the
-//!   per-transfer state mutex effectively uncontended in steady state.
+//!   claim atom on [`TransferDescriptor`](super::descriptor::TransferDescriptor)
+//!   and the atomicity of `ReadySet`'s pop. `ReadySet::insert` is CAS-gated on
+//!   this claim: a concurrent wake calling `insert` while the descriptor is
+//!   already in the ready set (or being polled) finds claim=true and silently
+//!   no-ops, preventing duplicate ready-set entries. Concurrent `poll_work` is
+//!   prevented by `SkipMap`'s atomic dequeue, not by the claim.
+//!
+//!   The claim is asserted on first insert and held continuously across all
+//!   subsequent `pop` -> `poll_work` -> `reinsert_under_claim` cycles in the
+//!   `Ready` path, until `poll_work` returns `Pending` or `Done` (at which
+//!   point the claim is explicitly released). This keeps the per-transfer
+//!   state mutex effectively uncontended in steady state and lets a transfer
+//!   making continuous progress avoid CAS overhead on each iteration.
 //! - **Ready set entries are unique per transfer id.** Duplicates re-open the
 //!   single-poll invariant and produce lock-contention storms under burst
 //!   completions.
@@ -452,12 +461,27 @@ impl Scheduler {
             desc.notify_idle();
         }
 
-        // Terminal transfer: no further work from THIS transfer. Clean up when fully drained.
+        // Terminal transfer: no further work from THIS transfer. Clean up
+        // when fully drained. Routed through `remove_transfer_atomic` so
+        // the transfers/by_group/groups lock-ordering protocol is held;
+        // a concurrent child enqueue cannot slip into a window between
+        // the parent's removal from `transfers` and its group's removal,
+        // which would otherwise orphan the child.
         if desc.is_terminal() && is_idle {
-            let tid = desc.id();
-            self.0.transfers.write().unwrap().remove(&tid);
-            if tid.parent.is_none() {
-                self.0.ready_set.remove_group(tid.id);
+            let desc_id = desc.id();
+            let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
+            if !orphans.is_empty() {
+                tracing::warn!(
+                    target: telemetry::TARGET_SCHEDULING,
+                    parent_id = %desc_id,
+                    child_count = orphans.len(),
+                    "transfer reached terminal+idle in on_completion while \
+                     children still alive; cleaning up. This is a Transfer \
+                     trait contract violation."
+                );
+                for desc in orphans {
+                    self.cancel_descriptor(desc);
+                }
             }
         }
 
@@ -483,10 +507,22 @@ impl Scheduler {
 
         let is_idle = desc.work_finished();
         if is_idle {
-            let tid = desc.id();
-            self.0.transfers.write().unwrap().remove(&tid);
-            if tid.parent.is_none() {
-                self.0.ready_set.remove_group(tid.id);
+            // Same lock-ordering protocol as on_completion: route
+            // through `remove_transfer_atomic` to keep transfers and
+            // by_group/groups consistent under concurrent child enqueue.
+            let desc_id = desc.id();
+            let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
+            if !orphans.is_empty() {
+                tracing::warn!(
+                    target: telemetry::TARGET_SCHEDULING,
+                    parent_id = %desc_id,
+                    child_count = orphans.len(),
+                    "panicking transfer reached idle while children still \
+                     alive; cleaning up."
+                );
+                for desc in orphans {
+                    self.cancel_descriptor(desc);
+                }
             }
         }
         desc.notify_idle();
@@ -2198,6 +2234,12 @@ mod loom_tests {
         // group internals (vruntime, queue) are irrelevant to the
         // existence-tracking protocol.
         by_group: RwLock<HashMap<u64, ()>>,
+        // Mirrors `ReadySet.groups` (the root SkipMap of group entries).
+        // Value type stripped to (). The phantom-group race lives in the
+        // by_group/groups consistency: an entry can be left in `groups`
+        // for a group_id no longer present in `by_group` if the inner
+        // `ReadySet::insert_child` lock dance is wrong.
+        groups: RwLock<HashMap<u64, ()>>,
     }
 
     impl LoomScheduler {
@@ -2205,15 +2247,16 @@ mod loom_tests {
             Self {
                 transfers: RwLock::new(HashMap::new()),
                 by_group: RwLock::new(HashMap::new()),
+                groups: RwLock::new(HashMap::new()),
             }
         }
 
         /// Pre-register a top-level group for setup. Mirrors the state
-        /// after a successful top-level enqueue: the parent is in both
-        /// `transfers` (so `cancel_transfer` removes it and proceeds to
-        /// remove the group) and `by_group` (so child enqueues find it).
+        /// after a successful top-level enqueue: the parent is in
+        /// `transfers`, `by_group`, AND `groups` (the root tree).
         fn register_group(&self, group_id: u64) {
             self.by_group.write().unwrap().insert(group_id, ());
+            self.groups.write().unwrap().insert(group_id, ());
             self.transfers.write().unwrap().insert(
                 TidShim {
                     id: group_id,
@@ -2223,54 +2266,52 @@ mod loom_tests {
             );
         }
 
-        /// Mirror of FIXED `Scheduler::enqueue_transfer` lock dance.
-        ///
-        /// Lock order: acquire `transfers.write`, hold while taking
-        /// `by_group.read` to check parent existence and inserting,
-        /// then release `transfers.write` and re-check via
-        /// `by_group.read` (the publication step performed by
-        /// `ready_set.insert` in production). Matches
-        /// `Scheduler::enqueue_transfer`'s resolve+insert critical
-        /// section followed by the post-release `ready_set.insert` /
-        /// OrphanedChild fallback.
+        /// Mirror of FIXED `Scheduler::enqueue_transfer` lock dance,
+        /// PLUS the inner `ReadySet::insert_child` lock dance via the
+        /// `try_insert_into_existing_group` helper. Both protocols are
+        /// held atomically with their respective lock guards.
         fn enqueue_transfer(&self, tid: TidShim) {
+            // Outer protocol: resolve parent + insert into transfers
+            // under transfers.write. Already verified by
+            // fixed_dance_no_orphan and two_enqueues_one_cancel_no_orphan.
             let inserted = {
                 let mut transfers = self.transfers.write().unwrap();
-                // resolve_group_vruntime equivalent: by_group.read while
-                // holding transfers.write enforces lock ordering.
                 let parent_exists = match tid.parent {
                     Some(p) => self.by_group.read().unwrap().contains_key(&p),
                     None => true,
                 };
                 if !parent_exists {
                     drop(transfers);
-                    // Production: ctx.set_cancelled() + ctx.signal_terminal().
                     return;
                 }
                 transfers.insert(tid, ());
                 true
             };
             let _ = inserted;
-            // transfers released. ready_set.insert equivalent: by_group.read again.
-            if let Some(p) = tid.parent {
-                let still = self.by_group.read().unwrap().contains_key(&p);
-                if !still {
-                    // OrphanedChild branch: production calls
-                    // cancel_transfer(tid). We inline the relevant cleanup
-                    // (remove from transfers); production also calls
-                    // cancel_descriptor which is outside the protocol.
-                    self.transfers.write().unwrap().remove(&tid);
-                }
+
+            // Inner protocol: ready_set.insert tail. Mirrors the FIXED
+            // production helper: by_group.read held across groups.write.
+            // A concurrent remove_group (which needs by_group.write) is
+            // blocked until this scope exits.
+            let group_id = tid.parent.unwrap_or(tid.id);
+            let by_group = self.by_group.read().unwrap();
+            if !by_group.contains_key(&group_id) {
+                drop(by_group);
+                self.transfers.write().unwrap().remove(&tid);
+                return;
             }
+            // by_group.read is held across the groups.write below.
+            self.groups.write().unwrap().insert(group_id, ());
+            drop(by_group);
         }
 
-        /// Mirror of FIXED `Scheduler::cancel_transfer` lock dance.
+        /// Mirror of FIXED `Scheduler::cancel_transfer` lock dance,
+        /// extended to also remove from `groups` (the production
+        /// `ready_set.remove_group` removes from both `by_group` and
+        /// `groups`).
         ///
         /// Single critical section: `transfers.write` held across
-        /// `by_group.write`. Matches the production `cancel_transfer`
-        /// removal block; production also calls `cancel_descriptor` for
-        /// each removed descriptor outside the lock, which is irrelevant
-        /// to the protocol.
+        /// `by_group.write` and `groups.write`.
         fn cancel_transfer(&self, id: TidShim) {
             let mut transfers = self.transfers.write().unwrap();
             let removed = transfers.remove(&id).is_some();
@@ -2283,13 +2324,17 @@ mod loom_tests {
                 transfers.remove(k);
             }
             if removed && id.parent.is_none() {
-                // remove_group equivalent: by_group.write while
-                // transfers.write held.
+                // Production `ReadySet::remove_group` removes from
+                // by_group AND groups. Both happen under the outer
+                // `transfers.write` so cancel is atomic from any
+                // observer's perspective.
                 self.by_group.write().unwrap().remove(&id.id);
+                self.groups.write().unwrap().remove(&id.id);
             }
         }
 
-        /// Invariant: no transfer remains whose parent group is gone.
+        /// Outer-protocol invariant: no transfer remains whose parent
+        /// group is gone from `by_group`.
         fn no_orphans(&self) -> bool {
             let t = self.transfers.read().unwrap();
             let bg = self.by_group.read().unwrap();
@@ -2297,6 +2342,17 @@ mod loom_tests {
                 Some(p) => bg.contains_key(&p),
                 None => true,
             })
+        }
+
+        /// Inner-protocol invariant: no entry in `groups` (the root
+        /// tree) without a matching entry in `by_group`. A phantom in
+        /// `groups` indicates the inner ready_set lock dance dropped
+        /// `by_group.read` before the `groups.insert`, allowing a
+        /// concurrent `remove_group` to slip in.
+        fn no_phantom_groups(&self) -> bool {
+            let groups = self.groups.read().unwrap();
+            let by_group = self.by_group.read().unwrap();
+            groups.keys().all(|gid| by_group.contains_key(gid))
         }
     }
 
@@ -2371,6 +2427,46 @@ mod loom_tests {
             assert!(
                 sched.no_orphans(),
                 "fixed dance produced an orphan with 2 enqueues + 1 cancel"
+            );
+        });
+    }
+
+    /// Verification: no phantom group entry in `groups` after a child
+    /// enqueue races a parent cancel. Catches the inner-protocol bug
+    /// landonxjames flagged: `insert_child` (and friends) drop
+    /// `by_group.read` BEFORE writing to `groups`, so a concurrent
+    /// `remove_group` can leave an entry in `groups` for a group_id no
+    /// longer present in `by_group`.
+    ///
+    /// Expected to FAIL on the current shim (which mirrors the buggy
+    /// production code) and PASS once the inner protocol is fixed
+    /// (hold `by_group.read` across `groups.write`).
+    #[test]
+    fn child_insert_phantom_group() {
+        loom::model(|| {
+            let sched = Arc::new(LoomScheduler::new());
+            sched.register_group(1);
+
+            let s1 = sched.clone();
+            let h1 = thread::spawn(move || {
+                s1.enqueue_transfer(TidShim {
+                    id: 100,
+                    parent: Some(1),
+                });
+            });
+            let s2 = sched.clone();
+            let h2 = thread::spawn(move || {
+                s2.cancel_transfer(TidShim {
+                    id: 1,
+                    parent: None,
+                });
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            assert!(
+                sched.no_phantom_groups(),
+                "phantom group entry: groups contains a group_id not in by_group"
             );
         });
     }

@@ -349,20 +349,79 @@ impl ReadySet {
     pub(super) fn reinsert_under_claim(&self, descriptor: TransferDescriptor) {
         let tid = descriptor.id();
         let group_id = tid.parent.unwrap_or(tid.id);
-        let by_group = self.by_group.read().unwrap();
-        if let Some(group) = by_group.get(&group_id) {
-            let group = Arc::clone(group);
-            drop(by_group);
-            let prev_count = group.insert(descriptor);
-            if prev_count == 0 && group.state.try_enter_root() {
-                let gv = group.group_vruntime();
-                let key = GroupKey {
-                    group_vruntime: gv,
-                    group_id,
-                };
-                self.groups.insert(key, group);
-            }
+        // The Ready path: descriptor was popped from this group, so its
+        // group_vruntime is already current; preserve it (don't reset to
+        // root_min).
+        if self
+            .try_insert_into_existing_group(group_id, descriptor, false)
+            .is_err()
+        {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_SCHEDULING,
+                id = %tid,
+                "reinsert_under_claim: parent group gone (cancel during Ready); descriptor already terminal"
+            );
         }
+    }
+
+    /// Helper for the inner ready_set lock-ordering protocol: consistency
+    /// between `by_group` and `groups`.
+    ///
+    /// Lock-ordering invariant: `by_group.read` is held across both
+    /// `group.insert(descriptor)` (into the inner queue) AND
+    /// `self.groups.insert(...)` (into the root tree). A concurrent
+    /// `remove_group` (which needs `by_group.write`) blocks until this
+    /// method returns. Without this ordering, `remove_group` could clear
+    /// `by_group` and `groups` between our drop-of-read and our write,
+    /// leaving a phantom entry in `groups` for a group_id no longer
+    /// present in `by_group`. The phantom misleads pop and stalls
+    /// scheduling for that descriptor.
+    ///
+    /// Verified by `loom_tests::child_insert_phantom_group`.
+    ///
+    /// On `Err(descriptor)`: group is gone (parent was cancelled
+    /// concurrently). Caller decides whether this is an error
+    /// (`insert_child` returns OrphanedChild) or benign (Ready-path
+    /// reinsert: descriptor will be cleaned up via terminal flag).
+    /// Importantly, `descriptor` is returned UNCONSUMED on this path,
+    /// so callers can run cleanup or fall back to a different code path.
+    ///
+    /// `reset_group_vruntime`: when true, the group's vruntime is reset
+    /// to the current root floor (used by `insert_top_level` and
+    /// `insert_child`, which are wake/spawn paths). When false, the
+    /// existing group vruntime is preserved (used by
+    /// `reinsert_under_claim`, where the descriptor was popped from
+    /// this group and the vruntime is current).
+    fn try_insert_into_existing_group(
+        &self,
+        group_id: u64,
+        descriptor: TransferDescriptor,
+        reset_group_vruntime: bool,
+    ) -> Result<(), TransferDescriptor> {
+        let by_group = self.by_group.read().unwrap();
+        let group = match by_group.get(&group_id) {
+            Some(g) => Arc::clone(g),
+            None => return Err(descriptor),
+        };
+        // From here, by_group.read is held until end-of-scope. Concurrent
+        // remove_group blocks waiting for by_group.write.
+        let prev_count = group.insert(descriptor);
+        if prev_count == 0 && group.state.try_enter_root() {
+            let gv = if reset_group_vruntime {
+                let root_min = self.min_vruntime();
+                group.state.set_group_vruntime(root_min);
+                root_min
+            } else {
+                group.group_vruntime()
+            };
+            let key = GroupKey {
+                group_vruntime: gv,
+                group_id,
+            };
+            self.groups.insert(key, group);
+        }
+        drop(by_group);
+        Ok(())
     }
 
     /// Pop the transfer with lowest vruntime (highest scheduling priority).
@@ -499,24 +558,19 @@ impl ReadySet {
         // transfer returned Pending, was popped, then woken and re-inserted),
         // add the descriptor to the existing group rather than overwriting it.
         // Overwriting would orphan any descendants currently in the group.
-        let by_group = self.by_group.read().unwrap();
-        if let Some(group) = by_group.get(&group_id) {
-            let group = Arc::clone(group);
-            drop(by_group);
-            let prev_count = group.insert(descriptor);
-            if prev_count == 0 && group.state.try_enter_root() {
-                let root_min = self.min_vruntime();
-                group.state.set_group_vruntime(root_min);
-                let key = GroupKey {
-                    group_vruntime: root_min,
-                    group_id,
-                };
-                self.groups.insert(key, group);
-            }
-            return;
-        }
-        drop(by_group);
+        let descriptor = match self.try_insert_into_existing_group(group_id, descriptor, true) {
+            Ok(()) => return,
+            Err(d) => d,
+        };
 
+        // New-group path: no concurrent access to this group_id is
+        // possible (parent's enqueue blocks any code path that could
+        // observe the group; cancel needs a handle which the user
+        // doesn't have until enqueue returns). Inserts proceed in
+        // order: by_group BEFORE groups. This makes the type-level
+        // invariant — every entry in `groups` has a matching entry in
+        // `by_group` — hold unconditionally, including for any future
+        // protocol path that observes a group in the root tree.
         let root_min = self.min_vruntime();
         let gv_arc = descriptor.group_vruntime_arc();
         let group = Arc::new(GroupQueue::new(gv_arc));
@@ -529,8 +583,11 @@ impl ReadySet {
             group_vruntime: root_min,
             group_id,
         };
-        self.groups.insert(key, Arc::clone(&group));
-        self.by_group.write().unwrap().insert(group_id, group);
+        self.by_group
+            .write()
+            .unwrap()
+            .insert(group_id, Arc::clone(&group));
+        self.groups.insert(key, group);
     }
 
     fn insert_child(
@@ -538,31 +595,14 @@ impl ReadySet {
         parent_id: u64,
         descriptor: TransferDescriptor,
     ) -> Result<(), OrphanedChild> {
-        let by_group = self.by_group.read().unwrap();
-        let group = match by_group.get(&parent_id) {
-            Some(g) => Arc::clone(g),
-            None => {
-                // Release the claim we took since we're rejecting this insert
+        match self.try_insert_into_existing_group(parent_id, descriptor, true) {
+            Ok(()) => Ok(()),
+            Err(descriptor) => {
+                // Release the claim we took since we're rejecting this insert.
                 descriptor.release_claim();
-                return Err(OrphanedChild);
+                Err(OrphanedChild)
             }
-        };
-        drop(by_group);
-
-        let prev_count = group.insert(descriptor);
-
-        // If we transitioned from 0->1, try to claim root-tree insertion.
-        if prev_count == 0 && group.state.try_enter_root() {
-            let root_min = self.min_vruntime();
-            group.state.set_group_vruntime(root_min);
-            let key = GroupKey {
-                group_vruntime: root_min,
-                group_id: parent_id,
-            };
-            self.groups.insert(key, group);
         }
-
-        Ok(())
     }
 }
 

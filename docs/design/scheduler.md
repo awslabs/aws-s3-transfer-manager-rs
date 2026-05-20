@@ -341,15 +341,14 @@ the scheduler depends on to make progress). Cost is O(1) per call for leaf
 transfers; composite transfers bound their fan-out explicitly.
 
 **Single-poll exclusivity.** At most one thread is inside `poll_work(desc)`
-for any given descriptor at a time. The ready set's insert path is CAS-gated
-on a claim flag carried by the descriptor. The claim remains asserted from the
-moment the scheduler decides to poll through `pop` and `poll_work` until
-`generate_work` has finished handling the outcome (`Ready`, `Pending`, or
-`Done`). The Transfer trait's `&self` API forces interior-mutable state
-behind a mutex, so single-poll exclusivity isn't required for correctness  -
-its purpose is performance, keeping that mutex effectively uncontended in
-steady state. Without it, burst completions converge on lock contention
-that pins managed-thread runtimes (see "Invariants and Violations").
+for any given descriptor at a time. Without it, burst completions converge
+on lock contention on the transfer's state mutex, starving the runtimes
+those threads host. A claim flag on the descriptor enforces the invariant:
+the descriptor enters the ready set under a claim and stays claimed across
+re-insertions in the `Ready` path until `poll_work` returns `Pending` or
+`Done`. Concurrent wakes that try to re-insert while the descriptor is
+claimed are no-ops, preventing duplicate ready-set entries that would
+re-open the window.
 
 **Ready set uniqueness.** The ready set contains at most one entry per
 transfer id. Duplicates re-open the single-poll window and, under bursty
@@ -506,11 +505,12 @@ arrive to resolve the contention.
 
 **Mechanism.** A claim flag on the descriptor is CAS-swapped to true by
 `ReadySet::insert`. A failed CAS indicates the descriptor is already
-queued or being polled, and the insert becomes a no-op. The claim stays
-asserted from insert through `pop` through `poll_work`, and is released
-only by `generate_work` after handling the outcome. Callers that need to
-re-insert after `PollWork::Ready` use `ReadySet::reinsert_under_claim`,
-which bypasses the CAS because the caller still owns the claim.
+queued or being polled, and the insert becomes a no-op. The claim is
+asserted on first insert and held continuously across the `Ready` path's
+pop / `poll_work` / reinsert cycles, released only when `poll_work` returns
+`Pending` or `Done`. Callers that need to re-insert after `PollWork::Ready`
+use `ReadySet::reinsert_under_claim`, which bypasses the CAS because the
+caller still owns the claim.
 
 ### Bounded per-call cost
 
