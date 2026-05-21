@@ -65,6 +65,47 @@ struct State {
     flushing: bool,
 }
 
+// Number of currently-live `Submission` handles held by this thread
+// across nested `SubmissionQueue::enter` calls.
+//
+// The first `enter()` on a thread takes the shared-state path (grabs
+// the state lock, increments `pending`, blocks on `not_flushing` if a
+// flush is in progress). Subsequent re-entrant `enter()` calls on the
+// same thread skip that path and participate as nested producers — they
+// can still `push` items, but they don't bump `pending` and won't
+// deadlock waiting for a flush that the outer frame owns.
+//
+// The counter is per-thread because `pending` is a global count of
+// distinct producers, not a count of `Submission` handles. A single
+// thread that re-enters via scheduler recursion is still one producer
+// from the queue's perspective.
+//
+// The `loom::thread_local!` variant under `cfg(s3_tm_loom)` is per-
+// loom-thread; `std::thread_local!` would be shared across all loom-
+// simulated threads (they run on a single OS thread) and mis-classify
+// separate loom threads as nested re-entries.
+#[cfg(not(all(test, s3_tm_loom)))]
+std::thread_local! {
+    static SUBMISSION_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, s3_tm_loom))]
+loom::thread_local! {
+    static SUBMISSION_DEPTH: core::cell::Cell<u32> = core::cell::Cell::new(0);
+}
+
+fn incr_depth() -> u32 {
+    SUBMISSION_DEPTH.with(|c| {
+        let depth = c.get();
+        c.set(depth + 1);
+        depth
+    })
+}
+
+fn decr_depth() {
+    SUBMISSION_DEPTH.with(|c| c.set(c.get() - 1));
+}
+
 // Safety: producers write to distinct slots (claimed via atomic fetch_add on
 // tail). The flusher has exclusive access after all producers exit. T: Send is
 // required because items cross thread boundaries.
@@ -74,11 +115,18 @@ unsafe impl<T: Send> Sync for SubmissionQueue<T> {}
 /// Participation in a submission round. Provides [`push`](Self::push) access to
 /// the queue and is consumed by [`submit`](Self::submit) to complete the round.
 ///
+/// A `Submission` may be either *primary* or *nested*. The first `enter()` on
+/// a thread returns a primary handle that holds one unit of the queue's global
+/// `pending` count. Subsequent re-entrant `enter()` calls on the same thread
+/// return nested handles — they can push items but don't affect `pending`.
+///
 /// If dropped without calling `submit` (e.g. due to a panic), the destructor
-/// decrements the pending count and cleans up any pushed items when it is the
-/// last producer out.
+/// correctly accounts for both primary and nested cases.
 pub(crate) struct Submission<'a, T> {
     sq: &'a SubmissionQueue<T>,
+    /// True when this handle came from a re-entrant `enter()` on the same
+    /// thread and does not own a unit of `pending`.
+    nested: bool,
 }
 
 /// Exclusive access to items from a completed submission. Provides slice access
@@ -115,15 +163,48 @@ impl<T> SubmissionQueue<T> {
         }
     }
 
-    /// Enter a submission round. Blocks while a flush is in progress.
-    /// Returns a [`Submission`] that provides push access.
+    /// Enter a submission round.
+    ///
+    /// For the first call on a given thread, this blocks while a flush is in
+    /// progress and then increments the global `pending` count. For re-entrant
+    /// calls on the same thread, it returns a nested handle immediately
+    /// without blocking or bumping `pending` — the outer primary handle
+    /// already owns this thread's contribution to the round.
     pub(crate) fn enter(&self) -> Submission<'_, T> {
+        let depth = incr_depth();
+        if depth > 0 {
+            // Re-entrant on this thread — the outer primary handle already
+            // holds the pending contribution; we just participate in pushes.
+            return Submission {
+                sq: self,
+                nested: true,
+            };
+        }
         let mut state = self.state.lock();
+        let mut parked = false;
         while state.flushing {
+            if !parked {
+                tracing::trace!(
+                    phase = "enter_blocked",
+                    pending = state.pending,
+                    "enter blocked on flush in progress"
+                );
+                parked = true;
+            }
             state = self.not_flushing.wait(state);
         }
+        if parked {
+            tracing::trace!(
+                phase = "enter_unblocked",
+                pending = state.pending,
+                "enter unblocked"
+            );
+        }
         state.pending += 1;
-        Submission { sq: self }
+        Submission {
+            sq: self,
+            nested: false,
+        }
     }
 
     /// Number of items the queue can hold per round.
@@ -151,9 +232,21 @@ impl<'a, T> Submission<'a, T> {
         Ok(())
     }
 
-    /// Complete the submission. If this is the last producer to finish,
-    /// returns a [`SubmissionGuard`] with access to all submitted items.
+    /// Complete the submission.
+    ///
+    /// For a primary handle, decrements `pending`. If this was the last
+    /// primary out, transitions the queue into the flushing phase and returns
+    /// a [`SubmissionGuard`] granting exclusive access to the batch.
+    ///
+    /// For a nested handle, returns `None` immediately — the outer primary
+    /// will perform the flush. Items pushed via the nested handle remain in
+    /// the queue and are included in that flush.
     pub(crate) fn submit(self) -> Option<SubmissionGuard<'a, T>> {
+        decr_depth();
+        if self.nested {
+            std::mem::forget(self);
+            return None;
+        }
         let sq = self.sq;
         std::mem::forget(self);
         let mut state = sq.state.lock();
@@ -162,8 +255,14 @@ impl<'a, T> Submission<'a, T> {
             state.flushing = true;
             drop(state);
             let count = sq.tail.swap(0, Ordering::Relaxed).min(sq.capacity);
+            tracing::trace!(phase = "flush_start", count, "submission flush starting");
             Some(SubmissionGuard { sq, count, next: 0 })
         } else {
+            // Deliberately not logging the no-flush path: it fires on every
+            // submit under concurrent producers and drowns useful events.
+            // The absence of `flush_start` over time is the diagnostic
+            // signal (stuck flushing => no flush_start; stuck pending =>
+            // flush_start fires but with unexpected `count` or never).
             None
         }
     }
@@ -171,6 +270,12 @@ impl<'a, T> Submission<'a, T> {
 
 impl<T> Drop for Submission<'_, T> {
     fn drop(&mut self) {
+        decr_depth();
+        if self.nested {
+            // A nested handle owns no `pending` contribution and no slot
+            // ownership. Items it pushed are claimed by the outer primary.
+            return;
+        }
         let mut state = self.sq.state.lock();
         state.pending -= 1;
         if state.pending == 0 && !state.flushing {
@@ -252,6 +357,7 @@ impl<T> Drop for SubmissionGuard<'_, T> {
         let mut state = self.sq.state.lock();
         state.flushing = false;
         self.sq.not_flushing.notify_all();
+        tracing::trace!(phase = "flush_end", "submission flush complete");
     }
 }
 
@@ -542,6 +648,132 @@ mod tests {
         }
 
         assert_eq!(total.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn reentrant_enter_does_not_deadlock() {
+        // A single thread entering twice must not deadlock on `pending`.
+        // The primary handle holds the `pending` contribution; the nested
+        // handle is a no-op from the queue's perspective.
+        let q: SubmissionQueue<i32> = SubmissionQueue::new(8);
+
+        let outer = q.enter();
+        outer.push(1).unwrap();
+
+        // Nested enter on the same thread.
+        let inner = q.enter();
+        inner.push(2).unwrap();
+        assert!(
+            inner.submit().is_none(),
+            "nested submit never returns a guard"
+        );
+
+        // Outer sees both items in its flush.
+        let mut guard = outer.submit().expect("primary should flush");
+        let items: Vec<_> = guard.drain().collect();
+        assert_eq!(items.len(), 2);
+        assert!(items.contains(&1));
+        assert!(items.contains(&2));
+    }
+
+    #[test]
+    fn reentrant_enter_does_not_bump_pending() {
+        // Verify `pending` stays at 1 through re-entrant enter/submit cycles.
+        let q: SubmissionQueue<i32> = SubmissionQueue::new(4);
+
+        let outer = q.enter();
+        assert_eq!(q.state.lock().pending, 1);
+
+        let inner = q.enter();
+        assert_eq!(
+            q.state.lock().pending,
+            1,
+            "nested enter must not bump pending"
+        );
+
+        inner.submit();
+        assert_eq!(
+            q.state.lock().pending,
+            1,
+            "nested submit must not touch pending"
+        );
+
+        outer.submit();
+        assert_eq!(q.state.lock().pending, 0);
+    }
+
+    #[test]
+    fn nested_submission_drop_is_safe() {
+        // Dropping a nested submission without calling submit must not
+        // decrement pending or clean up slots.
+        let q: SubmissionQueue<i32> = SubmissionQueue::new(4);
+        let outer = q.enter();
+        outer.push(10).unwrap();
+
+        {
+            let inner = q.enter();
+            inner.push(20).unwrap();
+            // inner drops here without submit
+        }
+
+        assert_eq!(
+            q.state.lock().pending,
+            1,
+            "nested drop must not change pending"
+        );
+
+        let mut guard = outer.submit().expect("outer should flush");
+        let items: Vec<_> = guard.drain().collect();
+        assert_eq!(items.len(), 2, "both items should reach the flush");
+    }
+
+    #[test]
+    fn cross_thread_entries_still_independent() {
+        // Thread-local depth must not affect other threads. Backpressure
+        // semantics for distinct threads remain as before.
+        let q = Arc::new(SubmissionQueue::<i32>::new(8));
+
+        let q2 = Arc::clone(&q);
+        let outer = q.enter();
+        assert_eq!(q.state.lock().pending, 1);
+
+        let handle = std::thread::spawn(move || {
+            let s = q2.enter();
+            assert_eq!(
+                q2.state.lock().pending,
+                2,
+                "different thread must bump pending"
+            );
+            s.push(1).unwrap();
+            s.submit();
+        });
+        handle.join().unwrap();
+
+        assert_eq!(q.state.lock().pending, 1);
+        outer.submit();
+    }
+
+    #[test]
+    fn reentrant_enter_during_push_overflow() {
+        // The outer frame fills the queue; a nested enter on the same thread
+        // cannot push more, mirroring the behaviour the outer would see.
+        let q: SubmissionQueue<i32> = SubmissionQueue::new(2);
+
+        let outer = q.enter();
+        outer.push(1).unwrap();
+        outer.push(2).unwrap();
+        // Outer has filled the queue.
+
+        let inner = q.enter();
+        assert!(
+            inner.push(3).is_err(),
+            "queue is full, nested push should fail just like outer"
+        );
+        inner.submit();
+
+        let mut guard = outer.submit().expect("outer flushes");
+        let items: Vec<_> = guard.drain().collect();
+        assert_eq!(items.len(), 2);
     }
 }
 

@@ -93,8 +93,8 @@ jobs:
 
       - name: test s3-transfer-manager HLL
         run: |
-          cargo nextest run --workspace --all-features
-          cargo test --doc --workspace --all-features
+          cargo nextest run --workspace --all-features --no-fail-fast
+          cargo test --doc --workspace --all-features --no-fail-fast
 
       - name: test s3-transfer-manager e2e
         run: |
@@ -214,10 +214,27 @@ jobs:
         run: cargo deny --all-features check --hide-inclusion-graph --config .cargo-deny-config.toml licenses bans sources
 
   sanitizers:
-    name: saniters
+    name: saniters (${{ matrix.sanitizer }})
     needs: basics
     runs-on: ubuntu-24.04
-    # TODO - add additional sanitizers like leak via matrix or other jobs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ASAN: leak detection + use-after-free + heap/stack buffer overflow.
+          # `--test-threads 1` keeps leak attribution readable when something
+          # panics mid-test and leaves Arc cycles behind.
+          - sanitizer: address
+            rustflags: -Z sanitizer=address --cfg s3_tm_asan
+            cargo_args: ""
+            test_args: --test-threads 1 --nocapture
+          # TSan is parked: requires `-Z build-std` for correct happens-before
+          # modeling against std synchronization (the alternative
+          # `-Cunsafe-allow-abi-mismatch=sanitizer` produces both false
+          # positives and missed races); build-std currently fails to
+          # compile transitive `tower 0.4` against `indexmap 1.9` due to
+          # feature-resolution differences. Re-evaluate when the dep
+          # graph picks up tower 0.5+.
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
@@ -228,10 +245,10 @@ jobs:
         with:
           toolchain: ${{ env.rust_nightly }}
       - uses: Swatinem/rust-cache@v2
-      - name: asan
-        run: cargo test --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- --test-threads 1 --nocapture
+      - name: ${{ matrix.sanitizer }}
+        run: cargo test ${{ matrix.cargo_args }} --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
         env:
-          RUSTFLAGS: -Z sanitizer=address
+          RUSTFLAGS: ${{ matrix.rustflags }}
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
@@ -302,8 +319,12 @@ jobs:
           RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
             --lib --release -- loom_tests --nocapture
         env:
-          LOOM_MAX_PREEMPTIONS: 2
-          LOOM_MAX_BRANCHES: 10000
+          # Three preemption points catches three-way interleaving bugs that
+          # two-preemption exploration misses. Branch budget raised to absorb
+          # the larger state space; if a specific test exhausts it, we calibrate
+          # that test rather than dropping back globally.
+          LOOM_MAX_PREEMPTIONS: 3
+          LOOM_MAX_BRANCHES: 50000
           RUST_BACKTRACE: 1
 
   # TODO - get cross check working

@@ -467,7 +467,7 @@ impl SlotBodyConsumer {
     /// `is_terminal` should return `true` when the transfer has reached a terminal
     /// state (success, failure, or cancellation). The caller must ensure
     /// [`BodyWriter::notify_consumer`] is called when the transfer becomes terminal,
-    /// otherwise the consumer may block indefinitely.
+    /// otherwise the consumer may wait indefinitely.
     pub(crate) async fn next(&self, is_terminal: impl Fn() -> bool) -> Option<ChunkOutput> {
         loop {
             // Register interest before checking state
