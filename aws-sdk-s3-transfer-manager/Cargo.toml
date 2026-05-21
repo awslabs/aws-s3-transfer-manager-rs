@@ -48,7 +48,7 @@ aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test
 aws-smithy-checksums = "0.64.6"
 aws-smithy-mocks = "0.2.6"
 aws-smithy-runtime = { version = "1.11.1", features = ["client", "test-util"] }
-aws-smithy-http-client = { version = "1.1.12", features = ["test-util", "wire-mock", "rustls-aws-lc", "s2n-tls"] }
+aws-smithy-http-client = { version = "1.1.12", features = ["test-util", "wire-mock", "rustls-aws-lc"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.4.0"
 http = "1"

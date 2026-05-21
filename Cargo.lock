@@ -187,7 +187,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
 dependencies = [
  "aws-lc-sys",
- "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -563,9 +562,6 @@ dependencies = [
  "rustls 0.23.40",
  "rustls-native-certs",
  "rustls-pki-types",
- "s2n-tls",
- "s2n-tls-hyper",
- "s2n-tls-tokio",
  "serde",
  "serde_json",
  "tokio",
@@ -3027,7 +3023,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted 0.9.0",
+ "untrusted",
  "windows-sys 0.52.0",
 ]
 
@@ -3116,7 +3112,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -3128,7 +3124,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -3142,57 +3138,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "s2n-tls"
-version = "0.3.36"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d22c36f207d0bb6a38272d5d1fa1cd99094335c70db1bfef54e0b8b672ae26f"
-dependencies = [
- "errno",
- "hex",
- "libc",
- "pin-project-lite",
- "s2n-tls-sys",
-]
-
-[[package]]
-name = "s2n-tls-hyper"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f48b9922eed6521a7f9d5b444bcc36a5df988161b67579112cc5377ca021ed78"
-dependencies = [
- "http 1.4.0",
- "hyper 1.9.0",
- "hyper-util",
- "s2n-tls",
- "s2n-tls-tokio",
- "tower-service",
-]
-
-[[package]]
-name = "s2n-tls-sys"
-version = "0.3.36"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcf9e3b136cdd2c99f0cee2811d80b9f6bc44b5fd48c172857de32babb506f5e"
-dependencies = [
- "aws-lc-rs",
- "cc",
- "libc",
-]
-
-[[package]]
-name = "s2n-tls-tokio"
-version = "0.3.36"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0ab00b075ab482e89509de51e1972a8f38ff70e1dbd5279caa0fd8d25f86cb"
-dependencies = [
- "errno",
- "libc",
- "pin-project-lite",
- "s2n-tls",
- "tokio",
-]
 
 [[package]]
 name = "s3-mock-server"
@@ -3315,7 +3260,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
 dependencies = [
  "ring",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -4019,12 +3964,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "untrusted"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"
