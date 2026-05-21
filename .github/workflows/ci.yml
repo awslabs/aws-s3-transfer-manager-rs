@@ -228,19 +228,13 @@ jobs:
             rustflags: -Z sanitizer=address --cfg s3_tm_asan
             cargo_args: ""
             test_args: --test-threads 1 --nocapture
-          # TSan: data race detection on real concurrent execution. Loom
-          # covers bounded model checking on synthetic primitives; TSan
-          # covers actual races in production code paths exercised by tests.
-          # `-Z build-std` rebuilds the sysroot with TSan instrumentation so
-          # synchronization in std (mutexes, condvars, atomics) is visible to
-          # the TSan runtime, eliminating false positives and missed races
-          # that come from linking instrumented code against an
-          # uninstrumented sysroot. Cold-cache cost is several minutes;
-          # warm-cache cost is near-zero.
-          - sanitizer: thread
-            rustflags: -Z sanitizer=thread
-            cargo_args: -Z build-std=core,alloc,std,proc_macro
-            test_args: --nocapture
+          # TSan is parked: requires `-Z build-std` for correct happens-before
+          # modeling against std synchronization (the alternative
+          # `-Cunsafe-allow-abi-mismatch=sanitizer` produces both false
+          # positives and missed races); build-std currently fails to
+          # compile transitive `tower 0.4` against `indexmap 1.9` due to
+          # feature-resolution differences. Re-evaluate when the dep
+          # graph picks up tower 0.5+.
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
@@ -250,8 +244,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_nightly }}
-          # rust-src is required by `-Z build-std` (TSan).
-          components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
         run: cargo test ${{ matrix.cargo_args }} --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
