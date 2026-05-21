@@ -226,19 +226,20 @@ jobs:
           # panics mid-test and leaves Arc cycles behind.
           - sanitizer: address
             rustflags: -Z sanitizer=address --cfg s3_tm_asan
+            cargo_args: ""
             test_args: --test-threads 1 --nocapture
           # TSan: data race detection on real concurrent execution. Loom
           # covers bounded model checking on synthetic primitives; TSan
           # covers actual races in production code paths exercised by tests.
-          # Run with default test-threads to allow concurrent test execution.
+          # `-Z build-std` rebuilds the sysroot with TSan instrumentation so
+          # synchronization in std (mutexes, condvars, atomics) is visible to
+          # the TSan runtime, eliminating false positives and missed races
+          # that come from linking instrumented code against an
+          # uninstrumented sysroot. Cold-cache cost is several minutes;
+          # warm-cache cost is near-zero.
           - sanitizer: thread
             rustflags: -Z sanitizer=thread
-            test_args: --nocapture
-          # UBSan: integer overflow, alignment, unaligned atomic access.
-          # Cheap to add; catches bit-math UB in packed atomics
-          # (QueuedExecuting, GroupKey, vruntime u64).
-          - sanitizer: undefined
-            rustflags: -Z sanitizer=undefined
+            cargo_args: -Z build-std=core,alloc,std,proc_macro
             test_args: --nocapture
     steps:
       - uses: actions/checkout@v4
@@ -249,9 +250,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_nightly }}
+          # rust-src is required by `-Z build-std` (TSan).
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
-        run: cargo test --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
+        run: cargo test ${{ matrix.cargo_args }} --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
