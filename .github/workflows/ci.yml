@@ -231,7 +231,7 @@ jobs:
       - name: asan
         run: cargo test --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- --test-threads 1 --nocapture
         env:
-          RUSTFLAGS: -Z sanitizer=address
+          RUSTFLAGS: -Z sanitizer=address --cfg s3_tm_asan
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
