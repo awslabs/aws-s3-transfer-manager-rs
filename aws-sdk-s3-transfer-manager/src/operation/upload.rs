@@ -80,6 +80,7 @@ impl Upload {
 mod test {
 
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
+    use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -109,10 +110,18 @@ mod test {
         let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
             .then_output(|| AbortMultipartUploadOutput::builder().build());
 
+        // The test races abort against the upload completion. Under slow execution
+        // (e.g. ASAN-instrumented), the single-part upload can reach
+        // CompleteMultipartUpload before abort dispatches. Provide a rule for that
+        // case so the mock doesn't panic on no-rule-matched, which would crash a
+        // managed thread and leave Arc cycles for LeakSanitizer to flag.
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+            .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::MatchAny,
-            &[create_mpu, upload_part, abort_mpu]
+            &[create_mpu, upload_part, abort_mpu, complete_mpu]
         );
 
         let tm_config = crate::Config::builder()
