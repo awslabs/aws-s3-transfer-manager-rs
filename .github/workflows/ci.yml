@@ -93,8 +93,8 @@ jobs:
 
       - name: test s3-transfer-manager HLL
         run: |
-          cargo nextest run --workspace --all-features
-          cargo test --doc --workspace --all-features
+          cargo nextest run --workspace --all-features --no-fail-fast
+          cargo test --doc --workspace --all-features --no-fail-fast
 
       - name: test s3-transfer-manager e2e
         run: |

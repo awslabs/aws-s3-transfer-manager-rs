@@ -105,8 +105,13 @@ mod sys {
         Ok(())
     }
 
-    pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
-        Ok(())
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        // Windows has no native fallocate equivalent. set_len calls
+        // SetEndOfFile which extends the file logical size; matches the
+        // macOS path. On both platforms preallocation is best-effort
+        // length-setting without disk-space reservation; only Linux's
+        // posix_fallocate guarantees ENOSPC at preallocate time.
+        file.set_len(len)
     }
 }
 
