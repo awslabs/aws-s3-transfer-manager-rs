@@ -1955,6 +1955,21 @@ mod tests {
             lo_count
         );
 
+        // Cancel both transfers so the registry drains before shutdown.
+        // The test only consumed ~800 of 2000 enqueued work items; without
+        // cancellation, the remaining transfers stay in the registry holding
+        // Arc<Handle> references, forming a cycle the runtime shutdown
+        // doesn't break. Visible to LeakSanitizer at process exit.
+        scheduler.cancel_transfer(hi_id);
+        scheduler.cancel_transfer(lo_id);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should become idle after cancellation");
+
         handle.runtime.shutdown();
     }
 
