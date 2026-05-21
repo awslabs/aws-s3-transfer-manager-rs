@@ -71,4 +71,4 @@ loom = { version = "0.7", features = ["checkpoint"] }
 jemallocator = "0.5.4"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)', 'cfg(s3_tm_asan)'] }
