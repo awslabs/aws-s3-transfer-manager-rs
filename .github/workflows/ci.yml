@@ -45,6 +45,7 @@ jobs:
       - check-deny
       - sanitizers
       - features
+      - dial9-build
       - miri
       - loom
     steps:
@@ -93,12 +94,12 @@ jobs:
 
       - name: test s3-transfer-manager HLL
         run: |
-          cargo nextest run --workspace --all-features --no-fail-fast
-          cargo test --doc --workspace --all-features --no-fail-fast
+          cargo nextest run --workspace --no-fail-fast
+          cargo test --doc --workspace --no-fail-fast
 
       - name: test s3-transfer-manager e2e
         run: |
-          RUSTFLAGS="--cfg e2e_test" cargo test --all-features --test e2e_transfer_test
+          RUSTFLAGS="--cfg e2e_test" cargo test --test e2e_transfer_test
 
   fmt:
     name: fmt
@@ -132,7 +133,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --all-features --no-deps
+        run: cargo clippy --all --tests --no-deps
 
   docs:
     name: docs
@@ -144,9 +145,9 @@ jobs:
         with:
           toolchain: ${{ env.rust_nightly }}
       - uses: Swatinem/rust-cache@v2
-      - name: "doc --lib --all-features"
+      - name: "doc --lib"
         run: |
-          cargo doc --lib --no-deps --all-features --document-private-items
+          cargo doc --lib --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: --cfg docsrs
 
@@ -160,8 +161,8 @@ jobs:
         with:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
-      - name: "check --workspace --all-features"
-        run: cargo check --workspace --all-features
+      - name: "check --workspace"
+        run: cargo check --workspace
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
@@ -192,7 +193,7 @@ jobs:
         with:
           tool: cargo-check-external-types@0.4.0
       - name: check-external-types
-        run: cargo check-external-types --all-features --config external-types.toml
+        run: cargo check-external-types --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
 
   check-deny:
@@ -246,7 +247,7 @@ jobs:
           toolchain: ${{ env.rust_nightly }}
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
-        run: cargo test ${{ matrix.cargo_args }} --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
+        run: cargo test ${{ matrix.cargo_args }} --workspace --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
@@ -279,7 +280,32 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
-        run: cargo hack check --all --feature-powerset
+        # Exclude dial9: it requires RUSTFLAGS=--cfg tokio_unstable (see the
+        # dial9-build job for dedicated coverage).
+        run: cargo hack check --all --feature-powerset --exclude-features dial9
+
+  dial9-build:
+    # Verifies the optional `dial9` feature compiles. dial9-tokio-telemetry
+    # uses tokio's unstable runtime metrics + task-lifecycle hooks, gated
+    # behind `--cfg tokio_unstable`. The `cp` example is the sole consumer
+    # of dial9 types in the workspace; building it transitively compiles
+    # the lib with `cfg(feature = "dial9")` paths active, which is enough
+    # to prove the wiring. Keeping it a dedicated job avoids leaking
+    # `tokio_unstable` into the rest of CI.
+    name: dial9 build
+    needs: basics
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build cp example with dial9
+        run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
+        env:
+          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
 
   miri:
     name: miri

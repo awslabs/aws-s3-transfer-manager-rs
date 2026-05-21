@@ -38,7 +38,12 @@ aws-smithy-http-client = { version = "1.1.12", features = ["rustls-aws-lc"] }
 aws-smithy-dns = { version = "0.1.12", features = ["hickory-dns"] }
 fastrand = "2.4"
 hdrhistogram = "7"
+http-body-1x = { package = "http-body", version = "1" }
 same-file = "1.0.6"
+dial9-tokio-telemetry = { version = "0.3", optional = true, features = ["cpu-profiling"] }
+
+[features]
+dial9 = ["dep:dial9-tokio-telemetry"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs"] }

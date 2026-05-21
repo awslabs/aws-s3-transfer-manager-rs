@@ -4,7 +4,7 @@
  */
 
 use core::fmt;
-use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
+use std::sync::Arc;
 
 use crate::metrics::{unit::ByteUnit, Throughput};
 
@@ -187,118 +187,6 @@ impl FailedDownload {
     /// The error encountered downloading the object
     pub fn error(&self) -> &crate::error::Error {
         &self.error
-    }
-}
-
-/// A filter for choosing which objects to upload to S3.
-#[derive(Clone)]
-pub struct UploadFilter {
-    pub(crate) predicate: Arc<dyn Fn(&UploadFilterItem<'_>) -> bool + Send + Sync + 'static>,
-}
-
-impl fmt::Debug for UploadFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut formatter = f.debug_struct("UploadFilter");
-        formatter.field("predicate", &"<closure>");
-        formatter.finish()
-    }
-}
-
-impl<F> From<F> for UploadFilter
-where
-    F: Fn(&UploadFilterItem<'_>) -> bool + Send + Sync + 'static,
-{
-    fn from(value: F) -> Self {
-        UploadFilter {
-            predicate: Arc::new(value),
-        }
-    }
-}
-
-fn is_hidden_file_name(path: &Path) -> bool {
-    path.file_name()
-        .map(|name| name.to_string_lossy().starts_with('.'))
-        .unwrap_or(false)
-}
-
-// This default filter does not exclude hidden directories. For example, if an `UploadFilterItem` corresponds to the path
-//   path/to/.hidden/ignore-me.txt
-// the item will not be filtered out and will be uploaded to S3.
-// https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/72#discussion_r1835109128
-impl Default for UploadFilter {
-    fn default() -> Self {
-        Self {
-            predicate: Arc::new(|item| {
-                item.metadata().is_file() && !is_hidden_file_name(item.path())
-            }),
-        }
-    }
-}
-
-/// An item passed to [`UploadFilter`] for evaluation
-#[non_exhaustive]
-#[derive(Debug)]
-pub struct UploadFilterItem<'a> {
-    pub(crate) path: Cow<'a, Path>,
-    pub(crate) metadata: Metadata,
-}
-
-impl<'a> UploadFilterItem<'a> {
-    pub(crate) fn builder() -> UploadFilterItemBuilder<'a> {
-        UploadFilterItemBuilder::default()
-    }
-
-    /// Full path to the file.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Metadata about the file located at `self.path`.
-    ///
-    /// Use this `Metadata` for queries `is_dir()` and `is_file()`. However, it cannot
-    /// be used to determine whether `self.path` is a symbolic link because the metadata
-    /// set in this struct is assumed to return true for either `is_dir()` or `is_file()`,
-    /// but not for `is_symlink()`.
-    pub fn metadata(&self) -> &Metadata {
-        &self.metadata
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct UploadFilterItemBuilder<'a> {
-    pub(crate) path: Option<Cow<'a, Path>>,
-    pub(crate) metadata: Option<Metadata>,
-}
-
-impl<'a> UploadFilterItemBuilder<'a> {
-    // Set the full path for a path entry to be filtered.
-    //
-    // NOTE: A path is required.
-    pub(crate) fn path(mut self, path: impl Into<Cow<'a, Path>>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    // Set the `Metadata` for `self.path`.
-    //
-    // This `Metadata` must be one of the following:
-    // - Obtained via `fs::metadata()`, which follows symbolic links.
-    // - Obtained via `fs::symlink_metadata()`, which is guaranteed to return true for either `is_dir()` or `is_file()`,
-    //   but not for `is_symlink()`.
-    //
-    // NOTE: A metadata is required.
-    pub(crate) fn metadata(mut self, metadata: Metadata) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    pub(crate) fn build(self) -> UploadFilterItem<'a> {
-        UploadFilterItem {
-            path: self.path.expect("required field `path` should be set"),
-            metadata: self
-                .metadata
-                .expect("required field `metadata` should be set"),
-        }
     }
 }
 

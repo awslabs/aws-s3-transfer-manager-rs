@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
-
 /// Operation builders
 pub mod builders;
 
@@ -16,108 +14,45 @@ pub use handle::UploadObjectsHandle;
 
 mod output;
 pub use output::{UploadObjectsOutput, UploadObjectsOutputBuilder};
-use tokio::{sync::watch, task::JoinSet};
-use tracing::Instrument;
-
-mod worker;
 
 mod transfer;
-#[allow(unused_imports)] // wired up by the operation orchestrator
-pub(crate) use transfer::{UploadObjectsTransfer, UploadObjectsWork};
+pub(crate) use transfer::UploadObjectsTransfer;
 
-use crate::{error, types::FailedUpload};
+use std::sync::Arc;
 
-use super::{
-    validate_target_is_dir, CancelBroadcastReceiver, CancelBroadcastSender, LegacyTransferContext,
-};
+use crate::io::walk::FsWalkContext;
+use crate::transfer::TransferContext;
 
 /// Operation struct for uploading multiple objects to Amazon S3
 #[derive(Clone, Default, Debug)]
 pub(crate) struct UploadObjects;
 
 impl UploadObjects {
-    /// Execute a single `UploadObjects` transfer operation
-    pub(crate) async fn orchestrate(
+    /// Execute a single `UploadObjects` transfer operation.
+    ///
+    /// Source validation (not a directory, symlinked root with
+    /// `follow_symlinks` disabled, etc.) is handled by the walker. The error
+    /// surfaces from `handle.join()` as `ErrorKind::IOError`.
+    pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: UploadObjectsInput,
     ) -> Result<UploadObjectsHandle, crate::error::Error> {
-        //  validate existence of source, possibly a symlink, and return error if it's not a directory
         let source = input.source().expect("source set");
-        let symlink_metadata = tokio::fs::symlink_metadata(source).await?;
-        if let Err(e) = validate_target_is_dir(&symlink_metadata, source) {
-            if symlink_metadata.is_symlink() {
-                if input.follow_symlinks() {
-                    let metadata = tokio::fs::metadata(source).await?;
-                    validate_target_is_dir(&metadata, source)?;
-                } else {
-                    return Err(error::invalid_input(
-                        format!("{source:?} is a symbolic link to a directory but the current upload operation does not follow symbolic links"))
-                    );
-                }
-            } else {
-                return Err(e);
-            }
-        };
-        let concurrency = handle.num_workers();
-        let ctx = UploadObjectsContext::new(handle.clone(), input);
 
-        // spawn all work into the same JoinSet such that when the set is dropped all tasks are cancelled.
-        let mut tasks = JoinSet::new();
-        let (list_directory_tx, list_directory_rx) = async_channel::bounded(concurrency);
+        let walker = input.walker().cloned().unwrap_or_default();
+        let walk = walker.walk(FsWalkContext::builder().root(source).build());
 
-        // spawn worker to discover/distribute work
-        tasks.spawn(worker::list_directory_contents(
-            ctx.state.clone(),
-            list_directory_tx,
-        ));
+        let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        for i in 0..concurrency {
-            let worker = worker::upload_objects(ctx.clone(), list_directory_rx.clone())
-                .instrument(tracing::debug_span!("object-uploader", worker = i));
-            tasks.spawn(worker);
-        }
+        let transfer = UploadObjectsTransfer::new(ctx, input, walk);
 
-        let handle = UploadObjectsHandle { tasks, ctx };
-        Ok(handle)
-    }
-}
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
 
-/// UploadObjects operation specific state
-#[derive(Debug)]
-pub(crate) struct UploadObjectsState {
-    // TODO - Determine if `input` should be separated from this struct
-    // https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/67#discussion_r1821661603
-    input: UploadObjectsInput,
-    cancel_tx: CancelBroadcastSender,
-    cancel_rx: CancelBroadcastReceiver,
-    failed_uploads: Mutex<Vec<FailedUpload>>,
-    successful_uploads: AtomicU64,
-    total_bytes_transferred: AtomicU64,
-}
-
-impl UploadObjectsState {
-    pub(crate) fn new(
-        input: UploadObjectsInput,
-        cancel_tx: CancelBroadcastSender,
-        cancel_rx: CancelBroadcastReceiver,
-    ) -> Self {
-        Self {
-            input,
-            cancel_tx,
-            cancel_rx,
-            failed_uploads: Mutex::new(Vec::new()),
-            successful_uploads: AtomicU64::default(),
-            total_bytes_transferred: AtomicU64::default(),
-        }
-    }
-}
-
-type UploadObjectsContext = LegacyTransferContext<UploadObjectsState>;
-
-impl UploadObjectsContext {
-    fn new(handle: Arc<crate::client::Handle>, input: UploadObjectsInput) -> Self {
-        let (cancel_tx, cancel_rx) = watch::channel(());
-        let state = Arc::new(UploadObjectsState::new(input, cancel_tx, cancel_rx));
-        LegacyTransferContext::from_state(handle, state)
+        Ok(UploadObjectsHandle {
+            completion_rx: Some(completion_rx),
+            transfer,
+        })
     }
 }

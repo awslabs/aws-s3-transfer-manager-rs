@@ -9,10 +9,8 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::pin::Pin;
 
-use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 
-use crate::error;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
@@ -93,20 +91,61 @@ impl InputStream {
         Self::read_from().path(path).build()
     }
 
-    /// Converts `InputStream` to ByteStream that can be used in PutObject.
-    pub(crate) async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
+    /// Returns `true` when this `InputStream` reads from a local file.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self.inner, RawInputStream::Fs(_))
+    }
+
+    /// Convert this input stream into an [`SdkBody`] suitable for a top-level
+    /// retryable SDK call (e.g. `PutObject`). The returned body is retryable
+    /// at the SDK layer:
+    ///
+    /// * In-memory (`Buf`) streams go through [`SdkBody::from`] whose
+    ///   rebuild path is a cheap `Bytes` clone.
+    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each
+    ///   retry constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`]
+    ///   with its own open file descriptor and read cursor.
+    ///
+    /// `direct_io` selects between the two file-body implementations:
+    /// `true` when the caller owns the polling thread (managed-thread
+    /// direct I/O), `false` when the body may be polled by the shared
+    /// tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `Dyn` streams. Dyn sources cannot be rewound and must
+    /// route through the multipart upload path (see [`is_mpu_only`]).
+    ///
+    /// [`SdkBody`]: aws_smithy_types::body::SdkBody
+    /// [`SdkBody::from`]: aws_smithy_types::body::SdkBody::from
+    /// [`SdkBody::retryable`]: aws_smithy_types::body::SdkBody::retryable
+    /// [`DirectFileBody`]: crate::operation::upload::file_body::DirectFileBody
+    /// [`OffloadedFileBody`]: crate::operation::upload::file_body::OffloadedFileBody
+    /// [`is_mpu_only`]: Self::is_mpu_only
+    pub(crate) fn into_sdk_body(self, direct_io: bool) -> aws_smithy_types::body::SdkBody {
+        use crate::operation::upload::file_body::{DirectFileBody, OffloadedFileBody};
+        use aws_smithy_types::body::SdkBody;
         match self.inner {
-            RawInputStream::Fs(path_body) => ByteStream::read_from()
-                .path(&path_body.path)
-                .offset(path_body.offset)
-                .length(aws_sdk_s3::primitives::Length::Exact(path_body.length))
-                .build()
-                .await
-                .map_err(error::from_kind(error::ErrorKind::IOError)),
-            RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
-            RawInputStream::Dyn(_) => {
-                unreachable!("dyn InputStream should not have into_byte_stream called on it!")
+            RawInputStream::Buf(bytes) => SdkBody::from(bytes),
+            RawInputStream::Fs(path_body) => {
+                let path = path_body.path;
+                let offset = path_body.offset;
+                let length = path_body.length;
+                if direct_io {
+                    SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(DirectFileBody::new(path.clone(), offset, length))
+                    })
+                } else {
+                    SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(OffloadedFileBody::new(path.clone(), offset, length))
+                    })
+                }
             }
+            RawInputStream::Dyn(_) => panic!(
+                "InputStream::into_sdk_body called on Dyn stream; \
+                 Dyn sources must route through the multipart upload path \
+                 (is_mpu_only() should have been checked upstream)"
+            ),
         }
     }
 

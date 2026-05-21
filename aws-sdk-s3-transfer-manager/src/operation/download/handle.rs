@@ -50,7 +50,7 @@ impl DownloadHandleInner {
         })
     }
 
-    /// Core join logic: wait for completion, handle failure/success.
+    /// Core join logic: wait for completion, handle failure/cancellation/success.
     pub(crate) async fn join(&mut self) -> Result<DownloadOutput, error::Error> {
         // Wait for transfer state machine to reach terminal state
         if let Some(rx) = self.completion_rx.take() {
@@ -70,6 +70,13 @@ impl DownloadHandleInner {
             // take the actual error (only we should do this)
             let err = ctx.take_error().expect("error taken outside of join()");
             return Err(err);
+        }
+
+        if ctx.is_cancelled() {
+            return Err(error::Error::new(
+                error::ErrorKind::OperationCancelled,
+                "download cancelled",
+            ));
         }
 
         // Success - discovery must have completed
@@ -269,7 +276,7 @@ impl Drop for DownloadHandle {
 ///
 /// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the
 /// transfer. On successful completion via [`join`](Self::join), the temporary
-/// file is fsynced and atomically renamed to the destination path. On failure,
+/// file is atomically renamed to the destination path. On failure,
 /// cancellation, or drop, the temporary file is deleted.
 #[derive(Debug)]
 pub struct ManagedDownloadHandle {
@@ -310,8 +317,8 @@ impl ManagedDownloadHandle {
 
     /// Wait for the download to complete.
     ///
-    /// On success, fsyncs the file and atomically renames the temporary file
-    /// to the destination path. On failure, deletes the temporary file.
+    /// On success, atomically renames the temporary file to the destination
+    /// path. On failure or cancellation, deletes the temporary file.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
@@ -391,7 +398,16 @@ impl Drop for ManagedDownloadHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadHandle, ManagedDownloadHandle};
+    use super::{DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
+    use crate::error::ErrorKind;
+    use crate::operation::download::body::{
+        new_slot_body, SlotBodyConsumer, DEFAULT_BODY_SLOT_CAPACITY,
+    };
+    use crate::operation::download::transfer::DownloadTransfer;
+    use crate::operation::download::DownloadInput;
+    use crate::transfer::TransferContext;
+    use crate::types::BucketType;
+    use crate::DEFAULT_CONCURRENCY;
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -402,5 +418,85 @@ mod tests {
         is_sync::<DownloadHandle>();
         is_send::<ManagedDownloadHandle>();
         is_sync::<ManagedDownloadHandle>();
+    }
+
+    /// Build a `DownloadHandleInner` whose `TransferContext` is already at
+    /// a `Cancelled` terminal state. Callers assemble either a
+    /// `DownloadHandle` or `ManagedDownloadHandle` around it to test the
+    /// post-cancel `join()` contract.
+    fn make_cancelled_download_inner() -> (DownloadHandleInner, SlotBodyConsumer) {
+        let handle = crate::client::Handle::new_for_test(
+            crate::Config::builder()
+                .client(aws_smithy_mocks::mock_client!(
+                    aws_sdk_s3,
+                    aws_smithy_mocks::RuleMode::MatchAny,
+                    &[]
+                ))
+                .build(),
+            DEFAULT_CONCURRENCY,
+        );
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let (writer, consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
+
+        ctx.set_cancelled();
+        ctx.signal_terminal();
+
+        let inner = DownloadHandleInner {
+            transfer,
+            completion_rx: Some(completion_rx),
+        };
+        (inner, consumer)
+    }
+
+    /// Regression: if the transfer reaches a `Cancelled` terminal state
+    /// before `join()` is awaited, `DownloadHandle::join()` must return
+    /// `Err(OperationCancelled)`. Previously this path panicked through
+    /// `object_meta().expect("object_meta must be set on successful completion")`
+    /// (or silently returned `Ok` if discovery had run before cancel).
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_download_join_returns_cancelled_error_when_transfer_cancelled() {
+        let (inner, consumer) = make_cancelled_download_inner();
+        let body = super::Body::new(consumer, inner.transfer.clone());
+        let handle = DownloadHandle { inner, body };
+        let err = handle
+            .join()
+            .await
+            .expect_err("join on cancelled transfer must return Err");
+        assert_eq!(err.kind(), &ErrorKind::OperationCancelled);
+    }
+
+    /// Regression: `ManagedDownloadHandle::join()` on a cancelled transfer
+    /// must return `Err(OperationCancelled)` and delete the temp file.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_managed_download_join_returns_cancelled_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.dat");
+        let temp = dir.path().join("out.dat.s3tmp.abcdefgh");
+        std::fs::write(&temp, b"partial").unwrap();
+
+        let (inner, _consumer) = make_cancelled_download_inner();
+        let managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+
+        let err = managed
+            .join()
+            .await
+            .expect_err("join on cancelled transfer must return Err");
+        assert_eq!(err.kind(), &ErrorKind::OperationCancelled);
+        assert!(
+            !temp.exists(),
+            "temp file must be cleaned up on cancellation"
+        );
+        assert!(
+            !dest.exists(),
+            "dest file must not be created on cancellation"
+        );
     }
 }

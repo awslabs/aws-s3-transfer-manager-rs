@@ -3,12 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::types::{FailedTransferPolicy, UploadFilter};
+use crate::io::walk::FsWalker;
+use crate::types::FailedTransferPolicy;
 use aws_smithy_types::error::operation::BuildError;
 
 use std::path::{Path, PathBuf};
 
-/// Input type for uploading multiple objects
+/// Default per-request memory cap on concurrently-materialized child upload transfers.
+///
+/// Acts as a backstop on memory growth; the scheduler's hierarchical
+/// CFS handles fairness and rate. Users can override via
+/// [`UploadObjectsInputBuilder::max_concurrent_uploads`] or the
+/// corresponding fluent builder method.
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 10000;
+
+/// Input type for uploading multiple objects.
+///
+/// Walk behavior (recursion, symbolic link handling, file filtering, sort
+/// order, etc.) is configured by supplying a custom [`FsWalker`] via
+/// [`walker`](UploadObjectsInputBuilder::walker). When no walker is
+/// provided, a default walker is used: non-recursive, does not follow
+/// symbolic links, no filter.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct UploadObjectsInput {
@@ -18,14 +33,9 @@ pub struct UploadObjectsInput {
     /// The local directory to upload from.
     pub source: Option<PathBuf>,
 
-    /// Whether to recurse into subdirectories when traversing local file tree.
-    pub recursive: bool,
-
-    /// Whether to follow symbolic links when traversing the local file tree.
-    pub follow_symlinks: bool,
-
-    /// The filter for choosing which files to upload.
-    pub filter: Option<UploadFilter>,
+    /// Walker configuration. See [`FsWalker`] for available options.
+    /// `None` selects the default walker.
+    pub walker: Option<FsWalker>,
 
     /// The S3 key prefix to use for each object.
     pub key_prefix: Option<String>,
@@ -36,11 +46,13 @@ pub struct UploadObjectsInput {
     /// The failure policy to use when any individual object upload fails.
     pub failure_policy: FailedTransferPolicy,
 
-    /// Maximum number of concurrent child upload transfers.
+    /// Per-request cap on concurrently-materialized child upload transfers.
     ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub pipeline_depth: usize,
+    /// Acts as a memory backstop: the scheduler's hierarchical fair-share
+    /// scheduling drives throughput and rate-limits the walker naturally,
+    /// so this knob primarily bounds the working-set size of in-flight
+    /// child handles. Defaults to 10000.
+    pub max_concurrent_uploads: usize,
 }
 
 impl UploadObjectsInput {
@@ -54,19 +66,10 @@ impl UploadObjectsInput {
         self.source.as_deref()
     }
 
-    /// Whether to recurse into subdirectories when traversing local file tree.
-    pub fn recursive(&self) -> bool {
-        self.recursive
-    }
-
-    /// Whether to follow symbolic links when traversing the local file tree.
-    pub fn follow_symlinks(&self) -> bool {
-        self.follow_symlinks
-    }
-
-    /// The filter for choosing which files to upload.
-    pub fn filter(&self) -> Option<&UploadFilter> {
-        self.filter.as_ref()
+    /// Walker configuration. Returns `None` when the default walker should
+    /// be used.
+    pub fn walker(&self) -> Option<&FsWalker> {
+        self.walker.as_ref()
     }
 
     /// The S3 key prefix to use for each object.
@@ -84,35 +87,29 @@ impl UploadObjectsInput {
         &self.failure_policy
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub fn pipeline_depth(&self) -> usize {
-        self.pipeline_depth
+    /// Returns the per-request cap on concurrently-materialized child
+    /// upload transfers.
+    pub fn max_concurrent_uploads(&self) -> usize {
+        self.max_concurrent_uploads
     }
 }
 
-/// A builder for [`UploadObjectsInput`]
+/// A builder for [`UploadObjectsInput`].
 #[non_exhaustive]
 #[derive(Clone, Default, Debug)]
 pub struct UploadObjectsInputBuilder {
     pub(crate) bucket: Option<String>,
     pub(crate) source: Option<PathBuf>,
-    pub(crate) recursive: bool,
-    pub(crate) follow_symlinks: bool,
-    pub(crate) filter: Option<UploadFilter>,
+    pub(crate) walker: Option<FsWalker>,
     pub(crate) key_prefix: Option<String>,
     pub(crate) delimiter: Option<String>,
     pub(crate) failure_policy: FailedTransferPolicy,
-    pub(crate) pipeline_depth: Option<usize>,
+    pub(crate) max_concurrent_uploads: Option<usize>,
 }
 
 impl UploadObjectsInputBuilder {
-    /// Consumes the builder and constructs an [`UploadObjectsInput`]
-    pub fn build(
-        self,
-    ) -> Result<UploadObjectsInput, ::aws_smithy_types::error::operation::BuildError> {
+    /// Consume the builder and construct an [`UploadObjectsInput`].
+    pub fn build(self) -> Result<UploadObjectsInput, BuildError> {
         if self.bucket.is_none() {
             return Err(BuildError::missing_field("bucket", "A bucket is required"));
         }
@@ -127,13 +124,13 @@ impl UploadObjectsInputBuilder {
         Ok(UploadObjectsInput {
             bucket: self.bucket,
             source: self.source,
-            recursive: self.recursive,
-            follow_symlinks: self.follow_symlinks,
-            filter: self.filter,
+            walker: self.walker,
             key_prefix: self.key_prefix,
             delimiter: self.delimiter,
             failure_policy: self.failure_policy,
-            pipeline_depth: self.pipeline_depth.unwrap_or(100),
+            max_concurrent_uploads: self
+                .max_concurrent_uploads
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS),
         })
     }
 
@@ -171,43 +168,25 @@ impl UploadObjectsInputBuilder {
         self.source.as_deref()
     }
 
-    /// Whether to recurse into subdirectories when traversing local file tree.
-    pub fn recursive(mut self, input: bool) -> Self {
-        self.recursive = input;
+    /// Walker configuration (recursion, symlink handling, filter, etc.).
+    ///
+    /// Pass an [`FsWalker`] built via [`FsWalker::builder`] to customize the
+    /// walk. When not set, a default walker is used: non-recursive, does not
+    /// follow symbolic links, no filter.
+    pub fn walker(mut self, input: FsWalker) -> Self {
+        self.walker = Some(input);
         self
     }
 
-    /// Whether to recurse into subdirectories when traversing local file tree.
-    pub fn get_recursive(&self) -> bool {
-        self.recursive
-    }
-
-    /// Whether to follow symbolic links when traversing the local file tree.
-    pub fn follow_symlinks(mut self, input: bool) -> Self {
-        self.follow_symlinks = input;
+    /// Walker configuration.
+    pub fn set_walker(mut self, input: Option<FsWalker>) -> Self {
+        self.walker = input;
         self
     }
 
-    /// Whether to follow symbolic links when traversing the local file tree.
-    pub fn get_follow_symlinks(&self) -> bool {
-        self.follow_symlinks
-    }
-
-    /// The filter for choosing which files to upload.
-    pub fn filter(mut self, input: impl Into<UploadFilter>) -> Self {
-        self.filter = Some(input.into());
-        self
-    }
-
-    /// The filter for choosing which files to upload.
-    pub fn set_filter(mut self, input: Option<UploadFilter>) -> Self {
-        self.filter = input;
-        self
-    }
-
-    /// The filter for choosing which files to upload.
-    pub fn get_filter(&self) -> &Option<UploadFilter> {
-        &self.filter
+    /// Walker configuration.
+    pub fn get_walker(&self) -> Option<&FsWalker> {
+        self.walker.as_ref()
     }
 
     /// The S3 key prefix to use for each object.
@@ -255,29 +234,27 @@ impl UploadObjectsInputBuilder {
         &self.failure_policy
     }
 
-    /// Maximum number of concurrent child upload transfers.
+    /// Per-request cap on concurrently-materialized child upload transfers.
     ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub fn pipeline_depth(mut self, input: usize) -> Self {
-        self.pipeline_depth = Some(input);
+    /// Acts as a memory backstop: the scheduler's hierarchical fair-share
+    /// scheduling drives throughput and rate-limits the walker naturally,
+    /// so this knob primarily bounds the working-set size of in-flight
+    /// child handles. Defaults to 10000.
+    pub fn max_concurrent_uploads(mut self, input: usize) -> Self {
+        self.max_concurrent_uploads = Some(input);
         self
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub fn set_pipeline_depth(mut self, input: Option<usize>) -> Self {
-        self.pipeline_depth = input;
+    /// Per-request cap on concurrently-materialized child upload transfers.
+    /// See [`max_concurrent_uploads`](Self::max_concurrent_uploads).
+    pub fn set_max_concurrent_uploads(mut self, input: Option<usize>) -> Self {
+        self.max_concurrent_uploads = input;
         self
     }
 
-    /// Maximum number of concurrent child upload transfers.
-    ///
-    /// Controls how many individual object uploads run simultaneously.
-    /// Defaults to 100.
-    pub fn get_pipeline_depth(&self) -> Option<usize> {
-        self.pipeline_depth
+    /// Returns the configured per-request cap on concurrently-materialized
+    /// child upload transfers, if any.
+    pub fn get_max_concurrent_uploads(&self) -> Option<usize> {
+        self.max_concurrent_uploads
     }
 }
