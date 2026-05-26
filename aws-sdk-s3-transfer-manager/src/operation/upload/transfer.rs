@@ -45,7 +45,7 @@ const MAX_PARTS: u64 = 10_000;
 /// `.config_override(...)`; leaves any caller-provided `TimeoutConfig`
 /// fields on the client (connect / operation / operation-attempt) intact.
 ///
-/// 30 s is wide enough for slow networks and tight enough to surface a
+/// 30s is wide enough for slow networks and tight enough to surface a
 /// stuck connection before the transfer stalls. On timeout the SDK's
 /// standard retry strategy rebuilds the body from the source (see
 /// `SdkBody::retryable` wiring in `InputStream::into_sdk_body`) and
@@ -54,6 +54,7 @@ const MAX_PARTS: u64 = 10_000;
 /// Scoped to `PutObject` only. `UploadPart` uses the adaptive
 /// `LatencyTracker::guarded` wrapper; control-plane operations rely on
 /// SDK or caller configuration.
+/// TODO(vnext): remove/replace when read timeout is defaulted for the SDK with new BMV + connection pool
 const PUT_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Upload transfer that generates and executes upload work.

@@ -44,7 +44,7 @@ use crate::io::part_reader::file_util::read_file_chunk;
 /// limit (5 GB); without chunking, the body would buffer the entire payload.
 ///
 // TODO(vnext): allocate chunks through a shared buffer pool rather than
-// `BytesMut::zeroed` per chunk. Tracked in bosun.md under Deferred.
+// `BytesMut::zeroed` per chunk.
 pub(crate) const FILE_BODY_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Channel capacity for [`OffloadedFileBody`]. Bounds the number of chunks
@@ -323,34 +323,30 @@ async fn read_task(
     }
 }
 
-/// Drives a [`Body`] to completion, collecting all data frames into a
-/// single `Vec<u8>`. Used by tests.
-#[cfg(test)]
-async fn collect_body<B>(mut body: B) -> io::Result<Vec<u8>>
-where
-    B: Body<Data = Bytes, Error = io::Error> + Unpin,
-{
-    use std::future::poll_fn;
-    let mut out = Vec::new();
-    loop {
-        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
-        match frame {
-            Some(Ok(frame)) => {
-                if let Ok(data) = frame.into_data() {
-                    out.extend_from_slice(&data);
-                }
-                // Non-data frames (trailers) are ignored by tests.
-            }
-            Some(Err(e)) => return Err(e),
-            None => return Ok(out),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::poll_fn;
     use std::io::Write;
+
+    async fn collect_body<B>(mut body: B) -> io::Result<Vec<u8>>
+    where
+        B: Body<Data = Bytes, Error = io::Error> + Unpin,
+    {
+        let mut out = Vec::new();
+        loop {
+            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        out.extend_from_slice(&data);
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Ok(out),
+            }
+        }
+    }
 
     fn write_tempfile(contents: &[u8]) -> tempfile::NamedTempFile {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();

@@ -1557,8 +1557,6 @@ mod tests {
         // items concurrently triggers a high-contention path that has not
         // been root-caused. A lower target keeps in-flight pressure inside
         // the queue capacity and exercises the same fairness invariant.
-        // See bosun.md / "Submission queue contention under managed runtime"
-        // for the deferred investigation.
         let handle = test_handle_managed(20);
         impl_composite_vs_single_fair_share_at_root(handle).await;
     }

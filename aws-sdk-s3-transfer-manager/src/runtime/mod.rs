@@ -64,7 +64,7 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 // check. Mid-flight connections dropped via timeout will go back in broken. Need
 // to either contribute an is_ready check upstream or explicitly close the
 // connection before dropping. The legacy pool's Pooled::Drop checks is_open()
-// which correctly destroys mid-flight connections. See bosun.md for details.
+// which correctly destroys mid-flight connections.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,

@@ -57,47 +57,24 @@ fn make_flat_dataset(count: usize, size: usize) -> TempDir {
     dir
 }
 
-/// Count objects in the mock server bucket under a given key prefix by
-/// issuing a `ListObjectsV2` via the SDK.
-async fn count_objects(
-    server_handle: &s3_mock_server::ServerHandle,
-    bucket: &str,
-    prefix: &str,
-) -> usize {
-    let s3_client = server_handle.client().await;
-    let mut total = 0usize;
-    let mut continuation: Option<String> = None;
-    loop {
-        let mut req = s3_client.list_objects_v2().bucket(bucket).prefix(prefix);
-        if let Some(token) = continuation.take() {
-            req = req.continuation_token(token);
-        }
-        let resp = req.send().await.expect("list objects");
-        total += resp.contents().len();
-        if resp.is_truncated().unwrap_or(false) {
-            continuation = resp.next_continuation_token().map(|s| s.to_string());
-        } else {
-            break;
-        }
-    }
-    total
+/// Count objects in the mock server bucket under a given key prefix.
+async fn count_objects(server: &S3MockServer, bucket: &str, prefix: &str) -> usize {
+    server
+        .list_objects(bucket, Some(prefix))
+        .await
+        .expect("list objects")
+        .len()
 }
 
 /// Fetch the bytes of a single object from the mock server.
-async fn fetch_object_bytes(
-    server_handle: &s3_mock_server::ServerHandle,
-    bucket: &str,
-    key: &str,
-) -> Vec<u8> {
-    let s3_client = server_handle.client().await;
-    let resp = s3_client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
+async fn fetch_object_bytes(server: &S3MockServer, bucket: &str, key: &str) -> Vec<u8> {
+    server
+        .get_object(bucket, key)
         .await
-        .expect("get object");
-    resp.body.collect().await.expect("collect body").to_vec()
+        .expect("get object")
+        .expect("object not found")
+        .body
+        .to_vec()
 }
 
 /// Regression coverage for the small-file concurrent-upload hang seen in
@@ -132,7 +109,7 @@ async fn test_upload_objects_many_small_files() {
             "network_tx should equal sum of file sizes"
         );
 
-        let landed = count_objects(&server_handle, bucket, "small/").await;
+        let landed = count_objects(&_server, bucket, "small/").await;
         assert_eq!(count, landed, "all files should land in the mock bucket");
 
         server_handle.shutdown().await.expect("shutdown");
@@ -175,7 +152,7 @@ async fn test_upload_objects_flat_directory_content_roundtrip() {
         // Every key should match its source file's content.
         for i in 0..count {
             let key = format!("roundtrip/{i:03}.bin");
-            let got = fetch_object_bytes(&server_handle, bucket, &key).await;
+            let got = fetch_object_bytes(&_server, bucket, &key).await;
             assert_eq!(got, vec![i as u8; size], "content mismatch for key {key}");
         }
 
@@ -222,7 +199,7 @@ async fn test_upload_objects_nested_tree() {
 
         for (rel, contents) in files {
             let key = format!("tree/{rel}");
-            let got = fetch_object_bytes(&server_handle, bucket, &key).await;
+            let got = fetch_object_bytes(&_server, bucket, &key).await;
             assert_eq!(got, contents.to_vec(), "content mismatch for {key}");
         }
 
@@ -261,7 +238,7 @@ async fn test_upload_objects_multipart_children() {
         assert_eq!((count * size) as u64, output.metrics.network_tx);
         assert_eq!((count * size) as u64, output.metrics.disk_read);
 
-        let landed = count_objects(&server_handle, bucket, "mpu/").await;
+        let landed = count_objects(&_server, bucket, "mpu/").await;
         assert_eq!(count, landed);
 
         server_handle.shutdown().await.expect("shutdown");
@@ -312,7 +289,7 @@ async fn test_upload_objects_walker_filter_applied() {
         assert_eq!(3, output.objects_uploaded());
         assert!(output.failed_transfers().is_empty());
 
-        let landed = count_objects(&server_handle, bucket, "filtered/").await;
+        let landed = count_objects(&_server, bucket, "filtered/").await;
         assert_eq!(3, landed);
 
         // Confirm none of the .log files made it.
@@ -338,12 +315,10 @@ async fn test_upload_objects_walker_filter_applied() {
     .expect("test_upload_objects_walker_filter_applied timed out");
 }
 
-/// Sanity: pipeline_depth=1 serial execution over real HTTP still
-/// completes and uploads every file. Helpful when debugging scheduler or
-/// reap-race regressions — a stall in the serial regime is usually a
-/// signal that terminal reaping or wake propagation is broken.
+/// Serial execution (max_concurrent_uploads=1) completes and uploads
+/// every file. Exercises the state machine under zero concurrency overlap.
 #[tokio::test]
-async fn test_upload_objects_pipeline_depth_one_over_http() {
+async fn test_upload_objects_serial_execution() {
     timeout(TEST_TIMEOUT, async {
         let (_server, server_handle, tm) = setup().await;
 
@@ -366,13 +341,13 @@ async fn test_upload_objects_pipeline_depth_one_over_http() {
         assert_eq!(count as u64, output.objects_uploaded());
         assert!(output.failed_transfers().is_empty());
 
-        let landed = count_objects(&server_handle, bucket, "serial/").await;
+        let landed = count_objects(&_server, bucket, "serial/").await;
         assert_eq!(count, landed);
 
         server_handle.shutdown().await.expect("shutdown");
     })
     .await
-    .expect("test_upload_objects_pipeline_depth_one_over_http timed out");
+    .expect("test_upload_objects_serial_execution timed out");
 }
 
 /// Empty source directory terminates cleanly with zero metrics even when
@@ -409,13 +384,102 @@ async fn test_upload_objects_empty_source() {
 
         // Create the bucket so count_objects can list it (no PutObject was
         // issued, so the mock server's auto-create-on-put never fired).
-        let landed = count_objects(&server_handle, bucket, "empty/").await;
+        let landed = count_objects(&_server, bucket, "empty/").await;
         assert_eq!(0, landed);
 
         server_handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_upload_objects_empty_source timed out");
+}
+
+/// Deep and wide directory tree exercises subtree claiming across many
+/// levels. Structure: 4 levels deep, 4 directories per level, 2 files
+/// per directory = 4^1 + 4^2 + 4^3 + 4^4 = 340 directories, 680 files.
+#[tokio::test]
+async fn test_upload_objects_deep_wide_tree() {
+    timeout(TEST_TIMEOUT, async {
+        let (_server, server_handle, tm) = setup().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut expected_files = 0u64;
+
+        fn populate(
+            base: &Path,
+            depth: usize,
+            files_per_dir: usize,
+            breadth: usize,
+            count: &mut u64,
+        ) {
+            for i in 0..files_per_dir {
+                let path = base.join(format!("f{i}.bin"));
+                std::fs::write(&path, [0u8; 64]).expect("write");
+                *count += 1;
+            }
+            if depth > 0 {
+                for d in 0..breadth {
+                    let sub = base.join(format!("d{d}"));
+                    std::fs::create_dir(&sub).expect("mkdir");
+                    populate(&sub, depth - 1, files_per_dir, breadth, count);
+                }
+            }
+        }
+
+        populate(dir.path(), 3, 2, 4, &mut expected_files);
+
+        let bucket = "test-bucket";
+        let handle = tm
+            .upload_objects()
+            .bucket(bucket)
+            .source(dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix("deep/")
+            .initiate()
+            .expect("initiate");
+
+        let output = handle.join().await.expect("join");
+        assert_eq!(expected_files, output.objects_uploaded());
+        assert!(output.failed_transfers().is_empty());
+
+        let landed = count_objects(&_server, bucket, "deep/").await;
+        assert_eq!(expected_files as usize, landed);
+
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_upload_objects_deep_wide_tree timed out");
+}
+
+/// Abort mid-transfer over real HTTP. Verifies the cancellation cascade
+/// propagates through the scheduler to in-flight children without
+/// deadlocking or leaking connections.
+#[tokio::test]
+async fn test_upload_objects_abort_terminates() {
+    timeout(TEST_TIMEOUT, async {
+        let (_server, server_handle, tm) = setup().await;
+
+        let count = 200usize;
+        let size = 1024usize;
+        let dataset = make_flat_dataset(count, size);
+
+        let bucket = "test-bucket";
+        let handle = tm
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix("abort/")
+            .initiate()
+            .expect("initiate");
+
+        // Let some children dispatch before aborting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort().await;
+
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_upload_objects_abort_terminates timed out");
 }
 
 /// Suppress unused warning on `Path` in case the test matrix rotates.
