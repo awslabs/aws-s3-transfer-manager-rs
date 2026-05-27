@@ -169,6 +169,32 @@ impl std::fmt::Debug for Scheduler {
     }
 }
 
+/// Result of a [`Scheduler::cancel_transfer`] call.
+///
+/// Carries the descriptors that were cancelled (the target and any
+/// depth-1 children). Drop the value for fire-and-forget cancel; await
+/// [`Cancellation::wait_for_idle`] to wait for in-flight executing
+/// work to drain before continuing. Pending (queued but not yet
+/// dispatched) work is purged synchronously during cancel; only work
+/// that was already dispatched needs draining.
+pub(crate) struct Cancellation {
+    pub(super) target: Option<TransferDescriptor>,
+    pub(super) children: Vec<TransferDescriptor>,
+}
+
+impl Cancellation {
+    /// Wait for the cancelled parent and all cancelled children to
+    /// finish any work that was already dispatched at cancellation time.
+    pub(crate) async fn wait_for_idle(self) {
+        if let Some(d) = self.target {
+            d.wait_for_idle().await;
+        }
+        for d in self.children {
+            d.wait_for_idle().await;
+        }
+    }
+}
+
 impl Scheduler {
     pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
         Scheduler(Arc::new(SchedulerInner {
@@ -310,23 +336,6 @@ impl Scheduler {
 
     /// Cancel a transfer and any child transfers, removing them from the scheduler.
     ///
-    /// Lock-ordering protocol: this method holds `transfers.write` across
-    /// its call to `ready_set.remove_group` (which acquires
-    /// `by_group.write` internally). Together with `enqueue_transfer`,
-    /// the protocol prevents a child being orphaned in `transfers` after
-    /// its parent group is removed. See `loom_tests::fixed_dance_no_orphan`
-    /// at the bottom of this file.
-    ///
-    /// Cancels the target transfer first, then cancels all transfers whose
-    /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each cancelled
-    /// transfer has its status set to cancelled, pending work purged, and idle
-    /// notification sent. Outstanding work already being executed will complete
-    /// naturally - use `wait_for_idle(id)` to wait for draining.
-    ///
-    /// Returns `true` if the target transfer existed in the map, `false` otherwise.
-    /// The return value does not reflect whether any children were found or cancelled.
-    /// Cancel a transfer and any child transfers, removing them from the scheduler.
-    ///
     /// Lock-ordering protocol: delegates to `remove_transfer_atomic`, which
     /// holds `transfers.write` across `ready_set.remove_group`. Together
     /// with `enqueue_transfer`, the protocol prevents a child being
@@ -334,23 +343,24 @@ impl Scheduler {
     /// `loom_tests::fixed_dance_no_orphan` at the bottom of this file.
     ///
     /// Cancels the target transfer first, then cancels all transfers whose
-    /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each cancelled
-    /// transfer has its status set to cancelled, pending work purged, and idle
-    /// notification sent. Outstanding work already being executed will complete
-    /// naturally - use `wait_for_idle(id)` to wait for draining.
+    /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each
+    /// cancelled transfer has its status set to cancelled, pending work
+    /// purged, and idle notification sent. Outstanding work already being
+    /// executed will complete naturally.
     ///
-    /// Returns `true` if the target transfer existed in the map, `false` otherwise.
-    /// The return value does not reflect whether any children were found or cancelled.
-    pub(crate) fn cancel_transfer(&self, id: TransferId) -> bool {
+    /// Returns a [`Cancellation`] carrying the cancelled descriptors.
+    /// Drop it for fire-and-forget; await
+    /// [`Cancellation::wait_for_idle`] to wait for in-flight executing
+    /// work to drain.
+    pub(crate) fn cancel_transfer(&self, id: TransferId) -> Cancellation {
         let (target, children) = self.remove_transfer_atomic(id);
-        let found = target.is_some();
-        if let Some(desc) = target {
-            self.cancel_descriptor(desc);
+        if let Some(desc) = &target {
+            self.cancel_descriptor(desc.clone());
         }
-        for desc in children {
-            self.cancel_descriptor(desc);
+        for desc in &children {
+            self.cancel_descriptor(desc.clone());
         }
-        found
+        Cancellation { target, children }
     }
 
     /// Atomic protocol-respecting removal of a transfer and its direct children.
@@ -703,17 +713,6 @@ impl Scheduler {
     pub(crate) fn is_idle(&self) -> bool {
         self.0.transfers.read().unwrap().is_empty()
             && self.0.dispatched.load(Ordering::Relaxed) == 0
-    }
-
-    /// Wait for a specific transfer to have no outstanding work.
-    pub(crate) async fn wait_for_idle(&self, id: TransferId) {
-        let desc = {
-            let transfers = self.0.transfers.read().unwrap();
-            transfers.get(&id).cloned()
-        };
-        if let Some(desc) = desc {
-            desc.wait_for_idle().await;
-        }
     }
 
     /// Pre-register an empty group for `group_id`. See
@@ -1232,8 +1231,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Cancel the transfer - returns true on first call
-        assert!(scheduler.cancel_transfer(id));
-        assert!(!scheduler.cancel_transfer(id));
+        assert!(scheduler.cancel_transfer(id).target.is_some());
+        assert!(scheduler.cancel_transfer(id).target.is_none());
 
         // Wait for scheduler to become idle
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1293,7 +1292,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(scheduler.cancel_transfer(parent_id));
+        assert!(scheduler.cancel_transfer(parent_id).target.is_some());
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while !scheduler.is_idle() {
@@ -1331,8 +1330,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(scheduler.cancel_transfer(id));
-        assert!(!scheduler.cancel_transfer(id));
+        assert!(scheduler.cancel_transfer(id).target.is_some());
+        assert!(scheduler.cancel_transfer(id).target.is_none());
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while !scheduler.is_idle() {
@@ -1392,7 +1391,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(scheduler.cancel_transfer(child_a));
+        assert!(scheduler.cancel_transfer(child_a).target.is_some());
         assert!(ctx_a.is_cancelled(), "child A should be cancelled");
         assert!(parent_ctx.is_active(), "parent should still be active");
         assert!(ctx_b.is_active(), "sibling B should still be active");
@@ -1410,7 +1409,7 @@ mod tests {
             id: 999,
             parent: None,
         };
-        assert!(!scheduler.cancel_transfer(fake_id));
+        assert!(scheduler.cancel_transfer(fake_id).target.is_none());
 
         handle.runtime.shutdown();
     }
@@ -2016,7 +2015,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Cancel the composite - this cascades to children
-        assert!(scheduler.cancel_transfer(c_id));
+        assert!(scheduler.cancel_transfer(c_id).target.is_some());
 
         // Wait for scheduler to become idle. The in-flight execute futures
         // will observe cancellation via is_cancelled() and return early.

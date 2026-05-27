@@ -76,8 +76,11 @@ impl UploadObjectsHandle {
         let ctx = self.transfer.ctx();
 
         if ctx.is_failed() {
-            ctx.handle.scheduler.cancel_transfer(ctx.id);
-            ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+            ctx.handle
+                .scheduler
+                .cancel_transfer(ctx.id)
+                .wait_for_idle()
+                .await;
             return Err(ctx.take_error().expect("failed transfer must have error"));
         }
 
@@ -106,8 +109,11 @@ impl UploadObjectsHandle {
     /// No further child uploads will be initiated.
     pub async fn abort(self) {
         let ctx = self.transfer.ctx();
-        ctx.handle.scheduler.cancel_transfer(ctx.id);
-        ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+        ctx.handle
+            .scheduler
+            .cancel_transfer(ctx.id)
+            .wait_for_idle()
+            .await;
     }
 
     /// Current status of this transfer.

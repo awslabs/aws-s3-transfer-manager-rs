@@ -96,8 +96,11 @@ impl UploadHandle {
         let ctx = self.transfer.ctx();
 
         if ctx.is_failed() {
-            ctx.handle.scheduler.cancel_transfer(ctx.id);
-            ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+            ctx.handle
+                .scheduler
+                .cancel_transfer(ctx.id)
+                .wait_for_idle()
+                .await;
             let err = ctx.take_error().expect("failed transfer must have error");
             return Err(err);
         }
@@ -138,11 +141,12 @@ impl UploadHandle {
         // for the HTTP response even after cancellation.
         let create_mpu_in_flight = self.transfer.is_create_mpu_in_flight();
 
-        // Cancel the transfer and purge queued work
-        ctx.handle.scheduler.cancel_transfer(ctx.id);
-
-        // Wait for any executing work to complete
-        ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+        // Cancel the transfer (purge queued work) and wait for any executing work to complete.
+        ctx.handle
+            .scheduler
+            .cancel_transfer(ctx.id)
+            .wait_for_idle()
+            .await;
 
         // If CreateMPU was in flight, wait for it to complete or be cancelled
         if create_mpu_in_flight {
