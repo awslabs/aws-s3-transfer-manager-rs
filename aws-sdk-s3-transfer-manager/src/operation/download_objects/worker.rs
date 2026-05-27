@@ -219,10 +219,7 @@ async fn write_body_to_file(body: &mut Body, key_path: &Path) -> Result<(), erro
 /// be in flight, and callers that stat the file immediately can observe
 /// a short read. See the tokio docs:
 /// <https://docs.rs/tokio/latest/tokio/fs/struct.File.html#in-the-presence-of-buffering>.
-async fn write_body_to_open_file(
-    body: &mut Body,
-    mut dest: fs::File,
-) -> Result<(), error::Error> {
+async fn write_body_to_open_file(body: &mut Body, mut dest: fs::File) -> Result<(), error::Error> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
         for segment in chunk.data.into_segments() {
