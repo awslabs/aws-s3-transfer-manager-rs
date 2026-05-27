@@ -18,6 +18,7 @@ pub use handle::DownloadObjectsHandle;
 use tokio::{fs, sync::watch};
 
 mod list_objects;
+pub(crate) mod transfer;
 mod worker;
 
 use std::sync::atomic::AtomicU64;

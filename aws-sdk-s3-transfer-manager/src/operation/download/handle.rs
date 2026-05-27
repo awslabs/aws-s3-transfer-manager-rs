@@ -8,7 +8,7 @@ use crate::operation::download::body::{Body, SlotBodyConsumer};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
-use crate::transfer::StateMachineTerminalReceiver;
+use crate::transfer::{StateMachineTerminalReceiver, TransferId};
 
 /// Shared core logic for download handles.
 ///
@@ -308,6 +308,12 @@ impl ManagedDownloadHandle {
             temp_path: None,
             dest_path: None,
         }
+    }
+
+    /// The transfer ID for this child download.
+    #[allow(dead_code)] // Used by download_objects state machine (chunk 2 wire-up)
+    pub(crate) fn transfer_id(&self) -> TransferId {
+        self.inner.transfer.id()
     }
 
     /// Object metadata.
