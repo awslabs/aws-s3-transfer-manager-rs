@@ -6,7 +6,7 @@
 //! State machine for plural upload (`upload_objects`).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
@@ -345,7 +345,7 @@ impl fmt::Debug for ChildTransfer {
 /// would serialise concurrent `poll_work` callers behind a single
 /// producer.
 struct State {
-    walks: HashMap<u64, FsWalk>,
+    walks: BTreeMap<u64, FsWalk>,
     next_walk_id: u64,
     in_flight_walks: usize,
     pending_entries: VecDeque<DirEntry>,
@@ -406,7 +406,7 @@ impl UploadObjectsTransfer {
         request: super::UploadObjectsInput,
         walker: FsWalk,
     ) -> Self {
-        let mut walks = HashMap::new();
+        let mut walks = BTreeMap::new();
         walks.insert(0, walker);
         let inner = Arc::new(UploadObjectsTransferInner {
             ctx,

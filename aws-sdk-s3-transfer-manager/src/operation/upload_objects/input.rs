@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// CFS handles fairness and rate. Users can override via
 /// [`UploadObjectsInputBuilder::max_concurrent_uploads`] or the
 /// corresponding fluent builder method.
-const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 10000;
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 4096;
 
 /// Input type for uploading multiple objects.
 ///
@@ -51,7 +51,7 @@ pub struct UploadObjectsInput {
     /// Acts as a memory backstop: the scheduler's hierarchical fair-share
     /// scheduling drives throughput and rate-limits the walker naturally,
     /// so this knob primarily bounds the working-set size of in-flight
-    /// child handles. Defaults to 10000.
+    /// child handles. Defaults to 4096.
     pub max_concurrent_uploads: usize,
 }
 
@@ -239,7 +239,7 @@ impl UploadObjectsInputBuilder {
     /// Acts as a memory backstop: the scheduler's hierarchical fair-share
     /// scheduling drives throughput and rate-limits the walker naturally,
     /// so this knob primarily bounds the working-set size of in-flight
-    /// child handles. Defaults to 10000.
+    /// child handles. Defaults to 4096.
     pub fn max_concurrent_uploads(mut self, input: usize) -> Self {
         self.max_concurrent_uploads = Some(input);
         self
