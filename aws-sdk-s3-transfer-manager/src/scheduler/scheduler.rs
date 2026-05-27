@@ -114,40 +114,21 @@ use std::time::Duration;
 /// Batch size for work generated and submitted in a single round
 const SUBMISSION_QUEUE_SIZE: usize = 64;
 
-thread_local! {
-    /// True while this thread is inside [`Scheduler::generate_work`]. Used
-    /// by [`Scheduler::enqueue_transfer`] to skip driving the scheduler
-    /// when called from inside a `poll_work` frame.
-    ///
-    /// Defense in depth against re-entrancy: both the submission queue
-    /// (see [`SubmissionQueue`] in `runtime::sync`) and the upload_objects
-    /// state machine (see `poll_work` in `upload_objects::transfer`) are
-    /// individually re-entrancy-safe, but making the re-entrant
-    /// `generate_work` call a no-op at the scheduler boundary is cheaper
-    /// than letting the call propagate all the way through the scheduler
-    /// to discover there's no work to do. The outer `generate_work` frame
-    /// will drive the newly-inserted transfer on its next `ready_set.pop`
-    /// iteration.
-    static IN_GENERATE_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// RAII guard that clears [`IN_GENERATE_WORK`] on drop. Constructed at the
-/// top of [`Scheduler::generate_work`] so the flag is unset even if a nested
-/// `poll_work` panics.
-struct GenerateWorkGuard;
-
-impl GenerateWorkGuard {
-    fn enter() -> Self {
-        IN_GENERATE_WORK.with(|f| f.set(true));
-        Self
-    }
-}
-
-impl Drop for GenerateWorkGuard {
-    fn drop(&mut self) {
-        IN_GENERATE_WORK.with(|f| f.set(false));
-    }
-}
+/// RAII guard for [`Scheduler::generate_work`] exclusion.
+///
+/// Only one thread may be inside `generate_work` at a time. This
+/// serializes scheduling decisions so that priority ordering is
+/// respected even under high concurrency — without it, N threads
+/// pop from the ready set simultaneously, draining the tree in
+/// parallel without giving any transfer the chance to re-insert
+/// between pops. Priority differentiation depends on sequential
+/// pop-poll-reinsert cycles (hi-priority re-enters at lower vruntime,
+/// gets popped again sooner); concurrent pops short-circuit this.
+///
+/// The lock also prevents re-entrancy: `enqueue_transfer` (called from
+/// inside `poll_work` → `spawn_children`) checks `try_lock` and skips
+/// `generate_work` when the current thread already holds it.
+struct GenerateWorkGuard<'a>(#[allow(dead_code)] parking_lot::MutexGuard<'a, ()>);
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -161,6 +142,9 @@ struct SchedulerInner {
     handle: Weak<crate::client::Handle>,
     dispatched: AtomicUsize,
     submission_queue: SubmissionQueue<ScheduledWork>,
+    /// Cross-thread exclusion for [`Scheduler::generate_work`].
+    /// See [`GenerateWorkGuard`] for rationale.
+    generate_work_lock: parking_lot::Mutex<()>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -203,6 +187,7 @@ impl Scheduler {
             handle,
             dispatched: AtomicUsize::new(0),
             submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
+            generate_work_lock: parking_lot::Mutex::new(()),
         }))
     }
 
@@ -284,18 +269,29 @@ impl Scheduler {
         }
 
         tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, "transfer enqueued");
-        // Only drive `generate_work` from the top level. When we are already
-        // inside a `generate_work` frame on this thread (the parent's
-        // `poll_work` called `spawn_children` → `enqueue_transfer`), the
-        // outer frame will pick up the newly-inserted transfer on its next
-        // loop iteration. Re-entering `generate_work` here would deadlock:
-        // the re-entrant frame increments `SubmissionQueue::pending` and
-        // leaves it live until the outer frame finishes, which prevents
-        // `submit_and_reenter` from ever flushing work to the runtime.
-        let reentrant = IN_GENERATE_WORK.with(|f| f.get());
-        if !reentrant {
-            self.generate_work();
-        }
+        // Drive `generate_work` unless we're already inside it on this
+        // thread (the parent's `poll_work` called `spawn_children` →
+        // `enqueue_transfer`). The cross-thread `generate_work_lock`
+        // handles both cases:
+        //
+        // 1. Re-entrancy: `try_lock` returns None on the same thread
+        //    that already holds it. Without this, the re-entrant frame
+        //    would call `submission_queue.enter()`, incrementing the
+        //    global `pending` counter. The outer frame's `submit()` then
+        //    sees pending > 0 and waits for the nested submission to
+        //    flush — but the nested frame can't flush until the outer
+        //    frame releases the lock. Deadlock.
+        //
+        // 2. Cross-thread serialization: only one thread pops from the
+        //    ready set at a time, preserving priority ordering. Priority
+        //    depends on sequential pop-poll-reinsert cycles (hi-priority
+        //    re-enters at lower vruntime, gets popped again sooner).
+        //    Concurrent pops short-circuit this by draining the tree in
+        //    parallel without giving transfers the chance to re-insert.
+        //
+        // The outer frame picks up the newly-inserted transfer on its
+        // next loop iteration (or on the second pass of the for loop).
+        self.generate_work();
     }
 
     /// Wake a transfer, moving it from pending to ready.
@@ -573,140 +569,165 @@ impl Scheduler {
 
     /// Generate work from ready transfers and dispatch to runtime.
     fn generate_work(&self) {
-        let _guard = GenerateWorkGuard::enter();
-        let mut sub = self.0.submission_queue.enter();
-        let mut generated = 0usize;
-        let mut polled = 0usize;
-        let mut pending_count = 0usize;
-        let mut done_count = 0usize;
-        let mut terminal_skipped = 0usize;
-        tracing::trace!(
-            target: telemetry::TARGET_SCHEDULING,
-            has_capacity = self.has_capacity(),
-            dispatched = self.0.dispatched.load(Ordering::Relaxed),
-            target = self.handle().controller.target(),
-            "generate_work.enter",
-        );
-        let break_reason = loop {
-            if !self.has_capacity() {
-                break "no_capacity";
-            }
-            let Some(desc) = self.0.ready_set.pop() else {
-                break "ready_set_empty";
-            };
+        // Serialize scheduling decisions across threads so priority
+        // ordering is respected. If another thread (or a re-entrant
+        // enqueue_transfer call) already holds the lock, bail out —
+        // the holder will pick up any newly-available work via the
+        // has_capacity + ready_set.is_empty re-check below.
+        let Some(lock) = self.0.generate_work_lock.try_lock() else {
+            return;
+        };
+        let _guard = GenerateWorkGuard(lock);
+        // Run the generation loop up to twice: once for the primary pass,
+        // and once more to catch work inserted by wake()/on_completion()
+        // calls that failed try_lock while we held it. Without the second
+        // pass, those callers' generate_work is lost.
+        for _pass in 0..2 {
+            let mut sub = self.0.submission_queue.enter();
+            let mut generated = 0usize;
+            let mut polled = 0usize;
+            let mut pending_count = 0usize;
+            let mut done_count = 0usize;
+            let mut terminal_skipped = 0usize;
+            tracing::trace!(
+                target: telemetry::TARGET_SCHEDULING,
+                has_capacity = self.has_capacity(),
+                dispatched = self.0.dispatched.load(Ordering::Relaxed),
+                target = self.handle().controller.target(),
+                "generate_work.enter",
+            );
+            let break_reason = loop {
+                if !self.has_capacity() {
+                    break "no_capacity";
+                }
+                let Some(desc) = self.0.ready_set.pop() else {
+                    break "ready_set_empty";
+                };
 
-            // Skip cancelled/failed transfers still in the ready set.
-            // Release the claim explicitly since we won't call poll_work.
-            if desc.is_terminal() {
-                terminal_skipped += 1;
+                // Skip cancelled/failed transfers still in the ready set.
+                // Release the claim explicitly since we won't call poll_work.
+                if desc.is_terminal() {
+                    terminal_skipped += 1;
+                    let claim = ClaimGuard::new(&desc);
+                    claim.release();
+                    continue;
+                }
+
+                polled += 1;
+                let id = desc.id();
+                // Consume any pre-existing wake signal so we only observe
+                // wakes that arrive DURING the poll below.
+                desc.take_wake_requested();
+
                 let claim = ClaimGuard::new(&desc);
-                claim.release();
-                continue;
-            }
+                let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    desc.transfer().poll_work()
+                }));
 
-            polled += 1;
-            let id = desc.id();
-            // Consume any pre-existing wake signal so we only observe
-            // wakes that arrive DURING the poll below.
-            desc.take_wake_requested();
-
-            let claim = ClaimGuard::new(&desc);
-            let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                desc.transfer().poll_work()
-            }));
-
-            match poll_result {
-                Ok(PollWork::Ready(item)) => {
-                    generated += 1;
-                    desc.work_generated();
-                    // Re-insert under the still-held claim - bypasses the
-                    // CAS gate that `insert` would otherwise apply.
-                    claim.hold();
-                    self.0.ready_set.reinsert_under_claim(desc.clone());
-                    self.0.dispatched.fetch_add(1, Ordering::Relaxed);
-                    desc.work_queued();
-                    let work = ScheduledWork {
-                        item,
-                        descriptor: desc,
-                    };
-                    sub = self.enqueue(sub, work);
-                }
-                Ok(PollWork::Pending) => {
-                    pending_count += 1;
-                    tracing::trace!(
-                        target: telemetry::TARGET_SCHEDULING,
-                        id = %id,
-                        "poll_work.pending",
-                    );
-                    // Release-and-recheck. A wake arriving in this
-                    // window either takes the claim itself (its CAS
-                    // succeeds) or sets wake_requested for us to
-                    // observe. See the `claim` module for the protocol.
-                    claim.release();
-                    if desc.take_wake_requested() {
-                        // OrphanedChild: parent's group was removed; wake is moot.
-                        let _ = self.0.ready_set.insert(desc);
+                match poll_result {
+                    Ok(PollWork::Ready(item)) => {
+                        generated += 1;
+                        desc.work_generated();
+                        // Re-insert under the still-held claim - bypasses the
+                        // CAS gate that `insert` would otherwise apply.
+                        claim.hold();
+                        self.0.ready_set.reinsert_under_claim(desc.clone());
+                        self.0.dispatched.fetch_add(1, Ordering::Relaxed);
+                        desc.work_queued();
+                        let work = ScheduledWork {
+                            item,
+                            descriptor: desc,
+                        };
+                        sub = self.enqueue(sub, work);
                     }
-                }
-                Ok(PollWork::Done) => {
-                    done_count += 1;
-                    tracing::trace!(
-                        target: telemetry::TARGET_SCHEDULING,
-                        id = %id,
-                        "poll_work.done",
-                    );
-                    claim.release();
-                    let desc_id = desc.id();
-                    let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
-                    // The parent's `_completed` descriptor is the same one
-                    // we just polled; it terminated normally so we do not
-                    // call `cancel_descriptor` on it. Children should not
-                    // exist if the Transfer contract was upheld; if they
-                    // do, the contract is violated — clean them up
-                    // defensively and surface the violation as a warning.
-                    if !orphans.is_empty() {
-                        tracing::warn!(
+                    Ok(PollWork::Pending) => {
+                        pending_count += 1;
+                        tracing::trace!(
                             target: telemetry::TARGET_SCHEDULING,
-                            parent_id = %desc_id,
-                            child_count = orphans.len(),
-                            "transfer returned PollWork::Done while children \
-                             still alive; cleaning up. This is a Transfer \
-                             trait contract violation."
+                            id = %id,
+                            "poll_work.pending",
                         );
-                        for desc in orphans {
-                            self.cancel_descriptor(desc);
+                        // Release-and-recheck. A wake arriving in this
+                        // window either takes the claim itself (its CAS
+                        // succeeds) or sets wake_requested for us to
+                        // observe. See the `claim` module for the protocol.
+                        claim.release();
+                        if desc.take_wake_requested() {
+                            // OrphanedChild: parent's group was removed; wake is moot.
+                            let _ = self.0.ready_set.insert(desc);
                         }
                     }
+                    Ok(PollWork::Done) => {
+                        done_count += 1;
+                        tracing::trace!(
+                            target: telemetry::TARGET_SCHEDULING,
+                            id = %id,
+                            "poll_work.done",
+                        );
+                        claim.release();
+                        let desc_id = desc.id();
+                        let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
+                        // The parent's `_completed` descriptor is the same one
+                        // we just polled; it terminated normally so we do not
+                        // call `cancel_descriptor` on it. Children should not
+                        // exist if the Transfer contract was upheld; if they
+                        // do, the contract is violated — clean them up
+                        // defensively and surface the violation as a warning.
+                        if !orphans.is_empty() {
+                            tracing::warn!(
+                                target: telemetry::TARGET_SCHEDULING,
+                                parent_id = %desc_id,
+                                child_count = orphans.len(),
+                                "transfer returned PollWork::Done while children \
+                                 still alive; cleaning up. This is a Transfer \
+                                 trait contract violation."
+                            );
+                            for desc in orphans {
+                                self.cancel_descriptor(desc);
+                            }
+                        }
+                    }
+                    Err(_panic_payload) => {
+                        // ClaimGuard's Drop releases the claim. cancel_transfer
+                        // handles terminal transition + child cascade.
+                        tracing::error!(
+                            target: telemetry::TARGET_SCHEDULING,
+                            id = %id,
+                            "panic in poll_work, forcing terminal",
+                        );
+                        drop(claim);
+                        drop(desc);
+                        self.cancel_transfer(id);
+                    }
                 }
-                Err(_panic_payload) => {
-                    // ClaimGuard's Drop releases the claim. cancel_transfer
-                    // handles terminal transition + child cascade.
-                    tracing::error!(
-                        target: telemetry::TARGET_SCHEDULING,
-                        id = %id,
-                        "panic in poll_work, forcing terminal",
-                    );
-                    drop(claim);
-                    drop(desc);
-                    self.cancel_transfer(id);
-                }
+            };
+            if let Some(mut guard) = sub.submit() {
+                self.handle().runtime.dispatch(&mut guard);
             }
-        };
-        if let Some(mut guard) = sub.submit() {
-            self.handle().runtime.dispatch(&mut guard);
-        }
-        tracing::trace!(
-            target: telemetry::TARGET_SCHEDULING,
-            generated,
-            polled,
-            pending_count,
-            done_count,
-            terminal_skipped,
-            break_reason,
-            dispatched = self.0.dispatched.load(Ordering::Relaxed),
-            target = self.handle().controller.target(),
-            "generate_work.exit",
-        );
+            tracing::trace!(
+                target: telemetry::TARGET_SCHEDULING,
+                generated,
+                polled,
+                pending_count,
+                done_count,
+                terminal_skipped,
+                break_reason,
+                dispatched = self.0.dispatched.load(Ordering::Relaxed),
+                target = self.handle().controller.target(),
+                "generate_work.exit",
+            );
+            // Re-check: a wake() or on_completion() may have inserted into
+            // the ready set while we were in the submit/dispatch path above.
+            // Their generate_work() call failed try_lock and returned.
+            // If the inner loop found nothing (ready_set was empty and we
+            // generated no work), no point retrying.
+            if break_reason == "ready_set_empty" && generated == 0 {
+                break;
+            }
+            if !self.has_capacity() {
+                break;
+            }
+        } // end for _pass
     }
 
     #[allow(dead_code)]
@@ -1936,17 +1957,14 @@ mod tests {
         let lo_count = lo_counter.count();
 
         // 4x priority difference (255 vs 64) yields ~4x dispatch ratio
-        // via the priority-scaled vruntime delta. With 800 total dispatches
-        // (~200 scheduling rounds at concurrency=4), the ratio converges
-        // toward 4x. On managed threads, OS thread scheduling introduces
-        // latency variance that dilutes the observed ratio (the scheduler
-        // picks correctly, but thread wake latency means completions don't
-        // arrive in strict priority order). 2.5 validates priority works
-        // while absorbing this systematic effect.
+        // via the priority-scaled vruntime delta. With serialized
+        // generate_work (cross-thread exclusion via parking_lot::Mutex),
+        // the ratio converges to the theoretical value on both runtimes.
+        // Threshold of 3.5 provides margin for CI scheduling noise.
         let ratio = hi_count as f64 / lo_count.max(1) as f64;
         assert!(
-            ratio > 2.5,
-            "expected ratio > 2.5, got {:.2} (hi={}, lo={})",
+            ratio > 3.5,
+            "expected ratio > 3.5, got {:.2} (hi={}, lo={})",
             ratio,
             hi_count,
             lo_count
@@ -1978,12 +1996,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    // ASAN instrumentation amplifies managed-thread wake jitter enough to push
-    // the priority-ratio sample distribution below the 2.5 threshold. The
-    // dilution under concurrent generate_work is documented and orthogonal to
-    // memory safety; ASAN is not the right harness for a statistical
-    // thread-scheduling test.
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_priority_change_shifts_root_share_managed_runtime() {
         let handle = test_handle_managed(4);
