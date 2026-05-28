@@ -5,7 +5,7 @@
 
 use tracing::Instrument;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
@@ -83,7 +83,11 @@ impl UploadHandle {
         }
     }
 
-    /// Consume the handle and wait for upload to complete
+    /// Consume the handle and wait for upload to complete.
+    ///
+    /// Returns the uploaded object output on success. Returns an error
+    /// when the transfer failed (with the recorded failure cause) or when
+    /// the transfer was cancelled (with `ErrorKind::OperationCancelled`).
     pub async fn join(mut self) -> Result<UploadOutput, Error> {
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;
@@ -92,10 +96,20 @@ impl UploadHandle {
         let ctx = self.transfer.ctx();
 
         if ctx.is_failed() {
-            ctx.handle.scheduler.cancel_transfer(ctx.id);
-            ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+            ctx.handle
+                .scheduler
+                .cancel_transfer(ctx.id)
+                .wait_for_idle()
+                .await;
             let err = ctx.take_error().expect("failed transfer must have error");
             return Err(err);
+        }
+
+        if ctx.is_cancelled() {
+            return Err(Error::new(
+                ErrorKind::OperationCancelled,
+                "upload cancelled",
+            ));
         }
 
         Ok(self
@@ -127,11 +141,12 @@ impl UploadHandle {
         // for the HTTP response even after cancellation.
         let create_mpu_in_flight = self.transfer.is_create_mpu_in_flight();
 
-        // Cancel the transfer and purge queued work
-        ctx.handle.scheduler.cancel_transfer(ctx.id);
-
-        // Wait for any executing work to complete
-        ctx.handle.scheduler.wait_for_idle(ctx.id).await;
+        // Cancel the transfer (purge queued work) and wait for any executing work to complete.
+        ctx.handle
+            .scheduler
+            .cancel_transfer(ctx.id)
+            .wait_for_idle()
+            .await;
 
         // If CreateMPU was in flight, wait for it to complete or be cancelled
         if create_mpu_in_flight {
@@ -173,6 +188,11 @@ impl UploadHandle {
         }
     }
 
+    /// Get the transfer ID for this upload.
+    pub(crate) fn id(&self) -> crate::transfer::TransferId {
+        self.transfer.ctx().id
+    }
+
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
@@ -202,6 +222,13 @@ impl Drop for UploadHandle {
 #[cfg(test)]
 mod tests {
     use super::UploadHandle;
+    use crate::error::ErrorKind;
+    use crate::io::InputStream;
+    use crate::operation::upload::transfer::UploadTransfer;
+    use crate::operation::upload::UploadInput;
+    use crate::transfer::TransferContext;
+    use crate::types::BucketType;
+    use crate::DEFAULT_CONCURRENCY;
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -210,5 +237,43 @@ mod tests {
     fn test_handle_properties() {
         is_send::<UploadHandle>();
         is_sync::<UploadHandle>();
+    }
+
+    /// Regression: if the transfer reaches a `Cancelled` terminal state
+    /// before `join()` is awaited, `join()` must return
+    /// `Err(OperationCancelled)`. Previously this path panicked through
+    /// `take_result().expect("result must be set on successful completion")`.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_join_returns_cancelled_error_when_transfer_cancelled() {
+        let handle = crate::client::Handle::new_for_test(
+            crate::Config::builder()
+                .client(aws_smithy_mocks::mock_client!(
+                    aws_sdk_s3,
+                    aws_smithy_mocks::RuleMode::MatchAny,
+                    &[]
+                ))
+                .build(),
+            DEFAULT_CONCURRENCY,
+        );
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let stream = InputStream::from(Vec::<u8>::new());
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadTransfer::new(ctx.clone(), BucketType::Standard, input, stream);
+
+        // Drive to Cancelled terminal state.
+        ctx.set_cancelled();
+        ctx.signal_terminal();
+
+        let upload_handle = UploadHandle::new(completion_rx, transfer);
+        let err = upload_handle
+            .join()
+            .await
+            .expect_err("join on cancelled transfer must return Err");
+        assert_eq!(err.kind(), &ErrorKind::OperationCancelled);
     }
 }

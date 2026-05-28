@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_smithy_types::timeout::TimeoutConfig;
 use bytes::Buf;
 use tracing::Instrument;
 
@@ -38,6 +39,23 @@ pub(crate) enum UploadWork {
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
+
+/// Bound on time-to-first-response-byte for a `PutObject` call. Applied
+/// per-operation via [`TimeoutConfig::read_timeout`] through a
+/// `.config_override(...)`; leaves any caller-provided `TimeoutConfig`
+/// fields on the client (connect / operation / operation-attempt) intact.
+///
+/// 30s is wide enough for slow networks and tight enough to surface a
+/// stuck connection before the transfer stalls. On timeout the SDK's
+/// standard retry strategy rebuilds the body from the source (see
+/// `SdkBody::retryable` wiring in `InputStream::into_sdk_body`) and
+/// retries on a fresh connection.
+///
+/// Scoped to `PutObject` only. `UploadPart` uses the adaptive
+/// `LatencyTracker::guarded` wrapper; control-plane operations rely on
+/// SDK or caller configuration.
+/// TODO(vnext): remove/replace when read timeout is defaulted for the SDK with new BMV + connection pool
+const PUT_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Upload transfer that generates and executes upload work.
 ///
@@ -143,7 +161,7 @@ impl UploadTransfer {
     ///
     /// Returns:
     /// - `PollWork::Ready(work)` - work available to execute
-    /// - `PollWork::Pending` - blocked waiting for in-flight work
+    /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {
@@ -496,29 +514,71 @@ impl UploadTransfer {
             .upper()
             .expect("content length must be known for PutObject");
 
-        // TODO: PutObject streams data lazily through the SDK — the actual
-        // source I/O happens when the SDK consumes the ByteStream during send.
-        // For scheduler control over source I/O (important for many small files),
-        // InputStream internals will need tighter integration with the execution layer.
-        let byte_stream = match stream.into_byte_stream().await {
-            Ok(bs) => bs,
-            Err(e) => return self.fail(e),
-        };
+        let is_file_backed = stream.is_file_backed();
+        let direct_io = self.inner.ctx.handle.runtime.components().direct_io();
+
+        // Hand the request body off to the SDK as a retryable `SdkBody`:
+        // in-memory sources ride `SdkBody::from(Bytes)`'s built-in rebuild
+        // path; file-backed sources go through our `DirectFileBody` or
+        // `OffloadedFileBody` so that (a) retries get a fresh file
+        // descriptor and read cursor, (b) the read path stays on the TM's
+        // own I/O machinery rather than the SDK's `FsBuilder` +
+        // `tokio::fs` path, and (c) peak memory is bounded by the chunk
+        // size regardless of how large the object is.
+        let sdk_body = stream.into_sdk_body(direct_io);
+        let byte_stream = ByteStream::new(sdk_body);
 
         let put_req = copy_fields_to_put_object_request(
             &self.inner.request,
             self.inner.ctx.s3_client().put_object().body(byte_stream),
         );
 
+        // Per-operation `read_timeout` caps time-to-first-response-byte.
+        // Only `read_timeout` is overridden; caller-provided connect /
+        // operation / operation-attempt timeouts remain intact.
+        let timeout_cfg = TimeoutConfig::builder()
+            .read_timeout(PUT_OBJECT_READ_TIMEOUT)
+            .build();
+        let config_override = aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
+
+        // Per-call SDK telemetry: latency + error attribution.
+        let transfer_id = self.inner.ctx.id;
+        let send_start = std::time::Instant::now();
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            ?transfer_id,
+            content_length,
+            is_file_backed,
+            "put_object.send_enter",
+        );
+
         let resp = match put_req
             .customize()
+            .config_override(config_override)
             .disable_payload_signing()
             .send()
             .instrument(tracing::debug_span!("send-put-object"))
             .await
         {
-            Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Ok(resp) => {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    ?transfer_id,
+                    elapsed_ms = send_start.elapsed().as_millis() as u64,
+                    "put_object.send_exit_ok",
+                );
+                resp
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    ?transfer_id,
+                    elapsed_ms = send_start.elapsed().as_millis() as u64,
+                    error = %e,
+                    "put_object.send_exit_err",
+                );
+                return self.fail(e.into());
+            }
         };
 
         let result = UploadOutputBuilder::from(resp)
@@ -528,8 +588,17 @@ impl UploadTransfer {
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
 
+        // A successful response means the SDK fully read the body and
+        // the bytes made it to the wire. For file-backed sources, the
+        // body implementations above have therefore read `content_length`
+        // bytes from disk. We attribute the metric here (rather than
+        // per-chunk inside the body) so that there is a single semantic
+        // anchor — "recorded when the SDK confirms success" — consistent
+        // with how `network_tx` is attributed.
+        let disk_read = if is_file_backed { content_length } else { 0 };
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
+            disk_read,
             ..Default::default()
         });
 
@@ -809,6 +878,86 @@ mod tests {
         assert!(
             !transfer.ctx().handle.telemetry.io_counters.is_idle(),
             "PutObject should record network_tx to IOCounters"
+        );
+    }
+
+    /// Regression: when the upload source is a file (`InputStream::from_path`),
+    /// the PutObject code path must record `disk_read` equal to the payload
+    /// size. Previously only `network_tx` was recorded, leaving the plural
+    /// `upload_objects` metrics' `disk_read` at zero for all small-file
+    /// children.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_put_object_records_disk_read_for_file_source() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        use std::io::Write;
+
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let payload = vec![0u8; 1024];
+        tmp.write_all(&payload).unwrap();
+        tmp.flush().unwrap();
+
+        let handle = crate::client::Handle::new_for_test(
+            crate::Config::builder().client(s3_client).build(),
+            DEFAULT_CONCURRENCY,
+        );
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let stream = InputStream::from_path(tmp.path()).unwrap();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream);
+
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<UploadWork>(),
+            UploadWork::PutObject { .. }
+        ));
+        let outcome = transfer.execute(&mut work).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+
+        let metrics = transfer.ctx().metrics();
+        assert_eq!(
+            payload.len() as u64,
+            metrics.network_tx,
+            "network_tx should equal the file size"
+        );
+        assert_eq!(
+            payload.len() as u64,
+            metrics.disk_read,
+            "disk_read should equal the file size for a file-backed PutObject"
+        );
+    }
+
+    /// Complement to the file-backed test: in-memory (`RawInputStream::Buf`)
+    /// uploads must NOT inflate `disk_read`, since no bytes were read from
+    /// disk.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_put_object_does_not_record_disk_read_for_memory_source() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+        let content = vec![0u8; 1024];
+        let transfer = create_test_transfer(s3_client, content.clone());
+
+        let mut work = assert_ready(transfer.poll_work());
+        let outcome = transfer.execute(&mut work).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+
+        let metrics = transfer.ctx().metrics();
+        assert_eq!(content.len() as u64, metrics.network_tx);
+        assert_eq!(
+            0, metrics.disk_read,
+            "in-memory source must not report disk_read"
         );
     }
 

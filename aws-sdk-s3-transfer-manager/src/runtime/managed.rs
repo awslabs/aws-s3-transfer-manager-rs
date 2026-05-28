@@ -188,7 +188,14 @@ impl ManagedThreadRuntime {
     /// Spawns one OS thread per core in the topology. Each thread creates its
     /// own tokio current-thread runtime (the I/O driver binds to the creating
     /// thread).
-    fn new(handle: Weak<crate::client::Handle>, topology: Topology, pin_threads: bool) -> Self {
+    fn new(
+        handle: Weak<crate::client::Handle>,
+        topology: Topology,
+        pin_threads: bool,
+        #[cfg(feature = "dial9")] telemetry_guard: Option<
+            std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+        >,
+    ) -> Self {
         let shutdown_token = CancellationToken::new();
 
         let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
@@ -201,12 +208,30 @@ impl ManagedThreadRuntime {
                 let cpu_index = id.0;
 
                 let resolver = dns_resolver.clone();
+                #[cfg(feature = "dial9")]
+                let telemetry_guard = telemetry_guard.clone();
+
                 let join_handle = std::thread::Builder::new()
                     .name(format!("s3-tm-{}", id))
                     .spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .max_blocking_threads(1)
+                        let mut builder = tokio::runtime::Builder::new_current_thread();
+                        builder.enable_all().max_blocking_threads(1);
+
+                        #[cfg(feature = "dial9")]
+                        let rt = if let Some(ref guard) = telemetry_guard {
+                            let (rt, _handle) = guard
+                                .trace_runtime(format!("s3-tm-{}", cpu_index))
+                                .build(builder)
+                                .expect("failed to create traced tokio runtime");
+                            rt
+                        } else {
+                            builder
+                                .build()
+                                .expect("failed to create tokio current-thread runtime")
+                        };
+
+                        #[cfg(not(feature = "dial9"))]
+                        let rt = builder
                             .build()
                             .expect("failed to create tokio current-thread runtime");
 
@@ -277,6 +302,8 @@ pub(crate) struct ManagedThreadRuntimeBuilder {
     handle: Weak<crate::client::Handle>,
     topology: Option<Topology>,
     pin_threads: bool,
+    #[cfg(feature = "dial9")]
+    telemetry_guard: Option<std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>>,
 }
 
 impl ManagedThreadRuntimeBuilder {
@@ -285,7 +312,19 @@ impl ManagedThreadRuntimeBuilder {
             handle,
             topology: None,
             pin_threads: false,
+            #[cfg(feature = "dial9")]
+            telemetry_guard: None,
         }
+    }
+
+    /// Set a dial9 telemetry guard for tracing per-thread runtimes.
+    #[cfg(feature = "dial9")]
+    pub(crate) fn telemetry_guard(
+        mut self,
+        guard: std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+    ) -> Self {
+        self.telemetry_guard = Some(guard);
+        self
     }
 
     /// Set the hardware topology. Defaults to `Topology::uniform(num_cpus)`
@@ -313,7 +352,13 @@ impl ManagedThreadRuntimeBuilder {
                     .unwrap_or(1),
             )
         });
-        ManagedThreadRuntime::new(self.handle, topology, self.pin_threads)
+        ManagedThreadRuntime::new(
+            self.handle,
+            topology,
+            self.pin_threads,
+            #[cfg(feature = "dial9")]
+            self.telemetry_guard,
+        )
     }
 }
 

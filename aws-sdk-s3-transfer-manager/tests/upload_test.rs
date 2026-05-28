@@ -126,7 +126,7 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
 //
 // See https://github.com/awslabs/aws-c-s3/blob/5d8d4205e7de4e152bf26bb27d86f3acf8cd5d2/tests/s3_many_async_uploads_without_data_test.c
 // PartStream deadlock: 200 uploads consume all concurrency slots blocking on poll_part(),
-// starving transfers that have data ready. See bosun.md "PartStream deadlock" open question.
+// starving transfers that have data ready.
 #[ignore = "PartStream deadlock — workers block in execute waiting for user data, consuming all slots"]
 #[tokio::test]
 async fn test_many_uploads_no_deadlock() {

@@ -75,7 +75,7 @@ impl DirEntry {
     }
 }
 
-type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
+type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 
 /// Configuration for walking a local filesystem directory.
 ///
@@ -108,6 +108,13 @@ type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 /// same target) are not deduplicated. Both are followed and the target's
 /// content is yielded twice. If deduplication is desired, apply it at a
 /// higher layer.
+///
+/// # Cloning
+///
+/// `FsWalker` is cheap to clone: all configuration fields are small values
+/// and the optional filter is stored as `Arc<dyn Fn>`. Clone a configured
+/// walker to reuse it across multiple operations without re-specifying the
+/// configuration.
 // TODO(walker): `dir_filter: Option<Box<dyn Fn(&DirEntry) -> bool>>` — subtree
 //   prune predicate. Biggest perf improvement for bulk ops on trees with large
 //   excluded subtrees (.git/, node_modules/).
@@ -118,6 +125,7 @@ type FilterFn = Box<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 //   normalization of filenames before deriving relative paths / S3 keys.
 // TODO(walker): `same_file_system: bool` — refuse to cross filesystem
 //   boundaries during recursion.
+#[derive(Clone)]
 pub struct FsWalker {
     follow_symlinks: bool,
     max_depth: usize,
@@ -203,8 +211,10 @@ impl FsWalker {
             "fs walk started",
         );
 
+        let root: Arc<Path> = root.into();
+
         FsWalk {
-            config: self,
+            config: Arc::new(self),
             root,
             pending_dirs,
             ready_files: VecDeque::new(),
@@ -218,7 +228,7 @@ impl FsWalker {
 ///
 /// All fields have sensible defaults: non-recursive, symlinks not followed,
 /// unsorted, no filter, `canonicalize_root` disabled.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct FsWalkerBuilder {
     follow_symlinks: bool,
     max_depth: usize,
@@ -340,7 +350,7 @@ impl FsWalkerBuilder {
     /// `node_modules/`), compose multiple walks rooted at smaller subtrees.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&DirEntry) -> bool + Send + Sync + 'static) -> Self {
-        self.filter = Some(Box::new(f));
+        self.filter = Some(Arc::new(f));
         self
     }
 
@@ -354,6 +364,14 @@ impl FsWalkerBuilder {
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
         }
+    }
+}
+
+impl Default for FsWalker {
+    /// A default walker: non-recursive, does not follow symlinks, no filter.
+    /// Equivalent to `FsWalker::builder().build()`.
+    fn default() -> Self {
+        FsWalker::builder().build()
     }
 }
 
@@ -408,9 +426,14 @@ impl FsWalkContextBuilder {
 ///
 /// Errors encountered during the walk are interleaved with successful
 /// entries. Fatal errors terminate the walk; non-fatal errors do not.
+///
+/// Parallel enumeration is supported via [`try_claim_subtree`](Self::try_claim_subtree),
+/// which splits off an independent `FsWalk` for a pending subdirectory. The caller
+/// controls when and how many subtrees to claim, enabling backpressure-aware fan-out
+/// without hidden coordination.
 pub struct FsWalk {
-    config: FsWalker,
-    root: PathBuf,
+    config: Arc<FsWalker>,
+    root: Arc<Path>,
     pending_dirs: VecDeque<PendingDir>,
     ready_files: VecDeque<DirEntry>,
     pending_errors: VecDeque<WalkError>,
@@ -481,6 +504,67 @@ impl FsWalk {
     /// Whether the walk has finished (no more entries will be produced).
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Try to claim an independent subtree for parallel walking.
+    ///
+    /// Returns a new `FsWalk` that will walk one pending directory (and its
+    /// descendants) independently. The parent walk continues with the remaining
+    /// pending directories and will not yield entries from the claimed subtree.
+    ///
+    /// Returns `None` when splitting would not produce parallelism:
+    ///
+    /// - The walk is `done`.
+    /// - The walk has fewer than two pending directories. Splitting hands the
+    ///   only pending directory to the child and leaves the parent exhausted —
+    ///   the child does the same work the parent would have done, and no
+    ///   concurrency is gained. Advance the walk via [`next`](Self::next) until
+    ///   the walk has discovered additional subdirectories, then try again.
+    ///
+    /// Entries yielded from the claimed subtree have `relative_path` computed
+    /// against the original walk root, not the subtree root. Both walks share
+    /// the same configuration (filters, depth limits, symlink policy).
+    ///
+    /// The claimed subtree and the parent walk can be advanced concurrently on
+    /// different threads. There is no shared mutable state between them.
+    ///
+    /// Subtrees are claimed in BFS order (front of the pending queue), matching
+    /// the order that [`next`](Self::next) would have visited them.
+    pub fn try_claim_subtree(&mut self) -> Option<FsWalk> {
+        if self.done || self.pending_dirs.len() < 2 {
+            return None;
+        }
+        let claimed = self.pending_dirs.pop_front()?;
+        Some(FsWalk {
+            config: Arc::clone(&self.config),
+            root: Arc::clone(&self.root),
+            pending_dirs: VecDeque::from([claimed]),
+            ready_files: VecDeque::new(),
+            pending_errors: VecDeque::new(),
+            done: false,
+        })
+    }
+
+    /// Returns `true` if this walk has no more entries to yield.
+    ///
+    /// A walk is exhausted when it has no pending directories, no buffered files,
+    /// and no buffered errors. Equivalent to `next()` having returned (or being
+    /// about to return) `None`.
+    pub fn is_exhausted(&self) -> bool {
+        self.done
+            || (self.pending_dirs.is_empty()
+                && self.ready_files.is_empty()
+                && self.pending_errors.is_empty())
+    }
+
+    /// Number of files already read and queued for yield. Diagnostic accessor.
+    pub(crate) fn ready_files_len(&self) -> usize {
+        self.ready_files.len()
+    }
+
+    /// Number of directories queued for read. Diagnostic accessor.
+    pub(crate) fn pending_dirs_len(&self) -> usize {
+        self.pending_dirs.len()
     }
 
     fn read_dir(
@@ -1704,5 +1788,777 @@ mod tests {
         assert_send_sync::<FsWalkContext>();
         assert_send_sync::<FsWalkerBuilder>();
         assert_send_sync::<FsWalkContextBuilder>();
+    }
+
+    // --- try_claim_subtree / is_exhausted tests ---
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_try_claim_subtree_returns_none_on_empty_walk() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+
+        let mut walk = walker().build().walk(ctx(dir.path()));
+        while walk.next().await.is_some() {}
+        assert!(walk.try_claim_subtree().is_none());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_try_claim_subtree_returns_none_on_done_walk() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+
+        let mut walk = walker().build().walk(ctx(dir.path()));
+        while walk.next().await.is_some() {}
+        assert!(walk.is_done());
+        assert!(walk.try_claim_subtree().is_none());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_is_exhausted_on_fresh_walk() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+
+        let walk = walker().build().walk(ctx(dir.path()));
+        // Root is pending, so not exhausted
+        assert!(!walk.is_exhausted());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_is_exhausted_after_full_drain() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+
+        let mut walk = walker().build().walk(ctx(dir.path()));
+        while walk.next().await.is_some() {}
+        assert!(walk.is_exhausted());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_is_exhausted_matches_next_none() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/b.txt"), "").unwrap();
+
+        let mut walk = walker().recursive(true).build().walk(ctx(dir.path()));
+        // Before calling next, not exhausted (root is pending)
+        assert!(!walk.is_exhausted());
+        // Drain
+        while walk.next().await.is_some() {}
+        // After next() returns None, is_exhausted is true
+        assert!(walk.is_exhausted());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_claim_subtree_after_root_read() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub1")).unwrap();
+        fs::create_dir(dir.path().join("sub2")).unwrap();
+        fs::create_dir(dir.path().join("sub3")).unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        // Read root: next() reads the root dir, populating pending_dirs with
+        // sub1, sub2, sub3 and ready_files with top.txt. First call yields top.txt.
+        let entry = walk.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("top.txt"));
+
+        // Pending_dirs has 3 entries; can claim while >= 2 remain.
+        assert!(walk.try_claim_subtree().is_some()); // claims sub1, [sub2, sub3] remain
+        assert!(walk.try_claim_subtree().is_some()); // claims sub2, [sub3] remains
+        assert!(walk.try_claim_subtree().is_none()); // only sub3 left, no split
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_parent_does_not_yield_from_claimed_subtree() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/child.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("other")).unwrap();
+        fs::write(dir.path().join("other/keep.txt"), "").unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        // Read root to populate pending_dirs with [other, sub] (sorted).
+        let _ = walk.next().await; // yields top.txt
+
+        // Claim "other" (first in pending_dirs after sort).
+        let claimed = walk.try_claim_subtree().unwrap();
+
+        // Parent should yield only entries from "sub", not from "other".
+        let (parent_entries, _) = collect_entries(walk).await;
+        let parent_paths: Vec<_> = parent_entries
+            .iter()
+            .map(|e| norm(e.relative_path()))
+            .collect();
+        assert_eq!(parent_paths, vec!["sub/child.txt"]);
+
+        // Claimed walk yields entries from "other".
+        let (claimed_entries, _) = collect_entries(claimed).await;
+        let claimed_paths: Vec<_> = claimed_entries
+            .iter()
+            .map(|e| norm(e.relative_path()))
+            .collect();
+        assert_eq!(claimed_paths, vec!["other/keep.txt"]);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_claimed_subtree_yields_all_descendants() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+        fs::write(dir.path().join("sub/a.txt"), "").unwrap();
+        fs::write(dir.path().join("sub/deep/b.txt"), "").unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // yields top.txt; pending_dirs = [sub, zz_unrelated]
+
+        let claimed = walk.try_claim_subtree().unwrap(); // claims sub
+        let (entries, _) = collect_entries(claimed).await;
+        let mut names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
+        names.sort();
+        assert_eq!(names, vec!["sub/a.txt", "sub/deep/b.txt"]);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_relative_path_consistent_across_parent_and_claim() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("root_file.txt"), "").unwrap();
+        fs::create_dir_all(dir.path().join("c/d")).unwrap();
+        fs::write(dir.path().join("c/d/file.txt"), "").unwrap();
+        // Sibling subdir to allow claiming.
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // yields root_file.txt; pending_dirs = [c, zz_unrelated]
+
+        let claimed = walk.try_claim_subtree().unwrap(); // claims c
+        let (entries, _) = collect_entries(claimed).await;
+        assert_eq!(entries.len(), 1);
+        // relative_path is from original root, not from "c"
+        assert_eq!(entries[0].relative_path(), Path::new("c/d/file.txt"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_nested_claim() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        fs::create_dir(dir.path().join("a/sibling")).unwrap();
+        fs::write(dir.path().join("a/mid.txt"), "").unwrap();
+        fs::write(dir.path().join("a/b/deep.txt"), "").unwrap();
+        fs::write(dir.path().join("a/sibling/keep.txt"), "").unwrap();
+        // Sibling at root to allow claiming "a".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // yields top.txt; pending_dirs = [a, zz_unrelated]
+
+        let mut claimed_a = walk.try_claim_subtree().unwrap(); // claims a
+                                                               // Read "a": yields mid.txt, pending_dirs gets [b, sibling]
+        let entry = claimed_a.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("a/mid.txt"));
+
+        // Now claim "b" from claimed_a (sorted: b before sibling).
+        let claimed_b = claimed_a.try_claim_subtree().unwrap();
+        let (b_entries, _) = collect_entries(claimed_b).await;
+        assert_eq!(b_entries.len(), 1);
+        assert_eq!(b_entries[0].relative_path(), Path::new("a/b/deep.txt"));
+
+        // claimed_a still has "sibling" left.
+        let (rest, _) = collect_entries(claimed_a).await;
+        let rest_paths: Vec<_> = rest.iter().map(|e| norm(e.relative_path())).collect();
+        assert_eq!(rest_paths, vec!["a/sibling/keep.txt"]);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_parallel_vs_serial_yields_same_entries() {
+        use std::collections::HashSet;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/a1.txt"), "").unwrap();
+        fs::write(dir.path().join("a/a2.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("b")).unwrap();
+        fs::write(dir.path().join("b/b1.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("b/c")).unwrap();
+        fs::write(dir.path().join("b/c/c1.txt"), "").unwrap();
+
+        // Serial
+        let walk = walker().recursive(true).build().walk(ctx(dir.path()));
+        let (serial_entries, _) = collect_entries(walk).await;
+        let serial_set: HashSet<_> = serial_entries
+            .iter()
+            .map(|e| norm(e.relative_path()))
+            .collect();
+
+        // Parallel: claim all subtrees
+        let mut walk = walker().recursive(true).build().walk(ctx(dir.path()));
+        let entry = walk.next().await.unwrap().unwrap(); // top.txt
+        let mut parallel_set: HashSet<String> = HashSet::new();
+        parallel_set.insert(norm(entry.relative_path()));
+
+        // Claim all available subtrees and drain them
+        let mut subtrees = Vec::new();
+        while let Some(sub) = walk.try_claim_subtree() {
+            subtrees.push(sub);
+        }
+        for sub in subtrees {
+            let (entries, _) = collect_entries(sub).await;
+            for e in entries {
+                parallel_set.insert(norm(e.relative_path()));
+            }
+        }
+        // Drain parent remainder
+        let (remaining, _) = collect_entries(walk).await;
+        for e in remaining {
+            parallel_set.insert(norm(e.relative_path()));
+        }
+
+        assert_eq!(serial_set, parallel_set);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_filter_applied_in_claimed_subtrees() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::write(dir.path().join("top.log"), "").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/a.txt"), "").unwrap();
+        fs::write(dir.path().join("sub/b.log"), "").unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
+            .build()
+            .walk(ctx(dir.path()));
+
+        // Read root: yields top.txt (top.log filtered out).
+        let entry = walk.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("top.txt"));
+
+        // Claim "sub" subtree.
+        let claimed = walk.try_claim_subtree().unwrap();
+        let (entries, _) = collect_entries(claimed).await;
+        // Only a.txt should pass filter, b.log should be filtered.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path(), Path::new("sub/a.txt"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_max_depth_honored_across_splits() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("d0.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/d1.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("a/b")).unwrap();
+        fs::write(dir.path().join("a/b/d2.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("a/b/c")).unwrap();
+        fs::write(dir.path().join("a/b/c/d3.txt"), "").unwrap();
+        // Sibling subdir to allow claiming "a".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        // max_depth=2: should yield d0.txt, a/d1.txt, a/b/d2.txt but NOT a/b/c/d3.txt.
+        let mut walk = walker()
+            .max_depth(2)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let entry = walk.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("d0.txt"));
+
+        // Claim subtree "a" (sorted before zz_unrelated).
+        let claimed = walk.try_claim_subtree().unwrap();
+        let (entries, _) = collect_entries(claimed).await;
+        let mut names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
+        names.sort();
+        // a/d1.txt (depth 1) and a/b/d2.txt (depth 2) should be yielded.
+        // a/b/c/d3.txt (depth 3) should NOT.
+        assert_eq!(names, vec!["a/b/d2.txt", "a/d1.txt"]);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sort_within_claimed_subtree() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/zebra.txt"), "").unwrap();
+        fs::write(dir.path().join("sub/apple.txt"), "").unwrap();
+        fs::write(dir.path().join("sub/mango.txt"), "").unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
+
+        let claimed = walk.try_claim_subtree().unwrap(); // claims sub
+        let (entries, _) = collect_entries(claimed).await;
+        let names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
+        assert_eq!(
+            names,
+            vec!["sub/apple.txt", "sub/mango.txt", "sub/zebra.txt"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_symlink_cycle_detection_in_claimed_subtree() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("file.txt"), "").unwrap();
+        // Create symlink back to root inside sub.
+        std::os::unix::fs::symlink(dir.path(), sub.join("link_to_root")).unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .follow_symlinks(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
+
+        let claimed = walk.try_claim_subtree().unwrap(); // claims sub
+        let (entries, errors) = collect_entries(claimed).await;
+
+        // Should yield file.txt from sub.
+        assert!(entries
+            .iter()
+            .any(|e| norm(e.relative_path()) == "sub/file.txt"));
+        // Should detect cycle.
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind() == WalkErrorKind::SymlinkCycle),
+            "expected SymlinkCycle in claimed subtree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_follow_symlinks_applies_to_claimed_subtrees() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("real.txt"), "").unwrap();
+        std::os::unix::fs::symlink(sub.join("real.txt"), sub.join("link.txt")).unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .follow_symlinks(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
+
+        let claimed = walk.try_claim_subtree().unwrap(); // claims sub
+        let (entries, errors) = collect_entries(claimed).await;
+        assert!(errors.is_empty());
+        // Both real.txt and link.txt should be yielded.
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_fatal_error_in_claimed_subtree_does_not_affect_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("good")).unwrap();
+        fs::write(dir.path().join("good/ok.txt"), "").unwrap();
+        let bad = dir.path().join("bad");
+        fs::create_dir(&bad).unwrap();
+        fs::write(bad.join("hidden.txt"), "").unwrap();
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        // Third sibling so we can claim "bad" and "good" while still leaving
+        // a pending directory in the parent.
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        // Check if we can actually trigger permission denied (not running as root)
+        let can_read = std::fs::read_dir(&bad).is_ok();
+        if can_read {
+            fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root, skip test
+        }
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let entry = walk.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("top.txt"));
+
+        // Claim "bad" subtree (sorted: bad comes before good)
+        let mut claimed_bad = walk.try_claim_subtree().unwrap();
+        // Claim "good" subtree
+        let claimed_good = walk.try_claim_subtree().unwrap();
+
+        // Bad subtree produces an error and then terminates
+        let result = claimed_bad.next().await;
+        assert!(matches!(result, Some(Err(_))));
+        // After the error, the claimed walk is done
+        assert!(claimed_bad.next().await.is_none());
+        assert!(claimed_bad.is_done());
+
+        // Good subtree should work fine, unaffected by bad subtree's error
+        let (good_entries, good_errors) = collect_entries(claimed_good).await;
+        assert!(good_errors.is_empty());
+        assert_eq!(good_entries.len(), 1);
+        assert_eq!(good_entries[0].relative_path(), Path::new("good/ok.txt"));
+
+        // Restore permissions for cleanup
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_non_fatal_error_in_claimed_subtree() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("real.txt"), "").unwrap();
+        std::os::unix::fs::symlink("/nonexistent/target/xyz", sub.join("broken")).unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .follow_symlinks(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
+
+        let claimed = walk.try_claim_subtree().unwrap(); // claims sub
+        let (entries, errors) = collect_entries(claimed).await;
+
+        // Should yield real.txt.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path(), Path::new("sub/real.txt"));
+        // Should have non-fatal error for broken symlink.
+        assert_eq!(errors.len(), 1);
+        assert!(!errors[0].is_fatal());
+        assert_eq!(errors[0].kind(), WalkErrorKind::BrokenSymlink);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_claim_when_ready_files_non_empty() {
+        let dir = tempdir().unwrap();
+        // Root has both files and subdirs.
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        fs::write(dir.path().join("b.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/c.txt"), "").unwrap();
+        // Sibling subdir to allow claiming "sub".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        // First next() reads root: files [a.txt, b.txt] go to ready_files,
+        // [sub, zz_unrelated] go to pending_dirs. Returns a.txt.
+        let entry = walk.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("a.txt"));
+
+        // Claim subtree - should NOT disturb ready_files (b.txt still there).
+        let claimed = walk.try_claim_subtree().unwrap(); // claims sub
+
+        // Parent should still yield b.txt next.
+        let entry = walk.next().await.unwrap().unwrap();
+        assert_eq!(entry.relative_path(), Path::new("b.txt"));
+
+        // Claimed should yield c.txt.
+        let (entries, _) = collect_entries(claimed).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path(), Path::new("sub/c.txt"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_claim_empty_dir_subtree() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("empty")).unwrap();
+        // Sibling subdir to allow claiming "empty".
+        fs::create_dir(dir.path().join("zz_unrelated")).unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // top.txt; pending_dirs = [empty, zz_unrelated]
+
+        let mut claimed = walk.try_claim_subtree().unwrap(); // claims empty
+        assert!(claimed.next().await.is_none());
+        assert!(claimed.is_exhausted());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_root_that_is_empty_dir() {
+        let dir = tempdir().unwrap();
+
+        let mut walk = walker().build().walk(ctx(dir.path()));
+        assert!(walk.next().await.is_none());
+        assert!(walk.is_exhausted());
+        assert!(walk.try_claim_subtree().is_none());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_try_claim_subtree_is_fifo_with_next() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("aaa")).unwrap();
+        fs::write(dir.path().join("aaa/a.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("bbb")).unwrap();
+        fs::write(dir.path().join("bbb/b.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("ccc")).unwrap();
+        fs::write(dir.path().join("ccc/c.txt"), "").unwrap();
+        // 4th sibling so we can claim 3 while always leaving >= 2 pending.
+        fs::create_dir(dir.path().join("ddd")).unwrap();
+        fs::write(dir.path().join("ddd/d.txt"), "").unwrap();
+
+        // With sort, pending_dirs after root read will be [aaa, bbb, ccc, ddd].
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let _ = walk.next().await; // top.txt
+
+        // Claims should come in FIFO order (same as next() would visit).
+        let claimed1 = walk.try_claim_subtree().unwrap();
+        let claimed2 = walk.try_claim_subtree().unwrap();
+        let claimed3 = walk.try_claim_subtree().unwrap();
+
+        let (e1, _) = collect_entries(claimed1).await;
+        let (e2, _) = collect_entries(claimed2).await;
+        let (e3, _) = collect_entries(claimed3).await;
+
+        assert_eq!(e1[0].relative_path(), Path::new("aaa/a.txt"));
+        assert_eq!(e2[0].relative_path(), Path::new("bbb/b.txt"));
+        assert_eq!(e3[0].relative_path(), Path::new("ccc/c.txt"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_mixed_claim_and_next_interleaved() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        fs::write(dir.path().join("b.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub1")).unwrap();
+        fs::write(dir.path().join("sub1/s1.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub2")).unwrap();
+        fs::write(dir.path().join("sub2/s2.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("sub3")).unwrap();
+        fs::write(dir.path().join("sub3/s3.txt"), "").unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+
+        // 1. First next() reads root: ready_files=[a.txt, b.txt], pending_dirs=[sub1, sub2, sub3]
+        let e1 = walk.next().await.unwrap().unwrap();
+        assert_eq!(e1.relative_path(), Path::new("a.txt"));
+
+        // 2. Second next() yields b.txt from ready_files
+        let e2 = walk.next().await.unwrap().unwrap();
+        assert_eq!(e2.relative_path(), Path::new("b.txt"));
+
+        // 3. After yielding root files, 3 pending subdirs remain
+        assert!(!walk.is_exhausted());
+
+        // 4. Third next() pops sub1 from pending_dirs, reads it, yields s1.txt
+        let e3 = walk.next().await.unwrap().unwrap();
+        assert_eq!(norm(e3.relative_path()), "sub1/s1.txt");
+
+        // 5. try_claim_subtree() claims sub2 (next in BFS queue)
+        let claimed = walk.try_claim_subtree().unwrap();
+
+        // 6. Parent's next() skips sub2 (claimed), pops sub3, yields s3.txt
+        let e4 = walk.next().await.unwrap().unwrap();
+        assert_eq!(norm(e4.relative_path()), "sub3/s3.txt");
+
+        // 7. Parent exhausted
+        assert!(walk.next().await.is_none());
+
+        // 8. Claimed walk yields s2.txt exactly once, then None
+        let (claimed_entries, claimed_errors) = collect_entries(claimed).await;
+        assert!(claimed_errors.is_empty());
+        assert_eq!(claimed_entries.len(), 1);
+        assert_eq!(norm(claimed_entries[0].relative_path()), "sub2/s2.txt");
+
+        // 9. Total entries: exactly the 5 files, no duplicates, no missing
+        let all: Vec<_> = [
+            norm(e1.relative_path()),
+            norm(e2.relative_path()),
+            norm(e3.relative_path()),
+            norm(e4.relative_path()),
+            norm(claimed_entries[0].relative_path()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            all,
+            vec![
+                "a.txt",
+                "b.txt",
+                "sub1/s1.txt",
+                "sub3/s3.txt",
+                "sub2/s2.txt"
+            ]
+        );
+        let as_set: std::collections::HashSet<_> = all.into_iter().collect();
+        assert_eq!(as_set.len(), 5);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_parallel_walks_run_concurrently() {
+        use std::collections::HashSet;
+
+        let dir = tempdir().unwrap();
+        // Build a moderate tree: 3 subdirs, each with 2 nested subdirs, each with files
+        for i in 0..3 {
+            let sub = dir.path().join(format!("dir{i}"));
+            fs::create_dir(&sub).unwrap();
+            for j in 0..3 {
+                fs::write(sub.join(format!("file{j}.txt")), "").unwrap();
+            }
+            for j in 0..2 {
+                let nested = sub.join(format!("nested{j}"));
+                fs::create_dir(&nested).unwrap();
+                for k in 0..3 {
+                    fs::write(nested.join(format!("deep{k}.txt")), "").unwrap();
+                }
+            }
+        }
+        // Root-level files
+        for i in 0..3 {
+            fs::write(dir.path().join(format!("root{i}.txt")), "").unwrap();
+        }
+        // Total: 3 root files + 3 dirs * (3 files + 2 nested * 3 files) = 3 + 3*9 = 30 files
+
+        // Serial walk for reference
+        let serial_walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (serial_entries, _) = collect_entries(serial_walk).await;
+        let serial_set: HashSet<String> = serial_entries
+            .iter()
+            .map(|e| norm(e.relative_path()))
+            .collect();
+        assert_eq!(serial_set.len(), 30);
+
+        // Parallel walk: prime, claim all subtrees, spawn concurrently
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        // Prime: first next() reads root, populating pending_dirs
+        let first = walk.next().await.unwrap().unwrap();
+        let first_path = norm(first.relative_path());
+
+        // Claim all available subtrees
+        let mut claimed = Vec::new();
+        while let Some(sub) = walk.try_claim_subtree() {
+            claimed.push(sub);
+        }
+
+        // Spawn parent and all claimed subtrees concurrently
+        let parent_task = tokio::spawn(async move { collect_entries(walk).await });
+        let sub_tasks: Vec<_> = claimed
+            .into_iter()
+            .map(|sub| tokio::spawn(async move { collect_entries(sub).await }))
+            .collect();
+
+        // Await all concurrently
+        let (parent_entries, _) = parent_task.await.expect("parent task panicked");
+        let sub_results: Vec<_> = futures_util::future::join_all(sub_tasks).await;
+
+        // Combine all entries
+        let mut parallel_set: HashSet<String> = HashSet::new();
+        parallel_set.insert(first_path);
+        for e in &parent_entries {
+            parallel_set.insert(norm(e.relative_path()));
+        }
+        for result in sub_results {
+            let (entries, _) = result.expect("subtree task panicked");
+            for e in &entries {
+                parallel_set.insert(norm(e.relative_path()));
+            }
+        }
+
+        assert_eq!(
+            parallel_set, serial_set,
+            "concurrent walks must yield the same entries as serial walk"
+        );
     }
 }

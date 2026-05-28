@@ -73,6 +73,14 @@ pub struct Args {
     /// Path to manifest JSON for concurrent transfers
     #[arg(long)]
     manifest: Option<String>,
+
+    /// Directory to write dial9 runtime traces (enables tracing when set)
+    #[arg(long)]
+    trace_dir: Option<String>,
+
+    /// Enable CPU profiling in dial9 traces (Linux only, requires --trace-dir)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    cpu_profiling: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -267,14 +275,17 @@ async fn do_recursive_upload(
         .source(source)
         .bucket(bucket)
         .key_prefix(key_prefix)
-        .recursive(true)
-        .send()
-        .await?;
+        .walker(
+            aws_sdk_s3_transfer_manager::io::walk::FsWalker::builder()
+                .recursive(true)
+                .build(),
+        )
+        .initiate()?;
 
     let output = handle.join().await?;
     tracing::info!("recursive upload output: {output:?}");
 
-    let transfer_size_bytes = output.total_bytes_transferred();
+    let transfer_size_bytes = output.metrics.network_tx;
     println!(
         "uploaded {} objects totalling {transfer_size_bytes} bytes ({})",
         output.objects_uploaded(),
@@ -359,11 +370,48 @@ async fn main() -> Result<(), BoxError> {
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
     };
 
-    let tm_config = aws_sdk_s3_transfer_manager::from_env()
+    #[cfg(feature = "dial9")]
+    let trace_dir = args
+        .trace_dir
+        .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok());
+    #[cfg(feature = "dial9")]
+    let telemetry_guard = if let Some(ref trace_dir) = trace_dir {
+        use dial9_tokio_telemetry::telemetry::{RotatingWriter, TelemetryCore};
+        let _ = std::fs::create_dir_all(trace_dir);
+        let writer = RotatingWriter::builder()
+            .base_path(format!("{trace_dir}/trace.bin"))
+            .max_file_size(64 * 1024 * 1024)
+            .max_total_size(512 * 1024 * 1024)
+            .build()
+            .expect("failed to create trace writer");
+        let cpu_profiling = if args.cpu_profiling {
+            Some(dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig::default())
+        } else {
+            None
+        };
+        let guard = TelemetryCore::builder()
+            .writer(writer)
+            .trace_path(format!("{trace_dir}/trace.bin"))
+            .maybe_cpu_profiling(cpu_profiling)
+            .build()
+            .expect("failed to create telemetry session");
+        guard.enable();
+        Some(guard)
+    } else {
+        None
+    };
+
+    #[allow(unused_mut)]
+    let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
-        .part_size(PartSize::Target(args.part_size))
-        .load()
-        .await;
+        .part_size(PartSize::Target(args.part_size));
+
+    #[cfg(feature = "dial9")]
+    if let Some(guard) = telemetry_guard {
+        config_loader = config_loader.telemetry_guard(guard);
+    }
+
+    let tm_config = config_loader.load().await;
 
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 

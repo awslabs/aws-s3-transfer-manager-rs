@@ -495,8 +495,7 @@ async fn test_objects_transfer() {
         .bucket(bucket_name.as_str())
         .set_key_prefix(Some(generate_key("test")))
         .source(temp_dir.path())
-        .send()
-        .await
+        .initiate()
         .unwrap();
     upload_handle.join().await.unwrap();
 }

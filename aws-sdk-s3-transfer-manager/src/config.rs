@@ -72,6 +72,8 @@ pub struct Config {
     concurrency: ConcurrencyMode,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
+    #[cfg(feature = "dial9")]
+    pub(crate) telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
 }
 
 impl Config {
@@ -109,6 +111,14 @@ impl Config {
             .take()
             .expect("s3 client source already taken")
     }
+
+    /// Take the telemetry guard, if set.
+    #[cfg(feature = "dial9")]
+    pub(crate) fn take_telemetry_guard(
+        &mut self,
+    ) -> Option<dial9_tokio_telemetry::telemetry::TelemetryGuard> {
+        self.telemetry_guard.take()
+    }
 }
 
 /// Fluent style builder for [Config]
@@ -120,6 +130,8 @@ pub struct Builder {
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
+    #[cfg(feature = "dial9")]
+    telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
 }
 
 impl Builder {
@@ -217,6 +229,18 @@ impl Builder {
         self
     }
 
+    /// Set a dial9 telemetry guard for runtime tracing.
+    ///
+    /// When set, each managed worker runtime will be traced via dial9-tokio-telemetry.
+    #[cfg(feature = "dial9")]
+    pub fn telemetry_guard(
+        mut self,
+        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
+    ) -> Self {
+        self.telemetry_guard = Some(guard);
+        self
+    }
+
     /// Consumes the builder and constructs a [`Config`]
     pub fn build(self) -> Config {
         let s3_client_source = match (self.client, self.s3_client_config) {
@@ -230,6 +254,8 @@ impl Builder {
             concurrency: self.concurrency,
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
+            #[cfg(feature = "dial9")]
+            telemetry_guard: self.telemetry_guard,
         }
     }
 }
