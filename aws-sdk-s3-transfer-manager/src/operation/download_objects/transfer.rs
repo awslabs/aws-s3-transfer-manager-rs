@@ -168,6 +168,18 @@ impl DownloadObjectsTransfer {
     pub(crate) fn poll_work(&self) -> PollWork {
         let mut state = self.inner.state.lock();
 
+        // Prefetch the next listing page before draining terminal children, so
+        // a steady child-completion stream can't starve discovery. The walk is
+        // single-flight (walk_in_flight) and dispatch_walk's pipeline_depth
+        // capacity gate pauses prefetch when the pipeline is full, so this
+        // keeps at most one page in flight. Skipped once the transfer is no
+        // longer active so cancellation/failure stops issuing new listings.
+        if self.inner.ctx.is_active() {
+            if let Some(work) = self.dispatch_walk(&mut state) {
+                return work;
+            }
+        }
+
         // Phase 1: drain terminal children
         if let Some(batch) = self.drain_terminal_children(&mut state) {
             state.reaping_in_flight += 1;
@@ -192,12 +204,15 @@ impl DownloadObjectsTransfer {
             self.merge_spawned(&mut state, spawned);
         }
 
-        // Phase 3: check terminal, dispatch walk
+        // Phase 3: check terminal
         if let Some(result) = self.check_terminal(&state) {
             return result;
         }
 
-        self.dispatch_walk(&mut state)
+        // Nothing dispatchable now: walk in flight, pipeline full, or walk
+        // done with children still draining.
+        self.inner.ctx.set_pending();
+        PollWork::Pending
     }
 
     /// Collect children that have reached a terminal state (success, failure,
@@ -411,41 +426,35 @@ impl DownloadObjectsTransfer {
         None
     }
 
-    fn dispatch_walk(&self, state: &mut State) -> PollWork {
-        // Don't dispatch if walk is already in flight or done
+    /// Dispatch a listing page if the walk is idle, not done, and the pipeline
+    /// has capacity. Returns `None` when no listing can be dispatched (the
+    /// caller falls through to draining/spawning and ultimately `set_pending`).
+    fn dispatch_walk(&self, state: &mut State) -> Option<PollWork> {
+        // Already listing, or pipeline full (backpressure on listing).
         if state.walk_in_flight {
-            self.inner.ctx.set_pending();
-            return PollWork::Pending;
+            return None;
         }
-
-        // Don't dispatch if pipeline is full (backpressure on listing)
         let active = state.children.len() + state.children_reserved + state.pending_entries.len();
         if active >= self.inner.pipeline_depth {
-            self.inner.ctx.set_pending();
-            return PollWork::Pending;
+            return None;
         }
 
-        // Take the walk out for execution
+        // Take the walk out for execution; put it back if it's already done.
         let walk = match state.walk.take() {
             Some(w) if !w.is_done() => w,
             Some(w) => {
-                // Walk is done, put it back
                 state.walk = Some(w);
-                self.inner.ctx.set_pending();
-                return PollWork::Pending;
+                return None;
             }
-            None => {
-                self.inner.ctx.set_pending();
-                return PollWork::Pending;
-            }
+            None => return None,
         };
 
         state.walk_in_flight = true;
-        PollWork::Ready(IoRequest {
+        Some(PollWork::Ready(IoRequest {
             data: Some(Box::new(DownloadObjectsWork::AdvanceWalker {
                 walk: Some(walk),
             })),
-        })
+        }))
     }
 
     // -----------------------------------------------------------------------
