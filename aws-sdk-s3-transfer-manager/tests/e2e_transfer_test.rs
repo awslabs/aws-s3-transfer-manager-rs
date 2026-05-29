@@ -11,7 +11,7 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::{DownloadFilter, PartSize};
+use aws_sdk_s3_transfer_manager::types::PartSize;
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::future::Future;
 use std::pin::Pin;
@@ -463,10 +463,14 @@ async fn test_objects_transfer() {
         .download_objects()
         .bucket(bucket_name.as_str())
         .key_prefix("pre-existing")
-        .set_filter(Some(DownloadFilter::from(sse_c_filter)))
+        .walker(
+            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+                .filter(sse_c_filter)
+                .prefix("pre-existing")
+                .build(),
+        )
         .destination(temp_dir.path())
-        .send()
-        .await
+        .initiate()
         .unwrap();
     download_handle.join().await.unwrap();
 

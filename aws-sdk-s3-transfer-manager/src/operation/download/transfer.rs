@@ -603,7 +603,6 @@ mod tests {
     use crate::transfer::TransferContext;
     use crate::transfer::{IoRequest, WorkOutcome};
     use crate::types::BucketType;
-    use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -632,7 +631,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -733,7 +732,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -877,7 +876,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")

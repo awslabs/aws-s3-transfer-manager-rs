@@ -62,9 +62,6 @@
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
 
-/// Default in-flight concurrency
-pub(crate) const DEFAULT_CONCURRENCY: usize = 128;
-
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
 

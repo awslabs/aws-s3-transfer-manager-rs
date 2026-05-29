@@ -9,14 +9,6 @@ use aws_smithy_types::error::operation::BuildError;
 
 use std::path::{Path, PathBuf};
 
-/// Default per-request memory cap on concurrently-materialized child upload transfers.
-///
-/// Acts as a backstop on memory growth; the scheduler's hierarchical
-/// CFS handles fairness and rate. Users can override via
-/// [`UploadObjectsInputBuilder::max_concurrent_uploads`] or the
-/// corresponding fluent builder method.
-const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 4096;
-
 /// Input type for uploading multiple objects.
 ///
 /// Walk behavior (recursion, symbolic link handling, file filtering, sort
@@ -130,7 +122,7 @@ impl UploadObjectsInputBuilder {
             failure_policy: self.failure_policy,
             max_concurrent_uploads: self
                 .max_concurrent_uploads
-                .unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS),
+                .unwrap_or(crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN),
         })
     }
 

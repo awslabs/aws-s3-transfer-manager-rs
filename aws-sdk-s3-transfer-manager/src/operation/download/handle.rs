@@ -417,7 +417,6 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::transfer::TransferContext;
     use crate::types::BucketType;
-    use crate::DEFAULT_CONCURRENCY;
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -443,7 +442,7 @@ mod tests {
                     &[]
                 ))
                 .build(),
-            DEFAULT_CONCURRENCY,
+            128,
         );
         let input = DownloadInput::builder()
             .bucket("test-bucket")

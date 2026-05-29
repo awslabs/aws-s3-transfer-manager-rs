@@ -117,14 +117,16 @@ struct DownloadObjectsTransferInner {
 impl DownloadObjectsTransfer {
     pub(crate) fn new(
         ctx: TransferContext,
+        input: &crate::operation::download_objects::DownloadObjectsInput,
         walk: S3Walk,
-        bucket: String,
-        destination: PathBuf,
-        key_prefix: Option<String>,
-        delimiter: Option<String>,
-        failure_policy: FailedTransferPolicy,
         pipeline_depth: usize,
     ) -> Self {
+        let bucket = input.bucket().unwrap().to_string();
+        let destination = input.destination().unwrap().to_path_buf();
+        let key_prefix = input.key_prefix().map(|s| s.to_string());
+        let delimiter = input.delimiter().map(|s| s.to_string());
+        let failure_policy = input.failure_policy().clone();
+
         Self {
             inner: Arc::new(DownloadObjectsTransferInner {
                 ctx,
@@ -146,6 +148,9 @@ impl DownloadObjectsTransfer {
                 pipeline_depth,
             }),
         }
+    }
+    pub(crate) fn ctx(&self) -> &TransferContext {
+        &self.inner.ctx
     }
 
     pub(crate) fn successful_downloads(&self) -> u64 {
@@ -382,12 +387,14 @@ impl DownloadObjectsTransfer {
     fn dispatch_walk(&self, state: &mut State) -> PollWork {
         // Don't dispatch if walk is already in flight or done
         if state.walk_in_flight {
+            self.inner.ctx.set_pending();
             return PollWork::Pending;
         }
 
         // Don't dispatch if pipeline is full (backpressure on listing)
         let active = state.children.len() + state.children_reserved + state.pending_entries.len();
         if active >= self.inner.pipeline_depth {
+            self.inner.ctx.set_pending();
             return PollWork::Pending;
         }
 
@@ -397,9 +404,13 @@ impl DownloadObjectsTransfer {
             Some(w) => {
                 // Walk is done, put it back
                 state.walk = Some(w);
+                self.inner.ctx.set_pending();
                 return PollWork::Pending;
             }
-            None => return PollWork::Pending,
+            None => {
+                self.inner.ctx.set_pending();
+                return PollWork::Pending;
+            }
         };
 
         state.walk_in_flight = true;
@@ -476,6 +487,16 @@ impl DownloadObjectsTransfer {
                 ErrorKind::ObjectNotDiscoverable,
                 format!("S3 listing failed: {err}"),
             ));
+            // If no children are in flight, signal terminal immediately.
+            // Otherwise try_wake will re-poll and check_terminal will handle it.
+            if state.children.is_empty()
+                && state.children_reserved == 0
+                && state.reaping_in_flight == 0
+            {
+                drop(state);
+                self.inner.ctx.signal_terminal();
+                return WorkOutcome::Success { data: None };
+            }
         } else {
             state.pending_entries.extend(entries);
             if !walk.is_done() {
@@ -611,7 +632,6 @@ mod tests {
     use super::*;
     use crate::io::walk::{S3WalkContext, S3Walker};
     use crate::transfer::TransferContext;
-    use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
     use aws_sdk_s3::types::Object;
@@ -677,7 +697,7 @@ mod tests {
         crate::transfer::StateMachineTerminalReceiver,
     ) {
         let config = crate::Config::builder().client(s3_client.clone()).build();
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
@@ -691,16 +711,13 @@ mod tests {
             .scheduler
             .register_empty_group_for_test(ctx.id.id);
 
-        let transfer = DownloadObjectsTransfer::new(
-            ctx,
-            walk,
-            "test-bucket".to_string(),
-            dest.to_path_buf(),
-            None,
-            None,
-            policy,
-            1000,
-        );
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(dest)
+            .failure_policy(policy)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
         (transfer, completion_rx)
     }
 
@@ -1041,7 +1058,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
         let config = crate::Config::builder().client(client.clone()).build();
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let walk = S3Walker::builder().prefix("backup/2023/").build().walk(
             S3WalkContext::builder()
@@ -1055,16 +1072,14 @@ mod tests {
             .scheduler
             .register_empty_group_for_test(ctx.id.id);
 
-        let transfer = DownloadObjectsTransfer::new(
-            ctx,
-            walk,
-            "test-bucket".to_string(),
-            dir.path().to_path_buf(),
-            Some("backup/2023/".to_string()),
-            None,
-            FailedTransferPolicy::Continue,
-            1000,
-        );
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(dir.path())
+            .key_prefix("backup/2023/")
+            .failure_policy(FailedTransferPolicy::Continue)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
 
         timeout(Duration::from_secs(10), async {
             drive_transfer(&transfer).await;

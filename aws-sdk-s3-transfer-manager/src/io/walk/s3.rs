@@ -4,13 +4,14 @@
  */
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use aws_sdk_s3::types::Object;
 
 use super::error::{WalkError, WalkErrorKind};
 use crate::types::BucketType;
 
-type FilterFn = Box<dyn Fn(&Object) -> bool + Send + Sync>;
+type FilterFn = Arc<dyn Fn(&Object) -> bool + Send + Sync>;
 
 /// Result of listing a single page of S3 objects.
 ///
@@ -49,6 +50,7 @@ pub(crate) struct ListPageResult {
 //   but don't yet have a configurable refuse policy for sync operations.
 // TODO(walker): resume token persistence — save/restore continuation state
 //   across process restarts.
+#[derive(Clone)]
 pub struct S3Walker {
     prefix: Option<String>,
     delimiter: Option<String>,
@@ -72,6 +74,23 @@ impl std::fmt::Debug for S3Walker {
             .field("page_size", &self.page_size)
             .finish()
     }
+}
+
+impl Default for S3Walker {
+    /// A default walker that filters out 0-byte folder markers (keys ending in '/').
+    fn default() -> Self {
+        S3Walker::builder()
+            .filter(exclude_s3_folder_markers)
+            .build()
+    }
+}
+
+/// Exclude 0-byte objects whose key ends with `/`. These are "folder markers"
+/// created by the S3 console and have no meaningful content to download.
+pub(crate) fn exclude_s3_folder_markers(obj: &Object) -> bool {
+    let dominated_by_slash = obj.key().unwrap_or("").ends_with('/');
+    let is_zero_byte = obj.size().unwrap_or(1) == 0;
+    !(dominated_by_slash && is_zero_byte)
 }
 
 impl S3Walker {
@@ -189,7 +208,7 @@ impl S3WalkerBuilder {
     /// Returning `false` drops the object silently.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&Object) -> bool + Send + Sync + 'static) -> Self {
-        self.filter = Some(Box::new(f));
+        self.filter = Some(Arc::new(f));
         self
     }
 
@@ -467,7 +486,7 @@ impl S3Walk {
 
         let mut objects: Vec<Object> = output.contents.unwrap_or_default();
         if let Some(ref filter) = self.config.filter {
-            objects.retain(filter);
+            objects.retain(|obj| filter(obj));
         }
 
         let common_prefixes = output

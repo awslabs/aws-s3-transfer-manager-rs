@@ -1186,7 +1186,6 @@ mod tests {
     use super::*;
     use crate::transfer::TransferContext;
     use crate::types::FailedTransferPolicy;
-    use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use std::fs;
@@ -1292,7 +1291,7 @@ mod tests {
         crate::transfer::StateMachineTerminalReceiver,
     ) {
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let input = super::super::UploadObjectsInputBuilder::default()
             .bucket("test-bucket")
@@ -1415,7 +1414,7 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
 
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::new_for_test(config, 128);
 
         let input = super::super::UploadObjectsInputBuilder::default()
             .bucket("test-bucket")

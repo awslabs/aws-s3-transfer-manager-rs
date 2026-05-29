@@ -710,7 +710,6 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -719,7 +718,7 @@ mod tests {
     fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
         let handle = crate::client::Handle::new_for_test(
             crate::Config::builder().client(s3_client).build(),
-            DEFAULT_CONCURRENCY,
+            128,
         );
 
         let input = UploadInput::builder()
@@ -903,7 +902,7 @@ mod tests {
 
         let handle = crate::client::Handle::new_for_test(
             crate::Config::builder().client(s3_client).build(),
-            DEFAULT_CONCURRENCY,
+            128,
         );
         let input = UploadInput::builder()
             .bucket("test-bucket")
