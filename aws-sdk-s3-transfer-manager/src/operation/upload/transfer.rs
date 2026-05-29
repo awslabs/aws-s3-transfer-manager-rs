@@ -716,9 +716,8 @@ mod tests {
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder().client(s3_client).build(),
-            128,
         );
 
         let input = UploadInput::builder()
@@ -900,9 +899,8 @@ mod tests {
         tmp.write_all(&payload).unwrap();
         tmp.flush().unwrap();
 
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder().client(s3_client).build(),
-            128,
         );
         let input = UploadInput::builder()
             .bucket("test-bucket")

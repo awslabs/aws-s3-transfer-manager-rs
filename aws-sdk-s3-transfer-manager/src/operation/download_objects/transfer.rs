@@ -697,7 +697,7 @@ mod tests {
         crate::transfer::StateMachineTerminalReceiver,
     ) {
         let config = crate::Config::builder().client(s3_client.clone()).build();
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
@@ -733,6 +733,41 @@ mod tests {
                 PollWork::Done => break,
             }
         }
+    }
+
+    /// Setup that enqueues the transfer into the scheduler (for managed-runtime tests).
+    /// Returns the transfer and completion receiver. The scheduler drives execution.
+    fn setup_enqueued(
+        dest: &Path,
+        policy: FailedTransferPolicy,
+        s3_client: aws_sdk_s3::Client,
+        handle: std::sync::Arc<crate::client::Handle>,
+    ) -> (
+        DownloadObjectsTransfer,
+        crate::transfer::StateMachineTerminalReceiver,
+    ) {
+        let walk = S3Walker::builder().build().walk(
+            S3WalkContext::builder()
+                .client(s3_client)
+                .bucket("test-bucket")
+                .build(),
+        );
+
+        let (ctx, completion_rx) = TransferContext::new(handle.clone());
+
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(dest)
+            .failure_policy(policy)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+
+        (transfer, completion_rx)
     }
 
     // --- Key derivation tests (ported from worker.rs) ---
@@ -1058,7 +1093,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
         let config = crate::Config::builder().client(client.clone()).build();
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().prefix("backup/2023/").build().walk(
             S3WalkContext::builder()
@@ -1174,5 +1209,110 @@ mod tests {
         .expect("cancelled transfer should terminate");
 
         assert!(!transfer.inner.ctx.is_active());
+    }
+
+    // --- Managed-runtime tests ---
+    // These exercise the real scheduler dispatch path (managed threads drive
+    // poll_work/execute). Catches bugs like missing set_pending that only
+    // manifest when work crosses thread boundaries.
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_happy_path_managed_runtime() {
+        let dir = tempdir().unwrap();
+        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+
+        let (transfer, completion_rx) = setup_enqueued(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            handle,
+        );
+
+        timeout(Duration::from_secs(10), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 3);
+        assert!(dir.path().join("a.txt").exists());
+        assert!(dir.path().join("b.txt").exists());
+        assert!(dir.path().join("c.txt").exists());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_many_objects_managed_runtime() {
+        let dir = tempdir().unwrap();
+
+        let objects: Vec<Object> = (0..20)
+            .map(|i| {
+                Object::builder()
+                    .key(format!("file{i:02}.txt"))
+                    .size(2)
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(objects.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(2)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
+                .build()
+        });
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+
+        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+
+        let (transfer, completion_rx) = setup_enqueued(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            s3_client,
+            handle,
+        );
+
+        timeout(Duration::from_secs(10), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 20);
+        for i in 0..20 {
+            assert!(dir.path().join(format!("file{i:02}.txt")).exists());
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_fatal_walker_error_managed_runtime() {
+        let dir = tempdir().unwrap();
+        let s3_client = mock_s3_list_failure();
+
+        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+
+        let (transfer, completion_rx) = setup_enqueued(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            s3_client,
+            handle,
+        );
+
+        timeout(Duration::from_secs(10), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 0);
+        assert!(transfer.ctx().is_failed());
     }
 }

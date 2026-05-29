@@ -1291,7 +1291,7 @@ mod tests {
         crate::transfer::StateMachineTerminalReceiver,
     ) {
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
             .bucket("test-bucket")
@@ -1414,7 +1414,7 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
 
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
             .bucket("test-bucket")

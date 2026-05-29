@@ -631,7 +631,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -732,7 +732,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")
@@ -876,7 +876,7 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
 
-        let handle = crate::client::Handle::new_for_test(config, 128);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = DownloadInput::builder()
             .bucket("test-bucket")

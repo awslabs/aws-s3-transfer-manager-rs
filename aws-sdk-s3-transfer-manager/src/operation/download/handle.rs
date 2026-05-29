@@ -434,7 +434,7 @@ mod tests {
     /// `DownloadHandle` or `ManagedDownloadHandle` around it to test the
     /// post-cancel `join()` contract.
     fn make_cancelled_download_inner() -> (DownloadHandleInner, SlotBodyConsumer) {
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
                 .client(aws_smithy_mocks::mock_client!(
                     aws_sdk_s3,
@@ -442,7 +442,6 @@ mod tests {
                     &[]
                 ))
                 .build(),
-            128,
         );
         let input = DownloadInput::builder()
             .bucket("test-bucket")

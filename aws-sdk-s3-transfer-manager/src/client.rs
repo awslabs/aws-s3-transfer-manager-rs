@@ -84,6 +84,37 @@ impl Handle {
         })
     }
 
+    /// Test handle using the ambient tokio runtime (no OS threads spawned).
+    ///
+    /// Use for: state machine logic, poll_work/execute correctness, mock SDK
+    /// interactions. Fast and deterministic.
+    ///
+    /// Does NOT exercise: managed thread dispatch, per-thread HTTP clients,
+    /// cross-runtime wake semantics.
+    #[cfg(test)]
+    pub(crate) fn test_handle_tokio(config: crate::Config) -> Arc<Self> {
+        Self::new_for_test(config, 128)
+    }
+
+    /// Test handle with real managed threads (4 OS threads).
+    ///
+    /// Use for: end-to-end dispatch/wake correctness, verifying behavior
+    /// under real thread scheduling. Catches bugs like missing `set_pending`
+    /// that only manifest when work is dispatched across thread boundaries.
+    ///
+    /// The outer test can use `#[tokio::test]` (single-thread) — managed
+    /// threads own their own runtimes independently.
+    #[cfg(test)]
+    pub(crate) fn test_handle_managed(config: crate::Config) -> Arc<Self> {
+        Self::new_for_test_with_runtime(config, 128, |weak| {
+            Arc::new(
+                crate::runtime::ManagedThreadRuntime::builder(weak)
+                    .topology(crate::runtime::Topology::uniform(4))
+                    .build(),
+            )
+        })
+    }
+
     /// Create a Handle for testing with a custom runtime factory.
     #[cfg(test)]
     pub(crate) fn new_for_test_with_runtime(
