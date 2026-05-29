@@ -546,7 +546,7 @@ impl UploadTransfer {
         let send_start = std::time::Instant::now();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            ?transfer_id,
+            tid = %transfer_id,
             content_length,
             is_file_backed,
             "put_object.send_enter",
@@ -563,7 +563,7 @@ impl UploadTransfer {
             Ok(resp) => {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_TRANSFER,
-                    ?transfer_id,
+                    tid = %transfer_id,
                     elapsed_ms = send_start.elapsed().as_millis() as u64,
                     "put_object.send_exit_ok",
                 );
@@ -572,7 +572,7 @@ impl UploadTransfer {
             Err(e) => {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_TRANSFER,
-                    ?transfer_id,
+                    tid = %transfer_id,
                     elapsed_ms = send_start.elapsed().as_millis() as u64,
                     error = %e,
                     "put_object.send_exit_err",

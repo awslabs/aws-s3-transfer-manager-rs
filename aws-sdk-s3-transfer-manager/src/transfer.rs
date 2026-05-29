@@ -599,7 +599,7 @@ impl TransferContext {
         self.wake_flag.set_pending();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            id = %self.id,
+            tid = %self.id,
             "ctx.set_pending",
         );
     }
@@ -615,14 +615,14 @@ impl TransferContext {
         if self.wake_flag.take_pending() {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                id = %self.id,
+                tid = %self.id,
                 "ctx.try_wake.fired",
             );
             self.handle.scheduler.wake(self.id);
         } else {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                id = %self.id,
+                tid = %self.id,
                 "ctx.try_wake.skipped",
             );
         }

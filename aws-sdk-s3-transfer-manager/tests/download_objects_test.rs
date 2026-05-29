@@ -513,12 +513,11 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
 
 /// When a child GetObject fails under Abort policy, `join()` returns an error.
 #[tokio::test]
-#[ignore] // TODO: singular download error path doesn't terminate child on non-retryable error
 async fn test_failed_get_object_should_cancel_the_operation() {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    timeout(Duration::from_secs(30), async {
+    timeout(Duration::from_secs(10), async {
         let bucket = MockBucket::builder()
             .key_with_size("key1", 12)
             .key_with_error("key2")

@@ -7,9 +7,7 @@
 //!
 //! Mirrors the `upload_objects` state machine: a single S3 listing walker
 //! discovers objects, the parent spawns child downloads (via
-//! [`Download::orchestrate_to_path_child`]), and reaps them as they complete.
-
-#![allow(dead_code)] // Not wired into production yet (chunk 2)
+//! [`Download::orchestrate_with_sink`]), and reaps them as they complete.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -221,6 +219,13 @@ impl DownloadObjectsTransfer {
             .filter_map(|id| state.children.remove(&id))
             .collect();
 
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %self.inner.ctx.id,
+            reaping = batch.len(),
+            remaining_children = state.children.len(),
+            "download_objects draining terminal children",
+        );
         Some(batch)
     }
 
@@ -242,6 +247,13 @@ impl DownloadObjectsTransfer {
     fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
         let handle = &self.inner.ctx.handle;
         let parent_id = self.inner.ctx.id.id;
+
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %self.inner.ctx.id,
+            count = entries.len(),
+            "download_objects spawning children",
+        );
 
         entries
             .into_iter()
@@ -364,9 +376,17 @@ impl DownloadObjectsTransfer {
                 && state.reaping_in_flight == 0
                 && !state.walk_in_flight
             {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    tid = %self.inner.ctx.id,
+                    successful = state.successful_downloads,
+                    failed = state.failed.len(),
+                    "download_objects terminal (cancelled/failed), signaling",
+                );
                 self.inner.ctx.signal_terminal();
                 return Some(PollWork::Done);
             }
+            return None;
         }
 
         // Check if walk is done and no more work to do
@@ -377,6 +397,13 @@ impl DownloadObjectsTransfer {
             && state.children_reserved == 0
             && state.reaping_in_flight == 0
         {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %self.inner.ctx.id,
+                successful = state.successful_downloads,
+                failed = state.failed.len(),
+                "download_objects terminal (walk exhausted), signaling",
+            );
             self.inner.ctx.signal_terminal();
             return Some(PollWork::Done);
         }
@@ -470,6 +497,7 @@ impl DownloadObjectsTransfer {
                     // Non-fatal errors: log and continue
                     tracing::warn!(
                         target: crate::telemetry::TARGET_TRANSFER,
+                        tid = %self.inner.ctx.id,
                         error = %err,
                         "non-fatal walker error, continuing"
                     );
@@ -483,25 +511,36 @@ impl DownloadObjectsTransfer {
         state.walk_in_flight = false;
 
         if let Some(err) = fatal_error {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %self.inner.ctx.id,
+                error = %err,
+                "download_objects fatal walker error",
+            );
             self.inner.ctx.set_failed(Error::new(
                 ErrorKind::ObjectNotDiscoverable,
                 format!("S3 listing failed: {err}"),
             ));
-            // If no children are in flight, signal terminal immediately.
-            // Otherwise try_wake will re-poll and check_terminal will handle it.
-            if state.children.is_empty()
-                && state.children_reserved == 0
-                && state.reaping_in_flight == 0
-            {
-                drop(state);
-                self.inner.ctx.signal_terminal();
-                return WorkOutcome::Success { data: None };
-            }
         } else {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %self.inner.ctx.id,
+                discovered = entries.len(),
+                walk_done = walk.is_done(),
+                "download_objects walker advanced",
+            );
             state.pending_entries.extend(entries);
             if !walk.is_done() {
                 state.walk = Some(walk);
             }
+        }
+
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition: check and signal here rather than deferring to
+        // a subsequent poll_work.
+        if self.check_terminal(&state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
         }
 
         drop(state);
@@ -541,6 +580,13 @@ impl DownloadObjectsTransfer {
 
         let mut state = self.inner.state.lock();
         state.reaping_in_flight -= 1;
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition: check and signal here rather than deferring to
+        // a subsequent poll_work.
+        if self.check_terminal(&state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
         drop(state);
         // Wake: freed pipeline capacity may unblock dispatch_walk or spawning.
         self.inner.ctx.try_wake();

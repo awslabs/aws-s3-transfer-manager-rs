@@ -268,7 +268,7 @@ impl Scheduler {
             }
         }
 
-        tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, "transfer enqueued");
+        tracing::debug!(target: telemetry::TARGET_SCHEDULING, tid = %id, "transfer enqueued");
         // Drive `generate_work` unless we're already inside it on this
         // thread (the parent's `poll_work` called `spawn_children` →
         // `enqueue_transfer`). The cross-thread `generate_work_lock`
@@ -315,7 +315,7 @@ impl Scheduler {
                 let _ = self.0.ready_set.insert(desc);
                 tracing::trace!(
                     target: telemetry::TARGET_SCHEDULING,
-                    id = %id,
+                    tid = %id,
                     "wake",
                 );
                 self.generate_work();
@@ -323,7 +323,7 @@ impl Scheduler {
             None => {
                 tracing::trace!(
                     target: telemetry::TARGET_SCHEDULING,
-                    id = %id,
+                    tid = %id,
                     "wake.not_found",
                 );
             }
@@ -412,7 +412,7 @@ impl Scheduler {
         self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
         desc.work_purged(purged);
         desc.notify_idle();
-        tracing::debug!(target: telemetry::TARGET_SCHEDULING, id = %id, purged, "transfer cancelled");
+        tracing::debug!(target: telemetry::TARGET_SCHEDULING, tid = %id, purged, "transfer cancelled");
     }
 
     /// Set the priority of a transfer.
@@ -444,7 +444,7 @@ impl Scheduler {
         };
         tracing::trace!(
             target: telemetry::TARGET_SCHEDULING,
-            id = %work.descriptor.id(),
+            tid = %work.descriptor.id(),
             ?elapsed,
             outcome = outcome_tag,
             "work completed",
@@ -644,7 +644,7 @@ impl Scheduler {
                         pending_count += 1;
                         tracing::trace!(
                             target: telemetry::TARGET_SCHEDULING,
-                            id = %id,
+                            tid = %id,
                             "poll_work.pending",
                         );
                         // Release-and-recheck. A wake arriving in this
@@ -661,7 +661,7 @@ impl Scheduler {
                         done_count += 1;
                         tracing::trace!(
                             target: telemetry::TARGET_SCHEDULING,
-                            id = %id,
+                            tid = %id,
                             "poll_work.done",
                         );
                         claim.release();
@@ -692,7 +692,7 @@ impl Scheduler {
                         // handles terminal transition + child cascade.
                         tracing::error!(
                             target: telemetry::TARGET_SCHEDULING,
-                            id = %id,
+                            tid = %id,
                             "panic in poll_work, forcing terminal",
                         );
                         drop(claim);

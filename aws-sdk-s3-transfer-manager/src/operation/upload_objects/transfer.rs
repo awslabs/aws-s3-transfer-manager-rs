@@ -123,7 +123,7 @@ impl Drop for Reservation {
             state.children_reserved = state.children_reserved.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.transfer.ctx.id,
+                tid = %self.transfer.ctx.id,
                 count = self.count,
                 "Reservation dropped unconsumed; children_reserved recovered"
             );
@@ -207,7 +207,7 @@ impl Drop for ReapingBatch {
             state.reaping_in_flight = state.reaping_in_flight.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.transfer.ctx.id,
+                tid = %self.transfer.ctx.id,
                 count = self.count,
                 "ReapingBatch dropped unconsumed; reaping_in_flight recovered"
             );
@@ -296,7 +296,7 @@ impl Drop for WalkSlot {
             }
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.transfer.ctx.id,
+                tid = %self.transfer.ctx.id,
                 walk_id = self.walk_id,
                 "WalkSlot dropped unconsumed; in_flight_walks recovered"
             );
@@ -550,7 +550,7 @@ impl UploadObjectsTransfer {
         let cause = cause.into();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
         self.inner.ctx.set_failed(crate::error::Error::new(
@@ -710,7 +710,7 @@ impl UploadObjectsTransfer {
                     let child_id = handle.id();
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         child_id = ?child_id,
                         key = %key,
                         "spawned child upload"
@@ -757,7 +757,7 @@ impl UploadObjectsTransfer {
                     state.next_walk_id += 1;
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         parent_walk_id = wid,
                         new_walk_id = new_id,
                         "claimed subtree"
@@ -783,7 +783,7 @@ impl UploadObjectsTransfer {
             let m = self.inner.ctx.metrics();
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 successful = state.successful_uploads,
                 failed = state.failed.len(),
                 network_tx = m.network_tx,
@@ -802,7 +802,7 @@ impl UploadObjectsTransfer {
         if state.children.len() + state.children_reserved >= max_concurrent_uploads {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 children = state.children.len(),
                 children_reserved = state.children_reserved,
                 max_concurrent_uploads,
@@ -814,7 +814,7 @@ impl UploadObjectsTransfer {
         if state.walks.is_empty() && state.in_flight_walks > 0 {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 in_flight_walks = state.in_flight_walks,
                 "dispatch_walk.pending.walks_in_flight"
             );
@@ -824,7 +824,7 @@ impl UploadObjectsTransfer {
         if state.in_flight_walks >= MAX_PARALLEL_WALKS {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 in_flight_walks = state.in_flight_walks,
                 MAX_PARALLEL_WALKS,
                 "dispatch_walk.pending.walks_saturated"
@@ -847,7 +847,7 @@ impl UploadObjectsTransfer {
             };
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 walk_id,
                 "dispatching advance_walker"
             );
@@ -859,7 +859,7 @@ impl UploadObjectsTransfer {
         } else {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 children = state.children.len(),
                 children_reserved = state.children_reserved,
                 in_flight_walks = state.in_flight_walks,
@@ -890,7 +890,7 @@ impl UploadObjectsTransfer {
         let ctx = &self.inner.ctx;
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             walk_id,
             ready_files = walk.ready_files_len(),
             pending_dirs = walk.pending_dirs_len(),
@@ -933,7 +933,7 @@ impl UploadObjectsTransfer {
         if let Some(fatal) = fatal_error {
             tracing::error!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 walk_id,
                 error = %fatal,
                 "fatal walker error, failing upload_objects"
@@ -956,7 +956,7 @@ impl UploadObjectsTransfer {
         for we in walk_errors {
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 walk_id,
                 path = ?we.path(),
                 error = %we,
@@ -986,7 +986,7 @@ impl UploadObjectsTransfer {
         slot.consume(&mut state, walk_back);
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             walk_id,
             yielded = n_entries,
             ready_files = ready_files_remaining,
@@ -996,6 +996,14 @@ impl UploadObjectsTransfer {
         );
 
         state.debug_assert_capacity(self.max_concurrent_uploads());
+
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition: check and signal here rather than deferring to
+        // a subsequent poll_work.
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
         drop(state);
         ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -1013,7 +1021,7 @@ impl UploadObjectsTransfer {
         let n_children = children.len();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             n_children,
             "join_children start"
         );
@@ -1056,7 +1064,7 @@ impl UploadObjectsTransfer {
                     });
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         key = %key,
                         "child upload completed"
                     );
@@ -1074,7 +1082,7 @@ impl UploadObjectsTransfer {
                         should_abort.then(|| format!("child upload failed ({key}): {e}"));
                     tracing::warn!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         key = %key,
                         error = %e,
                         "child upload failed"
@@ -1102,14 +1110,22 @@ impl UploadObjectsTransfer {
         batch.consume(&mut state);
 
         state.debug_assert_capacity(self.max_concurrent_uploads());
-        drop(state);
-        self.inner.ctx.try_wake();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             reaped,
             "join_children end"
         );
+
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition: check and signal here rather than deferring to
+        // a subsequent poll_work.
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
+        drop(state);
+        self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
     }
 }

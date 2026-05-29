@@ -63,13 +63,13 @@ impl DownloadHandleInner {
         let id = self.transfer.id();
 
         if ctx.is_failed() {
-            tracing::debug!(ctx = %ctx, "join: cancelling and waiting for idle");
+            tracing::debug!(tid = %ctx.id, "join: cancelling and waiting for idle");
             ctx.handle
                 .scheduler
                 .cancel_transfer(id)
                 .wait_for_idle()
                 .await;
-            tracing::debug!(ctx = %ctx, "join: idle, returning error");
+            tracing::debug!(tid = %ctx.id, "join: idle, returning error");
             // take the actual error (only we should do this)
             let err = ctx.take_error().expect("error taken outside of join()");
             return Err(err);
