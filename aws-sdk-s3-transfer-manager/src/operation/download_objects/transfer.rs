@@ -25,9 +25,26 @@ use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle}
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedDownload, FailedTransferPolicy};
 
-/// How many entries to claim from pending_entries per poll_work cycle.
-/// Limits how long the state lock is released during child orchestration.
+/// Children spawned per `poll_work` cycle.
+///
+/// Spawning registers a new child transfer in the scheduler: a CFS entity that
+/// can be re-polled the instant it becomes highest priority. The batch
+/// therefore bounds *schedulable-entity injection*, and small is correct —
+/// large batches let one parent flood the ready set and starve peers. Refill
+/// stays fast because the scheduler re-polls the parent immediately after each
+/// `Ready`, so capacity drains at SPAWN_BATCH_SIZE per cycle but many cycles
+/// per round.
 const SPAWN_BATCH_SIZE: usize = 32;
+
+/// Terminal children reaped per `JoinChildren` work item.
+///
+/// Deliberately larger than SPAWN_BATCH_SIZE. A reap injects no schedulable
+/// entities — it is one work item that awaits already-terminal handles — so it
+/// cannot dilute CFS no matter how many children it joins. The only cost a
+/// large batch trades against is worker-thread hold time, since
+/// `execute_join_children` joins serially; this bound caps that hold so a burst
+/// of thousands of completions cannot monopolize a thread in a single join.
+const REAP_BATCH_SIZE: usize = 256;
 
 /// Maximum entries to drain from the walker per AdvanceWalker work item.
 /// Prevents a single work item from holding the executor across multiple
@@ -169,22 +186,47 @@ impl DownloadObjectsTransfer {
         }
     }
 
+    /// Generate one unit of work, keeping the pipeline full.
+    ///
+    /// Ordering is a contract, not a convenience:
+    ///
+    /// 1. Spawn first. Spawning returns no work item, so it composes with the
+    ///    slot returned below — the in-flight set is topped up every cycle no
+    ///    matter where that slot goes. Gating on *active* (non-terminal)
+    ///    children (see `claim_spawn_batch`) means a completion burst frees
+    ///    capacity here at once instead of after the reap, which is what holds
+    ///    in-flight flat rather than letting it sawtooth.
+    /// 2. Walk before reap for the returned slot. A steady completion stream
+    ///    must not starve discovery; listing is single-flight and
+    ///    backpressured by the memory budget (see `dispatch_walk`), so at most
+    ///    one page is ever outstanding.
+    /// 3. Reap last, bounded by REAP_BATCH_SIZE.
+    ///
+    /// Steps 1 and 2 are skipped once the transfer leaves the active state, so
+    /// cancellation and failure quiesce new listings and child downloads while
+    /// in-flight work drains.
     pub(crate) fn poll_work(&self) -> PollWork {
         let mut state = self.inner.state.lock();
 
-        // Prefetch the next listing page before draining terminal children, so
-        // a steady child-completion stream can't starve discovery. The walk is
-        // single-flight (walk_in_flight) and dispatch_walk's pipeline_depth
-        // capacity gate pauses prefetch when the pipeline is full, so this
-        // keeps at most one page in flight. Skipped once the transfer is no
-        // longer active so cancellation/failure stops issuing new listings.
+        // 1: spawn (lock released around orchestration; no work item returned).
+        if self.inner.ctx.is_active() {
+            let to_spawn = self.claim_spawn_batch(&mut state);
+            if !to_spawn.is_empty() {
+                drop(state);
+                let spawned = self.spawn_children(to_spawn);
+                state = self.inner.state.lock();
+                self.merge_spawned(&mut state, spawned);
+            }
+        }
+
+        // 2: walk.
         if self.inner.ctx.is_active() {
             if let Some(work) = self.dispatch_walk(&mut state) {
                 return work;
             }
         }
 
-        // Phase 1: drain terminal children
+        // 3: reap.
         if let Some(batch) = self.drain_terminal_children(&mut state) {
             state.reaping_in_flight += 1;
             return PollWork::Ready(IoRequest {
@@ -192,41 +234,23 @@ impl DownloadObjectsTransfer {
             });
         }
 
-        // Check if we're done
-        if !self.inner.ctx.is_active() {
-            if let Some(result) = self.check_terminal(&state) {
-                return result;
-            }
-        }
-
-        // Phase 2: spawn children from pending entries (lock released)
-        let to_spawn = self.claim_spawn_batch(&mut state);
-        if !to_spawn.is_empty() {
-            drop(state);
-            let spawned = self.spawn_children(to_spawn);
-            state = self.inner.state.lock();
-            self.merge_spawned(&mut state, spawned);
-        }
-
-        // Phase 3: check terminal
+        // Idle: listing in flight, pipeline full, or walk done and draining.
         if let Some(result) = self.check_terminal(&state) {
             return result;
         }
-
-        // Nothing dispatchable now: walk in flight, pipeline full, or walk
-        // done with children still draining.
         self.inner.ctx.set_pending();
         PollWork::Pending
     }
 
-    /// Collect children that have reached a terminal state (success, failure,
-    /// or cancellation) for reaping via JoinChildren.
+    /// Collect up to REAP_BATCH_SIZE children that have reached a terminal
+    /// state (success, failure, or cancellation) for reaping via JoinChildren.
     fn drain_terminal_children(&self, state: &mut State) -> Option<Vec<ChildTransfer>> {
         let terminal_ids: Vec<TransferId> = state
             .children
             .iter()
             .filter(|(_, child)| child.handle.status() != crate::types::TransferStatus::Active)
             .map(|(id, _)| *id)
+            .take(REAP_BATCH_SIZE)
             .collect();
 
         if terminal_ids.is_empty() {
@@ -248,12 +272,23 @@ impl DownloadObjectsTransfer {
         Some(batch)
     }
 
-    /// Claim up to SPAWN_BATCH_SIZE entries from pending_entries for
-    /// child spawning. Increments children_reserved so concurrent
-    /// poll_work callers don't overshoot pipeline_depth.
+    /// Claim up to SPAWN_BATCH_SIZE pending entries to spawn as children.
+    ///
+    /// Gates on the *in-flight budget*: active (still transferring) children
+    /// plus reserved, against `pipeline_depth`. Terminal-but-unreaped children
+    /// are excluded deliberately — they hold a memory slot (bounded separately
+    /// in `dispatch_walk`) but do no network or disk work, so counting them
+    /// here would couple spawn-refill to reap latency and reintroduce the
+    /// sawtooth. `children_reserved` covers entries claimed but not yet merged,
+    /// so concurrent callers cannot together overshoot the budget.
     fn claim_spawn_batch(&self, state: &mut State) -> Vec<Object> {
-        let active_children = state.children.len() + state.children_reserved;
-        let available = self.inner.pipeline_depth.saturating_sub(active_children);
+        let active = state
+            .children
+            .values()
+            .filter(|c| c.handle.status() == crate::types::TransferStatus::Active)
+            .count()
+            + state.children_reserved;
+        let available = self.inner.pipeline_depth.saturating_sub(active);
         let count = available
             .min(SPAWN_BATCH_SIZE)
             .min(state.pending_entries.len());
@@ -435,16 +470,22 @@ impl DownloadObjectsTransfer {
         None
     }
 
-    /// Dispatch a listing page if the walk is idle, not done, and the pipeline
-    /// has capacity. Returns `None` when no listing can be dispatched (the
-    /// caller falls through to draining/spawning and ultimately `set_pending`).
+    /// Dispatch one listing page, or `None` if listing cannot proceed.
+    ///
+    /// Listing is single-flight (`walk_in_flight`) and backpressured by the
+    /// *memory budget*: registered children (active and terminal-unreaped,
+    /// since both hold buffers until joined) plus reserved plus queued entries,
+    /// against `pipeline_depth`. This is distinct from the in-flight budget
+    /// that gates spawning — listing fills memory, spawning consumes
+    /// network/disk concurrency. Returns `None` when listing is in flight, the
+    /// memory budget is full, or the walk is exhausted.
     fn dispatch_walk(&self, state: &mut State) -> Option<PollWork> {
-        // Already listing, or pipeline full (backpressure on listing).
         if state.walk_in_flight {
             return None;
         }
-        let active = state.children.len() + state.children_reserved + state.pending_entries.len();
-        if active >= self.inner.pipeline_depth {
+        let registered =
+            state.children.len() + state.children_reserved + state.pending_entries.len();
+        if registered >= self.inner.pipeline_depth {
             return None;
         }
 

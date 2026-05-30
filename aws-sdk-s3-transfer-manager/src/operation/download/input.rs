@@ -305,7 +305,7 @@ impl fmt::Debug for DownloadInput {
 }
 
 impl DownloadInput {
-    /// Creates a new builder-style object to manufacture [`DownloadInput`](crate::operation::download::DownloadInput).
+    /// Creates a new builder-style object to manufacture [`DownloadInput`].
     pub fn builder() -> DownloadInputBuilder {
         DownloadInputBuilder::default()
     }

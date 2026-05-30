@@ -78,7 +78,7 @@ impl Download {
     /// Orchestrate a download that writes to a file path (temp file + rename).
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
-    /// given composite transfer via [`TransferContext::new_child`].
+    /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,

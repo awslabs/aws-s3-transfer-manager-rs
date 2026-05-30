@@ -55,7 +55,7 @@
 //!   state. Long `poll_work` calls pin the caller's runtime, preventing it from
 //!   polling its own async tasks (including in-flight SDK requests).
 //! - **At most one thread is inside `poll_work(desc)` at a time.** Enforced by a
-//!   claim atom on [`TransferDescriptor`](super::descriptor::TransferDescriptor)
+//!   claim atom on [`TransferDescriptor`]
 //!   and the atomicity of `ReadySet`'s pop. `ReadySet::insert` is CAS-gated on
 //!   this claim: a concurrent wake calling `insert` while the descriptor is
 //!   already in the ready set (or being polled) finds claim=true and silently
