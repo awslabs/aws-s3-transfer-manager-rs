@@ -10,7 +10,7 @@
 //! [`Download::orchestrate_with_sink`]), and reaps them as they complete.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -110,6 +110,9 @@ struct DownloadObjectsTransferInner {
     delimiter: Option<String>,
     failure_policy: FailedTransferPolicy,
     pipeline_depth: usize,
+    /// Directories already created (dedup `create_dir_all` across children
+    /// that share a prefix; objects in the same S3 "folder" map to one dir).
+    created_dirs: Mutex<HashSet<PathBuf>>,
 }
 
 impl DownloadObjectsTransfer {
@@ -144,6 +147,7 @@ impl DownloadObjectsTransfer {
                 delimiter,
                 failure_policy,
                 pipeline_depth,
+                created_dirs: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -296,16 +300,21 @@ impl DownloadObjectsTransfer {
             self.inner.delimiter.as_deref(),
         )?;
 
-        // Create parent directories synchronously. On managed threads this
-        // is inline; acceptable because it's in the orchestration path (not
-        // the data-plane hot path) and typically a no-op after the first few.
+        // Create parent directories, deduped via created_dirs so we don't
+        // re-stat the whole ancestor chain for every object sharing a prefix
+        // (create_dir_all stats each ancestor; for N small files in a few
+        // dirs that's the dominant per-child syscall cost).
         if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                error::Error::new(
-                    ErrorKind::IOError,
-                    format!("failed to create directory for key '{key}': {e}"),
-                )
-            })?;
+            let known = self.inner.created_dirs.lock().contains(parent);
+            if !known {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    error::Error::new(
+                        ErrorKind::IOError,
+                        format!("failed to create directory for key '{key}': {e}"),
+                    )
+                })?;
+                self.inner.created_dirs.lock().insert(parent.to_path_buf());
+            }
         }
 
         let input = DownloadInput::builder()
