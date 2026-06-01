@@ -44,8 +44,7 @@
 //!     .download_objects()
 //!     .bucket("my-bucket")
 //!     .destination("/tmp/my-bucket")
-//!     .send()
-//!     .await?;
+//!     .initiate()?;
 //!
 //! // wait for transfer to complete
 //! handle.join().await?;

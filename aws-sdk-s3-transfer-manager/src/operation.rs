@@ -26,6 +26,12 @@ pub(crate) const DEFAULT_DELIMITER: &str = "/";
 /// (shared by upload_objects and download_objects).
 pub(crate) const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 4096;
 
+/// Children spawned per `poll_work` cycle (shared by upload_objects and
+/// download_objects). Each spawn injects a schedulable CFS entity, so a small
+/// batch bounds ready-set flooding. The scheduler re-polls the parent after
+/// each `Ready`, so refill stays fast across cycles.
+pub(crate) const SPAWN_BATCH_SIZE: usize = 32;
+
 // Checks if the target path at `path`, with the provided `metadata`, represents a directory.
 //
 // The caller is responsible for providing the correct `Metadata`. If the `Metadata` is obtained

@@ -25,25 +25,12 @@ use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle}
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedDownload, FailedTransferPolicy};
 
-/// Children spawned per `poll_work` cycle.
-///
-/// Spawning registers a new child transfer in the scheduler: a CFS entity that
-/// can be re-polled the instant it becomes highest priority. The batch
-/// therefore bounds *schedulable-entity injection*, and small is correct —
-/// large batches let one parent flood the ready set and starve peers. Refill
-/// stays fast because the scheduler re-polls the parent immediately after each
-/// `Ready`, so capacity drains at SPAWN_BATCH_SIZE per cycle but many cycles
-/// per round.
-const SPAWN_BATCH_SIZE: usize = 32;
+use crate::operation::SPAWN_BATCH_SIZE;
 
-/// Terminal children reaped per `JoinChildren` work item.
-///
-/// Deliberately larger than SPAWN_BATCH_SIZE. A reap injects no schedulable
-/// entities — it is one work item that awaits already-terminal handles — so it
-/// cannot dilute CFS no matter how many children it joins. The only cost a
-/// large batch trades against is worker-thread hold time, since
-/// `execute_join_children` joins serially; this bound caps that hold so a burst
-/// of thousands of completions cannot monopolize a thread in a single join.
+/// Terminal children reaped per `JoinChildren` work item. A reap injects no
+/// schedulable entity (it joins already-terminal handles), so unlike spawning
+/// it can batch large; the bound only caps worker-thread hold time on the
+/// serial join.
 const REAP_BATCH_SIZE: usize = 256;
 
 /// Maximum entries to drain from the walker per AdvanceWalker work item.
@@ -186,25 +173,20 @@ impl DownloadObjectsTransfer {
         }
     }
 
-    /// Generate one unit of work, keeping the pipeline full.
+    /// Produce one unit of work. The three steps run in order each call:
     ///
-    /// Ordering is a contract, not a convenience:
+    /// 1. Spawn. A side effect, not a returned item, so it runs every call and
+    ///    composes with whatever is returned below. Gating on *active* children
+    ///    (`claim_spawn_batch`) lets a completion burst refill immediately, so
+    ///    the active-child count holds at the cap instead of sawtoothing.
+    /// 2. Walk, if a page is available. poll_work returns at most one item;
+    ///    walk is preferred over reap for it, else a steady completion stream
+    ///    would reap forever and never list the next page. `dispatch_walk`
+    ///    yields nothing once registered children fill the cap.
+    /// 3. Reap, bounded by REAP_BATCH_SIZE.
     ///
-    /// 1. Spawn first. Spawning returns no work item, so it composes with the
-    ///    slot returned below — the in-flight set is topped up every cycle no
-    ///    matter where that slot goes. Gating on *active* (non-terminal)
-    ///    children (see `claim_spawn_batch`) means a completion burst frees
-    ///    capacity here at once instead of after the reap, which is what holds
-    ///    in-flight flat rather than letting it sawtooth.
-    /// 2. Walk before reap for the returned slot. A steady completion stream
-    ///    must not starve discovery; listing is single-flight and
-    ///    backpressured by the memory budget (see `dispatch_walk`), so at most
-    ///    one page is ever outstanding.
-    /// 3. Reap last, bounded by REAP_BATCH_SIZE.
-    ///
-    /// Steps 1 and 2 are skipped once the transfer leaves the active state, so
-    /// cancellation and failure quiesce new listings and child downloads while
-    /// in-flight work drains.
+    /// Steps 1-2 are skipped when inactive, so cancel/fail stops new work
+    /// while in-flight drains.
     pub(crate) fn poll_work(&self) -> PollWork {
         let mut state = self.inner.state.lock();
 
@@ -274,13 +256,11 @@ impl DownloadObjectsTransfer {
 
     /// Claim up to SPAWN_BATCH_SIZE pending entries to spawn as children.
     ///
-    /// Gates on the *in-flight budget*: active (still transferring) children
-    /// plus reserved, against `pipeline_depth`. Terminal-but-unreaped children
-    /// are excluded deliberately — they hold a memory slot (bounded separately
-    /// in `dispatch_walk`) but do no network or disk work, so counting them
-    /// here would couple spawn-refill to reap latency and reintroduce the
-    /// sawtooth. `children_reserved` covers entries claimed but not yet merged,
-    /// so concurrent callers cannot together overshoot the budget.
+    /// Gates on the *in-flight budget*: active children plus reserved, against
+    /// `pipeline_depth`. Terminal-unreaped children are excluded — they hold a
+    /// memory slot (bounded in `dispatch_walk`) but do no work, so counting
+    /// them would couple spawn-refill to reap latency and reintroduce the
+    /// sawtooth. `children_reserved` stops concurrent callers overshooting.
     fn claim_spawn_batch(&self, state: &mut State) -> Vec<Object> {
         let active = state
             .children
@@ -472,13 +452,11 @@ impl DownloadObjectsTransfer {
 
     /// Dispatch one listing page, or `None` if listing cannot proceed.
     ///
-    /// Listing is single-flight (`walk_in_flight`) and backpressured by the
-    /// *memory budget*: registered children (active and terminal-unreaped,
-    /// since both hold buffers until joined) plus reserved plus queued entries,
-    /// against `pipeline_depth`. This is distinct from the in-flight budget
-    /// that gates spawning — listing fills memory, spawning consumes
-    /// network/disk concurrency. Returns `None` when listing is in flight, the
-    /// memory budget is full, or the walk is exhausted.
+    /// Single-flight (`walk_in_flight`) and backpressured by the *memory
+    /// budget*: all registered children (active and terminal-unreaped) plus
+    /// reserved plus queued entries, against `pipeline_depth`. Distinct from
+    /// the in-flight budget that gates spawning — listing fills memory,
+    /// spawning consumes network/disk concurrency.
     fn dispatch_walk(&self, state: &mut State) -> Option<PollWork> {
         if state.walk_in_flight {
             return None;
