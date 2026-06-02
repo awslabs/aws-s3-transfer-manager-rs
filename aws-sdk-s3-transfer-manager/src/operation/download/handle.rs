@@ -311,7 +311,6 @@ impl ManagedDownloadHandle {
     }
 
     /// The transfer ID for this child download.
-    #[allow(dead_code)] // Used by download_objects state machine (chunk 2 wire-up)
     pub(crate) fn transfer_id(&self) -> TransferId {
         self.inner.transfer.id()
     }

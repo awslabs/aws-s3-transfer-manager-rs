@@ -71,6 +71,10 @@ struct State {
     /// The S3 listing walker (taken out during AdvanceWalker execution).
     walk: Option<S3Walk>,
 
+    /// Whether the destination directory has been validated (once, on the
+    /// first walker advance, so the blocking stat runs off the caller thread).
+    validated: bool,
+
     /// Whether a walker work item is currently in flight.
     walk_in_flight: bool,
 
@@ -137,6 +141,7 @@ impl DownloadObjectsTransfer {
                 ctx,
                 state: Mutex::new(State {
                     walk: Some(walk),
+                    validated: false,
                     walk_in_flight: false,
                     pending_entries: std::collections::VecDeque::new(),
                     children: HashMap::new(),
@@ -300,6 +305,15 @@ impl DownloadObjectsTransfer {
                 (obj, result.map(|h| ChildTransfer { handle: h, key }))
             })
             .collect()
+    }
+
+    /// Stat the destination and confirm it is a directory. Blocking; called
+    /// once from the first walker advance, during work-item execution rather
+    /// than on the caller's `initiate` thread.
+    fn validate_destination(&self) -> Result<(), Error> {
+        let dest = &self.inner.destination;
+        let metadata = std::fs::metadata(dest)?;
+        crate::operation::validate_target_is_dir(&metadata, dest)
     }
 
     fn spawn_single_child(
@@ -509,6 +523,30 @@ impl DownloadObjectsTransfer {
     }
 
     async fn execute_advance_walker(&self, mut walk: S3Walk) -> WorkOutcome {
+        // Validate the destination directory once, on the first advance, so the
+        // blocking stat runs here (during work-item execution) rather than on
+        // the caller's `initiate` thread. On failure, fail the transfer; the
+        // error surfaces from `handle.join()`.
+        let needs_validation = {
+            let mut state = self.inner.state.lock();
+            let first = !state.validated;
+            state.validated = true;
+            first
+        };
+        if needs_validation {
+            if let Err(err) = self.validate_destination() {
+                let mut state = self.inner.state.lock();
+                state.walk_in_flight = false;
+                self.inner.ctx.set_failed(err);
+                if self.check_terminal(&state).is_some() {
+                    return WorkOutcome::Success { data: None };
+                }
+                drop(state);
+                self.inner.ctx.try_wake();
+                return WorkOutcome::Success { data: None };
+            }
+        }
+
         // Drain up to a page worth of entries from the walker
         let mut entries = Vec::new();
         let mut fatal_error = None;

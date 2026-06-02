@@ -24,8 +24,6 @@ use std::sync::Arc;
 use crate::io::walk::{S3WalkContext, S3Walker};
 use crate::transfer::TransferContext;
 
-use super::validate_target_is_dir;
-
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
 pub(crate) struct DownloadObjects;
@@ -39,14 +37,13 @@ impl DownloadObjects {
         handle: Arc<crate::client::Handle>,
         input: DownloadObjectsInput,
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
-        let destination = input
-            .destination()
-            .ok_or_else(|| crate::error::invalid_input("destination is required"))?;
-        // TODO(vnext): revisit sync I/O in initiate path. This runs on the
-        // caller's thread — acceptable for a single stat() but worth
-        // reconsidering if initiate grows more blocking work.
-        let metadata = std::fs::metadata(destination)?;
-        validate_target_is_dir(&metadata, destination)?;
+        // Destination presence is validated here (cheap, no I/O); directory
+        // validation is deferred to the state machine's first walker advance so
+        // the blocking stat runs during work-item execution, not on the
+        // caller's thread. That error surfaces from `handle.join()`.
+        if input.destination().is_none() {
+            return Err(crate::error::invalid_input("destination is required"));
+        }
 
         let bucket = input
             .bucket()

@@ -72,8 +72,9 @@ struct DownloadTransferInner {
     state: Mutex<DownloadState>,
     /// The original request
     request: Arc<DownloadInput>,
-    /// Type of S3 bucket targeted by this operation
-    #[allow(dead_code)] // used for hedging/routing decisions
+    /// Type of S3 bucket targeted by this operation.
+    // TODO(vnext): unify bucket representation (name + kind) across operations.
+    #[allow(dead_code)]
     bucket_type: BucketType,
     /// Sequence window for backpressure control
     writer: BodyWriter,
@@ -112,18 +113,6 @@ impl DownloadTransfer {
         self.inner.ctx.id
     }
 
-    /// The original request.
-    #[allow(dead_code)] // exposed for handle/execution layer integration
-    pub(crate) fn request(&self) -> &DownloadInput {
-        &self.inner.request
-    }
-
-    /// Type of S3 bucket targeted by this operation.
-    #[allow(dead_code)] // exposed for handle/execution layer integration
-    pub(crate) fn bucket_type(&self) -> BucketType {
-        self.inner.bucket_type
-    }
-
     /// Body writer for backpressure control and chunk delivery.
     pub(crate) fn writer(&self) -> &BodyWriter {
         &self.inner.writer
@@ -137,12 +126,6 @@ impl DownloadTransfer {
     /// Notified when discovery completes.
     pub(crate) fn discovery_notify(&self) -> &tokio::sync::Notify {
         &self.inner.discovery_notify
-    }
-
-    /// Get the cancellation token for this transfer.
-    #[allow(dead_code)] // exposed for handle/execution layer integration
-    pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
-        self.inner.ctx.cancellation_token()
     }
 
     /// The target part size to use for this download.

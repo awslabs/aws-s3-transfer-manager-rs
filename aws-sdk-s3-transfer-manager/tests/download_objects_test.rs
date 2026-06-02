@@ -409,13 +409,14 @@ async fn test_destination_dir_not_valid() {
 
     let dest = tempfile::NamedTempFile::new().unwrap();
 
-    let err = tm
+    let handle = tm
         .download_objects()
         .bucket("test-bucket")
         .destination(dest.path())
         .initiate()
-        .unwrap_err();
+        .unwrap();
 
+    let err = handle.join().await.unwrap_err();
     let err_str = format!("{}", DisplayErrorContext(err));
     assert!(err_str.contains("target is not a directory"));
 }

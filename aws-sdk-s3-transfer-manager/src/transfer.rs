@@ -497,7 +497,6 @@ impl TransferContext {
     /// on the child wakes the parent so the parent state machine can reap it.
     /// `scheduler.cancel_transfer(parent_id)` cascades to children via the
     /// parent linkage.
-    #[allow(dead_code)] // used by upload_objects (next PR)
     pub(crate) fn new_child(
         handle: Arc<crate::client::Handle>,
         parent_id: u64,

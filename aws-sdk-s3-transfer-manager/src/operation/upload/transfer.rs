@@ -74,8 +74,9 @@ struct UploadTransferInner {
     state: Mutex<UploadState>,
     /// The original request (body taken for processing)
     request: Arc<UploadInput>,
-    /// Type of S3 bucket targeted by this operation
-    #[allow(dead_code)] // used for hedging/routing decisions
+    /// Type of S3 bucket targeted by this operation.
+    // TODO(vnext): unify bucket representation (name + kind) across operations.
+    #[allow(dead_code)]
     bucket_type: BucketType,
     /// Notified when CreateMPU completes (success or failure)
     create_mpu_complete: tokio::sync::Notify,
