@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
 
+use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
@@ -383,21 +385,20 @@ impl DownloadTransfer {
                 let rh = range_header.clone();
                 let etag = etag.clone();
                 let ctx = self.inner.ctx.clone();
-                let mut req = self
-                    .inner
-                    .ctx
-                    .s3_client()
-                    .get_object()
-                    .bucket(input.bucket().unwrap_or_default())
-                    .key(input.key().unwrap_or_default())
-                    .range(rh.clone());
-
-                if let Some(ref etag) = etag {
-                    req = req.if_match(etag.as_ref());
+                // Every chunk GET must carry the same request fields as discovery
+                // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
+                // conversion, then pin this chunk's range and the discovered etag.
+                let mut builder: GetObjectInputBuilder = input.clone().into();
+                builder = builder.set_range(Some(rh.clone()));
+                if let Some(etag) = etag.as_ref() {
+                    builder = builder.if_match(etag.as_ref());
                 }
 
                 async move {
-                    let resp = req.send().await.map_err(crate::error::Error::from)?;
+                    let resp = builder
+                        .send_with(ctx.s3_client())
+                        .await
+                        .map_err(crate::error::Error::from)?;
                     validate_content_range(seq, &rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let mut segmented = SegmentedBuf::new();
