@@ -106,8 +106,26 @@ pub(crate) struct ObjectMetadata {
     pub server_side_encryption: Option<String>,
     pub cache_control: Option<String>,
     pub content_encoding: Option<String>,
-    pub content_disposition: Option<String>,
     pub content_language: Option<String>,
+    pub content_disposition: Option<String>,
+
+    /// Part boundaries + per-part checksums for a completed multipart object,
+    /// in part order. Empty for single-PUT objects. Enables range-aware checksum
+    /// responses: a GET whose range exactly matches a part boundary returns that
+    /// part's checksum (matching real S3).
+    #[serde(default)]
+    pub parts: Vec<ObjectPart>,
+}
+
+/// A completed multipart object's part: its size and per-algorithm checksum.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ObjectPart {
+    pub size: u64,
+    pub crc32: Option<String>,
+    pub crc32c: Option<String>,
+    pub crc64nvme: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
 }
 
 impl ObjectMetadata {
@@ -118,6 +136,26 @@ impl ObjectMetadata {
         self.crc64nvme = None;
         self.sha1 = None;
         self.sha256 = None;
+    }
+
+    /// Resolve the checksum headers for a ranged GET, matching real S3:
+    /// if `[start, end)` exactly matches one part boundary, expose that part's
+    /// individual checksum (no `-N` suffix); otherwise no checksum applies.
+    /// `end` is exclusive.
+    pub(crate) fn apply_range_checksums(&mut self, start: u64, end: u64) {
+        let mut offset = 0u64;
+        for part in &self.parts {
+            if start == offset && end == offset + part.size {
+                self.crc32 = part.crc32.clone();
+                self.crc32c = part.crc32c.clone();
+                self.crc64nvme = part.crc64nvme.clone();
+                self.sha1 = part.sha1.clone();
+                self.sha256 = part.sha256.clone();
+                return;
+            }
+            offset += part.size;
+        }
+        self.clear_checksums();
     }
 }
 
@@ -141,6 +179,7 @@ impl Default for ObjectMetadata {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            parts: Vec::new(),
         }
     }
 }

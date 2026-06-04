@@ -74,6 +74,21 @@ fn calculate_checksum(data: &[u8], algorithm: ChecksumAlgorithm) -> String {
     }
 }
 
+/// S3-faithful composite value: hash the RAW (decoded) part checksum bytes,
+/// base64-encode, and append `-<part_count>`.
+fn expected_composite(part_checksums: &[String], algorithm: ChecksumAlgorithm) -> String {
+    use base64::Engine;
+    let raw: Vec<u8> = part_checksums
+        .iter()
+        .flat_map(|c| base64::engine::general_purpose::STANDARD.decode(c).unwrap())
+        .collect();
+    format!(
+        "{}-{}",
+        calculate_checksum(&raw, algorithm),
+        part_checksums.len()
+    )
+}
+
 // ============================================================================
 // SINGLE PART UPLOAD TESTS
 // ============================================================================
@@ -770,16 +785,16 @@ async fn run_multipart_composite_checksum(
 
     match algorithm {
         ChecksumAlgorithm::Crc32 => {
-            part1_request = part1_request.checksum_crc32(part1_checksum);
-            part2_request = part2_request.checksum_crc32(part2_checksum);
+            part1_request = part1_request.checksum_crc32(part1_checksum.clone());
+            part2_request = part2_request.checksum_crc32(part2_checksum.clone());
         }
         ChecksumAlgorithm::Sha1 => {
-            part1_request = part1_request.checksum_sha1(part1_checksum);
-            part2_request = part2_request.checksum_sha1(part2_checksum);
+            part1_request = part1_request.checksum_sha1(part1_checksum.clone());
+            part2_request = part2_request.checksum_sha1(part2_checksum.clone());
         }
         ChecksumAlgorithm::Sha256 => {
-            part1_request = part1_request.checksum_sha256(part1_checksum);
-            part2_request = part2_request.checksum_sha256(part2_checksum);
+            part1_request = part1_request.checksum_sha256(part1_checksum.clone());
+            part2_request = part2_request.checksum_sha256(part2_checksum.clone());
         }
         _ => panic!("Unsupported algorithm for composite: {:?}", algorithm),
     }
@@ -815,22 +830,165 @@ async fn run_multipart_composite_checksum(
     // Should complete successfully with ETag
     assert!(response.e_tag().is_some());
 
-    // Should validate composite checksum and return it in response
-    match algorithm {
-        ChecksumAlgorithm::Crc32 => {
-            assert!(response.checksum_crc32().is_some());
-        }
-        ChecksumAlgorithm::Sha1 => {
-            assert!(response.checksum_sha1().is_some());
-        }
-        ChecksumAlgorithm::Sha256 => {
-            assert!(response.checksum_sha256().is_some());
-        }
+    // Should validate composite checksum and return the S3-faithful value:
+    // hash of the raw part-checksum bytes, with a `-<part_count>` suffix.
+    let expected = expected_composite(
+        &[part1_checksum.clone(), part2_checksum.clone()],
+        algorithm.clone(),
+    );
+    let actual = match algorithm {
+        ChecksumAlgorithm::Crc32 => response.checksum_crc32(),
+        ChecksumAlgorithm::Sha1 => response.checksum_sha1(),
+        ChecksumAlgorithm::Sha256 => response.checksum_sha256(),
         _ => panic!("Unsupported algorithm: {:?}", algorithm),
-    }
+    };
+    assert_eq!(actual, Some(expected.as_str()));
 
     handle.shutdown().await?;
     Ok(())
+}
+
+/// P4 — ranged-GET checksum fidelity (mirrors real-S3 verification 4).
+/// A composite MPU object: an aligned ranged GET returns that part's individual
+/// checksum (no `-N`); an unaligned range returns none; whole-object returns `-N`.
+async fn run_ranged_get_checksum_fidelity(storage_type: StorageType) -> Result<()> {
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+
+    let key = "test-ranged-get-fidelity.bin";
+    // Two distinct parts; sizes need not be >=5MiB (mock doesn't enforce it).
+    let part1 = vec![0xABu8; 4096];
+    let part2 = vec![0xCDu8; 2048];
+    let c1 = calculate_checksum(&part1, ChecksumAlgorithm::Crc32);
+    let c2 = calculate_checksum(&part2, ChecksumAlgorithm::Crc32);
+
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .send()
+        .await?
+        .upload_id()
+        .unwrap()
+        .to_string();
+
+    let e1 = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(Bytes::from(part1.clone()).into())
+        .checksum_crc32(c1.clone())
+        .send()
+        .await?
+        .e_tag()
+        .unwrap()
+        .to_string();
+    let e2 = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(2)
+        .body(Bytes::from(part2.clone()).into())
+        .checksum_crc32(c2.clone())
+        .send()
+        .await?
+        .e_tag()
+        .unwrap()
+        .to_string();
+
+    s3.complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(e1)
+                        .checksum_crc32(c1.clone())
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(e2)
+                        .checksum_crc32(c2.clone())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let whole = expected_composite(&[c1.clone(), c2.clone()], ChecksumAlgorithm::Crc32);
+    let len1 = part1.len() as u64;
+    let len2 = part2.len() as u64;
+
+    // Aligned to part 1 → part1's own checksum, NO `-N`.
+    let r = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .range(format!("bytes=0-{}", len1 - 1))
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(r.checksum_crc32(), Some(c1.as_str()), "aligned part1 range");
+
+    // Aligned to part 2 → part2's own checksum.
+    let r = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .range(format!("bytes={}-{}", len1, len1 + len2 - 1))
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(r.checksum_crc32(), Some(c2.as_str()), "aligned part2 range");
+
+    // Unaligned range → no checksum.
+    let r = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .range("bytes=10-100")
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(r.checksum_crc32(), None, "unaligned range");
+
+    // Whole-object GET → composite `-N` value.
+    let r = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(
+        r.checksum_crc32(),
+        Some(whole.as_str()),
+        "whole-object composite"
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ranged_get_checksum_fidelity_in_memory() -> Result<()> {
+    run_ranged_get_checksum_fidelity(StorageType::InMemory).await
+}
+
+#[tokio::test]
+async fn test_ranged_get_checksum_fidelity_filesystem() -> Result<()> {
+    run_ranged_get_checksum_fidelity(StorageType::Filesystem).await
 }
 
 /// Test CompleteMultipartUpload with incorrect composite checksum (should fail with BadDigest)

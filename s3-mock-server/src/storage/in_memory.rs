@@ -15,7 +15,7 @@ use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
-use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
+use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, ObjectPart, PartMetadata};
 use crate::storage::StorageBackend;
 use crate::streaming::{apply_range, VecByteStream};
 use crate::types::StoredObjectMetadata;
@@ -106,6 +106,7 @@ impl StorageBackend for InMemoryStorage {
             content_encoding: request.content_encoding,
             content_disposition: request.content_disposition,
             content_language: request.content_language,
+            parts: Vec::new(),
         };
 
         let mut buckets = self.buckets.write().await;
@@ -134,7 +135,7 @@ impl StorageBackend for InMemoryStorage {
             None => return Ok(None),
         };
 
-        let is_range_request = request.range.is_some();
+        let range_bounds = request.range.clone();
         let data = if let Some(range) = request.range {
             apply_range(data, range)
         } else {
@@ -147,8 +148,8 @@ impl StorageBackend for InMemoryStorage {
         > = Box::new(stream);
 
         let mut response_metadata = metadata.clone();
-        if is_range_request {
-            response_metadata.clear_checksums();
+        if let Some(range) = range_bounds {
+            response_metadata.apply_range_checksums(range.start, range.end);
         }
 
         Ok(Some(crate::storage::GetObjectResponse {
@@ -411,6 +412,14 @@ impl StorageBackend for InMemoryStorage {
                 combined.extend_from_slice(part_data);
                 etags.push(part_metadata.etag.clone());
                 total_size += part_metadata.size;
+                final_metadata.parts.push(ObjectPart {
+                    size: part_metadata.size,
+                    crc32: part_metadata.crc32.clone(),
+                    crc32c: part_metadata.crc32c.clone(),
+                    crc64nvme: part_metadata.crc64nvme.clone(),
+                    sha1: part_metadata.sha1.clone(),
+                    sha256: part_metadata.sha256.clone(),
+                });
             }
         }
 
@@ -459,7 +468,14 @@ impl StorageBackend for InMemoryStorage {
                             };
 
                             if let Some(checksum) = part_checksum {
-                                integrity_checks.update(checksum.as_bytes());
+                                // S3 computes the composite over the raw part-checksum
+                                // bytes, not their base64 text.
+                                if let Ok(raw) = base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    checksum,
+                                ) {
+                                    integrity_checks.update(&raw);
+                                }
                             }
                         }
                     }
@@ -488,7 +504,14 @@ impl StorageBackend for InMemoryStorage {
                             };
 
                             if let Some(checksum) = part_checksum {
-                                integrity_checks.update(checksum.as_bytes());
+                                // S3 computes the composite over the raw part-checksum
+                                // bytes, not their base64 text.
+                                if let Ok(raw) = base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    checksum,
+                                ) {
+                                    integrity_checks.update(&raw);
+                                }
                             }
                         }
                     }
@@ -496,7 +519,26 @@ impl StorageBackend for InMemoryStorage {
             }
         }
 
-        let object_integrity = integrity_checks.finalize();
+        let mut object_integrity = integrity_checks.finalize();
+
+        // A composite checksum carries a `-<part_count>` suffix (e.g. `aB3..==-14`).
+        if matches!(
+            checksum_type,
+            Some(aws_sdk_s3::types::ChecksumType::Composite)
+        ) {
+            let n = request.parts.len();
+            for v in [
+                &mut object_integrity.crc32,
+                &mut object_integrity.crc32c,
+                &mut object_integrity.sha1,
+                &mut object_integrity.sha256,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                v.push_str(&format!("-{n}"));
+            }
+        }
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
