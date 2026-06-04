@@ -11,6 +11,7 @@
 //! concurrent operations, error handling, and performance characteristics.
 
 mod error;
+mod faults;
 mod s3s;
 mod server;
 mod storage;
@@ -19,6 +20,7 @@ mod types;
 
 pub use error::Error;
 pub use error::Result;
+pub use faults::{FaultType, Occurrence};
 pub use server::{
     AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
     ServerHandle,

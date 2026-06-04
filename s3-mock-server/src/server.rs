@@ -150,6 +150,7 @@ impl S3MockServerBuilder {
 
         Ok(S3MockServer {
             storage,
+            faults: Arc::new(crate::faults::FaultRegistry::default()),
             config: self.config,
         })
     }
@@ -222,6 +223,9 @@ pub struct S3MockServer {
     /// Storage backend.
     storage: Arc<dyn StorageBackend>,
 
+    /// Key-scoped fault injection registry (shared with the serving task).
+    faults: Arc<crate::faults::FaultRegistry>,
+
     /// Server configuration.
     config: ServerConfig,
 }
@@ -278,6 +282,27 @@ impl S3MockServer {
     /// Create a bucket in the mock server.
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         self.storage.create_bucket(bucket).await
+    }
+
+    /// Register a fault for `(bucket, key)`. Faults form an ordered queue
+    /// consumed over successive matching requests: `skip` matching requests pass
+    /// cleanly first, then the fault fires per `occurrence`. Deterministic and
+    /// traceable — every fire logs the request number under
+    /// `target: "s3_mock_server::fault"`.
+    pub fn insert_fault(
+        &self,
+        bucket: &str,
+        key: &str,
+        fault: crate::faults::FaultType,
+        skip: u32,
+        occurrence: crate::faults::Occurrence,
+    ) {
+        self.faults.insert(bucket, key, fault, skip, occurrence);
+    }
+
+    /// Drop the entire fault queue for `(bucket, key)`.
+    pub fn clear_fault(&self, bucket: &str, key: &str) {
+        self.faults.clear(bucket, key);
     }
 
     /// Check if an object exists.
@@ -368,11 +393,12 @@ impl S3MockServer {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let storage = self.storage.clone();
+        let faults = self.faults.clone();
         let server_task = tokio::spawn(async move {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-            let inner = Inner::new(storage);
+            let inner = Inner::with_faults(storage, faults);
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
