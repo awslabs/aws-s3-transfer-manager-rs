@@ -256,10 +256,26 @@ impl DownloadTransfer {
         // chunk. A larger multipart object's discovery chunk carries part 1's
         // checksum, which is not the object checksum.
         let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
+        // Resolve the effective validation state the same way the SDK's GetObject
+        // mutator does: enabled if the request set ChecksumMode=Enabled, or the
+        // request left it unset and the client's ResponseChecksumValidation is not
+        // WhenRequired (WhenSupported, the default, and unknown values enable it).
+        let validation_enabled = match input.checksum_mode {
+            Some(aws_sdk_s3::types::ChecksumMode::Enabled) => true,
+            _ => !matches!(
+                self.ctx()
+                    .s3_client()
+                    .config()
+                    .response_checksum_validation()
+                    .copied()
+                    .unwrap_or_default(),
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired
+            ),
+        };
         let integrity = build_integrity_checks(
             chunk_meta.as_ref(),
             whole_object_in_chunk,
-            input.checksum_mode.as_ref(),
+            validation_enabled,
         );
         let _ = self.inner.integrity_checks.set(integrity);
 
@@ -619,14 +635,10 @@ fn validate_content_range(
 fn build_integrity_checks(
     chunk_meta: Option<&ChunkMetadata>,
     whole_object_in_chunk: bool,
-    checksum_mode: Option<&aws_sdk_s3::types::ChecksumMode>,
+    validation_enabled: bool,
 ) -> crate::types::IntegrityChecks {
     use crate::types::{ChecksumValidation, NotValidatedReason};
 
-    let validation_enabled = matches!(
-        checksum_mode,
-        Some(aws_sdk_s3::types::ChecksumMode::Enabled)
-    );
     let checksum_validation = if validation_enabled {
         ChecksumValidation::NotValidated {
             reason: NotValidatedReason::Unavailable,
@@ -666,7 +678,7 @@ mod tests {
 
     use crate::operation::download::chunk_meta::ChunkMetadata;
     use crate::types::{ChecksumValidation, NotValidatedReason};
-    use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
+    use aws_sdk_s3::types::ChecksumType;
 
     fn chunk_with_crc32(value: &str) -> ChunkMetadata {
         let mut m = ChunkMetadata::default();
@@ -676,8 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn integrity_disabled_when_mode_off() {
-        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, None);
+    fn integrity_disabled_when_validation_not_enabled() {
+        // validation_enabled=false models a WhenRequired client with no request
+        // override: no validation is attempted, so the verdict is Disabled.
+        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, false);
         assert_eq!(
             *ic.checksum_validation(),
             ChecksumValidation::NotValidated {
@@ -689,11 +703,7 @@ mod tests {
     #[test]
     fn integrity_unavailable_when_enabled_pending_sdk_signal() {
         // TODO(vnext): becomes Validated once the SDK reports a validation outcome.
-        let ic = build_integrity_checks(
-            Some(&chunk_with_crc32("DUoRhQ==")),
-            true,
-            Some(&ChecksumMode::Enabled),
-        );
+        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, true);
         assert_eq!(
             *ic.checksum_validation(),
             ChecksumValidation::NotValidated {
@@ -705,13 +715,13 @@ mod tests {
     #[test]
     fn integrity_surfaces_value_only_for_whole_object_chunk() {
         // Whole object in the discovery chunk -> the chunk checksum IS the object's.
-        let whole = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, None);
+        let whole = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, false);
         assert_eq!(whole.checksum_crc32(), Some("DUoRhQ=="));
         assert_eq!(whole.checksum_type(), Some(&ChecksumType::FullObject));
 
         // Multipart (object did not fit in the discovery chunk) -> part-1 value is
         // NOT surfaced as the object value.
-        let multipart = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), false, None);
+        let multipart = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), false, false);
         assert_eq!(multipart.checksum_crc32(), None);
         assert_eq!(multipart.checksum_type(), None);
     }

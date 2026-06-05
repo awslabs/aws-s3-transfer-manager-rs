@@ -639,9 +639,39 @@ async fn test_download_write_to_path_error_cleans_up() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
-/// Single-part (whole object in the discovery chunk) response carrying an
-/// optional CRC32 checksum header. `data` must match `crc32` (the SDK validates
-/// any present checksum header under the default `WhenSupported` setting).
+/// Download requests carry `x-amz-checksum-mode: ENABLED` by default. The SDK's
+/// GetObject operation auto-enables it when the client resolves
+/// `ResponseChecksumValidation` to `WHEN_SUPPORTED` (the default), so the TM gets
+/// response validation without setting the mode itself. This guards against a
+/// regression (SDK change or client config) that would silently stop requesting
+/// the stored checksum and therefore stop validating downloads.
+#[tokio::test]
+async fn test_checksum_mode_enabled_by_default() {
+    // Multipart object so the assertion covers the discovery GET and every
+    // subsequent range-chunk GET.
+    let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert!(requests.len() > 1, "expected multiple GETs (multipart)");
+    for (i, req) in requests.iter().enumerate() {
+        assert_eq!(
+            req.headers().get("x-amz-checksum-mode"),
+            Some("ENABLED"),
+            "GET #{i} must carry x-amz-checksum-mode=ENABLED by default"
+        );
+    }
+}
+
 fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClient {
     let mut resp = http::Response::builder()
         .status(200)
@@ -665,14 +695,62 @@ fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClien
 const HELLO: &[u8] = b"hello world";
 const HELLO_CRC32: &str = "DUoRhQ==";
 
-/// checksum_mode off → validation reported as Disabled, regardless of headers.
+/// Default checksum_mode (unset): the SDK auto-enables validation when the client
+/// resolves ResponseChecksumValidation to WhenSupported (the default), so the
+/// verdict is Unavailable (validation attempted) — NOT Disabled. See
+/// `test_integrity_checks_disabled_when_validation_when_required` for the only
+/// genuinely-disabled case.
 #[tokio::test]
-async fn test_integrity_checks_disabled_when_mode_off() {
+async fn test_integrity_checks_default_mode_attempts_validation() {
     use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
 
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    assert_eq!(
+        *output.integrity_checks().checksum_validation(),
+        ChecksumValidation::NotValidated {
+            reason: NotValidatedReason::Unavailable
+        }
+    );
+}
+
+/// Client ResponseChecksumValidation=WhenRequired with no request override: the
+/// SDK does not auto-enable ChecksumMode, so validation is genuinely off and the
+/// verdict is Disabled.
+#[tokio::test]
+async fn test_integrity_checks_disabled_when_validation_when_required() {
+    use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
+
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let http_client = single_part_connector(&data, Some(HELLO_CRC32));
+    let s3_client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Config::builder()
+            .http_client(http_client)
+            .region(Region::from_static("us-west-2"))
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
+            .with_test_defaults()
+            .build(),
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .part_size(PartSize::Target(part_size as u64))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let mut handle = tm
         .download()

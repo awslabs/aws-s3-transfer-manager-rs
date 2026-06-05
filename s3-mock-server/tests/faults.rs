@@ -43,6 +43,37 @@ async fn validating_get(handle: &ServerHandle) -> Result<()> {
     Ok(())
 }
 
+/// Same but with a whole-object RANGE (bytes=0-(len-1)), like the TM's discovery GET.
+async fn validating_ranged_get(handle: &ServerHandle) -> Result<()> {
+    let s3 = handle.client().await;
+    let resp = s3
+        .get_object()
+        .bucket(B)
+        .key(K)
+        .range(format!("bytes=0-{}", BODY.len() - 1))
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    let _ = resp.body.collect().await?;
+    Ok(())
+}
+
+/// A ranged whole-object GET (as the transfer manager issues for discovery) of a
+/// corrupted body must fail the SDK's checksum validation.
+#[tokio::test]
+async fn test_ranged_get_corrupt_body_fails_validation() -> Result<()> {
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    seed(&handle).await?;
+    server.insert_fault(B, K, FaultType::CorruptBody, 0, Occurrence::Always);
+    assert!(
+        validating_ranged_get(&handle).await.is_err(),
+        "ranged GET corrupt body should fail validation"
+    );
+    handle.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_wrong_stored_checksum_fails_validating_get() -> Result<()> {
     let server = S3MockServer::builder().with_in_memory_store().build()?;

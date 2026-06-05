@@ -139,10 +139,18 @@ impl ObjectMetadata {
     }
 
     /// Resolve the checksum headers for a ranged GET, matching real S3:
-    /// if `[start, end)` exactly matches one part boundary, expose that part's
-    /// individual checksum (no `-N` suffix); otherwise no checksum applies.
+    /// a range covering the whole object keeps the object-level checksum; a range
+    /// matching one part boundary of a multipart object exposes that part's
+    /// individual checksum (no `-N` suffix); any other range has no checksum.
     /// `end` is exclusive.
     pub(crate) fn apply_range_checksums(&mut self, start: u64, end: u64) {
+        // A whole-object range keeps the object-level checksum. Covers single-PUT
+        // objects (no parts) and a multipart object's combined value. Verified
+        // against real S3: a ranged GET covering the whole object returns the
+        // full-object checksum.
+        if start == 0 && end == self.content_length {
+            return;
+        }
         let mut offset = 0u64;
         for part in &self.parts {
             if start == offset && end == offset + part.size {
