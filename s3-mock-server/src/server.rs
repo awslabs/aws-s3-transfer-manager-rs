@@ -285,9 +285,9 @@ impl S3MockServer {
     }
 
     /// Register a fault for `(bucket, key)`. Faults form an ordered queue
-    /// consumed over successive matching requests: `skip` matching requests pass
-    /// cleanly first, then the fault fires per `occurrence`. Deterministic and
-    /// traceable — every fire logs the request number under
+    /// consumed over successive matching requests: the first `skip` matching
+    /// requests pass cleanly, then the fault fires per `occurrence`. Firing is
+    /// deterministic; every fire logs the request number under
     /// `target: "s3_mock_server::fault"`.
     pub fn insert_fault(
         &self,

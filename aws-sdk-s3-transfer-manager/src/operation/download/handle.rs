@@ -88,7 +88,16 @@ impl DownloadHandleInner {
             .object_meta()
             .expect("object_meta must be set on successful completion")
             .clone();
-        Ok(DownloadOutput::new(object_meta, ctx.metrics()))
+        let integrity_checks = self
+            .transfer
+            .integrity_checks()
+            .expect("integrity_checks must be set on successful completion")
+            .clone();
+        Ok(DownloadOutput::new(
+            object_meta,
+            ctx.metrics(),
+            integrity_checks,
+        ))
     }
 
     /// Core abort logic: cancel transfer, notify consumer, and wait for idle.

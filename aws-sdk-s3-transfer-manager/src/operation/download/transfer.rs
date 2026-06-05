@@ -82,6 +82,8 @@ struct DownloadTransferInner {
     writer: BodyWriter,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
+    /// Object-integrity result (set once discovery completes)
+    integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
 }
@@ -100,6 +102,7 @@ impl DownloadTransfer {
             bucket_type,
             writer,
             object_meta: std::sync::OnceLock::new(),
+            integrity_checks: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
         Self { inner }
@@ -123,6 +126,11 @@ impl DownloadTransfer {
     /// Object metadata from discovery.
     pub(crate) fn object_meta(&self) -> Option<&ObjectMetadata> {
         self.inner.object_meta.get()
+    }
+
+    /// Object-integrity result from discovery.
+    pub(crate) fn integrity_checks(&self) -> Option<&crate::types::IntegrityChecks> {
+        self.inner.integrity_checks.get()
     }
 
     /// Notified when discovery completes.
@@ -243,6 +251,18 @@ impl DownloadTransfer {
 
         // Store object_meta for object_meta() and join()
         let _ = self.inner.object_meta.set(object_meta.clone());
+
+        // Object checksum is known only when the whole object arrived in this
+        // chunk. A larger multipart object's discovery chunk carries part 1's
+        // checksum, which is not the object checksum.
+        let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
+        let integrity = build_integrity_checks(
+            chunk_meta.as_ref(),
+            whole_object_in_chunk,
+            input.checksum_mode.as_ref(),
+        );
+        let _ = self.inner.integrity_checks.set(integrity);
+
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
 
@@ -579,6 +599,52 @@ fn validate_content_range(
     }
 }
 
+/// Build the object-integrity result for a completed download.
+///
+/// `whole_object_in_chunk` must be true only when the entire object arrived in
+/// the discovery chunk, the one case where the chunk checksum is the object
+/// checksum. Otherwise value members are left `None`.
+///
+/// Validation is reported `Disabled` when not requested, else
+/// `NotValidated{Unavailable}`. `Validated{algorithm}` requires a per-response
+/// validation outcome the Rust SDK does not currently expose.
+// TODO(vnext): resolve `Validated{algorithm}` from an SDK-reported per-response
+// validation outcome once the SDK exposes one, instead of always reporting
+// NotValidated when validation is enabled.
+fn build_integrity_checks(
+    chunk_meta: Option<&ChunkMetadata>,
+    whole_object_in_chunk: bool,
+    checksum_mode: Option<&aws_sdk_s3::types::ChecksumMode>,
+) -> crate::types::IntegrityChecks {
+    use crate::types::{ChecksumValidation, NotValidatedReason};
+
+    let validation_enabled = matches!(
+        checksum_mode,
+        Some(aws_sdk_s3::types::ChecksumMode::Enabled)
+    );
+    let checksum_validation = if validation_enabled {
+        ChecksumValidation::NotValidated {
+            reason: NotValidatedReason::Unavailable,
+        }
+    } else {
+        ChecksumValidation::NotValidated {
+            reason: NotValidatedReason::Disabled,
+        }
+    };
+
+    // Surface checksum values only when they describe the whole object.
+    let cm = chunk_meta.filter(|_| whole_object_in_chunk);
+    crate::types::IntegrityChecks::new(
+        cm.and_then(|m| m.checksum_crc32.clone()),
+        cm.and_then(|m| m.checksum_crc32_c.clone()),
+        cm.and_then(|m| m.checksum_crc64_nvme.clone()),
+        cm.and_then(|m| m.checksum_sha1.clone()),
+        cm.and_then(|m| m.checksum_sha256.clone()),
+        cm.and_then(|m| m.checksum_type.clone()),
+        checksum_validation,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +658,58 @@ mod tests {
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     const MB: u64 = 1024 * 1024;
+
+    use crate::operation::download::chunk_meta::ChunkMetadata;
+    use crate::types::{ChecksumValidation, NotValidatedReason};
+    use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
+
+    fn chunk_with_crc32(value: &str) -> ChunkMetadata {
+        let mut m = ChunkMetadata::default();
+        m.checksum_crc32 = Some(value.to_string());
+        m.checksum_type = Some(ChecksumType::FullObject);
+        m
+    }
+
+    #[test]
+    fn integrity_disabled_when_mode_off() {
+        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, None);
+        assert_eq!(
+            *ic.checksum_validation(),
+            ChecksumValidation::NotValidated {
+                reason: NotValidatedReason::Disabled
+            }
+        );
+    }
+
+    #[test]
+    fn integrity_unavailable_when_enabled_pending_sdk_signal() {
+        // TODO(vnext): becomes Validated once the SDK reports a validation outcome.
+        let ic = build_integrity_checks(
+            Some(&chunk_with_crc32("DUoRhQ==")),
+            true,
+            Some(&ChecksumMode::Enabled),
+        );
+        assert_eq!(
+            *ic.checksum_validation(),
+            ChecksumValidation::NotValidated {
+                reason: NotValidatedReason::Unavailable
+            }
+        );
+    }
+
+    #[test]
+    fn integrity_surfaces_value_only_for_whole_object_chunk() {
+        // Whole object in the discovery chunk -> the chunk checksum IS the object's.
+        let whole = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, None);
+        assert_eq!(whole.checksum_crc32(), Some("DUoRhQ=="));
+        assert_eq!(whole.checksum_type(), Some(&ChecksumType::FullObject));
+
+        // Multipart (object did not fit in the discovery chunk) -> part-1 value is
+        // NOT surfaced as the object value.
+        let multipart = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), false, None);
+        assert_eq!(multipart.checksum_crc32(), None);
+        assert_eq!(multipart.checksum_type(), None);
+    }
 
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {
         let chunk = vec![0u8; part_size as usize];

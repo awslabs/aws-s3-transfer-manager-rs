@@ -18,10 +18,10 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultType {
     /// GET returns a valid-format but incorrect `x-amz-checksum-*` (first byte
-    /// XOR'd) — drives a download checksum mismatch.
+    /// XOR'd). Drives a download checksum mismatch.
     WrongStoredChecksum,
     /// GET returns tampered body bytes (byte 0 XOR'd) with the checksum left
-    /// intact — proves body-content validation, not just header comparison.
+    /// intact. Exercises body-content validation, not just header comparison.
     CorruptBody,
 }
 
@@ -33,7 +33,7 @@ pub enum Occurrence {
     Once,
     /// Fire `n` times, then pop the entry.
     NTimes(u32),
-    /// Fire forever (never popped) — terminal.
+    /// Fire forever; never popped.
     Always,
 }
 

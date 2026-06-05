@@ -253,3 +253,123 @@ impl Bucket {
         self.kind
     }
 }
+
+/// Object-integrity information for a completed download.
+///
+/// Carries the object's reported checksum values (as returned by S3) and the
+/// outcome of checksum validation over the delivered bytes. Validation is a
+/// completion-time fact, distinct from the discovery-time [`ObjectMetadata`].
+///
+/// A checksum mismatch is not represented here; it surfaces as an `Err` from the
+/// download's `join()`. On a successful `DownloadOutput`, [`ChecksumValidation`]
+/// distinguishes "validated" from "validation did not happen".
+///
+/// [`ObjectMetadata`]: crate::operation::download::ObjectMetadata
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct IntegrityChecks {
+    checksum_crc32: Option<String>,
+    checksum_crc32c: Option<String>,
+    checksum_crc64_nvme: Option<String>,
+    checksum_sha1: Option<String>,
+    checksum_sha256: Option<String>,
+    checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    checksum_validation: ChecksumValidation,
+}
+
+impl IntegrityChecks {
+    /// The outcome of checksum validation over the delivered object bytes.
+    pub fn checksum_validation(&self) -> &ChecksumValidation {
+        &self.checksum_validation
+    }
+
+    /// The base64-encoded CRC-32 checksum reported by S3, if present.
+    pub fn checksum_crc32(&self) -> Option<&str> {
+        self.checksum_crc32.as_deref()
+    }
+
+    /// The base64-encoded CRC-32C checksum reported by S3, if present.
+    pub fn checksum_crc32c(&self) -> Option<&str> {
+        self.checksum_crc32c.as_deref()
+    }
+
+    /// The base64-encoded CRC-64/NVME checksum reported by S3, if present.
+    pub fn checksum_crc64_nvme(&self) -> Option<&str> {
+        self.checksum_crc64_nvme.as_deref()
+    }
+
+    /// The base64-encoded SHA-1 checksum reported by S3, if present.
+    pub fn checksum_sha1(&self) -> Option<&str> {
+        self.checksum_sha1.as_deref()
+    }
+
+    /// The base64-encoded SHA-256 checksum reported by S3, if present.
+    pub fn checksum_sha256(&self) -> Option<&str> {
+        self.checksum_sha256.as_deref()
+    }
+
+    /// The object's checksum type (full-object vs composite), if reported.
+    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+        self.checksum_type.as_ref()
+    }
+}
+
+/// Whether the bytes delivered by a download were validated against a checksum.
+///
+/// `Validated` means the *entire* delivered object was covered by a checksum and
+/// matched. Anything short of whole-object coverage is `NotValidated` with a
+/// [`NotValidatedReason`]; there is no partial state.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumValidation {
+    /// Every delivered byte was validated against a checksum and matched.
+    Validated {
+        /// The algorithm used to validate.
+        algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
+    },
+    /// No whole-object validation occurred. `reason` explains why.
+    NotValidated {
+        /// Why validation did not cover the whole object.
+        reason: NotValidatedReason,
+    },
+}
+
+/// Why a download's bytes were not whole-object checksum-validated.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotValidatedReason {
+    /// Checksum validation was not enabled for the request (client
+    /// `ResponseChecksumValidation::WhenRequired` with no request override).
+    Disabled,
+    /// The object carries only a composite (`-N`) checksum, which cannot be
+    /// validated against delivered bytes.
+    CompositeChecksum,
+    /// Some delivered bytes were validated but not the whole object.
+    PartialCoverage,
+    /// No checksum covered the delivered bytes (object has no stored checksum,
+    /// or the requested range did not align to a stored part).
+    Unavailable,
+}
+
+impl IntegrityChecks {
+    /// Build from the object's reported checksum fields and a resolved verdict.
+    pub(crate) fn new(
+        checksum_crc32: Option<String>,
+        checksum_crc32c: Option<String>,
+        checksum_crc64_nvme: Option<String>,
+        checksum_sha1: Option<String>,
+        checksum_sha256: Option<String>,
+        checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+        checksum_validation: ChecksumValidation,
+    ) -> Self {
+        Self {
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_crc64_nvme,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_type,
+            checksum_validation,
+        }
+    }
+}
