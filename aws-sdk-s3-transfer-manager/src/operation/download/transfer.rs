@@ -335,7 +335,10 @@ impl DownloadTransfer {
             let data = match result {
                 Ok(data) => data,
                 Err(e) => {
-                    self.decrement_in_flight();
+                    // Go terminal before any wake: fail() sets Terminal under the
+                    // lock, so a woken poll_work cannot observe ranges_in_flight==0
+                    // and complete() the transfer over this error. The in-flight
+                    // count is abandoned with the Transferring state.
                     let guard = self.inner.state.lock().unwrap();
                     return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
                 }
@@ -362,7 +365,7 @@ impl DownloadTransfer {
 
         slot.fill(chunk);
         if let Err(e) = self.inner.writer.try_flush() {
-            self.decrement_in_flight();
+            // Go terminal before any wake (see fail_range).
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
@@ -457,7 +460,7 @@ impl DownloadTransfer {
 
         slot.fill(chunk);
         if let Err(e) = self.inner.writer.try_flush() {
-            self.decrement_in_flight();
+            // Go terminal before any wake (see fail_range).
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
@@ -489,7 +492,9 @@ impl DownloadTransfer {
 
     /// Fail a range request with an error.
     fn fail_range(&self, seq: u64, e: impl Into<crate::error::BoxError>) -> WorkOutcome {
-        self.decrement_in_flight();
+        // Go terminal before any wake (see the discovery-body error path). Do not
+        // decrement_in_flight first: that wakes poll_work, which would observe
+        // ranges_in_flight==0 and complete() over this error.
         let guard = self.inner.state.lock().unwrap();
         self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e))
     }
