@@ -60,6 +60,14 @@ impl Handle {
         }
     }
 
+    /// Whether the user pinned an explicit part size (vs leaving it `Auto`).
+    /// When `Auto`, the transfer manager owns part sizing and may override it
+    /// (e.g. align download ranges to an object's stored part size for
+    /// validation); an explicit size is respected as set.
+    pub(crate) fn user_set_part_size(&self) -> bool {
+        matches!(self.config.part_size(), PartSize::Target(_))
+    }
+
     /// Create a Handle for testing with a custom scheduler factory.
     #[cfg(test)]
     pub(crate) fn new_for_test(mut config: crate::Config, concurrency: usize) -> Arc<Self> {

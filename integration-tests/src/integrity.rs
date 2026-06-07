@@ -59,20 +59,32 @@
 //! | single-part                   | on            | round-trip; value shown; not Validated*   |
 //! | multipart full-object         | on            | round-trip; object value not from a part  |
 //! | multipart composite           | on            | round-trip; object value not from a part  |
-//! | single-part tampered          | on            | download errors (never Ok)                |
-//! | single-part tampered (file)   | on            | errors; temp cleaned, dest not created    |
-//! | multipart tampered (aligned)  | on            | download errors (never Ok)                |
-//! | multipart aligned             | on            | round-trip (download ranges align)        |
-//! | multipart unaligned, tampered | on            | NOT caught (no checksum on unaligned GET) |
+//! | single-part tampered          | on            | ChunkFailed (never Ok)                     |
+//! | single-part tampered (file)   | on            | ChunkFailed; temp cleaned, dest not created|
+//! | multipart tampered (explicit) | on            | ChunkFailed (explicit matched size)        |
+//! | multipart, default part size  | on            | round-trip (auto-aligned to stored parts) |
+//! | multipart tampered (default)  | on            | ChunkFailed (auto-aligned, caught)         |
+//! | single-PUT split, tampered    | on            | #[ignore] intent: must ChunkFailed (TODO)  |
+//!
+//! Tamper tests assert the specific `ErrorKind::ChunkFailed` (the kind a checksum
+//! mismatch surfaces as), not merely `is_err()`, so an unrelated failure cannot
+//! pass them.
+//!
+//! Multipart downloads are validated by default: when validating a multipart
+//! object with an Auto part size, the TM discovers the stored part size (a
+//! partNumber=1 GET reports part 1's exact length) and slices download ranges to
+//! it, so every range aligns to a stored part boundary and the SDK validates each
+//! part (including the ragged tail). An explicit user part size is respected as-is
+//! (no auto-align), so it validates only when it matches the uploaded part size.
+//!
+//! One `#[ignore]`d intent test states the remaining deferred goal (gated on wire
+//! checksum): `single_put_split_tamper_caught_mock_gp` — a large single-PUT
+//! object split into ranged GETs has no per-range checksum, so validating it needs
+//! a TM-computed whole-object hash. It verifiably FAILS today and is the executable
+//! statement of that goal.
 //!
 //! *not Validated until the SDK reports a per-response validation outcome
 //! (see the limitation above).
-//!
-//! Multipart download validation requires the download range to match a stored
-//! part boundary. The TM downloads with ranged GETs, so a test pins an explicit
-//! part size to align upload and download; the unaligned row pins the current
-//! default behavior (upload 8 MiB, download 5 MiB) where validation does not
-//! occur. See `harness::TmTestClient::connect_with`.
 //!
 //! Algorithm is a pass-through axis for the transfer manager (it forwards the
 //! choice and reads back whatever S3 returns), so per-algorithm value
@@ -82,16 +94,17 @@
 
 use crate::harness::Target;
 use aws_sdk_s3::types::ChecksumMode;
+use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason, PartSize};
 use s3_mock_server::{FaultType, Occurrence};
 
-/// A part size pinned equally for upload and download so multipart download
-/// ranges align to the uploaded part boundaries (the precondition for per-part
-/// download validation). The TM's default leaves upload (8 MiB) and download
-/// (5 MiB) unaligned; see the unaligned boundary test.
+/// A part size pinned equally for upload and download. Multipart downloads align
+/// automatically for an Auto part size; this pins an explicit size to cover the
+/// explicit-part-size path (where the user's size must match the upload to
+/// validate).
 const ALIGNED_PART_SIZE: PartSize = PartSize::Target(5 * 1024 * 1024);
 
 fn small() -> Vec<u8> {
@@ -105,10 +118,34 @@ fn multipart_data() -> Vec<u8> {
         .collect()
 }
 
+/// Data above the download part size (5 MiB) but below the multipart-upload
+/// threshold (16 MiB): uploaded as a SINGLE PUT (full-object checksum, no `-N`),
+/// but downloaded as multiple ranged GETs (split for throughput). S3 returns no
+/// per-range checksum for a single-stored-part object, so the SDK validates
+/// nothing on the split chunks.
+fn large_single_put() -> Vec<u8> {
+    (0..12 * ByteUnit::Mebibyte.as_bytes_usize())
+        .map(|i| (i % 256) as u8)
+        .collect()
+}
+
 fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
     match output.integrity_checks().checksum_validation() {
         ChecksumValidation::NotValidated { reason } => assert_eq!(*reason, expected),
         other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
+    }
+}
+
+/// Assert a download failed with a per-chunk failure (the kind a checksum
+/// mismatch surfaces as: the SDK body validator errors on a chunk, which the
+/// transfer manager reports as `ErrorKind::ChunkFailed`). Asserting the kind,
+/// not just `is_err()`, pins that the failure is integrity-related and not some
+/// unrelated error path.
+fn assert_chunk_failed<T>(result: Result<T, Error>) {
+    match result {
+        Err(e) if matches!(e.kind(), ErrorKind::ChunkFailed(_)) => {}
+        Err(e) => panic!("expected ErrorKind::ChunkFailed, got {:?}", e.kind()),
+        Ok(_) => panic!("expected the download to fail with ChunkFailed, but it succeeded"),
     }
 }
 
@@ -312,7 +349,7 @@ async fn tampered_single_part_errors(target: Target) {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert!(result.is_err(), "tampered body must fail the download");
+    assert_chunk_failed(result);
 
     t.shutdown().await;
 }
@@ -351,7 +388,7 @@ async fn tampered_single_part_file_errors(target: Target) {
     let result = t
         .download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
         .await;
-    assert!(result.is_err(), "tampered body must fail the file download");
+    assert_chunk_failed(result);
     assert!(
         !dest.exists(),
         "destination must not be created on a failed download"
@@ -403,10 +440,10 @@ async fn file_download_round_trips_mock_gp() {
 }
 
 async fn tampered_multipart_errors(target: Target) {
-    // Align download ranges to the uploaded part boundaries so each chunk carries
-    // a per-part checksum the SDK validates. Without alignment, S3 returns no
-    // checksum for the ranges and tampering cannot be caught (see the unaligned
-    // boundary test below).
+    // Explicit part size, applied to BOTH upload and download, so the download
+    // ranges match the uploaded part boundaries without relying on auto-alignment
+    // (auto-alignment only fires for an Auto part size). Each aligned chunk carries
+    // a per-part checksum the SDK validates, so a tampered checksum fails.
     let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
     let data = multipart_data();
     t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
@@ -423,7 +460,7 @@ async fn tampered_multipart_errors(target: Target) {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert!(result.is_err(), "tampered checksum must fail the download");
+    assert_chunk_failed(result);
 
     t.shutdown().await;
 }
@@ -433,24 +470,19 @@ async fn tampered_multipart_errors_mock_gp() {
     tampered_multipart_errors(Target::mock_gp()).await;
 }
 
-// part-size alignment boundary --------------------------------------------------
+// multipart download is aligned to the stored part size by default ---------------
 //
 // S3 returns a per-part checksum for a ranged GET only when the range matches a
-// stored part boundary (flexible-checksums SEP). The TM downloads with ranged
-// GETs, so multipart download validation depends on the download part size
-// matching the uploaded part size. These two tests pin both sides of that
-// boundary so the behavior cannot drift silently.
-//
-// TODO(vnext): the TM should align download ranges to the stored part size by
-// default (today upload defaults to 8 MiB, download to 5 MiB, so the default is
-// unaligned and not validated). When that lands, the unaligned case below stops
-// being the default; it remains reachable only with an explicit mismatched size.
+// stored part boundary. The TM downloads with ranged
+// GETs and, when validating a multipart object with an Auto part size, discovers
+// the stored part size (via a partNumber=1 GET) and slices download ranges to it
+// so every chunk aligns to a stored boundary (including the ragged tail) and the
+// SDK validates each part. These tests pin that aligned-by-default behavior.
 
-/// Aligned (upload part size == download part size): a non-tampered multipart
-/// download round-trips. Tampering on this path is caught (see
-/// `tampered_multipart_errors`).
+/// Default part size (Auto): a non-tampered multipart download round-trips. The
+/// TM aligns ranges to the stored part size, so the SDK validates each part.
 async fn multipart_aligned_round_trips(target: Target) {
-    let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
+    let t = target.connect().await;
     let data = multipart_data();
     t.put(
         "obj",
@@ -473,12 +505,12 @@ async fn multipart_aligned_round_trips_mock_gp() {
     multipart_aligned_round_trips(Target::mock_gp()).await;
 }
 
-/// Unaligned (TM default: upload 8 MiB, download 5 MiB): the download still
-/// round-trips, but a tampered checksum is NOT caught, because S3 returns no
-/// checksum for the unaligned ranges. This pins the silent no-validation default
-/// so the alignment fix (TODO above) flips it deliberately.
-async fn multipart_unaligned_tamper_not_caught(target: Target) {
-    let t = target.connect().await; // default unaligned part sizes
+/// Default part size (Auto): a tampered chunk of a multipart download IS caught.
+/// The TM aligns download ranges to the stored part boundaries, so each ranged
+/// GET carries a per-part checksum the SDK validates; a corrupted part fails the
+/// download. This is the integrity-critical guarantee for multipart downloads.
+async fn multipart_default_tamper_caught(target: Target) {
+    let t = target.connect().await; // default (Auto) part size -> auto-aligned
     let data = multipart_data();
     t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
         .await;
@@ -492,18 +524,53 @@ async fn multipart_unaligned_tamper_not_caught(target: Target) {
         Occurrence::Always,
     );
 
-    // Unaligned ranges carry no checksum, so the tamper is invisible and the
-    // download succeeds. This is the gap the alignment fix closes.
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert!(
-        result.is_ok(),
-        "unaligned multipart download is not validated, so it currently succeeds"
-    );
+    assert_chunk_failed(result);
 
     t.shutdown().await;
 }
 
 #[tokio::test]
-async fn multipart_unaligned_tamper_not_caught_mock_gp() {
-    multipart_unaligned_tamper_not_caught(Target::mock_gp()).await;
+async fn multipart_default_tamper_caught_mock_gp() {
+    multipart_default_tamper_caught(Target::mock_gp()).await;
+}
+
+// large single-PUT object split for throughput ---------------------------------
+//
+// An object uploaded as a SINGLE PUT (below the multipart-upload threshold) but
+// larger than the download part size is split into parallel ranged GETs for
+// throughput. The split already happens today (the slicer cuts by byte range,
+// not by stored part count). S3 stores ONE full-object checksum and returns NO
+// checksum for any sub-range of a single-stored-part object, so the SDK cannot
+// validate the split chunks. Closing this needs the transfer manager to compute
+// a whole-object checksum over the delivered bytes itself (HeadObject for the
+// expected value + an ordered hash at the slot-buffer consume point), or a wire
+// checksum from S3 over arbitrary response bytes.
+
+/// INTENT (not yet implemented): a tampered chunk of a split single-PUT download
+/// MUST fail the download. Ignored until the transfer manager validates this path
+/// itself; it currently succeeds (the chunks carry no checksum), so this FAILS
+/// today. The test states the desired behavior; the ignore reason states why it
+/// is not running yet.
+#[tokio::test]
+#[ignore = "TODO(vnext): wire checksums, or TM-computed whole-object checksum over the slot-buffer bytes, to validate split single-PUT downloads"]
+async fn single_put_split_tamper_caught_mock_gp() {
+    let t = Target::mock_gp().connect().await; // default part sizes; 12 MiB -> 3 ranged GETs
+    let data = large_single_put();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        "obj",
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_chunk_failed(result);
+
+    t.shutdown().await;
 }

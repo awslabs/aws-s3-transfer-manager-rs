@@ -20,6 +20,11 @@ pub(crate) enum DownloadState {
         ranges_in_flight: usize,
         /// ETag for consistency (shared across all range requests)
         etag: Option<std::sync::Arc<str>>,
+        /// Per-chunk size used to slice `remaining`. Normally the configured
+        /// download part size; for a multipart object being validated it is the
+        /// object's stored part size so each range aligns to a stored part
+        /// boundary (S3 returns a per-part checksum only for an aligned range).
+        part_size: u64,
     },
 
     /// Terminal state - transfer ended (success, failure, or cancelled)

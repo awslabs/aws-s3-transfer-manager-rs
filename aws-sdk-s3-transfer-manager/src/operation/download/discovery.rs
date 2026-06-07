@@ -41,6 +41,20 @@ pub(super) struct ObjectDiscovery {
 
     /// the first chunk of data if fetched during discovery
     pub(super) initial_chunk: Option<ByteStream>,
+
+    /// Per-chunk size the transfer should slice remaining ranges at. Normally the
+    /// configured download part size; for a validated multipart object it is the
+    /// object's stored part size so every range aligns to a stored part boundary
+    /// (the precondition for per-part download validation).
+    pub(super) effective_part_size: u64,
+}
+
+/// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
+/// Returns `None` for a single-part ETag (no `-N` suffix) or unparseable input.
+fn parts_from_etag(etag: &str) -> Option<u32> {
+    let trimmed = etag.trim_matches('"');
+    let (_, n) = trimmed.rsplit_once('-')?;
+    n.parse::<u32>().ok().filter(|&n| n > 1)
 }
 
 impl ObjectDiscoveryStrategy {
@@ -71,10 +85,13 @@ impl ObjectDiscoveryStrategy {
 pub(super) async fn discover_obj(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
+    validation_enabled: bool,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
+    let configured_part_size = transfer.ctx().handle.download_part_size_bytes();
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     tracing::trace!("discovering object with strategy {:?}", strategy);
-    let discovery = match strategy {
+    let user_explicit_part_size = transfer.ctx().handle.user_set_part_size();
+    let mut discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject => {
             discover_obj_with_head(transfer, input)
                 .instrument(tracing::debug_span!("send-head-object-for-discovery"))
@@ -86,11 +103,54 @@ pub(super) async fn discover_obj(
                 .await
         }
     }?;
+    // Default: slice at the configured download part size. The alignment path
+    // below overrides this with the stored part size when validating a multipart
+    // object.
+    discovery.effective_part_size = configured_part_size;
+
+    // Align download ranges to the object's stored part size so each ranged GET
+    // matches a stored part boundary and S3 returns the part's checksum for the
+    // SDK to validate. Only for: validation on, no user range, a multipart object
+    // (ETag carries `-N`), and the user did not pin an explicit part size.
+    //
+    // The initial ranged discovery fetched `[0, configured)`, whose chunk length
+    // is the CONFIGURED size, not the stored part size, so it cannot tell us the
+    // stored layout. Re-issue via partNumber=1, whose response reports the exact
+    // first-part (= stored part) size via Content-Range; slice every range at that
+    // size so all chunks align to stored boundaries (incl. the ragged tail). One
+    // extra request, only on this path.
+    //
+    // TODO(vnext): a wire checksum over arbitrary response bytes removes the need
+    // to align, so this partNumber re-issue can go away once that exists.
+    let is_multipart = discovery
+        .object_meta
+        .e_tag
+        .as_deref()
+        .and_then(parts_from_etag)
+        .is_some();
+    if validation_enabled && input.range().is_none() && is_multipart && !user_explicit_part_size {
+        let mut aligned = discover_obj_with_get_first_part(transfer, input).await?;
+        let stored_part_size = aligned
+            .chunk_meta
+            .as_ref()
+            .and_then(|m| m.content_length)
+            .map(|len| len as u64)
+            .filter(|&len| len != 0)
+            .unwrap_or(configured_part_size);
+        tracing::debug!(
+            configured_part_size,
+            stored_part_size,
+            "realigned multipart download to stored part size for validation"
+        );
+        aligned.effective_part_size = stored_part_size;
+        discovery = aligned;
+    }
 
     tracing::trace!(
-        "discovered object, remaining: {:?}; initial chunk set: {}",
-        discovery.remaining,
-        discovery.initial_chunk.is_some()
+        remaining = ?discovery.remaining,
+        initial_chunk = discovery.initial_chunk.is_some(),
+        effective_part_size = discovery.effective_part_size,
+        "discovered object",
     );
 
     Ok(discovery)
@@ -133,6 +193,8 @@ async fn discover_obj_with_head(
         chunk_meta: None,
         object_meta,
         initial_chunk: None,
+        // Filled in by discover_obj (configured size, or stored size when aligning).
+        effective_part_size: 0,
     })
 }
 
@@ -208,6 +270,8 @@ fn first_chunk_response_handler(
         chunk_meta: Some(chunk_meta),
         object_meta,
         initial_chunk,
+        // Filled in by discover_obj (configured size, or stored size when aligning).
+        effective_part_size: 0,
     })
 }
 
@@ -250,6 +314,14 @@ mod tests {
             .client(client)
             .set_target_part_size(PartSize::Target(target_part_size))
             .build();
+        let tm = crate::Client::new(tm_config);
+        tm.handle.clone()
+    }
+
+    // Handle with an Auto part size (download Auto = 5 MiB), so the multipart
+    // alignment branch (gated on `!user_set_part_size`) can be exercised.
+    fn test_handle_auto(client: aws_sdk_s3::Client) -> Arc<crate::client::Handle> {
+        let tm_config = crate::Config::builder().client(client).build();
         let tm = crate::Client::new(tm_config);
         tm.handle.clone()
     }
@@ -338,7 +410,7 @@ mod tests {
 
         let transfer = test_transfer(test_handle(client, target_part_size), &request);
 
-        let discovery = discover_obj(&transfer, &request).await.unwrap();
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(200, remaining.clone().count());
         assert_eq!(500..=699, remaining);
@@ -376,7 +448,7 @@ mod tests {
 
         let transfer = test_transfer(test_handle(client, target_part_size), &request);
 
-        let discovery = discover_obj(&transfer, &request).await.unwrap();
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
@@ -386,6 +458,89 @@ mod tests {
             .await
             .expect("valid body");
         assert_eq!(400, initial_chunk.remaining());
+    }
+
+    // A validating download of a multipart object (ETag `-N`) with an Auto part
+    // size re-issues discovery via partNumber=1 to learn the exact stored part
+    // size and aligns subsequent ranges to it. Download Auto = 5 MiB, but the
+    // stored part is 8 MiB; effective_part_size must become 8 MiB.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_discover_obj_aligns_multipart_when_validating() {
+        const MIB: u64 = 1024 * 1024;
+        let download_default = 5 * MIB; // Auto download part size
+        let stored_part = 8 * MIB;
+        let total = 20 * MIB; // 8 + 8 + 4 -> 3 parts
+        let ranged = mock!(Client::get_object)
+            .match_requests(move |r| {
+                r.range() == Some(format!("bytes=0-{}", download_default - 1).as_str())
+                    && r.part_number().is_none()
+            })
+            .then_output(move || {
+                GetObjectOutput::builder()
+                    .content_length(download_default as i64)
+                    .content_range(format!("0-{}/{}", download_default - 1, total))
+                    .e_tag("\"abc-3\"")
+                    .body(ByteStream::from_static(&[0u8; 8]))
+                    .build()
+            });
+        let part1 = mock!(Client::get_object)
+            .match_requests(|r| r.part_number() == Some(1))
+            .then_output(move || {
+                GetObjectOutput::builder()
+                    .content_length(stored_part as i64)
+                    .content_range(format!("0-{}/{}", stored_part - 1, total))
+                    .e_tag("\"abc-3\"")
+                    .parts_count(3)
+                    .body(ByteStream::from_static(&[0u8; 8]))
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part1]);
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let transfer = test_transfer(test_handle_auto(client), &request);
+
+        let discovery = discover_obj(&transfer, &request, true).await.unwrap();
+
+        // Aligned to the stored part size (8 MiB), not the Auto default (5 MiB).
+        assert_eq!(discovery.effective_part_size, stored_part);
+        // remaining starts at the first stored boundary (after part 1).
+        assert_eq!(discovery.remaining, Some(stored_part..=total - 1));
+    }
+
+    // Without validation, no partNumber re-issue: the slice size stays the
+    // configured part size even for a multipart object.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_discover_obj_no_align_when_validation_disabled() {
+        let configured = 500;
+        let ranged = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=0-499"))
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(500)
+                    .content_range("0-499/700")
+                    .e_tag("\"abc-2\"")
+                    .body(ByteStream::from_static(&[0u8; 500]))
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, &[&ranged]);
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let transfer = test_transfer(test_handle(client, configured), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
+
+        assert_eq!(discovery.effective_part_size, configured);
+        assert_eq!(discovery.remaining, Some(500..=699));
     }
 
     #[cfg_attr(miri, ignore)]
@@ -413,7 +568,7 @@ mod tests {
 
         let transfer = test_transfer(test_handle(client, target_part_size), &request);
 
-        let discovery = discover_obj(&transfer, &request).await.unwrap();
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(200, remaining.clone().count());
         assert_eq!(300..=499, remaining);
@@ -452,7 +607,7 @@ mod tests {
 
         let transfer = test_transfer(test_handle(client, target_part_size), &request);
 
-        let discovery = discover_obj(&transfer, &request).await.unwrap();
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
@@ -486,7 +641,7 @@ mod tests {
 
         let transfer = test_transfer(test_handle(client, target_part_size), &request);
 
-        let discovery = discover_obj(&transfer, &request).await.unwrap();
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         assert!(discovery.remaining.is_none());
         assert!(discovery.initial_chunk.is_none());
     }

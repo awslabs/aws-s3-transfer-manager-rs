@@ -848,7 +848,6 @@ async fn run_multipart_composite_checksum(
     Ok(())
 }
 
-/// P4 — ranged-GET checksum fidelity (mirrors real-S3 verification 4).
 /// A composite MPU object: an aligned ranged GET returns that part's individual
 /// checksum (no `-N`); an unaligned range returns none; whole-object returns `-N`.
 async fn run_ranged_get_checksum_fidelity(storage_type: StorageType) -> Result<()> {
@@ -989,6 +988,145 @@ async fn test_ranged_get_checksum_fidelity_in_memory() -> Result<()> {
 #[tokio::test]
 async fn test_ranged_get_checksum_fidelity_filesystem() -> Result<()> {
     run_ranged_get_checksum_fidelity(StorageType::Filesystem).await
+}
+
+/// A `partNumber=N` GET returns exactly that stored part's bytes, the part's own
+/// checksum (no `-N`), `parts_count`, and a `Content-Range` with the total object
+/// size. This is the contract the TM's download range-alignment relies on; pin it
+/// so the mock cannot silently diverge from S3.
+async fn run_part_number_get_fidelity(storage_type: StorageType) -> Result<()> {
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+
+    let key = "test-part-number-fidelity.bin";
+    // Uniform interior + smaller tail (the ragged-tail case).
+    let part1 = vec![0x11u8; 4096];
+    let part2 = vec![0x22u8; 4096];
+    let part3 = vec![0x33u8; 1024];
+    let c1 = calculate_checksum(&part1, ChecksumAlgorithm::Crc32);
+    let c2 = calculate_checksum(&part2, ChecksumAlgorithm::Crc32);
+    let c3 = calculate_checksum(&part3, ChecksumAlgorithm::Crc32);
+    let total = (part1.len() + part2.len() + part3.len()) as u64;
+
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .send()
+        .await?
+        .upload_id()
+        .unwrap()
+        .to_string();
+
+    let mut etags = Vec::new();
+    for (i, (part, c)) in [(&part1, &c1), (&part2, &c2), (&part3, &c3)]
+        .iter()
+        .enumerate()
+    {
+        let etag = s3
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(i as i32 + 1)
+            .body(Bytes::from((*part).clone()).into())
+            .checksum_crc32((*c).clone())
+            .send()
+            .await?
+            .e_tag()
+            .unwrap()
+            .to_string();
+        etags.push(etag);
+    }
+
+    s3.complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(&etags[0])
+                        .checksum_crc32(&c1)
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(&etags[1])
+                        .checksum_crc32(&c2)
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(3)
+                        .e_tag(&etags[2])
+                        .checksum_crc32(&c3)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+
+    // partNumber=1 → part 1's bytes + checksum + parts_count + Content-Range/total.
+    let r = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(1)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(r.checksum_crc32(), Some(c1.as_str()), "part1 checksum");
+    assert_eq!(r.parts_count(), Some(3), "parts_count");
+    assert_eq!(r.content_length(), Some(part1.len() as i64), "part1 length");
+    assert_eq!(
+        r.content_range(),
+        Some(format!("bytes 0-{}/{}", part1.len() - 1, total).as_str()),
+        "part1 content-range carries total size"
+    );
+
+    // partNumber=3 → the ragged tail's bytes + checksum.
+    let r = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(3)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(r.checksum_crc32(), Some(c3.as_str()), "tail part checksum");
+    assert_eq!(r.content_length(), Some(part3.len() as i64), "tail length");
+    let body = r.body.collect().await?.to_vec();
+    assert_eq!(body, part3, "tail part bytes");
+
+    // Out-of-range part number → error (not a panic, not wrong data).
+    let err = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .part_number(99)
+        .send()
+        .await;
+    assert!(err.is_err(), "out-of-range partNumber must error");
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_part_number_get_fidelity_in_memory() -> Result<()> {
+    run_part_number_get_fidelity(StorageType::InMemory).await
+}
+
+#[tokio::test]
+async fn test_part_number_get_fidelity_filesystem() -> Result<()> {
+    run_part_number_get_fidelity(StorageType::Filesystem).await
 }
 
 /// Test CompleteMultipartUpload with incorrect composite checksum (should fail with BadDigest)

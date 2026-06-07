@@ -165,6 +165,28 @@ impl ObjectMetadata {
         }
         self.clear_checksums();
     }
+
+    /// Byte range `[start, end)` of the 1-based `part_number` for a completed
+    /// multipart object, from the stored part boundaries. `None` if the object
+    /// has no parts (single-PUT) or the part number is out of range. Matches S3's
+    /// `partNumber` GET, which returns exactly that part's bytes.
+    pub(crate) fn part_range(&self, part_number: i32) -> Option<std::ops::Range<u64>> {
+        if part_number < 1 {
+            return None;
+        }
+        let idx = (part_number - 1) as usize;
+        if idx >= self.parts.len() {
+            return None;
+        }
+        let start: u64 = self.parts[..idx].iter().map(|p| p.size).sum();
+        let end = start + self.parts[idx].size;
+        Some(start..end)
+    }
+
+    /// Number of stored parts for a completed multipart object (0 for single-PUT).
+    pub(crate) fn parts_count(&self) -> usize {
+        self.parts.len()
+    }
 }
 
 impl Default for ObjectMetadata {

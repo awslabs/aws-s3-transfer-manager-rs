@@ -138,9 +138,24 @@ impl DownloadTransfer {
         &self.inner.discovery_notify
     }
 
-    /// The target part size to use for this download.
-    fn target_part_size_bytes(&self) -> u64 {
-        self.inner.ctx.handle.download_part_size_bytes()
+    /// Whether download checksum validation is in effect, resolved the same way
+    /// the SDK's GetObject mutator does: enabled if the request set
+    /// `ChecksumMode=Enabled`, or it is unset and the client's
+    /// `ResponseChecksumValidation` is not `WhenRequired` (`WhenSupported`, the
+    /// default, and unknown values enable it).
+    fn validation_enabled(&self, input: &DownloadInput) -> bool {
+        match input.checksum_mode {
+            Some(aws_sdk_s3::types::ChecksumMode::Enabled) => true,
+            _ => !matches!(
+                self.ctx()
+                    .s3_client()
+                    .config()
+                    .response_checksum_validation()
+                    .copied()
+                    .unwrap_or_default(),
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired
+            ),
+        }
     }
 
     /// Poll for the next work item.
@@ -173,6 +188,7 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight,
                 etag,
+                part_size,
                 ..
             } => {
                 // Check seq window before generating work
@@ -182,7 +198,11 @@ impl DownloadTransfer {
                 };
 
                 if let Some(range) = remaining.take() {
-                    let part_size = self.target_part_size_bytes();
+                    // `part_size` is the stored part size for a validated multipart
+                    // object (so each range aligns to a stored part boundary and S3
+                    // returns the part's checksum for the SDK to validate), else the
+                    // configured download part size. Set at discovery.
+                    let part_size = *part_size;
                     let start = *range.start();
                     let end = *range.end();
                     let chunk_end = cmp::min(start + part_size - 1, end);
@@ -234,7 +254,14 @@ impl DownloadTransfer {
     async fn execute_discovery(&self) -> WorkOutcome {
         let input = self.inner.request.as_ref();
 
-        let discovery = match discover_obj(self, input).await {
+        // Resolve the effective validation state the same way the SDK's GetObject
+        // mutator does: enabled if the request set ChecksumMode=Enabled, or the
+        // request left it unset and the client's ResponseChecksumValidation is not
+        // WhenRequired (WhenSupported, the default, and unknown values enable it).
+        // Computed before discovery because it drives range alignment.
+        let validation_enabled = self.validation_enabled(input);
+
+        let discovery = match discover_obj(self, input, validation_enabled).await {
             Ok(d) => d,
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
@@ -247,6 +274,7 @@ impl DownloadTransfer {
             object_meta,
             initial_chunk,
             chunk_meta,
+            effective_part_size,
         } = discovery;
 
         // Store object_meta for object_meta() and join()
@@ -256,22 +284,6 @@ impl DownloadTransfer {
         // chunk. A larger multipart object's discovery chunk carries part 1's
         // checksum, which is not the object checksum.
         let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        // Resolve the effective validation state the same way the SDK's GetObject
-        // mutator does: enabled if the request set ChecksumMode=Enabled, or the
-        // request left it unset and the client's ResponseChecksumValidation is not
-        // WhenRequired (WhenSupported, the default, and unknown values enable it).
-        let validation_enabled = match input.checksum_mode {
-            Some(aws_sdk_s3::types::ChecksumMode::Enabled) => true,
-            _ => !matches!(
-                self.ctx()
-                    .s3_client()
-                    .config()
-                    .response_checksum_validation()
-                    .copied()
-                    .unwrap_or_default(),
-                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired
-            ),
-        };
         let integrity = build_integrity_checks(
             chunk_meta.as_ref(),
             whole_object_in_chunk,
@@ -320,6 +332,7 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag,
+                part_size: effective_part_size,
             };
         }
 

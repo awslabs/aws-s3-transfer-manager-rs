@@ -182,7 +182,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         // Convert s3s Range to std Range if present
-        let range = input
+        let mut range = input
             .range
             .as_ref()
             .map(|range_dto| {
@@ -191,6 +191,27 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                     .map_err(|_| Error::InvalidRange)
             })
             .transpose()?;
+
+        // A partNumber GET returns exactly that stored part's bytes. Translate it
+        // to the part's byte range; the range path below then returns the part's
+        // data, Content-Range, and per-part checksum. parts_count is set on the
+        // response so callers learn the stored part count.
+        // For a non-multipart (single-PUT) object there are no stored parts:
+        // partNumber=1 returns the whole object, any higher number errors.
+        let parts_count = metadata.parts_count();
+        if let Some(pn) = input.part_number {
+            if parts_count == 0 {
+                if pn != 1 {
+                    return Err(Error::InvalidPart.into());
+                }
+                // pn == 1, single-PUT: leave range as-is (whole object).
+            } else {
+                match metadata.part_range(pn) {
+                    Some(r) => range = Some(r),
+                    None => return Err(Error::InvalidPart.into()),
+                }
+            }
+        }
 
         // Get object stream with validated range
         let request = crate::storage::GetObjectRequest {
@@ -247,6 +268,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_sha1 = stream_metadata.sha1;
         output.checksum_sha256 = stream_metadata.sha256;
         output.checksum_crc64nvme = stream_metadata.crc64nvme;
+
+        // A partNumber GET reports the object's stored part count.
+        if input.part_number.is_some() && parts_count > 1 {
+            output.parts_count = Some(parts_count as i32);
+        }
 
         // Return stored HTTP headers
         output.storage_class = stream_metadata.storage_class.map(|s| s.parse().unwrap());
