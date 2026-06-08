@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,10 +44,12 @@ const DEFAULT_DELIMITER: &str = "/";
 
 /// Work items produced by [`DownloadObjectsTransfer::poll_work`].
 pub(crate) enum DownloadObjectsWork {
-    /// Advance the S3 listing walker by one page/entry.
-    AdvanceWalker { walk: Option<S3Walk> },
+    /// Advance the S3 listing walker by one page/entry. The walker is boxed:
+    /// `S3Walk` is large (hundreds of bytes), and boxing keeps the work enum
+    /// small for the common `JoinChildren` variant (large_enum_variant).
+    AdvanceWalker { walk: Option<Box<S3Walk>> },
     /// Join a batch of terminal child downloads.
-    JoinChildren { batch: Vec<ChildTransfer> },
+    JoinChildren { batch: Option<ReapingBatch> },
 }
 
 impl std::fmt::Debug for DownloadObjectsWork {
@@ -55,7 +58,7 @@ impl std::fmt::Debug for DownloadObjectsWork {
             Self::AdvanceWalker { .. } => f.debug_struct("AdvanceWalker").finish_non_exhaustive(),
             Self::JoinChildren { batch } => f
                 .debug_struct("JoinChildren")
-                .field("count", &batch.len())
+                .field("count", &batch.as_ref().map(|b| b.count))
                 .finish(),
         }
     }
@@ -65,6 +68,131 @@ impl std::fmt::Debug for DownloadObjectsWork {
 pub(crate) struct ChildTransfer {
     pub(crate) handle: ManagedDownloadHandle,
     pub(crate) key: String,
+}
+
+/// Owns a reservation of N slots in `State::children_reserved`. Either
+/// consumed by [`DownloadObjectsTransfer::merge_spawned`] (paired decrement
+/// under the state lock) or released on `Drop` if `consume` is not reached.
+/// Constructed only by [`DownloadObjectsTransfer::claim_spawn_batch`].
+///
+/// The type makes the counter pairing structural: `merge_spawned`'s signature
+/// requires the token, so a caller cannot forget to release the reservation,
+/// and the count released always matches the count reserved.
+struct Reservation {
+    transfer: Arc<DownloadObjectsTransferInner>,
+    count: usize,
+    consumed: bool,
+}
+
+impl Reservation {
+    /// Caller holds `state.lock`. Decrements `children_reserved` by the owned
+    /// count and marks the reservation consumed. Always paired 1:1 with the
+    /// `claim_spawn_batch` that produced this token.
+    fn consume(mut self, state: &mut State) {
+        debug_assert!(
+            !self.consumed,
+            "Reservation::consume called on already-consumed reservation"
+        );
+        debug_assert!(
+            state.children_reserved >= self.count,
+            "children_reserved underflow: have {}, releasing {}",
+            state.children_reserved,
+            self.count,
+        );
+        state.children_reserved -= self.count;
+        self.consumed = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.consumed && self.count > 0 {
+            let mut state = self.transfer.state.lock();
+            state.children_reserved = state.children_reserved.saturating_sub(self.count);
+            tracing::warn!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %self.transfer.ctx.id,
+                count = self.count,
+                "Reservation dropped unconsumed; children_reserved recovered"
+            );
+        }
+    }
+}
+
+/// Owns N slots in `State::reaping_in_flight` plus the drained
+/// [`ChildTransfer`]s themselves. Either consumed by
+/// [`DownloadObjectsTransfer::execute_join_children`] (paired decrement under
+/// the state lock) or released on `Drop` if the work item is dropped without
+/// executing or `execute_join_children` panics.
+///
+/// Travels across the `IoRequest` dispatch boundary embedded in
+/// [`DownloadObjectsWork::JoinChildren`]. On `Drop` without `consume`, the
+/// counter is recovered and the children's handles are dropped, cascading
+/// cancellation via their own `Drop`.
+pub(crate) struct ReapingBatch {
+    transfer: Arc<DownloadObjectsTransferInner>,
+    /// Drained terminal children, awaiting `join()` in
+    /// `execute_join_children`. Taken out for processing via
+    /// [`Self::take_children`]; the counter is still owned by the batch until
+    /// `consume()` is called or `Drop` runs.
+    children: Option<Vec<ChildTransfer>>,
+    count: usize,
+    consumed: bool,
+}
+
+impl fmt::Debug for ReapingBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReapingBatch")
+            .field("count", &self.count)
+            .field("consumed", &self.consumed)
+            .field("children_len", &self.children.as_ref().map(|c| c.len()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReapingBatch {
+    /// Take the inner children Vec out for processing. Must be called exactly
+    /// once before `consume`.
+    fn take_children(&mut self) -> Vec<ChildTransfer> {
+        self.children
+            .take()
+            .expect("ReapingBatch::take_children called twice or after consume")
+    }
+
+    /// Caller holds `state.lock`. Decrements `reaping_in_flight` by the owned
+    /// count and marks the batch consumed.
+    fn consume(mut self, state: &mut State) {
+        debug_assert!(
+            !self.consumed,
+            "ReapingBatch::consume called on already-consumed batch"
+        );
+        debug_assert!(
+            state.reaping_in_flight >= self.count,
+            "reaping_in_flight underflow: have {}, releasing {}",
+            state.reaping_in_flight,
+            self.count,
+        );
+        state.reaping_in_flight -= self.count;
+        self.consumed = true;
+    }
+}
+
+impl Drop for ReapingBatch {
+    fn drop(&mut self) {
+        if !self.consumed {
+            let mut state = self.transfer.state.lock();
+            state.reaping_in_flight = state.reaping_in_flight.saturating_sub(self.count);
+            tracing::warn!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %self.transfer.ctx.id,
+                count = self.count,
+                "ReapingBatch dropped unconsumed; reaping_in_flight recovered"
+            );
+            // Children Vec (if still present) drops here. Each
+            // ManagedDownloadHandle's own Drop cancels its child transfer via
+            // scheduler.cancel_transfer, so orphans don't leak.
+        }
+    }
 }
 
 struct State {
@@ -197,13 +325,15 @@ impl DownloadObjectsTransfer {
 
         // 1: spawn (lock released around orchestration; no work item returned).
         if self.inner.ctx.is_active() {
-            let to_spawn = self.claim_spawn_batch(&mut state);
+            let (to_spawn, reservation) = self.claim_spawn_batch(&mut state);
             if !to_spawn.is_empty() {
                 drop(state);
                 let spawned = self.spawn_children(to_spawn);
                 state = self.inner.state.lock();
-                self.merge_spawned(&mut state, spawned);
+                self.merge_spawned(&mut state, spawned, reservation);
             }
+            // An empty claim yields a zero-count reservation that drops here
+            // harmlessly (its Drop is a no-op for count == 0).
         }
 
         // 2: walk.
@@ -215,9 +345,10 @@ impl DownloadObjectsTransfer {
 
         // 3: reap.
         if let Some(batch) = self.drain_terminal_children(&mut state) {
-            state.reaping_in_flight += 1;
             return PollWork::Ready(IoRequest {
-                data: Some(Box::new(DownloadObjectsWork::JoinChildren { batch })),
+                data: Some(Box::new(DownloadObjectsWork::JoinChildren {
+                    batch: Some(batch),
+                })),
             });
         }
 
@@ -231,7 +362,7 @@ impl DownloadObjectsTransfer {
 
     /// Collect up to REAP_BATCH_SIZE children that have reached a terminal
     /// state (success, failure, or cancellation) for reaping via JoinChildren.
-    fn drain_terminal_children(&self, state: &mut State) -> Option<Vec<ChildTransfer>> {
+    fn drain_terminal_children(&self, state: &mut State) -> Option<ReapingBatch> {
         let terminal_ids: Vec<TransferId> = state
             .children
             .iter()
@@ -256,7 +387,18 @@ impl DownloadObjectsTransfer {
             remaining_children = state.children.len(),
             "download_objects draining terminal children",
         );
-        Some(batch)
+        let count = batch.len();
+        // Reserve reaping_in_flight by the child count (not 1 per batch): the
+        // terminal-check guards compare reaping_in_flight == 0, so the counter
+        // must track children in flight, released 1:1 by the batch's consume()
+        // or Drop.
+        state.reaping_in_flight += count;
+        Some(ReapingBatch {
+            transfer: self.inner.clone(),
+            children: Some(batch),
+            count,
+            consumed: false,
+        })
     }
 
     /// Claim up to SPAWN_BATCH_SIZE pending entries to spawn as children.
@@ -266,7 +408,7 @@ impl DownloadObjectsTransfer {
     /// memory slot (bounded in `dispatch_walk`) but do no work, so counting
     /// them would couple spawn-refill to reap latency and reintroduce the
     /// sawtooth. `children_reserved` stops concurrent callers overshooting.
-    fn claim_spawn_batch(&self, state: &mut State) -> Vec<Object> {
+    fn claim_spawn_batch(&self, state: &mut State) -> (Vec<Object>, Reservation) {
         let active = state
             .children
             .values()
@@ -280,7 +422,12 @@ impl DownloadObjectsTransfer {
 
         let batch: Vec<Object> = state.pending_entries.drain(..count).collect();
         state.children_reserved += batch.len();
-        batch
+        let reservation = Reservation {
+            transfer: self.inner.clone(),
+            count: batch.len(),
+            consumed: false,
+        };
+        (batch, reservation)
     }
 
     fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
@@ -387,16 +534,16 @@ impl DownloadObjectsTransfer {
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
-    /// Merge results of child spawning back into state. Decrements
-    /// `children_reserved` for each entry and either inserts the child
-    /// into the active set or records the failure.
+    /// Merge results of child spawning back into state. Inserts each child into
+    /// the active set or records the failure, then consumes the [`Reservation`]
+    /// in lockstep so the `children_reserved` pairing is structural.
     fn merge_spawned(
         &self,
         state: &mut State,
         spawned: Vec<(Object, Result<ChildTransfer, Error>)>,
+        reservation: Reservation,
     ) {
         for (obj, result) in spawned {
-            state.children_reserved -= 1;
             match result {
                 Ok(child) => {
                     let id = child.handle.transfer_id();
@@ -425,6 +572,9 @@ impl DownloadObjectsTransfer {
                 }
             }
         }
+        // Release the reservation under the same lock: count reserved by
+        // claim_spawn_batch == results merged here.
+        reservation.consume(state);
     }
 
     fn check_terminal(&self, state: &State) -> Option<PollWork> {
@@ -449,7 +599,7 @@ impl DownloadObjectsTransfer {
         }
 
         // Check if walk is done and no more work to do
-        let walk_done = state.walk.as_ref().map_or(true, |w| w.is_done()) && !state.walk_in_flight;
+        let walk_done = state.walk.as_ref().is_none_or(|w| w.is_done()) && !state.walk_in_flight;
         if walk_done
             && state.pending_entries.is_empty()
             && state.children.is_empty()
@@ -504,7 +654,7 @@ impl DownloadObjectsTransfer {
         state.walk_in_flight = true;
         Some(PollWork::Ready(IoRequest {
             data: Some(Box::new(DownloadObjectsWork::AdvanceWalker {
-                walk: Some(walk),
+                walk: Some(Box::new(walk)),
             })),
         }))
     }
@@ -524,10 +674,11 @@ impl DownloadObjectsTransfer {
 
         match data {
             DownloadObjectsWork::AdvanceWalker { walk } => {
-                self.execute_advance_walker(walk.take().unwrap()).await
+                self.execute_advance_walker(*walk.take().unwrap()).await
             }
             DownloadObjectsWork::JoinChildren { batch } => {
-                self.execute_join_children(std::mem::take(batch)).await
+                let batch = batch.take().expect("batch already taken");
+                self.execute_join_children(batch).await
             }
         }
     }
@@ -634,8 +785,9 @@ impl DownloadObjectsTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    async fn execute_join_children(&self, batch: Vec<ChildTransfer>) -> WorkOutcome {
-        for child in batch {
+    async fn execute_join_children(&self, mut batch: ReapingBatch) -> WorkOutcome {
+        let children = batch.take_children();
+        for child in children {
             let key = child.key;
             // Snapshot metrics before `join()` consumes the handle.
             let metrics = child.handle.metrics();
@@ -678,7 +830,7 @@ impl DownloadObjectsTransfer {
         }
 
         let mut state = self.inner.state.lock();
-        state.reaping_in_flight -= 1;
+        batch.consume(&mut state);
         // An execute callback that drains the last in-flight work owns the
         // terminal transition: check and signal here rather than deferring to
         // a subsequent poll_work.
@@ -987,8 +1139,15 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test]
     fn test_local_key_path_comprehensive() {
+        // (key, key_prefix, delimiter, expected) for derive_local_path.
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Result<&'static str, &'static str>,
+        );
         let root = Path::new("test");
-        let cases: &[(&str, Option<&str>, Option<&str>, Result<&str, &str>)] = &[
+        let cases: &[Case] = &[
             ("2023/Jan/1.png", None, None, Ok("test/2023/Jan/1.png")),
             ("2023/Jan/1.png", Some("2023/Jan/"), None, Ok("test/1.png")),
             ("2023/Jan/1.png", Some("2023/Jan"), None, Ok("test/1.png")),
@@ -1497,5 +1656,198 @@ mod tests {
 
         assert_eq!(transfer.successful_downloads(), 0);
         assert!(transfer.ctx().is_failed());
+    }
+
+    // --- RAII counter guard tests (mirror upload_objects) ---
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reservation_consume_decrements_counter() {
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        // Pre-set the counter as if claim_spawn_batch had reserved 5 slots.
+        {
+            let mut state = transfer.inner.state.lock();
+            state.children_reserved = 5;
+        }
+
+        let reservation = Reservation {
+            transfer: transfer.inner.clone(),
+            count: 5,
+            consumed: false,
+        };
+
+        {
+            let mut state = transfer.inner.state.lock();
+            reservation.consume(&mut state);
+            assert_eq!(0, state.children_reserved, "consume must decrement");
+        }
+
+        // Drop after consume is a no-op (consumed = true).
+        let state = transfer.inner.state.lock();
+        assert_eq!(
+            0, state.children_reserved,
+            "Drop after consume must not double-decrement"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reservation_drop_without_consume_recovers_counter() {
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        {
+            let mut state = transfer.inner.state.lock();
+            state.children_reserved = 5;
+        }
+
+        // Drop without calling consume (e.g. an early return before merge_spawned).
+        {
+            let _reservation = Reservation {
+                transfer: transfer.inner.clone(),
+                count: 5,
+                consumed: false,
+            };
+        }
+
+        let state = transfer.inner.state.lock();
+        assert_eq!(
+            0, state.children_reserved,
+            "Drop on unconsumed Reservation must recover the counter"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reservation_drop_underflow_saturates() {
+        // State is 0; reservation claims 5. Drop must saturate, not panic.
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        {
+            let _reservation = Reservation {
+                transfer: transfer.inner.clone(),
+                count: 5,
+                consumed: false,
+            };
+        }
+
+        let state = transfer.inner.state.lock();
+        assert_eq!(0, state.children_reserved, "Drop must saturate, not panic");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reaping_batch_consume_decrements_counter() {
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        {
+            let mut state = transfer.inner.state.lock();
+            state.reaping_in_flight = 3;
+        }
+
+        let batch = ReapingBatch {
+            transfer: transfer.inner.clone(),
+            children: Some(Vec::new()),
+            count: 3,
+            consumed: false,
+        };
+
+        {
+            let mut state = transfer.inner.state.lock();
+            batch.consume(&mut state);
+            assert_eq!(0, state.reaping_in_flight, "consume must decrement");
+        }
+
+        let state = transfer.inner.state.lock();
+        assert_eq!(
+            0, state.reaping_in_flight,
+            "Drop after consume must not double-decrement"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reaping_batch_drop_without_consume_recovers_counter() {
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        {
+            let mut state = transfer.inner.state.lock();
+            state.reaping_in_flight = 3;
+        }
+
+        // Simulates the scheduler dropping a JoinChildren work item without
+        // executing, or execute_join_children panicking before batch.consume.
+        {
+            let _batch = ReapingBatch {
+                transfer: transfer.inner.clone(),
+                children: Some(Vec::new()),
+                count: 3,
+                consumed: false,
+            };
+        }
+
+        let state = transfer.inner.state.lock();
+        assert_eq!(
+            0, state.reaping_in_flight,
+            "Drop on unconsumed ReapingBatch must recover the counter"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reaping_batch_take_children_then_consume() {
+        // The happy path: execute_join_children takes children out for
+        // processing, then consumes the batch under the lock at the end.
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        {
+            let mut state = transfer.inner.state.lock();
+            state.reaping_in_flight = 2;
+        }
+
+        let mut batch = ReapingBatch {
+            transfer: transfer.inner.clone(),
+            children: Some(Vec::new()),
+            count: 2,
+            consumed: false,
+        };
+
+        let _children = batch.take_children();
+
+        {
+            let mut state = transfer.inner.state.lock();
+            batch.consume(&mut state);
+            assert_eq!(0, state.reaping_in_flight);
+        }
     }
 }
