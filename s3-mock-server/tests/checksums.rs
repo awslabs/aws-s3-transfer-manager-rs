@@ -77,16 +77,7 @@ fn calculate_checksum(data: &[u8], algorithm: ChecksumAlgorithm) -> String {
 /// S3-faithful composite value: hash the RAW (decoded) part checksum bytes,
 /// base64-encode, and append `-<part_count>`.
 fn expected_composite(part_checksums: &[String], algorithm: ChecksumAlgorithm) -> String {
-    use base64::Engine;
-    let raw: Vec<u8> = part_checksums
-        .iter()
-        .flat_map(|c| base64::engine::general_purpose::STANDARD.decode(c).unwrap())
-        .collect();
-    format!(
-        "{}-{}",
-        calculate_checksum(&raw, algorithm),
-        part_checksums.len()
-    )
+    s3_mock_server::composite_checksum(part_checksums, algorithm)
 }
 
 // ============================================================================

@@ -31,10 +31,6 @@ pub(crate) enum Backend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BucketKind {
     GeneralPurpose,
-    // TODO(vnext): add S3 Express coverage. The mock does not yet distinguish
-    // directory buckets, so an Express target against the mock would not exercise
-    // real Express behavior. Real-S3 Express is covered by the existing e2e tests
-    // until those migrate into this harness.
     #[cfg(e2e_test)]
     Express,
 }
@@ -53,6 +49,22 @@ impl Target {
         Self {
             backend: Backend::Mock,
             bucket_kind: BucketKind::GeneralPurpose,
+        }
+    }
+
+    #[cfg(e2e_test)]
+    pub(crate) fn real_gp() -> Self {
+        Self {
+            backend: Backend::RealS3,
+            bucket_kind: BucketKind::GeneralPurpose,
+        }
+    }
+
+    #[cfg(e2e_test)]
+    pub(crate) fn real_express() -> Self {
+        Self {
+            backend: Backend::RealS3,
+            bucket_kind: BucketKind::Express,
         }
     }
 
@@ -95,6 +107,9 @@ pub(crate) struct TmTestClient {
     bucket: String,
     /// Present for mock targets. Owns the server; held until `shutdown`.
     mock: Option<MockBackend>,
+    /// Present for real-S3 targets; used for direct SDK calls (e.g. HeadObject).
+    #[cfg(e2e_test)]
+    s3_client: Option<aws_sdk_s3::Client>,
 }
 
 struct MockBackend {
@@ -142,6 +157,8 @@ impl TmTestClient {
             tm: TmClient::new(builder.build()),
             bucket: "test-bucket".to_string(),
             mock: Some(MockBackend { server, handle }),
+            #[cfg(e2e_test)]
+            s3_client: None,
         }
     }
 
@@ -157,6 +174,10 @@ impl TmTestClient {
             BucketKind::GeneralPurpose => bucket_name,
             BucketKind::Express => format!("{bucket_name}--usw2-az1--x-s3"),
         };
+        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let s3_client = aws_sdk_s3::Client::new(&shared_config);
         let mut loader = aws_sdk_s3_transfer_manager::from_env();
         if let Some(ps) = part_size {
             loader = loader.part_size(ps);
@@ -165,6 +186,7 @@ impl TmTestClient {
             tm: TmClient::new(loader.load().await),
             bucket,
             mock: None,
+            s3_client: Some(s3_client),
         }
     }
 
@@ -177,6 +199,15 @@ impl TmTestClient {
     /// real-S3 target (faults cannot be injected into real S3).
     pub(crate) fn mock(&self) -> Option<&S3MockServer> {
         self.mock.as_ref().map(|m| &m.server)
+    }
+
+    /// The raw S3 client for direct SDK calls (e.g. HeadObject). Only available
+    /// on real-S3 targets.
+    #[cfg(e2e_test)]
+    pub(crate) fn s3(&self) -> &aws_sdk_s3::Client {
+        self.s3_client
+            .as_ref()
+            .expect("s3() requires a real-S3 target")
     }
 
     /// Upload `data` under `key` with the given checksum strategy.

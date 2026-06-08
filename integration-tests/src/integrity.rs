@@ -52,19 +52,41 @@
 //!
 //! # Coverage
 //!
-//! | Object                        | checksum_mode | Asserts                                   |
-//! |-------------------------------|---------------|-------------------------------------------|
-//! | single-part                   | default       | round-trip; verdict Unavailable (on)      |
-//! | single-part (WhenRequired)    | default       | round-trip; verdict Disabled (off)        |
-//! | single-part                   | on            | round-trip; value shown; not Validated*   |
-//! | multipart full-object         | on            | round-trip; object value not from a part  |
-//! | multipart composite           | on            | round-trip; object value not from a part  |
-//! | single-part tampered          | on            | ChunkFailed (never Ok)                     |
-//! | single-part tampered (file)   | on            | ChunkFailed; temp cleaned, dest not created|
-//! | multipart tampered (explicit) | on            | ChunkFailed (explicit matched size)        |
-//! | multipart, default part size  | on            | round-trip (auto-aligned to stored parts) |
-//! | multipart tampered (default)  | on            | ChunkFailed (auto-aligned, caught)         |
-//! | single-PUT split, tampered    | on            | #[ignore] intent: must ChunkFailed (TODO)  |
+//! Two guarantees, each a table. "Request mode" is the download request's
+//! `checksum_mode` (whether the caller asks S3 to return a stored checksum for
+//! the SDK to validate against): ENABLED, or unset. "Client validation" is the
+//! S3 client's `ResponseChecksumValidation` (which decides whether an unset mode
+//! is auto-promoted to ENABLED): WhenSupported is the default. "Backend" is where
+//! the body runs: `mock` only, or `mock + real S3` (the same assertions gated
+//! under `--cfg e2e_test`, run against both GP and Express buckets). Tamper tests
+//! are `mock` only by design: fault injection cannot be done against real S3.
+//!
+//! ## Positive: a good download round-trips and reports an honest verdict
+//!
+//! | Object              | Request mode | Client validation | Verdict asserted                      | Backend     |
+//! |---------------------|--------------|-------------------|---------------------------------------|-------------|
+//! | single-part         | unset        | WhenSupported     | NotValidated{Unavailable}*            | mock + real |
+//! | single-part         | unset        | WhenRequired      | NotValidated{Disabled}                | mock        |
+//! | single-part         | ENABLED      | default           | object value surfaced; not Validated* | mock + real |
+//! | multipart full-obj  | ENABLED      | default           | object value is NOT a part checksum   | mock + real |
+//! | multipart composite | ENABLED      | default           | object value is NOT a part checksum   | mock + real |
+//! | multipart (Auto sz) | ENABLED      | default           | round-trip (ranges auto-aligned)      | mock + real |
+//! | single-part (file)  | ENABLED      | default           | round-trip on disk                    | mock + real |
+//! | composite MPU value | ENABLED      | default           | object value == composite_checksum    | real        |
+//!
+//! ## Negative: a tampered download MUST fail (mock only)
+//!
+//! | Object              | Request mode | Tamper injected     | Asserts                                |
+//! |---------------------|--------------|---------------------|----------------------------------------|
+//! | single-part         | ENABLED      | CorruptBody         | ChunkFailed                            |
+//! | single-part (file)  | ENABLED      | CorruptBody         | ChunkFailed; temp cleaned, dest absent |
+//! | multipart (matched) | ENABLED      | WrongStoredChecksum | ChunkFailed (explicit matched size)    |
+//! | multipart (Auto sz) | ENABLED      | WrongStoredChecksum | ChunkFailed (auto-aligned, caught)     |
+//! | single-PUT split    | ENABLED      | CorruptBody         | #[ignore] intent: must ChunkFailed — FAILS today (TODO) |
+//!
+//! * Verdict stays NotValidated even on success until the SDK exposes a
+//!   per-response validation outcome (see "Current limitation"). The negative
+//!   tables hold today regardless.
 //!
 //! Tamper tests assert the specific `ErrorKind::ChunkFailed` (the kind a checksum
 //! mismatch surfaces as), not merely `is_err()`, so an unrelated failure cannot
@@ -201,6 +223,16 @@ async fn single_part_mode_default(target: Target) {
 async fn single_part_mode_default_mock_gp() {
     single_part_mode_default(Target::mock_gp()).await;
 }
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn single_part_mode_default_real_gp() {
+    single_part_mode_default(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn single_part_mode_default_real_express() {
+    single_part_mode_default(Target::real_express()).await;
+}
 
 // single-part, client ResponseChecksumValidation=WhenRequired -------------------
 //
@@ -269,6 +301,16 @@ async fn single_part_mode_on(target: Target) {
 async fn single_part_mode_on_mock_gp() {
     single_part_mode_on(Target::mock_gp()).await;
 }
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn single_part_mode_on_real_gp() {
+    single_part_mode_on(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn single_part_mode_on_real_express() {
+    single_part_mode_on(Target::real_express()).await;
+}
 
 // multipart full-object ---------------------------------------------------------
 
@@ -300,6 +342,16 @@ async fn multipart_full_object(target: Target) {
 async fn multipart_full_object_mock_gp() {
     multipart_full_object(Target::mock_gp()).await;
 }
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn multipart_full_object_real_gp() {
+    multipart_full_object(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn multipart_full_object_real_express() {
+    multipart_full_object(Target::real_express()).await;
+}
 
 // multipart composite -----------------------------------------------------------
 
@@ -329,6 +381,128 @@ async fn multipart_composite(target: Target) {
 #[tokio::test]
 async fn multipart_composite_mock_gp() {
     multipart_composite(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn multipart_composite_real_gp() {
+    multipart_composite(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn multipart_composite_real_express() {
+    multipart_composite(Target::real_express()).await;
+}
+
+/// Real-S3 authority gate: assert that S3's composite checksum value for a
+/// multipart upload exactly equals our `s3_mock_server::composite_checksum`
+/// computation. Uses the raw SDK client to control per-part checksums.
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn mpu_composite_value_matches_expected_real_gp() {
+    use aws_sdk_s3::types::{
+        ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart,
+    };
+    use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+
+    let t = Target::real_gp().connect().await;
+    let s3 = t.s3();
+    let bucket = t.bucket();
+    let key = &format!("integrity-composite-gate-{}", uuid::Uuid::new_v4());
+
+    let algorithm = ChecksumAlgorithm::Crc32;
+
+    // Two parts, each >= 5 MiB (S3's minimum part size for MPU).
+    let part1: Vec<u8> = (0..5 * ByteUnit::Mebibyte.as_bytes_usize())
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let part2: Vec<u8> = (0..5 * ByteUnit::Mebibyte.as_bytes_usize())
+        .map(|i| (i % 239) as u8)
+        .collect();
+
+    let create = s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .checksum_algorithm(algorithm.clone())
+        .send()
+        .await
+        .expect("create MPU");
+    let upload_id = create.upload_id().unwrap();
+
+    let r1 = s3
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .checksum_algorithm(algorithm.clone())
+        .body(aws_sdk_s3::primitives::ByteStream::from(part1))
+        .send()
+        .await
+        .expect("upload part 1");
+
+    let r2 = s3
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(2)
+        .checksum_algorithm(algorithm.clone())
+        .body(aws_sdk_s3::primitives::ByteStream::from(part2))
+        .send()
+        .await
+        .expect("upload part 2");
+
+    let c1 = r1.checksum_crc32().unwrap().to_owned();
+    let c2 = r2.checksum_crc32().unwrap().to_owned();
+
+    s3.complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(r1.e_tag().unwrap())
+                        .checksum_crc32(&c1)
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(r2.e_tag().unwrap())
+                        .checksum_crc32(&c2)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete MPU");
+
+    let head = s3
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("head object");
+
+    let actual = head
+        .checksum_crc32()
+        .expect("expected composite CRC32 in HeadObject response");
+    let expected = s3_mock_server::composite_checksum(&[c1, c2], algorithm);
+    assert_eq!(
+        actual, expected,
+        "real S3 composite value must match our composite_checksum computation"
+    );
+
+    // Cleanup
+    s3.delete_object().bucket(bucket).key(key).send().await.ok();
+    t.shutdown().await;
 }
 
 // tamper -> error (the integrity-critical negative; mock only) -------------------
@@ -438,6 +612,16 @@ async fn file_download_round_trips(target: Target) {
 async fn file_download_round_trips_mock_gp() {
     file_download_round_trips(Target::mock_gp()).await;
 }
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn file_download_round_trips_real_gp() {
+    file_download_round_trips(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn file_download_round_trips_real_express() {
+    file_download_round_trips(Target::real_express()).await;
+}
 
 async fn tampered_multipart_errors(target: Target) {
     // Explicit part size, applied to BOTH upload and download, so the download
@@ -503,6 +687,16 @@ async fn multipart_aligned_round_trips(target: Target) {
 #[tokio::test]
 async fn multipart_aligned_round_trips_mock_gp() {
     multipart_aligned_round_trips(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn multipart_aligned_round_trips_real_gp() {
+    multipart_aligned_round_trips(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn multipart_aligned_round_trips_real_express() {
+    multipart_aligned_round_trips(Target::real_express()).await;
 }
 
 /// Default part size (Auto): a tampered chunk of a multipart download IS caught.

@@ -25,3 +25,4 @@ pub use server::{
     AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
     ServerHandle,
 };
+pub use types::composite_checksum;

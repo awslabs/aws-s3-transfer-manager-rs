@@ -7,6 +7,7 @@
 
 use aws_smithy_checksums::ChecksumAlgorithm;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Client-provided checksums from S3 API requests
 #[derive(Debug, Clone)]
@@ -256,6 +257,33 @@ impl ObjectIntegrity {
 #[derive(Debug, Clone)]
 pub struct StoredObjectMetadata {
     pub object_integrity: ObjectIntegrity,
+}
+
+/// S3-faithful composite multipart checksum: hash the RAW (base64-decoded) per-part
+/// checksum bytes, base64-encode, and append `-<part_count>`. Verified against real S3.
+pub fn composite_checksum(
+    part_checksums: &[String],
+    algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
+) -> String {
+    use base64::Engine;
+
+    let smithy_algorithm = aws_smithy_checksums::ChecksumAlgorithm::from_str(algorithm.as_str())
+        .expect("unsupported checksum algorithm");
+
+    let raw: Vec<u8> = part_checksums
+        .iter()
+        .flat_map(|c| {
+            base64::engine::general_purpose::STANDARD
+                .decode(c)
+                .expect("invalid base64 part checksum")
+        })
+        .collect();
+
+    let mut hasher = smithy_algorithm.into_impl();
+    hasher.update(&raw);
+    let digest = hasher.finalize();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&digest);
+    format!("{}-{}", encoded, part_checksums.len())
 }
 
 #[cfg(test)]
