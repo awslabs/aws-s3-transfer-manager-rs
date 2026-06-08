@@ -3,9 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use core::fmt;
-use std::sync::Arc;
-
 use crate::metrics::{unit::ByteUnit, Throughput};
 
 /// The target part size for an upload or download request.
@@ -124,47 +121,6 @@ pub enum FailedTransferPolicy {
     /// Continue the transfer. Any failure will be logged and the details of all failed
     /// objects will be available in the output after the transfer completes.
     Continue,
-}
-
-/// A filter for downloading objects from S3
-#[derive(Clone)]
-pub struct DownloadFilter {
-    pub(crate) predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static>,
-}
-
-impl fmt::Debug for DownloadFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut formatter = f.debug_struct("DownloadFilter");
-        formatter.field("predicate", &"<closure>");
-        formatter.finish()
-    }
-}
-
-impl<F> From<F> for DownloadFilter
-where
-    F: Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static,
-{
-    fn from(value: F) -> Self {
-        DownloadFilter {
-            predicate: Arc::new(value),
-        }
-    }
-}
-
-impl Default for DownloadFilter {
-    fn default() -> Self {
-        Self {
-            predicate: Arc::new(all_objects_filter),
-        }
-    }
-}
-
-/// Filter that returns all non-folder objects. A folder is a 0-byte object created
-/// when a customer uses S3 console to create a folder, and it always ends with '/'.
-fn all_objects_filter(obj: &aws_sdk_s3::types::Object) -> bool {
-    let key = obj.key().unwrap_or("");
-    let is_folder = key.ends_with('/') && obj.size().is_some() && obj.size().unwrap() == 0;
-    !is_folder
 }
 
 /// Detailed information about a failed object download

@@ -17,7 +17,7 @@ use crate::error;
 use crate::io::walk::{DirEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
-use crate::operation::DEFAULT_DELIMITER;
+use crate::operation::{DEFAULT_DELIMITER, SPAWN_BATCH_SIZE};
 use crate::runtime::sync::Mutex;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedTransferPolicy, FailedUpload};
@@ -35,13 +35,11 @@ const MAX_PARALLEL_WALKS: usize = 16;
 /// entries added to `State::pending_entries` in one pass.
 const WALK_BATCH_SIZE: usize = 64;
 
-/// Maximum number of children spawned per `poll_work` pass before yielding
-/// back to the scheduler. Bounds the time spent in a single composite poll
-/// (each spawn calls `Upload::orchestrate_child` and `enqueue_transfer`)
-/// independently of `max_concurrent_uploads`. The scheduler's hierarchical
-/// fair-share keeps the spawn rate matched to consumption; this constant
-/// primarily caps per-poll latency, not steady-state concurrency.
-const SPAWN_BATCH_SIZE: usize = 32;
+/// Terminal children reaped per `JoinChildren` work item. A reap injects no
+/// schedulable entity (it joins already-terminal handles), so unlike spawning
+/// it can batch large; the bound only caps worker-thread hold time on the
+/// serial join.
+const REAP_BATCH_SIZE: usize = 256;
 
 /// Work data variants for the UploadObjectsTransfer state machine.
 #[derive(Debug)]
@@ -123,7 +121,7 @@ impl Drop for Reservation {
             state.children_reserved = state.children_reserved.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.transfer.ctx.id,
+                tid = %self.transfer.ctx.id,
                 count = self.count,
                 "Reservation dropped unconsumed; children_reserved recovered"
             );
@@ -207,7 +205,7 @@ impl Drop for ReapingBatch {
             state.reaping_in_flight = state.reaping_in_flight.saturating_sub(self.count);
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.transfer.ctx.id,
+                tid = %self.transfer.ctx.id,
                 count = self.count,
                 "ReapingBatch dropped unconsumed; reaping_in_flight recovered"
             );
@@ -296,7 +294,7 @@ impl Drop for WalkSlot {
             }
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.transfer.ctx.id,
+                tid = %self.transfer.ctx.id,
                 walk_id = self.walk_id,
                 "WalkSlot dropped unconsumed; in_flight_walks recovered"
             );
@@ -368,20 +366,29 @@ struct State {
 }
 
 impl State {
-    /// Capacity protocol invariant: `children + children_reserved <= max`
-    /// holds whenever the state mutex is released outside of phase 1
-    /// of `poll_work`. Phase 1 (`claim_spawn_batch`) may have a slack
-    /// of up to `SPAWN_BATCH_SIZE` reservations until phase 3
-    /// (`merge_spawned`) runs, so this check is intentionally not
-    /// applied between those phases.
-    ///
-    /// Compiles to nothing in release builds.
+    /// Children still actively transferring (non-terminal): the *in-flight
+    /// budget* that gates spawning, distinct from `children.len()` which
+    /// counts terminal-unreaped children still holding a memory slot.
+    fn active_children(&self) -> usize {
+        self.children
+            .values()
+            .filter(|c| !c.handle.status().is_terminal())
+            .count()
+    }
+
+    /// Capacity invariant: `active_children + children_reserved <= max` holds
+    /// whenever the state mutex is released outside phase 1 of `poll_work`
+    /// (phase 1 may hold up to `SPAWN_BATCH_SIZE` slack until `merge_spawned`).
+    /// Asserts the in-flight budget — terminal-unreaped children are excluded
+    /// since they consume no network/disk concurrency. Cheap insurance;
+    /// compiles to nothing in release.
     #[inline]
     fn debug_assert_capacity(&self, max: usize) {
+        let active = self.active_children();
         debug_assert!(
-            self.children.len() + self.children_reserved <= max,
-            "upload_objects capacity violated: children={} children_reserved={} max={}",
-            self.children.len(),
+            active + self.children_reserved <= max,
+            "upload_objects capacity violated: active={} children_reserved={} max={}",
+            active,
             self.children_reserved,
             max,
         );
@@ -446,89 +453,105 @@ impl UploadObjectsTransfer {
         self.inner.request.failure_policy()
     }
 
+    /// Produce one unit of work. The three steps run in order each call:
+    ///
+    /// 1. Spawn. A side effect, not a returned item, so it runs every call and
+    ///    composes with whatever is returned below. Gating on *active* children
+    ///    (`claim_spawn_batch`) lets a completion burst refill immediately, so
+    ///    the active-child count holds at the cap instead of sawtoothing.
+    /// 2. Walk, if a page is available. poll_work returns at most one item;
+    ///    walk is preferred over reap for it, else a steady completion stream
+    ///    would reap forever and never list the next page. `dispatch_walk`
+    ///    yields nothing once registered children fill the cap.
+    /// 3. Reap, bounded by REAP_BATCH_SIZE.
+    ///
+    /// When inactive, spawn and walk are skipped but reap still runs so partial
+    /// results are tallied; once in-flight drains the transfer signals terminal.
     pub(crate) fn poll_work(&self) -> PollWork {
         let active = self.inner.ctx.is_active();
 
-        // Phase 1: under state lock, drain terminal children, handle
-        // cancellation, claim a batch of entries to spawn, and decide
-        // whether the remaining steps need to run at all.
-        let claim: SpawnDecision = {
+        // Phase 1: under the state lock, claim a batch of entries to spawn.
+        // This does the side-effect-free work (key derivation, stream creation,
+        // `UploadInput` build) under the lock; the heavyweight
+        // `Upload::orchestrate_child` runs lock-released in phase 2. Skipped
+        // when inactive so cancel/fail stops spawning new child uploads.
+        let claim = if active {
             let mut state = self.inner.state.lock();
-
-            // 1a. Drain any children that have reached a terminal status
-            //     into a single JoinChildren work item. Running them as a
-            //     batch avoids N scheduler round-trips when many children
-            //     finish in the same window. Runs regardless of `active`
-            //     so partial results at cancellation time make the summary.
-            if let Some(batch) = self.drain_terminal_children(&mut state) {
-                return PollWork::Ready(IoRequest {
-                    data: Some(Box::new(UploadObjectsWork::JoinChildren {
-                        batch: Some(batch),
-                    })),
-                });
-            }
-
-            // 1b. If we are inactive (cancelled or failed), signal terminal
-            //     and exit. Children are cancelled via
-            //     `scheduler.cancel_transfer(parent_id)` from the handle's
-            //     abort/drop/join paths, which cascade outside the state lock.
-            if !active {
-                self.inner.ctx.signal_terminal();
-                return PollWork::Done;
-            }
-
-            // 1c. Claim a batch of entries to orchestrate as children. This
-            //     does all the side-effect-free work under the lock (key
-            //     derivation, stream creation, `UploadInput` build). The
-            //     heavyweight step - `Upload::orchestrate_child`, which
-            //     recurses into the scheduler - runs in phase 2 with the
-            //     lock released.
-            self.claim_spawn_batch(&mut state)
+            Some(self.claim_spawn_batch(&mut state))
+        } else {
+            None
         };
 
-        let (claimed, reservation) = match claim {
-            SpawnDecision::Abort => return PollWork::Done,
-            SpawnDecision::Batch(items, reservation) => (items, reservation),
+        // Phase 2: orchestrate claimed children with the state lock released.
+        // `orchestrate_child` calls `scheduler.enqueue_transfer`, which acquires
+        // scheduler-level locks; holding this transfer's state lock across that
+        // would serialise all concurrent `poll_work` callers (child wakes, drain
+        // cycles) behind a single producer. The `reservation` token carries the
+        // `children_reserved` slots into phase 3's `merge_spawned`; if this
+        // phase panics, its `Drop` recovers the counter so the parent doesn't
+        // hang on a leaked reservation.
+        let spawned = match claim {
+            Some(SpawnDecision::Abort) => return PollWork::Done,
+            Some(SpawnDecision::Batch(claimed, reservation)) => {
+                let outcomes: Vec<(OrchestrateOutcome, PathBuf, String)> = claimed
+                    .into_iter()
+                    .map(|claimed| {
+                        let ClaimedEntry {
+                            source_path,
+                            key,
+                            input,
+                        } = claimed;
+                        let outcome = Upload::orchestrate_child(
+                            self.inner.ctx.handle.clone(),
+                            input,
+                            self.inner.ctx.id.id,
+                        );
+                        (outcome, source_path, key)
+                    })
+                    .collect();
+                Some((outcomes, reservation))
+            }
+            None => None,
         };
 
-        // Phase 2: orchestrate claimed children without holding the state
-        // lock. `Upload::orchestrate_child` calls `scheduler.enqueue_transfer`
-        // which acquires scheduler-level locks; doing that while holding
-        // this transfer's state lock would serialise all concurrent
-        // `poll_work` callers (child wakes, drain cycles) behind a single
-        // producer.
-        //
-        // The `reservation` token outlives this scope and is consumed by
-        // `merge_spawned` in phase 3. If anything in this phase panics,
-        // the token's `Drop` recovers `children_reserved` so the parent
-        // doesn't hang on a leaked counter.
-        let outcomes: Vec<(OrchestrateOutcome, PathBuf, String)> = claimed
-            .into_iter()
-            .map(|claimed| {
-                let ClaimedEntry {
-                    source_path,
-                    key,
-                    input,
-                } = claimed;
-                let outcome = Upload::orchestrate_child(
-                    self.inner.ctx.handle.clone(),
-                    input,
-                    self.inner.ctx.id.id,
-                );
-                (outcome, source_path, key)
-            })
-            .collect();
-
-        // Phase 3: under state lock again, merge orchestration results,
-        // release the reservation, and proceed to subtree claiming /
-        // terminal check / dispatch. An abort during merge returns Done.
+        // Phase 3: re-lock and run merge through the return decision under a
+        // single lock, so the work item returned reflects one consistent state
+        // snapshot.
         let mut state = self.inner.state.lock();
-        if let Some(done) = self.merge_spawned(&mut state, outcomes, reservation) {
-            return done;
+
+        // Merge orchestration results (an abort during merge returns Done) and
+        // opportunistically claim subtrees to widen the walk.
+        if let Some((outcomes, reservation)) = spawned {
+            if let Some(done) = self.merge_spawned(&mut state, outcomes, reservation) {
+                return done;
+            }
+            self.claim_subtrees(&mut state);
         }
 
-        // Opportunistic subtree claiming.
-        self.claim_subtrees(&mut state);
+        // Walk before reap for the single returned item (skipped when inactive).
+        if active {
+            if let Some(work) = self.dispatch_walk(&mut state) {
+                return work;
+            }
+        }
+
+        // Reap terminal children. Runs regardless of `active` so partial
+        // results at cancellation time make the summary.
+        if let Some(batch) = self.drain_terminal_children(&mut state) {
+            return PollWork::Ready(IoRequest {
+                data: Some(Box::new(UploadObjectsWork::JoinChildren {
+                    batch: Some(batch),
+                })),
+            });
+        }
+
+        // Inactive and fully drained: signal terminal. Children are cancelled
+        // via `scheduler.cancel_transfer(parent_id)` from the handle's
+        // abort/drop/join paths, which cascade outside the state lock.
+        if !active {
+            self.inner.ctx.signal_terminal();
+            return PollWork::Done;
+        }
 
         // Terminal check (all walks drained, all children done, no reaps in
         // flight, no reservations outstanding).
@@ -536,12 +559,11 @@ impl UploadObjectsTransfer {
             return out;
         }
 
-        // Phase 3 has merged all orchestration results back into state;
-        // capacity must hold strictly here.
+        // No spawn slack outside phase 1, so capacity must hold strictly here.
         state.debug_assert_capacity(self.max_concurrent_uploads());
 
-        // Decide dispatch.
-        self.dispatch_walk(&mut state)
+        self.inner.ctx.set_pending();
+        PollWork::Pending
     }
 
     /// Record the failure cause and signal terminal. Children are cancelled
@@ -550,7 +572,7 @@ impl UploadObjectsTransfer {
         let cause = cause.into();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
         self.inner.ctx.set_failed(crate::error::Error::new(
@@ -573,6 +595,7 @@ impl UploadObjectsTransfer {
             .iter()
             .filter(|(_, c)| c.handle.status().is_terminal())
             .map(|(id, _)| *id)
+            .take(REAP_BATCH_SIZE)
             .collect();
         if terminal_ids.is_empty() {
             return None;
@@ -611,8 +634,11 @@ impl UploadObjectsTransfer {
         let key_prefix = self.inner.request.key_prefix().map(|s| s.to_string());
         let delimiter = self.inner.request.delimiter().map(|s| s.to_string());
 
+        // Gate on the in-flight budget (active + reserved), not total
+        // registered; see `active_children`.
+        let active = state.active_children();
         let mut batch: Vec<ClaimedEntry> = Vec::new();
-        while state.children.len() + state.children_reserved + batch.len() < max_concurrent_uploads
+        while active + state.children_reserved + batch.len() < max_concurrent_uploads
             && batch.len() < SPAWN_BATCH_SIZE
         {
             let entry = match state.pending_entries.pop_front() {
@@ -710,7 +736,7 @@ impl UploadObjectsTransfer {
                     let child_id = handle.id();
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         child_id = ?child_id,
                         key = %key,
                         "spawned child upload"
@@ -757,7 +783,7 @@ impl UploadObjectsTransfer {
                     state.next_walk_id += 1;
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         parent_walk_id = wid,
                         new_walk_id = new_id,
                         "claimed subtree"
@@ -783,7 +809,7 @@ impl UploadObjectsTransfer {
             let m = self.inner.ctx.metrics();
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 successful = state.successful_uploads,
                 failed = state.failed.len(),
                 network_tx = m.network_tx,
@@ -797,40 +823,43 @@ impl UploadObjectsTransfer {
         None
     }
 
-    fn dispatch_walk(&self, state: &mut State) -> PollWork {
+    /// Dispatch one walker advance, or `None` if listing cannot proceed.
+    ///
+    /// Backpressured by the *memory budget*: total registered children plus
+    /// reserved, against `max_concurrent_uploads` — distinct from the
+    /// in-flight budget that gates spawning. `None` when that budget is full,
+    /// walks are saturated or all in flight, or no walk is available.
+    fn dispatch_walk(&self, state: &mut State) -> Option<PollWork> {
         let max_concurrent_uploads = self.max_concurrent_uploads();
         if state.children.len() + state.children_reserved >= max_concurrent_uploads {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 children = state.children.len(),
                 children_reserved = state.children_reserved,
                 max_concurrent_uploads,
-                "dispatch_walk.pending.cap_full"
+                "dispatch_walk.none.cap_full"
             );
-            self.inner.ctx.set_pending();
-            return PollWork::Pending;
+            return None;
         }
         if state.walks.is_empty() && state.in_flight_walks > 0 {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 in_flight_walks = state.in_flight_walks,
-                "dispatch_walk.pending.walks_in_flight"
+                "dispatch_walk.none.walks_in_flight"
             );
-            self.inner.ctx.set_pending();
-            return PollWork::Pending;
+            return None;
         }
         if state.in_flight_walks >= MAX_PARALLEL_WALKS {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 in_flight_walks = state.in_flight_walks,
                 MAX_PARALLEL_WALKS,
-                "dispatch_walk.pending.walks_saturated"
+                "dispatch_walk.none.walks_saturated"
             );
-            self.inner.ctx.set_pending();
-            return PollWork::Pending;
+            return None;
         }
 
         if let Some(&walk_id) = state.walks.keys().next() {
@@ -847,26 +876,25 @@ impl UploadObjectsTransfer {
             };
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 walk_id,
                 "dispatching advance_walker"
             );
-            PollWork::Ready(IoRequest {
+            Some(PollWork::Ready(IoRequest {
                 data: Some(Box::new(UploadObjectsWork::AdvanceWalker {
                     slot: Some(slot),
                 })),
-            })
+            }))
         } else {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 children = state.children.len(),
                 children_reserved = state.children_reserved,
                 in_flight_walks = state.in_flight_walks,
-                "dispatch_walk.pending.no_walks_no_work"
+                "dispatch_walk.none.no_walks_no_work"
             );
-            self.inner.ctx.set_pending();
-            PollWork::Pending
+            None
         }
     }
 
@@ -890,7 +918,7 @@ impl UploadObjectsTransfer {
         let ctx = &self.inner.ctx;
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             walk_id,
             ready_files = walk.ready_files_len(),
             pending_dirs = walk.pending_dirs_len(),
@@ -933,7 +961,7 @@ impl UploadObjectsTransfer {
         if let Some(fatal) = fatal_error {
             tracing::error!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 walk_id,
                 error = %fatal,
                 "fatal walker error, failing upload_objects"
@@ -956,7 +984,7 @@ impl UploadObjectsTransfer {
         for we in walk_errors {
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
-                transfer_id = ?self.inner.ctx.id,
+                tid = %self.inner.ctx.id,
                 walk_id,
                 path = ?we.path(),
                 error = %we,
@@ -986,7 +1014,7 @@ impl UploadObjectsTransfer {
         slot.consume(&mut state, walk_back);
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             walk_id,
             yielded = n_entries,
             ready_files = ready_files_remaining,
@@ -996,6 +1024,14 @@ impl UploadObjectsTransfer {
         );
 
         state.debug_assert_capacity(self.max_concurrent_uploads());
+
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition: check and signal here rather than deferring to
+        // a subsequent poll_work.
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
         drop(state);
         ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -1013,7 +1049,7 @@ impl UploadObjectsTransfer {
         let n_children = children.len();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             n_children,
             "join_children start"
         );
@@ -1056,7 +1092,7 @@ impl UploadObjectsTransfer {
                     });
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         key = %key,
                         "child upload completed"
                     );
@@ -1074,7 +1110,7 @@ impl UploadObjectsTransfer {
                         should_abort.then(|| format!("child upload failed ({key}): {e}"));
                     tracing::warn!(
                         target: crate::telemetry::TARGET_TRANSFER,
-                        transfer_id = ?self.inner.ctx.id,
+                        tid = %self.inner.ctx.id,
                         key = %key,
                         error = %e,
                         "child upload failed"
@@ -1102,14 +1138,22 @@ impl UploadObjectsTransfer {
         batch.consume(&mut state);
 
         state.debug_assert_capacity(self.max_concurrent_uploads());
-        drop(state);
-        self.inner.ctx.try_wake();
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
-            transfer_id = ?self.inner.ctx.id,
+            tid = %self.inner.ctx.id,
             reaped,
             "join_children end"
         );
+
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition: check and signal here rather than deferring to
+        // a subsequent poll_work.
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
+        drop(state);
+        self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
     }
 }
@@ -1186,7 +1230,6 @@ mod tests {
     use super::*;
     use crate::transfer::TransferContext;
     use crate::types::FailedTransferPolicy;
-    use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use std::fs;
@@ -1292,7 +1335,7 @@ mod tests {
         crate::transfer::StateMachineTerminalReceiver,
     ) {
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
             .bucket("test-bucket")
@@ -1415,7 +1458,7 @@ mod tests {
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
 
         let config = crate::Config::builder().client(s3_client).build();
-        let handle = crate::client::Handle::new_for_test(config, DEFAULT_CONCURRENCY);
+        let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
             .bucket("test-bucket")

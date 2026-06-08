@@ -205,10 +205,3 @@ where
         Error::new(kind, value)
     }
 }
-
-static CANCELLATION_ERROR: &str =
-    "at least one operation has been aborted, cancelling all ongoing requests";
-
-pub(crate) fn operation_cancelled() -> Error {
-    Error::new(ErrorKind::OperationCancelled, CANCELLATION_ERROR)
-}

@@ -8,7 +8,7 @@ use crate::operation::download::body::{Body, SlotBodyConsumer};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
-use crate::transfer::StateMachineTerminalReceiver;
+use crate::transfer::{StateMachineTerminalReceiver, TransferId};
 
 /// Shared core logic for download handles.
 ///
@@ -63,13 +63,13 @@ impl DownloadHandleInner {
         let id = self.transfer.id();
 
         if ctx.is_failed() {
-            tracing::debug!(ctx = %ctx, "join: cancelling and waiting for idle");
+            tracing::debug!(tid = %ctx.id, "join: cancelling and waiting for idle");
             ctx.handle
                 .scheduler
                 .cancel_transfer(id)
                 .wait_for_idle()
                 .await;
-            tracing::debug!(ctx = %ctx, "join: idle, returning error");
+            tracing::debug!(tid = %ctx.id, "join: idle, returning error");
             // take the actual error (only we should do this)
             let err = ctx.take_error().expect("error taken outside of join()");
             return Err(err);
@@ -310,6 +310,11 @@ impl ManagedDownloadHandle {
         }
     }
 
+    /// The transfer ID for this child download.
+    pub(crate) fn transfer_id(&self) -> TransferId {
+        self.inner.transfer.id()
+    }
+
     /// Object metadata.
     ///
     /// Waits for discovery to complete if metadata is not yet available.
@@ -411,7 +416,6 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::transfer::TransferContext;
     use crate::types::BucketType;
-    use crate::DEFAULT_CONCURRENCY;
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -429,7 +433,7 @@ mod tests {
     /// `DownloadHandle` or `ManagedDownloadHandle` around it to test the
     /// post-cancel `join()` contract.
     fn make_cancelled_download_inner() -> (DownloadHandleInner, SlotBodyConsumer) {
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
                 .client(aws_smithy_mocks::mock_client!(
                     aws_sdk_s3,
@@ -437,7 +441,6 @@ mod tests {
                     &[]
                 ))
                 .build(),
-            DEFAULT_CONCURRENCY,
         );
         let input = DownloadInput::builder()
             .bucket("test-bucket")

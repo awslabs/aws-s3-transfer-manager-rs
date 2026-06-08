@@ -74,8 +74,9 @@ struct UploadTransferInner {
     state: Mutex<UploadState>,
     /// The original request (body taken for processing)
     request: Arc<UploadInput>,
-    /// Type of S3 bucket targeted by this operation
-    #[allow(dead_code)] // used for hedging/routing decisions
+    /// Type of S3 bucket targeted by this operation.
+    // TODO(vnext): unify bucket representation (name + kind) across operations.
+    #[allow(dead_code)]
     bucket_type: BucketType,
     /// Notified when CreateMPU completes (success or failure)
     create_mpu_complete: tokio::sync::Notify,
@@ -546,7 +547,7 @@ impl UploadTransfer {
         let send_start = std::time::Instant::now();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            ?transfer_id,
+            tid = %transfer_id,
             content_length,
             is_file_backed,
             "put_object.send_enter",
@@ -563,7 +564,7 @@ impl UploadTransfer {
             Ok(resp) => {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_TRANSFER,
-                    ?transfer_id,
+                    tid = %transfer_id,
                     elapsed_ms = send_start.elapsed().as_millis() as u64,
                     "put_object.send_exit_ok",
                 );
@@ -572,7 +573,7 @@ impl UploadTransfer {
             Err(e) => {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_TRANSFER,
-                    ?transfer_id,
+                    tid = %transfer_id,
                     elapsed_ms = send_start.elapsed().as_millis() as u64,
                     error = %e,
                     "put_object.send_exit_err",
@@ -710,16 +711,14 @@ mod tests {
     use super::*;
     use crate::io::InputStream;
     use crate::scheduler::test_util::{assert_pending, assert_ready};
-    use crate::DEFAULT_CONCURRENCY;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     fn create_test_transfer(s3_client: aws_sdk_s3::Client, content: Vec<u8>) -> UploadTransfer {
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder().client(s3_client).build(),
-            DEFAULT_CONCURRENCY,
         );
 
         let input = UploadInput::builder()
@@ -901,9 +900,8 @@ mod tests {
         tmp.write_all(&payload).unwrap();
         tmp.flush().unwrap();
 
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder().client(s3_client).build(),
-            DEFAULT_CONCURRENCY,
         );
         let input = UploadInput::builder()
             .bucket("test-bucket")

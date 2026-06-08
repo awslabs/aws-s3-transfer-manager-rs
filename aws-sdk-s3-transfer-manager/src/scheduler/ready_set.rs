@@ -358,7 +358,7 @@ impl ReadySet {
         {
             tracing::trace!(
                 target: crate::telemetry::TARGET_SCHEDULING,
-                id = %tid,
+                tid = %tid,
                 "reinsert_under_claim: parent group gone (cancel during Ready); descriptor already terminal"
             );
         }

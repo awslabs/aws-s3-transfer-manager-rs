@@ -228,7 +228,6 @@ mod tests {
     use crate::operation::upload::UploadInput;
     use crate::transfer::TransferContext;
     use crate::types::BucketType;
-    use crate::DEFAULT_CONCURRENCY;
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -246,7 +245,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_join_returns_cancelled_error_when_transfer_cancelled() {
-        let handle = crate::client::Handle::new_for_test(
+        let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
                 .client(aws_smithy_mocks::mock_client!(
                     aws_sdk_s3,
@@ -254,7 +253,6 @@ mod tests {
                     &[]
                 ))
                 .build(),
-            DEFAULT_CONCURRENCY,
         );
         let input = UploadInput::builder()
             .bucket("test-bucket")

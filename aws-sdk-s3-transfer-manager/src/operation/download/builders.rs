@@ -42,8 +42,13 @@ impl DownloadFluentBuilder {
         path: impl Into<std::path::PathBuf>,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate_to_path(self.handle, input, path.into())
-            .await
+        crate::operation::download::Download::orchestrate_to_path(
+            self.handle,
+            input,
+            path.into(),
+            None,
+        )
+        .await
     }
 
     /// Download the object and write it to the given open file.

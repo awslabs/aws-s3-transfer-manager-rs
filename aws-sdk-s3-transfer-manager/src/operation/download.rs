@@ -76,11 +76,15 @@ impl Download {
     }
 
     /// Orchestrate a download that writes to a file path (temp file + rename).
+    ///
+    /// When `parent_id` is `Some`, the transfer is linked as a child of the
+    /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         dest_path: std::path::PathBuf,
+        parent_id: Option<u64>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
         let unique_id = fastrand::u32(..);
@@ -97,7 +101,7 @@ impl Download {
         let file = tokio_file.into_std().await;
 
         let range_start = object_range_start_from_input(&input);
-        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, true)?;
+        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, true, parent_id)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -109,19 +113,20 @@ impl Download {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let range_start = object_range_start_from_input(&input);
-        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, false)?;
+        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, false, None)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
 
     /// Shared orchestration for file-sink downloads.
     #[cfg(any(unix, windows))]
-    fn orchestrate_with_sink(
+    pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
         object_range_start: u64,
         owns_file: bool,
+        parent_id: Option<u64>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -139,7 +144,10 @@ impl Download {
             owns_file,
         );
 
-        let (ctx, completion_rx) = TransferContext::new(handle.clone());
+        let (ctx, completion_rx) = match parent_id {
+            Some(pid) => TransferContext::new_child(handle.clone(), pid),
+            None => TransferContext::new(handle.clone()),
+        };
 
         let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
         handle

@@ -22,8 +22,7 @@ use crate::transfer::StateMachineTerminalReceiver;
 /// let handle = tm.upload_objects()
 ///     .bucket("my-bucket")
 ///     .source("/path/to/dir")
-///     .send()
-///     .await?;
+///     .initiate()?;
 ///
 /// let output = handle.join().await?;
 /// println!("uploaded {} objects", output.objects_uploaded());

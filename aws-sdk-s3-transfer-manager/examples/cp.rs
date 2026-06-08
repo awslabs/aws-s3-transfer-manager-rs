@@ -79,7 +79,7 @@ pub struct Args {
     trace_dir: Option<String>,
 
     /// Enable CPU profiling in dial9 traces (Linux only, requires --trace-dir)
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue, requires = "trace_dir")]
     cpu_profiling: bool,
 }
 
@@ -229,13 +229,12 @@ async fn do_recursive_download(
         .bucket(bucket)
         .key_prefix(key_prefix)
         .destination(dest)
-        .send()
-        .await?;
+        .initiate()?;
 
     let output = handle.join().await?;
     tracing::info!("download output: {output:?}");
 
-    let transfer_size_bytes = output.total_bytes_transferred();
+    let transfer_size_bytes = output.metrics.network_rx;
     println!(
         "downloaded {} objects totalling {transfer_size_bytes} bytes ({})",
         output.objects_downloaded(),

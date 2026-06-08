@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::metrics::unit::ByteUnit;
 use crate::runtime::ManagedThreadRuntime;
 use crate::scheduler::{
     AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
@@ -11,7 +12,6 @@ use crate::scheduler::{
 use crate::telemetry::Telemetry;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
-use crate::{metrics::unit::ByteUnit, DEFAULT_CONCURRENCY};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,14 +35,6 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
-    /// Get the concrete number of workers to use based on the concurrency setting.
-    pub(crate) fn num_workers(&self) -> usize {
-        match self.config.concurrency() {
-            ConcurrencyMode::Explicit(concurrency) => *concurrency,
-            _ => DEFAULT_CONCURRENCY,
-        }
-    }
-
     /// Get the concrete minimum upload size in bytes to use to determine whether multipart uploads
     /// are enabled for a given request.
     pub(crate) fn mpu_threshold_bytes(&self) -> u64 {
@@ -89,6 +81,37 @@ impl Handle {
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
             }
+        })
+    }
+
+    /// Test handle using the ambient tokio runtime (no OS threads spawned).
+    ///
+    /// Use for: state machine logic, poll_work/execute correctness, mock SDK
+    /// interactions. Fast and deterministic.
+    ///
+    /// Does NOT exercise: managed thread dispatch, per-thread HTTP clients,
+    /// cross-runtime wake semantics.
+    #[cfg(test)]
+    pub(crate) fn test_handle_tokio(config: crate::Config) -> Arc<Self> {
+        Self::new_for_test(config, 128)
+    }
+
+    /// Test handle with real managed threads (4 OS threads).
+    ///
+    /// Use for: end-to-end dispatch/wake correctness, verifying behavior
+    /// under real thread scheduling. Catches bugs like missing `set_pending`
+    /// that only manifest when work is dispatched across thread boundaries.
+    ///
+    /// The outer test can use `#[tokio::test]` (single-thread) — managed
+    /// threads own their own runtimes independently.
+    #[cfg(test)]
+    pub(crate) fn test_handle_managed(config: crate::Config) -> Arc<Self> {
+        Self::new_for_test_with_runtime(config, 128, |weak| {
+            Arc::new(
+                crate::runtime::ManagedThreadRuntime::builder(weak)
+                    .topology(crate::runtime::Topology::uniform(4))
+                    .build(),
+            )
         })
     }
 
@@ -281,8 +304,7 @@ impl Client {
     ///         .download_objects()
     ///         .bucket("my-bucket")
     ///         .destination(dest)
-    ///         .send()
-    ///         .await?;
+    ///         .initiate()?;
     ///
     ///     // wait for transfer to complete
     ///     handle.join().await?;
