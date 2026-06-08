@@ -333,6 +333,12 @@ impl DownloadObjectsTransfer {
         // re-stat the whole ancestor chain for every object sharing a prefix
         // (create_dir_all stats each ancestor; for N small files in a few
         // dirs that's the dominant per-child syscall cost).
+        //
+        // TODO(vnext): revisit moving this to the execute phase. poll_work is
+        // documented as non-blocking, but the scheduler is edge-triggered so
+        // this often already runs on a managed thread; deferring to execute adds
+        // a work-item round-trip that may increase total latency rather than
+        // reduce it. Measure before moving.
         if let Some(parent) = dest_path.parent() {
             let known = self.inner.created_dirs.lock().contains(parent);
             if !known {
@@ -457,6 +463,10 @@ impl DownloadObjectsTransfer {
                 failed = state.failed.len(),
                 "download_objects terminal (walk exhausted), signaling",
             );
+            // The success transition: status is still Active here (the
+            // !is_active() branch above handles an already-terminal drain after
+            // set_failed/set_cancelled, where completing would be wrong).
+            self.inner.ctx.set_completed();
             self.inner.ctx.signal_terminal();
             return Some(PollWork::Done);
         }
@@ -627,10 +637,24 @@ impl DownloadObjectsTransfer {
     async fn execute_join_children(&self, batch: Vec<ChildTransfer>) -> WorkOutcome {
         for child in batch {
             let key = child.key;
+            // Snapshot metrics before `join()` consumes the handle.
+            let metrics = child.handle.metrics();
             match child.handle.join().await {
                 Ok(_output) => {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
+                    drop(state);
+                    // Aggregate the child's bytes into the parent's per-transfer
+                    // MetricsState directly (not via record_io on the child's
+                    // context, which already updated the client-level counters
+                    // during the child transfer) so DownloadObjectsOutput.metrics
+                    // reflects the whole directory download without double-counting.
+                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
+                        network_tx: metrics.network_tx,
+                        network_rx: metrics.network_rx,
+                        disk_read: metrics.disk_read,
+                        disk_write: metrics.disk_write,
+                    });
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();
@@ -1289,6 +1313,25 @@ mod tests {
         for i in 0..20 {
             assert!(dir.path().join(format!("file{i:02}.txt")).exists());
         }
+
+        // The success transition runs set_completed(), so a successful transfer
+        // ends Completed (not still Active). Without it, a dropped handle would
+        // see is_active() and spuriously cancel an already-finished transfer.
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+
+        // Child metrics are rolled into the parent: 20 objects x 2 bytes each.
+        let m = transfer.ctx().metrics();
+        assert_eq!(
+            m.network_rx, 40,
+            "child network_rx must aggregate to parent"
+        );
+        assert_eq!(
+            m.disk_write, 40,
+            "child disk_write must aggregate to parent"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1409,6 +1452,25 @@ mod tests {
         for i in 0..20 {
             assert!(dir.path().join(format!("file{i:02}.txt")).exists());
         }
+
+        // The success transition runs set_completed(), so a successful transfer
+        // ends Completed (not still Active). Without it, a dropped handle would
+        // see is_active() and spuriously cancel an already-finished transfer.
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+
+        // Child metrics are rolled into the parent: 20 objects x 2 bytes each.
+        let m = transfer.ctx().metrics();
+        assert_eq!(
+            m.network_rx, 40,
+            "child network_rx must aggregate to parent"
+        );
+        assert_eq!(
+            m.disk_write, 40,
+            "child disk_write must aggregate to parent"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
