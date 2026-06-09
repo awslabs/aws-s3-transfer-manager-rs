@@ -105,6 +105,10 @@ impl Target {
 pub(crate) struct TmTestClient {
     tm: TmClient,
     bucket: String,
+    /// A per-instance key prefix so concurrent tests sharing one (real) bucket do
+    /// not collide on object keys. Each `connect()` gets a fresh prefix; callers
+    /// pass logical keys (e.g. `"obj"`) and the harness namespaces them.
+    key_prefix: String,
     /// Present for mock targets. Owns the server; held until `shutdown`.
     mock: Option<MockBackend>,
     /// Present for real-S3 targets; used for direct SDK calls (e.g. HeadObject).
@@ -156,6 +160,7 @@ impl TmTestClient {
         Self {
             tm: TmClient::new(builder.build()),
             bucket: "test-bucket".to_string(),
+            key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: Some(MockBackend { server, handle }),
             #[cfg(e2e_test)]
             s3_client: None,
@@ -185,6 +190,7 @@ impl TmTestClient {
         Self {
             tm: TmClient::new(loader.load().await),
             bucket,
+            key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: None,
             s3_client: Some(s3_client),
         }
@@ -193,6 +199,15 @@ impl TmTestClient {
     /// The bucket name to target.
     pub(crate) fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// Namespace a logical key with this instance's unique prefix so concurrent
+    /// tests sharing one bucket do not collide. Keys live under `upload/` so the
+    /// test bucket's lifecycle expiration policy reaps the objects (the same
+    /// prefix the legacy e2e tests use; `pre-existing` fixtures are deliberately
+    /// outside it and not reaped).
+    pub(crate) fn key(&self, key: &str) -> String {
+        format!("upload/{}/{}", self.key_prefix, key)
     }
 
     /// The mock server, for fault injection and direct inspection. `None` on a
@@ -220,7 +235,7 @@ impl TmTestClient {
         self.tm
             .upload()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.key(key))
             .checksum_strategy(strategy)
             .body(aws_sdk_s3_transfer_manager::io::InputStream::from(data))
             .initiate()
@@ -244,7 +259,7 @@ impl TmTestClient {
         ),
         aws_sdk_s3_transfer_manager::error::Error,
     > {
-        let mut builder = self.tm.download().bucket(&self.bucket).key(key);
+        let mut builder = self.tm.download().bucket(&self.bucket).key(self.key(key));
         if let Some(mode) = checksum_mode {
             builder = builder.checksum_mode(mode);
         }
@@ -278,7 +293,7 @@ impl TmTestClient {
         aws_sdk_s3_transfer_manager::operation::download::DownloadOutput,
         aws_sdk_s3_transfer_manager::error::Error,
     > {
-        let mut builder = self.tm.download().bucket(&self.bucket).key(key);
+        let mut builder = self.tm.download().bucket(&self.bucket).key(self.key(key));
         if let Some(mode) = checksum_mode {
             builder = builder.checksum_mode(mode);
         }

@@ -407,7 +407,7 @@ async fn mpu_composite_value_matches_expected_real_gp() {
     let t = Target::real_gp().connect().await;
     let s3 = t.s3();
     let bucket = t.bucket();
-    let key = &format!("integrity-composite-gate-{}", uuid::Uuid::new_v4());
+    let key = &format!("upload/mpu-composite-checksum-{}", uuid::Uuid::new_v4());
 
     let algorithm = ChecksumAlgorithm::Crc32;
 
@@ -516,7 +516,7 @@ async fn tampered_single_part_errors(target: Target) {
     let mock = t.mock().expect("tamper faults require the mock backend");
     mock.insert_fault(
         t.bucket(),
-        "obj",
+        &t.key("obj"),
         FaultType::CorruptBody,
         0,
         Occurrence::Always,
@@ -550,7 +550,7 @@ async fn tampered_single_part_file_errors(target: Target) {
     let mock = t.mock().expect("tamper faults require the mock backend");
     mock.insert_fault(
         t.bucket(),
-        "obj",
+        &t.key("obj"),
         FaultType::CorruptBody,
         0,
         Occurrence::Always,
@@ -637,7 +637,7 @@ async fn tampered_multipart_errors(target: Target) {
     // Fail every chunk for a deterministic transfer outcome.
     mock.insert_fault(
         t.bucket(),
-        "obj",
+        &t.key("obj"),
         FaultType::WrongStoredChecksum,
         0,
         Occurrence::Always,
@@ -712,7 +712,7 @@ async fn multipart_default_tamper_caught(target: Target) {
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
         t.bucket(),
-        "obj",
+        &t.key("obj"),
         FaultType::WrongStoredChecksum,
         0,
         Occurrence::Always,
@@ -757,7 +757,7 @@ async fn single_put_split_tamper_caught_mock_gp() {
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
         t.bucket(),
-        "obj",
+        &t.key("obj"),
         FaultType::CorruptBody,
         0,
         Occurrence::Always,
