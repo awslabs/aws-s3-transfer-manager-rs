@@ -903,6 +903,82 @@ impl Transfer for NoopChild {
     }
 }
 
+/// A parent that transitions itself to a terminal state in an execute callback
+/// without calling `signal_terminal`, while a child is still registered. Models
+/// a state machine that calls `set_failed`/`set_completed` without the paired
+/// `signal_terminal` (e.g. an `Abort`-policy directory transfer): the scheduler
+/// observes the parent terminal-and-idle and removes it, and the owning handle's
+/// `join()` resolves only if the scheduler signals the removed transfer.
+pub(crate) struct TerminalWithoutSignalMock {
+    ctx: TransferContext,
+    handle: Arc<crate::client::Handle>,
+    spawned: AtomicBool,
+}
+
+impl std::fmt::Debug for TerminalWithoutSignalMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalWithoutSignalMock").finish()
+    }
+}
+
+impl TerminalWithoutSignalMock {
+    /// Returns the mock plus its own completion receiver (the parent handle's
+    /// channel) so a test can assert the parent's terminal was signaled.
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+    ) -> (Self, StateMachineTerminalReceiver) {
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle.clone());
+        (
+            Self {
+                ctx,
+                handle,
+                spawned: AtomicBool::new(false),
+            },
+            completion_rx,
+        )
+    }
+}
+
+impl Transfer for TerminalWithoutSignalMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        if !self.spawned.swap(true, Ordering::SeqCst) {
+            // Register a live child that never completes on its own, then emit
+            // one work item. After it executes (set_failed without signal), the
+            // parent is terminal-and-idle with a live child.
+            let child_id = TransferId {
+                id: 200_000,
+                parent: Some(self.ctx.id.id),
+            };
+            let (child, _term_rx) = NoopChild::new(child_id, self.handle.clone());
+            self.handle.scheduler.enqueue_transfer(Box::new(child));
+            return PollWork::Ready(IoRequest { data: None });
+        }
+        // No further work; the transfer is already terminal (set in execute).
+        self.ctx.set_pending();
+        PollWork::Pending
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            // Go terminal without signaling. Return Success (not Failed) so the
+            // transfer is not auto-signaled; completion flows through the
+            // scheduler's on_completion terminal+idle path.
+            self.ctx.set_failed(crate::error::from_kind(
+                crate::error::ErrorKind::RuntimeError,
+            )("terminal without signal"));
+            WorkOutcome::Success { data: None }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
