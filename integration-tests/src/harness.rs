@@ -245,6 +245,30 @@ impl TmTestClient {
             .expect("upload complete");
     }
 
+    /// Upload the file at `path` under `key`, streaming from disk via
+    /// `InputStream::from_path` (the body is never held in memory). Use this for
+    /// large objects instead of `put`, which takes an in-memory buffer.
+    pub(crate) async fn put_from_path(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        strategy: aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy,
+    ) {
+        let body = aws_sdk_s3_transfer_manager::io::InputStream::from_path(path)
+            .expect("open upload source file");
+        self.tm
+            .upload()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .checksum_strategy(strategy)
+            .body(body)
+            .initiate()
+            .expect("initiate upload")
+            .join()
+            .await
+            .expect("upload complete");
+    }
+
     /// Download `key`, fully draining the body. Returns the bytes and the output
     /// (carrying `integrity_checks()`). `checksum_mode` controls whether the
     /// request asks S3 to return and the SDK to validate stored checksums.

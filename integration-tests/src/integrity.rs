@@ -192,6 +192,48 @@ fn assert_same_content(expected: &[u8], actual: &[u8]) {
     );
 }
 
+/// Write `len` bytes of the deterministic `i % 256` pattern to `path` and return
+/// their CRC64NVME digest, in a single streaming pass (no full-file buffer). Used
+/// to stage a large upload source on disk without holding it in memory.
+fn write_pattern_file(path: &std::path::Path, len: usize) -> Vec<u8> {
+    use aws_smithy_checksums::ChecksumAlgorithm;
+    use std::io::Write;
+    let mut hasher = ChecksumAlgorithm::Crc64Nvme.into_impl();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).expect("create source file"));
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut written = 0;
+    while written < len {
+        let n = buf.len().min(len - written);
+        for (j, b) in buf[..n].iter_mut().enumerate() {
+            *b = ((written + j) % 256) as u8;
+        }
+        f.write_all(&buf[..n]).expect("write source file");
+        hasher.update(&buf[..n]);
+        written += n;
+    }
+    f.flush().expect("flush source file");
+    hasher.finalize().to_vec()
+}
+
+/// CRC64NVME digest of a file, read in bounded chunks (no full-file buffer). Used
+/// to verify a downloaded large object matches the uploaded source independently
+/// of S3's own checksum.
+fn crc64nvme_file(path: &std::path::Path) -> Vec<u8> {
+    use aws_smithy_checksums::ChecksumAlgorithm;
+    use std::io::Read;
+    let mut hasher = ChecksumAlgorithm::Crc64Nvme.into_impl();
+    let mut f = std::fs::File::open(path).expect("open file");
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).expect("read file");
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    hasher.finalize().to_vec()
+}
+
 // single-part, default checksum_mode (unset) -----------------------------------
 //
 // Leaving checksum_mode unset does NOT mean validation is off: the SDK's
@@ -621,6 +663,173 @@ async fn file_download_round_trips_real_gp() {
 #[tokio::test]
 async fn file_download_round_trips_real_express() {
     file_download_round_trips(Target::real_express()).await;
+}
+
+// multi-chunk file-sink downloads ----------------------------------------------
+//
+// The file sink (SlotBuffer) coalesces contiguous filled slots and pwrites them,
+// then atomically renames the temp file to the destination on success. small()
+// is a single chunk; these drive ~64 parts at the aligned part size so the
+// multi-slot flush/coalesce path runs and, on tamper, a partially-written temp
+// must be discarded across many already-flushed chunks. Source and dest are
+// files (streamed, not buffered in memory).
+
+/// Number of aligned parts for the multi-chunk file tests. 64 * 5 MiB = 320 MiB,
+/// enough to coalesce and flush across dozens of slots.
+const MANY_PARTS: usize = 64;
+
+fn many_part_len() -> usize {
+    MANY_PARTS * 5 * ByteUnit::Mebibyte.as_bytes_usize()
+}
+
+/// A many-part object downloaded to a file round-trips on disk. Ranges align to
+/// the stored part size (explicit, matching the upload), so each chunk validates;
+/// the coalescing flush writes all parts and renames to the destination.
+async fn many_part_file_download_round_trips(target: Target) {
+    let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src.bin");
+    let dest = dir.path().join("dest.bin");
+    let len = many_part_len();
+    let src_digest = write_pattern_file(&src, len);
+
+    t.put_from_path("obj", &src, ChecksumStrategy::with_calculated_crc32())
+        .await;
+    t.download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
+        .await
+        .expect("file download");
+
+    assert_eq!(
+        std::fs::metadata(&dest).expect("stat dest").len() as usize,
+        len,
+        "downloaded size mismatch"
+    );
+    assert_eq!(crc64nvme_file(&dest), src_digest, "content digest mismatch");
+
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn many_part_file_download_round_trips_mock_gp() {
+    many_part_file_download_round_trips(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn many_part_file_download_round_trips_real_gp() {
+    many_part_file_download_round_trips(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn many_part_file_download_round_trips_real_express() {
+    many_part_file_download_round_trips(Target::real_express()).await;
+}
+
+/// A tampered chunk partway through a many-part file download is caught, and the
+/// destination is never created even though earlier chunks were already flushed
+/// to the temp file. The fault skips the first chunks so the failure lands after
+/// real bytes have been written: this exercises discarding a partially-written
+/// temp, not a fail-on-first-chunk. Ranged GETs are concurrent, so the moment of
+/// failure varies, but the outcome (transfer fails, dest absent, temp cleaned) is
+/// deterministic.
+async fn tampered_many_part_file_cleans_up(target: Target) {
+    let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src.bin");
+    let dest = dir.path().join("dest.bin");
+    let _ = write_pattern_file(&src, many_part_len());
+
+    t.put_from_path("obj", &src, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("tamper faults require the mock backend");
+    // Skip the first 8 chunks so several parts flush to the temp before the
+    // corruption hits; then corrupt every subsequent body (checksum intact).
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        8,
+        Occurrence::Always,
+    );
+
+    let result = t
+        .download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
+        .await;
+    assert_chunk_failed(result);
+    assert!(
+        !dest.exists(),
+        "destination must not be created on a failed download"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".s3tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn tampered_many_part_file_cleans_up_mock_gp() {
+    tampered_many_part_file_cleans_up(Target::mock_gp()).await;
+}
+
+// large-object download (real S3 only) -----------------------------------------
+//
+// Sized past the 512-slot body buffer window (DEFAULT_BODY_SLOT_CAPACITY) so the
+// download crosses slot-index wraparound and exercises seq-window backpressure
+// against a real disk-bound file sink, also crossing the 5 GiB single-PUT /
+// multipart boundary. Real-S3 only: the data volume has no place in mock CI.
+// Source and dest are files; verification re-derives a CRC64NVME over the
+// downloaded file independently of S3.
+
+#[cfg(e2e_test)]
+async fn large_object_file_download_validates(target: Target) {
+    use aws_sdk_s3_transfer_manager::types::PartSize;
+
+    // 6 GiB at an 8 MiB part size = ~768 ranged GETs, past the 512-slot window.
+    let part = 8 * ByteUnit::Mebibyte.as_bytes_u64();
+    let t = target.connect_with(Some(PartSize::Target(part))).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src.bin");
+    let dest = dir.path().join("dest.bin");
+    let total = 6 * ByteUnit::Gibibyte.as_bytes_usize();
+    let src_digest = write_pattern_file(&src, total);
+
+    t.put_from_path(
+        "large-obj",
+        &src,
+        ChecksumStrategy::with_calculated_crc64_nvme(),
+    )
+    .await;
+    t.download_to_path("large-obj", &dest, Some(ChecksumMode::Enabled))
+        .await
+        .expect("large file download");
+
+    assert_eq!(
+        std::fs::metadata(&dest).expect("stat dest").len() as usize,
+        total,
+        "downloaded size mismatch"
+    );
+    assert_eq!(crc64nvme_file(&dest), src_digest, "content digest mismatch");
+
+    t.shutdown().await;
+}
+
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn large_object_file_download_validates_real_gp() {
+    large_object_file_download_validates(Target::real_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn large_object_file_download_validates_real_express() {
+    large_object_file_download_validates(Target::real_express()).await;
 }
 
 async fn tampered_multipart_errors(target: Target) {

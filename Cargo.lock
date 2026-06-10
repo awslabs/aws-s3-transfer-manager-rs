@@ -2417,6 +2417,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-sdk-s3-transfer-manager",
+ "aws-smithy-checksums 0.64.6",
  "s3-mock-server",
  "tempfile",
  "tokio",
