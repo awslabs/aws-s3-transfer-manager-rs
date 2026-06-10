@@ -219,12 +219,24 @@ impl SlotBuffer {
         let consumed = self.consumed.load(AtomicOrdering::Acquire);
         let claimed = self.claimed.load(AtomicOrdering::Acquire);
 
+        // DIAGNOSTIC: contiguous-only flush. When set, only flush the contiguous
+        // run starting at `consumed`, never a run ahead of it — so every write
+        // lands at the current end of file and NTFS never zero-fills a gap.
+        // Out-of-order chunks stay buffered until the frontier reaches them.
+        let contiguous_only = std::env::var_os("S3TM_DIAG_CONTIGUOUS_FLUSH").is_some();
+
         // Phase 1: Write FILLED slots to disk, coalescing contiguous runs
         let mut first_err: Option<std::io::Error> = None;
         let mut i = consumed;
         while i < claimed {
             let idx = (i % self.capacity) as usize;
             if self.slots[idx].state.load(AtomicOrdering::Acquire) != SLOT_FILLED {
+                if contiguous_only {
+                    // Gap at the write frontier: stop. Writing a later run would
+                    // land ahead of EOF and trigger a zero-fill. Wait for this
+                    // slot to fill on a future flush.
+                    break;
+                }
                 i += 1;
                 continue;
             }

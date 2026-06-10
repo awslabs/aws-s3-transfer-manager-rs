@@ -42,11 +42,11 @@ jobs:
           toolchain: ${{ env.rust_stable }}
       - uses: Swatinem/rust-cache@v2
 
-      # Baseline: preallocate ON. Captures per-flush write durations and the
-      # ahead-of-watermark flag (target: download::sink). --nocapture because the
-      # subscriber writes to stderr from managed threads (libtest capture is
-      # thread-local and managed threads bypass it).
-      - name: large download (preallocate ON) + flush timing
+      # Baseline: current behavior (out-of-order writes). Expected to FAIL with
+      # ConnectionReset; the flush-timing log shows multi-second ahead_by writes.
+      # --nocapture because the subscriber writes to stderr from managed threads
+      # (libtest capture is thread-local and managed threads bypass it).
+      - name: large download baseline (out-of-order writes)
         continue-on-error: true
         env:
           RUSTFLAGS: "--cfg e2e_test"
@@ -55,14 +55,15 @@ jobs:
           cargo test -p integration-tests \
             large_object_file_download_validates_real_gp -- --nocapture
 
-      # Variant: preallocate OFF. If this passes (or the slow ahead-of-watermark
-      # writes disappear), the NTFS valid-data-length zero-fill is the cause.
-      - name: large download (preallocate OFF) + flush timing
+      # Fix candidate: contiguous-only flush. Writes only ever land at EOF, so
+      # NTFS never zero-fills. Expect all ahead_by=0 in the timing log and the
+      # 6 GiB download to pass.
+      - name: large download contiguous flush
         continue-on-error: true
         env:
           RUSTFLAGS: "--cfg e2e_test"
           RUST_LOG: "download::sink=debug"
-          S3TM_DIAG_SKIP_PREALLOCATE: "1"
+          S3TM_DIAG_CONTIGUOUS_FLUSH: "1"
         run: |
           cargo test -p integration-tests \
             large_object_file_download_validates_real_gp -- --nocapture
