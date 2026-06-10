@@ -791,6 +791,18 @@ async fn tampered_many_part_file_cleans_up_mock_gp() {
 async fn large_object_file_download_validates(target: Target) {
     use aws_sdk_s3_transfer_manager::types::PartSize;
 
+    // DIAGNOSTIC: surface `download::sink` flush-timing events (and TM warnings)
+    // on the CI console. Global subscriber (managed threads bypass libtest's
+    // thread-local capture, so write to stderr and run with --nocapture).
+    // Idempotent across the two real_* tests. RUST_LOG overrides the filter.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("download::sink=debug")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     // 6 GiB at an 8 MiB part size = ~768 ranged GETs, past the 512-slot window.
     let part = 8 * ByteUnit::Mebibyte.as_bytes_u64();
     let t = target.connect_with(Some(PartSize::Target(part))).await;

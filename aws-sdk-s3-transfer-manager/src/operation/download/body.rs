@@ -65,6 +65,11 @@ struct Sink {
     flushing: AtomicBool,
     /// Counts fills; flush triggered every `FLUSH_INTERVAL` fills.
     fill_count: AtomicU64,
+    /// DIAGNOSTIC: highest file offset written so far (one past the last byte).
+    /// Used to flag flushes that write *ahead* of already-written data, which on
+    /// NTFS forces a synchronous zero-fill of the gap. Remove with the
+    /// flush-timing diagnostics.
+    written_high_water: AtomicU64,
 }
 
 impl std::fmt::Debug for Sink {
@@ -269,11 +274,33 @@ impl SlotBuffer {
                 i += 1;
             }
 
+            // DIAGNOSTIC: time each positioned write and flag writes that land
+            // ahead of the highest offset written so far. On NTFS a write past
+            // the file's valid-data-length forces a synchronous zero-fill of the
+            // gap, which would block this (managed) thread's reactor. Remove with
+            // the rest of the flush-timing diagnostics once the Windows
+            // large-download stall is understood.
+            let write_len = combined.remaining() as u64;
+            let prev_high = sink.written_high_water.load(AtomicOrdering::Relaxed);
+            let ahead_by = file_pos.saturating_sub(prev_high);
+            let write_start = std::time::Instant::now();
             if let Err(e) = crate::io::fs::write_all_at(&sink.file, &mut combined, file_pos) {
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
+            let write_elapsed = write_start.elapsed();
+            let new_high = file_pos + write_len;
+            sink.written_high_water
+                .fetch_max(new_high, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "download::sink",
+                file_pos,
+                write_len,
+                ahead_by,
+                elapsed_ms = write_elapsed.as_millis() as u64,
+                "sink flush write"
+            );
         }
 
         // Phase 2: Advance consumed past leading FLUSHED slots
@@ -444,6 +471,14 @@ impl BodyWriter {
     // continuing? Failing fast avoids wasting bandwidth downloading data we can't
     // store. EOPNOTSUPP/ENOTSUP should remain non-fatal (filesystem doesn't support it).
     pub(crate) fn preallocate(&self, len: u64) {
+        // DIAGNOSTIC: allow disabling preallocation to test whether a
+        // preallocated (set_len) file is the cause of the Windows large-download
+        // stall (NTFS zero-fills writes past valid-data-length). Remove with the
+        // flush-timing diagnostics.
+        if std::env::var_os("S3TM_DIAG_SKIP_PREALLOCATE").is_some() {
+            tracing::debug!(target: "download::sink", "preallocate skipped (diagnostic)");
+            return;
+        }
         if let Some(sink) = &self.buffer.sink {
             if sink.owns_file {
                 if let Err(e) = crate::io::fs::preallocate(&sink.file, len) {
@@ -520,6 +555,7 @@ pub(crate) fn new_slot_body_with_sink(
         owns_file,
         flushing: AtomicBool::new(false),
         fill_count: AtomicU64::new(0),
+        written_high_water: AtomicU64::new(0),
     });
     let buffer = Arc::new(buffer);
     (

@@ -1,0 +1,68 @@
+name: Diag Windows large download
+
+# TEMPORARY diagnostic workflow for the Windows-only large-download stall.
+# Windows-only; runs just the large-object e2e test with sink flush-timing
+# logging, in preallocate-on and preallocate-off variants. Delete once the
+# stall is understood.
+
+on:
+  push:
+    branches:
+      - vnext-integrity-debug
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  rust_stable: stable
+  CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
+  AWS_REGION: us-west-2
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  diag:
+    name: Diag large download (windows)
+    runs-on: windows-2022
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+
+      # Baseline: preallocate ON. Captures per-flush write durations and the
+      # ahead-of-watermark flag (target: download::sink). --nocapture because the
+      # subscriber writes to stderr from managed threads (libtest capture is
+      # thread-local and managed threads bypass it).
+      - name: large download (preallocate ON) + flush timing
+        continue-on-error: true
+        env:
+          RUSTFLAGS: "--cfg e2e_test"
+          RUST_LOG: "download::sink=debug"
+        run: |
+          cargo test -p integration-tests \
+            large_object_file_download_validates_real_gp -- --nocapture
+
+      # Variant: preallocate OFF. If this passes (or the slow ahead-of-watermark
+      # writes disappear), the NTFS valid-data-length zero-fill is the cause.
+      - name: large download (preallocate OFF) + flush timing
+        continue-on-error: true
+        env:
+          RUSTFLAGS: "--cfg e2e_test"
+          RUST_LOG: "download::sink=debug"
+          S3TM_DIAG_SKIP_PREALLOCATE: "1"
+        run: |
+          cargo test -p integration-tests \
+            large_object_file_download_validates_real_gp -- --nocapture
