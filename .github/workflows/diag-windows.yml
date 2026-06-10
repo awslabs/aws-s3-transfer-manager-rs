@@ -42,16 +42,27 @@ jobs:
           toolchain: ${{ env.rust_stable }}
       - uses: Swatinem/rust-cache@v2
 
-      # Confirms the Windows preallocate fix: this is the real production path
-      # (no env override). With preallocate now a no-op on Windows there is no
-      # NTFS valid-data-length gap to zero-fill, so the flush-timing log should
-      # show no multi-second ahead_by writes and the 6 GiB download should pass.
-      # --nocapture because the subscriber writes to stderr from managed threads
-      # (libtest capture is thread-local and managed threads bypass it).
-      - name: large download + flush timing (real fix)
+      # Baseline: preallocate ON. Captures per-flush write durations and the
+      # ahead-of-watermark flag (target: download::sink). --nocapture because the
+      # subscriber writes to stderr from managed threads (libtest capture is
+      # thread-local and managed threads bypass it).
+      - name: large download (preallocate ON) + flush timing
+        continue-on-error: true
         env:
           RUSTFLAGS: "--cfg e2e_test"
           RUST_LOG: "download::sink=debug"
+        run: |
+          cargo test -p integration-tests \
+            large_object_file_download_validates_real_gp -- --nocapture
+
+      # Variant: preallocate OFF. If this passes (or the slow ahead-of-watermark
+      # writes disappear), the NTFS valid-data-length zero-fill is the cause.
+      - name: large download (preallocate OFF) + flush timing
+        continue-on-error: true
+        env:
+          RUSTFLAGS: "--cfg e2e_test"
+          RUST_LOG: "download::sink=debug"
+          S3TM_DIAG_SKIP_PREALLOCATE: "1"
         run: |
           cargo test -p integration-tests \
             large_object_file_download_validates_real_gp -- --nocapture

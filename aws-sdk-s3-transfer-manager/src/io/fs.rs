@@ -105,20 +105,13 @@ mod sys {
         Ok(())
     }
 
-    pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
-        // No-op on Windows. set_len here calls SetEndOfFile, which moves the
-        // file's logical end but not its valid-data-length (VDL). A positioned
-        // write past the VDL then forces NTFS to synchronously zero-fill the gap
-        // from the VDL to the write offset. Download chunks arrive out of order,
-        // so writes land far ahead of the VDL routinely, and each one blocks on a
-        // multi-hundred-MiB (multi-second) zero-fill on the writing thread —
-        // which on the managed runtime is the same reactor driving that thread's
-        // S3 connections, stalling them until the service resets the idle
-        // sockets. set_len also reserves no disk space and gives no ENOSPC
-        // guarantee, so skipping it loses nothing. (SetFileValidData would avoid
-        // the zero-fill but requires the SE_MANAGE_VOLUME privilege and exposes
-        // stale on-disk data; not worth it.)
-        Ok(())
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        // Windows has no native fallocate equivalent. set_len calls
+        // SetEndOfFile which extends the file logical size; matches the
+        // macOS path. On both platforms preallocation is best-effort
+        // length-setting without disk-space reservation; only Linux's
+        // posix_fallocate guarantees ENOSPC at preallocate time.
+        file.set_len(len)
     }
 }
 
