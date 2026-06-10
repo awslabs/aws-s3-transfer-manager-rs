@@ -46,6 +46,9 @@ dial9 = ["dep:dial9-tokio-telemetry"]
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Ioctl", "Win32_System_IO", "Win32_Foundation"] }
+
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
 aws-smithy-checksums = "0.64.6"

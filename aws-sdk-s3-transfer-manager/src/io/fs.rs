@@ -26,6 +26,18 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     sys::preallocate(file, len)
 }
 
+/// Mark `file` as sparse so that writes past the file's valid-data-length do not
+/// synchronously zero-fill the intervening gap.
+///
+/// Download chunks arrive out of order and are written at their true offsets, so
+/// writes routinely land ahead of the contiguous data already on disk. On NTFS a
+/// non-sparse file zero-fills that gap on each such write (seconds for a
+/// multi-MiB gap); marking the file sparse leaves the gap as a hole until it is
+/// filled. No-op on platforms where files are already sparse by default (Unix).
+pub(crate) fn set_sparse(file: &File) -> io::Result<()> {
+    sys::set_sparse(file)
+}
+
 #[cfg(all(unix, not(miri)))]
 mod sys {
     use bytes::Buf;
@@ -59,6 +71,11 @@ mod sys {
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
     }
+
+    // Unix files are sparse by default; no action needed.
+    pub(super) fn set_sparse(_file: &File) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // Under miri, use simple seek+pwrite to avoid unsupported pwritev FFI.
@@ -83,6 +100,10 @@ mod sys {
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
+    }
+
+    pub(super) fn set_sparse(_file: &File) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -113,6 +134,34 @@ mod sys {
         // posix_fallocate guarantees ENOSPC at preallocate time.
         file.set_len(len)
     }
+
+    pub(super) fn set_sparse(file: &File) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let handle = file.as_raw_handle();
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: `handle` is a valid file handle for the lifetime of `file`.
+        // FSCTL_SET_SPARSE takes no input/output buffers (null/0). We pass a
+        // null OVERLAPPED for a synchronous call.
+        let ok = unsafe {
+            DeviceIoControl(
+                handle as _,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -129,6 +178,10 @@ mod sys {
     }
 
     pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn set_sparse(_file: &File) -> io::Result<()> {
         Ok(())
     }
 }

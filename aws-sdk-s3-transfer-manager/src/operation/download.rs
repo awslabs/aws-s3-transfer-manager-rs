@@ -100,6 +100,15 @@ impl Download {
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
         let file = tokio_file.into_std().await;
 
+        // DIAGNOSTIC: in "sparse" write mode, mark the file sparse so out-of-order
+        // writes past the valid-data-length don't zero-fill on NTFS.
+        if std::env::var("S3TM_DIAG_WRITE_MODE").as_deref() == Ok("sparse") {
+            match crate::io::fs::set_sparse(&file) {
+                Ok(()) => tracing::debug!(target: "download::sink", "set_sparse ok"),
+                Err(e) => tracing::warn!(target: "download::sink", error = %e, "set_sparse failed"),
+            }
+        }
+
         let range_start = object_range_start_from_input(&input);
         let inner = Self::orchestrate_with_sink(handle, input, file, range_start, true, parent_id)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))

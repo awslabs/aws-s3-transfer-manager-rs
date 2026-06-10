@@ -219,11 +219,28 @@ impl SlotBuffer {
         let consumed = self.consumed.load(AtomicOrdering::Acquire);
         let claimed = self.claimed.load(AtomicOrdering::Acquire);
 
-        // DIAGNOSTIC: contiguous-only flush. When set, only flush the contiguous
-        // run starting at `consumed`, never a run ahead of it — so every write
-        // lands at the current end of file and NTFS never zero-fills a gap.
-        // Out-of-order chunks stay buffered until the frontier reaches them.
-        let contiguous_only = std::env::var_os("S3TM_DIAG_CONTIGUOUS_FLUSH").is_some();
+        // DIAGNOSTIC: write-mode selector for the Windows large-download
+        // investigation (S3TM_DIAG_WRITE_MODE):
+        //   "contiguous"      - only flush the contiguous run from `consumed`,
+        //                       never ahead of EOF (no NTFS zero-fill).
+        //   "contiguous_cap"  - as above, plus cap each coalesced write at
+        //                       S3TM_DIAG_RUN_CAP_MIB so no single write blocks
+        //                       the reactor for long.
+        //   anything else / unset - current behavior (out-of-order writes);
+        //                       "sparse" relies on the file being marked sparse
+        //                       at creation so out-of-order writes don't zero-fill.
+        let mode = std::env::var("S3TM_DIAG_WRITE_MODE").unwrap_or_default();
+        let contiguous_only = mode == "contiguous" || mode == "contiguous_cap";
+        let run_cap_bytes: u64 = if mode == "contiguous_cap" {
+            std::env::var("S3TM_DIAG_RUN_CAP_MIB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(64)
+                * 1024
+                * 1024
+        } else {
+            u64::MAX
+        };
 
         // Phase 1: Write FILLED slots to disk, coalescing contiguous runs
         let mut first_err: Option<std::io::Error> = None;
@@ -259,6 +276,11 @@ impl SlotBuffer {
 
             // Extend with contiguous FILLED neighbors whose file offsets are adjacent
             while i < claimed {
+                // Cap the coalesced run so a single write can't block the
+                // (managed) thread's reactor for too long.
+                if run_end_offset - file_pos >= run_cap_bytes {
+                    break;
+                }
                 let jdx = (i % self.capacity) as usize;
                 if self.slots[jdx].state.load(AtomicOrdering::Acquire) != SLOT_FILLED {
                     break;
