@@ -158,6 +158,116 @@ impl<S: StorageBackend + 'static> Inner<S> {
                     )));
                 }
             }
+            Some(crate::faults::FaultType::TruncateBody { after_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `after_bytes`, then error the stream.
+                    // hyper aborts the connection mid-response.
+                    //
+                    // State: (inner stream, remaining passthrough bytes, errored?).
+                    let faulted = futures_util::stream::unfold(
+                        (body, after_bytes, false),
+                        |(mut stream, remaining, errored)| async move {
+                            if errored {
+                                return None;
+                            }
+                            if remaining == 0 {
+                                // Already delivered the allotted bytes: error now.
+                                return Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionReset,
+                                        "injected mid-stream truncation",
+                                    )),
+                                    (stream, 0, true),
+                                ));
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem, false)))
+                                    } else {
+                                        // Emit the partial head; error on next poll.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0, false)))
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    Some((Err(std::io::Error::other(e)), (stream, 0, true)))
+                                }
+                                // Real EOF before the truncation point: nothing to fault.
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::StallBody { after_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `after_bytes`, then stall the stream
+                    // (no further byte, no EOF).
+                    //
+                    // State: (inner stream, remaining passthrough bytes).
+                    let faulted = futures_util::stream::unfold(
+                        (body, after_bytes),
+                        |(mut stream, remaining)| async move {
+                            if remaining == 0 {
+                                // Allotment delivered: pend forever.
+                                std::future::pending::<()>().await;
+                                unreachable!("pending future never resolves");
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem)))
+                                    } else {
+                                        // Emit the partial head; stall on next poll.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0)))
+                                    }
+                                }
+                                Some(Err(e)) => Some((Err(std::io::Error::other(e)), (stream, 0))),
+                                // Real EOF before the stall point: nothing to fault.
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::ShortBody { actual_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `actual_bytes`, then end the stream
+                    // cleanly. Content-Length still advertises the full size, so
+                    // the client sees a short read.
+                    //
+                    // State: (inner stream, remaining bytes to deliver).
+                    let faulted = futures_util::stream::unfold(
+                        (body, actual_bytes),
+                        |(mut stream, remaining)| async move {
+                            if remaining == 0 {
+                                return None;
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem)))
+                                    } else {
+                                        // Emit the partial head, then end.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0)))
+                                    }
+                                }
+                                Some(Err(e)) => Some((Err(std::io::Error::other(e)), (stream, 0))),
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
             None => {}
         }
         Ok(())
