@@ -15,7 +15,9 @@ keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
 aws-config = { version = "1.8.15", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest"] }
+# LOCAL DEV ONLY (vnext-conn-pool): path dep to locally-built aws-sdk-s3
+# (0.0.0-local; cannot be reached via [patch.crates-io]). Revert before PR.
+aws-sdk-s3 = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/s3", features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = "1.11.6"
 aws-runtime = "1.7.2"
 aws-smithy-types = "1.4.7"
@@ -48,7 +50,9 @@ dial9 = ["dep:dial9-tokio-telemetry"]
 nix = { version = "0.31", features = ["uio", "fs"] }
 
 [dev-dependencies]
-aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
+# LOCAL DEV ONLY (vnext-conn-pool): path dep to locally-built aws-sdk-s3. Revert before PR.
+aws-sdk-s3 = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/s3", features = ["behavior-version-latest", "test-util"] }
+aws-smithy-checksums = "0.64.6"
 aws-smithy-mocks = "0.2.6"
 aws-smithy-runtime = { version = "1.11.1", features = ["client", "test-util"] }
 aws-smithy-http-client = { version = "1.1.12", features = ["test-util", "wire-mock", "rustls-aws-lc"] }

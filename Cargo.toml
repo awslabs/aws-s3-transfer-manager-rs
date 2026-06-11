@@ -1,10 +1,44 @@
 [workspace]
 resolver = "2"
+# LOCAL DEV ONLY (vnext-conn-pool): workspace trimmed to just the TM crate so
+# Cargo resolves only against the local SDK build. The other members
+# (s3-mock-server/benches/integration-tests) drag in s3s, which pins
+# hmac=0.13.0-rc.5 and conflicts with the local SDK's aws-sigv4 -> hmac 0.13.0.
+# Restore the full list (and path-dep aws-sdk-s3 in integration-tests) before PR.
 members = [
     "aws-sdk-s3-transfer-manager",
 
-    # internal
-    "s3-mock-server",
-    "benches",
-    "integration-tests"
+    # internal — temporarily excluded (see note above)
+    # "s3-mock-server",
+    # "benches",
+    # "integration-tests"
 ]
+
+# LOCAL DEV ONLY — DO NOT COMMIT TO THE vnext-conn-pool PR.
+# Points the shared AWS runtime libraries at the locally-built smithy-rs SDK
+# artifacts that contain the partitioned HTTP connection pool
+# (aws-smithy-http-client 1.3.0). Generated service crates (aws-sdk-s3, sts,
+# sso, ssooidc) are 0.0.0-local and cannot be bridged by [patch]; aws-sdk-s3 is
+# wired as a path dependency in aws-sdk-s3-transfer-manager/Cargo.toml instead
+# (it transitively pulls the local sts/sso/ssooidc via its own path deps).
+# Source: /Users/todaaron/sandbox/rs/smithy-rs (branch aajtodd/http-conn-pool-v2-explore)
+[patch.crates-io]
+aws-config = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-config" }
+aws-credential-types = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-credential-types" }
+aws-runtime = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-runtime" }
+aws-sigv4 = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-sigv4" }
+aws-types = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-types" }
+aws-smithy-async = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-async" }
+aws-smithy-checksums = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-checksums" }
+aws-smithy-dns = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-dns" }
+aws-smithy-eventstream = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-eventstream" }
+aws-smithy-http = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-http" }
+aws-smithy-http-client = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-http-client" }
+aws-smithy-json = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-json" }
+aws-smithy-mocks = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-mocks" }
+aws-smithy-observability = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-observability" }
+aws-smithy-query = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-query" }
+aws-smithy-runtime = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-runtime" }
+aws-smithy-runtime-api = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-runtime-api" }
+aws-smithy-types = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-types" }
+aws-smithy-xml = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-xml" }

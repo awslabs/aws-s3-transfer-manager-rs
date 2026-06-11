@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
-use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient, SharedHttpClient};
+use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient};
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
@@ -67,7 +67,6 @@ struct ThreadHandle {
     runtime_handle: tokio::runtime::Handle,
     join_handle: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<AtomicUsize>,
-    http_client: SharedHttpClient,
 }
 
 impl std::fmt::Debug for ThreadHandle {
@@ -207,7 +206,6 @@ impl ManagedThreadRuntime {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let cpu_index = id.0;
 
-                let resolver = dns_resolver.clone();
                 #[cfg(feature = "dial9")]
                 let telemetry_guard = telemetry_guard.clone();
 
@@ -235,16 +233,11 @@ impl ManagedThreadRuntime {
                             .build()
                             .expect("failed to create tokio current-thread runtime");
 
-                        // Create per-thread HTTP client on this thread's runtime.
-                        // The TLS connector and connection pool bind to this thread's reactor.
-                        let http_client = aws_smithy_http_client::Builder::new()
-                            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-                            ))
-                            // .tls_provider(aws_smithy_http_client::tls::Provider::S2nTls)
-                            .build_with_resolver(resolver);
-
-                        let _ = tx.send((rt.handle().clone(), http_client));
+                        // Send the runtime handle back. The shared pool is built
+                        // once all handles are collected, with one partition bound
+                        // to this runtime (TokioDriverSpawner::from_handle) so its
+                        // connection drivers run on this thread.
+                        let _ = tx.send(rt.handle().clone());
                         MANAGED_THREAD_CPU.set(Some(cpu_index));
                         rt.block_on(shutdown.cancelled());
                     })
@@ -257,22 +250,58 @@ impl ManagedThreadRuntime {
         let threads: Vec<_> = pending
             .into_iter()
             .map(|(id, rx, join_handle)| {
-                let (runtime_handle, http_client) =
-                    rx.recv().expect("managed thread failed to start");
+                let runtime_handle = rx.recv().expect("managed thread failed to start");
                 ThreadHandle {
                     id,
                     runtime_handle,
                     join_handle: Mutex::new(Some(join_handle)),
                     in_flight: Arc::new(AtomicUsize::new(0)),
-                    http_client,
                 }
             })
             .collect();
 
-        // Build an http_client_fn that dispatches to the per-thread HTTP client
-        // based on which managed thread is calling.
-        let per_thread_clients: Arc<Vec<SharedHttpClient>> =
-            Arc::new(threads.iter().map(|th| th.http_client.clone()).collect());
+        // One shared pool, one partition per managed thread (PartitionId == cpu
+        // index). `from_handle` spawns each partition's connection driver on that
+        // thread's runtime, so a connection stays local to the thread that issues
+        // requests on it.
+        //
+        // nic = None and the default `Never` policy give single-NIC behavior: no
+        // interface binding, no cross-partition connection sharing.
+        //
+        // pool_idle_timeout must be set explicitly: the builder default is None
+        // (idle connections are never evicted). 90s caps idle connection lifetime;
+        // S3 closes idle connections earlier, so this may be lowered. max_connections
+        // is unset: no global connection cap.
+        let pool = aws_smithy_http_client::pool::SharedPool::builder()
+            .dns_resolver(dns_resolver)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .partitions(threads.iter().map(|th| {
+                aws_smithy_http_client::pool::Partition::new(
+                    aws_smithy_http_client::pool::PartitionId::from_index(th.id.0),
+                    aws_smithy_http_client::pool::TokioDriverSpawner::from_handle(
+                        th.runtime_handle.clone(),
+                    ),
+                )
+            }))
+            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .build_https();
+
+        // One per-partition client handle per managed thread; each implements
+        // `HttpClient`. The dispatch fn routes a request to the calling thread's
+        // partition handle.
+        let per_thread_clients: Arc<Vec<aws_smithy_http_client::pool::Client>> = Arc::new(
+            threads
+                .iter()
+                .map(|th| {
+                    aws_smithy_http_client::pool::Client::from_partition(
+                        &pool,
+                        aws_smithy_http_client::pool::PartitionId::from_index(th.id.0),
+                    )
+                })
+                .collect(),
+        );
 
         let shared_http_client = http_client_fn(move |settings, components| {
             let cpu_index = MANAGED_THREAD_CPU
@@ -460,7 +489,6 @@ mod tests {
             runtime_handle: rt.handle().clone(),
             join_handle: Mutex::new(None),
             in_flight: Arc::new(AtomicUsize::new(in_flight_count)),
-            http_client: http_client_fn(|_, _| unreachable!("test http client")),
         };
         (th, rt)
     }
