@@ -134,6 +134,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
         &self,
         bucket: &str,
         key: &str,
+        conn_fault: Option<&std::sync::Arc<crate::socket_fault::ConnectionFault>>,
         output: &mut s3s::dto::GetObjectOutput,
     ) -> S3Result<()> {
         match self.faults.next_fault(bucket, key) {
@@ -268,6 +269,13 @@ impl<S: StorageBackend + 'static> Inner<S> {
                     output.body = Some(StreamingBlob::wrap(faulted));
                 }
             }
+            Some(crate::faults::FaultType::ConnectionReset { after_bytes }) => {
+                // Arm the per-connection fault; the socket wrapper aborts the
+                // connection (RST) after `after_bytes` further bytes are written.
+                if let Some(fault) = conn_fault {
+                    fault.arm(after_bytes);
+                }
+            }
             None => {}
         }
         Ok(())
@@ -280,6 +288,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
+        let conn_fault = req
+            .extensions
+            .get::<std::sync::Arc<crate::socket_fault::ConnectionFault>>()
+            .cloned();
         let input = req.input;
         let bucket = &input.bucket;
         let key = &input.key;
@@ -394,7 +406,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
 
         apply_response_defaults_get(&mut output);
-        self.apply_get_fault(bucket, key, &mut output).await?;
+        self.apply_get_fault(bucket, key, conn_fault.as_ref(), &mut output)
+            .await?;
         Ok(S3Response::new(output))
     }
 

@@ -3625,6 +3625,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http 1.4.0",
+ "hyper 1.9.0",
  "hyper-util",
  "md5",
  "pin-project",

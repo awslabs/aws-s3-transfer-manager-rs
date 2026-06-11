@@ -358,3 +358,103 @@ async fn test_short_body_fails_length_mismatch() -> Result<()> {
     handle.shutdown().await?;
     Ok(())
 }
+
+/// `set_socket_drop` aborts the connection (RST) after a byte threshold. The
+/// `FaultType::ConnectionReset` aborts the connection (RST) after a byte budget,
+/// armed for the specific connection serving the faulted key's GET. The response
+/// headers succeed; the body delivers a prefix then errors with a real
+/// `ConnectionReset` (the OS-level reset, distinct from a body-stream error).
+#[tokio::test]
+async fn test_connection_reset_mid_stream() -> Result<()> {
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    let len = 24 * 1024 * 1024; // large enough that send() does not buffer the whole body
+    seed_big(&handle, len).await?;
+
+    server.insert_fault(
+        B,
+        BIG_KEY,
+        FaultType::ConnectionReset {
+            after_bytes: 1024 * 1024,
+        },
+        0,
+        Occurrence::Always,
+    );
+
+    let s3 = handle.client().await;
+    let mut resp = s3
+        .get_object()
+        .bucket(B)
+        .key(BIG_KEY)
+        .send()
+        .await
+        .expect("send/headers succeed; the reset is mid-body");
+
+    let mut read = 0u64;
+    loop {
+        match resp.body.next().await {
+            Some(Ok(chunk)) => read += chunk.len() as u64,
+            Some(Err(_)) => break,
+            None => panic!("body completed without error; expected a connection reset"),
+        }
+    }
+
+    assert!(
+        read > 0,
+        "body should deliver a prefix before the reset, got 0"
+    );
+    assert!(
+        read < len as u64,
+        "connection should reset before the full {len} bytes, read {read}"
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// Build a client with its own connection pool and retries disabled, so a
+/// connect-time fault forces a new connection and is not transparently retried.
+async fn fresh_client_no_retry(handle: &ServerHandle) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{retry::RetryConfig, Credentials, Region};
+    let endpoint_url = format!("http://127.0.0.1:{}", handle.socket_addr().port());
+    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .credentials_provider(Credentials::new(
+            "mock-akid",
+            "mock-secret",
+            None,
+            None,
+            "mock",
+        ))
+        .region(Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .retry_config(RetryConfig::disabled())
+        .load()
+        .await;
+    let config = aws_sdk_s3::config::Builder::from(&shared)
+        .force_path_style(true)
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
+/// `reset_next_connections` aborts a freshly accepted connection before any
+/// request is served, simulating a connect-time reset. Uses a fresh client (to
+/// force a new connection) with retries disabled (so the SDK does not
+/// transparently recover); the request fails at dispatch, not mid-body.
+#[tokio::test]
+async fn test_connect_time_reset_fails_dispatch() -> Result<()> {
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    seed_big(&handle, 4096).await?;
+
+    server.reset_next_connections(1);
+
+    let s3 = fresh_client_no_retry(&handle).await;
+    let result = s3.get_object().bucket(B).key(BIG_KEY).send().await;
+    assert!(
+        result.is_err(),
+        "a connect-time reset must fail the request at dispatch"
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}

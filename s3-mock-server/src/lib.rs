@@ -14,6 +14,7 @@ mod error;
 mod faults;
 mod s3s;
 mod server;
+mod socket_fault;
 mod storage;
 mod streaming;
 mod types;

@@ -35,6 +35,10 @@ pub enum FaultType {
     /// Content-Length header advertises. The client observes a length mismatch
     /// (body shorter than declared / unexpected EOF).
     ShortBody { actual_bytes: u64 },
+    /// GET aborts the connection with a TCP RST after `after_bytes` further bytes
+    /// are written to the client (counted from when the fault fires). The client
+    /// observes a `ConnectionReset`.
+    ConnectionReset { after_bytes: u64 },
 }
 
 /// How many times an eligible fault fires before it is consumed.
