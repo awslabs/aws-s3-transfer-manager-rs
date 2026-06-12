@@ -427,13 +427,10 @@ impl DownloadTransfer {
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
-        let result = self
-            .inner
-            .ctx
-            .handle
-            .telemetry
-            .recv_latencies
-            .guarded(|| {
+        let result = crate::retry::retry_guarded(
+            &self.inner.ctx.handle.telemetry.recv_latencies,
+            crate::retry::retry_deadline_only,
+            || {
                 let rh = range_header.clone();
                 let etag = etag.clone();
                 let ctx = self.inner.ctx.clone();
@@ -471,8 +468,9 @@ impl DownloadTransfer {
                     }
                     Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         let (chunk_meta, segmented, bytes_received) = match result {
             Ok(val) => val,

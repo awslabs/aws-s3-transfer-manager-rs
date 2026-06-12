@@ -395,13 +395,9 @@ impl UploadTransfer {
         let data_bytes = data.data;
         let checksum = data.checksum;
 
-        let resp = match self
-            .inner
-            .ctx
-            .handle
-            .telemetry
-            .send_latencies
-            .guarded(|| {
+        let send_latencies = &self.inner.ctx.handle.telemetry.send_latencies;
+        let result =
+            crate::retry::retry_guarded(send_latencies, crate::retry::retry_deadline_only, || {
                 let body = ByteStream::from(data_bytes.clone());
                 let req = copy_fields_to_upload_part_request(
                     &self.inner.request,
@@ -421,10 +417,11 @@ impl UploadTransfer {
                         .send()
                         .instrument(tracing::debug_span!("send-upload-part", part_number))
                         .await
+                        .map_err(crate::error::Error::from)
                 }
             })
-            .await
-        {
+            .await;
+        let resp = match result {
             Ok(resp) => resp,
             Err(e) => return self.fail(e),
         };

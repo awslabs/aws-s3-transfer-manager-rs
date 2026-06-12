@@ -97,6 +97,9 @@ pub(crate) mod telemetry;
 /// Metrics
 pub mod metrics;
 
+/// Body-read retry loop layered over the latency deadline guard
+pub(crate) mod retry;
+
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::Config;
