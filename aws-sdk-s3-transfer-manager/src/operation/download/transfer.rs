@@ -331,7 +331,7 @@ impl DownloadTransfer {
             *work = DownloadState::Transferring {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
-                etag,
+                etag: etag.clone(),
                 part_size: effective_part_size,
             };
         }
@@ -342,7 +342,7 @@ impl DownloadTransfer {
         // If discovery returned an initial chunk, process it
         match initial_work {
             Some((stream, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(stream, slot, chunk_meta)
+                self.execute_read_discovery_body(stream, slot, chunk_meta, etag)
                     .await
             }
             None => WorkOutcome::Success { data: None },
@@ -354,31 +354,68 @@ impl DownloadTransfer {
         stream: aws_sdk_s3::primitives::ByteStream,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
+        etag: Option<Arc<str>>,
     ) -> WorkOutcome {
         let seq = slot.seq();
-        // Read the body from the discovery response
-        let mut segmented = SegmentedBuf::new();
-        let mut bytes_received: u64 = 0;
-        let mut body_stream = stream;
-        while let Some(result) = body_stream.next().await {
-            let data = match result {
-                Ok(data) => data,
-                Err(e) => {
-                    // Go terminal before any wake: fail() sets Terminal under the
-                    // lock, so a woken poll_work cannot observe ranges_in_flight==0
-                    // and complete() the transfer over this error. The in-flight
-                    // count is abandoned with the Transferring state.
-                    let guard = self.inner.state.lock().unwrap();
-                    return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+        let input = self.inner.request.as_ref();
+        // The discovery GET already fetched this chunk's bytes; the first read
+        // consumes that stream with no extra request (preserving time-to-first-
+        // byte). A retry has no stream to reuse, so it re-issues a ranged GET for
+        // exactly the bytes this chunk covers, taken from the discovery response's
+        // content-range. A partNumber=1 discovery maps to the same byte range, so
+        // the re-issued aligned range returns the same per-part checksum the SDK
+        // validates against.
+        let reissue_range = chunk_meta
+            .content_range
+            .as_deref()
+            .and_then(crate::http::header::parse_content_range);
+
+        let mut initial = Some(stream);
+        let result = crate::retry::retry_guarded(
+            &self.inner.ctx.handle.telemetry.recv_latencies,
+            crate::retry::classify_body_retry,
+            || {
+                let pre_issued = initial.take();
+                let etag = etag.clone();
+                let ctx = self.inner.ctx.clone();
+                let reissue_range = reissue_range.clone();
+                let mut builder: GetObjectInputBuilder = input.clone().into();
+                if let Some(r) = reissue_range.as_ref() {
+                    builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
                 }
-            };
-            bytes_received += data.len() as u64;
-            segmented.push(data);
-            if !self.inner.ctx.is_active() {
-                self.decrement_in_flight();
-                return WorkOutcome::Cancelled;
+                if let Some(etag) = etag.as_ref() {
+                    builder = builder.if_match(etag.as_ref());
+                }
+                async move {
+                    let body = match pre_issued {
+                        // First attempt: the body discovery already fetched.
+                        Some(s) => s,
+                        // Retry: re-fetch the discovery chunk's range.
+                        None => {
+                            let resp = builder
+                                .send_with(ctx.s3_client())
+                                .await
+                                .map_err(crate::error::Error::from)?;
+                            resp.body
+                        }
+                    };
+                    Self::read_body_stream(&ctx, body).await
+                }
+            },
+        )
+        .await;
+
+        let (segmented, bytes_received) = match result {
+            Ok(val) => val,
+            // Go terminal before any wake: fail() sets Terminal under the lock, so
+            // a woken poll_work cannot observe ranges_in_flight==0 and complete()
+            // the transfer over this error. The in-flight count is abandoned with
+            // the Transferring state.
+            Err(e) => {
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
             }
-        }
+        };
 
         let chunk = ChunkOutput {
             seq,
@@ -417,6 +454,34 @@ impl DownloadTransfer {
         WorkOutcome::Success { data: None }
     }
 
+    /// Drain a chunk body stream into a buffer, returning the bytes and the count.
+    ///
+    /// Shared by the range-chunk and discovery-chunk paths. A stream error maps to
+    /// [`ErrorKind::IOError`] (the body-read class the retry classifier re-issues);
+    /// a cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`]
+    /// (which the classifier does not retry).
+    async fn read_body_stream(
+        ctx: &TransferContext,
+        body: aws_sdk_s3::primitives::ByteStream,
+    ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
+        let mut segmented = SegmentedBuf::new();
+        let mut bytes_received: u64 = 0;
+        let mut body_stream = body;
+        while let Some(result) = body_stream.next().await {
+            let data = result
+                .map_err(|e| crate::error::Error::new(crate::error::ErrorKind::IOError, e))?;
+            bytes_received += data.len() as u64;
+            segmented.push(data);
+            if !ctx.is_active() {
+                return Err(crate::error::Error::new(
+                    crate::error::ErrorKind::OperationCancelled,
+                    "transfer cancelled during body read",
+                ));
+            }
+        }
+        Ok((segmented, bytes_received))
+    }
+
     async fn execute_get_range(
         &self,
         range: std::ops::RangeInclusive<u64>,
@@ -450,22 +515,8 @@ impl DownloadTransfer {
                         .map_err(crate::error::Error::from)?;
                     validate_content_range(seq, &rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
-                    let mut segmented = SegmentedBuf::new();
-                    let mut bytes_received: u64 = 0;
-                    let mut body_stream = resp.body;
-                    while let Some(result) = body_stream.next().await {
-                        let data = result.map_err(|e| {
-                            crate::error::Error::new(crate::error::ErrorKind::IOError, e)
-                        })?;
-                        bytes_received += data.len() as u64;
-                        segmented.push(data);
-                        if !ctx.is_active() {
-                            return Err(crate::error::Error::new(
-                                crate::error::ErrorKind::OperationCancelled,
-                                "transfer cancelled during body read",
-                            ));
-                        }
-                    }
+                    let (segmented, bytes_received) =
+                        Self::read_body_stream(&ctx, resp.body).await?;
                     Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
                 }
             },

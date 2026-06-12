@@ -114,9 +114,9 @@
 //! through this matrix. Representative algorithms are used: CRC32 for full
 //! object, SHA-256 for the composite case.
 
+use crate::assertions::{assert_chunk_failed, assert_same_content};
 use crate::harness::Target;
 use aws_sdk_s3::types::ChecksumMode;
-use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
@@ -156,40 +156,6 @@ fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
         ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
         other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
     }
-}
-
-/// Assert a download failed with a per-chunk failure (the kind a checksum
-/// mismatch surfaces as: the SDK body validator errors on a chunk, which the
-/// transfer manager reports as `ErrorKind::ChunkFailed`). Asserting the kind,
-/// not just `is_err()`, pins that the failure is integrity-related and not some
-/// unrelated error path.
-fn assert_chunk_failed<T>(result: Result<T, Error>) {
-    match result {
-        Err(e) if matches!(e.kind(), ErrorKind::ChunkFailed(_)) => {}
-        Err(e) => panic!("expected ErrorKind::ChunkFailed, got {:?}", e.kind()),
-        Ok(_) => panic!("expected the download to fail with ChunkFailed, but it succeeded"),
-    }
-}
-
-/// Assert downloaded bytes match the source without dumping the buffers. A
-/// failed `assert_eq!` on multi-megabyte buffers prints both in full; this gates
-/// on real byte equality and, on mismatch, reports lengths and the first
-/// differing offset.
-fn assert_same_content(expected: &[u8], actual: &[u8]) {
-    if expected == actual {
-        return;
-    }
-    let first_diff = expected
-        .iter()
-        .zip(actual.iter())
-        .position(|(a, b)| a != b)
-        .unwrap_or(expected.len().min(actual.len()));
-    panic!(
-        "content mismatch: expected len={}, got len={}, first diff at byte {}",
-        expected.len(),
-        actual.len(),
-        first_diff
-    );
 }
 
 /// Write `len` bytes of the deterministic `i % 256` pattern to `path` and return
