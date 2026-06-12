@@ -19,6 +19,7 @@ aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = "1.11.6"
 aws-runtime = "1.7.2"
 aws-smithy-types = "1.4.7"
+aws-smithy-checksums = "0.64.6"
 aws-types = "1.3.14"
 bytes = "1"
 bytes-utils = "0.1.4"
@@ -48,7 +49,6 @@ nix = { version = "0.31", features = ["uio", "fs"] }
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
-aws-smithy-checksums = "0.64.6"
 aws-smithy-mocks = "0.2.6"
 aws-smithy-runtime = { version = "1.11.1", features = ["client", "test-util"] }
 aws-smithy-http-client = { version = "1.1.12", features = ["test-util", "wire-mock", "rustls-aws-lc"] }

@@ -14,7 +14,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::metrics::latency::{GuardError, LatencyTracker};
 
 /// Maximum attempts per operation before the last failure is returned. Counts
@@ -82,7 +82,7 @@ where
 fn into_error(ge: GuardError<Error>) -> Error {
     match ge {
         GuardError::DeadlineExceeded(deadline) => Error::new(
-            crate::error::ErrorKind::IOError,
+            ErrorKind::IOError,
             format!(
                 "request exceeded the {}ms latency deadline",
                 deadline.as_millis()
@@ -105,12 +105,65 @@ pub(crate) fn retry_deadline_only(ge: &GuardError<Error>) -> RetryDecision {
     }
 }
 
+/// Classifier for download body reads.
+///
+/// A chunk's body is consumed after the SDK's GetObject orchestration
+/// completes, so the SDK's own retry never covers a mid-stream failure. This
+/// loop exists to recover exactly that: a body-read failure (connection reset,
+/// truncated or short body) re-issues the ranged GET.
+///
+/// Within the body-read closure the error kind already separates the cases: a
+/// body-stream failure is an [`ErrorKind::IOError`], while a send-time failure
+/// arrives as an `SdkError`-derived kind that the SDK already retried before
+/// surfacing — re-issuing those is redundant, so they are terminal. A checksum
+/// mismatch also arrives as an `IOError` (the body validator errors mid-stream)
+/// and is ruled out before the IOError retry: a corrupt body must never be
+/// re-fetched and masked.
+pub(crate) fn classify_body_retry(ge: &GuardError<Error>) -> RetryDecision {
+    let err = match ge {
+        GuardError::DeadlineExceeded(_) => return RetryDecision::Retry { after: None },
+        GuardError::Inner(e) => e,
+    };
+
+    if is_checksum_mismatch(err) {
+        return RetryDecision::NoRetry;
+    }
+
+    match err.kind() {
+        ErrorKind::IOError => RetryDecision::Retry { after: None },
+        _ => RetryDecision::NoRetry,
+    }
+}
+
+/// Whether the error's source chain holds a checksum-validation mismatch.
+///
+// TODO(vnext): remove once errors are remapped. A checksum mismatch and a
+// transient transport failure both surface as `ErrorKind::IOError`, so this
+// downcasts through the source chain to tell them apart. Once the error rework
+// gives integrity failures their own kind, classification keys on that kind
+// directly and this source walk (and the `aws-smithy-checksums` dependency it
+// needs) goes away.
+fn is_checksum_mismatch(err: &Error) -> bool {
+    use aws_smithy_checksums::body::validate::Error as ChecksumError;
+    use std::error::Error as _;
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = err.source();
+    while let Some(e) = source {
+        if matches!(
+            e.downcast_ref::<ChecksumError>(),
+            Some(ChecksumError::ChecksumMismatch { .. })
+        ) {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ErrorKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     /// Pre-warm a tracker so its deadline is `Some` (mirrors latency.rs helper).
     fn warm_tracker(tracker: &LatencyTracker) {
@@ -183,5 +236,39 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    // classify_body_retry — arms that can be constructed directly. The SdkError
+    // (throttle/transient/permanent) and checksum-mismatch arms use real wire
+    // error shapes; those are covered by the mock-server fault integration tests
+    // (the non_exhaustive checksum error cannot be built outside its crate).
+
+    fn retry_after(decision: RetryDecision) -> Option<Option<Duration>> {
+        match decision {
+            RetryDecision::Retry { after } => Some(after),
+            RetryDecision::NoRetry => None,
+        }
+    }
+
+    #[test]
+    fn body_retry_deadline_exceeded_retries_immediately() {
+        let decision = classify_body_retry(&GuardError::DeadlineExceeded(Duration::from_secs(1)));
+        assert_eq!(retry_after(decision), Some(None));
+    }
+
+    #[test]
+    fn body_retry_cancellation_does_not_retry() {
+        let err = Error::new(ErrorKind::OperationCancelled, "cancelled mid body");
+        let decision = classify_body_retry(&GuardError::Inner(err));
+        assert!(matches!(decision, RetryDecision::NoRetry));
+    }
+
+    #[test]
+    fn body_retry_unrecognized_io_error_retries() {
+        // A transport/byte-stream error that isn't an SdkError or checksum
+        // mismatch falls through to retry-by-default.
+        let err = Error::new(ErrorKind::IOError, "connection reset by peer");
+        let decision = classify_body_retry(&GuardError::Inner(err));
+        assert_eq!(retry_after(decision), Some(None));
     }
 }

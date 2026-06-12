@@ -429,7 +429,7 @@ impl DownloadTransfer {
 
         let result = crate::retry::retry_guarded(
             &self.inner.ctx.handle.telemetry.recv_latencies,
-            crate::retry::retry_deadline_only,
+            crate::retry::classify_body_retry,
             || {
                 let rh = range_header.clone();
                 let etag = etag.clone();

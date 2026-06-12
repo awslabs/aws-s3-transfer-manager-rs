@@ -396,6 +396,9 @@ impl UploadTransfer {
         let checksum = data.checksum;
 
         let send_latencies = &self.inner.ctx.handle.telemetry.send_latencies;
+        // Only the latency deadline drives retry here. The SDK already retries
+        // the UploadPart dispatch by rewinding the in-memory body, so a returned
+        // error means those retries are exhausted and re-issuing would not help.
         let result =
             crate::retry::retry_guarded(send_latencies, crate::retry::retry_deadline_only, || {
                 let body = ByteStream::from(data_bytes.clone());
