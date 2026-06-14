@@ -188,7 +188,9 @@ impl Client {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = {
                 #[allow(unused_mut)]
-                let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
+                let mut builder = ManagedThreadRuntime::builder(weak_handle.clone())
+                    .topology(config.topology().resolve())
+                    .pin_threads(config.pin_threads());
                 #[cfg(feature = "dial9")]
                 if let Some(guard) = telemetry_guard {
                     builder = builder.telemetry_guard(guard);

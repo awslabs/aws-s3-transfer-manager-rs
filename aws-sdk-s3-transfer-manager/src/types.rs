@@ -4,6 +4,7 @@
  */
 
 use crate::metrics::{unit::ByteUnit, Throughput};
+use crate::runtime::{NumaNode, Topology};
 
 /// The target part size for an upload or download request.
 #[derive(Debug, Clone, Default)]
@@ -17,6 +18,75 @@ pub enum PartSize {
     /// NOTE: This is a suggestion and will be used if possible but may be adjusted for an individual request
     /// as required by the underlying API.
     Target(u64),
+}
+
+/// CPU/NUMA/NIC placement for the managed thread runtime.
+///
+/// Only takes effect when the transfer manager owns its runtime; it does not
+/// apply when a fully built S3 client is supplied.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum TopologyConfig {
+    /// Detect the system's NUMA nodes and cores. No NIC binding.
+    #[default]
+    Auto,
+    /// Detect the system's NUMA nodes and cores, and bind the given NICs. Each
+    /// NIC is attached to the NUMA node it belongs to; threads on a node are
+    /// distributed across that node's NICs.
+    AutoWithNics(Vec<String>),
+    /// An explicitly specified set of nodes.
+    Explicit(Vec<NodeConfig>),
+}
+
+impl TopologyConfig {
+    /// Resolve this configuration to a [`Topology`].
+    pub(crate) fn resolve(&self) -> Topology {
+        // TODO: detect NUMA nodes/cores from the system (sysfs / many_cpus).
+        // Auto and AutoWithNics resolve to a single node over all cores.
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        match self {
+            TopologyConfig::Auto => Topology::uniform(num_cpus),
+            TopologyConfig::AutoWithNics(nics) => {
+                Topology::from_nodes(vec![
+                    NumaNode::new(0, (0..num_cpus).collect()).with_nics(nics.clone())
+                ])
+            }
+            TopologyConfig::Explicit(nodes) => Topology::from_nodes(
+                nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(id, n)| NumaNode::new(id, n.cores.clone()).with_nics(n.nics.clone()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// One NUMA node in an [`Explicit`](TopologyConfig::Explicit) topology.
+#[derive(Debug, Clone)]
+pub struct NodeConfig {
+    cores: Vec<usize>,
+    nics: Vec<String>,
+}
+
+impl NodeConfig {
+    /// A node whose managed threads run on the given hardware cores, with no
+    /// NIC binding.
+    pub fn new(cores: impl IntoIterator<Item = usize>) -> Self {
+        Self {
+            cores: cores.into_iter().collect(),
+            nics: Vec::new(),
+        }
+    }
+
+    /// Bind the given NICs to this node. Threads on the node are distributed
+    /// across them.
+    pub fn with_nics(mut self, nics: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.nics = nics.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// The concurrency mode the client should use for executing requests.
@@ -373,5 +443,43 @@ impl IntegrityChecks {
             checksum_type,
             checksum_validation,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_resolves_to_uniform_with_no_nic() {
+        let topo = TopologyConfig::Auto.resolve();
+        let ids: Vec<_> = topo.thread_ids().collect();
+        assert!(!ids.is_empty());
+        assert_eq!(topo.nic_for_thread(ids[0]), None);
+    }
+
+    #[test]
+    fn auto_with_nics_binds_first_thread() {
+        let topo = TopologyConfig::AutoWithNics(vec!["eth0".into(), "eth1".into()]).resolve();
+        let ids: Vec<_> = topo.thread_ids().collect();
+        // Thread 0 (ordinal 0 within its node) binds the first NIC.
+        assert_eq!(topo.nic_for_thread(ids[0]), Some("eth0"));
+    }
+
+    #[test]
+    fn explicit_resolves_nodes_and_nics() {
+        let topo = TopologyConfig::Explicit(vec![
+            NodeConfig::new([0, 1]).with_nics(["eth0"]),
+            NodeConfig::new([2, 3]).with_nics(["eth1", "eth2"]),
+        ])
+        .resolve();
+        let ids: Vec<_> = topo.thread_ids().collect();
+        assert_eq!(ids.len(), 4);
+        // node 0: both threads bind the single NIC
+        assert_eq!(topo.nic_for_thread(ids[0]), Some("eth0"));
+        assert_eq!(topo.nic_for_thread(ids[1]), Some("eth0"));
+        // node 1: round-robin across the node's two NICs
+        assert_eq!(topo.nic_for_thread(ids[2]), Some("eth1"));
+        assert_eq!(topo.nic_for_thread(ids[3]), Some("eth2"));
     }
 }

@@ -21,12 +21,32 @@ impl fmt::Display for Cpu {
     }
 }
 
-/// A NUMA node with its assigned cores.
+/// A NUMA node with its assigned cores and the NICs bound to it.
 #[derive(Debug, Clone)]
 pub(crate) struct NumaNode {
     #[allow(dead_code)] // TODO: used by buffer pool NUMA partitioning
     pub(crate) id: usize,
     pub(crate) cores: Vec<usize>,
+    /// NICs pinned to this node. Empty means no interface binding for threads
+    /// on this node (partition `nic = None`).
+    pub(crate) nics: Vec<String>,
+}
+
+impl NumaNode {
+    /// A node with the given cores and no NIC binding.
+    pub(crate) fn new(id: usize, cores: Vec<usize>) -> Self {
+        Self {
+            id,
+            cores,
+            nics: Vec::new(),
+        }
+    }
+
+    /// Bind the given NICs to this node.
+    pub(crate) fn with_nics(mut self, nics: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.nics = nics.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// Hardware topology: NUMA nodes and their cores.
@@ -51,10 +71,7 @@ pub(crate) struct Topology {
 impl Topology {
     /// Single NUMA node with cores `0..num_cores`. No affinity, works everywhere.
     pub(crate) fn uniform(num_cores: usize) -> Self {
-        Self::from_nodes(vec![NumaNode {
-            id: 0,
-            cores: (0..num_cores).collect(),
-        }])
+        Self::from_nodes(vec![NumaNode::new(0, (0..num_cores).collect())])
     }
 
     /// Build from explicit node descriptions. Pre-computes lookup tables.
@@ -88,6 +105,23 @@ impl Topology {
     /// Core id for a thread (for pinning).
     pub(crate) fn core_for_thread(&self, id: Cpu) -> usize {
         self.thread_map[id.0].1
+    }
+
+    /// NIC this thread should bind, if its node has any. `None` means no
+    /// interface binding (partition `nic = None`). When a node has multiple
+    /// NICs, threads on the node are distributed across them by their ordinal
+    /// within the node.
+    pub(crate) fn nic_for_thread(&self, id: Cpu) -> Option<&str> {
+        let node_idx = self.node_for_thread(id);
+        let nics = &self.nodes[node_idx].nics;
+        if nics.is_empty() {
+            return None;
+        }
+        let ordinal = self.node_threads[node_idx]
+            .iter()
+            .position(|c| *c == id)
+            .expect("thread belongs to its node");
+        Some(nics[ordinal % nics.len()].as_str())
     }
 
     /// All threads on a NUMA node.
@@ -125,14 +159,8 @@ mod tests {
     #[test]
     fn multi_node() {
         let topo = Topology::from_nodes(vec![
-            NumaNode {
-                id: 0,
-                cores: vec![0, 1, 2, 3],
-            },
-            NumaNode {
-                id: 1,
-                cores: vec![4, 5, 6, 7],
-            },
+            NumaNode::new(0, vec![0, 1, 2, 3]),
+            NumaNode::new(1, vec![4, 5, 6, 7]),
         ]);
         assert_eq!(topo.thread_ids().count(), 8);
         assert_eq!(topo.num_nodes(), 2);
@@ -151,14 +179,8 @@ mod tests {
     #[test]
     fn non_contiguous_cores() {
         let topo = Topology::from_nodes(vec![
-            NumaNode {
-                id: 0,
-                cores: vec![0, 2, 4, 6],
-            },
-            NumaNode {
-                id: 1,
-                cores: vec![1, 3, 5, 7],
-            },
+            NumaNode::new(0, vec![0, 2, 4, 6]),
+            NumaNode::new(1, vec![1, 3, 5, 7]),
         ]);
         assert_eq!(topo.thread_ids().count(), 8);
         // Thread 0 → core 0, thread 1 → core 2, thread 2 → core 4, thread 3 → core 6
@@ -178,5 +200,27 @@ mod tests {
         let topo = Topology::uniform(3);
         let ids: Vec<_> = topo.thread_ids().collect();
         assert_eq!(ids, vec![Cpu(0), Cpu(1), Cpu(2)]);
+    }
+
+    #[test]
+    fn nic_for_thread_none_when_unbound() {
+        let topo = Topology::uniform(4);
+        for i in 0..4 {
+            assert_eq!(topo.nic_for_thread(Cpu(i)), None);
+        }
+    }
+
+    #[test]
+    fn nic_for_thread_distributes_within_node() {
+        // node 0 (threads 0,1): one NIC. node 1 (threads 2,3): two NICs.
+        let topo = Topology::from_nodes(vec![
+            NumaNode::new(0, vec![0, 1]).with_nics(["eth0"]),
+            NumaNode::new(1, vec![2, 3]).with_nics(["eth1", "eth2"]),
+        ]);
+        assert_eq!(topo.nic_for_thread(Cpu(0)), Some("eth0"));
+        assert_eq!(topo.nic_for_thread(Cpu(1)), Some("eth0"));
+        // round-robin across the node's NICs by ordinal within the node
+        assert_eq!(topo.nic_for_thread(Cpu(2)), Some("eth1"));
+        assert_eq!(topo.nic_for_thread(Cpu(3)), Some("eth2"));
     }
 }

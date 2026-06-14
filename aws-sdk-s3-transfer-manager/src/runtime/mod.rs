@@ -15,7 +15,7 @@ mod managed;
 pub(crate) use managed::ManagedThreadRuntime;
 
 mod topology;
-pub(crate) use topology::Topology;
+pub(crate) use topology::{NumaNode, Topology};
 
 pub(crate) mod sync;
 

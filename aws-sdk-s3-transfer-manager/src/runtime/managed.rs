@@ -55,6 +55,11 @@ impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
     }
 }
 
+/// Idle connections are evicted after this duration. Set below S3's server-side
+/// idle close so a socket the server already dropped is never reused (which
+/// would cost a reset + retry).
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 std::thread_local! {
     /// Identifies which managed thread the current OS thread corresponds to.
     /// Set once during thread startup, read by the per-thread HTTP client dispatch.
@@ -263,25 +268,27 @@ impl ManagedThreadRuntime {
         // One shared pool, one partition per managed thread (PartitionId == cpu
         // index). `from_handle` spawns each partition's connection driver on that
         // thread's runtime, so a connection stays local to the thread that issues
-        // requests on it.
-        //
-        // nic = None and the default `Never` policy give single-NIC behavior: no
-        // interface binding, no cross-partition connection sharing.
+        // requests on it. A partition binds a NIC only when its node has one
+        // (`nic_for_thread`); with no NIC the partition egresses on the default
+        // interface.
         //
         // pool_idle_timeout must be set explicitly: the builder default is None
-        // (idle connections are never evicted). 90s caps idle connection lifetime;
-        // S3 closes idle connections earlier, so this may be lowered. max_connections
-        // is unset: no global connection cap.
+        // (idle connections are never evicted). Connections are uncapped and the
+        // default cross-partition policy applies.
         let pool = aws_smithy_http_client::pool::SharedPool::builder()
             .dns_resolver(dns_resolver)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .partitions(threads.iter().map(|th| {
-                aws_smithy_http_client::pool::Partition::new(
+                let partition = aws_smithy_http_client::pool::Partition::new(
                     aws_smithy_http_client::pool::PartitionId::from_index(th.id.0),
                     aws_smithy_http_client::pool::TokioDriverSpawner::from_handle(
                         th.runtime_handle.clone(),
                     ),
-                )
+                );
+                match topology.nic_for_thread(th.id) {
+                    Some(nic) => partition.interface(nic),
+                    None => partition,
+                }
             }))
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
@@ -358,14 +365,12 @@ impl ManagedThreadRuntimeBuilder {
 
     /// Set the hardware topology. Defaults to `Topology::uniform(num_cpus)`
     /// where `num_cpus` is detected at build time.
-    #[allow(dead_code)] // TODO: expose on public config
     pub(crate) fn topology(mut self, topology: Topology) -> Self {
         self.topology = Some(topology);
         self
     }
 
     /// Enable thread pinning to cores. Default: false.
-    #[allow(dead_code)]
     pub(crate) fn pin_threads(mut self, pin: bool) -> Self {
         self.pin_threads = pin;
         self

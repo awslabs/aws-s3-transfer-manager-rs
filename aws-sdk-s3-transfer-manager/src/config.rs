@@ -7,7 +7,7 @@ use aws_runtime::user_agent::FrameworkMetadata;
 use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencyMode, PartSize};
+use crate::types::{ConcurrencyMode, PartSize, TopologyConfig};
 
 pub(crate) mod loader;
 
@@ -70,6 +70,8 @@ pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    topology: TopologyConfig,
+    pin_threads: bool,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
     #[cfg(feature = "dial9")]
@@ -97,6 +99,16 @@ impl Config {
     /// This is the mode used for concurrent in-flight requests across _all_ operations.
     pub fn concurrency(&self) -> &ConcurrencyMode {
         &self.concurrency
+    }
+
+    /// Returns the managed-runtime topology configuration (NUMA/cores/NICs).
+    pub fn topology(&self) -> &TopologyConfig {
+        &self.topology
+    }
+
+    /// Returns whether managed threads are pinned to their cores.
+    pub fn pin_threads(&self) -> bool {
+        self.pin_threads
     }
 
     /// Returns the framework metadata setting when using transfer manager.
@@ -127,6 +139,8 @@ pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    topology: TopologyConfig,
+    pin_threads: bool,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
@@ -198,6 +212,22 @@ impl Builder {
         self
     }
 
+    /// Set the managed-runtime topology (NUMA nodes, cores, and NICs).
+    ///
+    /// Default is [`TopologyConfig::Auto`] (detected topology, no NIC binding).
+    pub fn topology(mut self, topology: TopologyConfig) -> Self {
+        self.topology = topology;
+        self
+    }
+
+    /// Pin managed threads to their cores.
+    ///
+    /// Default is `false`.
+    pub fn pin_threads(mut self, pin: bool) -> Self {
+        self.pin_threads = pin;
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
@@ -252,6 +282,8 @@ impl Builder {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
+            topology: self.topology,
+            pin_threads: self.pin_threads,
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             #[cfg(feature = "dial9")]
