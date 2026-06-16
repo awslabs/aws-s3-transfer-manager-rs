@@ -4,11 +4,47 @@
  */
 
 use crate::error::{self, ErrorKind};
-use crate::operation::download::body::{Body, SlotBodyConsumer};
+use crate::operation::download::body::{Body, BodyWriter, SlotBodyConsumer};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
 use crate::transfer::{StateMachineTerminalReceiver, TransferId};
+
+/// Download I/O controls for a transfer.
+///
+/// Obtained via [`DownloadHandle::io_ctl`] or [`ManagedDownloadHandle::io_ctl`].
+/// Controls the read/prefetch window: how many parts ahead of the consumer the
+/// transfer is allowed to download.
+///
+/// [`DownloadHandle::io_ctl`]: crate::operation::download::DownloadHandle::io_ctl
+/// [`ManagedDownloadHandle::io_ctl`]: crate::operation::download::ManagedDownloadHandle::io_ctl
+#[derive(Debug)]
+pub struct IoCtl<'a> {
+    writer: &'a BodyWriter,
+}
+
+impl IoCtl<'_> {
+    /// Set the prefetch window — the maximum number of object parts this
+    /// download fetches ahead of the consumer's read position.
+    ///
+    /// The window is a sliding gap that advances automatically as data is
+    /// consumed; this sets its size. A larger window prefetches more
+    /// aggressively (higher throughput, more memory — up to `window * part_size`
+    /// bytes buffered for this transfer); a smaller window bounds memory.
+    /// Clamped to `[1, max]`, where `max` is fixed when the download starts.
+    ///
+    /// Increasing takes effect immediately. Decreasing below the parts already
+    /// in flight does not cancel them — new fetches pause until consumption
+    /// brings the in-flight depth under the new window.
+    pub fn set_prefetch_window(&self, parts: usize) {
+        self.writer.set_prefetch_window(parts);
+    }
+
+    /// The current prefetch window, in parts.
+    pub fn prefetch_window(&self) -> usize {
+        self.writer.prefetch_window()
+    }
+}
 
 /// Shared core logic for download handles.
 ///
@@ -119,6 +155,13 @@ impl DownloadHandleInner {
     /// Get scheduling controls for this transfer.
     pub(crate) fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
+    }
+
+    /// Get download I/O controls for this transfer.
+    pub(crate) fn io_ctl(&self) -> IoCtl<'_> {
+        IoCtl {
+            writer: self.transfer.writer(),
+        }
     }
 }
 
@@ -257,6 +300,13 @@ impl DownloadHandle {
         self.inner.scheduling()
     }
 
+    /// Get download I/O controls for this transfer.
+    ///
+    /// See [`IoCtl`] for available controls (e.g. the read/prefetch window).
+    pub fn io_ctl(&self) -> IoCtl<'_> {
+        self.inner.io_ctl()
+    }
+
     /// Current status of this transfer.
     pub fn status(&self) -> crate::types::TransferStatus {
         self.inner.transfer.ctx().transfer_status()
@@ -369,6 +419,13 @@ impl ManagedDownloadHandle {
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.inner.scheduling()
+    }
+
+    /// Get download I/O controls for this transfer.
+    ///
+    /// See [`IoCtl`] for available controls (e.g. the read/prefetch window).
+    pub fn io_ctl(&self) -> IoCtl<'_> {
+        self.inner.io_ctl()
     }
 
     /// Current status of this transfer.

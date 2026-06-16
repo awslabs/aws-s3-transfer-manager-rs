@@ -120,6 +120,11 @@ pub struct DownloadInput {
     pub expected_bucket_owner: Option<String>,
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
     pub checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    /// Prefetch window for this download, in object parts: how many parts to
+    /// fetch ahead of the consumer's read position. Bounds per-transfer memory
+    /// (up to `prefetch_window * part_size` buffered). `None` uses the client
+    /// default. Transfer-manager-specific; not a GetObject parameter.
+    pub prefetch_window: Option<usize>,
 }
 impl DownloadInput {
     /// <p>The bucket name containing the object.</p>
@@ -271,6 +276,11 @@ impl DownloadInput {
     pub fn checksum_mode(&self) -> Option<&aws_sdk_s3::types::ChecksumMode> {
         self.checksum_mode.as_ref()
     }
+    /// Prefetch window for this download, in object parts. See
+    /// [`DownloadInputBuilder::prefetch_window`].
+    pub fn prefetch_window(&self) -> Option<usize> {
+        self.prefetch_window
+    }
 }
 
 impl fmt::Debug for DownloadInput {
@@ -300,6 +310,7 @@ impl fmt::Debug for DownloadInput {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("prefetch_window", &self.prefetch_window);
         formatter.finish()
     }
 }
@@ -336,6 +347,7 @@ pub struct DownloadInputBuilder {
     pub(crate) part_number: Option<i32>,
     pub(crate) expected_bucket_owner: Option<String>,
     pub(crate) checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    pub(crate) prefetch_window: Option<usize>,
 }
 
 impl DownloadInputBuilder {
@@ -816,6 +828,24 @@ impl DownloadInputBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         &self.checksum_mode
     }
+    /// Set the prefetch window for this download, in object parts: how many
+    /// parts to fetch ahead of the consumer's read position. A larger window
+    /// prefetches more aggressively (higher throughput, more memory — up to
+    /// `prefetch_window * part_size` buffered); a smaller window bounds memory.
+    /// Unset uses the client configuration.
+    pub fn prefetch_window(mut self, parts: usize) -> Self {
+        self.prefetch_window = Some(parts);
+        self
+    }
+    /// Set the prefetch window, in object parts. `None` uses the client default.
+    pub fn set_prefetch_window(mut self, parts: Option<usize>) -> Self {
+        self.prefetch_window = parts;
+        self
+    }
+    /// The configured prefetch window, in object parts.
+    pub fn get_prefetch_window(&self) -> &Option<usize> {
+        &self.prefetch_window
+    }
     /// Consumes the builder and constructs a [`DownloadInput`].
     pub fn build(self) -> Result<DownloadInput, ::aws_smithy_types::error::operation::BuildError> {
         if self.bucket.is_none() {
@@ -848,6 +878,7 @@ impl DownloadInputBuilder {
             part_number: self.part_number,
             expected_bucket_owner: self.expected_bucket_owner,
             checksum_mode: self.checksum_mode,
+            prefetch_window: self.prefetch_window,
         })
     }
 }
@@ -879,6 +910,7 @@ impl fmt::Debug for DownloadInputBuilder {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("prefetch_window", &self.prefetch_window);
         formatter.finish()
     }
 }
@@ -942,6 +974,7 @@ impl From<DownloadInput> for DownloadInputBuilder {
             part_number: value.part_number,
             expected_bucket_owner: value.expected_bucket_owner,
             checksum_mode: value.checksum_mode,
+            prefetch_window: value.prefetch_window,
         }
     }
 }

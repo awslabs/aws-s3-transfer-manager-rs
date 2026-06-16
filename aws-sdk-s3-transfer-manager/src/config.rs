@@ -72,6 +72,7 @@ pub struct Config {
     concurrency: ConcurrencyMode,
     topology: TopologyConfig,
     pin_threads: bool,
+    download_prefetch_window: Option<usize>,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
     #[cfg(feature = "dial9")]
@@ -111,6 +112,12 @@ impl Config {
         self.pin_threads
     }
 
+    /// Default prefetch window for downloads, in object parts. `None` uses the
+    /// built-in default. A per-request prefetch window overrides this.
+    pub fn download_prefetch_window(&self) -> Option<usize> {
+        self.download_prefetch_window
+    }
+
     /// Returns the framework metadata setting when using transfer manager.
     #[doc(hidden)]
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
@@ -141,6 +148,7 @@ pub struct Builder {
     concurrency: ConcurrencyMode,
     topology: TopologyConfig,
     pin_threads: bool,
+    download_prefetch_window: Option<usize>,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
@@ -228,6 +236,14 @@ impl Builder {
         self
     }
 
+    /// Set the default prefetch window for downloads, in object parts: how many
+    /// parts to fetch ahead of the consumer per download. A per-request prefetch
+    /// window overrides this. Unset uses the built-in default.
+    pub fn download_prefetch_window(mut self, parts: usize) -> Self {
+        self.download_prefetch_window = Some(parts);
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
@@ -284,6 +300,7 @@ impl Builder {
             concurrency: self.concurrency,
             topology: self.topology,
             pin_threads: self.pin_threads,
+            download_prefetch_window: self.download_prefetch_window,
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             #[cfg(feature = "dial9")]

@@ -446,6 +446,16 @@ async fn run() -> Result<(), BoxError> {
         config_loader = config_loader.pin_threads(true);
     }
 
+    // S3FIO_DOWNLOAD_WINDOW=N sets the per-download prefetch window (parts) — how
+    // many parts to fetch ahead of the consumer. Bounds per-transfer memory.
+    if let Some(parts) = std::env::var("S3FIO_DOWNLOAD_WINDOW")
+        .ok()
+        .and_then(|w| w.parse::<usize>().ok())
+    {
+        tracing::info!(parts, "download prefetch window (S3FIO_DOWNLOAD_WINDOW)");
+        config_loader = config_loader.download_prefetch_window(parts);
+    }
+
     #[cfg(feature = "dial9")]
     if let Some(guard) = telemetry_guard {
         config_loader = config_loader.telemetry_guard(guard);

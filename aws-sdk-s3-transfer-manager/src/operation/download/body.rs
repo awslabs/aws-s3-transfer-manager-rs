@@ -93,6 +93,12 @@ impl std::fmt::Debug for Sink {
 struct SlotBuffer {
     slots: Box<[Slot]>,
     capacity: u64,
+    /// Soft, adjustable cap on the seq-window gap, `∈ [1, capacity]`. Gates
+    /// `try_claim`: a transfer may have at most `window_limit` parts claimed but
+    /// not yet consumed. `capacity` is the hard correctness bound (ring size);
+    /// this is a policy knob strictly inside it, so any value `≤ capacity`
+    /// preserves the no-aliasing invariant. Defaults to `capacity`.
+    window_limit: AtomicU64,
     /// Next seq to be consumed by the consumer. Only advanced by the consumer.
     consumed: AtomicU64,
     /// Next seq to be claimed by a producer. Advanced via CAS in `try_claim`.
@@ -134,11 +140,28 @@ impl SlotBuffer {
         Self {
             slots: slots.into_boxed_slice(),
             capacity: capacity as u64,
+            window_limit: AtomicU64::new(capacity as u64),
             consumed: AtomicU64::new(0),
             claimed: AtomicU64::new(0),
             notify: WakeNotify::new(),
             sink: None,
         }
+    }
+
+    /// Set the seq-window limit, clamped to `[1, capacity]`.
+    ///
+    /// Increasing takes effect immediately for new claims. Decreasing below the
+    /// current gap is a soft drain: in-flight claims are not revoked; `try_claim`
+    /// simply stops granting new ones until consumption brings the gap under the
+    /// new limit. `1` is the floor so a transfer can always make progress.
+    fn set_window(&self, window: u64) {
+        self.window_limit
+            .store(window.clamp(1, self.capacity), AtomicOrdering::Release);
+    }
+
+    /// Current seq-window limit (`∈ [1, capacity]`).
+    fn window(&self) -> u64 {
+        self.window_limit.load(AtomicOrdering::Acquire)
     }
 
     /// Write a completed chunk into the slot for `seq`.
@@ -372,15 +395,28 @@ impl BodyWriter {
         self.buffer.sink.is_some()
     }
 
+    /// Set the prefetch window: the max parts that may be downloaded but not yet
+    /// consumed. Clamped to `[1, capacity]`.
+    pub(crate) fn set_prefetch_window(&self, parts: usize) {
+        self.buffer.set_window(parts as u64);
+    }
+
+    /// Current prefetch window, in parts.
+    pub(crate) fn prefetch_window(&self) -> usize {
+        self.buffer.window() as usize
+    }
+
     /// Try to claim the next slot for work generation.
     ///
     /// Returns `None` if the seq window is exhausted
-    /// (`claimed - consumed >= capacity`).
+    /// (`claimed - consumed >= window`, where `window ≤ capacity`).
     pub(crate) fn try_claim(&self) -> Option<BodySlot> {
         loop {
             let consumed = self.buffer.consumed.load(AtomicOrdering::Acquire);
             let claimed = self.buffer.claimed.load(AtomicOrdering::Acquire);
-            if claimed >= consumed + self.buffer.capacity {
+            // window is clamped to [1, capacity] on set, so this never exceeds
+            // the ring size — the no-aliasing invariant holds for any window.
+            if claimed >= consumed + self.buffer.window() {
                 return None;
             }
             if self
@@ -815,6 +851,88 @@ mod tests {
         assert_eq!(writer.try_claim().unwrap().seq(), 1);
         assert_eq!(writer.try_claim().unwrap().seq(), 2);
         assert!(writer.try_claim().is_none());
+    }
+
+    #[test]
+    fn window_defaults_to_capacity() {
+        let (writer, _consumer) = new_slot_body(4);
+        assert_eq!(writer.prefetch_window(), 4);
+    }
+
+    #[test]
+    fn window_clamps_to_one_and_capacity() {
+        let (writer, _consumer) = new_slot_body(4);
+        writer.set_prefetch_window(0);
+        assert_eq!(
+            writer.prefetch_window(),
+            1,
+            "0 clamps up to 1 (must make progress)"
+        );
+        writer.set_prefetch_window(100);
+        assert_eq!(
+            writer.prefetch_window(),
+            4,
+            "above capacity clamps to capacity"
+        );
+    }
+
+    #[test]
+    fn window_one_still_makes_progress() {
+        let (writer, consumer) = new_slot_body(8);
+        writer.set_prefetch_window(1);
+        let s0 = writer.try_claim().unwrap();
+        assert_eq!(s0.seq(), 0);
+        assert!(
+            writer.try_claim().is_none(),
+            "window 1: only one outstanding"
+        );
+        s0.fill(chunk_resp(0, AggregatedBytes(SegmentedBuf::new())));
+        assert_eq!(consumer.try_take_next().unwrap().seq, 0);
+        // consume opened the window by one
+        assert_eq!(writer.try_claim().unwrap().seq(), 1);
+    }
+
+    #[test]
+    fn increasing_window_allows_more_claims() {
+        let (writer, _consumer) = new_slot_body(8);
+        writer.set_prefetch_window(2);
+        writer.try_claim().unwrap();
+        writer.try_claim().unwrap();
+        assert!(writer.try_claim().is_none(), "capped at window 2");
+        writer.set_prefetch_window(4);
+        assert_eq!(writer.try_claim().unwrap().seq(), 2);
+        assert_eq!(writer.try_claim().unwrap().seq(), 3);
+        assert!(writer.try_claim().is_none(), "capped at new window 4");
+    }
+
+    #[test]
+    fn decreasing_window_below_gap_is_a_soft_drain() {
+        let (writer, consumer) = new_slot_body(8);
+        // Claim 4 ahead (gap = 4) at the default window.
+        let s0 = writer.try_claim().unwrap();
+        let s1 = writer.try_claim().unwrap();
+        let s2 = writer.try_claim().unwrap();
+        let _s3 = writer.try_claim().unwrap();
+
+        // Shrink below the current gap: in-flight claims are NOT revoked, but no
+        // new claim is granted until consumption drains the gap under the limit.
+        writer.set_prefetch_window(2);
+        assert!(writer.try_claim().is_none(), "gap 4 >= window 2 → paused");
+
+        // Drain in order: consuming does not open the window until gap < 2.
+        s0.fill(chunk_resp(0, AggregatedBytes(SegmentedBuf::new())));
+        s1.fill(chunk_resp(1, AggregatedBytes(SegmentedBuf::new())));
+        assert_eq!(consumer.try_take_next().unwrap().seq, 0); // consumed=1, gap=3
+        assert_eq!(consumer.try_take_next().unwrap().seq, 1); // consumed=2, gap=2
+        assert!(writer.try_claim().is_none(), "gap 2 still >= window 2");
+
+        s2.fill(chunk_resp(2, AggregatedBytes(SegmentedBuf::new())));
+        assert_eq!(consumer.try_take_next().unwrap().seq, 2); // consumed=3, gap=1
+        assert_eq!(
+            writer.try_claim().unwrap().seq(),
+            4,
+            "gap 1 < window 2 → claiming resumes exactly at the crossing"
+        );
     }
 
     #[test]

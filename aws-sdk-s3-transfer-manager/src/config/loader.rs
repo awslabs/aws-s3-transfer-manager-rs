@@ -102,6 +102,14 @@ impl ConfigLoader {
         self
     }
 
+    /// Set the default prefetch window for downloads, in object parts: how many
+    /// parts to fetch ahead of the consumer per download. A per-request prefetch
+    /// window overrides this.
+    pub fn download_prefetch_window(mut self, parts: usize) -> Self {
+        self.builder = self.builder.download_prefetch_window(parts);
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that

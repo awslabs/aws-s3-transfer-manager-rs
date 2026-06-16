@@ -22,6 +22,7 @@ pub(crate) mod discovery;
 mod handle;
 pub use handle::DownloadHandle;
 pub(crate) use handle::DownloadHandleInner;
+pub use handle::IoCtl;
 pub use handle::ManagedDownloadHandle;
 
 mod output;
@@ -64,6 +65,15 @@ impl Download {
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
         let (writer, consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
+
+        // Per-request prefetch window overrides the client default. Applied
+        // before enqueue so the first claim already respects it.
+        if let Some(window) = input
+            .prefetch_window()
+            .or_else(|| handle.config.download_prefetch_window())
+        {
+            writer.set_prefetch_window(window);
+        }
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
@@ -143,6 +153,15 @@ impl Download {
             object_range_start,
             owns_file,
         );
+
+        // Per-request prefetch window overrides the client default. Applied
+        // before enqueue so the first claim already respects it.
+        if let Some(window) = input
+            .prefetch_window()
+            .or_else(|| handle.config.download_prefetch_window())
+        {
+            writer.set_prefetch_window(window);
+        }
 
         let (ctx, completion_rx) = match parent_id {
             Some(pid) => TransferContext::new_child(handle.clone(), pid),

@@ -540,6 +540,24 @@ impl DownloadFluentBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         self.inner.get_checksum_mode()
     }
+    /// Set the prefetch window for this download, in object parts: how many
+    /// parts to fetch ahead of the consumer's read position. A larger window
+    /// prefetches more aggressively (higher throughput, more memory — up to
+    /// `prefetch_window * part_size` buffered); a smaller window bounds memory.
+    /// Unset uses the client configuration.
+    pub fn prefetch_window(mut self, parts: usize) -> Self {
+        self.inner = self.inner.prefetch_window(parts);
+        self
+    }
+    /// Set the prefetch window, in object parts. `None` uses the client default.
+    pub fn set_prefetch_window(mut self, parts: Option<usize>) -> Self {
+        self.inner = self.inner.set_prefetch_window(parts);
+        self
+    }
+    /// The configured prefetch window, in object parts.
+    pub fn get_prefetch_window(&self) -> &Option<usize> {
+        self.inner.get_prefetch_window()
+    }
 }
 
 impl crate::operation::download::input::DownloadInputBuilder {
