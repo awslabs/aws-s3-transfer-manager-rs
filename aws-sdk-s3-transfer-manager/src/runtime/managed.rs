@@ -210,6 +210,10 @@ impl ManagedThreadRuntime {
                 let shutdown = shutdown_token.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 let cpu_index = id.0;
+                // Pin only when the topology carries real hardware core ids
+                // (detected/explicit); synthetic uniform cores are not pinned.
+                let pin_to =
+                    (pin_threads && topology.pinnable()).then(|| topology.core_for_thread(id));
 
                 #[cfg(feature = "dial9")]
                 let telemetry_guard = telemetry_guard.clone();
@@ -217,6 +221,9 @@ impl ManagedThreadRuntime {
                 let join_handle = std::thread::Builder::new()
                     .name(format!("s3-tm-{}", id))
                     .spawn(move || {
+                        if let Some(core) = pin_to {
+                            super::topology::pin_current_thread(core);
+                        }
                         let mut builder = tokio::runtime::Builder::new_current_thread();
                         builder.enable_all().max_blocking_threads(1);
 

@@ -63,6 +63,10 @@ pub(crate) struct Topology {
     /// Pre-computed: node index to thread ids
     #[allow(dead_code)] // TODO: used by buffer pool NUMA partitioning
     node_threads: Vec<Vec<Cpu>>,
+    /// Whether `core_for_thread` returns real hardware processor ids that may be
+    /// pinned. False for [`uniform`](Topology::uniform), whose cores are
+    /// synthetic indices with no hardware affinity.
+    pinnable: bool,
 }
 
 // Most Topology methods are used only in tests today but are the planned API
@@ -71,7 +75,34 @@ pub(crate) struct Topology {
 impl Topology {
     /// Single NUMA node with cores `0..num_cores`. No affinity, works everywhere.
     pub(crate) fn uniform(num_cores: usize) -> Self {
-        Self::from_nodes(vec![NumaNode::new(0, (0..num_cores).collect())])
+        let mut topo = Self::from_nodes(vec![NumaNode::new(0, (0..num_cores).collect())]);
+        topo.pinnable = false;
+        topo
+    }
+
+    /// Detect NUMA nodes and cores from the system and attach `nics` to the
+    /// node each is on. Synchronous: reads sysfs/cpuset once, intended only for
+    /// the runtime construction phase, never a request path.
+    ///
+    /// Falls back to a single non-pinnable node when the platform reports no
+    /// usable processors.
+    pub(crate) fn detect(nics: &[String]) -> Self {
+        let (cpus, pinnable) = detect_cpus();
+        let nic_nodes = nics
+            .iter()
+            .map(|nic| (nic.clone(), nic_numa_node(nic)))
+            .collect();
+        let nodes = build_nodes(cpus, nic_nodes);
+        if nodes.is_empty() {
+            return Self::uniform(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            );
+        }
+        let mut topo = Self::from_nodes(nodes);
+        topo.pinnable = pinnable;
+        topo
     }
 
     /// Build from explicit node descriptions. Pre-computes lookup tables.
@@ -89,7 +120,14 @@ impl Topology {
             nodes,
             thread_map,
             node_threads,
+            pinnable: true,
         }
+    }
+
+    /// Whether threads may be pinned to their cores. False for synthetic
+    /// (non-detected) topologies.
+    pub(crate) fn pinnable(&self) -> bool {
+        self.pinnable
     }
 
     /// All thread ids.
@@ -139,6 +177,116 @@ impl Topology {
         &self.nodes
     }
 }
+
+/// The NUMA node a NIC is attached to, read from sysfs.
+///
+/// `/sys/class/net/<nic>/device/numa_node` resolves through the net device's
+/// `device` symlink to the backing (PCI) device, whose `numa_node` attribute
+/// the kernel documents as the node id, or `-1` when affinity is unknown
+/// (single-node systems, some virtualized NICs). See the kernel PCI sysfs ABI:
+/// <https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-bus-pci>.
+///
+/// Returns `None` when affinity is unknown (`-1`), the attribute is absent
+/// (non-PCI / virtual NIC), or the path does not exist (non-Linux).
+fn nic_numa_node(nic: &str) -> Option<usize> {
+    let path = format!("/sys/class/net/{nic}/device/numa_node");
+    parse_numa_node(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Parse a sysfs `numa_node` attribute value. A non-negative integer is the
+/// node id; `-1` (unknown affinity) and any empty/unparseable value map to
+/// `None`.
+fn parse_numa_node(contents: &str) -> Option<usize> {
+    match contents.trim().parse::<i64>().ok()? {
+        n if n >= 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
+/// `(processor id, memory region id)` for every usable processor, and whether
+/// those ids are real hardware ids (pinnable).
+#[cfg(target_os = "linux")]
+fn detect_cpus() -> (Vec<(usize, usize)>, bool) {
+    let set = many_cpus::SystemHardware::current().processors();
+    let cpus = set
+        .processors()
+        .iter()
+        .map(|p| (p.id() as usize, p.memory_region_id() as usize))
+        .collect();
+    (cpus, true)
+}
+
+/// Non-Linux fallback: a single memory region over all cores, synthetic ids
+/// (not pinnable).
+#[cfg(not(target_os = "linux"))]
+fn detect_cpus() -> (Vec<(usize, usize)>, bool) {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    ((0..n).map(|core| (core, 0)).collect(), false)
+}
+
+/// Group processors into NUMA nodes (by memory region, first-seen order) and
+/// attach NICs to their nodes. A NIC with a known node binds to it; a NIC with
+/// no known node (`-1`/absent) is distributed round-robin across the nodes.
+fn build_nodes(
+    cpus: Vec<(usize, usize)>,
+    nic_nodes: Vec<(String, Option<usize>)>,
+) -> Vec<NumaNode> {
+    let mut regions: Vec<usize> = Vec::new();
+    let mut cores: Vec<Vec<usize>> = Vec::new();
+    for (proc_id, region) in cpus {
+        let idx = regions
+            .iter()
+            .position(|r| *r == region)
+            .unwrap_or_else(|| {
+                regions.push(region);
+                cores.push(Vec::new());
+                regions.len() - 1
+            });
+        cores[idx].push(proc_id);
+    }
+    if regions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut nics: Vec<Vec<String>> = vec![Vec::new(); regions.len()];
+    let mut next = 0usize;
+    for (nic, node) in nic_nodes {
+        let idx = node
+            .and_then(|region| regions.iter().position(|r| *r == region))
+            .unwrap_or_else(|| {
+                let i = next % regions.len();
+                next += 1;
+                i
+            });
+        nics[idx].push(nic);
+    }
+
+    regions
+        .into_iter()
+        .enumerate()
+        .map(|(i, region)| {
+            NumaNode::new(region, std::mem::take(&mut cores[i]))
+                .with_nics(std::mem::take(&mut nics[i]))
+        })
+        .collect()
+}
+
+/// Pin the calling thread to the processor with the given OS id. No-op when the
+/// id is not present, or on platforms without affinity support.
+#[cfg(target_os = "linux")]
+pub(crate) fn pin_current_thread(core: usize) {
+    if let Some(set) = many_cpus::SystemHardware::current()
+        .processors()
+        .filter(|p| p.id() as usize == core)
+    {
+        set.pin_current_thread_to();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn pin_current_thread(_core: usize) {}
 
 #[cfg(test)]
 mod tests {
@@ -222,5 +370,56 @@ mod tests {
         // round-robin across the node's NICs by ordinal within the node
         assert_eq!(topo.nic_for_thread(Cpu(2)), Some("eth1"));
         assert_eq!(topo.nic_for_thread(Cpu(3)), Some("eth2"));
+    }
+
+    // Values per the kernel PCI sysfs ABI (numa_node): node id, or -1 unknown.
+    // https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-bus-pci
+    #[test]
+    fn parse_numa_node_values() {
+        assert_eq!(parse_numa_node("0\n"), Some(0));
+        assert_eq!(parse_numa_node("1"), Some(1));
+        assert_eq!(parse_numa_node("3\n"), Some(3));
+        // -1 = kernel reports no NUMA affinity (single-node / virtual NIC)
+        assert_eq!(parse_numa_node("-1\n"), None);
+        assert_eq!(parse_numa_node(""), None);
+        assert_eq!(parse_numa_node("  \n"), None);
+        assert_eq!(parse_numa_node("garbage"), None);
+    }
+
+    #[test]
+    fn build_nodes_groups_by_region() {
+        // Two memory regions with interleaved processor ids.
+        let nodes = build_nodes(vec![(0, 0), (1, 1), (2, 0), (3, 1)], vec![]);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].id, 0);
+        assert_eq!(nodes[0].cores, vec![0, 2]);
+        assert_eq!(nodes[1].id, 1);
+        assert_eq!(nodes[1].cores, vec![1, 3]);
+    }
+
+    #[test]
+    fn build_nodes_attaches_nic_to_its_region() {
+        let nodes = build_nodes(
+            vec![(0, 0), (1, 1)],
+            vec![("eth0".into(), Some(1)), ("eth1".into(), Some(0))],
+        );
+        assert_eq!(nodes[0].nics, vec!["eth1"]);
+        assert_eq!(nodes[1].nics, vec!["eth0"]);
+    }
+
+    #[test]
+    fn build_nodes_round_robins_unknown_nic_node() {
+        // No known node: distribute across nodes by arrival order.
+        let nodes = build_nodes(
+            vec![(0, 0), (1, 1)],
+            vec![("a".into(), None), ("b".into(), None), ("c".into(), None)],
+        );
+        assert_eq!(nodes[0].nics, vec!["a", "c"]);
+        assert_eq!(nodes[1].nics, vec!["b"]);
+    }
+
+    #[test]
+    fn build_nodes_empty_when_no_cpus() {
+        assert!(build_nodes(vec![], vec![("eth0".into(), Some(0))]).is_empty());
     }
 }

@@ -6,7 +6,9 @@ use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_sdk_s3_transfer_manager::types::{
+    ConcurrencyMode, PartSize, TargetThroughput, TopologyConfig,
+};
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
 use std::error::Error;
@@ -419,6 +421,30 @@ async fn run() -> Result<(), BoxError> {
     let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size));
+
+    // S3FIO_INTERFACES=ens5,ens6 binds the managed-thread connection pool to the
+    // listed NICs (NUMA-aware via Topology::detect). Unset = default interface.
+    if let Ok(interfaces) = std::env::var("S3FIO_INTERFACES") {
+        let nics: Vec<String> = interfaces
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !nics.is_empty() {
+            tracing::info!(?nics, "binding NICs from S3FIO_INTERFACES");
+            config_loader = config_loader.topology(TopologyConfig::AutoWithNics(nics));
+        }
+    }
+
+    // S3FIO_PIN_THREADS=1 pins each managed thread to its core (Topology::detect
+    // assigns the cores). No effect on the synthetic uniform fallback.
+    if matches!(
+        std::env::var("S3FIO_PIN_THREADS").ok().as_deref(),
+        Some("1") | Some("true")
+    ) {
+        tracing::info!("pinning managed threads (S3FIO_PIN_THREADS)");
+        config_loader = config_loader.pin_threads(true);
+    }
 
     #[cfg(feature = "dial9")]
     if let Some(guard) = telemetry_guard {

@@ -41,18 +41,9 @@ pub enum TopologyConfig {
 impl TopologyConfig {
     /// Resolve this configuration to a [`Topology`].
     pub(crate) fn resolve(&self) -> Topology {
-        // TODO: detect NUMA nodes/cores from the system (sysfs / many_cpus).
-        // Auto and AutoWithNics resolve to a single node over all cores.
-        let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
         match self {
-            TopologyConfig::Auto => Topology::uniform(num_cpus),
-            TopologyConfig::AutoWithNics(nics) => {
-                Topology::from_nodes(vec![
-                    NumaNode::new(0, (0..num_cpus).collect()).with_nics(nics.clone())
-                ])
-            }
+            TopologyConfig::Auto => Topology::detect(&[]),
+            TopologyConfig::AutoWithNics(nics) => Topology::detect(nics),
             TopologyConfig::Explicit(nodes) => Topology::from_nodes(
                 nodes
                     .iter()
@@ -451,7 +442,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_resolves_to_uniform_with_no_nic() {
+    fn auto_resolves_with_no_nic() {
         let topo = TopologyConfig::Auto.resolve();
         let ids: Vec<_> = topo.thread_ids().collect();
         assert!(!ids.is_empty());

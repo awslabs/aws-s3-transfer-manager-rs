@@ -49,6 +49,11 @@ dial9 = ["dep:dial9-tokio-telemetry"]
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs"] }
 
+# NUMA topology detection and core pinning are Linux-only (sysfs + cgroup/cpuset
+# aware). Other platforms use a synthetic, non-pinnable fallback.
+[target.'cfg(target_os = "linux")'.dependencies]
+many_cpus = "2.4.8"
+
 [dev-dependencies]
 # LOCAL DEV ONLY (vnext-conn-pool): path dep to locally-built aws-sdk-s3. Revert before PR.
 aws-sdk-s3 = { path = "/Users/todaaron/sandbox/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/s3", features = ["behavior-version-latest", "test-util"] }

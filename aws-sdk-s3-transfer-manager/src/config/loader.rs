@@ -10,7 +10,7 @@ use aws_sdk_s3::config::{Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
 use crate::config::{Builder, Config};
-use crate::types::{ConcurrencyMode, PartSize};
+use crate::types::{ConcurrencyMode, PartSize, TopologyConfig};
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
@@ -83,6 +83,22 @@ impl ConfigLoader {
     /// Default is [ConcurrencyMode::Auto].
     pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
         self.builder = self.builder.concurrency(mode);
+        self
+    }
+
+    /// Set the CPU/NUMA/NIC topology for the managed thread runtime.
+    ///
+    /// Default is [`TopologyConfig::Auto`].
+    pub fn topology(mut self, topology: TopologyConfig) -> Self {
+        self.builder = self.builder.topology(topology);
+        self
+    }
+
+    /// Pin managed threads to their cores.
+    ///
+    /// Default is `false`.
+    pub fn pin_threads(mut self, pin: bool) -> Self {
+        self.builder = self.builder.pin_threads(pin);
         self
     }
 
