@@ -11,18 +11,40 @@
 
 use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 
-/// Assert a download failed with a per-chunk failure.
-///
-/// A checksum mismatch and a transient body-read failure both surface as
-/// [`ErrorKind::ChunkFailed`] (the SDK body validator or stream errors on a
-/// chunk, which the transfer manager reports as `ChunkFailed`). Asserting the
-/// kind, not merely `is_err()`, pins that the failure is the expected per-chunk
-/// path and not some unrelated error.
-pub(crate) fn assert_chunk_failed<T>(result: Result<T, Error>) {
+/// Assert a download failed because object integrity validation failed (a
+/// checksum mismatch). Pins the [`ErrorKind::IntegrityError`] kind, not merely
+/// `is_err()`, so a tamper test cannot pass on some unrelated failure.
+pub(crate) fn assert_integrity_error<T>(result: Result<T, Error>) {
     match result {
-        Err(e) if matches!(e.kind(), ErrorKind::ChunkFailed(_)) => {}
-        Err(e) => panic!("expected ErrorKind::ChunkFailed, got {:?}", e.kind()),
-        Ok(_) => panic!("expected the download to fail with ChunkFailed, but it succeeded"),
+        Err(e) if matches!(e.kind(), ErrorKind::IntegrityError(_)) => {}
+        Err(e) => panic!("expected ErrorKind::IntegrityError, got {:?}", e.kind()),
+        Ok(_) => panic!("expected the download to fail with IntegrityError, but it succeeded"),
+    }
+}
+
+/// Assert a download failed with an integrity error and return it for field
+/// inspection. Used by the backwards-compatibility test that pins the SDK
+/// checksum-mismatch error shape (algorithm/expected/computed extraction).
+pub(crate) fn expect_integrity_error<T: std::fmt::Debug>(
+    result: Result<T, Error>,
+) -> aws_sdk_s3_transfer_manager::error::IntegrityError {
+    match result {
+        Err(e) => match e.kind() {
+            ErrorKind::IntegrityError(ie) => ie.clone(),
+            other => panic!("expected ErrorKind::IntegrityError, got {other:?}"),
+        },
+        Ok(v) => panic!("expected an integrity error, but the download succeeded: {v:?}"),
+    }
+}
+///
+/// A body-stream failure (truncation, reset, short body) that exhausts retries
+/// surfaces as [`ErrorKind::IOError`]. Pinning the kind distinguishes a transport
+/// failure from an integrity failure (which must not be retried).
+pub(crate) fn assert_io_error<T>(result: Result<T, Error>) {
+    match result {
+        Err(e) if matches!(e.kind(), ErrorKind::IOError) => {}
+        Err(e) => panic!("expected ErrorKind::IOError, got {:?}", e.kind()),
+        Ok(_) => panic!("expected the download to fail with IOError, but it succeeded"),
     }
 }
 

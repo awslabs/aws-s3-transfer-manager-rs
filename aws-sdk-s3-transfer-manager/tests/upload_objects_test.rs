@@ -252,7 +252,7 @@ async fn test_source_dir_is_symlink() {
 
         // When the source is a symbolic link to a directory and follow_symlinks is false,
         // the walker rejects the root on first iteration; the error surfaces from join()
-        // as IOError (not InputInvalid as in the legacy eager-validation path).
+        // as InputInvalid (a bad source root is invalid input, not an I/O failure).
         {
             let handle = sut
                 .upload_objects()
@@ -262,7 +262,7 @@ async fn test_source_dir_is_symlink() {
                 .unwrap();
 
             let err = handle.join().await.unwrap_err();
-            assert_eq!(&ErrorKind::IOError, err.kind());
+            assert_eq!(&ErrorKind::InputInvalid, err.kind());
         }
 
         // should succeed when the source is a symbolic link to a directory and the operation follows symbolic links
@@ -389,7 +389,7 @@ async fn test_source_dir_not_valid() {
             .unwrap();
 
         let err = handle.join().await.unwrap_err();
-        assert_eq!(&ErrorKind::IOError, err.kind());
+        assert_eq!(&ErrorKind::InputInvalid, err.kind());
     })
     .await
     .expect("test_source_dir_not_valid timed out");

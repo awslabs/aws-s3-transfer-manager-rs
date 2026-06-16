@@ -89,6 +89,12 @@ impl WalkError {
         Self { path, kind, source }
     }
 
+    /// Consumes the error, returning its boxed source. Used to recover a concrete
+    /// service error by downcast when converting to the crate error type.
+    pub(crate) fn into_source(self) -> Box<dyn std::error::Error + Send + Sync> {
+        self.source
+    }
+
     /// Classify an `io::Error` into a non-root [`WalkErrorKind`].
     ///
     /// For root-level I/O failures construct

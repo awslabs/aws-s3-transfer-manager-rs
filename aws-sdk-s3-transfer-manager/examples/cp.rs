@@ -349,13 +349,31 @@ async fn do_manifest_upload(
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(e) = run().await {
-        // Print the full error chain (anyhow-style), so a failure shows the
-        // root cause, not just the top-level error.
-        eprintln!("Error: {e}");
-        let mut source = e.source();
-        while let Some(s) = source {
-            eprintln!("  caused by: {s}");
-            source = s.source();
+        // A transfer-manager error exposes the originating S3 operation, service
+        // code, and request ids directly, so a failure is traceable with AWS
+        // Support without digging through the source chain.
+        if let Some(tm) = e.downcast_ref::<aws_sdk_s3_transfer_manager::error::Error>() {
+            eprintln!("Error: {tm}");
+            if let Some(op) = tm.operation_name() {
+                eprintln!("  operation: {op}");
+            }
+            if let Some(code) = tm.code() {
+                eprintln!("  code: {code}");
+            }
+            if let Some(rid) = tm.request_id() {
+                eprintln!("  request id: {rid}");
+            }
+            if let Some(ext) = tm.extended_request_id() {
+                eprintln!("  extended request id: {ext}");
+            }
+        } else {
+            // Print the full error chain (anyhow-style) for non-TM errors.
+            eprintln!("Error: {e}");
+            let mut source = e.source();
+            while let Some(s) = source {
+                eprintln!("  caused by: {s}");
+                source = s.source();
+            }
         }
         std::process::exit(1);
     }

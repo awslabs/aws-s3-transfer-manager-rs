@@ -168,7 +168,7 @@ async fn discover_obj_with_get_first_part(
         .set_part_number(Some(1))
         .send_with(transfer.ctx().s3_client())
         .await
-        .map_err(error::discovery_failed)?;
+        .map_err(error::Error::from)?;
     first_chunk_response_handler(resp, None)
 }
 
@@ -185,7 +185,7 @@ async fn discover_obj_with_head(
         .set_key(input.key().map(str::to_string))
         .send()
         .await
-        .map_err(error::discovery_failed)?;
+        .map_err(error::Error::from)?;
     let object_meta: ObjectMetadata = resp.into();
 
     Ok(ObjectDiscovery {
@@ -228,7 +228,7 @@ async fn discover_obj_with_get(
                     // discover the object with the first part instead for empty object.
                     discover_obj_with_get_first_part(transfer, input).await
                 }
-                _ => Err(error::discovery_failed(error)),
+                _ => Err(error::Error::from(error)),
             }
         }
         Ok(response) => first_chunk_response_handler(response, range_from_user),

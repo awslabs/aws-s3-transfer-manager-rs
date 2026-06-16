@@ -14,7 +14,7 @@ use bytes_utils::SegmentedBuf;
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 
-use crate::error::{self, ChunkId, Error};
+use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
@@ -413,7 +413,7 @@ impl DownloadTransfer {
             // the Transferring state.
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
-                return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+                return self.fail(guard, e.with_chunk(ChunkRef::new(seq, None)));
             }
         };
 
@@ -456,10 +456,12 @@ impl DownloadTransfer {
 
     /// Drain a chunk body stream into a buffer, returning the bytes and the count.
     ///
-    /// Shared by the range-chunk and discovery-chunk paths. A stream error maps to
-    /// [`ErrorKind::IOError`] (the body-read class the retry classifier re-issues);
-    /// a cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`]
-    /// (which the classifier does not retry).
+    /// Shared by the range-chunk and discovery-chunk paths. A stream error is
+    /// classified by [`error::body_read_error`]: a checksum mismatch becomes
+    /// [`ErrorKind::IntegrityError`] (which the retry classifier never re-issues,
+    /// to avoid masking corruption), any other stream failure becomes
+    /// [`ErrorKind::IOError`] (the body-read class the classifier re-issues). A
+    /// cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`].
     async fn read_body_stream(
         ctx: &TransferContext,
         body: aws_sdk_s3::primitives::ByteStream,
@@ -468,8 +470,7 @@ impl DownloadTransfer {
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
         while let Some(result) = body_stream.next().await {
-            let data = result
-                .map_err(|e| crate::error::Error::new(crate::error::ErrorKind::IOError, e))?;
+            let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
             segmented.push(data);
             if !ctx.is_active() {
@@ -513,7 +514,7 @@ impl DownloadTransfer {
                         .send_with(ctx.s3_client())
                         .await
                         .map_err(crate::error::Error::from)?;
-                    validate_content_range(seq, &rh, resp.content_range())?;
+                    validate_content_range(&rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let (segmented, bytes_received) =
                         Self::read_body_stream(&ctx, resp.body).await?;
@@ -525,7 +526,9 @@ impl DownloadTransfer {
 
         let (chunk_meta, segmented, bytes_received) = match result {
             Ok(val) => val,
-            Err(e) => return self.fail_range(seq, e),
+            Err(e) => {
+                return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
+            }
         };
 
         bail_if_terminal!(self);
@@ -568,13 +571,13 @@ impl DownloadTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    /// Fail a range request with an error.
-    fn fail_range(&self, seq: u64, e: impl Into<crate::error::BoxError>) -> WorkOutcome {
+    /// Fail a range request with an error, tagging the chunk it belongs to.
+    fn fail_range(&self, location: ChunkRef, e: Error) -> WorkOutcome {
         // Go terminal before any wake (see the discovery-body error path). Do not
         // decrement_in_flight first: that wakes poll_work, which would observe
         // ranges_in_flight==0 and complete() over this error.
         let guard = self.inner.state.lock().unwrap();
-        self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e))
+        self.fail(guard, e.with_chunk(location))
     }
 
     fn decrement_in_flight(&self) {
@@ -658,7 +661,6 @@ impl Transfer for DownloadTransfer {
 
 /// Validate that the response Content-Range matches the requested range.
 fn validate_content_range(
-    seq: u64,
     requested_range: &str,
     response_content_range: Option<&str>,
 ) -> Result<(), Error> {
@@ -672,8 +674,8 @@ fn validate_content_range(
     {
         Ok(())
     } else {
-        Err(error::chunk_failed(
-            ChunkId::Download(seq),
+        Err(error::Error::new(
+            error::ErrorKind::RuntimeError,
             format!(
                 "content range mismatch: requested {}, response {:?}",
                 requested_range, response_content_range
@@ -1240,19 +1242,17 @@ mod tests {
 
     #[test]
     fn test_validate_content_range_success() {
-        assert!(validate_content_range(0, "bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
-        assert!(validate_content_range(0, "1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range("bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range("1024-2047", Some("bytes 1024-2047/4096")).is_ok());
     }
 
     #[test]
     fn test_validate_content_range_mismatch() {
-        assert!(
-            validate_content_range(0, "bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err()
-        );
+        assert!(validate_content_range("bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err());
     }
 
     #[test]
     fn test_validate_content_range_missing() {
-        assert!(validate_content_range(0, "bytes=1024-2047", None).is_err());
+        assert!(validate_content_range("bytes=1024-2047", None).is_err());
     }
 }

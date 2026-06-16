@@ -383,7 +383,7 @@ mod tests {
         let result: Result<(), _> = tracker
             .guarded(async {
                 Err::<(), _>(crate::error::Error::new(
-                    crate::error::ErrorKind::ChildOperationFailed,
+                    crate::error::ErrorKind::RuntimeError,
                     "simulated SDK error",
                 ))
             })

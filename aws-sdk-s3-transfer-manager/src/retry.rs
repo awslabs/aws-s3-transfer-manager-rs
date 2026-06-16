@@ -116,48 +116,20 @@ pub(crate) fn retry_deadline_only(ge: &GuardError<Error>) -> RetryDecision {
 /// body-stream failure is an [`ErrorKind::IOError`], while a send-time failure
 /// arrives as an `SdkError`-derived kind that the SDK already retried before
 /// surfacing — re-issuing those is redundant, so they are terminal. A checksum
-/// mismatch also arrives as an `IOError` (the body validator errors mid-stream)
-/// and is ruled out before the IOError retry: a corrupt body must never be
-/// re-fetched and masked.
+/// mismatch arrives as [`ErrorKind::IntegrityError`] (classified at the body-read
+/// boundary) and is terminal: a corrupt body must never be re-fetched and masked.
 pub(crate) fn classify_body_retry(ge: &GuardError<Error>) -> RetryDecision {
     let err = match ge {
         GuardError::DeadlineExceeded(_) => return RetryDecision::Retry { after: None },
         GuardError::Inner(e) => e,
     };
 
-    if is_checksum_mismatch(err) {
-        return RetryDecision::NoRetry;
-    }
-
     match err.kind() {
+        // A checksum mismatch must never be re-fetched and masked.
+        ErrorKind::IntegrityError(_) => RetryDecision::NoRetry,
         ErrorKind::IOError => RetryDecision::Retry { after: None },
         _ => RetryDecision::NoRetry,
     }
-}
-
-/// Whether the error's source chain holds a checksum-validation mismatch.
-///
-// TODO(vnext): remove once errors are remapped. A checksum mismatch and a
-// transient transport failure both surface as `ErrorKind::IOError`, so this
-// downcasts through the source chain to tell them apart. Once the error rework
-// gives integrity failures their own kind, classification keys on that kind
-// directly and this source walk (and the `aws-smithy-checksums` dependency it
-// needs) goes away.
-fn is_checksum_mismatch(err: &Error) -> bool {
-    use aws_smithy_checksums::body::validate::Error as ChecksumError;
-    use std::error::Error as _;
-
-    let mut source: Option<&(dyn std::error::Error + 'static)> = err.source();
-    while let Some(e) = source {
-        if matches!(
-            e.downcast_ref::<ChecksumError>(),
-            Some(ChecksumError::ChecksumMismatch { .. })
-        ) {
-            return true;
-        }
-        source = e.source();
-    }
-    false
 }
 
 #[cfg(test)]
@@ -225,12 +197,7 @@ mod tests {
 
         let result: Result<(), _> = retry_guarded(&tracker, retry_deadline_only, || {
             attempts.fetch_add(1, Ordering::Relaxed);
-            async {
-                Err::<(), _>(Error::new(
-                    ErrorKind::ChildOperationFailed,
-                    "simulated SDK error",
-                ))
-            }
+            async { Err::<(), _>(Error::new(ErrorKind::RuntimeError, "simulated SDK error")) }
         })
         .await;
 

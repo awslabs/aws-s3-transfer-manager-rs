@@ -30,7 +30,7 @@
 //! `aws-smithy-checksums` version `aws-sdk-s3` links, so an SDK version change
 //! that broke the downcast fails them.
 
-use crate::assertions::{assert_chunk_failed, assert_same_content};
+use crate::assertions::{assert_integrity_error, assert_io_error, assert_same_content};
 use crate::harness::Target;
 use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
@@ -206,7 +206,7 @@ async fn truncate_body_always_exhausts_and_fails() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_io_error(result);
 
     t.shutdown().await;
 }
@@ -234,7 +234,7 @@ async fn corrupt_body_always_fails() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
 
     t.shutdown().await;
 }
@@ -261,7 +261,7 @@ async fn corrupt_body_once_is_not_retried() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
 
     t.shutdown().await;
 }
@@ -330,7 +330,7 @@ async fn discovery_chunk_truncate_always_fails() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_io_error(result);
 
     t.shutdown().await;
 }
@@ -400,7 +400,7 @@ async fn range_retries_exhaust_at_budget_fail() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_io_error(result);
 
     t.shutdown().await;
 }
