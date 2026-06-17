@@ -21,7 +21,7 @@ use crate::metrics::latency::{GuardError, LatencyTracker};
 
 /// Maximum attempts per operation before the last failure is returned. Counts
 /// every attempt, not just timeouts: a retryable failure of any kind re-issues
-/// until this budget is spent. Each retry runs on a fresh connection.
+/// until this budget is spent.
 const MAX_ATTEMPTS: u32 = 3;
 
 /// A classifier's verdict for a failed attempt.
