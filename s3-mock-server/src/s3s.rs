@@ -276,6 +276,16 @@ impl<S: StorageBackend + 'static> Inner<S> {
                     fault.arm(after_bytes);
                 }
             }
+            Some(crate::faults::FaultType::ServiceError { status }) => {
+                // Send-time HTTP error: reaches the SDK retry/token-bucket layer
+                // (not the TM body-read loop). Map the status to an S3 error code.
+                let code = match status {
+                    500 => s3s::S3ErrorCode::InternalError,
+                    503 => s3s::S3ErrorCode::SlowDown,
+                    _ => s3s::S3ErrorCode::ServiceUnavailable,
+                };
+                return Err(s3s::S3Error::new(code));
+            }
             None => {}
         }
         Ok(())

@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
@@ -13,6 +12,7 @@ use std::{cmp, mem};
 use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
+use super::input::copy_fields_to_get_object_request;
 use super::object_meta::ObjectMetadata;
 use super::transfer::DownloadTransfer;
 use super::DownloadInput;
@@ -160,13 +160,14 @@ async fn discover_obj_with_get_first_part(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::Error> {
-    // Get object first part.
-    let builder: GetObjectInputBuilder = input.clone().into();
+    let builder = copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
     // S3 index starts with 1
     let resp = builder
         .set_range(None)
         .set_part_number(Some(1))
-        .send_with(transfer.ctx().s3_client())
+        .customize()
+        .config_override(crate::retry::bucket_partition_override(input.bucket()))
+        .send()
         .await
         .map_err(error::Error::from)?;
     first_chunk_response_handler(resp, None)
@@ -183,6 +184,8 @@ async fn discover_obj_with_head(
         .set_range(input.range.clone())
         .set_bucket(input.bucket().map(str::to_string))
         .set_key(input.key().map(str::to_string))
+        .customize()
+        .config_override(crate::retry::bucket_partition_override(input.bucket()))
         .send()
         .await
         .map_err(error::Error::from)?;
@@ -212,10 +215,12 @@ async fn discover_obj_with_get(
         ),
         None => ByteRange::Inclusive(0, target_part_size - 1),
     };
-    let builder: GetObjectInputBuilder = input.clone().into();
+    let builder = copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
     let resp = builder
         .range(header::Range::bytes(byte_range))
-        .send_with(transfer.ctx().s3_client())
+        .customize()
+        .config_override(crate::retry::bucket_partition_override(input.bucket()))
+        .send()
         .await;
     match resp {
         Err(error) => {

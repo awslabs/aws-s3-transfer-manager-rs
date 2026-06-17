@@ -36,7 +36,8 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::PartSize;
-use s3_mock_server::{FaultType, Occurrence};
+use aws_sdk_s3_transfer_manager::Client as TmClient;
+use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
 /// Part size pinned equally for upload and download so multipart download ranges
 /// align to the uploaded part boundaries (the precondition for per-part
@@ -403,4 +404,148 @@ async fn range_retries_exhaust_at_budget_fail() {
     assert_io_error(result);
 
     t.shutdown().await;
+}
+
+// --- Per-bucket retry partition -------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
+use aws_sdk_s3::config::retry::RetryPartition;
+use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+
+/// Captures the `RetryPartition` the SDK resolves per request, keyed by URI.
+#[derive(Debug, Clone)]
+struct PartitionRecorder {
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl PartitionRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn partitions_for(&self, bucket: &str) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(uri, _)| uri.contains(bucket))
+            .map(|(_, partition)| partition.clone())
+            .collect()
+    }
+}
+
+impl Intercept for PartitionRecorder {
+    fn name(&self) -> &'static str {
+        "PartitionRecorder"
+    }
+
+    // Reads after `config_override` has merged the partition into the bag.
+    fn read_before_transmit(
+        &self,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
+        _rc: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        if let Some(partition) = cfg.load::<RetryPartition>() {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((context.request().uri().to_string(), partition.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// The TM keys the SDK retry partition per bucket (`s3-tm-{bucket}`) via a
+/// per-operation `config_override`, so each bucket has an independent retry
+/// token bucket. This asserts the resolved partition directly: distinct
+/// partitions are distinct token buckets by the SDK's guarantee, so budget
+/// isolation follows. (The runtime drain-and-observe effect is not asserted —
+/// the adaptive bucket recovers between retries, so it can't be pinned without
+/// races.)
+#[tokio::test]
+async fn requests_carry_per_bucket_retry_partition() {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+    let handle = server.start().await.expect("start mock server");
+
+    let recorder = PartitionRecorder::new();
+    let s3 = {
+        let base = handle.client().await;
+        let conf = base
+            .config()
+            .to_builder()
+            .interceptor(recorder.clone())
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    };
+    let tm = TmClient::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(s3)
+            .part_size(PART_SIZE)
+            .build(),
+    );
+
+    let run = uuid::Uuid::new_v4();
+    let bucket_a = format!("alpha-{run}");
+    let bucket_b = format!("bravo-{run}");
+    let key = "obj";
+    let data = single_range_chunk_data();
+    for bucket in [&bucket_a, &bucket_b] {
+        server.create_bucket(bucket).await.expect("create bucket");
+        server
+            .add_object(bucket, key, data.clone(), None)
+            .await
+            .expect("seed object");
+    }
+
+    tm_download(&tm, &bucket_a, key).await.expect("download A");
+    tm_download(&tm, &bucket_b, key).await.expect("download B");
+
+    let a_parts = recorder.partitions_for(&bucket_a);
+    let b_parts = recorder.partitions_for(&bucket_b);
+    let expected_a = format!("s3-tm-{bucket_a}");
+    let expected_b = format!("s3-tm-{bucket_b}");
+
+    assert!(!a_parts.is_empty(), "no requests recorded for bucket A");
+    assert!(!b_parts.is_empty(), "no requests recorded for bucket B");
+    assert!(
+        a_parts.iter().all(|p| *p == expected_a),
+        "bucket A used {a_parts:?}, expected all {expected_a}",
+    );
+    assert!(
+        b_parts.iter().all(|p| *p == expected_b),
+        "bucket B used {b_parts:?}, expected all {expected_b}",
+    );
+    assert_ne!(expected_a, expected_b, "partitions must differ per bucket");
+
+    handle.shutdown().await.expect("shutdown mock server");
+    drop(server);
+}
+
+async fn tm_download(tm: &TmClient, bucket: &str, key: &str) -> Result<Vec<u8>, ()> {
+    let mut handle = tm
+        .download()
+        .bucket(bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .initiate()
+        .map_err(|_| ())?;
+    let mut data = Vec::new();
+    while let Some(chunk) = handle.body_mut().next().await {
+        match chunk {
+            Ok(c) => data.extend_from_slice(&c.data.into_bytes()),
+            Err(_) => {
+                let _ = handle.join().await;
+                return Err(());
+            }
+        }
+    }
+    handle.join().await.map(|_| data).map_err(|_| ())
 }

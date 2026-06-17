@@ -39,6 +39,11 @@ pub enum FaultType {
     /// are written to the client (counted from when the fault fires). The client
     /// observes a `ConnectionReset`.
     ConnectionReset { after_bytes: u64 },
+    /// GET returns an HTTP error status at send time (before any body), e.g. 503
+    /// SlowDown. Unlike the body-stream faults, this reaches the SDK's retry and
+    /// token-bucket layer rather than the TM body-read loop. Retryable statuses
+    /// (500/503) drive the SDK to spend retry tokens.
+    ServiceError { status: u16 },
 }
 
 /// How many times an eligible fault fires before it is consumed.

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use super::input::copy_fields_to_get_object_request;
 
 use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
@@ -379,23 +379,24 @@ impl DownloadTransfer {
                 let etag = etag.clone();
                 let ctx = self.inner.ctx.clone();
                 let reissue_range = reissue_range.clone();
-                let mut builder: GetObjectInputBuilder = input.clone().into();
+                let mut builder =
+                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
                 if let Some(r) = reissue_range.as_ref() {
                     builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
                 }
                 if let Some(etag) = etag.as_ref() {
                     builder = builder.if_match(etag.as_ref());
                 }
+                let req = builder
+                    .customize()
+                    .config_override(crate::retry::bucket_partition_override(input.bucket()));
                 async move {
                     let body = match pre_issued {
                         // First attempt: the body discovery already fetched.
                         Some(s) => s,
                         // Retry: re-fetch the discovery chunk's range.
                         None => {
-                            let resp = builder
-                                .send_with(ctx.s3_client())
-                                .await
-                                .map_err(crate::error::Error::from)?;
+                            let resp = req.send().await.map_err(crate::error::Error::from)?;
                             resp.body
                         }
                     };
@@ -503,17 +504,18 @@ impl DownloadTransfer {
                 // Every chunk GET must carry the same request fields as discovery
                 // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
                 // conversion, then pin this chunk's range and the discovered etag.
-                let mut builder: GetObjectInputBuilder = input.clone().into();
+                let mut builder =
+                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
                 builder = builder.set_range(Some(rh.clone()));
                 if let Some(etag) = etag.as_ref() {
                     builder = builder.if_match(etag.as_ref());
                 }
+                let req = builder
+                    .customize()
+                    .config_override(crate::retry::bucket_partition_override(input.bucket()));
 
                 async move {
-                    let resp = builder
-                        .send_with(ctx.s3_client())
-                        .await
-                        .map_err(crate::error::Error::from)?;
+                    let resp = req.send().await.map_err(crate::error::Error::from)?;
                     validate_content_range(&rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let (segmented, bytes_received) =

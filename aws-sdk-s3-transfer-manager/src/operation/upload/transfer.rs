@@ -283,6 +283,10 @@ impl UploadTransfer {
             copy_fields_to_mpu_request(&self.inner.request, client.create_multipart_upload());
 
         let resp = match mpu_req
+            .customize()
+            .config_override(crate::retry::bucket_partition_override(
+                self.inner.request.bucket(),
+            ))
             .send()
             .instrument(tracing::debug_span!("send-create-multipart-upload"))
             .await
@@ -416,6 +420,9 @@ impl UploadTransfer {
                 );
                 async move {
                     req.customize()
+                        .config_override(crate::retry::bucket_partition_override(
+                            self.inner.request.bucket(),
+                        ))
                         .disable_payload_signing()
                         .send()
                         .instrument(tracing::debug_span!("send-upload-part", part_number))
@@ -540,7 +547,12 @@ impl UploadTransfer {
         let timeout_cfg = TimeoutConfig::builder()
             .read_timeout(PUT_OBJECT_READ_TIMEOUT)
             .build();
-        let config_override = aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
+        let mut config_override =
+            aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
+        if let Some(bucket) = self.inner.request.bucket() {
+            config_override =
+                config_override.retry_partition(crate::retry::bucket_retry_partition(bucket));
+        }
 
         // Per-call SDK telemetry: latency + error attribution.
         let transfer_id = self.inner.ctx.id;
@@ -655,6 +667,10 @@ impl UploadTransfer {
         .await;
 
         let resp = match complete_req
+            .customize()
+            .config_override(crate::retry::bucket_partition_override(
+                self.inner.request.bucket(),
+            ))
             .send()
             .instrument(tracing::debug_span!("send-complete-multipart-upload"))
             .await

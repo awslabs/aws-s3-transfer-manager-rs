@@ -14,6 +14,8 @@
 use std::future::Future;
 use std::time::Duration;
 
+use aws_sdk_s3::config::retry::RetryPartition;
+
 use crate::error::{Error, ErrorKind};
 use crate::metrics::latency::{GuardError, LatencyTracker};
 
@@ -129,6 +131,29 @@ pub(crate) fn classify_body_retry(ge: &GuardError<Error>) -> RetryDecision {
         ErrorKind::IntegrityError(_) => RetryDecision::NoRetry,
         ErrorKind::IOError => RetryDecision::Retry { after: None },
         _ => RetryDecision::NoRetry,
+    }
+}
+
+/// Retry partition for an S3 bucket.
+///
+/// The SDK shares one retry token bucket per [`RetryPartition`]; the default
+/// is region-wide (`s3-{region}`), so a throttle storm on one bucket drains the
+/// retry budget for every other bucket on the client. Keying the partition by
+/// bucket isolates them: each bucket gets its own token bucket, matching CRT,
+/// which partitions per S3 host. Applied per operation via `config_override`.
+pub(crate) fn bucket_retry_partition(bucket: &str) -> RetryPartition {
+    RetryPartition::new(format!("s3-tm-{bucket}"))
+}
+
+/// Per-operation config override that keys the retry token bucket by bucket.
+///
+/// Returns an empty override when no bucket is set (a no-op merge), so call
+/// sites can attach it unconditionally via `.config_override(...)`.
+pub(crate) fn bucket_partition_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+    let builder = aws_sdk_s3::config::Builder::default();
+    match bucket {
+        Some(b) => builder.retry_partition(bucket_retry_partition(b)),
+        None => builder,
     }
 }
 

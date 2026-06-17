@@ -458,3 +458,48 @@ async fn test_connect_time_reset_fails_dispatch() -> Result<()> {
     handle.shutdown().await?;
     Ok(())
 }
+
+/// A `ServiceError` fault makes the GET return the configured HTTP error status
+/// at send time (before any body), reaching the SDK's dispatch/retry layer
+/// rather than the body-read path. Retry is disabled so the fault is observed
+/// directly. `Once` fires for the first GET only; the next recovers.
+#[tokio::test]
+async fn test_service_error_fault_returns_status() -> Result<()> {
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    seed(&handle).await?;
+
+    server.insert_fault(
+        B,
+        K,
+        FaultType::ServiceError { status: 503 },
+        0,
+        Occurrence::Once,
+    );
+
+    let s3 = fresh_client_no_retry(&handle).await;
+    let err = s3
+        .get_object()
+        .bucket(B)
+        .key(K)
+        .send()
+        .await
+        .expect_err("faulted GET returns a service error");
+    let service_err = err.into_service_error();
+    assert_eq!(
+        service_err.meta().code(),
+        Some("SlowDown"),
+        "503 maps to SlowDown",
+    );
+
+    // Once consumed → the next GET succeeds.
+    s3.get_object()
+        .bucket(B)
+        .key(K)
+        .send()
+        .await
+        .expect("second GET recovers");
+
+    handle.shutdown().await?;
+    Ok(())
+}
