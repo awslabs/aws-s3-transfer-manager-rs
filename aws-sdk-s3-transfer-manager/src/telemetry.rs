@@ -16,6 +16,7 @@
 
 use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IOCounters;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +43,12 @@ pub(crate) struct Telemetry {
     pub(crate) recv_latencies: LatencyTracker,
     /// Throughput counters (network tx/rx, disk read/write).
     pub(crate) io_counters: Arc<IOCounters>,
+    /// Download transfers currently unable to fetch ahead because their prefetch
+    /// window is full (claimed-but-unconsumed parts at the window limit, blocked
+    /// on in-order consumption of a slow head part). A gauge: high values with
+    /// low in-flight indicate the pipeline is prefetch-window/head-of-line bound
+    /// rather than connection- or work-generation bound.
+    pub(crate) window_blocked_downloads: AtomicUsize,
 }
 
 impl Telemetry {
@@ -51,6 +58,7 @@ impl Telemetry {
             send_latencies: LatencyTracker::new(),
             recv_latencies: LatencyTracker::new(),
             io_counters: Arc::new(IOCounters::new(counter_window)),
+            window_blocked_downloads: AtomicUsize::new(0),
         }
     }
 }

@@ -385,8 +385,6 @@ impl BodySlot {
     /// Attach a memory budget reservation to this slot. The reservation will
     /// move into ring storage on fill and drop when the chunk is consumed or
     /// flushed.
-    // TODO(budget): called by the download poll_work budget gate once wired in.
-    #[allow(dead_code)]
     pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
         self.reservation = Some(reservation);
     }
