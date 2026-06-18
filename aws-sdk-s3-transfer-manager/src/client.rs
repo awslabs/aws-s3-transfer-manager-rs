@@ -15,6 +15,7 @@ use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES, DEFAULT_MEMORY_BUDGET_BYTES};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -32,6 +33,7 @@ pub(crate) struct Handle {
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
+    pub(crate) memory_budget: Arc<MemoryBudget>,
 }
 
 impl Handle {
@@ -88,6 +90,7 @@ impl Handle {
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
+                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         })
     }
@@ -146,6 +149,7 @@ impl Handle {
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
+                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         })
     }
@@ -218,6 +222,7 @@ impl Client {
                 runtime,
                 controller,
                 telemetry,
+                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         });
         Client { handle }

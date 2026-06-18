@@ -19,10 +19,11 @@ use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::DownloadState;
+use crate::operation::download::context::{DownloadState, PendingClaim};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
+use crate::runtime::memory::{NotifyFn, Reservation, Reserve};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
 
@@ -46,6 +47,29 @@ impl DownloadWork {
             DownloadWork::GetObjectRange { slot, .. } => slot.take(),
         }
     }
+}
+
+/// The next chunk's range (sliced from `remaining` at `part_size`) and its byte
+/// length. Peek only — does not advance `remaining`.
+fn next_chunk_range(
+    remaining: &std::ops::RangeInclusive<u64>,
+    part_size: u64,
+) -> (std::ops::RangeInclusive<u64>, usize) {
+    let start = *remaining.start();
+    let end = *remaining.end();
+    let chunk_end = cmp::min(start + part_size - 1, end);
+    (start..=chunk_end, (chunk_end - start + 1) as usize)
+}
+
+/// `remaining` after committing `chunk`: the leftover range, or `None` when
+/// `chunk` reached the end of `remaining`.
+fn next_remaining(
+    chunk: &std::ops::RangeInclusive<u64>,
+    remaining: &std::ops::RangeInclusive<u64>,
+) -> Option<std::ops::RangeInclusive<u64>> {
+    let chunk_end = *chunk.end();
+    let end = *remaining.end();
+    (chunk_end < end).then_some((chunk_end + 1)..=end)
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -233,64 +257,137 @@ impl DownloadTransfer {
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
-            DownloadState::DiscoveryInFlight => {
-                self.inner.ctx.set_pending();
-                PollWork::Pending
-            }
+            DownloadState::DiscoveryInFlight => self.park(),
             DownloadState::Transferring {
                 remaining,
                 ranges_in_flight,
                 etag,
                 part_size,
-                ..
+                pending,
             } => {
-                // Check seq window before generating work
-                let Some(slot) = self.inner.writer.try_claim() else {
-                    // Window full. Blocked on in-order consumption only if there
-                    // is still work to fetch; otherwise we are draining the tail.
-                    if remaining.is_some() {
-                        self.set_window_blocked(true);
+                // Nothing left to fetch: drain in-flight, or finish once drained.
+                if remaining.is_none() {
+                    if *ranges_in_flight > 0 {
+                        return self.park();
                     }
-                    self.inner.ctx.set_pending();
-                    return PollWork::Pending;
-                };
-                self.set_window_blocked(false);
-
-                if let Some(range) = remaining.take() {
-                    // `part_size` is the stored part size for a validated multipart
-                    // object (so each range aligns to a stored part boundary and S3
-                    // returns the part's checksum for the SDK to validate), else the
-                    // configured download part size. Set at discovery.
-                    let part_size = *part_size;
-                    let start = *range.start();
-                    let end = *range.end();
-                    let chunk_end = cmp::min(start + part_size - 1, end);
-                    let chunk_range = start..=chunk_end;
-
-                    if chunk_end < end {
-                        *remaining = Some((chunk_end + 1)..=end);
-                    }
-
-                    *ranges_in_flight += 1;
-
-                    PollWork::Ready(IoRequest {
-                        data: Some(Box::new(DownloadWork::GetObjectRange {
-                            range: chunk_range,
-                            slot: Some(slot),
-                            etag: etag.clone(),
-                        })),
-                    })
-                } else if *ranges_in_flight > 0 {
-                    // All ranges generated, waiting for in-flight to complete
-                    self.inner.ctx.set_pending();
-                    PollWork::Pending
-                } else {
-                    // All done - success
                     self.complete(state);
-                    PollWork::Done
+                    return PollWork::Done;
                 }
+
+                let (range, range_len) = next_chunk_range(remaining.as_ref().unwrap(), *part_size);
+
+                // Claim a slot (the prefetch-window gate — a grant means the
+                // consumer is keeping up), then reserve the memory backing it,
+                // resuming a budget-parked claim if one is held. `None` means
+                // parked; a waker is armed (consumer release or budget grant).
+                let Some(slot) = self.acquire_slot(range_len, pending) else {
+                    return self.park();
+                };
+
+                // Commit the range and emit the ranged GET.
+                *remaining = next_remaining(&range, remaining.as_ref().unwrap());
+                *ranges_in_flight += 1;
+                PollWork::Ready(IoRequest {
+                    data: Some(Box::new(DownloadWork::GetObjectRange {
+                        range,
+                        slot: Some(slot),
+                        etag: etag.clone(),
+                    })),
+                })
             }
             DownloadState::Terminal => PollWork::Done,
+        }
+    }
+
+    /// Park the transfer: mark it pending so the scheduler stops polling it until
+    /// a waker re-readies it — the consumer on slot release (window), the budget
+    /// `NotifyFn` on grant, or a GET completion decrementing the in-flight count.
+    fn park(&self) -> PollWork {
+        self.inner.ctx.set_pending();
+        PollWork::Pending
+    }
+
+    /// Acquire a slot to fetch the next range into, with its memory reserved.
+    ///
+    /// Resumes a budget-parked claim if one is held; otherwise claims a fresh
+    /// slot (the prefetch-window gate) and reserves the backing memory. Returns
+    /// the slot with its reservation attached, or `None` when parked:
+    /// - window full (consumer lagging): `try_claim` returned `None`;
+    /// - budget exhausted: the reservation is queued and the claimed slot is
+    ///   stashed in `pending` until the budget grants it.
+    ///
+    /// Claiming before reserving makes the two states mutually exclusive — a
+    /// window-parked transfer holds nothing, a budget-parked one holds exactly
+    /// the slot it will fill — so there is no peek/claim race to handle.
+    fn acquire_slot(
+        &self,
+        range_len: usize,
+        pending: &mut Option<PendingClaim>,
+    ) -> Option<BodySlot> {
+        // Resume a budget-parked claim: the slot is already ours, just awaiting
+        // the reservation the budget queued.
+        if pending.is_some() {
+            self.set_window_blocked(false);
+            let granted = pending.as_mut().unwrap().ticket.take();
+            return match granted {
+                Some(reservation) => {
+                    let mut claim = pending.take().unwrap();
+                    claim.slot.attach_reservation(reservation);
+                    Some(claim.slot)
+                }
+                None => None, // not granted yet; the queued ticket is the waker
+            };
+        }
+
+        // Fresh: the window gate is the claim itself.
+        let Some(mut slot) = self.inner.writer.try_claim() else {
+            self.set_window_blocked(true);
+            return None;
+        };
+        self.set_window_blocked(false);
+
+        let notify: NotifyFn = {
+            let scheduler = self.inner.ctx.handle.scheduler.clone();
+            let tid = self.inner.ctx.id;
+            Arc::new(move || scheduler.wake(tid))
+        };
+        match self
+            .inner
+            .ctx
+            .handle
+            .memory_budget
+            .reserve(range_len, notify)
+        {
+            Reserve::Ready(reservation) => {
+                slot.attach_reservation(reservation);
+                Some(slot)
+            }
+            Reserve::Pending(ticket) => {
+                *pending = Some(PendingClaim { slot, ticket });
+                None
+            }
+        }
+    }
+
+    /// Reserve budget for a chunk of `len` bytes, awaiting a grant if the budget
+    /// is full. Used by the discovery path: discovery has already issued the GET
+    /// and must account its chunk's memory, but it runs inside an async `execute`
+    /// (not the re-pollable `poll_work`), so it backpressures by awaiting here —
+    /// holding the response stream undrained — rather than parking on the
+    /// scheduler. The head (seq 0) reserving before any read-ahead range keeps the
+    /// budget FIFO head-first, which guarantees forward progress under a tight cap.
+    async fn reserve_chunk(&self, len: usize) -> Reservation {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waker = Arc::clone(&notify);
+        let notify_fn: NotifyFn = Arc::new(move || waker.notify_one());
+        match self.inner.ctx.handle.memory_budget.reserve(len, notify_fn) {
+            Reserve::Ready(reservation) => reservation,
+            Reserve::Pending(mut ticket) => loop {
+                notify.notified().await;
+                if let Some(reservation) = ticket.take() {
+                    return reservation;
+                }
+            },
         }
     }
 
@@ -372,11 +469,19 @@ impl DownloadTransfer {
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(stream), Some(meta)) => {
-                let slot = self
+                let mut slot = self
                     .inner
                     .writer
                     .try_claim()
                     .expect("seq window should have capacity at start");
+                // Account the discovery chunk's memory before the transition wakes
+                // poll_work, so the head (seq 0) reserves before any read-ahead
+                // range. Awaiting here (the budget is non-binding at the default
+                // cap, so this is usually immediate) is correct backpressure: a
+                // full budget holds the discovery body undrained until a chunk
+                // frees.
+                let reservation = self.reserve_chunk(chunk_content_len as usize).await;
+                slot.attach_reservation(reservation);
                 Some((stream, meta, slot))
             }
             (None, _) => None,
@@ -392,6 +497,7 @@ impl DownloadTransfer {
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag: etag.clone(),
                 part_size: effective_part_size,
+                pending: None,
             };
         }
 
@@ -1315,5 +1421,63 @@ mod tests {
     #[test]
     fn test_validate_content_range_missing() {
         assert!(validate_content_range("bytes=1024-2047", None).is_err());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_budget_blocks_then_resumes() {
+        use crate::runtime::memory::BUDGET_CHUNK_BYTES;
+
+        // Object = 3 parts. Discovery fetches part 0 (seq 0) and reserves its
+        // chunk, so in_use == 1 after discovery; remaining covers parts 1+2.
+        let part_size = BUDGET_CHUNK_BYTES as u64;
+        let object_size = 3 * part_size;
+        let (transfer, consumer) = create_download_with_capacity(object_size, part_size, 8);
+
+        skip_discovery(&transfer).await;
+        let budget = &transfer.ctx().handle.memory_budget;
+        assert_eq!(budget.in_use_chunks(), 1, "discovery chunk is reserved");
+
+        // Tighten to 2 chunks: the discovery chunk plus room for exactly one range.
+        budget.set_limit(2 * BUDGET_CHUNK_BYTES);
+
+        // poll #1: part 1 fits (need 1, free 1) → Ready.
+        let _w1 = assert_ready(transfer.poll_work());
+        assert_eq!(budget.in_use_chunks(), 2);
+
+        // poll #2: part 2 does not fit (in_use 2, cap 2) → parked on the budget,
+        //          holding the claimed slot until a chunk frees.
+        assert_pending(transfer.poll_work());
+        {
+            let state = transfer.inner.state.lock().unwrap();
+            match &*state {
+                DownloadState::Transferring { pending, .. } => {
+                    assert!(pending.is_some(), "claim should be parked on the budget");
+                }
+                _ => panic!("expected Transferring"),
+            }
+        }
+
+        // Consume the discovery chunk (seq 0): its reservation drops, freeing a
+        // chunk that the budget immediately re-grants to the parked part-2 claim.
+        consumer.try_take_next().expect("discovery chunk is filled");
+        assert_eq!(
+            budget.in_use_chunks(),
+            2,
+            "freed chunk re-granted to the waiter"
+        );
+
+        // poll #3: the parked claim was granted → Ready, pending cleared.
+        let _w2 = assert_ready(transfer.poll_work());
+        {
+            let state = transfer.inner.state.lock().unwrap();
+            match &*state {
+                DownloadState::Transferring { pending, .. } => {
+                    assert!(pending.is_none(), "parked claim should be consumed");
+                }
+                _ => panic!("expected Transferring"),
+            }
+        }
+        assert_eq!(budget.in_use_chunks(), 2);
     }
 }

@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 
+use crate::metrics::unit::ByteUnit;
 use crate::runtime::sync::sync::Arc;
 use crate::runtime::sync::Mutex;
 
@@ -27,6 +28,14 @@ pub(crate) struct MemoryBudget {
     /// part against an 8 MiB chunk costs 2. Bounds accounting error to within one
     /// chunk per reservation while keeping the budget part-size-agnostic.
     chunk: usize,
+}
+
+impl std::fmt::Debug for MemoryBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryBudget")
+            .field("chunk", &self.chunk)
+            .finish_non_exhaustive()
+    }
 }
 
 // Lock-ordering invariant (developer note).
@@ -99,6 +108,18 @@ pub(crate) struct WaitTicket {
     slot: Arc<WaitSlot>,
     budget: Arc<MemoryBudget>,
 }
+
+impl std::fmt::Debug for WaitTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitTicket").finish_non_exhaustive()
+    }
+}
+
+// TODO(budget): replaced by machine-aware sizing + MemoryBudgetConfig (later delegation).
+/// Nominal 8 MiB accounting unit for budget reservations.
+pub(crate) const BUDGET_CHUNK_BYTES: usize = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+/// 8 GiB placeholder — large enough not to bind current tests.
+pub(crate) const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
 // A request fits when the free chunks cover its need. The `in_use == 0` clause is
 // the forced grant: a request larger than the entire capacity can only ever proceed
