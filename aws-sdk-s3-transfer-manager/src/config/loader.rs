@@ -10,7 +10,7 @@ use aws_sdk_s3::config::{Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
 use crate::config::{Builder, Config};
-use crate::types::{ConcurrencyMode, PartSize, TopologyConfig};
+use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, TopologyConfig};
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
@@ -107,6 +107,14 @@ impl ConfigLoader {
     /// window overrides this.
     pub fn download_prefetch_window(mut self, parts: usize) -> Self {
         self.builder = self.builder.download_prefetch_window(parts);
+        self
+    }
+
+    /// Set the memory budget: an upper bound on memory used for in-flight and
+    /// buffered transfer data. At the limit transfers backpressure rather than
+    /// fail. Default is [`MemoryBudgetConfig::Auto`].
+    pub fn memory_budget(mut self, budget: MemoryBudgetConfig) -> Self {
+        self.builder = self.builder.memory_budget(budget);
         self
     }
 

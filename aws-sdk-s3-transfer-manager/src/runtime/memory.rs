@@ -115,10 +115,11 @@ impl std::fmt::Debug for WaitTicket {
     }
 }
 
-// TODO(budget): replaced by machine-aware sizing + MemoryBudgetConfig (later delegation).
-/// Nominal 8 MiB accounting unit for budget reservations.
+/// Nominal 8 MiB accounting unit for budget reservations. A part costs
+/// `ceil(part_size / chunk)` chunks, so non-uniform part sizes account correctly.
 pub(crate) const BUDGET_CHUNK_BYTES: usize = 8 * ByteUnit::Mebibyte.as_bytes_usize();
-/// 8 GiB placeholder — large enough not to bind current tests.
+/// Non-binding budget for test handles, which size objects far below it.
+#[cfg(test)]
 pub(crate) const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
 // A request fits when the free chunks cover its need. The `in_use == 0` clause is

@@ -17,7 +17,7 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::{NumaNode, Topology};
 
-mod platform;
+pub(crate) mod platform;
 
 #[allow(dead_code)] // TODO(budget): remove once wired into scheduler/download path
 pub(crate) mod memory;

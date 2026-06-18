@@ -80,6 +80,35 @@ impl NodeConfig {
     }
 }
 
+/// Upper bound on memory the transfer manager uses for in-flight and buffered
+/// transfer data. At the limit transfers backpressure rather than fail.
+///
+/// Only takes effect when the transfer manager owns its runtime; it does not
+/// apply when a fully built S3 client is supplied.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum MemoryBudgetConfig {
+    /// A safe fraction of detected RAM, cgroup-aware, leaving room for the OS
+    /// page cache and the rest of the process.
+    #[default]
+    Auto,
+    /// The given fraction (0.0 to 1.0) of detected RAM.
+    Fraction(f64),
+    /// An explicit byte limit, overriding detection.
+    Limit(usize),
+}
+
+impl MemoryBudgetConfig {
+    /// Resolve to the budget capacity in bytes.
+    pub(crate) fn resolve(&self) -> usize {
+        match self {
+            MemoryBudgetConfig::Auto => crate::runtime::platform::machine_safe_mem(),
+            MemoryBudgetConfig::Fraction(f) => crate::runtime::platform::mem_for_fraction(*f),
+            MemoryBudgetConfig::Limit(bytes) => *bytes,
+        }
+    }
+}
+
 /// The concurrency mode the client should use for executing requests.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]

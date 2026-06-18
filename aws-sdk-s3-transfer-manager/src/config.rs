@@ -7,7 +7,7 @@ use aws_runtime::user_agent::FrameworkMetadata;
 use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencyMode, PartSize, TopologyConfig};
+use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, TopologyConfig};
 
 pub(crate) mod loader;
 
@@ -73,6 +73,7 @@ pub struct Config {
     topology: TopologyConfig,
     pin_threads: bool,
     download_prefetch_window: Option<usize>,
+    memory_budget: MemoryBudgetConfig,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
     #[cfg(feature = "dial9")]
@@ -118,6 +119,11 @@ impl Config {
         self.download_prefetch_window
     }
 
+    /// Returns the memory budget configuration.
+    pub fn memory_budget(&self) -> &MemoryBudgetConfig {
+        &self.memory_budget
+    }
+
     /// Returns the framework metadata setting when using transfer manager.
     #[doc(hidden)]
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
@@ -149,6 +155,7 @@ pub struct Builder {
     topology: TopologyConfig,
     pin_threads: bool,
     download_prefetch_window: Option<usize>,
+    memory_budget: MemoryBudgetConfig,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
@@ -244,6 +251,15 @@ impl Builder {
         self
     }
 
+    /// Set the memory budget: an upper bound on memory used for in-flight and
+    /// buffered transfer data. At the limit transfers backpressure rather than
+    /// fail. Default is [`MemoryBudgetConfig::Auto`] (a safe fraction of detected
+    /// RAM). Takes effect only when the transfer manager owns its runtime.
+    pub fn memory_budget(mut self, budget: MemoryBudgetConfig) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
@@ -301,6 +317,7 @@ impl Builder {
             topology: self.topology,
             pin_threads: self.pin_threads,
             download_prefetch_window: self.download_prefetch_window,
+            memory_budget: self.memory_budget,
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             #[cfg(feature = "dial9")]

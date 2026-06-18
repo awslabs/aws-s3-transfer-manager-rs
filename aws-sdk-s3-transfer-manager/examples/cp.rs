@@ -7,7 +7,7 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{
-    ConcurrencyMode, PartSize, TargetThroughput, TopologyConfig,
+    ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput, TopologyConfig,
 };
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
@@ -454,6 +454,17 @@ async fn run() -> Result<(), BoxError> {
     {
         tracing::info!(parts, "download prefetch window (S3FIO_DOWNLOAD_WINDOW)");
         config_loader = config_loader.download_prefetch_window(parts);
+    }
+
+    // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory budget at N GiB
+    // (in-flight plus buffered transfer data; transfers backpressure at the cap).
+    if let Some(gib) = std::env::var("S3FIO_MEMORY_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let bytes = gib * ByteUnit::Gibibyte.as_bytes_usize();
+        tracing::info!(gib, "memory budget limit (S3FIO_MEMORY_LIMIT, GiB)");
+        config_loader = config_loader.memory_budget(MemoryBudgetConfig::Limit(bytes));
     }
 
     #[cfg(feature = "dial9")]

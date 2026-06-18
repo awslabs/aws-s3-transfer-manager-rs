@@ -383,6 +383,7 @@ impl ManagedThreadRuntime {
         handle: Weak<crate::client::Handle>,
         topology: Topology,
         pin_threads: bool,
+        max_connections: Option<usize>,
         #[cfg(feature = "dial9")] telemetry_guard: Option<
             std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
         >,
@@ -529,9 +530,9 @@ impl ManagedThreadRuntime {
         // pool_idle_timeout must be set explicitly: the builder default is None
         // (idle connections are never evicted). max_connections caps live sockets
         // globally across all partitions, protecting machine descriptors and S3
-        // request fan-out (see runtime::platform). The default cross-partition
-        // policy applies.
-        let conn_cap = crate::runtime::platform::connection_cap();
+        // request fan-out (see runtime::platform). Unset (test paths) falls back
+        // to the descriptor-only cap. The default cross-partition policy applies.
+        let conn_cap = max_connections.unwrap_or_else(crate::runtime::platform::connection_cap);
         tracing::debug!(target: "aws_sdk_s3_transfer_manager::runtime", conn_cap, "connection pool cap");
         let mut pool_builder = aws_smithy_http_client::pool::SharedPool::builder()
             .dns_resolver(dns_resolver)
@@ -630,6 +631,7 @@ pub(crate) struct ManagedThreadRuntimeBuilder {
     handle: Weak<crate::client::Handle>,
     topology: Option<Topology>,
     pin_threads: bool,
+    max_connections: Option<usize>,
     #[cfg(feature = "dial9")]
     telemetry_guard: Option<std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>>,
 }
@@ -640,6 +642,7 @@ impl ManagedThreadRuntimeBuilder {
             handle,
             topology: None,
             pin_threads: false,
+            max_connections: None,
             #[cfg(feature = "dial9")]
             telemetry_guard: None,
         }
@@ -668,6 +671,12 @@ impl ManagedThreadRuntimeBuilder {
         self
     }
 
+    /// Cap on pooled connections. Unset falls back to the descriptor-only cap.
+    pub(crate) fn max_connections(mut self, cap: usize) -> Self {
+        self.max_connections = Some(cap);
+        self
+    }
+
     /// Build the runtime, spawning managed threads.
     pub(crate) fn build(self) -> ManagedThreadRuntime {
         let topology = self.topology.unwrap_or_else(|| {
@@ -682,6 +691,7 @@ impl ManagedThreadRuntimeBuilder {
             self.handle,
             topology,
             self.pin_threads,
+            self.max_connections,
             #[cfg(feature = "dial9")]
             self.telemetry_guard,
         )
