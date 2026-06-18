@@ -17,6 +17,8 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::Topology;
 
+#[allow(dead_code)] // TODO(budget): remove once wired into scheduler/download path
+pub(crate) mod memory;
 pub(crate) mod sync;
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
