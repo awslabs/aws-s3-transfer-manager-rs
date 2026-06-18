@@ -527,11 +527,16 @@ impl ManagedThreadRuntime {
         // interface.
         //
         // pool_idle_timeout must be set explicitly: the builder default is None
-        // (idle connections are never evicted). Connections are uncapped and the
-        // default cross-partition policy applies.
+        // (idle connections are never evicted). max_connections caps live sockets
+        // globally across all partitions, protecting machine descriptors and S3
+        // request fan-out (see runtime::platform). The default cross-partition
+        // policy applies.
+        let conn_cap = crate::runtime::platform::connection_cap();
+        tracing::debug!(target: "aws_sdk_s3_transfer_manager::runtime", conn_cap, "connection pool cap");
         let mut pool_builder = aws_smithy_http_client::pool::SharedPool::builder()
             .dns_resolver(dns_resolver)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .max_connections(conn_cap)
             .partitions(threads.iter().map(|th| {
                 let partition = aws_smithy_http_client::pool::Partition::new(
                     aws_smithy_http_client::pool::PartitionId::from_index(th.id.0),
