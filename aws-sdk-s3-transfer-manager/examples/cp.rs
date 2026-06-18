@@ -6,7 +6,9 @@ use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_sdk_s3_transfer_manager::types::{
+    ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput,
+};
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
 use std::error::Error;
@@ -419,6 +421,17 @@ async fn run() -> Result<(), BoxError> {
     let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(args.part_size));
+
+    // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory budget at N GiB
+    // (in-flight plus buffered transfer data; transfers backpressure at the cap).
+    if let Some(gib) = std::env::var("S3FIO_MEMORY_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let bytes = gib * ByteUnit::Gibibyte.as_bytes_usize();
+        tracing::info!(gib, "memory budget limit (S3FIO_MEMORY_LIMIT, GiB)");
+        config_loader = config_loader.memory_budget(MemoryBudgetConfig::Limit(bytes));
+    }
 
     #[cfg(feature = "dial9")]
     if let Some(guard) = telemetry_guard {

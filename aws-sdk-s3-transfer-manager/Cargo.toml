@@ -47,6 +47,15 @@ dial9 = ["dep:dial9-tokio-telemetry"]
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }
 
+# Total physical RAM via sysctl(hw.memsize).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# Total physical RAM via GlobalMemoryStatusEx; descriptor limit is not low on
+# Windows, so the connection cap there is the absolute ceiling.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
 aws-smithy-mocks = "0.2.6"

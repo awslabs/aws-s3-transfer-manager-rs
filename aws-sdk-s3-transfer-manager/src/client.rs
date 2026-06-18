@@ -15,7 +15,9 @@ use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES, DEFAULT_MEMORY_BUDGET_BYTES};
+#[cfg(test)]
+use crate::runtime::memory::DEFAULT_MEMORY_BUDGET_BYTES;
+use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -188,6 +190,9 @@ impl Client {
         #[cfg(feature = "dial9")]
         let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
 
+        // Resolve the budget once: it sizes the Handle's MemoryBudget.
+        let budget_capacity = config.memory_budget().resolve();
+
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = {
@@ -220,7 +225,7 @@ impl Client {
                 runtime,
                 controller,
                 telemetry,
-                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
+                memory_budget: MemoryBudget::new(budget_capacity, BUDGET_CHUNK_BYTES),
             }
         });
         Client { handle }
