@@ -119,7 +119,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
 
     loop {
         let Some(mut work) = pool.next_work().await else {
-            tracing::debug!(target: crate::telemetry::TARGET_EXECUTION, wid, "shutdown");
+            tracing::debug!(target: crate::telemetry::TARGET_RUNTIME, wid, "shutdown");
             break;
         };
         let Some(h) = handle.upgrade() else {
@@ -132,14 +132,14 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
 
         // Skip execution if transfer already terminal (failed/cancelled by another work item)
         if work.descriptor.is_terminal() {
-            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "skipped (terminal)");
+            tracing::trace!(target: crate::telemetry::TARGET_RUNTIME, wid, %tid, "skipped (terminal)");
             pool.complete();
             h.scheduler
                 .on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "executing");
+        tracing::trace!(target: crate::telemetry::TARGET_RUNTIME, wid, %tid, "executing");
         let transfer = work.descriptor.transfer();
         let started = Instant::now();
 
@@ -157,14 +157,14 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(_panic) => {
-                tracing::error!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "panic in transfer execute");
+                tracing::error!(target: crate::telemetry::TARGET_RUNTIME, wid, %tid, "panic in transfer execute");
                 pool.complete();
                 h.scheduler.on_panic(work);
                 continue;
             }
         };
 
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, ?outcome, "completed");
+        tracing::trace!(target: crate::telemetry::TARGET_RUNTIME, wid, %tid, ?outcome, "completed");
 
         let elapsed = started.elapsed();
         pool.complete();

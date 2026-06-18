@@ -8,6 +8,7 @@
 use std::cmp;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
@@ -86,6 +87,25 @@ struct DownloadTransferInner {
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// Edge-tracked: whether this transfer is currently blocked on its prefetch
+    /// window (full of claimed-but-unconsumed parts, waiting on in-order
+    /// consumption). Drives the client `window_blocked_downloads` gauge; see
+    /// [`DownloadTransfer::set_window_blocked`].
+    window_blocked: AtomicBool,
+}
+
+impl Drop for DownloadTransferInner {
+    fn drop(&mut self) {
+        // Release the gauge if the transfer ended (cancel/fail) while blocked;
+        // normal completion unblocks via a successful claim before finishing.
+        if self.window_blocked.load(Ordering::Relaxed) {
+            self.ctx
+                .handle
+                .telemetry
+                .window_blocked_downloads
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl DownloadTransfer {
@@ -104,6 +124,7 @@ impl DownloadTransfer {
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            window_blocked: AtomicBool::new(false),
         });
         Self { inner }
     }
@@ -121,6 +142,38 @@ impl DownloadTransfer {
     /// Body writer for backpressure control and chunk delivery.
     pub(crate) fn writer(&self) -> &BodyWriter {
         &self.inner.writer
+    }
+
+    /// Edge-track the prefetch-window-blocked vital sign: maintain the
+    /// client-level `window_blocked_downloads` gauge with exactly one increment
+    /// per block→unblock cycle, and emit an edge event. Blocked means the
+    /// transfer wanted to fetch another part but its window was full (waiting on
+    /// in-order consumption of a slow head part) — the head-of-line signal that
+    /// distinguishes a window-bound pipeline from a connection- or
+    /// work-generation-bound one. Idempotent: a no-op when already in `blocked`.
+    fn set_window_blocked(&self, blocked: bool) {
+        if self.inner.window_blocked.swap(blocked, Ordering::Relaxed) == blocked {
+            return;
+        }
+        let gauge = &self.inner.ctx.handle.telemetry.window_blocked_downloads;
+        if blocked {
+            let total = gauge.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::trace!(
+                target: crate::telemetry::TARGET_RUNTIME,
+                tid = %self.inner.ctx.id,
+                window = self.inner.writer.prefetch_window(),
+                window_blocked_downloads = total,
+                "download blocked on prefetch window",
+            );
+        } else {
+            let total = gauge.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+            tracing::trace!(
+                target: crate::telemetry::TARGET_RUNTIME,
+                tid = %self.inner.ctx.id,
+                window_blocked_downloads = total,
+                "download resumed (prefetch window opened)",
+            );
+        }
     }
 
     /// Object metadata from discovery.
@@ -193,9 +246,15 @@ impl DownloadTransfer {
             } => {
                 // Check seq window before generating work
                 let Some(slot) = self.inner.writer.try_claim() else {
+                    // Window full. Blocked on in-order consumption only if there
+                    // is still work to fetch; otherwise we are draining the tail.
+                    if remaining.is_some() {
+                        self.set_window_blocked(true);
+                    }
                     self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 };
+                self.set_window_blocked(false);
 
                 if let Some(range) = remaining.take() {
                     // `part_size` is the stored part size for a validated multipart

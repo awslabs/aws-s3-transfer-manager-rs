@@ -10,12 +10,17 @@
 //! path. Shutdown cancels a shared token; each thread's `block_on` returns and
 //! the thread exits.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aws_smithy_http_client::pool::{
+    Authority, ConnectionClosedEvent, ConnectionCreatedEvent, ConnectionEventListener,
+    ConnectionFailedEvent, ConnectionReusedEvent, PartitionId, SharedPool,
+};
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
 use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient};
 use futures_util::FutureExt;
@@ -64,6 +69,188 @@ std::thread_local! {
     /// Identifies which managed thread the current OS thread corresponds to.
     /// Set once during thread startup, read by the per-thread HTTP client dispatch.
     static MANAGED_THREAD_CPU: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Enables the periodic connection-pool snapshot sampler. Set to a positive
+/// interval in milliseconds (e.g. `200`) to spawn the aggregate snapshot task at
+/// that cadence. Off (absent / non-positive) by default. The per-connection
+/// event listener is installed regardless (its events are TRACE-level on the
+/// runtime target); this env only controls the periodic aggregate sampler.
+const POOL_SNAPSHOT_ENV: &str = "AWS_S3_TM_POOL_SNAPSHOT_MS";
+
+/// Connection-event listener for the diagnostic snapshot. Records the set of
+/// authorities the pool connects to (so the snapshot task knows which to query)
+/// and logs per-connection lifecycle at TRACE. The pool's events carry the
+/// authority but not the partition, so the per-NIC view is reconstructed by the
+/// snapshot task from the partition→NIC map.
+struct PoolObserver {
+    authorities: Mutex<HashSet<String>>,
+}
+
+impl PoolObserver {
+    fn new() -> Self {
+        Self {
+            authorities: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn authorities(&self) -> Vec<String> {
+        self.authorities
+            .lock()
+            .expect("pool observer poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn note(&self, authority: &Authority) {
+        let mut set = self.authorities.lock().expect("pool observer poisoned");
+        if !set.contains(authority.as_str()) {
+            set.insert(authority.as_str().to_string());
+        }
+    }
+}
+
+impl ConnectionEventListener for PoolObserver {
+    fn on_created(&self, event: &ConnectionCreatedEvent) {
+        self.note(event.authority());
+        tracing::trace!(
+            target: crate::telemetry::TARGET_RUNTIME,
+            authority = event.authority().as_str(),
+            remote = ?event.remote_addr(),
+            protocol = ?event.protocol(),
+            connect_ms = event.timing().connect_duration().as_millis() as u64,
+            conn = ?event.conn_id(),
+            "pool connection created",
+        );
+    }
+
+    fn on_reused(&self, event: &ConnectionReusedEvent) {
+        tracing::trace!(
+            target: crate::telemetry::TARGET_RUNTIME,
+            authority = event.authority().as_str(),
+            conn = ?event.conn_id(),
+            "pool connection reused",
+        );
+    }
+
+    fn on_closed(&self, event: &ConnectionClosedEvent) {
+        tracing::trace!(
+            target: crate::telemetry::TARGET_RUNTIME,
+            authority = event.authority().as_str(),
+            remote = ?event.remote_addr(),
+            reason = ?event.reason(),
+            error = ?event.error().map(|e| e.to_string()),
+            "pool connection closed",
+        );
+    }
+
+    fn on_connection_failed(&self, event: &ConnectionFailedEvent) {
+        // Failures are rare and diagnostic (a NIC whose routing is broken would
+        // surface here), so DEBUG rather than TRACE.
+        tracing::debug!(
+            target: crate::telemetry::TARGET_RUNTIME,
+            authority = event.authority().as_str(),
+            remote = ?event.remote_addr(),
+            error = %event.error(),
+            "pool connection failed",
+        );
+    }
+}
+
+/// Inputs for the periodic pool snapshot, bundled so the task owns one value
+/// (and the spawn signature stays small).
+struct PoolSnapshotState {
+    handle: Weak<crate::client::Handle>,
+    pool: SharedPool,
+    observer: Arc<PoolObserver>,
+    partition_nics: HashMap<PartitionId, String>,
+    in_flight: Vec<Arc<AtomicUsize>>,
+}
+
+/// Spawn the periodic per-NIC connection-pool snapshot on `runtime`. DEBUG: per
+/// NIC established/establishing/active + total in-flight work + window-blocked
+/// downloads. TRACE: per partition. Stops when `shutdown` is cancelled.
+fn spawn_pool_snapshot(
+    runtime: &tokio::runtime::Handle,
+    state: PoolSnapshotState,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    runtime.spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tick.tick() => state.emit(),
+            }
+        }
+    });
+}
+
+impl PoolSnapshotState {
+    fn emit(&self) {
+        let total_in_flight: usize = self
+            .in_flight
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        // Downloads currently blocked on their prefetch window (head-of-line).
+        // High here with low in-flight = prefetch-window-bound pipeline.
+        let window_blocked = self.handle.upgrade().map_or(0, |h| {
+            h.telemetry.window_blocked_downloads.load(Ordering::Relaxed)
+        });
+        let authorities = self.observer.authorities();
+        if authorities.is_empty() {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_RUNTIME,
+                in_flight = total_in_flight,
+                window_blocked,
+                "pool snapshot (no authorities yet)",
+            );
+            return;
+        }
+        for auth in &authorities {
+            let stats = self.pool.stats(&Authority::from_host(auth.clone()));
+            // Aggregate per NIC for DEBUG; emit per-partition at TRACE.
+            let mut by_nic: BTreeMap<&str, [usize; 3]> = BTreeMap::new();
+            for (pid, s) in stats.iter() {
+                let nic = self
+                    .partition_nics
+                    .get(&pid)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
+                let agg = by_nic.entry(nic).or_default();
+                agg[0] += s.established;
+                agg[1] += s.establishing;
+                agg[2] += s.active;
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_RUNTIME,
+                    authority = auth.as_str(),
+                    partition = ?pid,
+                    nic,
+                    established = s.established,
+                    establishing = s.establishing,
+                    active = s.active,
+                    "pool snapshot (partition)",
+                );
+            }
+            for (nic, [established, establishing, active]) in by_nic {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_RUNTIME,
+                    authority = auth.as_str(),
+                    nic,
+                    established,
+                    establishing,
+                    active,
+                    in_flight = total_in_flight,
+                    window_blocked,
+                    "pool snapshot (nic)",
+                );
+            }
+        }
+    }
 }
 
 /// One managed OS thread and its tokio current-thread handle.
@@ -127,11 +314,11 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
     work.descriptor.work_started();
 
     if work.descriptor.is_terminal() {
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "skipped (terminal)");
+        tracing::trace!(target: crate::telemetry::TARGET_RUNTIME, %tid, "skipped (terminal)");
         return ExecuteResult::Completed(WorkOutcome::Cancelled, Duration::ZERO);
     }
 
-    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "executing");
+    tracing::trace!(target: crate::telemetry::TARGET_RUNTIME, %tid, "executing");
     let transfer = work.descriptor.transfer();
     let started = Instant::now();
 
@@ -148,11 +335,11 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
 
     match outcome {
         Ok(outcome) => {
-            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, ?outcome, "completed");
+            tracing::trace!(target: crate::telemetry::TARGET_RUNTIME, %tid, ?outcome, "completed");
             ExecuteResult::Completed(outcome, started.elapsed())
         }
         Err(_panic) => {
-            tracing::error!(target: crate::telemetry::TARGET_EXECUTION, %tid, "panic in transfer execute");
+            tracing::error!(target: crate::telemetry::TARGET_RUNTIME, %tid, "panic in transfer execute");
             ExecuteResult::Panicked
         }
     }
@@ -201,6 +388,17 @@ impl ManagedThreadRuntime {
         >,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
+
+        // The connection-event listener is always installed: per-connection
+        // lifecycle is TRACE-level observability available via the runtime
+        // target without any opt-in. Only the periodic aggregate snapshot is
+        // env-gated (its interval), since it's a sampling task with a cadence.
+        let snapshot_interval = std::env::var(POOL_SNAPSHOT_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis);
+        let pool_observer = Arc::new(PoolObserver::new());
 
         let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
         // spawn and initialize concurrently
@@ -272,6 +470,55 @@ impl ManagedThreadRuntime {
             })
             .collect();
 
+        // Topology + NIC/pinning binding decisions, logged once at construction.
+        // DEBUG: a summary plus one line per NUMA node. TRACE: per-thread
+        // placement (one line per thread, noisy with many cores). The NIC
+        // distribution is the direct signal for whether a configured NIC is
+        // assigned to any partition at all.
+        {
+            let pinned = if pin_threads && topology.pinnable() {
+                threads.len()
+            } else {
+                0
+            };
+            let mut nic_distribution: BTreeMap<&str, usize> = BTreeMap::new();
+            for th in &threads {
+                *nic_distribution
+                    .entry(topology.nic_for_thread(th.id).unwrap_or("<none>"))
+                    .or_default() += 1;
+            }
+            tracing::debug!(
+                target: crate::telemetry::TARGET_RUNTIME,
+                threads = threads.len(),
+                nodes = topology.num_nodes(),
+                pinnable = topology.pinnable(),
+                pin_threads,
+                pinned,
+                nic_distribution = ?nic_distribution,
+                "managed runtime topology and binding",
+            );
+            for node in topology.nodes() {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_RUNTIME,
+                    node = node.id,
+                    cores = node.cores.len(),
+                    nics = ?node.nics,
+                    "topology node",
+                );
+            }
+            for th in &threads {
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_RUNTIME,
+                    thread = th.id.0,
+                    core = topology.core_for_thread(th.id),
+                    node = topology.node_for_thread(th.id),
+                    pinned = pin_threads && topology.pinnable(),
+                    nic = topology.nic_for_thread(th.id).unwrap_or("<none>"),
+                    "thread placement",
+                );
+            }
+        }
+
         // One shared pool, one partition per managed thread (PartitionId == cpu
         // index). `from_handle` spawns each partition's connection driver on that
         // thread's runtime, so a connection stays local to the thread that issues
@@ -282,7 +529,7 @@ impl ManagedThreadRuntime {
         // pool_idle_timeout must be set explicitly: the builder default is None
         // (idle connections are never evicted). Connections are uncapped and the
         // default cross-partition policy applies.
-        let pool = aws_smithy_http_client::pool::SharedPool::builder()
+        let mut pool_builder = aws_smithy_http_client::pool::SharedPool::builder()
             .dns_resolver(dns_resolver)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .partitions(threads.iter().map(|th| {
@@ -296,7 +543,9 @@ impl ManagedThreadRuntime {
                     Some(nic) => partition.interface(nic),
                     None => partition,
                 }
-            }))
+            }));
+        pool_builder = pool_builder.connection_event_listener(pool_observer.clone());
+        let pool = pool_builder
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
             ))
@@ -316,6 +565,37 @@ impl ManagedThreadRuntime {
                 })
                 .collect(),
         );
+
+        // Opt-in diagnostic: periodic per-NIC pool snapshot. The partition→NIC
+        // map lets the task render the pool's partition-keyed stats per NIC; it
+        // runs on the first managed thread and stops on shutdown.
+        if let Some(interval) = snapshot_interval {
+            let partition_nics = threads
+                .iter()
+                .map(|th| {
+                    (
+                        PartitionId::from_index(th.id.0),
+                        topology
+                            .nic_for_thread(th.id)
+                            .unwrap_or("<none>")
+                            .to_string(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let in_flight = threads.iter().map(|th| Arc::clone(&th.in_flight)).collect();
+            spawn_pool_snapshot(
+                &threads[0].runtime_handle,
+                PoolSnapshotState {
+                    handle: handle.clone(),
+                    pool: pool.clone(),
+                    observer: pool_observer.clone(),
+                    partition_nics,
+                    in_flight,
+                },
+                interval,
+                shutdown_token.clone(),
+            );
+        }
 
         let shared_http_client = http_client_fn(move |settings, components| {
             let cpu_index = MANAGED_THREAD_CPU
@@ -415,7 +695,7 @@ impl ExecutionRuntime for ManagedThreadRuntime {
             let tid = work.descriptor.id();
 
             tracing::trace!(
-                target: crate::telemetry::TARGET_EXECUTION,
+                target: crate::telemetry::TARGET_RUNTIME,
                 %tid,
                 thread = thread_id.0,
                 "dispatching to managed thread",
@@ -426,13 +706,13 @@ impl ExecutionRuntime for ManagedThreadRuntime {
                     return;
                 };
                 tracing::trace!(
-                    target: crate::telemetry::TARGET_EXECUTION,
+                    target: crate::telemetry::TARGET_RUNTIME,
                     %tid,
                     "execute starting",
                 );
                 let result = execute_work(&mut work, &h.scheduler).await;
                 tracing::trace!(
-                    target: crate::telemetry::TARGET_EXECUTION,
+                    target: crate::telemetry::TARGET_RUNTIME,
                     %tid,
                     "execute finished, entering on_completion",
                 );
@@ -446,7 +726,7 @@ impl ExecutionRuntime for ManagedThreadRuntime {
                     }
                 }
                 tracing::trace!(
-                    target: crate::telemetry::TARGET_EXECUTION,
+                    target: crate::telemetry::TARGET_RUNTIME,
                     %tid,
                     "on_completion returned",
                 );
