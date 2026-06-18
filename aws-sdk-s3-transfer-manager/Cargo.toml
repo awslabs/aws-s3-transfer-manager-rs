@@ -45,7 +45,7 @@ dial9-tokio-telemetry = { version = "0.3", optional = true, features = ["cpu-pro
 dial9 = ["dep:dial9-tokio-telemetry"]
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["uio", "fs"] }
+nix = { version = "0.31", features = ["uio", "fs", "resource"] }
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
