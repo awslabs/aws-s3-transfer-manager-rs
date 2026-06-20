@@ -196,17 +196,32 @@ impl PoolSnapshotState {
             .iter()
             .map(|c| c.load(Ordering::Relaxed))
             .sum();
-        // Downloads currently blocked on their prefetch window (head-of-line).
-        // High here with low in-flight = prefetch-window-bound pipeline.
-        let window_blocked = self.handle.upgrade().map_or(0, |h| {
-            h.telemetry.window_blocked_downloads.load(Ordering::Relaxed)
-        });
+        // Downloads currently parked, by cause: prefetch window (head-of-line) vs
+        // global memory budget. window_blocked with low in-flight = window-bound;
+        // budget_blocked = memory-bound. budget_in_use/capacity is the occupancy
+        // behind those counts: full occupancy with budget_blocked > 0 is the
+        // memory-bound case; low occupancy under high RSS means memory is escaping
+        // the budget. All read under one handle upgrade for a consistent instant.
+        let mib = crate::metrics::unit::ByteUnit::Mebibyte.as_bytes_u64();
+        let (window_blocked, budget_blocked, budget_in_use_mib, budget_capacity_mib) =
+            self.handle.upgrade().map_or((0, 0, 0, 0), |h| {
+                let bp = &h.telemetry.download_backpressure;
+                (
+                    bp.window.load(Ordering::Relaxed),
+                    bp.budget.load(Ordering::Relaxed),
+                    h.memory_budget.in_use_bytes() / mib,
+                    h.memory_budget.capacity_bytes() / mib,
+                )
+            });
         let authorities = self.observer.authorities();
         if authorities.is_empty() {
             tracing::debug!(
                 target: crate::telemetry::TARGET_RUNTIME,
                 in_flight = total_in_flight,
                 window_blocked,
+                budget_blocked,
+                budget_in_use_mib,
+                budget_capacity_mib,
                 "pool snapshot (no authorities yet)",
             );
             return;
@@ -246,6 +261,9 @@ impl PoolSnapshotState {
                     active,
                     in_flight = total_in_flight,
                     window_blocked,
+                    budget_blocked,
+                    budget_in_use_mib,
+                    budget_capacity_mib,
                     "pool snapshot (nic)",
                 );
             }

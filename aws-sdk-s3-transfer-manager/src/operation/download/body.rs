@@ -17,8 +17,22 @@ use crate::io::AggregatedBytes;
 use super::chunk_meta::ChunkMetadata;
 use super::transfer::DownloadTransfer;
 
-/// Default slot buffer capacity for download body delivery.
-pub(crate) const DEFAULT_BODY_SLOT_CAPACITY: usize = 512;
+/// Slot ring capacity: the fixed allocation size, and the hard bound that keeps
+/// producer and consumer from aliasing a slot. It is not the default fetch-ahead
+/// depth — that is `DEFAULT_DOWNLOAD_WINDOW` — but it is the ceiling the window is
+/// clamped to, so it bounds the largest window a transfer can run with. Sized well
+/// above the default so the window can be raised at runtime (per-request or via
+/// config) without reallocating the ring; raise it if a deeper window is ever
+/// needed (e.g. very high bandwidth-delay-product paths on large instances).
+pub(crate) const DEFAULT_BODY_SLOT_CAPACITY: usize = 256;
+
+/// Default prefetch window: the parts a download may have claimed but not yet
+/// consumed, i.e. the `window_limit` a fresh `SlotBuffer` starts at (clamped to
+/// capacity). The window bounds per-transfer buffer residency at
+/// `window × part_size`, so with N concurrent downloads it bounds aggregate
+/// residency at `N × window × part_size`. A per-request prefetch window or
+/// `Config::download_prefetch_window` overrides it.
+pub(crate) const DEFAULT_DOWNLOAD_WINDOW: usize = 32;
 
 /// Wakeup signal wrapper. Under loom, tokio::sync::Notify is unavailable,
 /// but the Notify doesn't participate in safety invariants — it's just a
@@ -126,9 +140,14 @@ struct Filled {
 /// Holds an optional `Filled` behind `UnsafeCell`. Access is synchronized
 /// through the atomic `state` field: producers write data then store `FILLED`,
 /// the consumer reads data only after loading `FILLED`.
+///
+/// `Filled` is boxed so an empty slot costs one pointer rather than the full
+/// `Filled` payload (which embeds `ChunkMetadata`). The ring allocates `capacity`
+/// slots up front but only `window_limit` of them hold a chunk at once, so the
+/// payload backing exists only for resident chunks, not the whole ring.
 struct Slot {
     state: AtomicU8,
-    data: UnsafeCell<Option<Filled>>,
+    data: UnsafeCell<Option<Box<Filled>>>,
 }
 
 // Safety: see SlotBuffer doc comment for the full invariant chain.
@@ -147,10 +166,13 @@ impl SlotBuffer {
                 data: UnsafeCell::new(None),
             })
             .collect();
+        // window_limit starts at the default, clamped to capacity (a buffer
+        // smaller than the default collapses to its capacity).
+        let initial_window = DEFAULT_DOWNLOAD_WINDOW.min(capacity) as u64;
         Self {
             slots: slots.into_boxed_slice(),
             capacity: capacity as u64,
-            window_limit: AtomicU64::new(capacity as u64),
+            window_limit: AtomicU64::new(initial_window),
             consumed: AtomicU64::new(0),
             claimed: AtomicU64::new(0),
             notify: WakeNotify::new(),
@@ -188,7 +210,7 @@ impl SlotBuffer {
         // Safety: seq window guarantees exclusive access to this slot index.
         self.slots[idx]
             .data
-            .with_mut(|ptr| unsafe { *ptr = Some(Filled { chunk, reservation }) });
+            .with_mut(|ptr| unsafe { *ptr = Some(Box::new(Filled { chunk, reservation })) });
         self.slots[idx]
             .state
             .store(SLOT_FILLED, AtomicOrdering::Release);
@@ -695,7 +717,10 @@ mod tests {
     use bytes_utils::SegmentedBuf;
     use std::sync::Arc;
 
-    use super::{new_slot_body, AggregatedBytes, Body, BodyWriter};
+    use super::{
+        new_slot_body, AggregatedBytes, Body, BodyWriter, DEFAULT_BODY_SLOT_CAPACITY,
+        DEFAULT_DOWNLOAD_WINDOW,
+    };
 
     fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
         ChunkOutput {
@@ -890,13 +915,17 @@ mod tests {
     }
 
     #[test]
-    fn window_defaults_to_capacity() {
-        let (writer, _consumer) = new_slot_body(4);
-        assert_eq!(writer.prefetch_window(), 4);
+    fn test_default_window() {
+        // A full-capacity buffer starts at the default window, not its capacity.
+        let (writer, _consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
+        assert_eq!(writer.prefetch_window(), DEFAULT_DOWNLOAD_WINDOW);
+        // A buffer smaller than the default clamps to its capacity.
+        let (small, _c) = new_slot_body(4);
+        assert_eq!(small.prefetch_window(), 4);
     }
 
     #[test]
-    fn window_clamps_to_one_and_capacity() {
+    fn test_window_clamps_to_one_and_capacity() {
         let (writer, _consumer) = new_slot_body(4);
         writer.set_prefetch_window(0);
         assert_eq!(
@@ -913,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn window_one_still_makes_progress() {
+    fn test_window_one_still_makes_progress() {
         let (writer, consumer) = new_slot_body(8);
         writer.set_prefetch_window(1);
         let s0 = writer.try_claim().unwrap();
@@ -929,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn increasing_window_allows_more_claims() {
+    fn test_increasing_window_allows_more_claims() {
         let (writer, _consumer) = new_slot_body(8);
         writer.set_prefetch_window(2);
         writer.try_claim().unwrap();
@@ -942,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn decreasing_window_below_gap_is_a_soft_drain() {
+    fn test_decreasing_window_soft_drain() {
         let (writer, consumer) = new_slot_body(8);
         // Claim 4 ahead (gap = 4) at the default window.
         let s0 = writer.try_claim().unwrap();
@@ -1442,7 +1471,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn two_producers_claim_unique_seqs() {
+    fn test_two_producers_claim_unique_seqs() {
         loom::model(|| {
             let (writer, _consumer) = new_slot_body(4);
             let writer2 = writer.clone();
@@ -1475,7 +1504,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn fill_then_take() {
+    fn test_fill_then_take() {
         loom::model(|| {
             let (writer, consumer) = new_slot_body(4);
 
@@ -1493,7 +1522,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn window_pressure() {
+    fn test_window_pressure() {
         // capacity=1, so after one claim the window is full
         loom::model(|| {
             let (writer, _consumer) = new_slot_body(1);
@@ -1509,7 +1538,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn concurrent_claim_fill_take() {
+    fn test_concurrent_claim_fill_take() {
         loom::model(|| {
             let (writer, consumer) = new_slot_body(2);
             let writer2 = writer.clone();
@@ -1542,7 +1571,7 @@ mod loom_tests {
     /// Producer fills while consumer concurrently polls try_take_next.
     /// This is the core production pattern.
     #[test]
-    fn concurrent_fill_and_take() {
+    fn test_concurrent_fill_and_take() {
         loom::model(|| {
             let (writer, consumer) = new_slot_body(2);
 
@@ -1562,7 +1591,7 @@ mod loom_tests {
 
     /// Fill, consume, then reclaim the same slot index — tests wrap-around.
     #[test]
-    fn claim_fill_take_reclaim() {
+    fn test_claim_fill_take_reclaim() {
         loom::model(|| {
             let (writer, consumer) = new_slot_body(1);
 
@@ -1584,7 +1613,7 @@ mod loom_tests {
 
     /// Two producers + concurrent consumer — the full production pattern.
     #[test]
-    fn two_producers_concurrent_consumer() {
+    fn test_two_producers_concurrent_consumer() {
         loom::model(|| {
             let (writer, consumer) = new_slot_body(4);
             let writer2 = writer.clone();

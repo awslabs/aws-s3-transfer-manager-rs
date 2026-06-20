@@ -8,7 +8,6 @@
 use std::cmp;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
@@ -24,6 +23,7 @@ use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
 use crate::runtime::memory::{NotifyFn, Reservation, Reserve};
+use crate::telemetry::{BackpressureSource, BackpressureState};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
 
@@ -111,23 +111,22 @@ struct DownloadTransferInner {
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
-    /// Edge-tracked: whether this transfer is currently blocked on its prefetch
-    /// window (full of claimed-but-unconsumed parts, waiting on in-order
-    /// consumption). Drives the client `window_blocked_downloads` gauge; see
-    /// [`DownloadTransfer::set_window_blocked`].
-    window_blocked: AtomicBool,
+    /// Edge-tracked cause this transfer is currently parked on (prefetch window
+    /// or memory budget), or none. Drives the client `download_backpressure`
+    /// counts; see [`DownloadTransfer::set_backpressure`].
+    backpressure: BackpressureState,
 }
 
 impl Drop for DownloadTransferInner {
     fn drop(&mut self) {
-        // Release the gauge if the transfer ended (cancel/fail) while blocked;
-        // normal completion unblocks via a successful claim before finishing.
-        if self.window_blocked.load(Ordering::Relaxed) {
+        // Release the count if the transfer ended (cancel/fail) while parked;
+        // normal completion unparks via a successful claim before finishing.
+        if let Some(source) = self.backpressure.load() {
             self.ctx
                 .handle
                 .telemetry
-                .window_blocked_downloads
-                .fetch_sub(1, Ordering::Relaxed);
+                .download_backpressure
+                .decrement(source);
         }
     }
 }
@@ -148,7 +147,7 @@ impl DownloadTransfer {
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
-            window_blocked: AtomicBool::new(false),
+            backpressure: BackpressureState::default(),
         });
         Self { inner }
     }
@@ -168,35 +167,37 @@ impl DownloadTransfer {
         &self.inner.writer
     }
 
-    /// Edge-track the prefetch-window-blocked vital sign: maintain the
-    /// client-level `window_blocked_downloads` gauge with exactly one increment
-    /// per block→unblock cycle, and emit an edge event. Blocked means the
-    /// transfer wanted to fetch another part but its window was full (waiting on
-    /// in-order consumption of a slow head part) — the head-of-line signal that
-    /// distinguishes a window-bound pipeline from a connection- or
-    /// work-generation-bound one. Idempotent: a no-op when already in `blocked`.
-    fn set_window_blocked(&self, blocked: bool) {
-        if self.inner.window_blocked.swap(blocked, Ordering::Relaxed) == blocked {
+    /// Edge-track the cause this transfer is parked on: maintain the client-level
+    /// `download_backpressure` counts with exactly one increment per parked
+    /// interval, and emit an edge event. `None` means running. A window→budget
+    /// (or reverse) transition releases the old cause's count and acquires the
+    /// new one; the cause is mutually exclusive by construction (claim-first
+    /// gate). Idempotent: a no-op when the cause is unchanged.
+    fn set_backpressure(&self, source: Option<BackpressureSource>) {
+        let prev = self.inner.backpressure.swap(source);
+        if prev == source {
             return;
         }
-        let gauge = &self.inner.ctx.handle.telemetry.window_blocked_downloads;
-        if blocked {
-            let total = gauge.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::trace!(
+        let counts = &self.inner.ctx.handle.telemetry.download_backpressure;
+        if let Some(old) = prev {
+            counts.decrement(old);
+        }
+        match source {
+            Some(src) => {
+                let count = counts.increment(src);
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_RUNTIME,
+                    tid = %self.inner.ctx.id,
+                    source = ?src,
+                    count,
+                    "download backpressured",
+                );
+            }
+            None => tracing::trace!(
                 target: crate::telemetry::TARGET_RUNTIME,
                 tid = %self.inner.ctx.id,
-                window = self.inner.writer.prefetch_window(),
-                window_blocked_downloads = total,
-                "download blocked on prefetch window",
-            );
-        } else {
-            let total = gauge.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
-            tracing::trace!(
-                target: crate::telemetry::TARGET_RUNTIME,
-                tid = %self.inner.ctx.id,
-                window_blocked_downloads = total,
-                "download resumed (prefetch window opened)",
-            );
+                "download resumed",
+            ),
         }
     }
 
@@ -327,24 +328,26 @@ impl DownloadTransfer {
         // Resume a budget-parked claim: the slot is already ours, just awaiting
         // the reservation the budget queued.
         if pending.is_some() {
-            self.set_window_blocked(false);
-            let granted = pending.as_mut().unwrap().ticket.take();
-            return match granted {
+            return match pending.as_mut().unwrap().ticket.take() {
                 Some(reservation) => {
+                    self.set_backpressure(None);
                     let mut claim = pending.take().unwrap();
                     claim.slot.attach_reservation(reservation);
                     Some(claim.slot)
                 }
-                None => None, // not granted yet; the queued ticket is the waker
+                // Not granted yet; the queued ticket is the waker.
+                None => {
+                    self.set_backpressure(Some(BackpressureSource::MemoryBudget));
+                    None
+                }
             };
         }
 
         // Fresh: the window gate is the claim itself.
         let Some(mut slot) = self.inner.writer.try_claim() else {
-            self.set_window_blocked(true);
+            self.set_backpressure(Some(BackpressureSource::PrefetchWindow));
             return None;
         };
-        self.set_window_blocked(false);
 
         let notify: NotifyFn = {
             let scheduler = self.inner.ctx.handle.scheduler.clone();
@@ -359,10 +362,12 @@ impl DownloadTransfer {
             .reserve(range_len, notify)
         {
             Reserve::Ready(reservation) => {
+                self.set_backpressure(None);
                 slot.attach_reservation(reservation);
                 Some(slot)
             }
             Reserve::Pending(ticket) => {
+                self.set_backpressure(Some(BackpressureSource::MemoryBudget));
                 *pending = Some(PendingClaim { slot, ticket });
                 None
             }
@@ -1457,6 +1462,10 @@ mod tests {
                 _ => panic!("expected Transferring"),
             }
         }
+        // The budget park is visible, and distinct from a window park.
+        let bp = &transfer.ctx().handle.telemetry.download_backpressure;
+        assert_eq!(bp.budget.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(bp.window.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         // Consume the discovery chunk (seq 0): its reservation drops, freeing a
         // chunk that the budget immediately re-grants to the parked part-2 claim.
@@ -1479,5 +1488,7 @@ mod tests {
             }
         }
         assert_eq!(budget.in_use_chunks(), 2);
+        // Resuming released the budget park.
+        assert_eq!(bp.budget.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

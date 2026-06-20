@@ -267,6 +267,17 @@ impl MemoryBudget {
         self.inner.lock().capacity
     }
 
+    /// Bytes currently reserved (`in_use_chunks × chunk`). Reservations are
+    /// chunk-quantized, so this is the nominal reserved size, not byte-exact demand.
+    pub(crate) fn in_use_bytes(&self) -> u64 {
+        self.inner.lock().in_use * self.chunk as u64
+    }
+
+    /// Capacity in bytes (`capacity_chunks × chunk`).
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        self.inner.lock().capacity * self.chunk as u64
+    }
+
     /// The fixed chunk size in bytes.
     pub(crate) fn chunk_bytes(&self) -> usize {
         self.chunk
