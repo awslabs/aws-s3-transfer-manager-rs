@@ -564,19 +564,10 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        self.inner.ctx.set_failed(Error::new(
+                        self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
                         ));
-                        // set_failed makes the transfer terminal but does not
-                        // signal; signal here so the terminal transition is
-                        // observable before returning to the scheduler. A
-                        // terminal transfer that returns idle without signaling
-                        // can be removed by the scheduler with its completion
-                        // channel never fired, hanging the owning handle. Any
-                        // surviving children are cancelled when the handle's
-                        // join()/drop calls cancel_transfer(parent_id).
-                        self.inner.ctx.signal_terminal();
                     }
                 }
             }
@@ -707,6 +698,7 @@ impl DownloadObjectsTransfer {
             if let Err(err) = self.validate_destination() {
                 let mut state = self.inner.state.lock();
                 state.walk_in_flight = false;
+                // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
                 self.inner.ctx.set_failed(err);
                 if self.check_terminal(&state).is_some() {
                     return WorkOutcome::Success { data: None };
@@ -829,19 +821,10 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        self.inner.ctx.set_failed(Error::new(
+                        self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
                         ));
-                        // set_failed makes the transfer terminal but does not
-                        // signal; signal here so the terminal transition is
-                        // observable before returning to the scheduler. A
-                        // terminal transfer that returns idle without signaling
-                        // can be removed by the scheduler with its completion
-                        // channel never fired, hanging the owning handle. Any
-                        // surviving children are cancelled when the handle's
-                        // join()/drop calls cancel_transfer(parent_id).
-                        self.inner.ctx.signal_terminal();
                     }
                 }
             }

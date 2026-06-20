@@ -323,11 +323,13 @@ impl IntegrityChecks {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumValidation {
     /// Every delivered byte was validated against a checksum and matched.
+    #[non_exhaustive]
     Validated {
         /// The algorithm used to validate.
         algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
     },
     /// No whole-object validation occurred. `reason` explains why.
+    #[non_exhaustive]
     NotValidated {
         /// Why validation did not cover the whole object.
         reason: NotValidatedReason,

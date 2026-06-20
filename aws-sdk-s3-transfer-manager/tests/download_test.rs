@@ -717,12 +717,12 @@ async fn test_integrity_checks_default_mode_attempts_validation() {
     let _ = drain(&mut handle).await.unwrap();
     let output = handle.join().await.unwrap();
 
-    assert_eq!(
-        *output.integrity_checks().checksum_validation(),
-        ChecksumValidation::NotValidated {
-            reason: NotValidatedReason::Unavailable
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::NotValidated { reason, .. } => {
+            assert_eq!(*reason, NotValidatedReason::Unavailable);
         }
-    );
+        other => panic!("expected NotValidated{{Unavailable}}, got {other:?}"),
+    }
 }
 
 /// Client ResponseChecksumValidation=WhenRequired with no request override: the
@@ -761,12 +761,12 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
     let _ = drain(&mut handle).await.unwrap();
     let output = handle.join().await.unwrap();
 
-    assert_eq!(
-        *output.integrity_checks().checksum_validation(),
-        ChecksumValidation::NotValidated {
-            reason: NotValidatedReason::Disabled
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::NotValidated { reason, .. } => {
+            assert_eq!(*reason, NotValidatedReason::Disabled);
         }
-    );
+        other => panic!("expected NotValidated{{Disabled}}, got {other:?}"),
+    }
 }
 
 /// checksum_mode on → reported as NotValidated (never falsely Validated) until
