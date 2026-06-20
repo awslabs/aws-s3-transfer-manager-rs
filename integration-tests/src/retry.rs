@@ -218,6 +218,59 @@ async fn truncate_body_always_exhausts_and_fails() {
     t.shutdown().await;
 }
 
+// cold-tracker stall -> must not hang -------------------------------------------
+
+/// A range chunk that stalls mid-body (bytes delivered, then no further byte and
+/// no EOF) before the latency tracker has warmed must still fail within a bounded
+/// time, not hang forever.
+///
+/// The TM's body-read deadline is adaptive: `LatencyTracker` only arms a timeout
+/// after `WARM_THRESHOLD` (10) recorded samples; while cold it returns no deadline,
+/// so `guarded` awaits the body with no timeout. A stall on an early chunk (here
+/// the first range chunk, fired before 10 chunks complete) therefore has no TM
+/// deadline to catch it. The SDK's stalled-stream protection (a minimum-throughput
+/// guard, always armed) is what covers this cold window: it aborts the silent body
+/// and the TM surfaces an I/O error. Disabling SSP would reopen this gap — this
+/// test is the guard against that.
+///
+/// The outer `timeout` is the test's own backstop: if the download does not
+/// terminate on its own, the test fails here instead of hanging the suite.
+#[tokio::test]
+async fn cold_tracker_body_stall_does_not_hang() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    let data = multipart_data();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::StallBody {
+            after_bytes: FAULT_AFTER_BYTES,
+        },
+        SKIP_DISCOVERY,
+        Occurrence::Always,
+    );
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        t.download("obj", Some(ChecksumMode::Enabled)),
+    )
+    .await;
+
+    match outcome {
+        Ok(result) => assert_io_error(result),
+        Err(_) => panic!(
+            "download hung on a cold-tracker body stall: the adaptive deadline was \
+             cold (< WARM_THRESHOLD samples) and stalled-stream protection did not \
+             catch the silent body"
+        ),
+    }
+
+    t.shutdown().await;
+}
+
 // checksum mismatch -> not retried --------------------------------------------
 
 /// A corrupt body (bytes altered, checksum intact) injected `Always` fails the

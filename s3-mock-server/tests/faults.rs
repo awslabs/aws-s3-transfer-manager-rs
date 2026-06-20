@@ -364,6 +364,11 @@ async fn test_short_body_fails_length_mismatch() -> Result<()> {
 /// armed for the specific connection serving the faulted key's GET. The response
 /// headers succeed; the body delivers a prefix then errors with a real
 /// `ConnectionReset` (the OS-level reset, distinct from a body-stream error).
+///
+/// Unix-only: Windows discards already-received data on RST, so the client
+/// observes the reset at the header read (`send()` fails) rather than after a
+/// readable body prefix — the prefix-then-reset contract is not observable there.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_connection_reset_mid_stream() -> Result<()> {
     let server = S3MockServer::builder().with_in_memory_store().build()?;
