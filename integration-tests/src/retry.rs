@@ -25,10 +25,16 @@
 //! into the stream.
 //!
 //! `corrupt_body_once_is_not_retried` and `corrupt_body_always_fails` cover the
-//! checksum path: a corrupt body fails the download and is not retried. They also
-//! exercise the classifier's source-chain downcast against the
-//! `aws-smithy-checksums` version `aws-sdk-s3` links, so an SDK version change
-//! that broke the downcast fails them.
+//! checksum path: a corrupt body fails the download and is not retried. Both
+//! assert the failure is `ErrorKind::IntegrityError`, not merely that it failed.
+//!
+//! That assertion is also the standing guard for the classifier's source-chain
+//! downcast (`error::checksum_mismatch_values`), which is fragile across
+//! `aws-smithy-checksums` versions (a `0.x` minor bump changes the `TypeId` and
+//! the downcast misses — see https://github.com/smithy-lang/smithy-rs/issues/4718).
+//! These run against the version `aws-sdk-s3` actually links, so a bump that broke
+//! the downcast turns the mismatch into a retryable I/O error and fails the
+//! `IntegrityError` assertion here — making the break CI-visible rather than silent.
 
 use crate::assertions::{assert_integrity_error, assert_io_error, assert_same_content};
 use crate::harness::Target;

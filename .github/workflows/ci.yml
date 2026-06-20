@@ -35,6 +35,7 @@ jobs:
   ci-required-checks:
     name: Required checks pass
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs:
       - test-hll
       - fmt
@@ -55,6 +56,7 @@ jobs:
   basics:
     name: basic checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs:
       - fmt
       - clippy
@@ -66,6 +68,7 @@ jobs:
   test-hll:
     name: Test S3 transfer manager HLL
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +108,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -125,6 +129,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_clippy }}
@@ -139,6 +144,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -155,6 +161,7 @@ jobs:
   minrust:
     name: minrust
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_min }}
@@ -171,6 +178,7 @@ jobs:
     name: check-external-types (${{ matrix.os }})
     needs: basics
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       matrix:
         os:
@@ -201,6 +209,7 @@ jobs:
     name: check deps with cargo-deny
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -219,6 +228,7 @@ jobs:
     name: saniters (${{ matrix.sanitizer }})
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -271,6 +281,7 @@ jobs:
     name: features
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -296,6 +307,7 @@ jobs:
     name: dial9 build
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -312,6 +324,7 @@ jobs:
     name: miri
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -334,6 +347,7 @@ jobs:
     name: loom
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
