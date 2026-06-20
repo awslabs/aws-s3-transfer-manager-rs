@@ -475,7 +475,7 @@ impl Scheduler {
         // which would otherwise orphan the child.
         if desc.is_terminal() && is_idle {
             let desc_id = desc.id();
-            let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
+            let (completed, orphans) = self.remove_transfer_atomic(desc_id);
             if !orphans.is_empty() {
                 tracing::warn!(
                     target: telemetry::TARGET_SCHEDULING,
@@ -488,6 +488,14 @@ impl Scheduler {
                 for desc in orphans {
                     self.cancel_descriptor(desc);
                 }
+            }
+            // Signal the removed transfer's terminal. A transfer that became
+            // terminal but was removed here before signaling would leave its
+            // completion channel unfired, hanging the owning handle. Signal
+            // after cancelling orphans so children are torn down before the
+            // handle observes completion. Idempotent if already signaled.
+            if let Some(completed) = completed {
+                completed.transfer().ctx().signal_terminal();
             }
         }
 
@@ -761,7 +769,8 @@ impl Scheduler {
 mod tests {
     use crate::client::Handle;
     use crate::scheduler::transfer::mock::{
-        BuggyDoneMock, FixedWorkCount, MockStateMachine, WithDelay, WithExecute,
+        BuggyDoneMock, FixedWorkCount, MockStateMachine, TerminalWithoutSignalMock, WithDelay,
+        WithExecute,
     };
     use crate::scheduler::MockTransfer;
     use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
@@ -2205,6 +2214,44 @@ mod tests {
                 .expect("child terminal should fire (cancelled by Done branch)")
                 .expect("terminal sender should not have been dropped");
         }
+
+        handle.runtime.shutdown();
+    }
+
+    /// A transfer that becomes terminal without calling `signal_terminal`,
+    /// while a child is still registered, is removed by `on_completion`'s
+    /// terminal+idle path. The scheduler must signal the removed transfer's
+    /// terminal so its owning handle's `join()` resolves rather than hanging.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_terminal_without_signal_does_not_strand_handle() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let parent_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let (mock, completion_rx) = TerminalWithoutSignalMock::new(parent_id, handle.clone());
+        scheduler.enqueue_transfer(Box::new(mock));
+
+        // The parent goes terminal without signaling; the scheduler removes it
+        // (terminal+idle) and must signal its completion. The handle's join
+        // (modeled here by awaiting completion_rx) must resolve, not hang.
+        tokio::time::timeout(Duration::from_secs(2), completion_rx)
+            .await
+            .expect("parent completion must be signaled on scheduler removal, not strand")
+            .expect("terminal sender should not have been dropped");
+
+        // And the scheduler drains (orphan child cleaned up).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should reach idle");
 
         handle.runtime.shutdown();
     }

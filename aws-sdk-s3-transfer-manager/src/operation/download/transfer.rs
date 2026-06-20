@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
 
+use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+
 use crate::error::{self, ChunkId, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
@@ -80,6 +82,8 @@ struct DownloadTransferInner {
     writer: BodyWriter,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
+    /// Object-integrity result (set once discovery completes)
+    integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
 }
@@ -98,6 +102,7 @@ impl DownloadTransfer {
             bucket_type,
             writer,
             object_meta: std::sync::OnceLock::new(),
+            integrity_checks: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
         Self { inner }
@@ -123,14 +128,34 @@ impl DownloadTransfer {
         self.inner.object_meta.get()
     }
 
+    /// Object-integrity result from discovery.
+    pub(crate) fn integrity_checks(&self) -> Option<&crate::types::IntegrityChecks> {
+        self.inner.integrity_checks.get()
+    }
+
     /// Notified when discovery completes.
     pub(crate) fn discovery_notify(&self) -> &tokio::sync::Notify {
         &self.inner.discovery_notify
     }
 
-    /// The target part size to use for this download.
-    fn target_part_size_bytes(&self) -> u64 {
-        self.inner.ctx.handle.download_part_size_bytes()
+    /// Whether download checksum validation is in effect, resolved the same way
+    /// the SDK's GetObject mutator does: enabled if the request set
+    /// `ChecksumMode=Enabled`, or it is unset and the client's
+    /// `ResponseChecksumValidation` is not `WhenRequired` (`WhenSupported`, the
+    /// default, and unknown values enable it).
+    fn validation_enabled(&self, input: &DownloadInput) -> bool {
+        match input.checksum_mode {
+            Some(aws_sdk_s3::types::ChecksumMode::Enabled) => true,
+            _ => !matches!(
+                self.ctx()
+                    .s3_client()
+                    .config()
+                    .response_checksum_validation()
+                    .copied()
+                    .unwrap_or_default(),
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired
+            ),
+        }
     }
 
     /// Poll for the next work item.
@@ -163,6 +188,7 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight,
                 etag,
+                part_size,
                 ..
             } => {
                 // Check seq window before generating work
@@ -172,7 +198,11 @@ impl DownloadTransfer {
                 };
 
                 if let Some(range) = remaining.take() {
-                    let part_size = self.target_part_size_bytes();
+                    // `part_size` is the stored part size for a validated multipart
+                    // object (so each range aligns to a stored part boundary and S3
+                    // returns the part's checksum for the SDK to validate), else the
+                    // configured download part size. Set at discovery.
+                    let part_size = *part_size;
                     let start = *range.start();
                     let end = *range.end();
                     let chunk_end = cmp::min(start + part_size - 1, end);
@@ -224,7 +254,14 @@ impl DownloadTransfer {
     async fn execute_discovery(&self) -> WorkOutcome {
         let input = self.inner.request.as_ref();
 
-        let discovery = match discover_obj(self, input).await {
+        // Resolve the effective validation state the same way the SDK's GetObject
+        // mutator does: enabled if the request set ChecksumMode=Enabled, or the
+        // request left it unset and the client's ResponseChecksumValidation is not
+        // WhenRequired (WhenSupported, the default, and unknown values enable it).
+        // Computed before discovery because it drives range alignment.
+        let validation_enabled = self.validation_enabled(input);
+
+        let discovery = match discover_obj(self, input, validation_enabled).await {
             Ok(d) => d,
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
@@ -237,10 +274,23 @@ impl DownloadTransfer {
             object_meta,
             initial_chunk,
             chunk_meta,
+            effective_part_size,
         } = discovery;
 
         // Store object_meta for object_meta() and join()
         let _ = self.inner.object_meta.set(object_meta.clone());
+
+        // Object checksum is known only when the whole object arrived in this
+        // chunk. A larger multipart object's discovery chunk carries part 1's
+        // checksum, which is not the object checksum.
+        let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
+        let integrity = build_integrity_checks(
+            chunk_meta.as_ref(),
+            whole_object_in_chunk,
+            validation_enabled,
+        );
+        let _ = self.inner.integrity_checks.set(integrity);
+
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
 
@@ -282,6 +332,7 @@ impl DownloadTransfer {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag,
+                part_size: effective_part_size,
             };
         }
 
@@ -313,7 +364,10 @@ impl DownloadTransfer {
             let data = match result {
                 Ok(data) => data,
                 Err(e) => {
-                    self.decrement_in_flight();
+                    // Go terminal before any wake: fail() sets Terminal under the
+                    // lock, so a woken poll_work cannot observe ranges_in_flight==0
+                    // and complete() the transfer over this error. The in-flight
+                    // count is abandoned with the Transferring state.
                     let guard = self.inner.state.lock().unwrap();
                     return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
                 }
@@ -340,7 +394,7 @@ impl DownloadTransfer {
 
         slot.fill(chunk);
         if let Err(e) = self.inner.writer.try_flush() {
-            self.decrement_in_flight();
+            // Go terminal before any wake (see fail_range).
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
@@ -383,21 +437,20 @@ impl DownloadTransfer {
                 let rh = range_header.clone();
                 let etag = etag.clone();
                 let ctx = self.inner.ctx.clone();
-                let mut req = self
-                    .inner
-                    .ctx
-                    .s3_client()
-                    .get_object()
-                    .bucket(input.bucket().unwrap_or_default())
-                    .key(input.key().unwrap_or_default())
-                    .range(rh.clone());
-
-                if let Some(ref etag) = etag {
-                    req = req.if_match(etag.as_ref());
+                // Every chunk GET must carry the same request fields as discovery
+                // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
+                // conversion, then pin this chunk's range and the discovered etag.
+                let mut builder: GetObjectInputBuilder = input.clone().into();
+                builder = builder.set_range(Some(rh.clone()));
+                if let Some(etag) = etag.as_ref() {
+                    builder = builder.if_match(etag.as_ref());
                 }
 
                 async move {
-                    let resp = req.send().await.map_err(crate::error::Error::from)?;
+                    let resp = builder
+                        .send_with(ctx.s3_client())
+                        .await
+                        .map_err(crate::error::Error::from)?;
                     validate_content_range(seq, &rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let mut segmented = SegmentedBuf::new();
@@ -436,7 +489,7 @@ impl DownloadTransfer {
 
         slot.fill(chunk);
         if let Err(e) = self.inner.writer.try_flush() {
-            self.decrement_in_flight();
+            // Go terminal before any wake (see fail_range).
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
@@ -468,7 +521,9 @@ impl DownloadTransfer {
 
     /// Fail a range request with an error.
     fn fail_range(&self, seq: u64, e: impl Into<crate::error::BoxError>) -> WorkOutcome {
-        self.decrement_in_flight();
+        // Go terminal before any wake (see the discovery-body error path). Do not
+        // decrement_in_flight first: that wakes poll_work, which would observe
+        // ranges_in_flight==0 and complete() over this error.
         let guard = self.inner.state.lock().unwrap();
         self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e))
     }
@@ -578,6 +633,48 @@ fn validate_content_range(
     }
 }
 
+/// Build the object-integrity result for a completed download.
+///
+/// `whole_object_in_chunk` must be true only when the entire object arrived in
+/// the discovery chunk, the one case where the chunk checksum is the object
+/// checksum. Otherwise value members are left `None`.
+///
+/// Validation is reported `Disabled` when not requested, else
+/// `NotValidated{Unavailable}`. `Validated{algorithm}` requires a per-response
+/// validation outcome the Rust SDK does not currently expose.
+// TODO(vnext): resolve `Validated{algorithm}` from an SDK-reported per-response
+// validation outcome once the SDK exposes one, instead of always reporting
+// NotValidated when validation is enabled.
+fn build_integrity_checks(
+    chunk_meta: Option<&ChunkMetadata>,
+    whole_object_in_chunk: bool,
+    validation_enabled: bool,
+) -> crate::types::IntegrityChecks {
+    use crate::types::{ChecksumValidation, NotValidatedReason};
+
+    let checksum_validation = if validation_enabled {
+        ChecksumValidation::NotValidated {
+            reason: NotValidatedReason::Unavailable,
+        }
+    } else {
+        ChecksumValidation::NotValidated {
+            reason: NotValidatedReason::Disabled,
+        }
+    };
+
+    // Surface checksum values only when they describe the whole object.
+    let cm = chunk_meta.filter(|_| whole_object_in_chunk);
+    crate::types::IntegrityChecks::new(
+        cm.and_then(|m| m.checksum_crc32.clone()),
+        cm.and_then(|m| m.checksum_crc32_c.clone()),
+        cm.and_then(|m| m.checksum_crc64_nvme.clone()),
+        cm.and_then(|m| m.checksum_sha1.clone()),
+        cm.and_then(|m| m.checksum_sha256.clone()),
+        cm.and_then(|m| m.checksum_type.clone()),
+        checksum_validation,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +688,56 @@ mod tests {
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     const MB: u64 = 1024 * 1024;
+
+    use crate::operation::download::chunk_meta::ChunkMetadata;
+    use crate::types::{ChecksumValidation, NotValidatedReason};
+    use aws_sdk_s3::types::ChecksumType;
+
+    fn chunk_with_crc32(value: &str) -> ChunkMetadata {
+        let mut m = ChunkMetadata::default();
+        m.checksum_crc32 = Some(value.to_string());
+        m.checksum_type = Some(ChecksumType::FullObject);
+        m
+    }
+
+    #[test]
+    fn integrity_disabled_when_validation_not_enabled() {
+        // validation_enabled=false models a WhenRequired client with no request
+        // override: no validation is attempted, so the verdict is Disabled.
+        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, false);
+        assert_eq!(
+            *ic.checksum_validation(),
+            ChecksumValidation::NotValidated {
+                reason: NotValidatedReason::Disabled
+            }
+        );
+    }
+
+    #[test]
+    fn integrity_unavailable_when_enabled_pending_sdk_signal() {
+        // TODO(vnext): becomes Validated once the SDK reports a validation outcome.
+        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, true);
+        assert_eq!(
+            *ic.checksum_validation(),
+            ChecksumValidation::NotValidated {
+                reason: NotValidatedReason::Unavailable
+            }
+        );
+    }
+
+    #[test]
+    fn integrity_surfaces_value_only_for_whole_object_chunk() {
+        // Whole object in the discovery chunk -> the chunk checksum IS the object's.
+        let whole = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, false);
+        assert_eq!(whole.checksum_crc32(), Some("DUoRhQ=="));
+        assert_eq!(whole.checksum_type(), Some(&ChecksumType::FullObject));
+
+        // Multipart (object did not fit in the discovery chunk) -> part-1 value is
+        // NOT surfaced as the object value.
+        let multipart = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), false, false);
+        assert_eq!(multipart.checksum_crc32(), None);
+        assert_eq!(multipart.checksum_type(), None);
+    }
 
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {
         let chunk = vec![0u8; part_size as usize];

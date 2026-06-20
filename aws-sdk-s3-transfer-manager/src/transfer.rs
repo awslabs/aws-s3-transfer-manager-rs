@@ -639,6 +639,14 @@ impl TransferContext {
 
     /// Mark transfer as failed and store the error.
     /// First-write-wins - returns true if this call set the status.
+    ///
+    /// Setting the status alone is not observable to the owning handle: a
+    /// terminal transition must be signalled via [`signal_terminal`] (directly,
+    /// or once in-flight work drains). For the common fail-and-abort case use
+    /// [`set_failed_and_signal`], which bundles both.
+    ///
+    /// [`signal_terminal`]: Self::signal_terminal
+    /// [`set_failed_and_signal`]: Self::set_failed_and_signal
     pub(crate) fn set_failed(&self, err: error::Error) -> bool {
         if self.status.set_failed() {
             *self.error.lock().unwrap() = Some(Box::new(err));
@@ -702,11 +710,17 @@ impl TransferContext {
         self.status.is_active()
     }
 
-    /// Signal that the transfer state machine has reached a terminal state.
+    /// Signal that the transfer has reached a terminal state.
     ///
-    /// Call this after `set_completed()`/`set_failed()`/`set_cancelled()`.
-    /// Wakes any waiters (e.g., `join()`). Note: in-flight work may still
-    /// be draining when this is called.
+    /// Call this after `set_completed()`/`set_failed()`/`set_cancelled()`. Wakes
+    /// any waiters (`join()`) and the parent transfer (so it can reap this child).
+    ///
+    /// Setting a terminal status is not enough on its own. A transfer that has
+    /// gone terminal but returns idle to the scheduler WITHOUT signalling can be
+    /// removed by the scheduler with its completion channel never fired — a
+    /// permanent hang of the owning handle, not merely a delay. Every terminal
+    /// transition must therefore reach exactly one `signal_terminal`. It is safe
+    /// to call while in-flight work is still draining.
     pub(crate) fn signal_terminal(&self) {
         self.metrics.set_finished();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
@@ -719,6 +733,24 @@ impl TransferContext {
                 parent: None,
             });
         }
+    }
+
+    /// Mark the transfer failed and immediately signal terminal (the
+    /// fail-and-abort path: the transfer is terminal now, with nothing to wait
+    /// for — see [`signal_terminal`]). Bundling the two calls keeps an abort site
+    /// from setting the status without making the transition observable. When the
+    /// signal must instead wait for in-flight work to drain, call [`set_failed`]
+    /// alone and signal once that work completes.
+    ///
+    /// Returns the result of [`set_failed`] (first-write-wins: `true` if this
+    /// call set the status).
+    ///
+    /// [`signal_terminal`]: Self::signal_terminal
+    /// [`set_failed`]: Self::set_failed
+    pub(crate) fn set_failed_and_signal(&self, err: error::Error) -> bool {
+        let set = self.set_failed(err);
+        self.signal_terminal();
+        set
     }
 
     /// Record an IO sample to per-transfer metrics and per-client telemetry.

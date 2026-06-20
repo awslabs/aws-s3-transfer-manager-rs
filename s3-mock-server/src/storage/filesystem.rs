@@ -21,7 +21,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 use crate::error::{Error, Result};
-use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
+use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, ObjectPart, PartMetadata};
 use crate::storage::StorageBackend;
 use crate::types::StoredObjectMetadata;
 
@@ -294,6 +294,7 @@ impl StorageBackend for FilesystemStorage {
             content_encoding: request.content_encoding,
             content_disposition: request.content_disposition,
             content_language: request.content_language,
+            parts: Vec::new(),
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
@@ -350,10 +351,11 @@ impl StorageBackend for FilesystemStorage {
             Box::new(reader_stream)
         };
 
-        // Clear checksums for range requests since they apply to full object
+        // Range-aware checksums: an aligned range exposes the part's checksum,
+        // otherwise none apply (matches real S3).
         let mut response_metadata = metadata;
-        if request.range.is_some() {
-            response_metadata.clear_checksums();
+        if let Some(ref range) = request.range {
+            response_metadata.apply_range_checksums(range.start, range.end);
         }
 
         Ok(Some(crate::storage::GetObjectResponse {
@@ -584,7 +586,14 @@ impl StorageBackend for FilesystemStorage {
                 Some(aws_sdk_s3::types::ChecksumType::Composite) => {
                     if let Some(algorithm) = checksum_algorithm.as_ref() {
                         if let Some(part_checksum) = get_part_checksum(part_metadata, algorithm) {
-                            integrity_checks.update(part_checksum.as_bytes());
+                            // S3 computes the composite over the raw part-checksum
+                            // bytes, not their base64 text.
+                            if let Ok(raw) = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                part_checksum,
+                            ) {
+                                integrity_checks.update(&raw);
+                            }
                         }
                     }
                 }
@@ -593,7 +602,14 @@ impl StorageBackend for FilesystemStorage {
                     // Future checksum types - default to composite behavior
                     if let Some(algorithm) = checksum_algorithm.as_ref() {
                         if let Some(part_checksum) = get_part_checksum(part_metadata, algorithm) {
-                            integrity_checks.update(part_checksum.as_bytes());
+                            // S3 computes the composite over the raw part-checksum
+                            // bytes, not their base64 text.
+                            if let Ok(raw) = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                part_checksum,
+                            ) {
+                                integrity_checks.update(&raw);
+                            }
                         }
                     }
                 }
@@ -601,7 +617,26 @@ impl StorageBackend for FilesystemStorage {
         }
 
         // Finalize checksum calculation
-        let object_integrity = integrity_checks.finalize();
+        let mut object_integrity = integrity_checks.finalize();
+
+        // A composite checksum carries a `-<part_count>` suffix (e.g. `aB3..==-14`).
+        if matches!(
+            checksum_type,
+            Some(aws_sdk_s3::types::ChecksumType::Composite)
+        ) {
+            let n = part_metadata_list.len();
+            for v in [
+                &mut object_integrity.crc32,
+                &mut object_integrity.crc32c,
+                &mut object_integrity.sha1,
+                &mut object_integrity.sha256,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                v.push_str(&format!("-{n}"));
+            }
+        }
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
@@ -615,6 +650,17 @@ impl StorageBackend for FilesystemStorage {
         final_metadata.content_length = total_size;
         final_metadata.etag = combined_etag.clone();
         final_metadata.last_modified = SystemTime::now();
+        final_metadata.parts = part_metadata_list
+            .iter()
+            .map(|(_, pm)| ObjectPart {
+                size: pm.size,
+                crc32: pm.crc32.clone(),
+                crc32c: pm.crc32c.clone(),
+                crc64nvme: pm.crc64nvme.clone(),
+                sha1: pm.sha1.clone(),
+                sha256: pm.sha256.clone(),
+            })
+            .collect();
 
         // Store calculated checksums in metadata
         final_metadata.crc32 = object_integrity.crc32.clone();

@@ -11,6 +11,10 @@
 #[cfg(test)]
 mod download;
 #[cfg(test)]
+mod harness;
+#[cfg(test)]
+mod integrity;
+#[cfg(test)]
 mod metrics;
 #[cfg(test)]
 mod upload;

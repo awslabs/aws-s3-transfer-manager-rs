@@ -100,6 +100,7 @@ jobs:
       - name: test s3-transfer-manager e2e
         run: |
           RUSTFLAGS="--cfg e2e_test" cargo test --test e2e_transfer_test
+          RUSTFLAGS="--cfg e2e_test" cargo test -p integration-tests
 
   fmt:
     name: fmt

@@ -575,11 +575,12 @@ impl UploadObjectsTransfer {
             tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
-        self.inner.ctx.set_failed(crate::error::Error::new(
-            crate::error::ErrorKind::ChildOperationFailed,
-            format!("upload_objects aborted: {cause}"),
-        ));
-        self.inner.ctx.signal_terminal();
+        self.inner
+            .ctx
+            .set_failed_and_signal(crate::error::Error::new(
+                crate::error::ErrorKind::ChildOperationFailed,
+                format!("upload_objects aborted: {cause}"),
+            ));
         PollWork::Done
     }
 
@@ -968,11 +969,10 @@ impl UploadObjectsTransfer {
             );
             // Transfer is failing: drop the walker (no walk_back).
             slot.consume(&mut state, None);
-            ctx.set_failed(crate::error::Error::new(
+            ctx.set_failed_and_signal(crate::error::Error::new(
                 crate::error::ErrorKind::IOError,
                 fatal.to_string(),
             ));
-            ctx.signal_terminal();
             return WorkOutcome::Failed {
                 classification: None,
             };

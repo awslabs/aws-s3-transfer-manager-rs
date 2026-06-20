@@ -74,6 +74,30 @@ fn has_any_checksum_get(o: &s3s::dto::GetObjectOutput) -> bool {
         || o.checksum_sha256.is_some()
 }
 
+/// Deterministically corrupt the first checksum header present on a GET response:
+/// decode it, XOR its first byte with 0xFF, re-encode. The result is valid-format
+/// but guaranteed ≠ the real value, and is recomputable from the object.
+fn xor_first_byte_of_checksum(output: &mut s3s::dto::GetObjectOutput) {
+    for value in [
+        &mut output.checksum_crc32,
+        &mut output.checksum_crc32c,
+        &mut output.checksum_crc64nvme,
+        &mut output.checksum_sha1,
+        &mut output.checksum_sha256,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(mut raw) = base64::engine::general_purpose::STANDARD.decode(value.as_bytes()) {
+            if let Some(b) = raw.first_mut() {
+                *b ^= 0xFF;
+                *value = base64::engine::general_purpose::STANDARD.encode(&raw);
+                return;
+            }
+        }
+    }
+}
+
 /// Inner implementation of the s3s::S3 trait.
 ///
 /// This struct implements the s3s::S3 trait, delegating all operations to the storage backend.
@@ -82,12 +106,61 @@ fn has_any_checksum_get(o: &s3s::dto::GetObjectOutput) -> bool {
 pub(crate) struct Inner<S: StorageBackend + 'static> {
     /// The storage backend.
     storage: S,
+    /// Key-scoped fault injection registry.
+    faults: std::sync::Arc<crate::faults::FaultRegistry>,
 }
 
 impl<S: StorageBackend + 'static> Inner<S> {
-    /// Create a new Inner with the given storage backend.
+    /// Create a new Inner with the given storage backend (no faults).
+    #[cfg(test)]
     pub(crate) fn new(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            faults: std::sync::Arc::new(crate::faults::FaultRegistry::default()),
+        }
+    }
+
+    /// Create a new Inner sharing an external fault registry.
+    pub(crate) fn with_faults(
+        storage: S,
+        faults: std::sync::Arc<crate::faults::FaultRegistry>,
+    ) -> Self {
+        Self { storage, faults }
+    }
+
+    /// Apply a registered fault to a GET response, if one fires for this request.
+    /// Effects are deterministic transforms (XOR) so a faulted value is derivable.
+    async fn apply_get_fault(
+        &self,
+        bucket: &str,
+        key: &str,
+        output: &mut s3s::dto::GetObjectOutput,
+    ) -> S3Result<()> {
+        match self.faults.next_fault(bucket, key) {
+            Some(crate::faults::FaultType::WrongStoredChecksum) => {
+                xor_first_byte_of_checksum(output);
+            }
+            Some(crate::faults::FaultType::CorruptBody) => {
+                if let Some(body) = output.body.take() {
+                    let mut bytes = BytesMut::new();
+                    let mut stream = body;
+                    while let Some(chunk) = stream.next().await {
+                        let chunk =
+                            chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if let Some(b) = bytes.first_mut() {
+                        *b ^= 0xFF;
+                    }
+                    let bytes = bytes.freeze();
+                    output.body = Some(StreamingBlob::wrap(futures_util::stream::once(
+                        async move { Ok::<_, std::io::Error>(bytes) },
+                    )));
+                }
+            }
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -109,7 +182,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         // Convert s3s Range to std Range if present
-        let range = input
+        let mut range = input
             .range
             .as_ref()
             .map(|range_dto| {
@@ -118,6 +191,27 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                     .map_err(|_| Error::InvalidRange)
             })
             .transpose()?;
+
+        // A partNumber GET returns exactly that stored part's bytes. Translate it
+        // to the part's byte range; the range path below then returns the part's
+        // data, Content-Range, and per-part checksum. parts_count is set on the
+        // response so callers learn the stored part count.
+        // For a non-multipart (single-PUT) object there are no stored parts:
+        // partNumber=1 returns the whole object, any higher number errors.
+        let parts_count = metadata.parts_count();
+        if let Some(pn) = input.part_number {
+            if parts_count == 0 {
+                if pn != 1 {
+                    return Err(Error::InvalidPart.into());
+                }
+                // pn == 1, single-PUT: leave range as-is (whole object).
+            } else {
+                match metadata.part_range(pn) {
+                    Some(r) => range = Some(r),
+                    None => return Err(Error::InvalidPart.into()),
+                }
+            }
+        }
 
         // Get object stream with validated range
         let request = crate::storage::GetObjectRequest {
@@ -175,6 +269,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_sha256 = stream_metadata.sha256;
         output.checksum_crc64nvme = stream_metadata.crc64nvme;
 
+        // A partNumber GET reports the object's stored part count.
+        if input.part_number.is_some() && parts_count > 1 {
+            output.parts_count = Some(parts_count as i32);
+        }
+
         // Return stored HTTP headers
         output.storage_class = stream_metadata.storage_class.map(|s| s.parse().unwrap());
         output.cache_control = stream_metadata.cache_control.map(|s| s.parse().unwrap());
@@ -185,6 +284,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
 
         apply_response_defaults_get(&mut output);
+        self.apply_get_fault(bucket, key, &mut output).await?;
         Ok(S3Response::new(output))
     }
 

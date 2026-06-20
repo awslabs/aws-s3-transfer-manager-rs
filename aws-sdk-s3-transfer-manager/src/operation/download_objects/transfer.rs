@@ -564,7 +564,7 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        self.inner.ctx.set_failed(Error::new(
+                        self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
                         ));
@@ -698,6 +698,7 @@ impl DownloadObjectsTransfer {
             if let Err(err) = self.validate_destination() {
                 let mut state = self.inner.state.lock();
                 state.walk_in_flight = false;
+                // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
                 self.inner.ctx.set_failed(err);
                 if self.check_terminal(&state).is_some() {
                     return WorkOutcome::Success { data: None };
@@ -820,7 +821,7 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        self.inner.ctx.set_failed(Error::new(
+                        self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
                         ));
@@ -1630,6 +1631,58 @@ mod tests {
             m.disk_write, 40,
             "child disk_write must aggregate to parent"
         );
+    }
+
+    /// Under `Abort`, a child failure sets the parent failed in an execute
+    /// callback, which must signal terminal there. Many keys keep sibling
+    /// children in flight when the failure fires, so the parent goes terminal
+    /// while children remain; its `join()` (completion) must resolve rather
+    /// than hang on the scheduler removing the terminal parent.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_child_failure_abort_managed_runtime_does_not_strand() {
+        let dir = tempdir().unwrap();
+
+        // Many keys so several children spawn; GetObject always errors so the
+        // first reaped failure aborts while siblings are still registered.
+        let objects: Vec<Object> = (0..20)
+            .map(|i| {
+                Object::builder()
+                    .key(format!("file{i:02}.txt"))
+                    .size(2)
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(objects.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_error(|| {
+            aws_sdk_s3::operation::get_object::GetObjectError::generic(
+                aws_sdk_s3::error::ErrorMetadata::builder()
+                    .code("NoSuchKey")
+                    .message("not found")
+                    .build(),
+            )
+        });
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+
+        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+
+        let (transfer, completion_rx) =
+            setup_enqueued(dir.path(), FailedTransferPolicy::Abort, s3_client, handle);
+
+        // The parent's completion must resolve promptly rather than stranding
+        // when the scheduler removes the terminal parent.
+        timeout(Duration::from_secs(10), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("Abort failure must signal parent terminal, not strand join()");
+
+        assert!(transfer.ctx().is_failed());
     }
 
     #[cfg_attr(miri, ignore)]

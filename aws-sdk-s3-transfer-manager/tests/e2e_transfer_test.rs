@@ -3,6 +3,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+// TODO(vnext): fold these tests into the integration-tests e2e harness (see integration-tests/src/harness.rs Target).
 // Tests here requires AWS account with pre-configured S3 bucket to run the tests.
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
@@ -438,10 +439,6 @@ async fn test_object_download_range_failures() {
     }
 }
 
-// FIXME: upload_objects/download_objects still use the old scheduler and panic
-// when the managed thread runtime's per-thread HTTP client is invoked from a
-// non-managed thread. Re-enable after migrating _objects paths to the new scheduler.
-#[ignore]
 #[tokio::test]
 async fn test_objects_transfer() {
     let _logs = show_test_logs();
