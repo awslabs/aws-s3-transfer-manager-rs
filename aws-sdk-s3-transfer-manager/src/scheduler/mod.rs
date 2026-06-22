@@ -4,6 +4,7 @@
  */
 
 pub(crate) mod concurrency;
+mod gate;
 #[allow(clippy::module_inception)]
 mod scheduler;
 mod transfer;
