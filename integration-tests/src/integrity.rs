@@ -76,21 +76,21 @@
 //!
 //! ## Negative: a tampered download MUST fail (mock only)
 //!
-//! | Object              | Request mode | Tamper injected     | Asserts                                |
-//! |---------------------|--------------|---------------------|----------------------------------------|
-//! | single-part         | ENABLED      | CorruptBody         | ChunkFailed                            |
-//! | single-part (file)  | ENABLED      | CorruptBody         | ChunkFailed; temp cleaned, dest absent |
-//! | multipart (matched) | ENABLED      | WrongStoredChecksum | ChunkFailed (explicit matched size)    |
-//! | multipart (Auto sz) | ENABLED      | WrongStoredChecksum | ChunkFailed (auto-aligned, caught)     |
-//! | single-PUT split    | ENABLED      | CorruptBody         | #[ignore] intent: must ChunkFailed — FAILS today (TODO) |
+//! | Object              | Request mode | Tamper injected     | Asserts                                 |
+//! |---------------------|--------------|---------------------|-----------------------------------------|
+//! | single-part         | ENABLED      | CorruptBody         | IntegrityError                          |
+//! | single-part (file)  | ENABLED      | CorruptBody         | IntegrityError; temp cleaned, dest absent |
+//! | multipart (matched) | ENABLED      | WrongStoredChecksum | IntegrityError (explicit matched size)  |
+//! | multipart (Auto sz) | ENABLED      | WrongStoredChecksum | IntegrityError (auto-aligned, caught)   |
+//! | single-PUT split    | ENABLED      | CorruptBody         | #[ignore] intent: must IntegrityError — FAILS today (TODO) |
 //!
 //! * Verdict stays NotValidated even on success until the SDK exposes a
 //!   per-response validation outcome (see "Current limitation"). The negative
 //!   tables hold today regardless.
 //!
-//! Tamper tests assert the specific `ErrorKind::ChunkFailed` (the kind a checksum
-//! mismatch surfaces as), not merely `is_err()`, so an unrelated failure cannot
-//! pass them.
+//! Tamper tests assert the specific `ErrorKind::IntegrityError` (the kind a
+//! checksum mismatch surfaces as), not merely `is_err()`, so an unrelated
+//! failure cannot pass them.
 //!
 //! Multipart downloads are validated by default: when validating a multipart
 //! object with an Auto part size, the TM discovers the stored part size (a
@@ -114,9 +114,9 @@
 //! through this matrix. Representative algorithms are used: CRC32 for full
 //! object, SHA-256 for the composite case.
 
+use crate::assertions::{assert_integrity_error, assert_same_content};
 use crate::harness::Target;
 use aws_sdk_s3::types::ChecksumMode;
-use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
@@ -156,40 +156,6 @@ fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
         ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
         other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
     }
-}
-
-/// Assert a download failed with a per-chunk failure (the kind a checksum
-/// mismatch surfaces as: the SDK body validator errors on a chunk, which the
-/// transfer manager reports as `ErrorKind::ChunkFailed`). Asserting the kind,
-/// not just `is_err()`, pins that the failure is integrity-related and not some
-/// unrelated error path.
-fn assert_chunk_failed<T>(result: Result<T, Error>) {
-    match result {
-        Err(e) if matches!(e.kind(), ErrorKind::ChunkFailed(_)) => {}
-        Err(e) => panic!("expected ErrorKind::ChunkFailed, got {:?}", e.kind()),
-        Ok(_) => panic!("expected the download to fail with ChunkFailed, but it succeeded"),
-    }
-}
-
-/// Assert downloaded bytes match the source without dumping the buffers. A
-/// failed `assert_eq!` on multi-megabyte buffers prints both in full; this gates
-/// on real byte equality and, on mismatch, reports lengths and the first
-/// differing offset.
-fn assert_same_content(expected: &[u8], actual: &[u8]) {
-    if expected == actual {
-        return;
-    }
-    let first_diff = expected
-        .iter()
-        .zip(actual.iter())
-        .position(|(a, b)| a != b)
-        .unwrap_or(expected.len().min(actual.len()));
-    panic!(
-        "content mismatch: expected len={}, got len={}, first diff at byte {}",
-        expected.len(),
-        actual.len(),
-        first_diff
-    );
 }
 
 /// Write `len` bytes of the deterministic `i % 256` pattern to `path` and return
@@ -565,7 +531,7 @@ async fn tampered_single_part_errors(target: Target) {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
 
     t.shutdown().await;
 }
@@ -573,6 +539,49 @@ async fn tampered_single_part_errors(target: Target) {
 #[tokio::test]
 async fn tampered_single_part_errors_mock_gp() {
     tampered_single_part_errors(Target::mock_gp()).await;
+}
+
+// Backwards-compatibility guard: a real checksum mismatch must populate the
+// IntegrityError fields. These are extracted from the SDK's
+// `aws_smithy_checksums::body::validate::Error` shape at the body-read boundary;
+// if the SDK changes that error type, the extraction silently degrades to a bare
+// IOError and integrity failures stop being distinguishable. This test fails
+// loudly in that case.
+#[tokio::test]
+async fn integrity_error_carries_extracted_fields_mock_gp() {
+    let t = Target::mock_gp().connect().await;
+    let data = small();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("tamper faults require the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    let ie = crate::assertions::expect_integrity_error(result);
+
+    // The expected/computed checksums must be recovered from the SDK error.
+    assert!(
+        ie.expected().is_some(),
+        "expected checksum should be extracted from the SDK mismatch error"
+    );
+    assert!(
+        ie.computed().is_some(),
+        "computed checksum should be extracted from the SDK mismatch error"
+    );
+    assert_ne!(
+        ie.expected(),
+        ie.computed(),
+        "a mismatch must report differing expected/computed values"
+    );
+
+    t.shutdown().await;
 }
 
 // tamper -> error on the FILE path (validate before rename) ---------------------
@@ -604,7 +613,7 @@ async fn tampered_single_part_file_errors(target: Target) {
     let result = t
         .download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
         .await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
     assert!(
         !dest.exists(),
         "destination must not be created on a failed download"
@@ -757,7 +766,7 @@ async fn tampered_many_part_file_cleans_up(target: Target) {
     let result = t
         .download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
         .await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
     assert!(
         !dest.exists(),
         "destination must not be created on a failed download"
@@ -853,7 +862,7 @@ async fn tampered_multipart_errors(target: Target) {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
 
     t.shutdown().await;
 }
@@ -928,7 +937,7 @@ async fn multipart_default_tamper_caught(target: Target) {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
 
     t.shutdown().await;
 }
@@ -973,7 +982,7 @@ async fn single_put_split_tamper_caught_mock_gp() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
-    assert_chunk_failed(result);
+    assert_integrity_error(result);
 
     t.shutdown().await;
 }

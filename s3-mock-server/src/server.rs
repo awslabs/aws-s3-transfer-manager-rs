@@ -151,6 +151,7 @@ impl S3MockServerBuilder {
         Ok(S3MockServer {
             storage,
             faults: Arc::new(crate::faults::FaultRegistry::default()),
+            connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: self.config,
         })
     }
@@ -225,6 +226,11 @@ pub struct S3MockServer {
 
     /// Key-scoped fault injection registry (shared with the serving task).
     faults: Arc<crate::faults::FaultRegistry>,
+
+    /// Connect-time reset: number of freshly accepted connections to abort (RST)
+    /// immediately, before serving any request. Server-scoped because no request
+    /// exists at connect time; decremented per reset. Shared with the serving task.
+    connect_reset: Arc<std::sync::atomic::AtomicU64>,
 
     /// Server configuration.
     config: ServerConfig,
@@ -303,6 +309,14 @@ impl S3MockServer {
     /// Drop the entire fault queue for `(bucket, key)`.
     pub fn clear_fault(&self, bucket: &str, key: &str) {
         self.faults.clear(bucket, key);
+    }
+
+    /// Abort (RST) the next `count` freshly accepted connections immediately,
+    /// before serving any request, simulating a connect-time connection reset.
+    /// Server-scoped because no request exists at connect time.
+    pub fn reset_next_connections(&self, count: u64) {
+        self.connect_reset
+            .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Check if an object exists.
@@ -394,6 +408,7 @@ impl S3MockServer {
 
         let storage = self.storage.clone();
         let faults = self.faults.clone();
+        let connect_reset = self.connect_reset.clone();
         let server_task = tokio::spawn(async move {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
@@ -422,8 +437,36 @@ impl S3MockServer {
                 };
                 tracing::trace!(port = %addr.port(), %peer, "accepted connection");
 
+                // Connect-time reset: abort this connection immediately (RST)
+                // before serving, if armed. Decrement the remaining count.
+                {
+                    use std::sync::atomic::Ordering;
+                    let remaining = connect_reset.load(Ordering::Relaxed);
+                    if remaining > 0
+                        && connect_reset
+                            .compare_exchange(
+                                remaining,
+                                remaining - 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        let _ = socket.set_zero_linger();
+                        drop(socket);
+                        continue;
+                    }
+                }
+
+                // Per-connection fault control: the socket wrapper reads it, the
+                // service wrapper injects it into each request's extensions so the
+                // handler can arm it for this connection.
+                let fault = Arc::new(crate::socket_fault::ConnectionFault::new());
+                let socket = crate::socket_fault::AbortAfterWrite::new(socket, fault.clone());
+                let service =
+                    crate::socket_fault::InjectConnectionFault::new(service.clone(), fault);
                 let conn = http_server
-                    .serve_connection(TokioIo::new(socket), service.clone())
+                    .serve_connection(TokioIo::new(socket), service)
                     .into_owned();
                 let conn = graceful.watch(conn);
                 tokio::spawn(async move {

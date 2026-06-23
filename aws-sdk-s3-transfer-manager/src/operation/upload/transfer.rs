@@ -283,6 +283,10 @@ impl UploadTransfer {
             copy_fields_to_mpu_request(&self.inner.request, client.create_multipart_upload());
 
         let resp = match mpu_req
+            .customize()
+            .config_override(crate::retry::bucket_partition_override(
+                self.inner.request.bucket(),
+            ))
             .send()
             .instrument(tracing::debug_span!("send-create-multipart-upload"))
             .await
@@ -395,13 +399,12 @@ impl UploadTransfer {
         let data_bytes = data.data;
         let checksum = data.checksum;
 
-        let resp = match self
-            .inner
-            .ctx
-            .handle
-            .telemetry
-            .send_latencies
-            .guarded(|| {
+        let send_latencies = &self.inner.ctx.handle.telemetry.send_latencies;
+        // Only the latency deadline drives retry here. The SDK already retries
+        // the UploadPart dispatch by rewinding the in-memory body, so a returned
+        // error means those retries are exhausted and re-issuing would not help.
+        let result =
+            crate::retry::retry_guarded(send_latencies, crate::retry::retry_deadline_only, || {
                 let body = ByteStream::from(data_bytes.clone());
                 let req = copy_fields_to_upload_part_request(
                     &self.inner.request,
@@ -417,14 +420,18 @@ impl UploadTransfer {
                 );
                 async move {
                     req.customize()
+                        .config_override(crate::retry::bucket_partition_override(
+                            self.inner.request.bucket(),
+                        ))
                         .disable_payload_signing()
                         .send()
                         .instrument(tracing::debug_span!("send-upload-part", part_number))
                         .await
+                        .map_err(crate::error::Error::from)
                 }
             })
-            .await
-        {
+            .await;
+        let resp = match result {
             Ok(resp) => resp,
             Err(e) => return self.fail(e),
         };
@@ -540,7 +547,12 @@ impl UploadTransfer {
         let timeout_cfg = TimeoutConfig::builder()
             .read_timeout(PUT_OBJECT_READ_TIMEOUT)
             .build();
-        let config_override = aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
+        let mut config_override =
+            aws_sdk_s3::config::Builder::default().timeout_config(timeout_cfg);
+        if let Some(bucket) = self.inner.request.bucket() {
+            config_override =
+                config_override.retry_partition(crate::retry::bucket_retry_partition(bucket));
+        }
 
         // Per-call SDK telemetry: latency + error attribution.
         let transfer_id = self.inner.ctx.id;
@@ -655,6 +667,10 @@ impl UploadTransfer {
         .await;
 
         let resp = match complete_req
+            .customize()
+            .config_override(crate::retry::bucket_partition_override(
+                self.inner.request.bucket(),
+            ))
             .send()
             .instrument(tracing::debug_span!("send-complete-multipart-upload"))
             .await

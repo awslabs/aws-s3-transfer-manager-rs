@@ -77,12 +77,25 @@ impl Target {
     /// `WhenRequired`, so the SDK does NOT auto-enable `ChecksumMode` and an
     /// unset-mode download resolves to validation disabled.
     pub(crate) async fn connect_mock_when_required(self) -> TmTestClient {
-        assert_eq!(self.backend, Backend::Mock, "mock-only helper");
-        TmTestClient::connect_mock_with(
-            None,
-            Some(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired),
-        )
+        self.connect_mock_configured(None, |b| {
+            b.response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
+        })
         .await
+    }
+
+    /// Mock-only escape hatch: connect with an arbitrary override applied to the
+    /// mock S3 client's config builder, for tests that need a non-default client
+    /// (checksum validation, stalled-stream protection, timeouts, ...). Builds the
+    /// mock client, applies `configure`, then wires it into the transfer manager.
+    pub(crate) async fn connect_mock_configured(
+        self,
+        part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
+        configure: impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder,
+    ) -> TmTestClient {
+        assert_eq!(self.backend, Backend::Mock, "mock-only helper");
+        TmTestClient::connect_mock_with(part_size, Some(configure)).await
     }
 
     /// Connect, optionally pinning an explicit part size. A pinned size applies
@@ -123,15 +136,20 @@ struct MockBackend {
 
 impl TmTestClient {
     async fn connect_mock(part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>) -> Self {
-        Self::connect_mock_with(part_size, None).await
+        Self::connect_mock_with(
+            part_size,
+            None::<fn(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder>,
+        )
+        .await
     }
 
-    /// Connect to the mock, optionally pinning a part size and overriding the S3
-    /// client's `ResponseChecksumValidation`. `None` validation leaves the SDK
-    /// default (`WhenSupported`), under which the SDK auto-enables `ChecksumMode`.
+    /// Connect to the mock, optionally pinning a part size and applying an
+    /// override to the S3 client's config builder. With no override the mock
+    /// client uses SDK defaults (`ResponseChecksumValidation::WhenSupported`,
+    /// stalled-stream protection enabled).
     async fn connect_mock_with(
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
-        response_checksum_validation: Option<aws_sdk_s3::config::ResponseChecksumValidation>,
+        configure: Option<impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder>,
     ) -> Self {
         let server = S3MockServer::builder()
             .with_in_memory_store()
@@ -139,12 +157,8 @@ impl TmTestClient {
             .expect("build mock server");
         let handle = server.start().await.expect("start mock server");
         let mut s3_client = handle.client().await;
-        if let Some(rcv) = response_checksum_validation {
-            let conf = s3_client
-                .config()
-                .to_builder()
-                .response_checksum_validation(rcv)
-                .build();
+        if let Some(configure) = configure {
+            let conf = configure(s3_client.config().to_builder()).build();
             s3_client = aws_sdk_s3::Client::from_conf(conf);
         }
         s3_client

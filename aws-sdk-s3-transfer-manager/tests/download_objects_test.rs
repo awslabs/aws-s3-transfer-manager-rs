@@ -485,7 +485,14 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
         // ListObjectsV2 returns a modeled error (no retries on modeled errors)
         let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_error(|| {
             ListObjectsV2Error::NoSuchBucket(
-                aws_sdk_s3::types::error::NoSuchBucket::builder().build(),
+                aws_sdk_s3::types::error::NoSuchBucket::builder()
+                    .meta(
+                        aws_smithy_types::error::ErrorMetadata::builder()
+                            .code("NoSuchBucket")
+                            .message("The specified bucket does not exist")
+                            .build(),
+                    )
+                    .build(),
             )
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list]);
@@ -505,8 +512,11 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
             .unwrap();
 
         let err = handle.join().await.unwrap_err();
-        // Walker failure surfaces as ObjectNotDiscoverable
-        assert_eq!(&ErrorKind::ObjectNotDiscoverable, err.kind());
+        // A ListObjectsV2 failure surfaces as a service error carrying the
+        // operation and recovered service metadata.
+        assert_eq!(&ErrorKind::ServiceError, err.kind());
+        assert_eq!(Some("ListObjectsV2"), err.operation_name());
+        assert!(err.is_not_found(), "NoSuchBucket should be not-found");
     })
     .await
     .expect("test_failed_list_objects_should_cancel_the_operation timed out");
@@ -542,12 +552,15 @@ async fn test_failed_get_object_should_cancel_the_operation() {
             .unwrap();
 
         let err = handle.join().await.unwrap_err();
-        // Child download failure under Abort policy propagates the error
+        // Under Abort policy the parent surfaces ChildOperationFailed, carrying
+        // the per-object failures so they are reachable on the error path.
+        assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
+        let failed = err
+            .failed_downloads()
+            .expect("ChildOperationFailed carries the failed downloads");
         assert!(
-            err.kind() == &ErrorKind::ObjectNotDiscoverable
-                || err.kind() == &ErrorKind::ChildOperationFailed,
-            "unexpected error kind: {:?}",
-            err.kind()
+            !failed.is_empty(),
+            "expected at least one failed download to be attached"
         );
     })
     .await

@@ -114,21 +114,7 @@ use std::time::Duration;
 /// Batch size for work generated and submitted in a single round
 const SUBMISSION_QUEUE_SIZE: usize = 64;
 
-/// RAII guard for [`Scheduler::generate_work`] exclusion.
-///
-/// Only one thread may be inside `generate_work` at a time. This
-/// serializes scheduling decisions so that priority ordering is
-/// respected even under high concurrency — without it, N threads
-/// pop from the ready set simultaneously, draining the tree in
-/// parallel without giving any transfer the chance to re-insert
-/// between pops. Priority differentiation depends on sequential
-/// pop-poll-reinsert cycles (hi-priority re-enters at lower vruntime,
-/// gets popped again sooner); concurrent pops short-circuit this.
-///
-/// The lock also prevents re-entrancy: `enqueue_transfer` (called from
-/// inside `poll_work` → `spawn_children`) checks `try_lock` and skips
-/// `generate_work` when the current thread already holds it.
-struct GenerateWorkGuard<'a>(#[allow(dead_code)] parking_lot::MutexGuard<'a, ()>);
+use super::gate::GenerateWorkGate;
 
 /// Event-driven scheduler for coordinating transfer work.
 ///
@@ -142,9 +128,9 @@ struct SchedulerInner {
     handle: Weak<crate::client::Handle>,
     dispatched: AtomicUsize,
     submission_queue: SubmissionQueue<ScheduledWork>,
-    /// Cross-thread exclusion for [`Scheduler::generate_work`].
-    /// See [`GenerateWorkGuard`] for rationale.
-    generate_work_lock: parking_lot::Mutex<()>,
+    /// Admits one work-generation runner and coalesces requests without losing
+    /// a wake. See [`GenerateWorkGate`].
+    generate_work_gate: GenerateWorkGate,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -187,7 +173,7 @@ impl Scheduler {
             handle,
             dispatched: AtomicUsize::new(0),
             submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
-            generate_work_lock: parking_lot::Mutex::new(()),
+            generate_work_gate: GenerateWorkGate::new(),
         }))
     }
 
@@ -271,26 +257,24 @@ impl Scheduler {
         tracing::debug!(target: telemetry::TARGET_SCHEDULING, tid = %id, "transfer enqueued");
         // Drive `generate_work` unless we're already inside it on this
         // thread (the parent's `poll_work` called `spawn_children` →
-        // `enqueue_transfer`). The cross-thread `generate_work_lock`
-        // handles both cases:
+        // `enqueue_transfer`). The `GenerateWorkGate` handles both cases:
         //
-        // 1. Re-entrancy: `try_lock` returns None on the same thread
-        //    that already holds it. Without this, the re-entrant frame
-        //    would call `submission_queue.enter()`, incrementing the
-        //    global `pending` counter. The outer frame's `submit()` then
-        //    sees pending > 0 and waits for the nested submission to
-        //    flush — but the nested frame can't flush until the outer
-        //    frame releases the lock. Deadlock.
+        // 1. Re-entrancy: `try_acquire` returns None on the runner's own
+        //    thread. Without this, the re-entrant frame would call
+        //    `submission_queue.enter()`, incrementing the global `pending`
+        //    counter. The outer frame's `submit()` then sees pending > 0 and
+        //    waits for the nested submission to flush — but the nested frame
+        //    can't flush until the outer frame returns. Deadlock.
         //
-        // 2. Cross-thread serialization: only one thread pops from the
-        //    ready set at a time, preserving priority ordering. Priority
-        //    depends on sequential pop-poll-reinsert cycles (hi-priority
-        //    re-enters at lower vruntime, gets popped again sooner).
-        //    Concurrent pops short-circuit this by draining the tree in
-        //    parallel without giving transfers the chance to re-insert.
+        // 2. Cross-thread serialization: only the runner pops from the ready
+        //    set at a time, preserving priority ordering. Priority depends on
+        //    sequential pop-poll-reinsert cycles (hi-priority re-enters at
+        //    lower vruntime, gets popped again sooner). Concurrent pops would
+        //    short-circuit this by draining the tree in parallel without
+        //    giving transfers the chance to re-insert.
         //
-        // The outer frame picks up the newly-inserted transfer on its
-        // next loop iteration (or on the second pass of the for loop).
+        // The runner picks up the newly-inserted transfer on its current pass,
+        // or on the extra pass our recorded request forces (case 1).
         self.generate_work();
     }
 
@@ -576,21 +560,20 @@ impl Scheduler {
     }
 
     /// Generate work from ready transfers and dispatch to runtime.
+    ///
+    /// Callers (`wake`, `on_completion`, re-entrant `enqueue_transfer`) insert
+    /// their descriptor into the ready set BEFORE calling this, then acquire the
+    /// [`GenerateWorkGate`]: the sole runner drains generation passes, and any
+    /// other caller's request is coalesced into an extra pass the runner makes
+    /// on its behalf, so no wake is lost.
     fn generate_work(&self) {
-        // Serialize scheduling decisions across threads so priority
-        // ordering is respected. If another thread (or a re-entrant
-        // enqueue_transfer call) already holds the lock, bail out —
-        // the holder will pick up any newly-available work via the
-        // has_capacity + ready_set.is_empty re-check below.
-        let Some(lock) = self.0.generate_work_lock.try_lock() else {
+        // Become the sole runner, or bail — a request was recorded for the
+        // active runner to drain on our behalf (this is also the re-entrancy
+        // guard; see `GenerateWorkGate::try_acquire`).
+        let Some(mut permit) = self.0.generate_work_gate.try_acquire() else {
             return;
         };
-        let _guard = GenerateWorkGuard(lock);
-        // Run the generation loop up to twice: once for the primary pass,
-        // and once more to catch work inserted by wake()/on_completion()
-        // calls that failed try_lock while we held it. Without the second
-        // pass, those callers' generate_work is lost.
-        for _pass in 0..2 {
+        loop {
             let mut sub = self.0.submission_queue.enter();
             let mut generated = 0usize;
             let mut polled = 0usize;
@@ -724,18 +707,16 @@ impl Scheduler {
                 target = self.handle().controller.target(),
                 "generate_work.exit",
             );
-            // Re-check: a wake() or on_completion() may have inserted into
-            // the ready set while we were in the submit/dispatch path above.
-            // Their generate_work() call failed try_lock and returned.
-            // If the inner loop found nothing (ready_set was empty and we
-            // generated no work), no point retrying.
-            if break_reason == "ready_set_empty" && generated == 0 {
+            // Attempt to release the permit, or run another pass if a wake() or
+            // on_completion() recorded a request while we drained above (their
+            // try_acquire could not take the permit, so they relied on us). A
+            // pass that stopped on `no_capacity` retires too: the on_completion
+            // that frees a slot re-enters generation. The gate makes the
+            // retire-vs-rerun decision lost-wake-free; see `try_release`.
+            if permit.try_release() {
                 break;
             }
-            if !self.has_capacity() {
-                break;
-            }
-        } // end for _pass
+        }
     }
 
     #[allow(dead_code)]
@@ -1967,7 +1948,7 @@ mod tests {
 
         // 4x priority difference (255 vs 64) yields ~4x dispatch ratio
         // via the priority-scaled vruntime delta. With serialized
-        // generate_work (cross-thread exclusion via parking_lot::Mutex),
+        // generate_work (single-runner admission via GenerateWorkGate),
         // the ratio converges to the theoretical value on both runtimes.
         // Threshold of 3.5 provides margin for CI scheduling noise.
         let ratio = hi_count as f64 / lo_count.max(1) as f64;
@@ -2259,8 +2240,10 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    //! Loom verification of the lock-ordering protocol used by
+    //! Loom verification of the enqueue/cancel lock-ordering protocol used by
     //! [`Scheduler::enqueue_transfer`] and [`Scheduler::cancel_transfer`].
+    //! (The `generate_work` admission protocol is verified in
+    //! [`super::super::gate`], co-located with its unit.)
     //!
     //! The protocol coordinates two independent locks:
     //!   - `Scheduler.transfers: RwLock<HashMap<TransferId, _>>`

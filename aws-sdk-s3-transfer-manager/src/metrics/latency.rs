@@ -24,11 +24,6 @@ const WARM_DEADLINE_MULTIPLIER: f64 = 2.0;
 /// deadline. Needs enough data for a meaningful P99 estimate.
 const WARM_THRESHOLD: usize = 10;
 
-/// Maximum attempts before failing the request. Each attempt after
-/// the first cancels the in-flight request (dropping the future
-/// releases the HTTP connection) and retries on a fresh connection.
-const MAX_TIMEOUT_ATTEMPTS: usize = 3;
-
 /// If the observed average request duration exceeds this threshold,
 /// disable adaptive timeouts (return None). For very large parts,
 /// re-uploading/re-downloading is more expensive than waiting for a
@@ -59,6 +54,16 @@ const TIMEOUT_BACKOFF_MODERATE: Duration = Duration::from_millis(100);
 
 /// Backoff added to deadline at high timeout rate.
 const TIMEOUT_BACKOFF_HIGH: Duration = Duration::from_secs(1);
+
+/// Outcome of a single [`LatencyTracker::guarded`] attempt that did not succeed.
+pub(crate) enum GuardError<E> {
+    /// The future did not complete within the adaptive deadline (the carried
+    /// [`Duration`]). The in-flight future was dropped, releasing its HTTP
+    /// connection, so a retry runs on a fresh one. Carries no inner error.
+    DeadlineExceeded(Duration),
+    /// The guarded future produced an error before the deadline.
+    Inner(E),
+}
 
 /// Tracks per-operation request latencies and computes adaptive deadlines.
 ///
@@ -97,6 +102,12 @@ impl LatencyTracker {
     /// Record a timed-out request.
     pub(crate) fn record_timeout(&self) {
         self.timeout_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of recorded timeouts. Test-only accessor for retry-loop tests.
+    #[cfg(test)]
+    pub(crate) fn timeout_count(&self) -> usize {
+        self.timeout_count.load(Ordering::Relaxed)
     }
 
     /// Compute the adaptive deadline for the next request.
@@ -149,65 +160,47 @@ impl LatencyTracker {
         Some(deadline)
     }
 
-    /// Execute `build` with an adaptive timeout, retrying up to
-    /// [`MAX_TIMEOUT_ATTEMPTS`] times on timeout.
+    /// Run `fut` once under the adaptive deadline.
     ///
-    /// When cold (no deadline), runs directly without timeout — always records
-    /// duration to warm up the tracker. The retry loop only applies when there
-    /// is a deadline to timeout against.
+    /// On success records the duration (warming the tracker) and returns the
+    /// value. When cold (no deadline) runs without a timeout, so the only
+    /// failure is the inner error. When warm, races `fut` against the deadline:
+    /// if it elapses, the in-flight future is dropped, a timeout is recorded,
+    /// and [`GuardError::DeadlineExceeded`] carries the deadline that was
+    /// exceeded.
     ///
-    /// On timeout the in-flight future is dropped, which tears down the
-    /// HTTP connection (hyper's `Pooled::Drop` sees the incomplete request
-    /// and discards the connection). The next `build()` call gets a fresh
-    /// connection from the pool.
-    ///
-    /// SDK errors (the inner `Err`) are returned immediately without retry —
-    /// they represent server-side rejections, not straggler latency.
-    pub(crate) async fn guarded<T, E, F, Fut>(&self, mut build: F) -> Result<T, crate::error::Error>
+    /// A single attempt: the inner error is returned verbatim as
+    /// [`GuardError::Inner`]. Retry and classification live in [`crate::retry`].
+    pub(crate) async fn guarded<T, E, Fut>(&self, fut: Fut) -> Result<T, GuardError<E>>
     where
-        F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, E>>,
-        E: Into<crate::error::Error>,
     {
-        for attempt in 1..=MAX_TIMEOUT_ATTEMPTS {
-            let deadline = self.deadline();
-            let start = Instant::now();
-
-            match deadline {
-                None => {
-                    // Cold or escape hatch: no timeout, run directly.
-                    // Always record duration to warm up the tracker.
-                    match build().await {
-                        Ok(val) => {
-                            self.record(start.elapsed());
-                            return Ok(val);
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
+        let start = Instant::now();
+        match self.deadline() {
+            None => match fut.await {
+                Ok(val) => {
+                    self.record(start.elapsed());
+                    Ok(val)
                 }
-                Some(dl) => match tokio::time::timeout(dl, build()).await {
-                    Ok(Ok(val)) => {
-                        self.record(start.elapsed());
-                        return Ok(val);
-                    }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_timeout) => {
-                        self.record_timeout();
-                        tracing::debug!(
-                            target: crate::telemetry::TARGET_TRANSFER,
-                            attempt,
-                            deadline_ms = dl.as_millis() as u64,
-                            "request timed out, retrying"
-                        );
-                    }
-                },
-            }
+                Err(e) => Err(GuardError::Inner(e)),
+            },
+            Some(dl) => match tokio::time::timeout(dl, fut).await {
+                Ok(Ok(val)) => {
+                    self.record(start.elapsed());
+                    Ok(val)
+                }
+                Ok(Err(e)) => Err(GuardError::Inner(e)),
+                Err(_timeout) => {
+                    self.record_timeout();
+                    tracing::debug!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        deadline_ms = dl.as_millis() as u64,
+                        "request exceeded latency deadline"
+                    );
+                    Err(GuardError::DeadlineExceeded(dl))
+                }
+            },
         }
-
-        Err(crate::error::Error::new(
-            crate::error::ErrorKind::IOError,
-            format!("request timed out after {MAX_TIMEOUT_ATTEMPTS} attempts"),
-        ))
     }
 }
 
@@ -224,7 +217,7 @@ impl std::fmt::Debug for LatencyTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     /// Pre-warm a tracker with uniform samples so deadline() returns Some.
     fn warm_tracker(tracker: &LatencyTracker, duration: Duration) {
@@ -340,12 +333,12 @@ mod tests {
 
         // Even though 100ms would exceed a warm P99, cold tracker applies no timeout
         let result = tracker
-            .guarded(|| async {
+            .guarded(async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok::<_, crate::error::Error>(42)
             })
             .await;
-        assert_eq!(result.unwrap(), 42);
+        assert!(matches!(result, Ok(42)));
         assert_eq!(tracker.sample_count.load(Ordering::Relaxed), 1);
     }
 
@@ -356,9 +349,9 @@ mod tests {
         warm_tracker(&tracker, Duration::from_millis(100));
 
         let result = tracker
-            .guarded(|| async { Ok::<_, crate::error::Error>(42) })
+            .guarded(async { Ok::<_, crate::error::Error>(42) })
             .await;
-        assert_eq!(result.unwrap(), 42);
+        assert!(matches!(result, Ok(42)));
         assert_eq!(
             tracker.sample_count.load(Ordering::Relaxed),
             WARM_THRESHOLD + 1
@@ -367,73 +360,35 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn test_guarded_timeout_then_success() {
+    async fn test_guarded_deadline_exceeded() {
         let tracker = LatencyTracker::new();
         warm_tracker(&tracker, Duration::from_millis(100));
-        // Warm deadline ≈ 200ms
+        // Warm deadline ≈ 200ms; a 30s future trips it.
 
-        let attempts = AtomicUsize::new(0);
-        let result = tracker
-            .guarded(|| {
-                let n = attempts.fetch_add(1, Ordering::Relaxed);
-                async move {
-                    if n == 0 {
-                        // Exceeds warm deadline (~200ms)
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                    }
-                    Ok::<_, crate::error::Error>(42)
-                }
+        let result: Result<(), _> = tracker
+            .guarded(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<_, crate::error::Error>(())
             })
             .await;
-        assert_eq!(result.unwrap(), 42);
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(matches!(result, Err(GuardError::DeadlineExceeded(_))));
+        // The deadline drop tears down the connection and records a timeout.
         assert_eq!(tracker.timeout_count.load(Ordering::Relaxed), 1);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn test_guarded_all_attempts_exhausted() {
+    async fn test_guarded_inner_error_passed_through() {
         let tracker = LatencyTracker::new();
-        warm_tracker(&tracker, Duration::from_millis(100));
-
-        let attempts = AtomicUsize::new(0);
-        let result = tracker
-            .guarded(|| {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                async {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    Ok::<_, crate::error::Error>(())
-                }
-            })
-            .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), &crate::error::ErrorKind::IOError);
-        assert_eq!(attempts.load(Ordering::Relaxed), MAX_TIMEOUT_ATTEMPTS);
-        assert_eq!(
-            tracker.timeout_count.load(Ordering::Relaxed),
-            MAX_TIMEOUT_ATTEMPTS
-        );
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test(start_paused = true)]
-    async fn test_guarded_sdk_error_no_retry() {
-        let tracker = LatencyTracker::new();
-        let attempts = AtomicUsize::new(0);
         let result: Result<(), _> = tracker
-            .guarded(|| {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                async {
-                    Err::<(), _>(crate::error::Error::new(
-                        crate::error::ErrorKind::ChildOperationFailed,
-                        "simulated SDK error",
-                    ))
-                }
+            .guarded(async {
+                Err::<(), _>(crate::error::Error::new(
+                    crate::error::ErrorKind::RuntimeError,
+                    "simulated SDK error",
+                ))
             })
             .await;
-        assert!(result.is_err());
-        // Should not retry on SDK errors
-        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        // The inner error is returned verbatim for the caller to classify.
+        assert!(matches!(result, Err(GuardError::Inner(_))));
     }
 }

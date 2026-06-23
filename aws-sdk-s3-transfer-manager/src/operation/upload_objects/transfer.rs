@@ -969,10 +969,7 @@ impl UploadObjectsTransfer {
             );
             // Transfer is failing: drop the walker (no walk_back).
             slot.consume(&mut state, None);
-            ctx.set_failed_and_signal(crate::error::Error::new(
-                crate::error::ErrorKind::IOError,
-                fatal.to_string(),
-            ));
+            ctx.set_failed_and_signal(fatal);
             return WorkOutcome::Failed {
                 classification: None,
             };
@@ -990,10 +987,11 @@ impl UploadObjectsTransfer {
                 error = %we,
                 "non-fatal walker error recorded"
             );
+            let source_path = we.path().map(|p| p.to_path_buf());
             state.failed.push(FailedUpload {
                 input: None,
-                error: crate::error::Error::new(crate::error::ErrorKind::IOError, we.to_string()),
-                source_path: we.path().map(|p| p.to_path_buf()),
+                error: crate::error::Error::from(we),
+                source_path,
             });
             if *self.failure_policy() == FailedTransferPolicy::Abort {
                 // Transfer is aborting: drop the walker (no walk_back).

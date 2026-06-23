@@ -17,23 +17,6 @@ use std::time::Duration;
 
 use crate::runtime::ExecutionRuntime;
 
-/// Disable the SDK's stalled-stream protection on a config builder the transfer
-/// manager constructs (the `from_env`/`s3_config` path).
-///
-/// The transfer manager owns stall detection for the bodies it drives (an
-/// adaptive, transfer-aware deadline in the download path), and it applies
-/// backpressure: a chunk body may be intentionally left unpolled while the slot
-/// buffer is full. The SDK's body-level minimum-throughput guard cannot tell
-/// that apart from a dead connection and would abort a healthy, backpressured
-/// chunk. A client supplied directly via `client()` is left untouched (the
-/// caller owns its configuration); this applies only to clients the transfer
-/// manager builds itself.
-fn without_stalled_stream_protection(
-    builder: aws_sdk_s3::config::Builder,
-) -> aws_sdk_s3::config::Builder {
-    builder.stalled_stream_protection(aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
-}
-
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -95,9 +78,7 @@ impl Handle {
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => client,
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    aws_sdk_s3::Client::from_conf(
-                        without_stalled_stream_protection(s3_config.builder).build(),
-                    )
+                    aws_sdk_s3::Client::from_conf(s3_config.builder.build())
                 }
             };
             Self {
@@ -155,9 +136,7 @@ impl Handle {
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => client,
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    aws_sdk_s3::Client::from_conf(
-                        without_stalled_stream_protection(s3_config.builder).build(),
-                    )
+                    aws_sdk_s3::Client::from_conf(s3_config.builder.build())
                 }
             };
             Self {
@@ -220,7 +199,7 @@ impl Client {
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => client,
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    let mut builder = without_stalled_stream_protection(s3_config.builder);
+                    let mut builder = s3_config.builder;
                     if s3_config.enable_runtime_http {
                         if let Some(http_client) = runtime.components().http_client() {
                             builder = builder.http_client(http_client.clone());

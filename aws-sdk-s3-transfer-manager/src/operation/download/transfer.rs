@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use bytes_utils::SegmentedBuf;
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use super::input::copy_fields_to_get_object_request;
 
-use crate::error::{self, ChunkId, Error};
+use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
@@ -331,7 +331,7 @@ impl DownloadTransfer {
             *work = DownloadState::Transferring {
                 remaining,
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
-                etag,
+                etag: etag.clone(),
                 part_size: effective_part_size,
             };
         }
@@ -342,7 +342,7 @@ impl DownloadTransfer {
         // If discovery returned an initial chunk, process it
         match initial_work {
             Some((stream, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(stream, slot, chunk_meta)
+                self.execute_read_discovery_body(stream, slot, chunk_meta, etag)
                     .await
             }
             None => WorkOutcome::Success { data: None },
@@ -354,31 +354,69 @@ impl DownloadTransfer {
         stream: aws_sdk_s3::primitives::ByteStream,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
+        etag: Option<Arc<str>>,
     ) -> WorkOutcome {
         let seq = slot.seq();
-        // Read the body from the discovery response
-        let mut segmented = SegmentedBuf::new();
-        let mut bytes_received: u64 = 0;
-        let mut body_stream = stream;
-        while let Some(result) = body_stream.next().await {
-            let data = match result {
-                Ok(data) => data,
-                Err(e) => {
-                    // Go terminal before any wake: fail() sets Terminal under the
-                    // lock, so a woken poll_work cannot observe ranges_in_flight==0
-                    // and complete() the transfer over this error. The in-flight
-                    // count is abandoned with the Transferring state.
-                    let guard = self.inner.state.lock().unwrap();
-                    return self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e));
+        let input = self.inner.request.as_ref();
+        // The discovery GET already fetched this chunk's bytes; the first read
+        // consumes that stream with no extra request (preserving time-to-first-
+        // byte). A retry has no stream to reuse, so it re-issues a ranged GET for
+        // exactly the bytes this chunk covers, taken from the discovery response's
+        // content-range. A partNumber=1 discovery maps to the same byte range, so
+        // the re-issued aligned range returns the same per-part checksum the SDK
+        // validates against.
+        let reissue_range = chunk_meta
+            .content_range
+            .as_deref()
+            .and_then(crate::http::header::parse_content_range);
+
+        let mut initial = Some(stream);
+        let result = crate::retry::retry_guarded(
+            &self.inner.ctx.handle.telemetry.recv_latencies,
+            crate::retry::classify_body_retry,
+            || {
+                let pre_issued = initial.take();
+                let etag = etag.clone();
+                let ctx = self.inner.ctx.clone();
+                let reissue_range = reissue_range.clone();
+                let mut builder =
+                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+                if let Some(r) = reissue_range.as_ref() {
+                    builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
                 }
-            };
-            bytes_received += data.len() as u64;
-            segmented.push(data);
-            if !self.inner.ctx.is_active() {
-                self.decrement_in_flight();
-                return WorkOutcome::Cancelled;
+                if let Some(etag) = etag.as_ref() {
+                    builder = builder.if_match(etag.as_ref());
+                }
+                let req = builder
+                    .customize()
+                    .config_override(crate::retry::bucket_partition_override(input.bucket()));
+                async move {
+                    let body = match pre_issued {
+                        // First attempt: the body discovery already fetched.
+                        Some(s) => s,
+                        // Retry: re-fetch the discovery chunk's range.
+                        None => {
+                            let resp = req.send().await.map_err(crate::error::Error::from)?;
+                            resp.body
+                        }
+                    };
+                    Self::read_body_stream(&ctx, body).await
+                }
+            },
+        )
+        .await;
+
+        let (segmented, bytes_received) = match result {
+            Ok(val) => val,
+            // Go terminal before any wake: fail() sets Terminal under the lock, so
+            // a woken poll_work cannot observe ranges_in_flight==0 and complete()
+            // the transfer over this error. The in-flight count is abandoned with
+            // the Transferring state.
+            Err(e) => {
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, e.with_chunk(ChunkRef::new(seq, None)));
             }
-        }
+        };
 
         let chunk = ChunkOutput {
             seq,
@@ -417,6 +455,35 @@ impl DownloadTransfer {
         WorkOutcome::Success { data: None }
     }
 
+    /// Drain a chunk body stream into a buffer, returning the bytes and the count.
+    ///
+    /// Shared by the range-chunk and discovery-chunk paths. A stream error is
+    /// classified by [`error::body_read_error`]: a checksum mismatch becomes
+    /// [`ErrorKind::IntegrityError`] (which the retry classifier never re-issues,
+    /// to avoid masking corruption), any other stream failure becomes
+    /// [`ErrorKind::IOError`] (the body-read class the classifier re-issues). A
+    /// cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`].
+    async fn read_body_stream(
+        ctx: &TransferContext,
+        body: aws_sdk_s3::primitives::ByteStream,
+    ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
+        let mut segmented = SegmentedBuf::new();
+        let mut bytes_received: u64 = 0;
+        let mut body_stream = body;
+        while let Some(result) = body_stream.next().await {
+            let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
+            bytes_received += data.len() as u64;
+            segmented.push(data);
+            if !ctx.is_active() {
+                return Err(crate::error::Error::new(
+                    crate::error::ErrorKind::OperationCancelled,
+                    "transfer cancelled during body read",
+                ));
+            }
+        }
+        Ok((segmented, bytes_received))
+    }
+
     async fn execute_get_range(
         &self,
         range: std::ops::RangeInclusive<u64>,
@@ -427,56 +494,43 @@ impl DownloadTransfer {
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
-        let result = self
-            .inner
-            .ctx
-            .handle
-            .telemetry
-            .recv_latencies
-            .guarded(|| {
+        let result = crate::retry::retry_guarded(
+            &self.inner.ctx.handle.telemetry.recv_latencies,
+            crate::retry::classify_body_retry,
+            || {
                 let rh = range_header.clone();
                 let etag = etag.clone();
                 let ctx = self.inner.ctx.clone();
                 // Every chunk GET must carry the same request fields as discovery
                 // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
                 // conversion, then pin this chunk's range and the discovered etag.
-                let mut builder: GetObjectInputBuilder = input.clone().into();
+                let mut builder =
+                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
                 builder = builder.set_range(Some(rh.clone()));
                 if let Some(etag) = etag.as_ref() {
                     builder = builder.if_match(etag.as_ref());
                 }
+                let req = builder
+                    .customize()
+                    .config_override(crate::retry::bucket_partition_override(input.bucket()));
 
                 async move {
-                    let resp = builder
-                        .send_with(ctx.s3_client())
-                        .await
-                        .map_err(crate::error::Error::from)?;
-                    validate_content_range(seq, &rh, resp.content_range())?;
+                    let resp = req.send().await.map_err(crate::error::Error::from)?;
+                    validate_content_range(&rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
-                    let mut segmented = SegmentedBuf::new();
-                    let mut bytes_received: u64 = 0;
-                    let mut body_stream = resp.body;
-                    while let Some(result) = body_stream.next().await {
-                        let data = result.map_err(|e| {
-                            crate::error::Error::new(crate::error::ErrorKind::IOError, e)
-                        })?;
-                        bytes_received += data.len() as u64;
-                        segmented.push(data);
-                        if !ctx.is_active() {
-                            return Err(crate::error::Error::new(
-                                crate::error::ErrorKind::OperationCancelled,
-                                "transfer cancelled during body read",
-                            ));
-                        }
-                    }
+                    let (segmented, bytes_received) =
+                        Self::read_body_stream(&ctx, resp.body).await?;
                     Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         let (chunk_meta, segmented, bytes_received) = match result {
             Ok(val) => val,
-            Err(e) => return self.fail_range(seq, e),
+            Err(e) => {
+                return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
+            }
         };
 
         bail_if_terminal!(self);
@@ -519,13 +573,13 @@ impl DownloadTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    /// Fail a range request with an error.
-    fn fail_range(&self, seq: u64, e: impl Into<crate::error::BoxError>) -> WorkOutcome {
+    /// Fail a range request with an error, tagging the chunk it belongs to.
+    fn fail_range(&self, location: ChunkRef, e: Error) -> WorkOutcome {
         // Go terminal before any wake (see the discovery-body error path). Do not
         // decrement_in_flight first: that wakes poll_work, which would observe
         // ranges_in_flight==0 and complete() over this error.
         let guard = self.inner.state.lock().unwrap();
-        self.fail(guard, error::chunk_failed(ChunkId::Download(seq), e))
+        self.fail(guard, e.with_chunk(location))
     }
 
     fn decrement_in_flight(&self) {
@@ -609,7 +663,6 @@ impl Transfer for DownloadTransfer {
 
 /// Validate that the response Content-Range matches the requested range.
 fn validate_content_range(
-    seq: u64,
     requested_range: &str,
     response_content_range: Option<&str>,
 ) -> Result<(), Error> {
@@ -623,8 +676,8 @@ fn validate_content_range(
     {
         Ok(())
     } else {
-        Err(error::chunk_failed(
-            ChunkId::Download(seq),
+        Err(error::Error::new(
+            error::ErrorKind::RuntimeError,
             format!(
                 "content range mismatch: requested {}, response {:?}",
                 requested_range, response_content_range
@@ -1191,19 +1244,17 @@ mod tests {
 
     #[test]
     fn test_validate_content_range_success() {
-        assert!(validate_content_range(0, "bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
-        assert!(validate_content_range(0, "1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range("bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range("1024-2047", Some("bytes 1024-2047/4096")).is_ok());
     }
 
     #[test]
     fn test_validate_content_range_mismatch() {
-        assert!(
-            validate_content_range(0, "bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err()
-        );
+        assert!(validate_content_range("bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err());
     }
 
     #[test]
     fn test_validate_content_range_missing() {
-        assert!(validate_content_range(0, "bytes=1024-2047", None).is_err());
+        assert!(validate_content_range("bytes=1024-2047", None).is_err());
     }
 }

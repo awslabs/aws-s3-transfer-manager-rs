@@ -173,6 +173,10 @@ impl UploadHandle {
                             .abort_multipart_upload()
                             .upload_id(&upload_id),
                     )
+                    .customize()
+                    .config_override(crate::retry::bucket_partition_override(
+                        self.transfer.request().bucket(),
+                    ))
                     .send()
                     .instrument(tracing::debug_span!("send-abort-multipart-upload"))
                     .await?;

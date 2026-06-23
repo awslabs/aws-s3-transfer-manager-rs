@@ -8,15 +8,13 @@
 //! These tests use s3-mock-server to test the full transfer manager flow
 //! against a real HTTP server, validating the public API without mocking internals.
 
-#[cfg(test)]
+#![cfg(test)]
+
+mod assertions;
 mod download;
-#[cfg(test)]
 mod harness;
-#[cfg(test)]
 mod integrity;
-#[cfg(test)]
 mod metrics;
-#[cfg(test)]
+mod retry;
 mod upload;
-#[cfg(test)]
 mod upload_objects;

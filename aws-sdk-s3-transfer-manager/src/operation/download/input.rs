@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
 use aws_smithy_types::error::operation::BuildError;
 
 /// Input type for downloading a single object
@@ -883,30 +883,39 @@ impl fmt::Debug for DownloadInputBuilder {
     }
 }
 
-impl From<DownloadInput> for GetObjectInputBuilder {
-    fn from(value: DownloadInput) -> Self {
-        GetObjectInputBuilder::default()
-            .set_bucket(value.bucket)
-            .set_if_match(value.if_match)
-            .set_if_modified_since(value.if_modified_since)
-            .set_if_none_match(value.if_none_match)
-            .set_if_unmodified_since(value.if_unmodified_since)
-            .set_key(value.key)
-            .set_range(value.range)
-            .set_response_cache_control(value.response_cache_control)
-            .set_response_content_disposition(value.response_content_disposition)
-            .set_response_content_encoding(value.response_content_encoding)
-            .set_response_content_language(value.response_content_language)
-            .set_response_content_type(value.response_content_type)
-            .set_response_expires(value.response_expires)
-            .set_version_id(value.version_id)
-            .set_sse_customer_algorithm(value.sse_customer_algorithm)
-            .set_sse_customer_key(value.sse_customer_key)
-            .set_sse_customer_key_md5(value.sse_customer_key_md5)
-            .set_request_payer(value.request_payer)
-            .set_expected_bucket_owner(value.expected_bucket_owner)
-            .set_checksum_mode(value.checksum_mode)
-    }
+/// Forward all `DownloadInput` fields onto a `GetObject` fluent builder.
+///
+/// The fluent builder (not the input builder) is used because it is the only
+/// form that exposes `.customize().config_override(...)` — which the download
+/// paths need to set a per-bucket retry partition. Every `GetObject` the
+/// transfer issues (discovery, partNumber re-issue, range chunk, range retry)
+/// routes through here so the full field set is forwarded uniformly; callers
+/// then layer the per-request range / partNumber / if_match / config_override.
+pub(crate) fn copy_fields_to_get_object_request(
+    input: &DownloadInput,
+    builder: GetObjectFluentBuilder,
+) -> GetObjectFluentBuilder {
+    builder
+        .set_bucket(input.bucket.clone())
+        .set_if_match(input.if_match.clone())
+        .set_if_modified_since(input.if_modified_since)
+        .set_if_none_match(input.if_none_match.clone())
+        .set_if_unmodified_since(input.if_unmodified_since)
+        .set_key(input.key.clone())
+        .set_range(input.range.clone())
+        .set_response_cache_control(input.response_cache_control.clone())
+        .set_response_content_disposition(input.response_content_disposition.clone())
+        .set_response_content_encoding(input.response_content_encoding.clone())
+        .set_response_content_language(input.response_content_language.clone())
+        .set_response_content_type(input.response_content_type.clone())
+        .set_response_expires(input.response_expires)
+        .set_version_id(input.version_id.clone())
+        .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
+        .set_sse_customer_key(input.sse_customer_key.clone())
+        .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
+        .set_request_payer(input.request_payer.clone())
+        .set_expected_bucket_owner(input.expected_bucket_owner.clone())
+        .set_checksum_mode(input.checksum_mode.clone())
 }
 
 impl From<DownloadInput> for DownloadInputBuilder {

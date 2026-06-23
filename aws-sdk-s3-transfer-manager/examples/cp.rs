@@ -347,7 +347,22 @@ async fn do_manifest_upload(
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), BoxError> {
+async fn main() {
+    if let Err(e) = run().await {
+        // The top-level Display already carries a TM error's operation, code, and
+        // request ids; the source chain carries the underlying detail (SdkError
+        // message, checksum values).
+        eprintln!("Error: {e}");
+        let mut source = e.source();
+        while let Some(s) = source {
+            eprintln!("  caused by: {s}");
+            source = s.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), BoxError> {
     let args = Args::parse();
     if args.tokio_console {
         console_subscriber::init();

@@ -226,7 +226,6 @@ impl http_body_1x::Body for FailingBody {
 
 /// Test chunk/part failure is retried
 #[tokio::test]
-#[ignore = "TODO(redux): body read retry not implemented"]
 async fn test_retry_failed_chunk() {
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -349,7 +348,6 @@ async fn test_non_retryable_error() {
 
 /// Test max attempts exhausted reading a stream
 #[tokio::test]
-#[ignore = "TODO(redux): body read retry not implemented"]
 async fn test_retry_max_attempts() {
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();

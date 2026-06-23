@@ -647,9 +647,9 @@ impl TransferContext {
     ///
     /// [`signal_terminal`]: Self::signal_terminal
     /// [`set_failed_and_signal`]: Self::set_failed_and_signal
-    pub(crate) fn set_failed(&self, err: error::Error) -> bool {
+    pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
         if self.status.set_failed() {
-            *self.error.lock().unwrap() = Some(Box::new(err));
+            *self.error.lock().unwrap() = Some(Box::new(err.into()));
             true
         } else {
             false
@@ -747,7 +747,7 @@ impl TransferContext {
     ///
     /// [`signal_terminal`]: Self::signal_terminal
     /// [`set_failed`]: Self::set_failed
-    pub(crate) fn set_failed_and_signal(&self, err: error::Error) -> bool {
+    pub(crate) fn set_failed_and_signal(&self, err: impl Into<error::Error>) -> bool {
         let set = self.set_failed(err);
         self.signal_terminal();
         set

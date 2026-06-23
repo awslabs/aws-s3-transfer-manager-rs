@@ -134,6 +134,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
         &self,
         bucket: &str,
         key: &str,
+        conn_fault: Option<&std::sync::Arc<crate::socket_fault::ConnectionFault>>,
         output: &mut s3s::dto::GetObjectOutput,
     ) -> S3Result<()> {
         match self.faults.next_fault(bucket, key) {
@@ -158,6 +159,133 @@ impl<S: StorageBackend + 'static> Inner<S> {
                     )));
                 }
             }
+            Some(crate::faults::FaultType::TruncateBody { after_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `after_bytes`, then error the stream.
+                    // hyper aborts the connection mid-response.
+                    //
+                    // State: (inner stream, remaining passthrough bytes, errored?).
+                    let faulted = futures_util::stream::unfold(
+                        (body, after_bytes, false),
+                        |(mut stream, remaining, errored)| async move {
+                            if errored {
+                                return None;
+                            }
+                            if remaining == 0 {
+                                // Already delivered the allotted bytes: error now.
+                                return Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionReset,
+                                        "injected mid-stream truncation",
+                                    )),
+                                    (stream, 0, true),
+                                ));
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem, false)))
+                                    } else {
+                                        // Emit the partial head; error on next poll.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0, false)))
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    Some((Err(std::io::Error::other(e)), (stream, 0, true)))
+                                }
+                                // Real EOF before the truncation point: nothing to fault.
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::StallBody { after_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `after_bytes`, then stall the stream
+                    // (no further byte, no EOF).
+                    //
+                    // State: (inner stream, remaining passthrough bytes).
+                    let faulted = futures_util::stream::unfold(
+                        (body, after_bytes),
+                        |(mut stream, remaining)| async move {
+                            if remaining == 0 {
+                                // Allotment delivered: pend forever.
+                                std::future::pending::<()>().await;
+                                unreachable!("pending future never resolves");
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem)))
+                                    } else {
+                                        // Emit the partial head; stall on next poll.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0)))
+                                    }
+                                }
+                                Some(Err(e)) => Some((Err(std::io::Error::other(e)), (stream, 0))),
+                                // Real EOF before the stall point: nothing to fault.
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::ShortBody { actual_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `actual_bytes`, then end the stream
+                    // cleanly. Content-Length still advertises the full size, so
+                    // the client sees a short read.
+                    //
+                    // State: (inner stream, remaining bytes to deliver).
+                    let faulted = futures_util::stream::unfold(
+                        (body, actual_bytes),
+                        |(mut stream, remaining)| async move {
+                            if remaining == 0 {
+                                return None;
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem)))
+                                    } else {
+                                        // Emit the partial head, then end.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0)))
+                                    }
+                                }
+                                Some(Err(e)) => Some((Err(std::io::Error::other(e)), (stream, 0))),
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::ConnectionReset { after_bytes }) => {
+                // Arm the per-connection fault; the socket wrapper aborts the
+                // connection (RST) after `after_bytes` further bytes are written.
+                if let Some(fault) = conn_fault {
+                    fault.arm(after_bytes);
+                }
+            }
+            Some(crate::faults::FaultType::ServiceError { status }) => {
+                // Send-time HTTP error: reaches the SDK retry/token-bucket layer
+                // (not the TM body-read loop). Map the status to an S3 error code.
+                let code = match status {
+                    500 => s3s::S3ErrorCode::InternalError,
+                    503 => s3s::S3ErrorCode::SlowDown,
+                    _ => s3s::S3ErrorCode::ServiceUnavailable,
+                };
+                return Err(s3s::S3Error::new(code));
+            }
             None => {}
         }
         Ok(())
@@ -170,6 +298,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
+        let conn_fault = req
+            .extensions
+            .get::<std::sync::Arc<crate::socket_fault::ConnectionFault>>()
+            .cloned();
         let input = req.input;
         let bucket = &input.bucket;
         let key = &input.key;
@@ -284,7 +416,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
 
         apply_response_defaults_get(&mut output);
-        self.apply_get_fault(bucket, key, &mut output).await?;
+        self.apply_get_fault(bucket, key, conn_fault.as_ref(), &mut output)
+            .await?;
         Ok(S3Response::new(output))
     }
 

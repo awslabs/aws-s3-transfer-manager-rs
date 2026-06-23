@@ -754,10 +754,7 @@ impl DownloadObjectsTransfer {
                 error = %err,
                 "download_objects fatal walker error",
             );
-            self.inner.ctx.set_failed(Error::new(
-                ErrorKind::ObjectNotDiscoverable,
-                format!("S3 listing failed: {err}"),
-            ));
+            self.inner.ctx.set_failed(err);
         } else {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
