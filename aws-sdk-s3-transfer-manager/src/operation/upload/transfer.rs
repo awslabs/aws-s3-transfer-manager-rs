@@ -400,11 +400,21 @@ impl UploadTransfer {
         let checksum = data.checksum;
 
         let send_latencies = &self.inner.ctx.handle.telemetry.send_latencies;
-        // Only the latency deadline drives retry here. The SDK already retries
-        // the UploadPart dispatch by rewinding the in-memory body, so a returned
-        // error means those retries are exhausted and re-issuing would not help.
-        let result =
-            crate::retry::retry_guarded(send_latencies, crate::retry::retry_deadline_only, || {
+        // Retry the latency deadline (stragglers) and transient transport errors.
+        // The SDK normally retries the UploadPart dispatch over the rewindable
+        // in-memory body, but under a concurrent ENOBUFS-style burst its shared
+        // retry token bucket can exhaust, surfacing a transient dispatch failure
+        // un-recovered. This outer loop re-issues those with full-jittered
+        // backoff so the re-issue lands after in-flight parts complete and
+        // refill the quota. Throttling/503 is NOT retried here — that is the
+        // SDK token bucket's job and a TM re-issue would amplify the storm.
+        let backoff = crate::retry::Backoff::transient();
+        let result = crate::retry::retry_guarded(
+            send_latencies,
+            |ge, retry_index| {
+                crate::retry::classify_upload_part_retry(ge, retry_index, &backoff)
+            },
+            || {
                 let body = ByteStream::from(data_bytes.clone());
                 let req = copy_fields_to_upload_part_request(
                     &self.inner.request,

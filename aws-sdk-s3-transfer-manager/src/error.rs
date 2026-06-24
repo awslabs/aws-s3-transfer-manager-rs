@@ -48,6 +48,15 @@ struct ErrorExtra {
     failed_uploads: Option<Vec<FailedUpload>>,
     /// Per-object download failures when this error aggregates a bulk download.
     failed_downloads: Option<Vec<FailedDownload>>,
+    /// `true` when the underlying `SdkError` was a transient transport failure
+    /// (a connect/read/write IO error or a client-side timeout) rather than a
+    /// service response. Set at conversion from the typed `SdkError`, where the
+    /// distinction is still available before type erasure. Drives the upload
+    /// part-send retry: such failures may not have been recovered by the SDK
+    /// (e.g. the shared retry token bucket was exhausted under a concurrent
+    /// burst), and a re-issue can succeed. Never set for throttling/service
+    /// errors — see `retry::classify_upload_part_retry`.
+    transient_transport: bool,
 }
 
 /// General categories of transfer errors.
@@ -170,6 +179,21 @@ impl Error {
         &self.kind
     }
 
+    /// Test-only: a `ServiceError` flagged as transient transport, mirroring what
+    /// `service_error` produces for an IO `DispatchFailure` (which cannot be
+    /// constructed directly in a unit test).
+    #[cfg(test)]
+    pub(crate) fn test_transient_transport() -> Error {
+        Error {
+            kind: ErrorKind::ServiceError,
+            source: "injected transient transport".into(),
+            extra: Some(Box::new(ErrorExtra {
+                transient_transport: true,
+                ..Default::default()
+            })),
+        }
+    }
+
     fn service(&self) -> Option<&ServiceMetadata> {
         self.extra.as_ref().and_then(|e| e.service.as_ref())
     }
@@ -214,6 +238,17 @@ impl Error {
             self.code(),
             Some("NotFound" | "NoSuchKey" | "NoSuchUpload" | "NoSuchBucket")
         )
+    }
+
+    /// Whether this error was a transient transport failure (connection IO error
+    /// or client-side timeout) as opposed to a service response. Such failures
+    /// are safe to re-issue and may not have been recovered by the SDK's own
+    /// retry (e.g. its shared retry token bucket was exhausted under a concurrent
+    /// burst). Always `false` for throttling and modeled service errors.
+    pub(crate) fn is_transient_transport(&self) -> bool {
+        self.extra
+            .as_ref()
+            .is_some_and(|e| e.transient_transport)
     }
 
     /// The chunk this failure is attributable to, if known.
@@ -434,8 +469,26 @@ where
     }
 }
 
+/// Whether an `SdkError` is a transient transport failure — a connection-level
+/// IO error or a client-side timeout — rather than a service response. Mirrors
+/// the predicate in the SDK's own `TransientErrorClassifier`
+/// (`is_io() || is_timeout()` on the connector error), captured here because the
+/// flattening into [`ErrorKind::ServiceError`] erases the `SdkError` variant.
+///
+/// Deliberately excludes service responses: a 503 `SlowDown` arrives as a
+/// `ServiceError`, not a `DispatchFailure`, so throttling is never classified
+/// transient here (see `retry::classify_upload_part_retry` for why that matters).
+fn is_sdk_transient_transport<E, R>(e: &SdkError<E, R>) -> bool {
+    match e {
+        SdkError::TimeoutError(_) => true,
+        SdkError::DispatchFailure(df) => df.is_io() || df.is_timeout(),
+        _ => false,
+    }
+}
+
 /// Converts an `SdkError` into a [`ErrorKind::ServiceError`], capturing the
-/// operation name and service metadata.
+/// operation name, service metadata, and whether it was a transient transport
+/// failure.
 fn service_error<E>(
     operation: &'static str,
     e: SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
@@ -444,11 +497,13 @@ where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     let service = service_metadata(operation, &e);
+    let transient_transport = is_sdk_transient_transport(&e);
     Error {
         kind: ErrorKind::ServiceError,
         source: Box::new(e),
         extra: Some(Box::new(ErrorExtra {
             service: Some(service),
+            transient_transport,
             ..Default::default()
         })),
     }
