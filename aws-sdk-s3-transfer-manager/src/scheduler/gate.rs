@@ -118,9 +118,11 @@ impl GateState {
 
     /// Clear `RUNNING` (preserving the epoch). Panic-path only; see
     /// [`GenerateWorkPermit`]'s `Drop`.
+    ///
+    /// A single atomic `fetch_and`, not a load/store pair: an epoch bump racing
+    /// this clear is preserved rather than stomped by a stale read-back.
     fn force_idle(&self) {
-        let s = self.packed.load(Ordering::SeqCst);
-        self.packed.store(s & !RUNNING, Ordering::SeqCst);
+        self.packed.fetch_and(!RUNNING, Ordering::SeqCst);
     }
 }
 
@@ -509,8 +511,8 @@ mod loom_tests {
         }
 
         /// Free one in-flight slot then re-drive — the exact order of
-        /// `Scheduler::on_completion` (`dispatched.fetch_sub` @436, then
-        /// `generate_work` @488). This is the completion edge the
+        /// `Scheduler::on_completion` (`dispatched.fetch_sub`, then
+        /// `generate_work`). This is the completion edge the
         /// retire-at-capacity path relies on to pick up stranded work.
         fn complete_one(&self) {
             self.dispatched.fetch_sub(1, Ordering::Relaxed);

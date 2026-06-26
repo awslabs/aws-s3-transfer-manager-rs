@@ -550,11 +550,11 @@ impl Scheduler {
     ///
     /// The plain-load `has_capacity` is correct in the dispatch hot loop, where
     /// the runner just observed its own `dispatched` writes. It is NOT safe at
-    /// the retire decision: when a runner re-arms off a *coalesced* notification
-    /// (a `wake`/`enqueue` CAS'd `RUNNING → NOTIFIED`), a concurrent
-    /// `on_completion` may have decremented `dispatched` and then found the gate
-    /// already `NOTIFIED` — so it published no gate edge and established no
-    /// happens-before with the runner. A `Relaxed` load may then read the stale
+    /// the retire decision: a concurrent `on_completion` decrements `dispatched`
+    /// and then bumps the gate epoch via `generate_work`'s `try_acquire`. When a
+    /// runner is already active that bump *coalesces* — it records the request on
+    /// the epoch but publishes no gate edge into this runner, so it establishes
+    /// no happens-before with it. A `Relaxed` load may then read the stale
     /// pre-decrement value, and the runner retires leaving a freed slot with
     /// queued work and no runner — a lost wake (loom: `gate.rs`
     /// `..._at_capacity_with_producer`).
@@ -790,10 +790,10 @@ impl Scheduler {
                 // the pending work. Retry the retire instead.
                 //
                 // No wake is lost across this retry. A completion racing in
-                // decrements `dispatched` (on_completion @436) BEFORE bumping the
-                // epoch via generate_work's try_acquire (@488); the RMW reads
-                // above observe that decrement, and the epoch-CAS retire fails if
-                // any request bumped past the observed epoch — so a racing request
+                // decrements `dispatched` (in `on_completion`) BEFORE bumping the
+                // epoch via `generate_work`'s `try_acquire`; the RMW reads above
+                // observe that decrement, and the epoch-CAS retire fails if any
+                // request bumped past the observed epoch — so a racing request
                 // is always seen, never stranded.
             }
         }
