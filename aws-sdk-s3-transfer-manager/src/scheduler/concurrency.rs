@@ -42,6 +42,12 @@ pub(crate) struct CompletionSample {
 /// [`AdaptiveConcurrencyController`] (adjusts based on observed throughput).
 pub(crate) trait ConcurrencyController: Send + Sync + fmt::Debug {
     /// Current concurrency target. May change between calls.
+    ///
+    /// MUST be `>= 1`. The scheduler's work-generation retire path relies on
+    /// this: when at capacity (`dispatched >= target`) it retires the runner
+    /// rather than spinning, trusting that an in-flight item will complete and
+    /// re-drive generation. A `target` of 0 would let "at capacity" hold with
+    /// nothing in flight, stranding queued work with no completion to wake it.
     fn target(&self) -> usize;
     /// Called when a work item is dispatched to a worker.
     fn on_dispatch(&self) {}
