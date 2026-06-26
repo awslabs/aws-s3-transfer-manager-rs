@@ -19,7 +19,6 @@ pub(crate) use topology::Topology;
 
 pub(crate) mod platform;
 
-#[allow(dead_code)] // TODO(budget): remove once wired into scheduler/download path
 pub(crate) mod memory;
 pub(crate) mod sync;
 

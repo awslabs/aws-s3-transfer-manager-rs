@@ -183,6 +183,9 @@ impl MemoryBudget {
 
     /// Attempt an immediate grant. Returns None if the queue is non-empty (no-barge)
     /// or the request does not fit.
+    // Synchronous no-park reservation path; consumed by the upload-side budget
+    // integration (no scheduler waker to register there). Exercised by tests.
+    #[allow(dead_code)]
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         let need = self.chunks_for(bytes);
         let mut inner = self.inner.lock();
@@ -245,6 +248,9 @@ impl MemoryBudget {
 
     /// Resize the capacity (in bytes). Growing may drain parked waiters. Shrinking
     /// is soft: never revokes already-granted chunks, just tightens future grants.
+    // Consumed by the resize loop (Mountpoint read-window control + adaptive
+    // budget sizing). Exercised by the grow/shrink tests.
+    #[allow(dead_code)]
     pub(crate) fn set_limit(self: &Arc<Self>, capacity_bytes: usize) {
         let new_capacity = (capacity_bytes / self.chunk) as u64;
         let notifies = {
@@ -257,17 +263,23 @@ impl MemoryBudget {
         }
     }
 
+    // Occupancy/introspection accessors, consumed by the per-NIC budget gauge in
+    // the backpressure-telemetry chunk (in_use/capacity render the occupancy
+    // line; chunk_bytes converts to bytes). Exercised by tests.
     /// Chunks currently reserved (granted and not yet released).
+    #[allow(dead_code)]
     pub(crate) fn in_use_chunks(&self) -> u64 {
         self.inner.lock().in_use
     }
 
     /// Current capacity in chunks.
+    #[allow(dead_code)]
     pub(crate) fn capacity_chunks(&self) -> u64 {
         self.inner.lock().capacity
     }
 
     /// The fixed chunk size in bytes.
+    #[allow(dead_code)]
     pub(crate) fn chunk_bytes(&self) -> usize {
         self.chunk
     }
