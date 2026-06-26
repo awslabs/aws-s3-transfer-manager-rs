@@ -35,6 +35,9 @@ pub(crate) const TARGET_RUNTIME: &str = "aws_sdk_s3_transfer_manager::runtime";
 /// Transfer lifecycle: enqueue, complete, cancel, fail, state transitions.
 pub(crate) const TARGET_TRANSFER: &str = "aws_sdk_s3_transfer_manager::transfer";
 
+/// Per-part body-read progress for stall analysis (TTFB, inter-chunk gaps, chunk sizes).
+pub(crate) const TARGET_BODY_PROGRESS: &str = "aws_sdk_s3_transfer_manager::body";
+
 /// Observability surface for transfer operations.
 ///
 /// Groups latency tracking and throughput counters. Transfers record

@@ -570,7 +570,7 @@ impl DownloadTransfer {
                             resp.body
                         }
                     };
-                    Self::read_body_stream(&ctx, body).await
+                    Self::read_body_stream(&ctx, body, seq).await
                 }
             },
         )
@@ -636,13 +636,50 @@ impl DownloadTransfer {
     async fn read_body_stream(
         ctx: &TransferContext,
         body: aws_sdk_s3::primitives::ByteStream,
+        seq: u64,
     ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
+        use std::time::{Duration, Instant};
+
+        const GAP_FLOOR: Duration = Duration::from_millis(1);
+
+        let enabled =
+            tracing::enabled!(target: crate::telemetry::TARGET_BODY_PROGRESS, tracing::Level::TRACE);
+
+        let part_start = Instant::now();
+        let mut last_chunk = part_start;
+        let mut chunk_idx: u64 = 0;
+        let mut ttfb_us: u128 = 0;
+
         let mut segmented = SegmentedBuf::new();
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
+            if enabled {
+                let now = Instant::now();
+                let gap = now.duration_since(last_chunk);
+                let is_first = chunk_idx == 0;
+                if is_first {
+                    ttfb_us = now.duration_since(part_start).as_micros();
+                }
+                if is_first || gap >= GAP_FLOOR {
+                    tracing::trace!(
+                        target: crate::telemetry::TARGET_BODY_PROGRESS,
+                        tid = %ctx.id,
+                        seq,
+                        chunk_idx,
+                        chunk_bytes = data.len(),
+                        cum_bytes = bytes_received,
+                        t_since_start_us = now.duration_since(part_start).as_micros() as u64,
+                        gap_us = gap.as_micros() as u64,
+                        is_first,
+                        "body.chunk",
+                    );
+                }
+                last_chunk = now;
+                chunk_idx += 1;
+            }
             segmented.push(data);
             if !ctx.is_active() {
                 return Err(crate::error::Error::new(
@@ -651,6 +688,20 @@ impl DownloadTransfer {
                 ));
             }
         }
+
+        if enabled {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_BODY_PROGRESS,
+                tid = %ctx.id,
+                seq,
+                ttfb_us = ttfb_us as u64,
+                total_us = part_start.elapsed().as_micros() as u64,
+                total_bytes = bytes_received,
+                n_chunks = chunk_idx,
+                "body.part_done",
+            );
+        }
+
         Ok((segmented, bytes_received))
     }
 
@@ -689,7 +740,7 @@ impl DownloadTransfer {
                     validate_content_range(&rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let (segmented, bytes_received) =
-                        Self::read_body_stream(&ctx, resp.body).await?;
+                        Self::read_body_stream(&ctx, resp.body, seq).await?;
                     Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
                 }
             },
