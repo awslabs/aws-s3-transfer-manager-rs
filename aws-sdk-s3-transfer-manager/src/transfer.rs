@@ -45,6 +45,12 @@ pub(crate) mod wake_flag {
         pub(crate) fn take_pending(&self) -> bool {
             self.pending.swap(false, Ordering::AcqRel)
         }
+
+        /// Non-consuming read: returns whether the pending bit is currently set.
+        #[cfg(test)]
+        pub(crate) fn is_pending(&self) -> bool {
+            self.pending.load(Ordering::Acquire)
+        }
     }
 }
 
@@ -781,6 +787,12 @@ impl TransferContext {
     /// Snapshot current transfer metrics.
     pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
         self.metrics.snapshot()
+    }
+
+    /// Whether the wake_flag pending bit is currently set (non-consuming peek).
+    #[cfg(test)]
+    pub(crate) fn wake_pending(&self) -> bool {
+        self.wake_flag.is_pending()
     }
 
     /// Get scheduling controls for this transfer.

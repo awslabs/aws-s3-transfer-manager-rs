@@ -753,21 +753,27 @@ impl DownloadTransfer {
     }
 
     fn decrement_in_flight(&self) {
-        let should_wake = {
+        // Mutator discipline: lock → mutate → unlock → try_wake (see
+        // TransferContext::set_pending). Mutate the count under the lock, then
+        // drop the lock before waking.
+        {
             let mut work = self.inner.state.lock().unwrap();
             if let DownloadState::Transferring {
                 ranges_in_flight, ..
             } = &mut *work
             {
                 *ranges_in_flight = ranges_in_flight.saturating_sub(1);
-                *ranges_in_flight == 0
-            } else {
-                false
             }
-        };
-        if should_wake {
-            self.inner.ctx.try_wake();
         }
+        // WS15 completion-edge re-drive (2026-06-25): re-drive the producer on
+        // EVERY GET completion, not only at ranges_in_flight==0. A completion is
+        // the earliest moment a parked producer can observe consumer-released
+        // window credit — instead of waiting for the consumer task to be
+        // scheduled and fire its own wake (the resonance behind the ~850ms
+        // dispatch-burst sawtooth). `try_wake` fires only if the producer is
+        // parked (`set_pending`); on a live producer it is a cheap no-op swap.
+        // Subsumes the old ==0 termination wake (still fires when parked).
+        self.inner.ctx.try_wake();
     }
 
     /// Transition to terminal failed state. Requires holding the work lock.
@@ -1490,5 +1496,41 @@ mod tests {
         assert_eq!(budget.in_use_chunks(), 2);
         // Resuming released the budget park.
         assert_eq!(bp.budget.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// Guards the WS15 completion-edge redrive: `decrement_in_flight` wakes a
+    /// parked producer on EVERY completion, not only when ranges_in_flight==0.
+    /// Discriminating: fails under the old `==0`-only wake because after one
+    /// decrement ranges_in_flight is still >0.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_completion_redrives_parked_producer() {
+        // 5 parts (40 MiB / 8 MiB), capacity=3. After discovery claims seq 0,
+        // the window allows 2 more ranges (claimed < consumed + capacity).
+        let (transfer, _consumer) = create_download_with_capacity(40 * MB, 8 * MB, 3);
+        skip_discovery(&transfer).await;
+
+        // Generate 2 ranges: both increment ranges_in_flight (now 2).
+        let _w1 = assert_ready(transfer.poll_work()); // seq 1, claimed=2
+        let _w2 = assert_ready(transfer.poll_work()); // seq 2, claimed=3
+
+        // Window full (claimed=3 >= consumed+3), transfer parks.
+        assert_pending(transfer.poll_work());
+
+        // Precondition: the wake_flag pending bit is set (park armed it).
+        assert!(
+            transfer.ctx().wake_pending(),
+            "producer must be parked (pending bit set)"
+        );
+
+        // Simulate ONE GET completion: ranges_in_flight goes 2 → 1 (still >0).
+        // Under the old ==0-only logic, no wake fires. Under the redrive, it does.
+        transfer.decrement_in_flight();
+
+        // The pending bit must have been consumed by try_wake (wake fired).
+        assert!(
+            !transfer.ctx().wake_pending(),
+            "try_wake must fire on completion even when ranges_in_flight > 0"
+        );
     }
 }
