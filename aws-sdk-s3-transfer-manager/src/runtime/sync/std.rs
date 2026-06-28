@@ -175,7 +175,7 @@ pub(crate) mod sync {
 
     pub(crate) mod atomic {
         pub(crate) use std::sync::atomic::{
-            AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+            AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
         };
     }
 }

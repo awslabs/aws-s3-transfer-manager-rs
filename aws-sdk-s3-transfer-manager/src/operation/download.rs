@@ -15,6 +15,15 @@ pub mod builders;
 mod body;
 pub use body::{Body, ChunkOutput};
 
+// In-order delivery buffer (out-of-order arrival → in-order stream). A generic,
+// self-contained data structure with its own loom models; `body.rs` will be rebuilt
+// on top of it.
+// TODO(flow-control): remove this allow once body.rs consumes PagedRecvBuffer — it
+// has no in-crate consumer yet, so its public surface reads as dead code. Tracked in
+// bosun.md flow-control workstream.
+#[allow(dead_code)]
+mod recv_buffer;
+
 mod context;
 
 pub(crate) mod discovery;
