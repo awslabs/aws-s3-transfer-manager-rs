@@ -26,7 +26,9 @@ pub struct Client {
     pub(crate) handle: Arc<Handle>,
 }
 
-/// Whatever is needed to carry out operations, e.g. scheduler, budgets, config, env details, etc
+/// Shared state backing every transfer operation: configuration, the S3 client,
+/// the scheduler, the execution runtime, the concurrency controller, telemetry,
+/// and the memory budget.
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,

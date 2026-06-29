@@ -368,13 +368,12 @@ impl DownloadTransfer {
         }
     }
 
-    /// Reserve budget for a chunk of `len` bytes, awaiting a grant if the budget
-    /// is full. Used by the discovery path: discovery has already issued the GET
-    /// and must account its chunk's memory, but it runs inside an async `execute`
-    /// (not the re-pollable `poll_work`), so it backpressures by awaiting here —
-    /// holding the response stream undrained — rather than parking on the
-    /// scheduler. The head (seq 0) reserving before any read-ahead range keeps the
-    /// budget FIFO head-first, which guarantees forward progress under a tight cap.
+    /// Reserve budget for a chunk of `len` bytes, awaiting the grant if the budget
+    /// is full. Backpressures by holding the caller's async context — and the
+    /// undrained response stream — rather than parking on the scheduler, so it
+    /// suits a caller running inside `execute` rather than the re-pollable
+    /// `poll_work`. Reserving seq 0 before any read-ahead range keeps it at the
+    /// FIFO head, preserving forward progress under a tight cap.
     async fn reserve_chunk(&self, len: usize) -> Reservation {
         let notify = Arc::new(tokio::sync::Notify::new());
         let waker = Arc::clone(&notify);
@@ -475,10 +474,8 @@ impl DownloadTransfer {
                     .expect("seq window should have capacity at start");
                 // Account the discovery chunk's memory before the transition wakes
                 // poll_work, so the head (seq 0) reserves before any read-ahead
-                // range. Awaiting here (the budget is non-binding at the default
-                // cap, so this is usually immediate) is correct backpressure: a
-                // full budget holds the discovery body undrained until a chunk
-                // frees.
+                // range. Awaiting here backpressures: a full budget holds the
+                // discovery body undrained until a chunk frees.
                 let reservation = self.reserve_chunk(chunk_content_len as usize).await;
                 slot.attach_reservation(reservation);
                 Some((stream, meta, slot))
@@ -1467,7 +1464,7 @@ mod tests {
         );
 
         // poll #3: the parked claim was granted → Ready, pending cleared.
-        let _w2 = assert_ready(transfer.poll_work());
+        let mut w2 = assert_ready(transfer.poll_work());
         {
             let state = transfer.inner.state.lock().unwrap();
             match &*state {
@@ -1478,5 +1475,22 @@ mod tests {
             }
         }
         assert_eq!(budget.in_use_chunks(), 2);
+
+        // The resumed work carries the claimed slot with its reservation attached:
+        // it is a GetObjectRange holding a slot, and dropping the work releases the
+        // reservation (in_use falls), proving the grant rode the slot rather than
+        // being silently dropped at resume.
+        match w2.data_mut::<DownloadWork>() {
+            DownloadWork::GetObjectRange { slot, .. } => {
+                assert!(slot.is_some(), "resumed work should hold its claimed slot");
+            }
+            _ => panic!("expected GetObjectRange"),
+        }
+        drop(w2);
+        assert_eq!(
+            budget.in_use_chunks(),
+            1,
+            "dropping the resumed work releases its reservation"
+        );
     }
 }

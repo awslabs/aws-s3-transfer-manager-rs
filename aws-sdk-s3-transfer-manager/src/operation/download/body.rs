@@ -1294,6 +1294,31 @@ mod tests {
     }
 
     #[test]
+    fn test_reservation_released_on_slot_drop_without_fill() {
+        // The abort path: a slot is claimed and its memory reserved, but the GET
+        // fails before the slot is filled. Dropping the slot must release the
+        // reservation rather than leaking the chunk.
+        let chunk_bytes = 1024;
+        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
+        let (writer, _consumer) = new_slot_body(4);
+
+        let mut slot = writer.try_claim().unwrap();
+        let reservation = budget
+            .try_reserve(chunk_bytes)
+            .expect("budget has capacity");
+        slot.attach_reservation(reservation);
+        assert_eq!(budget.in_use_chunks(), 1);
+
+        // Drop the claimed-but-never-filled slot.
+        drop(slot);
+        assert_eq!(
+            budget.in_use_chunks(),
+            0,
+            "dropping an unfilled slot releases its reservation"
+        );
+    }
+
+    #[test]
     fn test_no_reservation_is_harmless() {
         let (writer, consumer) = new_slot_body(4);
 

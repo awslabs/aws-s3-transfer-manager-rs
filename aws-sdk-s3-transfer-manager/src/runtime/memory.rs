@@ -11,9 +11,13 @@
 //! strictly FIFO as chunks are released.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::metrics::unit::ByteUnit;
-use crate::runtime::sync::sync::Arc;
+// The compat-layer Mutex is loom-instrumented under `cfg(s3_tm_loom)`, which is
+// what exercises the budget/slot lock-ordering invariant. `Arc` stays `std`: the
+// budget is held as `std::sync::Arc` across the call graph, and loom tracks the
+// locks, not the refcount.
 use crate::runtime::sync::Mutex;
 
 /// Closure the budget invokes to wake a parked reserver (= `scheduler.wake(tid)`).
@@ -159,10 +163,13 @@ fn drain(budget: &Arc<MemoryBudget>, inner: &mut Inner) -> Vec<NotifyFn> {
 
 impl MemoryBudget {
     /// Create a new budget. `chunk_bytes` is the fixed accounting unit (must be > 0).
-    /// Capacity is `floor(capacity_bytes / chunk_bytes)` chunks.
+    /// Capacity is `floor(capacity_bytes / chunk_bytes)` chunks, with a floor of one
+    /// chunk: a capacity that rounds to zero would force every request through the
+    /// idle-only grant path, serializing all transfers, so a budget configured below
+    /// one chunk is raised to one rather than silently throttling to a single part.
     pub(crate) fn new(capacity_bytes: usize, chunk_bytes: usize) -> Arc<Self> {
         assert!(chunk_bytes > 0, "chunk_bytes must be > 0");
-        let capacity = (capacity_bytes / chunk_bytes) as u64;
+        let capacity = (capacity_bytes / chunk_bytes).max(1) as u64;
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 in_use: 0,
@@ -181,10 +188,9 @@ impl MemoryBudget {
         bytes.div_ceil(self.chunk) as u64
     }
 
-    /// Attempt an immediate grant. Returns None if the queue is non-empty (no-barge)
-    /// or the request does not fit.
-    // Synchronous no-park reservation path; consumed by the upload-side budget
-    // integration (no scheduler waker to register there). Exercised by tests.
+    /// Attempt an immediate grant without parking. Returns None if the queue is
+    /// non-empty (no-barge) or the request does not fit. Unlike
+    /// [`reserve`](Self::reserve) it never enqueues a waiter and registers no waker.
     #[allow(dead_code)]
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         let need = self.chunks_for(bytes);
@@ -248,8 +254,6 @@ impl MemoryBudget {
 
     /// Resize the capacity (in bytes). Growing may drain parked waiters. Shrinking
     /// is soft: never revokes already-granted chunks, just tightens future grants.
-    // Consumed by the resize loop (Mountpoint read-window control + adaptive
-    // budget sizing). Exercised by the grow/shrink tests.
     #[allow(dead_code)]
     pub(crate) fn set_limit(self: &Arc<Self>, capacity_bytes: usize) {
         let new_capacity = (capacity_bytes / self.chunk) as u64;
@@ -263,9 +267,6 @@ impl MemoryBudget {
         }
     }
 
-    // Occupancy/introspection accessors, consumed by the per-NIC budget gauge in
-    // the backpressure-telemetry chunk (in_use/capacity render the occupancy
-    // line; chunk_bytes converts to bytes). Exercised by tests.
     /// Chunks currently reserved (granted and not yet released).
     #[allow(dead_code)]
     pub(crate) fn in_use_chunks(&self) -> u64 {
@@ -371,6 +372,20 @@ mod tests {
         assert_eq!(budget.chunks_for(1), 1);
         assert_eq!(budget.chunks_for(100), 1);
         assert_eq!(budget.chunks_for(101), 2);
+    }
+
+    #[test]
+    fn test_capacity_floored_at_one_chunk() {
+        // A budget configured below one chunk would otherwise round to zero
+        // capacity, forcing every request through the idle-only grant path and
+        // serializing transfers. It is raised to one chunk instead.
+        let chunk = 8 * 1024 * 1024;
+        let budget = MemoryBudget::new(chunk / 2, chunk);
+        assert_eq!(budget.capacity_chunks(), 1);
+        // The first request fits; a second parks rather than barging.
+        let first = budget.try_reserve(chunk);
+        assert!(first.is_some());
+        assert!(budget.try_reserve(chunk).is_none());
     }
 
     #[test]
@@ -489,30 +504,39 @@ mod tests {
         let (n_hold, _) = notify_flag();
         let (n_large, flag_large) = notify_flag();
 
-        // Fill all 4 chunks
-        let holder = match budget.reserve(chunk * 4, n_hold) {
+        // Hold 3 of 4 chunks, leaving 1 free.
+        let holder = match budget.reserve(chunk * 3, n_hold) {
             Reserve::Ready(r) => r,
             Reserve::Pending(_) => panic!("expected Ready"),
         };
 
-        // Queue a 4-chunk waiter
-        let mut ticket_large = match budget.reserve(chunk * 4, n_large) {
+        // Queue a 2-chunk waiter. It does not fit now (1 free < 2), so it parks.
+        let mut ticket_large = match budget.reserve(chunk * 2, n_large) {
             Reserve::Pending(t) => t,
             Reserve::Ready(_) => panic!("expected Pending"),
         };
 
-        // try_reserve of 1 chunk must return None (no-barge) even though 1 would
-        // fit if we freed 1 chunk.
-        assert!(budget.try_reserve(chunk).is_none());
+        // A 1-chunk request WOULD fit on capacity alone (1 chunk is free), so this
+        // isolates no-barge from exhaustion: it is rejected only because a waiter
+        // is queued ahead of it.
+        assert!(
+            budget.try_reserve(chunk).is_none(),
+            "no-barge: must not jump the queued waiter even though it fits"
+        );
 
-        // Release the holder -> the queued large waiter is served
+        // Drain the queue: releasing the holder frees 3 chunks; the parked 2-chunk
+        // waiter is granted, leaving in_use == 2.
         drop(holder);
         assert!(flag_large.load(Ordering::Acquire));
-        let _res_large = ticket_large.take().expect("large waiter should be granted");
+        let _res_large = ticket_large.take().expect("waiter should be granted");
+        assert_eq!(budget.in_use_chunks(), 2);
 
-        // Now try_reserve works (queue is empty)
-        // But capacity is fully used by the large waiter, so it won't fit
-        assert!(budget.try_reserve(chunk).is_none());
+        // Same 1-chunk request now succeeds: the queue is empty and 2 chunks are
+        // free, confirming the earlier rejection was no-barge, not exhaustion.
+        assert!(
+            budget.try_reserve(chunk).is_some(),
+            "with an empty queue and free capacity the request now fits"
+        );
     }
 
     #[test]
@@ -641,6 +665,55 @@ mod tests {
     }
 
     #[test]
+    fn test_cancel_middle_waiter_preserves_order_of_others() {
+        // Three waiters queued behind a holder; cancel the middle one. The
+        // remaining two must still be granted in arrival order — guarding against
+        // a cancel that removes the wrong entry (or all entries).
+        let chunk = 1024;
+        let budget = MemoryBudget::new(chunk, chunk); // capacity = 1 chunk
+        let (n_hold, _) = notify_flag();
+        let (n_a, flag_a) = notify_flag();
+        let (n_b, flag_b) = notify_flag();
+        let (n_c, flag_c) = notify_flag();
+
+        let holder = match budget.reserve(chunk, n_hold) {
+            Reserve::Ready(r) => r,
+            Reserve::Pending(_) => panic!("expected Ready"),
+        };
+        let mut ticket_a = match budget.reserve(chunk, n_a) {
+            Reserve::Pending(t) => t,
+            Reserve::Ready(_) => panic!("expected Pending"),
+        };
+        let ticket_b = match budget.reserve(chunk, n_b) {
+            Reserve::Pending(t) => t,
+            Reserve::Ready(_) => panic!("expected Pending"),
+        };
+        let mut ticket_c = match budget.reserve(chunk, n_c) {
+            Reserve::Pending(t) => t,
+            Reserve::Ready(_) => panic!("expected Pending"),
+        };
+
+        // Cancel the middle waiter (B).
+        drop(ticket_b);
+
+        // Release the holder: A (front) is granted; B and C are not yet.
+        drop(holder);
+        assert!(flag_a.load(Ordering::Acquire), "A should be granted first");
+        assert!(!flag_b.load(Ordering::Acquire), "B was cancelled");
+        assert!(!flag_c.load(Ordering::Acquire), "C waits behind A");
+        let res_a = ticket_a.take().expect("A granted");
+
+        // Release A: C is now front (B was removed, not C) and is granted.
+        drop(res_a);
+        assert!(
+            flag_c.load(Ordering::Acquire),
+            "C should be granted after A"
+        );
+        let _res_c = ticket_c.take().expect("C granted");
+        assert_eq!(budget.in_use_chunks(), 1);
+    }
+
+    #[test]
     fn test_wait_ticket_drop_after_granted_returns_chunks() {
         let chunk = 1024;
         let budget = MemoryBudget::new(chunk * 2, chunk); // 2 chunks
@@ -667,5 +740,86 @@ mod tests {
         // Drop the ticket WITHOUT calling take() — granted-but-untaken chunks released
         drop(ticket);
         assert_eq!(budget.in_use_chunks(), 0);
+    }
+}
+
+// Concurrency models for the lock-ordering invariant: `drain` takes the budget
+// lock then a slot lock; `WaitTicket::drop` takes a slot lock then the budget
+// lock. The invariant is that these never nest (drain holds the slot lock only to
+// store a grant; WaitTicket::drop releases the slot lock before touching the
+// budget). Loom exhaustively explores the interleavings; a regression that nested
+// the locks would deadlock (loom reports it) and a regression in the accounting
+// would trip an assertion.
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests {
+    use super::*;
+    use crate::runtime::sync::thread;
+
+    fn noop_notify() -> NotifyFn {
+        Arc::new(|| {})
+    }
+
+    #[test]
+    fn release_races_cancel() {
+        // One holder fills the budget, one waiter is parked. Releasing the holder
+        // (drain: budget -> slot) races dropping the waiter's ticket
+        // (cancel/return: slot -> budget). Whatever the interleaving, the holder's
+        // chunk is returned and the waiter ends with no chunk outstanding.
+        loom::model(|| {
+            let chunk = 1024;
+            let budget = MemoryBudget::new(chunk, chunk); // capacity = 1 chunk
+
+            let holder = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Ready(r) => r,
+                Reserve::Pending(_) => unreachable!("first reserve fits"),
+            };
+            let ticket = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Pending(t) => t,
+                Reserve::Ready(_) => unreachable!("budget is full"),
+            };
+
+            let h = thread::spawn(move || drop(holder));
+            drop(ticket);
+            h.join().unwrap();
+
+            // Reaching here means no deadlock. The waiter was either cancelled
+            // before its grant or granted then released by the ticket drop; either
+            // way nothing remains reserved.
+            assert_eq!(budget.in_use_chunks(), 0);
+        });
+    }
+
+    #[test]
+    fn release_races_take() {
+        // Releasing the holder (drain stores the grant) races the waiter taking it.
+        // After both complete the grant is delivered exactly once and accounting is
+        // consistent across release.
+        loom::model(|| {
+            let chunk = 1024;
+            let budget = MemoryBudget::new(chunk, chunk); // capacity = 1 chunk
+
+            let holder = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Ready(r) => r,
+                Reserve::Pending(_) => unreachable!("first reserve fits"),
+            };
+            let mut ticket = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Pending(t) => t,
+                Reserve::Ready(_) => unreachable!("budget is full"),
+            };
+
+            let h = thread::spawn(move || drop(holder));
+            let taken = ticket.take();
+            h.join().unwrap();
+
+            // The holder is gone, so the grant is available: take() either caught it
+            // or a second take() retrieves it now.
+            let granted = taken.or_else(|| ticket.take());
+            assert!(granted.is_some(), "waiter must be granted after release");
+            assert_eq!(budget.in_use_chunks(), 1);
+
+            drop(granted);
+            drop(ticket);
+            assert_eq!(budget.in_use_chunks(), 0);
+        });
     }
 }

@@ -208,7 +208,7 @@ impl Builder {
     /// Set the memory budget: an upper bound on memory used for in-flight and
     /// buffered transfer data. At the limit transfers backpressure rather than
     /// fail. Default is [`MemoryBudgetConfig::Auto`] (a safe fraction of detected
-    /// RAM). Takes effect only when the transfer manager owns its runtime.
+    /// RAM).
     pub fn memory_budget(mut self, budget: MemoryBudgetConfig) -> Self {
         self.memory_budget = budget;
         self

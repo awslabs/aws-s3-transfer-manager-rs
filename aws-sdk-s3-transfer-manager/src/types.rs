@@ -21,9 +21,6 @@ pub enum PartSize {
 
 /// Upper bound on memory the transfer manager uses for in-flight and buffered
 /// transfer data. At the limit transfers backpressure rather than fail.
-///
-/// Only takes effect when the transfer manager owns its runtime; it does not
-/// apply when a fully built S3 client is supplied.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum MemoryBudgetConfig {
@@ -31,7 +28,8 @@ pub enum MemoryBudgetConfig {
     /// page cache and the rest of the process.
     #[default]
     Auto,
-    /// The given fraction (0.0 to 1.0) of detected RAM.
+    /// The given fraction of detected RAM, clamped to `(0.0, 1.0]`. A
+    /// non-finite or non-positive value falls back to the `Auto` fraction.
     Fraction(f64),
     /// An explicit byte limit, overriding detection.
     Limit(usize),
