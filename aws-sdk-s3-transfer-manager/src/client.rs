@@ -238,6 +238,13 @@ impl Client {
         &self.handle.config
     }
 
+    /// Snapshot the global memory budget's resolved ceiling and current admission
+    /// state. For the configured intent (before resolution), see
+    /// [`config().memory_budget()`](Config::memory_budget).
+    pub fn memory_budget(&self) -> crate::types::MemoryBudgetSnapshot {
+        self.handle.memory_budget.stats()
+    }
+
     /// Upload a single object from S3.
     ///
     /// Constructs a fluent builder for the

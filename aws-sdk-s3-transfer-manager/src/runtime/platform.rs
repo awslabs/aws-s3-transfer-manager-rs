@@ -134,6 +134,12 @@ fn auto_budget(ram: Option<usize>) -> usize {
 /// capped — an explicit fraction is taken at the caller's word.
 /// `UNDETECTABLE_MEM_BYTES` when RAM is unknown.
 pub(crate) fn mem_for_fraction(fraction: f64) -> usize {
+    if !(fraction.is_finite() && fraction > 0.0) || fraction > 1.0 {
+        tracing::debug!(
+            requested = fraction,
+            "memory budget fraction outside (0.0, 1.0]; clamping"
+        );
+    }
     mem_for_fraction_from(available_ram(), fraction)
 }
 

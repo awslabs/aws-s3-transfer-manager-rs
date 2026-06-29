@@ -64,6 +64,9 @@ struct Inner {
     capacity: u64,
     /// Parked requests in strict arrival order; the front is served first.
     waiters: VecDeque<Waiter>,
+    /// Cumulative count of requests that ever parked (returned `Pending`).
+    /// Monotonic; distinguishes a budget that has bound from one that never has.
+    total_parked: u64,
 }
 
 /// A parked reservation request: how many chunks it needs, the slot through which
@@ -170,11 +173,24 @@ impl MemoryBudget {
     pub(crate) fn new(capacity_bytes: usize, chunk_bytes: usize) -> Arc<Self> {
         assert!(chunk_bytes > 0, "chunk_bytes must be > 0");
         let capacity = (capacity_bytes / chunk_bytes).max(1) as u64;
+        if capacity_bytes < chunk_bytes {
+            tracing::debug!(
+                requested_bytes = capacity_bytes,
+                chunk_bytes,
+                "memory budget below one chunk; raised to a single chunk"
+            );
+        }
+        tracing::debug!(
+            capacity_chunks = capacity,
+            chunk_bytes,
+            "memory budget resolved"
+        );
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 in_use: 0,
                 capacity,
                 waiters: VecDeque::new(),
+                total_parked: 0,
             }),
             chunk: chunk_bytes,
         })
@@ -246,6 +262,7 @@ impl MemoryBudget {
             slot: Arc::clone(&slot),
             notify,
         });
+        inner.total_parked += 1;
         Reserve::Pending(WaitTicket {
             slot,
             budget: Arc::clone(self),
@@ -283,6 +300,19 @@ impl MemoryBudget {
     #[allow(dead_code)]
     pub(crate) fn chunk_bytes(&self) -> usize {
         self.chunk
+    }
+
+    /// Snapshot the budget's admission state under a single lock. Chunk counts are
+    /// converted to bytes; `reserved_bytes` is admitted memory (a ceiling), not
+    /// resident memory.
+    pub(crate) fn stats(&self) -> crate::types::MemoryBudgetSnapshot {
+        let inner = self.inner.lock();
+        crate::types::MemoryBudgetSnapshot {
+            capacity_bytes: inner.capacity * self.chunk as u64,
+            reserved_bytes: inner.in_use * self.chunk as u64,
+            waiters: inner.waiters.len(),
+            total_parked: inner.total_parked,
+        }
     }
 }
 
@@ -386,6 +416,45 @@ mod tests {
         let first = budget.try_reserve(chunk);
         assert!(first.is_some());
         assert!(budget.try_reserve(chunk).is_none());
+    }
+
+    #[test]
+    fn test_stats_reports_bytes_and_park_counter() {
+        let chunk = 1024;
+        let budget = MemoryBudget::new(chunk * 2, chunk); // capacity = 2 chunks
+
+        let s = budget.stats();
+        assert_eq!(s.capacity_bytes, (chunk * 2) as u64);
+        assert_eq!(s.reserved_bytes, 0);
+        assert_eq!(s.waiters, 0);
+        assert_eq!(s.total_parked, 0);
+
+        // Reserve both chunks: reserved tracks in bytes, still no parking.
+        let holder = match budget.reserve(chunk * 2, notify_flag().0) {
+            Reserve::Ready(r) => r,
+            Reserve::Pending(_) => panic!("expected Ready"),
+        };
+        let s = budget.stats();
+        assert_eq!(s.reserved_bytes, (chunk * 2) as u64);
+        assert_eq!(s.waiters, 0);
+        assert_eq!(s.total_parked, 0);
+
+        // Next request parks: waiters rises and the cumulative counter ticks.
+        let ticket = match budget.reserve(chunk, notify_flag().0) {
+            Reserve::Pending(t) => t,
+            Reserve::Ready(_) => panic!("expected Pending"),
+        };
+        let s = budget.stats();
+        assert_eq!(s.waiters, 1);
+        assert_eq!(s.total_parked, 1);
+
+        // Drop the waiter: waiters falls back, but total_parked is monotonic.
+        drop(ticket);
+        let s = budget.stats();
+        assert_eq!(s.waiters, 0);
+        assert_eq!(s.total_parked, 1, "park counter is cumulative");
+
+        drop(holder);
     }
 
     #[test]
