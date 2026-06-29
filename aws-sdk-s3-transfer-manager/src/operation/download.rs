@@ -19,8 +19,8 @@ pub use body::{Body, ChunkOutput};
 #[allow(dead_code)]
 pub(crate) mod recv_buffer;
 
-/// Adaptive read-ahead window — paces speculative issuance to the consumer drain rate.
-mod read_ahead;
+/// Read-ahead window — the occupancy bound on speculative issuance.
+pub(crate) mod read_ahead;
 
 mod context;
 
@@ -36,6 +36,7 @@ pub use output::DownloadOutput;
 
 pub(crate) mod transfer;
 pub(crate) use transfer::DownloadTransfer;
+pub use transfer::DownloadIoCtl;
 
 /// Provides metadata for each chunk during an object download.
 mod chunk_meta;

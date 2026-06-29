@@ -356,6 +356,14 @@ struct Inner<T> {
     /// In-order delivery cursor. Written only by the consumer, read by the issuer
     /// for reclaim, so it is atomic and padded off the lock's cache line.
     consumed: CachePadded<AtomicU64>,
+    /// Count of parts whose payload memory the consumer has freed, across both
+    /// surfaces: the stream surface frees one per in-order delivery, the block
+    /// surface frees a whole segment's filled slots on drain (out of order). This is
+    /// resident occupancy's complement — `issued - released` is the read-ahead gate's
+    /// denominator. Distinct from `consumed`, which is the in-order cursor reclaim
+    /// needs; on the stream path the two advance together, on the block path only
+    /// `released` moves.
+    released: CachePadded<AtomicU64>,
     /// Slots per segment for this instance. Fixed at construction; used to size
     /// the initial segment and every grown successor.
     seg_size: usize,
@@ -472,6 +480,7 @@ impl<T> SegmentWrite<T> {
         if self.seg.state.is_drained() {
             return;
         }
+        let mut freed = 0u64;
         for slot in self.seg.slots.iter() {
             // SAFETY: winning the FULL → DRAINING CAS made this token the segment's
             // sole accessor, and the two consumption surfaces are mutually exclusive
@@ -479,9 +488,16 @@ impl<T> SegmentWrite<T> {
             // consumer touches these slots. Freeing the payload releases whatever it
             // carries (e.g. a memory reservation).
             slot.data.with_mut(|p| unsafe {
-                *p = None;
+                if (*p).take().is_some() {
+                    freed += 1;
+                }
             });
         }
+        // Release the read-ahead occupancy these parts held. Counts only slots that
+        // actually carried a payload (a partial tail segment has unfilled slots), so
+        // the count is exact. Out of order across segments is fine — it is a count,
+        // not a cursor.
+        self.inner.released.fetch_add(freed, Ordering::AcqRel);
         self.seg.state.set_drained();
         reclaim_front(&self.inner);
     }
@@ -565,6 +581,7 @@ impl<T> PagedRecvBuffer<T> {
                 issued: 0,
             }),
             consumed: CachePadded::new(AtomicU64::new(0)),
+            released: CachePadded::new(AtomicU64::new(0)),
             seg_size,
         });
         let consumer = RecvBufferConsumer {
@@ -693,10 +710,23 @@ impl<T> PagedRecvBuffer<T> {
     /// The in-order delivery cursor: the next sequence the consumer will deliver, i.e.
     /// the count of sequences already delivered. Lock-free read of the shared cursor.
     ///
-    /// For a producer-side read-ahead gate: the issuer bounds outstanding work by
-    /// `issued − consumed < W` (the caller tracks `issued`; this supplies `consumed`).
+    /// This is the in-order reclaim threshold, not the read-ahead gate's denominator
+    /// (use [`released`](Self::released) for that): the block surface delivers to disk
+    /// without advancing this cursor.
     pub(crate) fn consumed(&self) -> u64 {
         self.inner.consumed.load(Ordering::Acquire)
+    }
+
+    /// Count of parts whose payload memory the consumer has freed, across both the
+    /// stream and block surfaces. Lock-free.
+    ///
+    /// This is the read-ahead gate's denominator: the issuer bounds resident
+    /// occupancy by `issued − released < W` (the caller tracks `issued`; this
+    /// supplies `released`). Unlike [`consumed`](Self::consumed), it advances on the
+    /// block (disk) surface too, so a download larger than `W` keeps issuing as
+    /// segments drain instead of latching shut at the window.
+    pub(crate) fn released(&self) -> u64 {
+        self.inner.released.load(Ordering::Acquire)
     }
 
     // ── Introspection (advisory) ─────────────────────────────────────────────────
@@ -797,6 +827,9 @@ impl<T> RecvBufferConsumer<T> {
         self.current.slots[idx].state.set_empty();
         self.cursor += 1;
         self.inner.consumed.store(self.cursor, Ordering::Release);
+        // This delivery freed one part's payload; release its read-ahead occupancy.
+        // On the stream path `released` tracks `consumed` one-to-one.
+        self.inner.released.fetch_add(1, Ordering::AcqRel);
 
         Some(value)
     }

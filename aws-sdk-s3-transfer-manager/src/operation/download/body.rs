@@ -135,10 +135,10 @@ impl BodyWriter {
         }
     }
 
-    /// In-order delivery cursor. For the producer-side read-ahead gate:
-    /// `issued - consumed < W`.
-    pub(crate) fn consumed(&self) -> u64 {
-        self.buffer.consumed()
+    /// Parts whose memory the consumer has freed (stream delivery or disk drain) —
+    /// the read-ahead gate's denominator. See [`PagedRecvBuffer::released`].
+    pub(crate) fn released(&self) -> u64 {
+        self.buffer.released()
     }
 
     /// Disk mode: drain every sealed (FULL) segment to disk. Called on the
@@ -747,5 +747,44 @@ mod tests {
                 "mismatch at seq {seq}"
             );
         }
+    }
+
+    /// Draining sealed segments on the disk path must release read-ahead occupancy.
+    ///
+    /// The issuance gate bounds `issued - consumed()`. On the stream path `consumed()`
+    /// advances as the consumer pulls; on the disk path the consumer is
+    /// `drain_sealed`, which writes and frees whole segments. If draining does not
+    /// move the gate's occupancy, a download larger than the read-ahead window wedges:
+    /// the gate latches shut at the window and never reopens even though the buffer
+    /// has drained to empty. This drives that path directly — no network, no large
+    /// object — and asserts occupancy falls as segments drain.
+    #[test]
+    fn disk_drain_releases_read_ahead_occupancy() {
+        use super::SEG_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_slot_body_with_sink(file, 0, false);
+
+        // Fill and seal two full segments, draining after each seal — the disk path's
+        // steady-state loop. Bounded iteration, so a regression fails fast.
+        let total = (2 * SEG_SIZE) as u64;
+        for i in 0..total {
+            let slot = writer.claim();
+            slot.fill(chunk_at(i, i * 100, format!("d{i}").as_bytes()));
+            // Drain on the segment-seal boundary, as execute_get_range does.
+            writer.drain_sealed().unwrap();
+        }
+
+        // The gate measures resident occupancy as `issued - released()`. Every part
+        // has been written to disk and its memory freed, so occupancy must be 0 —
+        // otherwise the gate would still count drained parts against the window.
+        let released = writer.released();
+        let occupancy = total - released;
+        assert_eq!(
+            occupancy, 0,
+            "all {total} parts drained to disk, but the gate still counts {occupancy} \
+             as resident (released={released}); issuance cannot reopen past the window"
+        );
     }
 }

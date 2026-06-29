@@ -120,6 +120,11 @@ impl DownloadHandleInner {
     pub(crate) fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }
+
+    /// Get I/O controls for this transfer.
+    pub(crate) fn io_ctl(&self) -> super::transfer::DownloadIoCtl<'_> {
+        self.transfer.io_ctl()
+    }
 }
 
 /// Handle to an in-progress download operation.
@@ -257,6 +262,14 @@ impl DownloadHandle {
         self.inner.scheduling()
     }
 
+    /// Runtime I/O controls for this download.
+    ///
+    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
+    /// controls (e.g. adjusting read-ahead on a running transfer).
+    pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
+        self.inner.io_ctl()
+    }
+
     /// Current status of this transfer.
     pub fn status(&self) -> crate::types::TransferStatus {
         self.inner.transfer.ctx().transfer_status()
@@ -369,6 +382,14 @@ impl ManagedDownloadHandle {
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.inner.scheduling()
+    }
+
+    /// Runtime I/O controls for this download.
+    ///
+    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
+    /// controls (e.g. adjusting read-ahead on a running transfer).
+    pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
+        self.inner.io_ctl()
     }
 
     /// Current status of this transfer.

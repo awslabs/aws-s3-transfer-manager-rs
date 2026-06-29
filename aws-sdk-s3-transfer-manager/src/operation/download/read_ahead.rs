@@ -82,7 +82,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Provisional: when a global memory budget exists the window is sized from it
 /// (`memory_budget / part_size`) and arbitrated across transfers rather than fixed
 /// per transfer (see `flow-control-architecture.md` §7b, ladder rung 1).
-const DEFAULT_WINDOW_PARTS: u64 = 1024;
+///
+/// The default for the public [`ReadAhead::Auto`](crate::types::ReadAhead) mode;
+/// `Handle::download_read_ahead_window` resolves the knob to a window in parts.
+pub(crate) const DEFAULT_WINDOW_PARTS: u64 = 1024;
+
+/// Map the public [`ReadAhead`](crate::types::ReadAhead) knob to a window in parts.
+/// `Auto` is the fixed per-transfer cap (a future memory budget will size it);
+/// `Parts(n)` is `n + 1` — `n` parts of speculation beyond the part the consumer is
+/// waiting on, which is always admitted, so `Parts(0)` is demand paging. The single
+/// definition of the knob's meaning, used at transfer construction and by the
+/// dynamic control surface.
+pub(crate) fn window_parts_for(mode: &crate::types::ReadAhead) -> u64 {
+    match mode {
+        crate::types::ReadAhead::Auto => DEFAULT_WINDOW_PARTS,
+        crate::types::ReadAhead::Parts(n) => (*n as u64).saturating_add(1),
+    }
+}
 
 /// Per-transfer read-ahead window — the receive-window (rwnd) bound on speculative
 /// issuance.
@@ -97,12 +113,16 @@ pub(crate) struct ReadAhead {
 }
 
 impl ReadAhead {
-    /// Create a controller with the interim fixed window. The window opens at
-    /// [`DEFAULT_WINDOW_PARTS`] and (today) stays there: memory bounds the transfer,
-    /// the occupancy gate paces a slow or blocked consumer for free.
+    /// Create a controller with the default fixed window ([`DEFAULT_WINDOW_PARTS`]).
     pub(crate) fn new() -> Self {
+        Self::with_window(DEFAULT_WINDOW_PARTS)
+    }
+
+    /// Create a controller with an explicit window, in parts. The resolved value of
+    /// the public [`ReadAhead`](crate::types::ReadAhead) knob enters here.
+    pub(crate) fn with_window(parts: u64) -> Self {
         Self {
-            window: AtomicU64::new(DEFAULT_WINDOW_PARTS),
+            window: AtomicU64::new(parts),
         }
     }
 
@@ -112,12 +132,18 @@ impl ReadAhead {
         self.window.load(Ordering::Relaxed)
     }
 
+    /// Set the window, in parts. Lock-free. Used to apply a dynamic read-ahead
+    /// change to a running transfer; the next gate read observes the new value.
+    pub(crate) fn set_window(&self, parts: u64) {
+        self.window.store(parts, Ordering::Relaxed);
+    }
+
     /// Test-only: force the window to a fixed value, so transfer-level tests can
     /// drive the issuance gate deterministically (e.g. exercise the closed-gate
     /// path without claiming a thousand parts).
     #[cfg(test)]
     pub(crate) fn force_window(&self, w: u64) {
-        self.window.store(w, Ordering::Relaxed);
+        self.set_window(w);
     }
 }
 
@@ -148,9 +174,10 @@ mod tests {
     }
 
     #[test]
-    fn window_is_constant_today() {
-        // Nothing in the controller decays or adapts the window — that is deferred
-        // to the budget clamp and Auto-mode layers. Repeated reads are stable.
+    fn window_does_not_drift_on_its_own() {
+        // The controller never changes the window itself; only an explicit
+        // set_window (the budget clamp or the dynamic knob) moves it. Repeated reads
+        // with no writer are stable.
         let ra = ReadAhead::new();
         let w = ra.window();
         for _ in 0..1000 {
@@ -159,9 +186,34 @@ mod tests {
     }
 
     #[test]
+    fn set_window_updates_the_value() {
+        let ra = ReadAhead::new();
+        ra.set_window(7);
+        assert_eq!(ra.window(), 7);
+        ra.set_window(1);
+        assert_eq!(ra.window(), 1);
+    }
+
+    #[test]
     fn force_window_overrides_for_gate_tests() {
         let ra = ReadAhead::new();
         ra.force_window(3);
         assert_eq!(ra.window(), 3);
+    }
+
+    #[test]
+    fn window_parts_for_maps_the_knob() {
+        use crate::types::ReadAhead as Knob;
+        // Auto -> the fixed default.
+        assert_eq!(window_parts_for(&Knob::Auto), DEFAULT_WINDOW_PARTS);
+        // Parts(n) -> n + 1: n speculative parts plus the always-admitted demand part.
+        assert_eq!(window_parts_for(&Knob::Parts(0)), 1, "Parts(0) is demand paging");
+        assert_eq!(window_parts_for(&Knob::Parts(1)), 2);
+        assert_eq!(window_parts_for(&Knob::Parts(255)), 256);
+        // The + 1 saturates rather than overflowing at the top of the range.
+        assert_eq!(
+            window_parts_for(&Knob::Parts(usize::MAX)),
+            (usize::MAX as u64).saturating_add(1)
+        );
     }
 }

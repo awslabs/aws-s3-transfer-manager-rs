@@ -540,6 +540,23 @@ impl DownloadFluentBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         self.inner.get_checksum_mode()
     }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request. Default defers to the client's
+    /// [`Config`](crate::config::Config).
+    pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
+        self.inner = self.inner.read_ahead(input);
+        self
+    }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+        self.inner = self.inner.set_read_ahead(input);
+        self
+    }
+    /// The read-ahead override set on this builder, if any.
+    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+        self.inner.get_read_ahead()
+    }
 }
 
 impl crate::operation::download::input::DownloadInputBuilder {

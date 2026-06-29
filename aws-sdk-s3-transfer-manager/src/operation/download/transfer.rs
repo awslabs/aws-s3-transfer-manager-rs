@@ -89,8 +89,11 @@ impl DownloadTransfer {
         input: DownloadInput,
         writer: BodyWriter,
     ) -> Self {
+        // Resolve the read-ahead knob (per-request override, else client default)
+        // to a window in parts before `ctx` and `input` are moved into the struct.
+        let read_ahead = ReadAhead::with_window(ctx.handle.download_read_ahead_window(&input));
         let inner = Arc::new(DownloadTransferInner {
-            read_ahead: ReadAhead::new(),
+            read_ahead,
             ctx,
             state: Mutex::new(DownloadState::new()),
             request: Arc::new(input),
@@ -118,11 +121,20 @@ impl DownloadTransfer {
         &self.inner.writer
     }
 
-    /// The read-ahead window (the receive-window issuance bound). Test-only:
-    /// production code reads `self.inner.read_ahead` directly at the gate.
+    /// The read-ahead window (the receive-window issuance bound). The gate reads
+    /// `self.inner.read_ahead` directly and the control surface goes through
+    /// [`set_read_ahead`](Self::set_read_ahead); this accessor is for tests.
     #[cfg(test)]
     pub(crate) fn read_ahead(&self) -> &ReadAhead {
         &self.inner.read_ahead
+    }
+
+    /// Apply a dynamic read-ahead change, resolving the public knob to a window. The
+    /// next issuance-gate read observes the new value.
+    pub(crate) fn set_read_ahead(&self, mode: &crate::types::ReadAhead) {
+        self.inner
+            .read_ahead
+            .set_window(super::read_ahead::window_parts_for(mode));
     }
 
     /// Object metadata from discovery.
@@ -193,25 +205,28 @@ impl DownloadTransfer {
                 part_size,
                 issued,
             } => {
-                // Read-ahead gate: bound resident occupancy. `issued - consumed` is
-                // the count of parts claimed but not yet delivered in order; the gate
-                // holds it under the receive window. A slow or blocked consumer is
-                // paced for free — occupancy fills, the gate closes, issuance waits.
-                let consumed = self.inner.writer.consumed();
+                // Read-ahead gate: bound resident occupancy. `issued - released` is
+                // the count of parts claimed but whose memory the consumer has not yet
+                // freed; the gate holds it under the receive window. `released` counts
+                // both delivery surfaces (stream pull and disk drain), so a disk
+                // download paces to its drain rate rather than latching shut at the
+                // window. A slow or blocked consumer is paced for free — occupancy
+                // fills, the gate closes, issuance waits.
+                let released = self.inner.writer.released();
                 let window = self.inner.read_ahead.window();
-                if *issued - consumed >= window {
-                    // Gate closed: the issuer is `window` parts ahead of the consumer
-                    // and must wait for a delivery (which advances `consumed`) before
-                    // claiming more. This is the load-bearing line for diagnosing a
-                    // stall: a *wedge* shows up here as a gate that never reopens —
-                    // `consumed` frozen, `issued - consumed == window`, recurring every
-                    // poll. A healthy slow consumer shows the same fields advancing in
-                    // step. Trace, not debug: it fires every gated poll in steady state.
+                if *issued - released >= window {
+                    // Gate closed: the issuer is `window` parts ahead of what the
+                    // consumer has freed and must wait for a drain before claiming
+                    // more. The load-bearing line for diagnosing a stall: a *wedge*
+                    // shows up here as a gate that never reopens — `released` frozen,
+                    // `issued - released == window`, recurring every poll. A healthy
+                    // consumer shows the same fields advancing in step. Trace, not
+                    // debug: it fires every gated poll in steady state.
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         issued = *issued,
-                        consumed,
-                        in_flight = *issued - consumed,
+                        released,
+                        in_flight = *issued - released,
                         window,
                         "read-ahead gate closed: issuance paused until the consumer drains",
                     );
@@ -611,21 +626,23 @@ impl DownloadTransfer {
     }
 
     fn decrement_in_flight(&self) {
-        let should_wake = {
+        {
             let mut work = self.inner.state.lock().unwrap();
             if let DownloadState::Transferring {
                 ranges_in_flight, ..
             } = &mut *work
             {
                 *ranges_in_flight = ranges_in_flight.saturating_sub(1);
-                *ranges_in_flight == 0
-            } else {
-                false
             }
-        };
-        if should_wake {
-            self.inner.ctx.try_wake();
         }
+        // Repoke the issuer on every completion. A completed range has drained its
+        // payload (freeing read-ahead occupancy) and dropped the in-flight count, so
+        // a parked poll_work may now make progress — admit a part through a reopened
+        // gate, or complete the transfer when the last range lands. `try_wake` is a
+        // cheap no-op unless the issuer actually parked (it is gated on the pending
+        // flag), so poking unconditionally is correct and avoids a class of wedge
+        // where the gate reopens but nothing re-polls it.
+        self.inner.ctx.try_wake();
     }
 
     /// Transition to terminal failed state. Requires holding the work lock.
@@ -663,6 +680,34 @@ impl DownloadTransfer {
         drop(guard); // release lock before signaling waiters
         self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
+    }
+}
+
+/// Runtime I/O controls for a running download.
+///
+/// Adjusts how the transfer moves data, as opposed to how it is scheduled relative
+/// to other transfers (that is [`SchedulingCtl`](crate::transfer::SchedulingCtl)).
+/// Obtained via [`DownloadHandle::io_ctl()`](crate::operation::download::DownloadHandle::io_ctl).
+#[derive(Debug)]
+pub struct DownloadIoCtl<'a> {
+    transfer: &'a DownloadTransfer,
+}
+
+impl DownloadIoCtl<'_> {
+    /// Set how far this download prefetches ahead of the consumer, overriding the
+    /// value resolved at initiation. Takes effect on the next issuance decision.
+    ///
+    /// Lowering the window caps resident memory for a consumer that has fallen
+    /// behind; raising it restores prefetch depth once the consumer catches up.
+    pub fn set_read_ahead(&self, mode: crate::types::ReadAhead) {
+        self.transfer.set_read_ahead(&mode);
+    }
+}
+
+impl DownloadTransfer {
+    /// I/O controls for this transfer.
+    pub(crate) fn io_ctl(&self) -> DownloadIoCtl<'_> {
+        DownloadIoCtl { transfer: self }
     }
 }
 
@@ -1142,6 +1187,79 @@ mod tests {
         // Gate reopens for exactly one more claim.
         assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
+    }
+
+    /// The window resolved at construction follows precedence: a per-request
+    /// `read_ahead` override wins; absent one, the client default applies.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_ahead_resolution_precedence() {
+        use crate::types::ReadAhead;
+
+        let build = |client_mode: ReadAhead, input_override: Option<ReadAhead>| {
+            let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(8 * MB as i64)
+                    .content_range(format!("bytes 0-{}/{}", 8 * MB - 1, 8 * MB))
+                    .e_tag("test-etag")
+                    .body(ByteStream::from(vec![0u8; 8 * MB as usize]))
+                    .build()
+            });
+            let config = crate::Config::builder()
+                .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+                .part_size(crate::types::PartSize::Target(8 * MB))
+                .read_ahead(client_mode)
+                .build();
+            let handle = crate::client::Handle::test_handle_tokio(config);
+            let input = DownloadInput::builder()
+                .bucket("test-bucket")
+                .key("test-key")
+                .set_read_ahead(input_override)
+                .build()
+                .unwrap();
+            let (writer, _consumer) = crate::operation::download::body::new_slot_body();
+            let (ctx, _rx) = TransferContext::new(handle);
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+        };
+
+        // No request override: the client default resolves.
+        let t = build(ReadAhead::Parts(9), None);
+        assert_eq!(t.read_ahead().window(), 10, "client default applies");
+
+        // Request override wins over the client default.
+        let t = build(ReadAhead::Parts(9), Some(ReadAhead::Parts(3)));
+        assert_eq!(t.read_ahead().window(), 4, "request override wins");
+
+        // Client Auto resolves to the fixed default when not overridden.
+        let t = build(ReadAhead::Auto, None);
+        assert_eq!(
+            t.read_ahead().window(),
+            super::super::read_ahead::DEFAULT_WINDOW_PARTS
+        );
+    }
+
+    /// `io_ctl().set_read_ahead` resolves the public knob to a window and applies it
+    /// to the running transfer; the gate observes the new value on the next poll.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_io_ctl_set_read_ahead_resizes_window() {
+        let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
+        skip_discovery(&transfer).await;
+
+        // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
+        transfer.io_ctl().set_read_ahead(crate::types::ReadAhead::Parts(4));
+        assert_eq!(transfer.read_ahead().window(), 5);
+
+        // Parts(0) is demand paging: a window of exactly one outstanding part.
+        transfer.io_ctl().set_read_ahead(crate::types::ReadAhead::Parts(0));
+        assert_eq!(transfer.read_ahead().window(), 1);
+
+        // Auto returns to the default fixed window.
+        transfer.io_ctl().set_read_ahead(crate::types::ReadAhead::Auto);
+        assert_eq!(
+            transfer.read_ahead().window(),
+            super::super::read_ahead::DEFAULT_WINDOW_PARTS
+        );
     }
 
     use crate::http::header::Range;

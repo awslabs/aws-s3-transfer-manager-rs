@@ -565,3 +565,57 @@ async fn test_download_slow_consumer_does_not_wedge() {
     server_handle.shutdown().await.expect("shutdown");
 }
 
+/// A disk download whose part count exceeds the read-ahead window must complete.
+///
+/// The disk consumer drains via the block surface (`drain_sealed`), which frees a
+/// whole segment at a time and does not advance the in-order delivery cursor. The
+/// read-ahead gate must release occupancy on that drain, or issuance latches shut at
+/// the window and the transfer wedges with the buffer drained to empty. A small
+/// `ReadAhead::Parts` window makes the object exceed it cheaply (no multi-GiB
+/// object); the window is kept above the buffer's segment granularity so segments
+/// can seal and drain. Under a timeout so the wedge fails fast instead of hanging.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
+    use aws_sdk_s3_transfer_manager::types::ReadAhead;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+
+    // 40 parts (200 MiB) against a window of 32 (Parts(31) → 31 speculative + 1
+    // demand): the gate fills and must reopen on disk drains. The window spans two
+    // 16-part segments, so a segment seals and drains while issuance is gated — the
+    // path that wedged before the gate counted disk drains. Kept modest: the 5 MiB
+    // minimum part size makes larger objects costly on the test filesystem.
+    let size = 40 * part_size;
+    let content = deterministic_data(size);
+    server
+        .add_object("test-bucket", "disk-window-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let written = timeout(Duration::from_secs(30), async {
+        let handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("disk-window-key")
+            .read_ahead(ReadAhead::Parts(31))
+            .write_to_path(&dest_path)
+            .await
+            .unwrap();
+        handle.join().await.unwrap();
+        std::fs::read(&dest_path).unwrap()
+    })
+    .await
+    .expect("disk download did not complete within 30s (gate failed to reopen on drain)");
+
+    assert_eq!(written.len(), content.len(), "size mismatch");
+    assert_eq!(written, content, "data integrity check failed");
+    server_handle.shutdown().await.expect("shutdown");
+}
+
