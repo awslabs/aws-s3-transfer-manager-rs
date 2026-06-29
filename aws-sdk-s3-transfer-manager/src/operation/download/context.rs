@@ -25,6 +25,9 @@ pub(crate) enum DownloadState {
         /// object's stored part size so each range aligns to a stored part
         /// boundary (S3 returns a per-part checksum only for an aligned range).
         part_size: u64,
+        /// Number of slots claimed (the W-gate numerator). Tracks the issuance
+        /// cursor for the read-ahead bound: `issued - consumed < W`.
+        issued: u64,
     },
 
     /// Terminal state - transfer ended (success, failure, or cancelled)

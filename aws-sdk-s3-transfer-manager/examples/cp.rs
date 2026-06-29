@@ -24,6 +24,37 @@ use jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+// Compiled-in jemalloc runtime config. A saturated download frees and reallocates
+// part-sized (8 MiB) receive buffers at line rate; with the default config the
+// allocator returns those pages to the OS and refaults them on the next read, so
+// page-fault and purge cost dominates the receive path and resident size runs
+// several times the live working set. These options keep freed buffers mapped for
+// reuse, bounding both costs. Overridden by the _RJEM_MALLOC_CONF environment
+// variable (jemalloc config precedence).
+//
+//   background_thread:true  Run page purging on a dedicated thread instead of
+//                           inline on the freeing thread, where the madvise call
+//                           would block the receive path. pthread platforms only
+//                           (Linux); ignored with a startup warning elsewhere.
+//   narenas:32              Cap allocation arenas well below the default (~4x
+//                           CPUs). Fewer arenas concentrate freed buffers into a
+//                           shared dirty pool, so a free on one thread can satisfy
+//                           an allocation on another; the default scatters them
+//                           per-arena and forces a fresh mmap. Fixed count, not
+//                           machine-scaled (revisit per instance, or percpu_arena).
+//   dirty_decay_ms:1000     Hold a freed page mapped and reusable for 1s before
+//                           purging. This retention is the reuse window: a buffer
+//                           freed at delivery serves the next read without a fault.
+//                           0 disables reuse; larger values raise resident size.
+//   muzzy_decay_ms:0        Purge muzzy (already madvise(FREE)'d) pages immediately
+//                           rather than holding a second retention tier; the dirty
+//                           pool above provides the reuse.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,narenas:32,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 #[derive(Debug, Clone, Default, clap::ValueEnum)]
 enum OutputFormat {
     #[default]

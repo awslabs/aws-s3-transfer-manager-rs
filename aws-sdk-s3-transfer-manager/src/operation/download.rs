@@ -15,14 +15,12 @@ pub mod builders;
 mod body;
 pub use body::{Body, ChunkOutput};
 
-// In-order delivery buffer (out-of-order arrival → in-order stream). A generic,
-// self-contained data structure with its own loom models; `body.rs` will be rebuilt
-// on top of it.
-// TODO(flow-control): remove this allow once body.rs consumes PagedRecvBuffer — it
-// has no in-crate consumer yet, so its public surface reads as dead code. Tracked in
-// bosun.md flow-control workstream.
+/// In-order delivery buffer (out-of-order arrival → in-order stream).
 #[allow(dead_code)]
-mod recv_buffer;
+pub(crate) mod recv_buffer;
+
+/// Adaptive read-ahead window — paces speculative issuance to the consumer drain rate.
+mod read_ahead;
 
 mod context;
 
@@ -48,7 +46,7 @@ mod object_meta;
 pub use object_meta::ObjectMetadata;
 
 use crate::error;
-use crate::operation::download::body::{new_slot_body, DEFAULT_BODY_SLOT_CAPACITY};
+use crate::operation::download::body::new_slot_body;
 use crate::types::BucketType;
 use std::sync::Arc;
 
@@ -72,7 +70,7 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
+        let (writer, consumer) = new_slot_body();
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
@@ -147,7 +145,6 @@ impl Download {
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
         let (writer, _consumer) = body::new_slot_body_with_sink(
-            DEFAULT_BODY_SLOT_CAPACITY,
             file,
             object_range_start,
             owns_file,

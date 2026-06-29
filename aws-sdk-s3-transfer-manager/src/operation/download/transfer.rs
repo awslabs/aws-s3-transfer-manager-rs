@@ -17,6 +17,8 @@ use super::input::copy_fields_to_get_object_request;
 use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
+use crate::operation::download::read_ahead::ReadAhead;
+use crate::operation::download::recv_buffer::FillOutcome;
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
@@ -34,17 +36,6 @@ pub(crate) enum DownloadWork {
         slot: Option<BodySlot>,
         etag: Option<Arc<str>>,
     },
-}
-
-impl DownloadWork {
-    /// Extract the slot from this work item, if present.
-    #[cfg(test)]
-    fn take_slot(&mut self) -> Option<BodySlot> {
-        match self {
-            DownloadWork::Discovery => None,
-            DownloadWork::GetObjectRange { slot, .. } => slot.take(),
-        }
-    }
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -78,8 +69,11 @@ struct DownloadTransferInner {
     // TODO(vnext): unify bucket representation (name + kind) across operations.
     #[allow(dead_code)]
     bucket_type: BucketType,
-    /// Sequence window for backpressure control
+    /// Chunk delivery + disk-write surface.
     writer: BodyWriter,
+    /// Read-ahead window (rwnd): bounds resident occupancy by holding
+    /// `issued - consumed` under `read_ahead.window()`.
+    read_ahead: ReadAhead,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Object-integrity result (set once discovery completes)
@@ -96,6 +90,7 @@ impl DownloadTransfer {
         writer: BodyWriter,
     ) -> Self {
         let inner = Arc::new(DownloadTransferInner {
+            read_ahead: ReadAhead::new(),
             ctx,
             state: Mutex::new(DownloadState::new()),
             request: Arc::new(input),
@@ -118,9 +113,16 @@ impl DownloadTransfer {
         self.inner.ctx.id
     }
 
-    /// Body writer for backpressure control and chunk delivery.
+    /// Body writer for chunk delivery and disk writes.
     pub(crate) fn writer(&self) -> &BodyWriter {
         &self.inner.writer
+    }
+
+    /// The read-ahead window (the receive-window issuance bound). Test-only:
+    /// production code reads `self.inner.read_ahead` directly at the gate.
+    #[cfg(test)]
+    pub(crate) fn read_ahead(&self) -> &ReadAhead {
+        &self.inner.read_ahead
     }
 
     /// Object metadata from discovery.
@@ -189,13 +191,36 @@ impl DownloadTransfer {
                 ranges_in_flight,
                 etag,
                 part_size,
-                ..
+                issued,
             } => {
-                // Check seq window before generating work
-                let Some(slot) = self.inner.writer.try_claim() else {
+                // Read-ahead gate: bound resident occupancy. `issued - consumed` is
+                // the count of parts claimed but not yet delivered in order; the gate
+                // holds it under the receive window. A slow or blocked consumer is
+                // paced for free — occupancy fills, the gate closes, issuance waits.
+                let consumed = self.inner.writer.consumed();
+                let window = self.inner.read_ahead.window();
+                if *issued - consumed >= window {
+                    // Gate closed: the issuer is `window` parts ahead of the consumer
+                    // and must wait for a delivery (which advances `consumed`) before
+                    // claiming more. This is the load-bearing line for diagnosing a
+                    // stall: a *wedge* shows up here as a gate that never reopens —
+                    // `consumed` frozen, `issued - consumed == window`, recurring every
+                    // poll. A healthy slow consumer shows the same fields advancing in
+                    // step. Trace, not debug: it fires every gated poll in steady state.
+                    tracing::trace!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        issued = *issued,
+                        consumed,
+                        in_flight = *issued - consumed,
+                        window,
+                        "read-ahead gate closed: issuance paused until the consumer drains",
+                    );
                     self.inner.ctx.set_pending();
                     return PollWork::Pending;
-                };
+                }
+
+                let slot = self.inner.writer.claim();
+                *issued += 1;
 
                 if let Some(range) = remaining.take() {
                     // `part_size` is the stored part size for a validated multipart
@@ -313,11 +338,7 @@ impl DownloadTransfer {
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(stream), Some(meta)) => {
-                let slot = self
-                    .inner
-                    .writer
-                    .try_claim()
-                    .expect("seq window should have capacity at start");
+                let slot = self.inner.writer.claim();
                 Some((stream, meta, slot))
             }
             (None, _) => None,
@@ -333,6 +354,7 @@ impl DownloadTransfer {
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag: etag.clone(),
                 part_size: effective_part_size,
+                issued: if initial_work.is_some() { 1 } else { 0 },
             };
         }
 
@@ -430,11 +452,13 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        slot.fill(chunk);
-        if let Err(e) = self.inner.writer.try_flush() {
-            // Go terminal before any wake (see fail_range).
-            let guard = self.inner.state.lock().unwrap();
-            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        // Edge-triggered disk write: only the fill that seals a segment drains it.
+        if slot.fill(chunk) == FillOutcome::SealedSegment {
+            if let Err(e) = self.inner.writer.drain_sealed() {
+                // Go terminal before any wake (see fail_range).
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            }
         }
 
         // disk_write reflects bytes committed to the file sink buffer.
@@ -541,11 +565,15 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        slot.fill(chunk);
-        if let Err(e) = self.inner.writer.try_flush() {
-            // Go terminal before any wake (see fail_range).
-            let guard = self.inner.state.lock().unwrap();
-            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        // Edge-triggered disk write: only the fill that seals a segment drains it
+        // (one positioned write per full segment), not every fill. Stream mode's
+        // drain_sealed is a no-op.
+        if slot.fill(chunk) == FillOutcome::SealedSegment {
+            if let Err(e) = self.inner.writer.drain_sealed() {
+                // Go terminal before any wake (see fail_range).
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            }
         }
 
         // disk_write reflects bytes committed to the file sink buffer.
@@ -822,9 +850,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (writer, _consumer) = crate::operation::download::body::new_slot_body(
-            crate::operation::download::body::DEFAULT_BODY_SLOT_CAPACITY,
-        );
+        let (writer, _consumer) = crate::operation::download::body::new_slot_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
@@ -924,9 +950,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (writer, _consumer) = crate::operation::download::body::new_slot_body(
-            crate::operation::download::body::DEFAULT_BODY_SLOT_CAPACITY,
-        );
+        let (writer, _consumer) = crate::operation::download::body::new_slot_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
@@ -1035,10 +1059,9 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
-    fn create_download_with_capacity(
+    fn create_download_for_gate(
         object_size: u64,
         part_size: u64,
-        capacity: usize,
     ) -> (
         DownloadTransfer,
         crate::operation::download::body::SlotBodyConsumer,
@@ -1067,80 +1090,58 @@ mod tests {
             .build()
             .unwrap();
 
-        let (writer, consumer) = crate::operation::download::body::new_slot_body(capacity);
+        let (writer, consumer) = crate::operation::download::body::new_slot_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
         (transfer, consumer)
     }
 
+    /// The read-ahead gate bounds issuance at the current window: with the window
+    /// forced small (as a slow consumer's pacing would), issuance proceeds up to
+    /// `issued − consumed == window()`, then stalls. (The window's *value* is the
+    /// controller's job, unit-tested in `read_ahead`; here we test the gate wiring.)
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_seq_window_limits_work_generation() {
-        // Create download with many parts but small slot buffer capacity
-        let (transfer, _consumer) = create_download_with_capacity(128 * MB, 8 * MB, 3);
-
+    async fn test_read_ahead_gate_bounds_issuance() {
+        let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
         skip_discovery(&transfer).await;
-        // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
-        // Capacity=3 means: claimed < consumed + capacity → claimed < 3
-        // So we can claim seq 1, 2 (claimed becomes 2, then 3)
-
-        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
-        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
-
-        // Window exhausted (claimed=3, consumed=0, capacity=3: 3 >= 0+3)
-        assert_pending(transfer.poll_work());
+        // Force a small window to exercise the gate deterministically (the rwnd default
+        // opens wide, so a slow-consumer pacing is what makes it bind).
+        transfer.read_ahead().force_window(3);
+        let w = transfer.read_ahead().window();
+        // Discovery claimed seq 0 (issued=1, consumed=0). Drive until the gate stalls.
+        let mut issued = 1u64;
+        loop {
+            match transfer.poll_work() {
+                PollWork::Ready(_item) => {
+                    issued += 1;
+                    assert!(issued <= w, "issuance ran past the window");
+                }
+                PollWork::Pending => break,
+                PollWork::Done => panic!("unexpected Done"),
+            }
+        }
+        assert_eq!(issued, w, "issuance should fill the window then stall");
     }
 
+    /// Consuming a delivered chunk advances `consumed`, reopening the gate for more
+    /// issuance (`issued − consumed` drops below the window).
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_seq_window_consume_enables_more_work() {
-        let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
-
+    async fn test_consume_reopens_gate() {
+        let (transfer, mut consumer) = create_download_for_gate(128 * MB, 8 * MB);
         skip_discovery(&transfer).await;
-        // After discovery: seq 0 claimed and filled by discovery, consumed=0
-        // Capacity=2 means: claimed < consumed + 2
-
-        let mut w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
-        assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
-
-        // Consume seq 0 (filled by discovery) to open the window
-        consumer.try_take_next(); // consume seq 0, consumed=1
-
-        let mut w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
-        assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
-
-        // Fill seq 1 from its work item, then consume it
-        let slot1 = w1.data_mut::<DownloadWork>().take_slot().expect("has slot");
-        let mut seg = bytes_utils::SegmentedBuf::new();
-        seg.push(bytes::Bytes::from("data"));
-        slot1.fill(ChunkOutput {
-            seq: 1,
-            offset: 0,
-            data: crate::io::AggregatedBytes(seg),
-            metadata: Default::default(),
-        });
-        consumer.try_take_next(); // consume seq 1, consumed=2
-
-        let w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
+        transfer.read_ahead().force_window(3);
+        // Fill the window.
+        while let PollWork::Ready(_item) = transfer.poll_work() {}
         assert_pending(transfer.poll_work());
 
-        // Fill seq 2 from its work item, then consume it
-        let slot2 = w2.data_mut::<DownloadWork>().take_slot().expect("has slot");
-        let mut seg = bytes_utils::SegmentedBuf::new();
-        seg.push(bytes::Bytes::from("data"));
-        slot2.fill(ChunkOutput {
-            seq: 2,
-            offset: 0,
-            data: crate::io::AggregatedBytes(seg),
-            metadata: Default::default(),
-        });
-        consumer.try_take_next(); // consume seq 2
+        // Consume seq 0 (filled by discovery) — consumed advances 0 → 1, freeing a slot.
+        assert!(consumer.try_take_next().is_some(), "discovery chunk should deliver");
 
-        let _w4 = assert_ready(transfer.poll_work()); // seq=4
+        // Gate reopens for exactly one more claim.
+        assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
-
-        // Clean up remaining slots
-        drop(w3);
     }
 
     use crate::http::header::Range;

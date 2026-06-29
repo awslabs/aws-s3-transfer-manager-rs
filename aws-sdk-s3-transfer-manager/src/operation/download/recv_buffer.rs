@@ -232,6 +232,24 @@ impl SegState {
             .is_ok()
     }
 
+    /// Terminal-only: claim a segment for draining regardless of whether it is full,
+    /// `{OPEN | FULL} → DRAINING`, exactly once. For [`PagedRecvBuffer::take_tail`],
+    /// which drains the partial final segment at end-of-stream. Returns `true` for the
+    /// single caller that wins. Already-`DRAINING`/`DRAINED` segments are skipped.
+    fn try_claim_for_drain_partial(&self) -> bool {
+        // Try the full→draining edge first, then the open→draining edge. Whichever the
+        // segment currently sits at, exactly one of these CASes can succeed (the other
+        // observes a state that is no longer OPEN/FULL). Safe only at end-of-stream,
+        // when no producer will fill this segment further (caller obligation).
+        self.0
+            .compare_exchange(SEG_FULL, SEG_DRAINING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            || self
+                .0
+                .compare_exchange(SEG_OPEN, SEG_DRAINING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
     /// Mark consumption complete: `DRAINING → DRAINED` (`Release`).
     fn set_drained(&self) {
         self.0.store(SEG_DRAINED, Ordering::Release);
@@ -515,6 +533,14 @@ fn reclaim_front<T>(inner: &Inner<T>) {
 unsafe impl<T: Send> Send for PagedRecvBuffer<T> {}
 unsafe impl<T: Send> Sync for PagedRecvBuffer<T> {}
 unsafe impl<T: Send> Send for RecvBufferConsumer<T> {}
+// Safety: all mutation goes through `poll_next(&mut self)`, so a shared `&consumer`
+// exposes only Arc/Copy state with no interior mutation — Sync is sound. Needed so a
+// holder of the consumer (e.g. the download `Body`) can itself be Sync.
+unsafe impl<T: Send> Sync for RecvBufferConsumer<T> {}
+// Safety: a SlotHandle is claimed on one thread and may be filled on another (the
+// download claims in poll_work, fills in the async execute task). It carries an
+// Arc<Segment<T>> and indices; moving it and filling moves a `T`, so T: Send suffices.
+unsafe impl<T: Send> Send for SlotHandle<T> {}
 unsafe impl<T: Send> Send for SegmentWrite<T> {}
 unsafe impl<T: Send> Sync for SegmentWrite<T> {}
 
@@ -601,6 +627,14 @@ impl<T> PagedRecvBuffer<T> {
         seg.slots[idx].state.publish_filled();
         let prev = seg.filled_count.fetch_add(1, Ordering::AcqRel);
         if prev + 1 == seg.slots.len() {
+            // The sealing fill (the one that brought the count to full) sets FULL.
+            // `set_full` (Release) is not ordered with a concurrent
+            // `take_completed_segment`, which reads `state` under the lock this path
+            // does not take: a taker racing the seal may observe the segment still
+            // OPEN and skip it. That is safe, not a lost segment — the sealing thread
+            // returns `SealedSegment`, and its caller drains via `drain_sealed`, which
+            // re-scans and finds the now-FULL segment. Per-slot payload visibility is
+            // independent, carried by the publish_filled/is_filled pair above.
             seg.state.set_full();
             FillOutcome::SealedSegment
         } else {
@@ -625,6 +659,44 @@ impl<T> PagedRecvBuffer<T> {
             }
         }
         None
+    }
+
+    /// Terminal-only: hand out the frontmost not-yet-drained segment as an owned
+    /// [`SegmentWrite`] *regardless of whether it is full* (claimed `{OPEN | FULL} →
+    /// DRAINING` via [`SegState::try_claim_for_drain_partial`]), or `None` when every
+    /// segment is already draining/drained.
+    ///
+    /// This drains the **partial final segment** at end-of-stream — the block surface's
+    /// [`take_completed_segment`](Self::take_completed_segment) only yields *full*
+    /// segments, so the last segment of a stream whose length is not a multiple of the
+    /// segment size would otherwise never be handed out. Looping `take_tail` drains that
+    /// tail plus any straggler full segments.
+    ///
+    /// # Caller obligation
+    /// Call only once issuance is complete and all outstanding fills have landed: a
+    /// partial segment claimed here must not receive further fills (a concurrent fill
+    /// would race the consumer reading the segment's slots). The consumer reads only
+    /// the `FILLED` slots (via [`Slot::get`]); unfilled slots are skipped.
+    pub(crate) fn take_tail(&self) -> Option<SegmentWrite<T>> {
+        let guard = self.inner.locked.lock();
+        for seg in guard.segments.iter() {
+            if seg.state.try_claim_for_drain_partial() {
+                return Some(SegmentWrite {
+                    seg: seg.clone(),
+                    inner: self.inner.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    /// The in-order delivery cursor: the next sequence the consumer will deliver, i.e.
+    /// the count of sequences already delivered. Lock-free read of the shared cursor.
+    ///
+    /// For a producer-side read-ahead gate: the issuer bounds outstanding work by
+    /// `issued − consumed < W` (the caller tracks `issued`; this supplies `consumed`).
+    pub(crate) fn consumed(&self) -> u64 {
+        self.inner.consumed.load(Ordering::Acquire)
     }
 
     // ── Introspection (advisory) ─────────────────────────────────────────────────
@@ -815,6 +887,29 @@ impl<T> PagedRecvBuffer<T> {
 }
 
 #[cfg(test)]
+impl<T> PagedRecvBuffer<T> {
+    /// Test helper: fill the handle for sequence `slot`, taken out of a slice of
+    /// claimed handles by index. Lets a test drive fills in an arbitrary order
+    /// without consuming the whole slice up front. Each handle is filled at most
+    /// once; the cell is taken on use.
+    fn fill_at(&self, handles: &[SlotHandle<T>], slot: usize, value: T) {
+        // Fill by index without consuming the handle, so a test can drive an
+        // arbitrary fill order over a pre-claimed slice.
+        let h = &handles[slot];
+        let seg = h.seg.clone();
+        let idx = h.idx;
+        seg.slots[idx].data.with_mut(|p| unsafe {
+            *p = Some(value);
+        });
+        seg.slots[idx].state.publish_filled();
+        let prev = seg.filled_count.fetch_add(1, Ordering::AcqRel);
+        if prev + 1 == seg.slots.len() {
+            seg.state.set_full();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -964,6 +1059,62 @@ mod tests {
             ring.fill(h, i as u64);
         }
         assert!(ring.take_completed_segment().is_none());
+    }
+
+    /// `take_tail` drains a partial final segment that `take_completed_segment` won't
+    /// (not full). Only the FILLED slots carry payloads; unfilled are skipped.
+    #[test]
+    fn take_tail_drains_partial_segment() {
+        let seg_size = 4;
+        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        // Fill only 2 of 4 slots — segment never goes FULL.
+        let handles: Vec<_> = (0..2).map(|_| ring.claim()).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            ring.fill(h, (i * 10) as u64);
+        }
+        // The full-only surface yields nothing.
+        assert!(ring.take_completed_segment().is_none());
+        // The terminal tail surface hands out the partial segment.
+        let sw = ring.take_tail().expect("partial tail segment");
+        assert_eq!(sw.base_seq(), 0);
+        let seen: Vec<Option<u64>> = sw.payloads().iter().map(|s| s.get().copied()).collect();
+        assert_eq!(seen, vec![Some(0), Some(10), None, None]);
+        sw.complete();
+        // Once drained, a second take_tail finds nothing more in this segment.
+        assert!(ring.take_tail().is_none());
+    }
+
+    /// `take_tail` also claims a FULL segment (it accepts OPEN or FULL), and only once.
+    #[test]
+    fn take_tail_claims_full_and_is_exclusive() {
+        let seg_size = 2;
+        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            ring.fill(h, i as u64);
+        }
+        let sw = ring.take_tail().expect("full segment via take_tail");
+        assert_eq!(sw.base_seq(), 0);
+        // Already DRAINING → not handed out again by either take surface.
+        assert!(ring.take_tail().is_none());
+        assert!(ring.take_completed_segment().is_none());
+        sw.complete();
+    }
+
+    /// `consumed()` reports the in-order delivery cursor for the read-ahead gate.
+    #[test]
+    fn consumed_tracks_delivery_cursor() {
+        let seg_size = 2;
+        let (ring, mut consumer) = PagedRecvBuffer::new_with_segment_size(seg_size);
+        assert_eq!(ring.consumed(), 0);
+        let handles: Vec<_> = (0..3).map(|_| ring.claim()).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            ring.fill(h, i as u64);
+        }
+        assert_eq!(ring.consumed(), 0, "filling does not advance the cursor");
+        consumer.poll_next().unwrap();
+        consumer.poll_next().unwrap();
+        assert_eq!(ring.consumed(), 2, "two deliveries advance the cursor to 2");
     }
 
     /// Block surface reads payloads in place via `Slot::get`, then completes.
@@ -1134,7 +1285,7 @@ mod tests {
         );
         assert_eq!(snap.frontier, 5);
         assert_eq!(snap.outstanding(), 2);
-        assert_eq!(snap.arrived(), &[3..5]);
+        assert_eq!(snap.arrived(), std::slice::from_ref(&(3..5)));
         assert_eq!(
             snap.head_of_line(),
             None,
@@ -1247,7 +1398,7 @@ mod tests {
         assert_eq!(snap.frontier, 2);
         assert_eq!(snap.head_of_line(), Some(0));
         assert_eq!(snap.pending(), vec![0..1]);
-        assert_eq!(snap.arrived(), &[1..2]);
+        assert_eq!(snap.arrived(), std::slice::from_ref(&(1..2)));
 
         ring.fill(h0, 10u64);
     }
@@ -1266,7 +1417,7 @@ mod tests {
         assert_eq!(snap.outstanding(), 2);
         assert_eq!(snap.head_of_line(), None);
         assert!(snap.pending().is_empty());
-        assert_eq!(snap.arrived(), &[0..2]);
+        assert_eq!(snap.arrived(), std::slice::from_ref(&(0..2)));
     }
 
     #[test]
@@ -1328,36 +1479,20 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-impl<T> PagedRecvBuffer<T> {
-    /// Test helper: fill the handle for sequence `slot`, taken out of a slice of
-    /// claimed handles by index. Lets a test drive fills in an arbitrary order
-    /// without consuming the whole slice up front. Each handle is filled at most
-    /// once; the cell is taken on use.
-    fn fill_at(&self, handles: &[SlotHandle<T>], slot: usize, value: T) {
-        // Fill by index without consuming the handle, so a test can drive an
-        // arbitrary fill order over a pre-claimed slice.
-        let h = &handles[slot];
-        let seg = h.seg.clone();
-        let idx = h.idx;
-        seg.slots[idx].data.with_mut(|p| unsafe {
-            *p = Some(value);
-        });
-        seg.slots[idx].state.publish_filled();
-        let prev = seg.filled_count.fetch_add(1, Ordering::AcqRel);
-        if prev + 1 == seg.slots.len() {
-            seg.state.set_full();
-        }
-    }
-}
-
 // Loom model-checks the real structure directly (no model of it): the compat layer
 // swaps in loom's atomics/Arc/Mutex under `cfg(s3_tm_loom)`. Segment size is set to
 // 2 per ring (via new_with_segment_size) so boundary-crossing interleavings stay
-// tractable; the algorithm is identical at any size. Six models cover the handoff,
-// the segment hop, reclaim vs an outstanding write (complete and drop paths),
-// multi-producer fill, and the block-take CAS. Run with:
-//   RUSTFLAGS="--cfg s3_tm_loom" cargo test --lib --release loom_tests -- --test-threads=1
+// tractable; the algorithm is identical at any size. Nine models cover the handoff
+// (1), the segment hop (2), reclaim vs an outstanding write — complete (3) and drop
+// (6) paths, multi-producer fill (4), the block-take CAS (5), out-of-order fill
+// across a hop (7), reclaim racing the consumer hop (8), and two takers over
+// distinct segments (9). Run with:
+//   LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg s3_tm_loom" \
+//     cargo test --lib --release loom_tests -- --test-threads=1
+// The preemption bound is required: unbounded exploration of the multi-producer and
+// hop-vs-reclaim models is exponential and does not terminate in practical time. A
+// bound of 3 explores all interleavings with at most three preemptions, which
+// exercises every published ordering edge here while keeping the suite to seconds.
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
     use super::*;
@@ -1587,6 +1722,136 @@ mod loom_tests {
 
             taker.join().unwrap();
             assert!(ring.segment_count() >= 1);
+        });
+    }
+
+    /// Model 7 — out-of-order fill across a segment boundary, with the consumer
+    /// hopping.
+    ///
+    /// Four seqs span two segments (seg0={0,1}, seg1={2,3}). One producer fills seq 3
+    /// (sealing seg1) before seq 0, while another fills 0,1,2; the consumer drains
+    /// across the seg0→seg1 hop concurrently. This combines what Model 2 (hop) and
+    /// Model 4 (out-of-order fill) cover separately: a later segment may seal before
+    /// an earlier one, yet in-order delivery and the hop's `Arc` reconstruction must
+    /// still yield 0,1,2,3 exactly once with no use-after-free. loom's `UnsafeCell`
+    /// and Arc registry catch a torn read, a lost/dup payload, or a freed-segment hop.
+    #[test]
+    fn out_of_order_fill_across_segment_hop() {
+        loom::model(|| {
+            let (ring, mut consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(2);
+            // Claim all four up front (claim is serialized under the lock).
+            let handles: Vec<_> = (0..4).map(|_| ring.claim()).collect();
+
+            let ring_a = ring.clone();
+            let a = thread::spawn(move || {
+                // Seal seg1 before seg0 is touched: fill 3 then 2.
+                ring_a.fill_at(&handles, 3, 3);
+                ring_a.fill_at(&handles, 2, 2);
+                ring_a.fill_at(&handles, 1, 1);
+                ring_a.fill_at(&handles, 0, 0);
+            });
+
+            let mut got = Vec::new();
+            for _ in 0..8 {
+                if let Some(v) = consumer.poll_next() {
+                    got.push(v);
+                }
+                if got.len() == 4 {
+                    break;
+                }
+            }
+            a.join().unwrap();
+            while let Some(v) = consumer.poll_next() {
+                got.push(v);
+            }
+            assert_eq!(got, vec![0, 1, 2, 3], "in-order, exactly once, across the hop");
+        });
+    }
+
+    /// Model 8 — front-reclaim racing the consumer's hop.
+    ///
+    /// seg0 is filled and fully delivered (its slots emptied, `consumed` past its
+    /// end); the consumer is poised at the boundary about to hop to seg1. One thread
+    /// claims seq 2 (growing seg1) and then claims seq 3, whose `reclaim_locked` is
+    /// now eligible to pop the fully-consumed seg0 from the deque — concurrently with
+    /// the consumer loading `seg0.next` and reconstructing seg1's `Arc`. The hop holds
+    /// `self.current` (seg0) by strong ref until the reassignment, and seg1 cannot be
+    /// reclaimed while `consumed <= seg1.base`, so the reconstruction stays live.
+    /// loom's Arc registry catches a use-after-free if reclaim could free a segment
+    /// the hop still touches.
+    #[test]
+    fn reclaim_races_consumer_hop() {
+        loom::model(|| {
+            let (ring, mut consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(2);
+            // Fill and drain seg0 fully so it is reclaim-eligible and the consumer is
+            // at the seg0→seg1 boundary.
+            let h0 = ring.claim();
+            let h1 = ring.claim();
+            ring.fill(h0, 0);
+            ring.fill(h1, 1);
+            assert_eq!(consumer.poll_next(), Some(0));
+            assert_eq!(consumer.poll_next(), Some(1));
+
+            let ring2 = ring.clone();
+            let issuer = thread::spawn(move || {
+                let h2 = ring2.claim(); // grows seg1
+                ring2.fill(h2, 2);
+                let h3 = ring2.claim(); // reclaim_locked may pop the drained seg0
+                ring2.fill(h3, 3);
+            });
+
+            // Hop into seg1 concurrently with the reclaim above.
+            let mut got = Vec::new();
+            for _ in 0..6 {
+                if let Some(v) = consumer.poll_next() {
+                    got.push(v);
+                }
+                if got.len() == 2 {
+                    break;
+                }
+            }
+            issuer.join().unwrap();
+            while let Some(v) = consumer.poll_next() {
+                got.push(v);
+            }
+            assert_eq!(got, vec![2, 3], "post-hop delivery in order, exactly once");
+        });
+    }
+
+    /// Model 9 — two block takers race two distinct full segments.
+    ///
+    /// seg0 and seg1 are both FULL, then two threads call `take_completed_segment`
+    /// concurrently. Each `FULL → DRAINING` CAS succeeds on a different segment, so
+    /// the two takers must come away with seg0 and seg1 — one each, no duplicate, no
+    /// segment skipped. Model 5 proves at-most-once on a *single* contended segment;
+    /// this proves the forward scan hands out *every* takeable segment exactly once
+    /// when takers race across segments.
+    #[test]
+    fn two_takers_distinct_segments() {
+        loom::model(|| {
+            let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(2);
+            // Fill seg0 (0,1) and seg1 (2,3) both to FULL.
+            for i in 0..4u64 {
+                let h = ring.claim();
+                ring.fill(h, i);
+            }
+
+            let ring2 = ring.clone();
+            let t1 = thread::spawn(move || ring2.take_completed_segment().map(|sw| sw.base_seq()));
+            let t2 = thread::spawn(move || ring.take_completed_segment().map(|sw| sw.base_seq()));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both segments handed out, one per taker, no duplication. Order between
+            // the two threads is nondeterministic, so compare as a sorted set.
+            let mut bases: Vec<u64> = [r1, r2].into_iter().flatten().collect();
+            bases.sort_unstable();
+            assert_eq!(
+                bases,
+                vec![0, 2],
+                "both full segments handed out exactly once across racing takers"
+            );
         });
     }
 }

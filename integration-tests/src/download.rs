@@ -506,3 +506,62 @@ async fn test_download_empty_object() {
     handle.join().await.expect("join should succeed");
     server_handle.shutdown().await.expect("shutdown");
 }
+
+// ── Read-ahead window gate: slow-consumer progress ───────────────────────────
+//
+// The read-ahead gate bounds issuance to `issued - consumed < window`. When the
+// in-order consumer lags, occupancy fills the window and the gate closes; it must
+// reopen as the consumer drains so the transfer completes, never stall permanently.
+// These tests drive the gate against the localhost mock (real HTTP client, real
+// concurrent in-flight GETs) with a deliberately slow consumer.
+//
+// Each test is wrapped in a `timeout` so a stalled gate surfaces as a failure with
+// output (run with `RUST_LOG=aws_sdk_s3_transfer_manager::transfer=trace` to see the
+// gate-closed line and whether `consumed` is advancing), not as a hung test.
+
+/// A many-part download whose consumer drains slower than the issuer fetches, so the
+/// gate repeatedly fills and must reopen. Must complete and return every byte intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_download_slow_consumer_does_not_wedge() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let part_size = ByteUnit::Mebibyte.as_bytes_usize();
+    // 64 parts at 1 MiB, 16-way concurrency: the issuer runs well ahead of the slow
+    // in-order consumer, exercising the gate's reopen path repeatedly.
+    let (server, server_handle, tm) = setup_concurrent(part_size, 16).await;
+
+    let content: Vec<u8> = (0..64 * part_size).map(|i| (i % 256) as u8).collect();
+    let expected = content.clone();
+    server
+        .add_object("test-bucket", "slow-key", content, None)
+        .await
+        .expect("add object");
+
+    let result = timeout(Duration::from_secs(30), async {
+        let mut handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("slow-key")
+            .initiate()
+            .expect("initiate download");
+
+        let mut data = Vec::new();
+        while let Some(chunk) = handle.body_mut().next().await {
+            let chunk = chunk.expect("chunk");
+            data.extend_from_slice(&chunk.data.into_bytes());
+            // Slow consumer: pull, then pause, holding the in-order cursor back so
+            // occupancy fills the window and the gate closes between pulls.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.join().await.expect("join should succeed");
+        data
+    })
+    .await
+    .expect("slow-consumer download did not complete within 30s (gate failed to reopen)");
+
+    assert_eq!(result.len(), expected.len(), "size mismatch");
+    assert_eq!(result, expected, "data integrity check failed");
+    server_handle.shutdown().await.expect("shutdown");
+}
+

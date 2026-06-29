@@ -336,7 +336,7 @@ mod tests {
         input: &DownloadInput,
     ) -> DownloadTransfer {
         use crate::operation::download::body;
-        let (writer, _consumer) = body::new_slot_body(body::DEFAULT_BODY_SLOT_CAPACITY);
+        let (writer, _consumer) = body::new_slot_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer)
     }

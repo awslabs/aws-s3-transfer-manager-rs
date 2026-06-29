@@ -418,9 +418,7 @@ impl Drop for ManagedDownloadHandle {
 mod tests {
     use super::{DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
     use crate::error::ErrorKind;
-    use crate::operation::download::body::{
-        new_slot_body, SlotBodyConsumer, DEFAULT_BODY_SLOT_CAPACITY,
-    };
+    use crate::operation::download::body::{new_slot_body, SlotBodyConsumer};
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
     use crate::transfer::TransferContext;
@@ -456,7 +454,7 @@ mod tests {
             .key("test-key")
             .build()
             .unwrap();
-        let (writer, consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
+        let (writer, consumer) = new_slot_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
 
