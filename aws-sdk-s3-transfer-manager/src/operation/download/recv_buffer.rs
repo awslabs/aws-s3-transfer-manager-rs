@@ -6,142 +6,146 @@
 //! In-order delivery over out-of-order arrival.
 //!
 //! `PagedRecvBuffer<T>` assigns each payload a sequence number at claim time, accepts
-//! completed payloads into their slots in any order from many producers, and
-//! delivers them to a single consumer in sequence order. It grows to absorb
-//! head-of-line backlog and shrinks as delivery advances; its resident footprint
-//! tracks the gap between the oldest undelivered and newest claimed sequence,
-//! not the total sequence count.
+//! completed payloads into their slots in any order from many producers, and delivers
+//! them to a single consumer. It grows to absorb head-of-line backlog and shrinks as
+//! delivery advances; its resident footprint tracks the gap between the oldest
+//! undelivered and newest claimed sequence, not the total sequence count.
+//!
+//! A payload is consumed through exactly one of two surfaces (see Surface exclusion):
+//! the **stream** surface delivers one payload at a time in strict sequence order; the
+//! **block** surface hands out contiguous filled runs for bulk consumption (disk
+//! writes) with no in-order requirement. The Structure and Locking below are shared;
+//! each surface is then described on its own.
 //!
 //! # Structure
 //!
-//! Two levels. The primary level is a `VecDeque<Arc<Segment<T>>>` guarded by one
-//! `Mutex`; each segment holds a fixed run of `seg_size` slots covering a contiguous
-//! span of sequence numbers. The deque grows at the tail and is reclaimed from the
-//! front, so only the segments spanning the live window are resident.
+//! A `VecDeque<Arc<Segment<T>>>` guarded by one `Mutex`; each segment holds a fixed run
+//! of `seg_size` slots covering a contiguous span of sequence numbers. The deque grows
+//! at the tail and is reclaimed from the front, so only the segments spanning the live
+//! window are resident.
 //!
 //! ```text
-//!         reclaim ◀── front                    tail ──▶ grow
-//!   ┌───────────── Mutex<{ segments, issued }> ─────────────┐
-//!   │  ┌─────────┐     ┌─────────┐     ┌─────────┐          │
-//!   │  │  seg 0  │─nx─▶│  seg 1  │─nx─▶│  seg 2  │          │
-//!   │  │ F F . . │     │ F F F F │     │ F . _ _ │          │
-//!   │  │ 0 1 2 3 │     │ 4 5 6 7 │     │ 8 9     │          │
-//!   │  │ base=0  │     │ base=4  │     │ base=8  │ issued=9 │
-//!   │  └─────────┘     └────▲────┘     └─▲───────┘          │
-//!   └───────────────────────┼───────────┼──────────────────┘
-//!     consumed=6            cursor=5    fill (producers, any order, lock-free)
-//!     (RecvBufferConsumer.current ─┘
-//!      hops seg→seg via `nx`, lock-free)
+//!   reclaim ◀── front                        tail ──▶ grow
+//!   ┌─────────┐    ┌─────────┐    ┌─────────┐
+//!   │  seg 0  │─nx▶│  seg 1  │─nx▶│  seg 2  │
+//!   │ x x x x │    │ x x x . │    │ F . _ _ │
+//!   │ 0 1 2 3 │    │ 4 5 6 7 │    │ 8 9     │
+//!   │ base=0  │    │ base=4  │    │ base=8  │
+//!   └─────────┘    └───────▲─┘    └─────────┘
+//!                          │
+//!                     cursor=7   (issued=10; cursor mirrored to inner.consumed)
 //!
-//!   F = FILLED slot   _ = EMPTY slot   . = delivered/consumed   nx = next pointer
+//!   x = delivered (below the cursor; slot emptied)   F = filled, awaiting delivery
+//!   . = claimed but not yet filled (in flight)       _ = slot not yet claimed
+//!   nx = next pointer   (stream-surface view)
 //! ```
 //!
-//! In this picture the consumer has delivered seqs 0–4 (cursor at 5, the head of
-//! `seg 1`), producers have filled 5–8 out of order, seq 9 is still in flight, and
-//! `seg 0` is fully consumed (eligible for front-reclaim on the next claim). A
-//! `VecDeque` reallocation moves only the `Arc` pointers; the segments are
+//! In this picture (a stream consumer) seqs 0–6 are delivered (cursor at 7). Seq 7 is
+//! in flight and is the head-of-line gap: the cursor cannot advance until it fills,
+//! even though seq 8 has already arrived (`F` in `seg 2`) and waits behind it. Seq 9 is
+//! in flight; seqs 10–11 are not yet claimed (`issued == 10`). `seg 0` is fully
+//! delivered, eligible for front-reclaim on the next claim.
+//!
+//! A `VecDeque` reallocation moves only the `Arc` pointers; the segments are
 //! heap-stable behind `Arc`, so no producer or consumer reference is invalidated by
 //! growth. The only intrusive link is one `next` pointer per segment, by which the
-//! consumer reaches the successor segment without taking the lock.
+//! stream consumer reaches the successor segment without taking the lock.
 //!
-//! The stream surface (drawn above) tracks delivery with `consumed`. The block surface
-//! instead tracks two per-segment counters: `claim_cursor`, the number of leading
-//! slots claimed for draining, and `drained_count`, the number written and freed. A
-//! segment is reclaimable when either surface has finished it — `base + len <=
-//! consumed` for the stream, or `drained_count == len` for the block.
-//!
-//! # Locking
-//!
-//! One `Mutex` guards the segment deque and the `issued` counter. Only the issuer
-//! and block paths take it — `claim` (assign a sequence, maybe grow, opportunistic
-//! reclaim), `take_drain_run` (scan a contiguous filled run and claim it by advancing
-//! `claim_cursor`), and `complete`/drop reclaim. Each is a short critical section: a
-//! cursor scan or a `pop_front` loop, never held across the disk write itself. The two
-//! hot paths are lock-free: `fill` writes a claimed slot and publishes it with a
-//! `Release` store; `poll_next` reads the cursor slot under `Acquire` and hops
-//! segments via the `next` pointer. The delivery cursor lives in `RecvBufferConsumer` and
-//! is mirrored to an atomic `consumed` so the issuer's reclaim can read it without
-//! synchronizing with the consumer.
-//!
-//! # Roles
-//!
-//! - **issuer** — assigns sequence numbers and grows and reclaims segments. The
-//!   only writer to the deque; the one internal lock serializes issuers. Off the
-//!   hot path (producers fill lock-free), and claims are infrequent relative to
-//!   fills, so lock contention is incidental.
-//! - **producers** — each writes the single slot it claimed. Concurrent and
-//!   lock-free, touching disjoint memory.
-//! - **consumer** — reads slots in sequence order. Single and lock-free.
-//!
-//! # Surfaces
-//!
-//! [`PagedRecvBuffer::new`] returns a `(PagedRecvBuffer<T>, RecvBufferConsumer<T>)` pair, channel-style.
-//! The `PagedRecvBuffer` is cloneable and carries the producer and block surfaces; the
-//! `RecvBufferConsumer` is unique (not cloneable) and carries the stream surface.
-//!
-//! - **producer** (`PagedRecvBuffer`) — [`claim`](PagedRecvBuffer::claim) then
-//!   [`fill`](PagedRecvBuffer::fill).
-//! - **stream** (`RecvBufferConsumer`) — [`poll_next`](RecvBufferConsumer::poll_next) delivers
-//!   one payload at a time in strict sequence order, advancing a single cursor.
-//!   Taking `&mut self`, on a non-cloneable handle, makes "single consumer" a
-//!   type-level fact and lets the cursor and current-segment cache live in the
-//!   handle (so the hop needs no lock).
-//! - **block** (`PagedRecvBuffer`) — [`take_drain_run`](PagedRecvBuffer::take_drain_run)
-//!   hands out a contiguous filled *run* (a prefix of a segment, of at least the drain
-//!   batch) as an owned [`SegmentWrite`], for bulk consumption that does not need
-//!   in-order single-item delivery. Runs may be taken and completed out of order and
-//!   concurrently, and a single segment may be partitioned into several runs.
-//!
-//! An instance is driven through one consumption surface or the other, never both:
-//! the stream cursor empties slots as it passes; the block surface reads runs in place
-//! and frees them. A block-only caller drops the `RecvBufferConsumer`. **This exclusion is a
-//! caller obligation, not type-enforced** — `PagedRecvBuffer` is `Clone` and exposes the
-//! block surface, so the type system does not prevent driving both at once. Doing so
-//! races the stream `take` against the block in-place read and is undefined; the
-//! `unsafe` in both paths relies on the caller honoring this.
-//!
-//! # Slot states
+//! A slot moves `EMPTY → FILLED` and, on the stream path, back to `EMPTY`:
 //!
 //! ```text
 //!   EMPTY ──claim, then fill──▶ FILLED ──stream take──▶ EMPTY
 //! ```
 //!
 //! `FILLED` is published with a `Release` store after the payload write; a reader
-//! observes it with an `Acquire` load before reading the payload. The block
-//! surface leaves slots `FILLED` and frees them at run granularity.
+//! observes it with an `Acquire` load before reading the payload (the handoff, ordering
+//! rule 2). The block surface leaves slots `FILLED` and frees their payloads at run
+//! granularity rather than emptying them.
 //!
-//! # Segment progress (block surface)
+//! # Locking
 //!
-//! A segment carries three monotonic counts rather than a single state flag:
+//! One `Mutex` guards the segment deque and the `issued` counter. Only three paths take
+//! it — `claim` (assign a sequence, maybe grow, opportunistic reclaim),
+//! `take_drain_run` (scan a filled run and claim it by advancing `claim_cursor`), and
+//! `complete`/drop reclaim. Each is a short critical section — a cursor scan or a
+//! `pop_front` loop — never held across the disk write itself. The two hot paths are
+//! lock-free: `fill` writes a claimed slot and publishes it with a `Release` store;
+//! `poll_next` reads the cursor slot under `Acquire`. One lock acquisition per claim,
+//! none per fill.
+//!
+//! # Stream surface
+//!
+//! [`RecvBufferConsumer`] is the unique (non-cloneable) stream handle;
+//! [`poll_next`](RecvBufferConsumer::poll_next) delivers one payload at a time in
+//! strict sequence order. `poll_next` takes `&mut self`, so "single consumer" is a
+//! type-level fact: the delivery cursor and the current-segment `Arc` are fields of the
+//! handle rather than shared state, and `poll_next` reads and advances them — including
+//! the hop to a successor segment via its `next` pointer — without taking the lock.
+//!
+//! The cursor is mirrored to an atomic `consumed` (the two are always equal) so the
+//! issuer can read the delivery position for reclaim without synchronizing with the
+//! consumer. A segment is stream-reclaimable once `base + len <= consumed`: every slot
+//! it covers has been delivered.
+//!
+//! # Block surface
+//!
+//! [`PagedRecvBuffer`] is the cloneable producer/block handle;
+//! [`take_drain_run`](PagedRecvBuffer::take_drain_run) hands out a contiguous filled
+//! *run* as an owned [`SegmentWrite`] for bulk consumption. Runs may be taken and
+//! completed out of order and concurrently, and one segment may be partitioned into
+//! several runs. The block surface never uses the delivery cursor; it tracks two
+//! per-segment counters instead:
 //!
 //! ```text
-//!   filled_count   slots a producer has filled (any positions)   — lock-free
-//!   claim_cursor   leading slots claimed for draining            — under the lock
-//!   drained_count  slots written to the sink and freed           — lock-free add
+//!   block surface: one segment, seg_size = 8, drain batch = 3
 //!
-//!   claim_cursor <= len, drained_count <= len
-//!   drained_count == len  ⇒  segment reclaimable
+//!     slot      0 1 2   3 4 5   6 7
+//!     payload   D D D   F F F   F .
+//!               └run A┘ └run B┘
+//!
+//!   claim_cursor = 6   slots 0-5 claimed for draining (runs A and B)
+//!   drained_count = 3  run A written to the sink and freed; run B claimed, still
+//!                      draining (its slots stay FILLED, only the payload is freed)
+//!   slot 6 is filled but the run beyond claim_cursor (just slot 6, slot 7 in flight)
+//!   is below the drain batch, so it cannot be claimed yet
+//!
+//!   D = drained (payload freed)   F = filled   . = claimed, in flight
 //! ```
 //!
-//! `claim_cursor` and `filled_count` are *not* mutually ordered. A drainer claims a run
-//! by scanning per-slot `FILLED` state, not by reading `filled_count`, and a producer
-//! publishes a slot `FILLED` before bumping `filled_count` (the bump is a probe input,
-//! not the source of truth). So a drainer can advance `claim_cursor` past a slot whose
-//! `filled_count` increment a concurrent producer has not yet performed: from that
-//! producer's view, `claim_cursor > filled_count` transiently. Both are bounded by
-//! `len`, and the per-slot `FILLED` state — not their relative order — is what gates a
-//! safe read. The fill probe's `filled - claim_cursor` is therefore a saturating
-//! subtraction, never a bare one.
+//! - `claim_cursor` — leading slots claimed for draining, advanced only under the lock
+//!   in `take_drain_run`, so a run is handed out at most once and concurrent drainers
+//!   take disjoint runs.
+//! - `drained_count` — slots written to the sink and freed. Advanced (lock-free) when a
+//!   run completes; when it reaches the segment length every claimed slot has been
+//!   written and the segment is block-reclaimable.
 //!
 //! A *drainable run* is the contiguous `FILLED` slice between `claim_cursor` and the
-//! first unfilled slot. [`take_drain_run`](PagedRecvBuffer::take_drain_run) claims such
-//! a run by advancing `claim_cursor` under the lock — so a run is handed out at most
-//! once, and a segment may be partitioned into several runs claimed by different
-//! drainers. A non-terminal claim waits until the run spans the drain batch; a terminal
-//! claim takes whatever contiguous prefix is filled. Completing a run frees its
-//! payloads and advances `drained_count`; when that reaches the segment length every
-//! claimed slot has been written, and the segment is reclaimable. The stream surface
-//! ignores these counts and reclaims by `consumed`.
+//! first unfilled slot. A non-terminal claim takes it once it spans the drain batch (or
+//! once it reaches the end of a full segment, so a sub-batch tail residue still drains);
+//! a terminal claim takes whatever contiguous filled prefix exists. Completing a run
+//! frees its payloads and advances `drained_count`; dropping the token without
+//! completing runs the same drain.
+//!
+//! A third count, `filled_count` (slots a producer has filled, lock-free), feeds only
+//! the advisory fill probe that raises the drain edge. `claim_cursor` and `filled_count`
+//! are *not* mutually ordered: a drainer claims by scanning per-slot `FILLED` state, not
+//! by reading `filled_count`, and a producer publishes a slot `FILLED` before bumping
+//! `filled_count`. So a drainer can advance `claim_cursor` past a slot whose
+//! `filled_count` increment a concurrent producer has not yet performed — from that
+//! producer's view `claim_cursor > filled_count` transiently. Both are bounded by `len`,
+//! and the per-slot `FILLED` state, not their relative order, gates a safe read; the
+//! fill probe's `filled - claim_cursor` is therefore a saturating subtraction, never a
+//! bare one.
+//!
+//! # Surface exclusion
+//!
+//! An instance is driven through one consumption surface or the other, never both: the
+//! stream cursor empties slots as it passes; the block surface reads runs in place and
+//! frees them. A block-only caller drops the `RecvBufferConsumer`. This exclusion is a
+//! caller obligation, not type-enforced — `PagedRecvBuffer` is `Clone` and exposes the
+//! block surface, so the type system does not prevent driving both at once. Doing so
+//! races the stream `take` against the block in-place read and is undefined behavior;
+//! the `unsafe` in both paths relies on the caller honoring this.
 //!
 //! # Memory ordering and safety
 //!
@@ -159,14 +163,16 @@
 //!    So a slot is never the live target of two sequences — there is no reuse window
 //!    to race. (The window the caller must bound is *resident memory*, not aliasing:
 //!    see Caller obligations.)
-//! 4. **Segment-reclaim safety (the hop).** A segment is removed from the deque
-//!    (`pop_front`, front-only) only once `base + len <= consumed`, and only the
-//!    consumer advances `consumed`. So when the consumer hops, the successor it is
-//!    about to enter (base `== consumed`) cannot be popped, and stays strong-
-//!    referenced by the deque — which is what lets the consumer reconstruct an `Arc`
-//!    from the `next` pointer without the lock. This concerns *segment* removal
-//!    only; emptying a *slot's* payload (delivery, or future demand reclaim) leaves
-//!    the segment in place and does not bear on the hop.
+//! 4. **Segment-reclaim safety (the hop).** A front segment is removed (`pop_front`,
+//!    front-only) once `base + len <= consumed` (stream-drained) or `drained_count ==
+//!    len` (block-drained). On the stream path only the first applies, and only the
+//!    consumer advances `consumed`, so when the consumer hops, the successor it is
+//!    about to enter (base `== consumed`) has `base + len <= consumed` false and is not
+//!    block-drained (the surfaces are exclusive, so `drained_count` stays 0). It cannot
+//!    be popped and stays strong-referenced by the deque — which is what lets the
+//!    consumer reconstruct an `Arc` from the `next` pointer without the lock. This
+//!    concerns *segment* removal only; emptying a *slot's* payload leaves the segment
+//!    in place and does not bear on the hop.
 //! 5. **Outstanding block pin.** A live [`SegmentWrite`] holds an
 //!    `Arc<Segment<T>>`, so a segment with a run still being consumed by the block
 //!    surface stays alive until that token drains, even if front-reclaim pops it from
@@ -344,12 +350,12 @@ struct Inner<T> {
     /// for reclaim, so it is atomic and padded off the lock's cache line.
     consumed: CachePadded<AtomicU64>,
     /// Count of parts whose payload memory the consumer has freed, across both
-    /// surfaces: the stream surface frees one per in-order delivery, the block
-    /// surface frees a whole segment's filled slots on drain (out of order). This is
-    /// resident occupancy's complement — `issued - released` is the read-ahead gate's
-    /// denominator. Distinct from `consumed`, which is the in-order cursor reclaim
-    /// needs; on the stream path the two advance together, on the block path only
-    /// `released` moves.
+    /// surfaces: the stream surface frees one per in-order delivery, the block surface
+    /// frees a run's slots per drain (out of order; a segment may be several runs).
+    /// This is resident occupancy's complement — `issued - released` is the read-ahead
+    /// gate's denominator. Distinct from `consumed`, which is the in-order cursor
+    /// reclaim needs; on the stream path the two advance together, on the block path
+    /// only `released` moves.
     released: CachePadded<AtomicU64>,
     /// Slots per segment for this instance. Fixed at construction; used to size
     /// the initial segment and every grown successor.
@@ -412,9 +418,10 @@ impl<T> SlotHandle<T> {
 
 /// The result of a [`fill`](PagedRecvBuffer::fill).
 ///
-/// `DrainReady` is an advisory edge signal: after this fill, the count of filled
-/// slots in the segment reached the drain batch ahead of the slots already claimed
-/// for draining, so a block-surface consumer should attempt a drain via
+/// `DrainReady` is an advisory edge signal: after this fill, either the filled count
+/// reached the drain batch ahead of the slots already claimed for draining, or the
+/// segment became completely filled (so a sub-batch tail residue can still drain). A
+/// block-surface consumer should then attempt a drain via
 /// [`take_drain_run`](PagedRecvBuffer::take_drain_run). It carries no sequence and is
 /// not authoritative — the filled slots may not form a contiguous run yet (an earlier
 /// slot in the batch is still in flight), in which case `take_drain_run` claims
@@ -423,11 +430,11 @@ impl<T> SlotHandle<T> {
 /// ignores the outcome entirely.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FillOutcome {
-    /// Payload stored; the filled count has not reached the drain batch beyond what is
-    /// already claimed for draining.
+    /// Payload stored; the segment is neither full nor has its filled count reached the
+    /// drain batch beyond what is already claimed for draining.
     Stored,
-    /// Payload stored and the filled count reached the drain batch; a block consumer
-    /// should attempt [`take_drain_run`](PagedRecvBuffer::take_drain_run).
+    /// Payload stored and a drain edge was raised (drain batch reached, or segment
+    /// filled); a block consumer should attempt [`take_drain_run`](PagedRecvBuffer::take_drain_run).
     DrainReady,
 }
 
@@ -466,6 +473,7 @@ pub(crate) struct SegmentWrite<T> {
 
 impl<T> SegmentWrite<T> {
     /// Sequence number of the run's first slot.
+    #[cfg(test)]
     pub(crate) fn base_seq(&self) -> u64 {
         self.seg.base + self.start as u64
     }
@@ -506,9 +514,9 @@ impl<T> SegmentWrite<T> {
                 }
             });
         }
-        // Release the read-ahead occupancy these parts held. Counts only slots that
-        // actually carried a payload (a terminal run may include unfilled trailing
-        // slots if claimed loosely), so the count is exact.
+        // Release the read-ahead occupancy these parts held. A claimed run is entirely
+        // filled (`take_drain_run` scans only filled slots), so `freed == len`; counting
+        // the payloads actually taken keeps the occupancy exact regardless.
         self.inner.released.fetch_add(freed, Ordering::AcqRel);
         // Publish this run as drained. `AcqRel` so a reclaimer that reads `== len`
         // (`Acquire`) has seen the payload frees above. Adds `len`, not the freed
@@ -581,6 +589,7 @@ unsafe impl<T: Send> Sync for SegmentWrite<T> {}
 impl<T> PagedRecvBuffer<T> {
     /// Create an empty ring with the default segment size ([`DEFAULT_SEG_SIZE`]),
     /// returning the producer/block handle and the unique stream [`RecvBufferConsumer`].
+    #[cfg(test)]
     pub(crate) fn new() -> (Self, RecvBufferConsumer<T>) {
         Self::new_with_segment_size(DEFAULT_SEG_SIZE)
     }
@@ -654,7 +663,8 @@ impl<T> PagedRecvBuffer<T> {
     /// writes the slot's `data`, publishes filled via [`SlotState::publish_filled`],
     /// increments the segment's `filled_count`. Returns [`FillOutcome::DrainReady`]
     /// when the filled count reaches the drain batch beyond the slots already claimed
-    /// for draining.
+    /// for draining, or when this fill completes the segment (so a sub-batch tail
+    /// residue can still drain).
     pub(crate) fn fill(&self, handle: SlotHandle<T>, value: T) -> FillOutcome {
         let SlotHandle { seg, idx, .. } = handle;
         // Sole writer for this sequence number.
@@ -772,6 +782,7 @@ impl<T> PagedRecvBuffer<T> {
     /// This is the in-order reclaim threshold, not the read-ahead gate's denominator
     /// (use [`released`](Self::released) for that): the block surface delivers to disk
     /// without advancing this cursor.
+    #[cfg(test)]
     pub(crate) fn consumed(&self) -> u64 {
         self.inner.consumed.load(Ordering::Acquire)
     }
@@ -780,9 +791,9 @@ impl<T> PagedRecvBuffer<T> {
     /// stream and block surfaces. Lock-free.
     ///
     /// This is the read-ahead gate's denominator: the issuer bounds resident
-    /// occupancy by `issued − released < W` (the caller tracks `issued`; this
+    /// occupancy by `issued − released < window` (the caller tracks `issued`; this
     /// supplies `released`). Unlike [`consumed`](Self::consumed), it advances on the
-    /// block (disk) surface too, so a download larger than `W` keeps issuing as
+    /// block (disk) surface too, so a download larger than the window keeps issuing as
     /// segments drain instead of latching shut at the window.
     pub(crate) fn released(&self) -> u64 {
         self.inner.released.load(Ordering::Acquire)
@@ -797,6 +808,7 @@ impl<T> PagedRecvBuffer<T> {
     ///
     /// Callers that need byte offsets translate sequence numbers themselves; the
     /// ring has no notion of payload size.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RecvBufferSnapshot {
         let guard = self.inner.locked.lock();
         let cursor = self.inner.consumed.load(Ordering::Acquire);
@@ -860,13 +872,16 @@ impl<T> RecvBufferConsumer<T> {
             }
             // SAFETY: `raw` points to the successor segment, whose base is
             // `cursor` (we are at `current`'s end, so `consumed == cursor ==
-            // successor.base`). A segment is popped only when `base + len <=
-            // consumed`; for the successor that is `cursor + len <= cursor`, which
-            // is false, so it cannot be popped while we hold here (ordering rule 4).
-            // Its allocation is therefore live and still strong-referenced by the
-            // deque, so increment_strong_count is sound; the matching Drop of this
-            // Arc balances the increment. (`current` itself may now be poppable, but
-            // we hold it via `self.current` until the reassignment below.)
+            // successor.base`). A segment is popped when `base + len <= consumed` or
+            // when it is block-drained (`drained_count == len`); for the successor the
+            // first is `cursor + len <= cursor`, false, and the second cannot hold
+            // because driving the block surface alongside the stream is forbidden (the
+            // surface contract), so `drained_count` stays 0. It therefore cannot be
+            // popped while we hold here (ordering rule 4). Its allocation is live and
+            // still strong-referenced by the deque, so increment_strong_count is sound;
+            // the matching Drop of this Arc balances the increment. (`current` itself
+            // may now be poppable, but we hold it via `self.current` until the
+            // reassignment below.)
             let next = unsafe {
                 Arc::increment_strong_count(raw);
                 Arc::from_raw(raw)
@@ -902,6 +917,7 @@ impl<T> RecvBufferConsumer<T> {
 /// mark which sequences in that span have landed (the complement is claimed but not
 /// yet filled). All accessors are derived from these; the raw runs are private so
 /// callers express intent through the methods rather than re-deriving them.
+#[cfg(test)]
 pub(crate) struct RecvBufferSnapshot {
     /// In-order delivery cursor: the next sequence to be delivered. Everything
     /// below it has been delivered.
@@ -915,6 +931,7 @@ pub(crate) struct RecvBufferSnapshot {
     arrived: Vec<std::ops::Range<u64>>,
 }
 
+#[cfg(test)]
 impl RecvBufferSnapshot {
     /// Number of claimed-but-undelivered sequences: `frontier - cursor`. The size of
     /// the live window the ring is holding open.
@@ -975,6 +992,13 @@ impl<T> PagedRecvBuffer<T> {
     /// Number of segments currently in the deque (test introspection only).
     fn segment_count(&self) -> usize {
         self.inner.locked.lock().segments.len()
+    }
+
+    /// Base sequence of the front (oldest) segment (test introspection only). Rises as
+    /// front segments are reclaimed, so a test can assert *which* segment is gone, not
+    /// merely how many remain.
+    fn front_base(&self) -> u64 {
+        self.inner.locked.lock().segments.front().unwrap().base
     }
 }
 
@@ -1284,6 +1308,88 @@ mod tests {
         );
     }
 
+    /// A drain batch that does not divide the segment size leaves a sub-batch tail
+    /// residue. The batch-sized prefix drains on the batch edge; the tail cannot form a
+    /// batch-sized run (the segment fills first), so it drains only because the fill
+    /// that completes the segment raises the edge and `take_drain_run` takes the
+    /// segment-end residue. Without that path the residue would pin occupancy forever.
+    #[test]
+    fn non_dividing_batch_drains_segment_tail_residue() {
+        let seg_size = 4;
+        let batch = 3; // does not divide 4: prefix of 3, residue of 1
+        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        ring.set_drain_batch(batch);
+
+        // Fill the first `batch` slots in order via the production claim/fill path, so
+        // the asserted FillOutcome is the real probe's, not a test mirror. The fill that
+        // reaches the batch raises the edge.
+        let mut outcomes = Vec::new();
+        for i in 0..batch {
+            let h = ring.claim();
+            outcomes.push(ring.fill(h, (i * 10) as u64));
+        }
+        assert_eq!(
+            outcomes,
+            vec![FillOutcome::Stored, FillOutcome::Stored, FillOutcome::DrainReady],
+            "the fill that reaches the batch raises DrainReady"
+        );
+        let r0 = ring.take_drain_run(false).expect("batch-sized prefix run");
+        assert_eq!(r0.base_seq(), 0);
+        assert_eq!(r0.payloads().len(), batch, "prefix run is exactly the batch");
+        r0.complete();
+
+        // One slot of residue remains (slot 3). A non-terminal claim cannot take it —
+        // it is below the batch and the segment is not yet full.
+        assert!(
+            ring.take_drain_run(false).is_none(),
+            "sub-batch residue is not drainable while the segment is incomplete"
+        );
+
+        // Fill the final slot: this completes the segment (`filled == len`), which
+        // raises the edge for exactly this residue.
+        let h = ring.claim();
+        assert_eq!(
+            ring.fill(h, 30),
+            FillOutcome::DrainReady,
+            "the fill that completes the segment raises the edge for the tail residue"
+        );
+        let r1 = ring.take_drain_run(false).expect("segment-end residue run");
+        assert_eq!(r1.base_seq(), batch as u64);
+        assert_eq!(r1.payloads().len(), seg_size - batch, "residue is the sub-batch tail");
+        r1.complete();
+        assert_eq!(ring.released(), seg_size as u64, "every slot drained exactly once");
+    }
+
+    /// The block surface advances `released` (the read-ahead gate's denominator) by a
+    /// run's filled count on each drain, while `consumed` (the in-order stream cursor)
+    /// never moves — the two counters are distinct on the block path. Two batches arrive
+    /// separately (a drain between them), so the segment is claimed as two runs of 2;
+    /// `take_drain_run` takes the whole contiguous filled run available, so batches must
+    /// be separated to observe per-run accounting.
+    #[test]
+    fn block_drain_advances_released_not_consumed() {
+        let seg_size = 4;
+        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        ring.set_drain_batch(2);
+        let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
+        assert_eq!(ring.released(), 0);
+        assert_eq!(ring.consumed(), 0);
+
+        // First batch of 2 arrives and drains as run [0,2).
+        ring.fill_at(&handles, 0, 0);
+        ring.fill_at(&handles, 1, 10);
+        ring.take_drain_run(false).expect("run [0,2)").complete();
+        assert_eq!(ring.released(), 2, "a block drain advances released by the run length");
+        assert_eq!(ring.consumed(), 0, "the block surface never advances the stream cursor");
+
+        // Second batch of 2 arrives and drains as run [2,4).
+        ring.fill_at(&handles, 2, 20);
+        ring.fill_at(&handles, 3, 30);
+        ring.take_drain_run(false).expect("run [2,4)").complete();
+        assert_eq!(ring.released(), 4, "released tracks total drained across runs");
+        assert_eq!(ring.consumed(), 0, "consumed stays put on the block path");
+    }
+
     /// `consumed()` reports the in-order delivery cursor for the read-ahead gate.
     #[test]
     fn consumed_tracks_delivery_cursor() {
@@ -1333,35 +1439,66 @@ mod tests {
         sw.complete();
     }
 
-    /// A `SegmentWrite` dropped without `complete()` still drains: its run is freed and
-    /// counted toward `drained_count`, so the segment reclaims and reclaim does not
-    /// stall behind it.
+    /// A `SegmentWrite` dropped without `complete()` still drains: its run's payloads
+    /// are freed, `released` advances, and the run is counted toward `drained_count` so
+    /// the segment reclaims and reclaim does not stall behind it.
     #[test]
     fn drop_without_complete_reclaims() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use std::sync::Arc as StdArc;
+
+        // Payload that bumps a shared counter on drop, so we can prove the drop path
+        // actually freed the run's payloads — not merely advanced the reclaim counters.
+        struct DropCounter(#[allow(dead_code)] StdArc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, O::SeqCst);
+            }
+        }
+
+        let drops = StdArc::new(AtomicUsize::new(0));
         let seg_size = 2;
-        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        let (ring, _consumer) = PagedRecvBuffer::<DropCounter>::new_with_segment_size(seg_size);
         // Fill seg0 full and take it as one run.
-        for i in 0..seg_size {
+        for _ in 0..seg_size {
             let h = ring.claim();
-            ring.fill(h, i as u64);
+            ring.fill(h, DropCounter(drops.clone()));
         }
         let sw = ring.take_drain_run(false).expect("seg0 full");
         assert_eq!(sw.base_seq(), 0);
-        // Drop WITHOUT complete(): the Drop safety net frees the run and advances
-        // drained_count to the segment length.
+        assert_eq!(ring.released(), 0, "nothing released until the run drains");
+
+        // Drop WITHOUT complete(): the Drop safety net must free the run's payloads and
+        // advance both `released` (read-ahead occupancy) and `drained_count` (reclaim).
         drop(sw);
+        assert_eq!(
+            drops.load(O::SeqCst),
+            seg_size,
+            "drop-without-complete must free every payload in the run"
+        );
+        assert_eq!(
+            ring.released(),
+            seg_size as u64,
+            "drop-without-complete must release the run's occupancy"
+        );
+
         // `claim` runs reclaim before it grows, so the drained front pops on the
         // claim *after* seg1 exists. Two claims: the first grows seg1, the second
         // observes seg0 fully drained and reclaims it. A run left unaccounted would
         // never reach drained_count == len and the count would climb without bound.
-        for i in 0..2 {
+        for _ in 0..2 {
             let h = ring.claim();
-            ring.fill(h, 99 + i);
+            ring.fill(h, DropCounter(drops.clone()));
         }
         assert_eq!(
             ring.segment_count(),
             1,
             "dropped-without-complete run must drain and reclaim, not wedge"
+        );
+        assert_eq!(
+            ring.front_base(),
+            seg_size as u64,
+            "seg0 (base 0) is the segment reclaimed after its run drained"
         );
     }
 
@@ -1616,23 +1753,29 @@ mod tests {
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, i as u64);
         }
-        // At this point we have 2 segments in the deque.
+        // At this point we have 2 segments in the deque, front based at seq 0.
         assert_eq!(ring.segment_count(), 2);
+        assert_eq!(ring.front_base(), 0);
 
         // Consume all of the first segment and one item into the second.
         for _ in 0..seg_size + 1 {
             consumer.poll_next().unwrap();
         }
 
-        // Trigger reclaim by claiming more (which runs reclaim_locked).
+        // Trigger reclaim by claiming more (which runs reclaim_locked before it grows).
         let h = ring.claim();
         ring.fill(h, 999u64);
 
-        // The first segment should have been reclaimed.
+        // seg0 (base 0) is fully consumed (`base + len <= consumed`) and must be the
+        // segment reclaimed — the front now bases at seg_size, and one segment grew for
+        // the new claim, so the count returns to 2. Asserting `front_base` (not just the
+        // count) proves the *right* segment went: a reclaim that popped the wrong
+        // segment, or none, would leave `front_base == 0`.
+        assert_eq!(ring.segment_count(), 2, "seg0 reclaimed, seg2 grew");
         assert_eq!(
-            ring.segment_count(),
-            2,
-            "first segment should be reclaimed, leaving the second + newly grown"
+            ring.front_base(),
+            seg_size as u64,
+            "the fully-consumed front segment (base 0) is the one reclaimed"
         );
     }
 
@@ -1844,7 +1987,15 @@ mod loom_tests {
             ring.fill(h, 99);
 
             taker.join().unwrap();
-            assert!(ring.segment_count() >= 1);
+            // After both threads finish, seg0's run has drained (`complete`) so
+            // `drained_count == len`. A final claim runs reclaim deterministically
+            // (no new interleaving — both threads have joined), which must pop the
+            // now-drained seg0 exactly once. Asserting `front_base` past seg0, not just
+            // a count, proves the reclaim happened and freed the right segment without
+            // the two reclaim paths double-popping.
+            let h = ring.claim();
+            ring.fill(h, 100);
+            assert_eq!(ring.front_base(), 2, "drained seg0 (base 0) reclaimed exactly once");
         });
     }
 
@@ -1958,7 +2109,13 @@ mod loom_tests {
             ring.fill(h, 99);
 
             taker.join().unwrap();
-            assert!(ring.segment_count() >= 1);
+            // seg0's run drained via the Drop safety net. A final claim runs reclaim
+            // deterministically (both threads joined) and must pop the drained seg0
+            // exactly once — `front_base` past seg0 proves the drop path advanced
+            // `drained_count` and reclaim freed the right segment without double-pop.
+            let h = ring.claim();
+            ring.fill(h, 100);
+            assert_eq!(ring.front_base(), 2, "drop-drained seg0 (base 0) reclaimed exactly once");
         });
     }
 

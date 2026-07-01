@@ -206,9 +206,7 @@ impl BodyWriter {
         }
         // Report the terminal flush: how many parts this last pass wrote (those left
         // resident below the drain batch) and the total drained over the transfer.
-        // Fires once per disk transfer — the lifecycle marker that the tail actually
-        // reached disk; its absence on a hung transfer localizes the stall to the
-        // terminal drain.
+        // Logged once per disk transfer.
         let before = self.released();
         self.drain(true)?;
         let total = self.released();
@@ -301,18 +299,18 @@ fn write_run(
 
 /// Consumer wrapper carrying the notify handle alongside the buffer consumer.
 /// Handed from constructors to `Body::new`.
-pub(crate) struct SlotBodyConsumer {
+pub(crate) struct RecvBodyConsumer {
     consumer: RecvBufferConsumer<ChunkOutput>,
     notify: Arc<WakeNotify>,
 }
 
-impl std::fmt::Debug for SlotBodyConsumer {
+impl std::fmt::Debug for RecvBodyConsumer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlotBodyConsumer").finish_non_exhaustive()
+        f.debug_struct("RecvBodyConsumer").finish_non_exhaustive()
     }
 }
 
-impl SlotBodyConsumer {
+impl RecvBodyConsumer {
     /// Try to take the next sequential chunk without waiting.
     #[cfg(test)]
     pub(crate) fn try_take_next(&mut self) -> Option<ChunkOutput> {
@@ -326,7 +324,7 @@ impl SlotBodyConsumer {
 /// by a fixed buffer capacity — the buffer grows as needed.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
-pub(crate) fn new_slot_body() -> (BodyWriter, SlotBodyConsumer) {
+pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
     let writer = BodyWriter {
@@ -334,7 +332,7 @@ pub(crate) fn new_slot_body() -> (BodyWriter, SlotBodyConsumer) {
         notify: notify.clone(),
         mode: Arc::new(Mode::Stream),
     };
-    let slot_consumer = SlotBodyConsumer { consumer, notify };
+    let slot_consumer = RecvBodyConsumer { consumer, notify };
     (writer, slot_consumer)
 }
 
@@ -344,10 +342,10 @@ pub(crate) fn new_slot_body() -> (BodyWriter, SlotBodyConsumer) {
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
-fn new_slot_body_with_disk_mode(
+fn new_recv_body_with_disk_mode(
     sink: Box<dyn SinkWrite>,
     object_range_start: u64,
-) -> (BodyWriter, SlotBodyConsumer) {
+) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
     let writer = BodyWriter {
@@ -358,17 +356,17 @@ fn new_slot_body_with_disk_mode(
             object_range_start,
         }),
     };
-    let slot_consumer = SlotBodyConsumer { consumer, notify };
+    let slot_consumer = RecvBodyConsumer { consumer, notify };
     (writer, slot_consumer)
 }
 
 /// Create a producer/consumer pair with a file sink for download-to-file.
-pub(crate) fn new_slot_body_with_sink(
+pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
     object_range_start: u64,
     owns_file: bool,
-) -> (BodyWriter, SlotBodyConsumer) {
-    new_slot_body_with_disk_mode(Box::new(FileSink { file, owns_file }), object_range_start)
+) -> (BodyWriter, RecvBodyConsumer) {
+    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }), object_range_start)
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -416,7 +414,7 @@ impl std::fmt::Debug for ChunkOutput {
 }
 
 impl Body {
-    pub(crate) fn new(consumer: SlotBodyConsumer, transfer: DownloadTransfer) -> Self {
+    pub(crate) fn new(consumer: RecvBodyConsumer, transfer: DownloadTransfer) -> Self {
         Self {
             consumer: consumer.consumer,
             notify: consumer.notify,
@@ -485,7 +483,7 @@ mod tests {
     use bytes_utils::SegmentedBuf;
     use std::sync::Arc;
 
-    use super::{new_slot_body, AggregatedBytes, Body, BodyWriter};
+    use super::{new_recv_body, AggregatedBytes, Body, BodyWriter};
 
     fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
         ChunkOutput {
@@ -515,7 +513,7 @@ mod tests {
             .build()
             .unwrap();
         let (ctx, _) = TransferContext::new(tm.handle.clone());
-        let (writer, consumer) = new_slot_body();
+        let (writer, consumer) = new_recv_body();
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone());
         (Body::new(consumer, transfer.clone()), transfer, writer)
     }
@@ -635,8 +633,8 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_slot_body_with_disk_mode, new_slot_body_with_sink, BodyWriter as Writer, SinkWrite,
-        SlotBodyConsumer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, SinkWrite,
+        RecvBodyConsumer,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
@@ -691,9 +689,9 @@ mod tests {
         }
     }
 
-    fn new_slot_body_with_capture(
+    fn new_recv_body_with_capture(
         object_range_start: u64,
-    ) -> (Writer, SlotBodyConsumer, Arc<CaptureSink>) {
+    ) -> (Writer, RecvBodyConsumer, Arc<CaptureSink>) {
         let sink = Arc::new(CaptureSink::default());
         // The Mode holds a Box<dyn SinkWrite>; share state via an Arc the test also
         // holds. A thin forwarder lets the Box and the test handle point at one sink.
@@ -709,7 +707,7 @@ mod tests {
             }
         }
         let (writer, consumer) =
-            new_slot_body_with_disk_mode(Box::new(Shared(sink.clone())), object_range_start);
+            new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())), object_range_start);
         (writer, consumer, sink)
     }
 
@@ -719,7 +717,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
         // Fill a full segment's worth of slots
         for i in 0..SEG_SIZE as u64 {
@@ -750,7 +748,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
         // Fill fewer than a segment's worth (partial)
         let partial = SEG_SIZE / 2;
@@ -782,7 +780,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
         // Fill SEG_SIZE + 2 parts
         let total = SEG_SIZE + 2;
@@ -813,7 +811,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(file, 1000, false);
+        let (writer, _consumer) = new_recv_body_with_sink(file, 1000, false);
 
         let n = SEG_SIZE;
         for i in 0..n as u64 {
@@ -844,7 +842,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
         let n = SEG_SIZE;
         let mut handles = Vec::new();
@@ -892,7 +890,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
         // Fill two full segments, draining on the DrainReady edge after each fill — the
         // disk path's steady-state loop. Bounded iteration, so a regression fails fast.
@@ -947,7 +945,7 @@ mod tests {
             expected.extend_from_slice(&part_bytes(seq));
         }
 
-        let (writer, _consumer, sink) = new_slot_body_with_capture(range_start);
+        let (writer, _consumer, sink) = new_recv_body_with_capture(range_start);
 
         // Claim all slots up front (claim is serialized; seq assignment is in order).
         let slots: Vec<_> = (0..parts).map(|_| writer.claim()).collect();

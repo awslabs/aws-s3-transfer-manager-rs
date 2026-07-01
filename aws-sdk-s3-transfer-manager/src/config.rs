@@ -211,7 +211,9 @@ impl Builder {
     /// Set how far downloads may prefetch ahead of the consumer.
     ///
     /// This is the client default for all downloads; a request may override it via
-    /// [`DownloadInput`](crate::operation::download::DownloadInput).
+    /// [`DownloadInput`](crate::operation::download::DownloadInput), or a running
+    /// transfer may adjust it via
+    /// [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl).
     /// Default is [ReadAhead::Auto].
     pub fn read_ahead(mut self, mode: ReadAhead) -> Self {
         self.read_ahead = mode;

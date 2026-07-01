@@ -3,74 +3,40 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Per-transfer read-ahead window — the **receive window** (rwnd) of the download.
+//! Per-transfer read-ahead window: the occupancy bound on speculative issuance.
 //!
-//! # The bound it owns
+//! Issuance of a speculative part requires `issued - released < window()`, where
+//! `issued` counts parts claimed for issuance and `released` counts parts freed by
+//! either delivery surface (stream pull or disk drain; see `recv_buffer`). The
+//! quantity `issued - released` is the transfer's resident occupancy in parts, so
+//! the gate bounds how far issuance runs ahead of consumption and nothing more.
+//! It is one of three independent upper bounds on issuance; the others — total
+//! in-flight concurrency and the aggregate memory budget — live elsewhere, and
+//! issuance takes their min.
 //!
-//! Issuance of a speculative part requires `issued - consumed < window()`. The
-//! quantity `issued - consumed` is the transfer's **resident occupancy in parts**:
-//! parts claimed (issued) but not yet delivered in order to the consumer. So the
-//! gate is a pure occupancy bound — "do not run more than `window` parts ahead of
-//! the consumer" — and nothing more. It is one of three independent upper bounds
-//! on issuance (the others — total in-flight concurrency, and the aggregate memory
-//! budget — live elsewhere); issuance takes their min. This type owns only the
-//! read-ahead bound.
+//! The window is free buffer space, `window - occupancy`, an exact subtraction
+//! recomputed as the buffer fills and drains. It is not estimated from a rate and
+//! it does not decay, so a gap in delivery does not shrink it: a consumer paused
+//! between bursts, or blocked behind a not-yet-filled part, still leaves a full
+//! window of slack to make progress.
 //!
-//! # rwnd, not cwnd — and occupancy, not rate
+//! # Pacing
 //!
-//! The window maps onto TCP's *receive window* (rwnd), which is advertised from
-//! the receiver's **free buffer space** — `capacity - unread`. It is not estimated
-//! and it does not decay: it is an exact subtraction recomputed as the buffer fills
-//! and drains. This is categorically different from the *congestion window* (cwnd),
-//! which probes toward the bandwidth-delay product `R̂·L̂`. The cwnd job — ramping
-//! to the throughput knee — belongs to the **concurrency controller** (global,
-//! separate), never here.
+//! The window is a fixed per-transfer cap ([`DEFAULT_WINDOW_PARTS`]). The pacing
+//! behaviors follow from the occupancy gate directly:
 //!
-//! An earlier version of this controller derived the operating window from a
-//! measured drain rate (`W* = R̂·L̂/part_size`, smoothed by an EWMA, decayed on
-//! idle). That is cwnd math on an rwnd, and it self-destructs: any gap in delivery
-//! — a consumer between bursts, or one blocked behind a not-yet-filled part —
-//! decays the rate estimate toward zero, collapsing the window to its floor and
-//! throttling issuance to a single outstanding part (a wedge). The window is
-//! occupancy-bounded; no rate is estimated.
+//! - Fast consumer: `released` keeps pace, `issued - released` stays small, the
+//!   gate does not bind, and the transfer runs at the concurrency limit.
+//! - Slow consumer: `released` lags, `issued - released` fills to the window, the
+//!   gate closes, and issuance pauses until the consumer drains. Resident memory is
+//!   bounded at `window` parts.
+//! - Blocked consumer (a stalled or missing part): `released` cannot advance past
+//!   the hole, occupancy pins at the window, and issuance stops at `window`, leaving
+//!   a full window of slack to make progress around the hole rather than collapsing
+//!   to one part.
 //!
-//! # The window today: a fixed ceiling
-//!
-//! The window is a **fixed constant** ([`DEFAULT_WINDOW_PARTS`]) — a per-transfer
-//! resident cap, so memory bounds the transfer rather than a control loop. The
-//! pacing behaviors fall out of the occupancy gate directly, with no adaptation:
-//!
-//! - **Fast consumer:** `consumed` keeps pace → `issued - consumed` stays small →
-//!   the gate never binds → the transfer runs at full speed, bounded by concurrency
-//!   and (later) the global budget, not by us.
-//! - **Slow consumer:** `consumed` lags → `issued - consumed` fills to the window →
-//!   the gate closes → issuance pauses until the consumer drains. Resident memory is
-//!   bounded at exactly `window` parts; we never pile up parts the consumer will not
-//!   read soon. This is the backpressure, and it is automatic.
-//! - **Blocked consumer (a stalled/missing part):** `consumed` cannot advance past
-//!   the hole → occupancy pins at the window → issuance stops at `window`, leaving a
-//!   full window of slack to make progress around the hole. It does not collapse to
-//!   one part.
-//!
-//! # What is deferred
-//!
-//! Two layers build on this and are **not** implemented here yet (see
-//! `flow-control-architecture.md` §7b, the backpressure ladder):
-//!
-//! 1. **Budget-pressure clamp (ladder rung 1).** When aggregate resident across all
-//!    transfers approaches the global budget, the budget layer pulls each transfer's
-//!    effective window down toward its demand. The fixed constant here becomes
-//!    `memory_budget / part_size`, arbitrated globally. This is what stops one slow
-//!    transfer from holding buffer space other transfers need.
-//! 2. **`Auto`-mode resident-size adaptation.** A fill-side signal — resident set
-//!    size ballooning relative to the window — clamps the window down ahead of the
-//!    buffer filling completely. Observed where parts are filled (not by polling the
-//!    consumer, which is the thing we are waiting on). Layered under the public
-//!    `ReadAhead::Auto` mode once the fixed model is proven.
-//!
-//! The window is stored in an [`AtomicU64`] (not a plain constant) precisely so
-//! those layers can lower it with a lock-free store; today nothing writes it after
-//! construction except the test helper.
+//! The window is stored in an [`AtomicU64`] so it can be lowered with a lock-free
+//! store while a transfer runs (see [`ReadAhead::set_window`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -79,20 +45,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// staying well above the bandwidth-delay product of a 100 Gbps link (so the gate
 /// does not bind a consumer that keeps pace).
 ///
-/// Provisional: when a global memory budget exists the window is sized from it
-/// (`memory_budget / part_size`) and arbitrated across transfers rather than fixed
-/// per transfer (see `flow-control-architecture.md` §7b, ladder rung 1).
-///
 /// The default for the public [`ReadAhead::Auto`](crate::types::ReadAhead) mode;
-/// `Handle::download_read_ahead_window` resolves the knob to a window in parts.
+/// [`window_parts_for`] resolves the knob to a window in parts.
 pub(crate) const DEFAULT_WINDOW_PARTS: u64 = 1024;
 
+/// Resolve the effective read-ahead window in parts for a download, in precedence
+/// order: the per-request [`ReadAhead`](crate::types::ReadAhead) override if set,
+/// else the client default. See [`window_parts_for`] for the per-mode mapping.
+pub(crate) fn resolve_window(
+    request: Option<&crate::types::ReadAhead>,
+    client_default: &crate::types::ReadAhead,
+) -> u64 {
+    window_parts_for(request.unwrap_or(client_default))
+}
+
 /// Map the public [`ReadAhead`](crate::types::ReadAhead) knob to a window in parts.
-/// `Auto` is the fixed per-transfer cap (a future memory budget will size it);
-/// `Parts(n)` is `n + 1` — `n` parts of speculation beyond the part the consumer is
-/// waiting on, which is always admitted, so `Parts(0)` is demand paging. The single
-/// definition of the knob's meaning, used at transfer construction and by the
-/// dynamic control surface.
+/// `Auto` is the fixed per-transfer cap; `Parts(n)` is `n + 1` — `n` parts of
+/// speculation beyond the part the consumer is waiting on, which is always admitted,
+/// so `Parts(0)` is demand paging. The single definition of the knob's meaning, used
+/// at transfer construction and by the dynamic control surface.
 pub(crate) fn window_parts_for(mode: &crate::types::ReadAhead) -> u64 {
     match mode {
         crate::types::ReadAhead::Auto => DEFAULT_WINDOW_PARTS,
@@ -100,13 +71,12 @@ pub(crate) fn window_parts_for(mode: &crate::types::ReadAhead) -> u64 {
     }
 }
 
-/// Per-transfer read-ahead window — the receive-window (rwnd) bound on speculative
-/// issuance.
+/// Per-transfer read-ahead window: the occupancy bound on speculative issuance.
 ///
-/// `window()` is the hot read (the issuance gate, per claim) and is lock-free.
-/// Today the value is fixed at construction; the [`AtomicU64`] exists so the
-/// deferred budget-clamp and `Auto` adaptation layers can lower it without a lock.
-/// Shared `&self` across the issuer and consumer tasks.
+/// `window()` is the hot read (the issuance gate, per claim) and is lock-free. The
+/// value is fixed at construction; the [`AtomicU64`] allows it to be lowered with a
+/// lock-free store while the transfer runs. Shared `&self` across the issuer and
+/// consumer tasks.
 pub(crate) struct ReadAhead {
     /// Current window in parts. Read by the gate on every claim.
     window: AtomicU64,
@@ -127,7 +97,7 @@ impl ReadAhead {
     }
 
     /// The current read-ahead window, in parts. Lock-free; the issuance gate reads
-    /// this per claim (`issued - consumed < window()`).
+    /// this per claim (`issued - released < window()`).
     pub(crate) fn window(&self) -> u64 {
         self.window.load(Ordering::Relaxed)
     }

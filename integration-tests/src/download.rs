@@ -509,9 +509,10 @@ async fn test_download_empty_object() {
 
 // ── Read-ahead window gate: slow-consumer progress ───────────────────────────
 //
-// The read-ahead gate bounds issuance to `issued - consumed < window`. When the
+// The read-ahead gate bounds issuance to `issued - released < window`. When the
 // in-order consumer lags, occupancy fills the window and the gate closes; it must
 // reopen as the consumer drains so the transfer completes, never stall permanently.
+// (On the stream path `released` advances with the delivery cursor `consumed`.)
 // These tests drive the gate against the localhost mock (real HTTP client, real
 // concurrent in-flight GETs) with a deliberately slow consumer.
 //

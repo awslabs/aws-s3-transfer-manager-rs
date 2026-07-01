@@ -16,7 +16,6 @@ mod body;
 pub use body::{Body, ChunkOutput};
 
 /// In-order delivery buffer (out-of-order arrival → in-order stream).
-#[allow(dead_code)]
 pub(crate) mod recv_buffer;
 
 /// Read-ahead window — the occupancy bound on speculative issuance.
@@ -29,6 +28,7 @@ pub(crate) mod discovery;
 mod handle;
 pub use handle::DownloadHandle;
 pub(crate) use handle::DownloadHandleInner;
+pub use handle::DownloadIoCtl;
 pub use handle::ManagedDownloadHandle;
 
 mod output;
@@ -36,7 +36,6 @@ pub use output::DownloadOutput;
 
 pub(crate) mod transfer;
 pub(crate) use transfer::DownloadTransfer;
-pub use transfer::DownloadIoCtl;
 
 /// Provides metadata for each chunk during an object download.
 mod chunk_meta;
@@ -47,7 +46,7 @@ mod object_meta;
 pub use object_meta::ObjectMetadata;
 
 use crate::error;
-use crate::operation::download::body::new_slot_body;
+use crate::operation::download::body::new_recv_body;
 use crate::types::BucketType;
 use std::sync::Arc;
 
@@ -71,7 +70,7 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, consumer) = new_slot_body();
+        let (writer, consumer) = new_recv_body();
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
@@ -145,7 +144,7 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_slot_body_with_sink(
+        let (writer, _consumer) = body::new_recv_body_with_sink(
             file,
             object_range_start,
             owns_file,
