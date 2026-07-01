@@ -91,7 +91,11 @@ impl DownloadTransfer {
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
-        let read_ahead = ReadAhead::with_window(ctx.handle.download_read_ahead_window(&input));
+        let window = ctx.handle.download_read_ahead_window(&input);
+        let read_ahead = ReadAhead::with_window(window);
+        // Couple the disk drain batch to the initial window, so a window below the
+        // segment size drains in smaller runs from the first part.
+        writer.sync_drain_batch(window);
         let inner = Arc::new(DownloadTransferInner {
             read_ahead,
             ctx,
@@ -130,11 +134,12 @@ impl DownloadTransfer {
     }
 
     /// Apply a dynamic read-ahead change, resolving the public knob to a window. The
-    /// next issuance-gate read observes the new value.
+    /// next issuance-gate read observes the new value, and the disk drain batch is
+    /// re-coupled to it so a window below the segment size drains in smaller runs.
     pub(crate) fn set_read_ahead(&self, mode: &crate::types::ReadAhead) {
-        self.inner
-            .read_ahead
-            .set_window(super::read_ahead::window_parts_for(mode));
+        let window = super::read_ahead::window_parts_for(mode);
+        self.inner.read_ahead.set_window(window);
+        self.inner.writer.sync_drain_batch(window);
     }
 
     /// Object metadata from discovery.
@@ -205,39 +210,48 @@ impl DownloadTransfer {
                 part_size,
                 issued,
             } => {
-                // Read-ahead gate: bound resident occupancy. `issued - released` is
-                // the count of parts claimed but whose memory the consumer has not yet
-                // freed; the gate holds it under the receive window. `released` counts
-                // both delivery surfaces (stream pull and disk drain), so a disk
-                // download paces to its drain rate rather than latching shut at the
-                // window. A slow or blocked consumer is paced for free — occupancy
-                // fills, the gate closes, issuance waits.
-                let released = self.inner.writer.released();
-                let window = self.inner.read_ahead.window();
-                if *issued - released >= window {
-                    // Gate closed: the issuer is `window` parts ahead of what the
-                    // consumer has freed and must wait for a drain before claiming
-                    // more. The load-bearing line for diagnosing a stall: a *wedge*
-                    // shows up here as a gate that never reopens — `released` frozen,
-                    // `issued - released == window`, recurring every poll. A healthy
-                    // consumer shows the same fields advancing in step. Trace, not
-                    // debug: it fires every gated poll in steady state.
-                    tracing::trace!(
-                        target: crate::telemetry::TARGET_TRANSFER,
-                        issued = *issued,
-                        released,
-                        in_flight = *issued - released,
-                        window,
-                        "read-ahead gate closed: issuance paused until the consumer drains",
-                    );
-                    self.inner.ctx.set_pending();
-                    return PollWork::Pending;
-                }
+                if remaining.is_some() {
+                    // More ranges to issue. Apply the read-ahead gate: bound resident
+                    // occupancy. `issued - released` is the count of parts claimed but
+                    // whose memory the consumer has not yet freed; the gate holds it
+                    // under the receive window. `released` counts both delivery surfaces
+                    // (stream pull and disk drain), so a disk download paces to its
+                    // drain rate rather than latching shut at the window. A slow or
+                    // blocked consumer is paced for free — occupancy fills, the gate
+                    // closes, issuance waits.
+                    //
+                    // The gate guards *issuance only*. Once every range is generated
+                    // (`remaining` is None) the completion path below runs unconditionally,
+                    // so a transfer whose last parts are still resident (e.g. a disk tail
+                    // below the drain batch, freed only by the terminal drain in
+                    // `complete`) cannot deadlock with the gate holding issuance that has
+                    // nothing left to issue.
+                    let released = self.inner.writer.released();
+                    let window = self.inner.read_ahead.window();
+                    if *issued - released >= window {
+                        // Gate closed: the issuer is `window` parts ahead of what the
+                        // consumer has freed and must wait for a drain before claiming
+                        // more. The load-bearing line for diagnosing a stall: a *wedge*
+                        // shows up here as a gate that never reopens — `released` frozen,
+                        // `issued - released == window`, recurring every poll. A healthy
+                        // consumer shows the same fields advancing in step. Trace, not
+                        // debug: it fires every gated poll in steady state.
+                        tracing::trace!(
+                            target: crate::telemetry::TARGET_TRANSFER,
+                            issued = *issued,
+                            released,
+                            in_flight = *issued - released,
+                            window,
+                            "read-ahead gate closed: issuance paused until the consumer drains",
+                        );
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
 
-                let slot = self.inner.writer.claim();
-                *issued += 1;
+                    let slot = self.inner.writer.claim();
+                    *issued += 1;
 
-                if let Some(range) = remaining.take() {
+                    let range = remaining.take().expect("remaining is Some");
                     // `part_size` is the stored part size for a validated multipart
                     // object (so each range aligns to a stored part boundary and S3
                     // returns the part's checksum for the SDK to validate), else the
@@ -250,6 +264,18 @@ impl DownloadTransfer {
 
                     if chunk_end < end {
                         *remaining = Some((chunk_end + 1)..=end);
+                    } else {
+                        // Edge: the final range was just issued. From here issuance is
+                        // done and the transfer is draining its in-flight tail; the next
+                        // empty poll with no in-flight completes it. Fires once per
+                        // transfer — the lifecycle marker for "all issued, awaiting
+                        // drain", the phase a stalled transfer would be parked in.
+                        tracing::debug!(
+                            target: crate::telemetry::TARGET_TRANSFER,
+                            issued = *issued,
+                            ranges_in_flight = *ranges_in_flight + 1,
+                            "all ranges issued; draining in-flight tail",
+                        );
                     }
 
                     *ranges_in_flight += 1;
@@ -467,9 +493,10 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        // Edge-triggered disk write: only the fill that seals a segment drains it.
-        if slot.fill(chunk) == FillOutcome::SealedSegment {
-            if let Err(e) = self.inner.writer.drain_sealed() {
+        // Edge-triggered disk write: a fill that brings the segment's filled count to
+        // the drain batch attempts a drain of the batch-ready run(s).
+        if slot.fill(chunk) == FillOutcome::DrainReady {
+            if let Err(e) = self.inner.writer.drain(false) {
                 // Go terminal before any wake (see fail_range).
                 let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
@@ -580,11 +607,11 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        // Edge-triggered disk write: only the fill that seals a segment drains it
-        // (one positioned write per full segment), not every fill. Stream mode's
-        // drain_sealed is a no-op.
-        if slot.fill(chunk) == FillOutcome::SealedSegment {
-            if let Err(e) = self.inner.writer.drain_sealed() {
+        // Edge-triggered disk write: a fill that brings the segment's filled count to
+        // the drain batch attempts a drain of the batch-ready run(s) — one positioned
+        // write per coalesced run, not every fill. Stream mode's drain is a no-op.
+        if slot.fill(chunk) == FillOutcome::DrainReady {
+            if let Err(e) = self.inner.writer.drain(false) {
                 // Go terminal before any wake (see fail_range).
                 let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));

@@ -26,8 +26,7 @@
 //!   │  │  seg 0  │─nx─▶│  seg 1  │─nx─▶│  seg 2  │          │
 //!   │  │ F F . . │     │ F F F F │     │ F . _ _ │          │
 //!   │  │ 0 1 2 3 │     │ 4 5 6 7 │     │ 8 9     │          │
-//!   │  │ base=0  │     │ base=4  │     │ base=8  │          │
-//!   │  │ [DRAIND]│     │ [FULL]  │     │ [OPEN]  │ issued=9 │
+//!   │  │ base=0  │     │ base=4  │     │ base=8  │ issued=9 │
 //!   │  └─────────┘     └────▲────┘     └─▲───────┘          │
 //!   └───────────────────────┼───────────┼──────────────────┘
 //!     consumed=6            cursor=5    fill (producers, any order, lock-free)
@@ -45,12 +44,20 @@
 //! growth. The only intrusive link is one `next` pointer per segment, by which the
 //! consumer reaches the successor segment without taking the lock.
 //!
+//! The stream surface (drawn above) tracks delivery with `consumed`. The block surface
+//! instead tracks two per-segment counters: `claim_cursor`, the number of leading
+//! slots claimed for draining, and `drained_count`, the number written and freed. A
+//! segment is reclaimable when either surface has finished it — `base + len <=
+//! consumed` for the stream, or `drained_count == len` for the block.
+//!
 //! # Locking
 //!
 //! One `Mutex` guards the segment deque and the `issued` counter. Only the issuer
-//! paths take it — `claim` (assign a sequence, maybe grow, opportunistic reclaim),
-//! `take_completed_segment` (find a full segment), and `complete`/drop reclaim. The
-//! two hot paths are lock-free: `fill` writes a claimed slot and publishes it with a
+//! and block paths take it — `claim` (assign a sequence, maybe grow, opportunistic
+//! reclaim), `take_drain_run` (scan a contiguous filled run and claim it by advancing
+//! `claim_cursor`), and `complete`/drop reclaim. Each is a short critical section: a
+//! cursor scan or a `pop_front` loop, never held across the disk write itself. The two
+//! hot paths are lock-free: `fill` writes a claimed slot and publishes it with a
 //! `Release` store; `poll_next` reads the cursor slot under `Acquire` and hops
 //! segments via the `next` pointer. The delivery cursor lives in `RecvBufferConsumer` and
 //! is mirrored to an atomic `consumed` so the issuer's reclaim can read it without
@@ -79,14 +86,15 @@
 //!   Taking `&mut self`, on a non-cloneable handle, makes "single consumer" a
 //!   type-level fact and lets the cursor and current-segment cache live in the
 //!   handle (so the hop needs no lock).
-//! - **block** (`PagedRecvBuffer`) — [`take_completed_segment`](PagedRecvBuffer::take_completed_segment)
-//!   hands out a whole `FULL` segment as an owned [`SegmentWrite`], for bulk
-//!   consumption that does not need in-order single-item delivery. Segments may be
-//!   taken and completed out of order and concurrently.
+//! - **block** (`PagedRecvBuffer`) — [`take_drain_run`](PagedRecvBuffer::take_drain_run)
+//!   hands out a contiguous filled *run* (a prefix of a segment, of at least the drain
+//!   batch) as an owned [`SegmentWrite`], for bulk consumption that does not need
+//!   in-order single-item delivery. Runs may be taken and completed out of order and
+//!   concurrently, and a single segment may be partitioned into several runs.
 //!
 //! An instance is driven through one consumption surface or the other, never both:
-//! the stream cursor empties slots as it passes; the block surface consumes whole
-//! segments. A block-only caller drops the `RecvBufferConsumer`. **This exclusion is a
+//! the stream cursor empties slots as it passes; the block surface reads runs in place
+//! and frees them. A block-only caller drops the `RecvBufferConsumer`. **This exclusion is a
 //! caller obligation, not type-enforced** — `PagedRecvBuffer` is `Clone` and exposes the
 //! block surface, so the type system does not prevent driving both at once. Doing so
 //! races the stream `take` against the block in-place read and is undefined; the
@@ -100,20 +108,40 @@
 //!
 //! `FILLED` is published with a `Release` store after the payload write; a reader
 //! observes it with an `Acquire` load before reading the payload. The block
-//! surface leaves slots `FILLED` and reclaims at segment granularity.
+//! surface leaves slots `FILLED` and frees them at run granularity.
 //!
-//! # Segment states
+//! # Segment progress (block surface)
+//!
+//! A segment carries three monotonic counts rather than a single state flag:
 //!
 //! ```text
-//!   OPEN ──last slot filled──▶ FULL ──taken──▶ DRAINING ──complete──▶ DRAINED
+//!   filled_count   slots a producer has filled (any positions)   — lock-free
+//!   claim_cursor   leading slots claimed for draining            — under the lock
+//!   drained_count  slots written to the sink and freed           — lock-free add
+//!
+//!   claim_cursor <= len, drained_count <= len
+//!   drained_count == len  ⇒  segment reclaimable
 //! ```
 //!
-//! The fill that fills a segment's last slot *seals* it: `OPEN → FULL`. Sealing is
-//! by a count (`filled_count`), not a high-water index, so out-of-order fills reach
-//! `FULL` correctly. The block surface claims `FULL → DRAINING` once (so a segment
-//! is handed out at most once) and `DRAINING → DRAINED` on completion, after which
-//! the segment is reclaimable. The stream surface ignores these states and reclaims
-//! by cursor position.
+//! `claim_cursor` and `filled_count` are *not* mutually ordered. A drainer claims a run
+//! by scanning per-slot `FILLED` state, not by reading `filled_count`, and a producer
+//! publishes a slot `FILLED` before bumping `filled_count` (the bump is a probe input,
+//! not the source of truth). So a drainer can advance `claim_cursor` past a slot whose
+//! `filled_count` increment a concurrent producer has not yet performed: from that
+//! producer's view, `claim_cursor > filled_count` transiently. Both are bounded by
+//! `len`, and the per-slot `FILLED` state — not their relative order — is what gates a
+//! safe read. The fill probe's `filled - claim_cursor` is therefore a saturating
+//! subtraction, never a bare one.
+//!
+//! A *drainable run* is the contiguous `FILLED` slice between `claim_cursor` and the
+//! first unfilled slot. [`take_drain_run`](PagedRecvBuffer::take_drain_run) claims such
+//! a run by advancing `claim_cursor` under the lock — so a run is handed out at most
+//! once, and a segment may be partitioned into several runs claimed by different
+//! drainers. A non-terminal claim waits until the run spans the drain batch; a terminal
+//! claim takes whatever contiguous prefix is filled. Completing a run frees its
+//! payloads and advances `drained_count`; when that reaches the segment length every
+//! claimed slot has been written, and the segment is reclaimable. The stream surface
+//! ignores these counts and reclaims by `consumed`.
 //!
 //! # Memory ordering and safety
 //!
@@ -140,8 +168,17 @@
 //!    only; emptying a *slot's* payload (delivery, or future demand reclaim) leaves
 //!    the segment in place and does not bear on the hop.
 //! 5. **Outstanding block pin.** A live [`SegmentWrite`] holds an
-//!    `Arc<Segment<T>>`, so a segment being consumed by the block surface cannot
-//!    be reclaimed until that token completes.
+//!    `Arc<Segment<T>>`, so a segment with a run still being consumed by the block
+//!    surface stays alive until that token drains, even if front-reclaim pops it from
+//!    the deque first.
+//! 6. **Drain claim and reclaim handoff.** `claim_cursor` is advanced only under the
+//!    deque lock, so a run is claimed at most once and concurrent drainers take
+//!    disjoint runs; the fill probe's lock-free `Acquire` read of it is advisory only.
+//!    `drained_count` is advanced with `AcqRel` after a run's payloads are freed and
+//!    read with `Acquire` by front-reclaim, so a reclaimer observing `drained_count ==
+//!    len` has seen those frees. The per-slot `is_filled` `Acquire` (rule 2) is what
+//!    makes a claimed run's payloads safe to read; the lock orders drainers against
+//!    each other and against grow/reclaim, not against the lock-free fills.
 //!
 //! # Caller obligations
 //!
@@ -152,7 +189,9 @@
 use crossbeam_utils::CachePadded;
 
 use crate::runtime::sync::cell::UnsafeCell;
-use crate::runtime::sync::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::runtime::sync::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
 /// Default slots per segment for [`PagedRecvBuffer::new`].
@@ -197,67 +236,6 @@ impl SlotState {
     /// Mark the slot empty after its payload has been taken.
     fn set_empty(&self) {
         self.0.store(SLOT_EMPTY, Ordering::Release);
-    }
-}
-
-/// Segment open: accepting fills; not all slots filled yet.
-const SEG_OPEN: u8 = 0;
-/// Segment full: every slot filled, eligible to be taken by the block surface.
-const SEG_FULL: u8 = 1;
-/// Segment draining: claimed by a block consumer, pinned by a live [`SegmentWrite`],
-/// not yet reclaimable.
-const SEG_DRAINING: u8 = 2;
-/// Segment drained: block consumption complete, payloads freed, reclaimable.
-const SEG_DRAINED: u8 = 3;
-
-/// Segment lifecycle over an `AtomicU8`. The `FULL → DRAINING` transition is a CAS
-/// so a full segment is handed to the block surface at most once.
-struct SegState(AtomicU8);
-
-impl SegState {
-    fn new() -> Self {
-        Self(AtomicU8::new(SEG_OPEN))
-    }
-
-    /// Mark the segment full when its last slot fills: `OPEN → FULL` (`Release`).
-    fn set_full(&self) {
-        self.0.store(SEG_FULL, Ordering::Release);
-    }
-
-    /// Claim a full segment for block consumption exactly once: `FULL → DRAINING`.
-    /// Returns `true` for the single caller that wins the CAS.
-    fn try_claim_for_drain(&self) -> bool {
-        self.0
-            .compare_exchange(SEG_FULL, SEG_DRAINING, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    /// Terminal-only: claim a segment for draining regardless of whether it is full,
-    /// `{OPEN | FULL} → DRAINING`, exactly once. For [`PagedRecvBuffer::take_tail`],
-    /// which drains the partial final segment at end-of-stream. Returns `true` for the
-    /// single caller that wins. Already-`DRAINING`/`DRAINED` segments are skipped.
-    fn try_claim_for_drain_partial(&self) -> bool {
-        // Try the full→draining edge first, then the open→draining edge. Whichever the
-        // segment currently sits at, exactly one of these CASes can succeed (the other
-        // observes a state that is no longer OPEN/FULL). Safe only at end-of-stream,
-        // when no producer will fill this segment further (caller obligation).
-        self.0
-            .compare_exchange(SEG_FULL, SEG_DRAINING, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            || self
-                .0
-                .compare_exchange(SEG_OPEN, SEG_DRAINING, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-    }
-
-    /// Mark consumption complete: `DRAINING → DRAINED` (`Release`).
-    fn set_drained(&self) {
-        self.0.store(SEG_DRAINED, Ordering::Release);
-    }
-
-    /// Whether the segment has been fully drained (`Acquire`).
-    fn is_drained(&self) -> bool {
-        self.0.load(Ordering::Acquire) == SEG_DRAINED
     }
 }
 
@@ -312,11 +290,19 @@ struct Segment<T> {
     /// consumer may reconstruct an `Arc` from this pointer.
     next: AtomicPtr<Segment<T>>,
     /// Number of filled slots. Contended across this segment's producers, hence
-    /// padded off the header's read-mostly fields. The fill that brings it to
-    /// `slots.len()` seals the segment (`OPEN → FULL`).
+    /// padded off the header's read-mostly fields. The fill probe compares it against
+    /// `claim_cursor` and the drain batch to raise the [`FillOutcome::DrainReady`] edge.
     filled_count: CachePadded<AtomicUsize>,
-    /// Block-surface lifecycle: `OPEN → FULL → DRAINING → DRAINED`.
-    state: SegState,
+    /// Number of leading slots claimed for draining by the block surface, contiguous
+    /// from slot 0. Advanced only under the deque lock (in `take_drain_run`), so the
+    /// claim of a run is exclusive; read lock-free by the fill probe as an advisory
+    /// lower bound. Not contended (single writer under the lock), so unpadded.
+    claim_cursor: AtomicUsize,
+    /// Number of slots whose payload the block surface has written and freed. Reaches
+    /// `slots.len()` once every claimed run has completed, at which point the segment
+    /// is reclaimable. Written `AcqRel` by a draining [`SegmentWrite`]; read `Acquire`
+    /// by front-reclaim, so a reclaimer observing `== len` has seen the freed payloads.
+    drained_count: AtomicUsize,
 }
 
 impl<T> Segment<T> {
@@ -330,7 +316,8 @@ impl<T> Segment<T> {
             slots,
             next: AtomicPtr::new(std::ptr::null_mut()),
             filled_count: CachePadded::new(AtomicUsize::new(0)),
-            state: SegState::new(),
+            claim_cursor: AtomicUsize::new(0),
+            drained_count: AtomicUsize::new(0),
         }
     }
 
@@ -367,6 +354,14 @@ struct Inner<T> {
     /// Slots per segment for this instance. Fixed at construction; used to size
     /// the initial segment and every grown successor.
     seg_size: usize,
+    /// Drain batch, in slots: the minimum contiguous filled run the block surface
+    /// coalesces into one drain, and the threshold the fill probe raises
+    /// [`FillOutcome::DrainReady`] at. Defaults to `seg_size` (drain whole segments);
+    /// lowered toward 1 (drain on arrival) when the caller's resident-occupancy bound
+    /// is smaller than a segment, so the block surface never waits for a run it cannot
+    /// accumulate. Read lock-free by the fill probe (`Relaxed`) and under the lock by
+    /// `take_drain_run`.
+    drain_batch: AtomicUsize,
 }
 
 /// Producer + block handle to an in-order delivery buffer. Cloneable; share across
@@ -417,76 +412,94 @@ impl<T> SlotHandle<T> {
 
 /// The result of a [`fill`](PagedRecvBuffer::fill).
 ///
-/// `SealedSegment` is an edge signal: this fill was the one that filled a segment's
-/// last slot, so a block-surface consumer should drain via
-/// [`take_completed_segment`](PagedRecvBuffer::take_completed_segment). It carries no
-/// sequence — the consumer locates the full segment itself — so the only
-/// information is *that* a segment became drainable, not which. A stream-surface
-/// consumer ignores the outcome entirely.
+/// `DrainReady` is an advisory edge signal: after this fill, the count of filled
+/// slots in the segment reached the drain batch ahead of the slots already claimed
+/// for draining, so a block-surface consumer should attempt a drain via
+/// [`take_drain_run`](PagedRecvBuffer::take_drain_run). It carries no sequence and is
+/// not authoritative — the filled slots may not form a contiguous run yet (an earlier
+/// slot in the batch is still in flight), in which case `take_drain_run` claims
+/// nothing and the fill that later closes the gap re-raises the edge. The
+/// authoritative check is `take_drain_run` under the lock. A stream-surface consumer
+/// ignores the outcome entirely.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FillOutcome {
-    /// Payload stored; this fill did not fill a segment's last slot.
+    /// Payload stored; the filled count has not reached the drain batch beyond what is
+    /// already claimed for draining.
     Stored,
-    /// This fill filled a segment's last slot; a block consumer should drain.
-    SealedSegment,
+    /// Payload stored and the filled count reached the drain batch; a block consumer
+    /// should attempt [`take_drain_run`](PagedRecvBuffer::take_drain_run).
+    DrainReady,
 }
 
-/// An owned token granting consumption of one `FULL` segment's payloads.
+/// An owned token granting consumption of one claimed run of a segment's payloads.
 ///
-/// Holds an `Arc<Segment<T>>`, pinning the segment until [`complete`](Self::complete),
-/// and a strong `Arc<Inner<T>>` so completion can free memory and reclaim the
-/// shelf independent of issuance. It is owned rather than borrowed so it can outlive
-/// the call that produced it: a synchronous consumer completes it immediately, an
+/// A run is the contiguous slice `[start, start + len)` of a segment's slots, claimed
+/// by [`take_drain_run`](PagedRecvBuffer::take_drain_run). The token holds an
+/// `Arc<Segment<T>>`, pinning the segment until [`complete`](Self::complete), and a
+/// strong `Arc<Inner<T>>` so completion can free memory and reclaim the shelf
+/// independent of issuance. It is owned rather than borrowed so it can outlive the
+/// call that produced it: a synchronous consumer completes it immediately, an
 /// asynchronous one parks it and completes it on a later event.
 ///
 /// The strong ring reference keeps the buffer accounting alive for exactly the
 /// outstanding-write window — the correct lifetime, since a write may be reading a
-/// segment's bytes when every other handle has dropped. It is bounded (released at
+/// run's bytes when every other handle has dropped. It is bounded (released at
 /// `complete` or drop) and forms no cycle (segments do not point back at `Inner`).
 ///
 /// Dropping the token without calling [`complete`](Self::complete) is safe: `Drop`
-/// runs the same drain, so an aborted or short-circuited consumer cannot wedge
-/// reclaim by leaving the segment stuck `DRAINING`.
-#[must_use = "a taken segment must be completed (or dropped) to free its payloads and unblock reclaim"]
+/// runs the same drain, so an aborted or short-circuited consumer still frees the
+/// run's payloads and advances `drained_count`, and cannot stall front-reclaim by
+/// leaving the run's slots accounted-for-but-unfreed.
+#[must_use = "a claimed run must be completed (or dropped) to free its payloads and unblock reclaim"]
 pub(crate) struct SegmentWrite<T> {
     seg: Arc<Segment<T>>,
     inner: Arc<Inner<T>>,
+    /// First slot of the claimed run within `seg.slots`.
+    start: usize,
+    /// Number of slots in the claimed run.
+    len: usize,
+    /// Exactly-once guard for [`drain`](Self::drain), shared by `complete` and `Drop`.
+    /// Per-token (not per-segment): a segment may have several outstanding runs, each
+    /// of which must free its own slots exactly once.
+    drained: AtomicBool,
 }
 
 impl<T> SegmentWrite<T> {
-    /// Sequence number of the segment's first slot.
+    /// Sequence number of the run's first slot.
     pub(crate) fn base_seq(&self) -> u64 {
-        self.seg.base
+        self.seg.base + self.start as u64
     }
 
-    /// The segment's payloads in sequence order, all `FILLED`. Borrowed for the
-    /// duration of consumption; payloads are read in place, never moved out.
+    /// The run's payloads in sequence order, all `FILLED`. Borrowed for the duration
+    /// of consumption; payloads are read in place, never moved out.
     pub(crate) fn payloads(&self) -> &[Slot<T>] {
-        &self.seg.slots
+        &self.seg.slots[self.start..self.start + self.len]
     }
 
-    /// Free the segment's payloads, mark it `DRAINED`, and reclaim drained front
-    /// segments. Idempotent and shared by [`complete`](Self::complete) and `Drop`,
-    /// guarded on the `DRAINED` state so it runs exactly once per token.
+    /// Free the run's payloads, advance the segment's `drained_count`, and reclaim
+    /// drained front segments. Idempotent and shared by [`complete`](Self::complete)
+    /// and `Drop`, guarded on the token's `drained` flag so it runs exactly once per
+    /// token.
     ///
     /// Dropping the payloads here — rather than at segment pop — releases the budget
-    /// the bytes hold **eagerly and per-segment**, decoupled from the in-order
-    /// front-pop. A segment written out of order (e.g. seg 2 done while seg 0 still
-    /// writes) frees its memory immediately even though its empty shelf waits its
-    /// turn at the front.
+    /// the bytes hold **eagerly and per-run**, decoupled from the in-order front-pop.
+    /// A run written out of order (e.g. a later segment completed while an earlier one
+    /// still writes) frees its memory immediately even though its shelf waits its turn
+    /// at the front.
     fn drain(&self) {
         // Idempotency guard: complete() then drop, or a double drain, is a no-op the
-        // second time. Acquire pairs with the set_drained Release below.
-        if self.seg.state.is_drained() {
+        // second time. AcqRel so the freeing below happens once.
+        if self.drained.swap(true, Ordering::AcqRel) {
             return;
         }
         let mut freed = 0u64;
-        for slot in self.seg.slots.iter() {
-            // SAFETY: winning the FULL → DRAINING CAS made this token the segment's
-            // sole accessor, and the two consumption surfaces are mutually exclusive
-            // per instance (ordering rule 5, plus the surface contract), so no stream
-            // consumer touches these slots. Freeing the payload releases whatever it
-            // carries (e.g. a memory reservation).
+        for slot in self.payloads() {
+            // SAFETY: advancing `claim_cursor` under the lock in `take_drain_run` made
+            // this token the sole accessor of `[start, start + len)`, and the two
+            // consumption surfaces are mutually exclusive per instance (ordering rule
+            // 5, plus the surface contract), so no other drainer or stream consumer
+            // touches these slots. Freeing the payload releases whatever it carries
+            // (e.g. a memory reservation).
             slot.data.with_mut(|p| unsafe {
                 if (*p).take().is_some() {
                     freed += 1;
@@ -494,40 +507,45 @@ impl<T> SegmentWrite<T> {
             });
         }
         // Release the read-ahead occupancy these parts held. Counts only slots that
-        // actually carried a payload (a partial tail segment has unfilled slots), so
-        // the count is exact. Out of order across segments is fine — it is a count,
-        // not a cursor.
+        // actually carried a payload (a terminal run may include unfilled trailing
+        // slots if claimed loosely), so the count is exact.
         self.inner.released.fetch_add(freed, Ordering::AcqRel);
-        self.seg.state.set_drained();
+        // Publish this run as drained. `AcqRel` so a reclaimer that reads `== len`
+        // (`Acquire`) has seen the payload frees above. Adds `len`, not the freed
+        // count, because reclaim gates on every claimed slot being accounted for.
+        self.seg.drained_count.fetch_add(self.len, Ordering::AcqRel);
         reclaim_front(&self.inner);
     }
 
-    /// Finish consuming the segment: free its payloads now, mark it drained, and
-    /// reclaim drained front segments. Equivalent to dropping the token, but
-    /// explicit at the call site.
+    /// Finish consuming the run: free its payloads now, advance `drained_count`, and
+    /// reclaim drained front segments. Equivalent to dropping the token, but explicit
+    /// at the call site.
     pub(crate) fn complete(self) {
         self.drain();
-        // `self` drops here; Drop sees DRAINED and the drain is a no-op.
+        // `self` drops here; Drop sees the guard set and the drain is a no-op.
     }
 }
 
 impl<T> Drop for SegmentWrite<T> {
     /// Safety net: a token dropped without [`complete`](SegmentWrite::complete) —
-    /// an aborted or early-returning consumer — still drains, so the segment cannot
-    /// linger in `DRAINING` and stall front-reclaim behind it.
+    /// an aborted or early-returning consumer — still drains, so the run's slots are
+    /// freed and counted toward `drained_count` and cannot stall front-reclaim.
     fn drop(&mut self) {
         self.drain();
     }
 }
 
-/// Pop reclaimable segments from the front of the deque. A segment is
-/// reclaimable if fully consumed (`base + len <= consumed`) or drained
-/// by the block surface. Never pops the last segment so the deque is never empty.
+/// Pop reclaimable segments from the front of the deque. A segment is reclaimable if
+/// fully consumed by the stream surface (`base + len <= consumed`) or fully drained by
+/// the block surface (every claimed slot written and freed, `drained_count == len`).
+/// Never pops the last segment so the deque is never empty.
 fn reclaim_locked<T>(guard: &mut Locked<T>, consumed: u64) {
     while guard.segments.len() > 1 {
         let front = guard.segments.front().unwrap();
         let fully_consumed = front.base + front.len() <= consumed;
-        let drained = front.state.is_drained();
+        // `Acquire` pairs with the draining token's `AcqRel` add: observing the full
+        // count here means the freed payloads are visible.
+        let drained = front.drained_count.load(Ordering::Acquire) == front.slots.len();
         if fully_consumed || drained {
             guard.segments.pop_front();
         } else {
@@ -583,6 +601,7 @@ impl<T> PagedRecvBuffer<T> {
             consumed: CachePadded::new(AtomicU64::new(0)),
             released: CachePadded::new(AtomicU64::new(0)),
             seg_size,
+            drain_batch: AtomicUsize::new(seg_size),
         });
         let consumer = RecvBufferConsumer {
             inner: inner.clone(),
@@ -633,8 +652,9 @@ impl<T> PagedRecvBuffer<T> {
 
     /// Publish a payload into its claimed slot, consuming the handle. Lock-free:
     /// writes the slot's `data`, publishes filled via [`SlotState::publish_filled`],
-    /// increments the segment's `filled_count`. Returns [`FillOutcome::SealedSegment`]
-    /// when this fill brings the count to the segment's slot count.
+    /// increments the segment's `filled_count`. Returns [`FillOutcome::DrainReady`]
+    /// when the filled count reaches the drain batch beyond the slots already claimed
+    /// for draining.
     pub(crate) fn fill(&self, handle: SlotHandle<T>, value: T) -> FillOutcome {
         let SlotHandle { seg, idx, .. } = handle;
         // Sole writer for this sequence number.
@@ -642,65 +662,104 @@ impl<T> PagedRecvBuffer<T> {
             *p = Some(value);
         });
         seg.slots[idx].state.publish_filled();
-        let prev = seg.filled_count.fetch_add(1, Ordering::AcqRel);
-        if prev + 1 == seg.slots.len() {
-            // The sealing fill (the one that brought the count to full) sets FULL.
-            // `set_full` (Release) is not ordered with a concurrent
-            // `take_completed_segment`, which reads `state` under the lock this path
-            // does not take: a taker racing the seal may observe the segment still
-            // OPEN and skip it. That is safe, not a lost segment — the sealing thread
-            // returns `SealedSegment`, and its caller drains via `drain_sealed`, which
-            // re-scans and finds the now-FULL segment. Per-slot payload visibility is
-            // independent, carried by the publish_filled/is_filled pair above.
-            seg.state.set_full();
-            FillOutcome::SealedSegment
+        let filled = seg.filled_count.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Advisory drain probe. Both inputs race a concurrent `take_drain_run` (which
+        // advances `claim_cursor` under the lock) and the other producers' fills, so the
+        // result is only a hint to attempt a drain. `claim_cursor` is read lock-free and
+        // may either lag the cursor (under-read) or run ahead of *this* fill's local
+        // `filled` snapshot — another producer's later fill can let a drainer claim a run
+        // past this thread's count, so `claimed > filled` is reachable; the run length is
+        // therefore `saturating_sub`, never a bare subtraction. The probe can over-signal
+        // — `filled` counts slots anywhere in the segment, but `take_drain_run` claims
+        // only a contiguous run from the cursor, so a gap (an earlier slot still in
+        // flight) yields nothing until the fill that closes it raises the edge again. It
+        // cannot under-signal a drainable run: the fill that makes a run of `batch`
+        // contiguous brings `filled` to at least `claimed + batch`. Authority rests
+        // entirely with `take_drain_run`.
+        //
+        // The second term (`filled == len`) handles the segment's final residue. When
+        // the drain batch does not divide the segment size, the slots past the last
+        // batch-aligned boundary form a run shorter than the batch; no further fill can
+        // extend it (the segment is full), so the batch edge would never fire for it
+        // and it would wait for terminal drain — pinning occupancy and wedging a window
+        // smaller than a segment. The fill that completes the segment raises the edge so
+        // that residue drains. It is the only fill that observes `filled == len`.
+        let claimed = seg.claim_cursor.load(Ordering::Acquire);
+        let batch = self.inner.drain_batch.load(Ordering::Relaxed);
+        if filled == seg.slots.len() || filled.saturating_sub(claimed) >= batch {
+            FillOutcome::DrainReady
         } else {
             FillOutcome::Stored
         }
     }
 
-    // ── Block surface (out-of-order, segment-granular) ───────────────────────────
-
-    /// Hand out the frontmost full, not-yet-taken segment exactly once as an owned
-    /// [`SegmentWrite`] (claimed `FULL → DRAINING` via
-    /// [`SegState::try_claim_for_drain`]), or `None` if no segment is full. Segments
-    /// may be outstanding concurrently.
-    pub(crate) fn take_completed_segment(&self) -> Option<SegmentWrite<T>> {
-        let guard = self.inner.locked.lock();
-        for seg in guard.segments.iter() {
-            if seg.state.try_claim_for_drain() {
-                return Some(SegmentWrite {
-                    seg: seg.clone(),
-                    inner: self.inner.clone(),
-                });
-            }
-        }
-        None
+    /// Set the drain batch, in slots, clamped to at least 1. The block surface
+    /// coalesces a contiguous filled run of at least this many slots into one drain,
+    /// and the fill probe raises [`FillOutcome::DrainReady`] at this threshold. A value
+    /// of 1 drains each slot as it arrives; the default is the segment size (drain
+    /// whole segments). Lock-free; the next fill probe and `take_drain_run` observe it.
+    pub(crate) fn set_drain_batch(&self, batch: usize) {
+        self.inner
+            .drain_batch
+            .store(batch.max(1), Ordering::Relaxed);
     }
 
-    /// Terminal-only: hand out the frontmost not-yet-drained segment as an owned
-    /// [`SegmentWrite`] *regardless of whether it is full* (claimed `{OPEN | FULL} →
-    /// DRAINING` via [`SegState::try_claim_for_drain_partial`]), or `None` when every
-    /// segment is already draining/drained.
+    // ── Block surface (out-of-order, segment-granular) ───────────────────────────
+
+    /// Claim the frontmost drainable run as an owned [`SegmentWrite`], or `None`.
     ///
-    /// This drains the **partial final segment** at end-of-stream — the block surface's
-    /// [`take_completed_segment`](Self::take_completed_segment) only yields *full*
-    /// segments, so the last segment of a stream whose length is not a multiple of the
-    /// segment size would otherwise never be handed out. Looping `take_tail` drains that
-    /// tail plus any straggler full segments.
+    /// Walks segments front to back under the lock. For each segment, scans the
+    /// contiguous `FILLED` run beyond its `claim_cursor`. A non-terminal call claims
+    /// that run only if it spans at least the drain batch, and then claims the whole
+    /// run (coalescing greedily, bounded by the segment). A terminal call claims
+    /// whatever contiguous filled run exists, however short — this is what drains the
+    /// partial final segment at end-of-stream, which a non-terminal call would leave
+    /// below the batch forever. The run is `[claim_cursor, claim_cursor + len)`.
     ///
-    /// # Caller obligation
-    /// Call only once issuance is complete and all outstanding fills have landed: a
-    /// partial segment claimed here must not receive further fills (a concurrent fill
-    /// would race the consumer reading the segment's slots). The consumer reads only
-    /// the `FILLED` slots (via [`Slot::get`]); unfilled slots are skipped.
-    pub(crate) fn take_tail(&self) -> Option<SegmentWrite<T>> {
+    /// Advancing `claim_cursor` under the lock makes a run claimed at most once: a
+    /// second caller, racing or sequential, observes the advanced cursor and scans
+    /// beyond it, so concurrent drainers partition a segment into disjoint runs. The
+    /// per-slot `is_filled` check is an `Acquire` load pairing with the producer's
+    /// `publish_filled` `Release` — the same handoff [`poll_next`](RecvBufferConsumer::poll_next)
+    /// relies on — so the claimed run's payloads are safe to read.
+    ///
+    /// # Terminal caller obligation
+    /// Pass `terminal` only once issuance is complete and all outstanding fills have
+    /// landed: a slot claimed here must not receive a later fill (it would race the
+    /// block consumer reading the run). Unfilled trailing slots are simply not claimed.
+    pub(crate) fn take_drain_run(&self, terminal: bool) -> Option<SegmentWrite<T>> {
         let guard = self.inner.locked.lock();
+        let batch = self.inner.drain_batch.load(Ordering::Relaxed);
         for seg in guard.segments.iter() {
-            if seg.state.try_claim_for_drain_partial() {
+            let start = seg.claim_cursor.load(Ordering::Relaxed);
+            // Scan the contiguous filled run beyond what is already claimed.
+            let mut end = start;
+            while end < seg.slots.len() && seg.slots[end].state.is_filled() {
+                end += 1;
+            }
+            let avail = end - start;
+            // A non-terminal claim takes the run when it reaches the batch, or when it
+            // reaches the end of a full segment (no further fill can extend it, so a
+            // sub-batch residue at the segment tail must still drain — otherwise a
+            // window smaller than a segment would pin that residue forever). A terminal
+            // claim takes whatever contiguous filled prefix exists.
+            let at_segment_end = end == seg.slots.len();
+            let take = if terminal || avail >= batch || (avail > 0 && at_segment_end) {
+                avail
+            } else {
+                0
+            };
+            if take > 0 {
+                // Claim the run under the lock: the next scanner sees the advanced
+                // cursor and cannot re-claim these slots.
+                seg.claim_cursor.store(start + take, Ordering::Relaxed);
                 return Some(SegmentWrite {
                     seg: seg.clone(),
                     inner: self.inner.clone(),
+                    start,
+                    len: take,
+                    drained: AtomicBool::new(false),
                 });
             }
         }
@@ -935,10 +994,7 @@ impl<T> PagedRecvBuffer<T> {
             *p = Some(value);
         });
         seg.slots[idx].state.publish_filled();
-        let prev = seg.filled_count.fetch_add(1, Ordering::AcqRel);
-        if prev + 1 == seg.slots.len() {
-            seg.state.set_full();
-        }
+        seg.filled_count.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1029,8 +1085,11 @@ mod tests {
         assert_eq!(consumer.poll_next(), None);
     }
 
+    /// With the default batch (the segment size) the probe raises `DrainReady` exactly
+    /// on the fill that completes the segment — the same edge the prior full-segment
+    /// seal produced.
     #[test]
-    fn fill_outcome_sealed_on_last_fill() {
+    fn fill_outcome_drain_ready_on_last_fill() {
         let seg_size = 8;
         let (ring, _consumer) = PagedRecvBuffer::new_with_segment_size(seg_size);
         let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
@@ -1041,13 +1100,15 @@ mod tests {
             } else {
                 assert_eq!(
                     outcome,
-                    FillOutcome::SealedSegment,
-                    "expected SealedSegment on last fill"
+                    FillOutcome::DrainReady,
+                    "expected DrainReady on the segment-completing fill"
                 );
             }
         }
     }
 
+    /// At the default batch (the segment size), `take_drain_run(false)` yields a whole
+    /// segment as one run, exactly once, and the next segment after completion.
     #[test]
     fn block_path_take_and_complete() {
         let seg_size = 4;
@@ -1058,14 +1119,15 @@ mod tests {
             ring.fill(h, i as u64);
         }
 
-        // Take the completed segment.
+        // Claim the full segment as one run.
         let sw = ring
-            .take_completed_segment()
+            .take_drain_run(false)
             .expect("should have a full segment");
         assert_eq!(sw.base_seq(), 0);
+        assert_eq!(sw.payloads().len(), seg_size);
 
-        // Second immediate take returns None (already claimed).
-        assert!(ring.take_completed_segment().is_none());
+        // Second immediate take returns None (whole segment already claimed).
+        assert!(ring.take_drain_run(false).is_none());
 
         // Complete it.
         sw.complete();
@@ -1076,62 +1138,150 @@ mod tests {
             ring.fill(h, (seg_size + i) as u64);
         }
         let sw2 = ring
-            .take_completed_segment()
+            .take_drain_run(false)
             .expect("second full segment should be takeable");
         assert_eq!(sw2.base_seq(), seg_size as u64);
         sw2.complete();
     }
 
+    /// A non-terminal claim waits for a full batch: a segment filled below its size
+    /// (the default batch) yields nothing.
     #[test]
-    fn take_returns_none_when_partial() {
+    fn take_returns_none_when_below_batch() {
         let seg_size = 4;
         let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
-        // Fill only some slots.
+        // Fill only some slots — below the default batch (== seg_size).
         let handles: Vec<_> = (0..seg_size - 1).map(|_| ring.claim()).collect();
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, i as u64);
         }
-        assert!(ring.take_completed_segment().is_none());
+        assert!(ring.take_drain_run(false).is_none());
     }
 
-    /// `take_tail` drains a partial final segment that `take_completed_segment` won't
-    /// (not full). Only the FILLED slots carry payloads; unfilled are skipped.
+    /// A relief-regime batch below the segment size drains a segment in disjoint runs
+    /// as fills arrive incrementally: a batch's worth lands and drains, then the next.
+    /// (A claim is greedy — it takes the whole contiguous filled run, bounded by what
+    /// has arrived — so partition follows arrival, not a fixed slice size.)
     #[test]
-    fn take_tail_drains_partial_segment() {
+    fn drain_runs_partition_segment_at_small_batch() {
+        let seg_size = 4;
+        let (ring, _consumer) = PagedRecvBuffer::new_with_segment_size(seg_size);
+        ring.set_drain_batch(2);
+        let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
+
+        // First batch arrives: slots 0,1.
+        ring.fill_at(&handles, 0, 0);
+        ring.fill_at(&handles, 1, 10);
+        let r0 = ring.take_drain_run(false).expect("first run");
+        assert_eq!(r0.base_seq(), 0);
+        let seen0: Vec<u64> = r0.payloads().iter().map(|s| *s.get().unwrap()).collect();
+        assert_eq!(seen0, vec![0, 10]);
+        // Nothing more until the next batch arrives.
+        assert!(ring.take_drain_run(false).is_none());
+
+        // Second batch arrives: slots 2,3.
+        ring.fill_at(&handles, 2, 20);
+        ring.fill_at(&handles, 3, 30);
+        let r1 = ring.take_drain_run(false).expect("second run");
+        assert_eq!(r1.base_seq(), 2);
+        let seen1: Vec<u64> = r1.payloads().iter().map(|s| *s.get().unwrap()).collect();
+        assert_eq!(seen1, vec![20, 30]);
+
+        assert!(ring.take_drain_run(false).is_none(), "segment exhausted");
+        r0.complete();
+        r1.complete();
+    }
+
+    /// A gap (an unfilled slot inside the segment) stops a run at the gap. A claim
+    /// takes the contiguous prefix before it, yields nothing more until the gap fills,
+    /// then takes the rest.
+    #[test]
+    fn drain_run_stops_at_gap() {
         let seg_size = 4;
         let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
-        // Fill only 2 of 4 slots — segment never goes FULL.
+        ring.set_drain_batch(2);
+        let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
+        // Fill slots 0, 1, 3 — gap at slot 2.
+        ring.fill_at(&handles, 0, 0);
+        ring.fill_at(&handles, 1, 10);
+        ring.fill_at(&handles, 3, 30);
+
+        // The contiguous run from 0 is [0,2); slot 2 blocks the rest.
+        let r0 = ring.take_drain_run(false).expect("prefix before the gap");
+        assert_eq!(r0.base_seq(), 0);
+        assert_eq!(r0.payloads().len(), 2);
+        // Nothing more: the run beyond the cursor starts at the unfilled slot 2.
+        assert!(ring.take_drain_run(false).is_none());
+
+        // Fill the gap; now [2,4) is a contiguous run of the batch size.
+        ring.fill_at(&handles, 2, 20);
+        let r1 = ring.take_drain_run(false).expect("run after the gap fills");
+        assert_eq!(r1.base_seq(), 2);
+        let seen: Vec<u64> = r1.payloads().iter().map(|s| *s.get().unwrap()).collect();
+        assert_eq!(seen, vec![20, 30]);
+        r0.complete();
+        r1.complete();
+    }
+
+    /// A terminal claim takes a partial prefix below the batch that a non-terminal
+    /// claim leaves untouched.
+    #[test]
+    fn terminal_drains_partial_below_batch() {
+        let seg_size = 4;
+        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        // Default batch == seg_size. Fill only 2 of 4.
         let handles: Vec<_> = (0..2).map(|_| ring.claim()).collect();
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, (i * 10) as u64);
         }
-        // The full-only surface yields nothing.
-        assert!(ring.take_completed_segment().is_none());
-        // The terminal tail surface hands out the partial segment.
-        let sw = ring.take_tail().expect("partial tail segment");
+        // Non-terminal: below batch, nothing.
+        assert!(ring.take_drain_run(false).is_none());
+        // Terminal: take the filled prefix.
+        let sw = ring.take_drain_run(true).expect("partial tail run");
         assert_eq!(sw.base_seq(), 0);
-        let seen: Vec<Option<u64>> = sw.payloads().iter().map(|s| s.get().copied()).collect();
-        assert_eq!(seen, vec![Some(0), Some(10), None, None]);
+        let seen: Vec<u64> = sw.payloads().iter().map(|s| *s.get().unwrap()).collect();
+        assert_eq!(seen, vec![0, 10]);
         sw.complete();
-        // Once drained, a second take_tail finds nothing more in this segment.
-        assert!(ring.take_tail().is_none());
+        // Once claimed, a second terminal call finds nothing more here.
+        assert!(ring.take_drain_run(true).is_none());
     }
 
-    /// `take_tail` also claims a FULL segment (it accepts OPEN or FULL), and only once.
+    /// Reclaim gates on every claimed slot being drained: a segment split into two runs
+    /// reclaims only after both runs complete.
     #[test]
-    fn take_tail_claims_full_and_is_exclusive() {
-        let seg_size = 2;
-        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+    fn reclaim_waits_for_all_runs_of_a_segment() {
+        let seg_size = 4;
+        let (ring, _consumer) = PagedRecvBuffer::new_with_segment_size(seg_size);
+        ring.set_drain_batch(2);
         let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
-        for (i, h) in handles.into_iter().enumerate() {
-            ring.fill(h, i as u64);
-        }
-        let sw = ring.take_tail().expect("full segment via take_tail");
-        assert_eq!(sw.base_seq(), 0);
-        // Already DRAINING → not handed out again by either take surface.
-        assert!(ring.take_tail().is_none());
-        assert!(ring.take_completed_segment().is_none());
-        sw.complete();
+        // Two batches arrive separately, so each is claimed as its own run.
+        ring.fill_at(&handles, 0, 0);
+        ring.fill_at(&handles, 1, 1);
+        let r0 = ring.take_drain_run(false).expect("run [0,2)");
+        ring.fill_at(&handles, 2, 2);
+        ring.fill_at(&handles, 3, 3);
+        let r1 = ring.take_drain_run(false).expect("run [2,4)");
+
+        // Complete only the first run, then grow + reclaim. seg0 is not fully drained
+        // (drained_count == 2 < 4), so it must not be reclaimed.
+        r0.complete();
+        let h = ring.claim(); // seq 4 → grows seg1, runs reclaim_locked
+        ring.fill(h, 4);
+        assert_eq!(
+            ring.segment_count(),
+            2,
+            "seg0 has an outstanding run; must not reclaim yet"
+        );
+
+        // Complete the second run; now drained_count == len, and `complete`'s own
+        // front-reclaim pops seg0 (a second segment exists, so the deque-non-empty
+        // floor does not block it).
+        r1.complete();
+        assert_eq!(
+            ring.segment_count(),
+            1,
+            "seg0 reclaims once every claimed run completed"
+        );
     }
 
     /// `consumed()` reports the in-order delivery cursor for the read-ahead gate.
@@ -1159,15 +1309,15 @@ mod tests {
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, (i * 10) as u64);
         }
-        let sw = ring.take_completed_segment().expect("full segment");
+        let sw = ring.take_drain_run(false).expect("full segment");
         let seen: Vec<u64> = sw.payloads().iter().map(|s| *s.get().unwrap()).collect();
         assert_eq!(seen, vec![0, 10, 20, 30]);
         sw.complete();
     }
 
     /// `Slot::get` returns the payload for a filled slot. (The empty-slot `None`
-    /// branch is not reachable through the public block surface, which hands out only
-    /// FULL segments — every slot filled.)
+    /// branch is not reachable through a non-terminal claim, whose run is filled by
+    /// construction — every slot of the run is filled.)
     #[test]
     fn slot_get_returns_filled_payload() {
         let seg_size = 4;
@@ -1176,32 +1326,34 @@ mod tests {
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, (i * 7) as u64);
         }
-        let sw = ring.take_completed_segment().expect("full segment");
+        let sw = ring.take_drain_run(false).expect("full segment");
         for (i, slot) in sw.payloads().iter().enumerate() {
             assert_eq!(*slot.get().expect("filled"), (i * 7) as u64);
         }
         sw.complete();
     }
 
-    /// A `SegmentWrite` dropped without `complete()` still drains: the segment is
-    /// reclaimed (not left stuck DRAINING), so reclaim does not wedge behind it.
+    /// A `SegmentWrite` dropped without `complete()` still drains: its run is freed and
+    /// counted toward `drained_count`, so the segment reclaims and reclaim does not
+    /// stall behind it.
     #[test]
     fn drop_without_complete_reclaims() {
         let seg_size = 2;
         let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
-        // Fill seg0 full and take it.
+        // Fill seg0 full and take it as one run.
         for i in 0..seg_size {
             let h = ring.claim();
             ring.fill(h, i as u64);
         }
-        let sw = ring.take_completed_segment().expect("seg0 full");
+        let sw = ring.take_drain_run(false).expect("seg0 full");
         assert_eq!(sw.base_seq(), 0);
-        // Drop WITHOUT complete(): the Drop safety net marks seg0 DRAINED.
+        // Drop WITHOUT complete(): the Drop safety net frees the run and advances
+        // drained_count to the segment length.
         drop(sw);
         // `claim` runs reclaim before it grows, so the drained front pops on the
         // claim *after* seg1 exists. Two claims: the first grows seg1, the second
-        // observes seg0 drained and reclaims it. A segment stuck DRAINING would
-        // never pop and the count would climb without bound.
+        // observes seg0 fully drained and reclaims it. A run left unaccounted would
+        // never reach drained_count == len and the count would climb without bound.
         for i in 0..2 {
             let h = ring.claim();
             ring.fill(h, 99 + i);
@@ -1209,12 +1361,12 @@ mod tests {
         assert_eq!(
             ring.segment_count(),
             1,
-            "dropped-without-complete segment must drain and reclaim, not wedge"
+            "dropped-without-complete run must drain and reclaim, not wedge"
         );
     }
 
     /// `complete()` and `Drop` are exactly-once: payloads are freed once, never twice
-    /// (the DRAINED state guard makes the second drain a no-op).
+    /// (the token's `drained` guard makes the second drain a no-op).
     #[test]
     fn complete_then_drop_frees_exactly_once() {
         use std::sync::atomic::{AtomicUsize, Ordering as O};
@@ -1235,7 +1387,7 @@ mod tests {
             let h = ring.claim();
             ring.fill(h, DropCounter(drops.clone()));
         }
-        let sw = ring.take_completed_segment().expect("full");
+        let sw = ring.take_drain_run(false).expect("full");
         // complete() frees both payloads.
         sw.complete();
         assert_eq!(
@@ -1279,12 +1431,13 @@ mod tests {
         let h3 = it.next().unwrap();
         ring.fill(h2, DropCounter(drops.clone()));
         ring.fill(h3, DropCounter(drops.clone()));
-        // seg1 is now FULL while seg0 is still OPEN. Take and complete seg1.
-        let sw = ring.take_completed_segment().expect("seg1 is full");
+        // seg1 is now full while seg0 has no contiguous filled run. take_drain_run
+        // skips seg0 (its run from the cursor is empty) and claims seg1.
+        let sw = ring.take_drain_run(false).expect("seg1 is full");
         assert_eq!(
             sw.base_seq(),
             seg_size as u64,
-            "frontmost full segment is seg1"
+            "frontmost drainable run is in seg1"
         );
         sw.complete();
         // seg1's two payloads freed immediately, even though seg0 sits ahead unfilled.
@@ -1483,6 +1636,40 @@ mod tests {
         );
     }
 
+    /// The fill probe's run-length (`filled - claim_cursor`) must not underflow when a
+    /// concurrent drainer advances `claim_cursor` past *this* fill's local `filled`
+    /// snapshot. `filled` is captured at this thread's `fetch_add`; `claim_cursor` is
+    /// read lock-free afterward, and another producer's later fill can let a drainer
+    /// claim a run beyond this thread's count, so `claim_cursor > filled` is reachable.
+    /// A bare subtraction wraps in release but panics under overflow-checks (the default
+    /// for debug and `cargo test`), crashing the fill path. Reproduces only under real
+    /// concurrency — single-threaded, `claim_cursor <= filled` always holds — so this is
+    /// a multi-thread stress test at batch 1 (the disk relief regime) over a wide
+    /// segment, looped to make the race near-certain. It can only fail on a regression;
+    /// it never false-positives.
+    #[test]
+    fn fill_probe_does_not_underflow_under_concurrent_drain() {
+        for _ in 0..2_000 {
+            let seg_size = 16;
+            let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+            ring.set_drain_batch(1);
+            let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
+            let ring = Arc::new(ring);
+            std::thread::scope(|s| {
+                for h in handles {
+                    let ring = ring.clone();
+                    s.spawn(move || {
+                        if ring.fill(h, 0) == FillOutcome::DrainReady {
+                            while let Some(sw) = ring.take_drain_run(false) {
+                                sw.complete();
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+
     #[test]
     fn concurrent_producer_consumer() {
         let seg_size = 4;
@@ -1515,11 +1702,12 @@ mod tests {
 // Loom model-checks the real structure directly (no model of it): the compat layer
 // swaps in loom's atomics/Arc/Mutex under `cfg(s3_tm_loom)`. Segment size is set to
 // 2 per ring (via new_with_segment_size) so boundary-crossing interleavings stay
-// tractable; the algorithm is identical at any size. Nine models cover the handoff
-// (1), the segment hop (2), reclaim vs an outstanding write — complete (3) and drop
-// (6) paths, multi-producer fill (4), the block-take CAS (5), out-of-order fill
-// across a hop (7), reclaim racing the consumer hop (8), and two takers over
-// distinct segments (9). Run with:
+// tractable; the algorithm is identical at any size. Ten models cover the handoff
+// (1), the segment hop (2), reclaim vs an outstanding run — complete (3) and drop
+// (6) paths, multi-producer fill (4), one full segment claimed by racing drainers
+// (5), out-of-order fill across a hop (7), reclaim racing the consumer hop (8), two
+// drainers over distinct segments (9), and two drainers partitioning one segment into
+// disjoint runs at batch 1 (10). Run with:
 //   LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg s3_tm_loom" \
 //     cargo test --lib --release loom_tests -- --test-threads=1
 // The preemption bound is required: unbounded exploration of the multi-producer and
@@ -1608,10 +1796,10 @@ mod loom_tests {
         });
     }
 
-    /// Model 3 — segment reclaim vs an outstanding write pin.
+    /// Model 3 — segment reclaim vs an outstanding run pin.
     ///
-    /// Fill seg0 full (seqs 0,1) so it is takeable on the block surface. One thread
-    /// takes it and `complete`s it (frees payloads, marks DRAINED, reclaims drained
+    /// Fill seg0 full (seqs 0,1) so a run is drainable. One thread claims the run and
+    /// `complete`s it (frees payloads, advances `drained_count`, reclaims drained
     /// front segments); concurrently the other thread `claim`s seq 2 (which grows
     /// seg1 and runs front-reclaim). The `SegmentWrite` pins seg0 via its `Arc`
     /// until `complete`, so the segment must not be freed while the token is alive,
@@ -1621,7 +1809,8 @@ mod loom_tests {
     fn reclaim_vs_outstanding_write() {
         loom::model(|| {
             let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(2);
-            // Fill seg0 (seqs 0,1) to FULL.
+            // Fill seg0 (seqs 0,1) full; the default batch (== seg_size) makes it one
+            // drainable run.
             for i in 0..2 {
                 let h = ring.claim();
                 ring.fill(h, i as u64);
@@ -1630,10 +1819,10 @@ mod loom_tests {
             let ring2 = ring.clone();
             let taker = thread::spawn(move || {
                 let sw = ring2
-                    .take_completed_segment()
-                    .expect("seg0 is full and takeable");
+                    .take_drain_run(false)
+                    .expect("seg0 is full and drainable");
                 assert_eq!(sw.base_seq(), 0);
-                sw.complete(); // frees payloads, DRAINED, reclaim_front
+                sw.complete(); // frees payloads, drained_count += len, reclaim_front
             });
 
             // Concurrently grow + reclaim from the issuer side.
@@ -1690,12 +1879,13 @@ mod loom_tests {
         });
     }
 
-    /// Model 5 — two block takers race one full segment.
+    /// Model 5 — two drainers race one full segment at the default batch.
     ///
-    /// seg0 is filled FULL, then two threads call `take_completed_segment`
-    /// concurrently. The `FULL → DRAINING` CAS must hand the segment to exactly one:
-    /// one thread gets `Some(SegmentWrite)`, the other `None`. This proves the
-    /// at-most-once handout invariant under contention, which the single-threaded
+    /// seg0 is filled full, then two threads call `take_drain_run(false)` concurrently
+    /// with the batch equal to the segment size, so the only drainable run is the whole
+    /// segment. Advancing `claim_cursor` under the lock must hand that run to exactly
+    /// one: one thread gets `Some(SegmentWrite)` based at 0, the other `None`. This
+    /// proves the at-most-once handout under contention, which the single-threaded
     /// "second take returns None" test cannot.
     #[test]
     fn two_takers_race_one_segment() {
@@ -1707,28 +1897,28 @@ mod loom_tests {
             }
 
             let ring2 = ring.clone();
-            let t1 = thread::spawn(move || ring2.take_completed_segment().map(|sw| sw.base_seq()));
-            let t2 = thread::spawn(move || ring.take_completed_segment().map(|sw| sw.base_seq()));
+            let t1 = thread::spawn(move || ring2.take_drain_run(false).map(|sw| sw.base_seq()));
+            let t2 = thread::spawn(move || ring.take_drain_run(false).map(|sw| sw.base_seq()));
 
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
 
-            // Exactly one winner, and it got seg0.
+            // Exactly one winner, and it got the run based at seq 0.
             let winners: Vec<u64> = [r1, r2].into_iter().flatten().collect();
             assert_eq!(
                 winners,
                 vec![0],
-                "exactly one taker wins the FULL→DRAINING CAS"
+                "exactly one drainer claims the full-segment run"
             );
         });
     }
 
-    /// Model 6 — segment drop (no complete) vs concurrent reclaim.
+    /// Model 6 — run drop (no complete) vs concurrent reclaim.
     ///
-    /// Same shape as Model 3, but the taker **drops** the `SegmentWrite` instead of
-    /// calling `complete()`. The `Drop` safety net runs the same drain (free
-    /// payloads, set DRAINED, reclaim_front) concurrently with the issuer's `claim`
-    /// reclaim. The drain's idempotency guard and the `Arc` pin must still give
+    /// Same shape as Model 3, but the drainer **drops** the `SegmentWrite` instead of
+    /// calling `complete()`. The `Drop` safety net runs the same drain (free payloads,
+    /// advance `drained_count`, reclaim_front) concurrently with the issuer's `claim`
+    /// reclaim. The token's idempotency guard and the `Arc` pin must still give
     /// exactly-once teardown across the drop path and claim's reclaim — loom's Arc
     /// registry catches a double-free or use-after-free.
     #[test]
@@ -1743,8 +1933,8 @@ mod loom_tests {
             let ring2 = ring.clone();
             let taker = thread::spawn(move || {
                 let sw = ring2
-                    .take_completed_segment()
-                    .expect("seg0 is full and takeable");
+                    .take_drain_run(false)
+                    .expect("seg0 is full and drainable");
                 assert_eq!(sw.base_seq(), 0);
                 // Drop without complete(): Drop must drain and reclaim safely.
                 drop(sw);
@@ -1851,39 +2041,110 @@ mod loom_tests {
         });
     }
 
-    /// Model 9 — two block takers race two distinct full segments.
+    /// Model 9 — two drainers race two distinct full segments.
     ///
-    /// seg0 and seg1 are both FULL, then two threads call `take_completed_segment`
-    /// concurrently. Each `FULL → DRAINING` CAS succeeds on a different segment, so
-    /// the two takers must come away with seg0 and seg1 — one each, no duplicate, no
-    /// segment skipped. Model 5 proves at-most-once on a *single* contended segment;
-    /// this proves the forward scan hands out *every* takeable segment exactly once
-    /// when takers race across segments.
+    /// seg0 and seg1 are both full, then two threads call `take_drain_run(false)`
+    /// concurrently at the default batch (so each segment is one run). The forward
+    /// scan plus the `claim_cursor` advance must hand the two segments' runs to the two
+    /// drainers — one each, no duplicate, no segment skipped. Model 5 proves
+    /// at-most-once on a *single* contended segment; this proves the forward scan hands
+    /// out *every* drainable run exactly once when drainers race across segments.
     #[test]
     fn two_takers_distinct_segments() {
         loom::model(|| {
             let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(2);
-            // Fill seg0 (0,1) and seg1 (2,3) both to FULL.
+            // Fill seg0 (0,1) and seg1 (2,3) both full.
             for i in 0..4u64 {
                 let h = ring.claim();
                 ring.fill(h, i);
             }
 
             let ring2 = ring.clone();
-            let t1 = thread::spawn(move || ring2.take_completed_segment().map(|sw| sw.base_seq()));
-            let t2 = thread::spawn(move || ring.take_completed_segment().map(|sw| sw.base_seq()));
+            let t1 = thread::spawn(move || ring2.take_drain_run(false).map(|sw| sw.base_seq()));
+            let t2 = thread::spawn(move || ring.take_drain_run(false).map(|sw| sw.base_seq()));
 
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
 
-            // Both segments handed out, one per taker, no duplication. Order between
+            // Both segments handed out, one per drainer, no duplication. Order between
             // the two threads is nondeterministic, so compare as a sorted set.
             let mut bases: Vec<u64> = [r1, r2].into_iter().flatten().collect();
             bases.sort_unstable();
             assert_eq!(
                 bases,
                 vec![0, 2],
-                "both full segments handed out exactly once across racing takers"
+                "both full segments handed out exactly once across racing drainers"
+            );
+        });
+    }
+
+    /// Model 10 — two drainers partition one segment into disjoint runs at batch 1.
+    ///
+    /// One segment of size 2, batch lowered to 1 so each slot is individually
+    /// drainable. Each thread fills its own slot then drains, the realistic disk path
+    /// where a completing part probes and drains. The fills and drains interleave: a
+    /// drainer may find only its own slot filled and claim a single-slot run, or find
+    /// both and claim the pair — but advancing `claim_cursor` under the lock means the
+    /// two drainers' runs are always disjoint, so no slot is read by both. A terminal
+    /// sweep after the join mops up any slot whose filler had not reached its own drain
+    /// scan. A `DropCounter` payload proves every slot is freed exactly once: a run
+    /// overlap would either double-free (count > 2) or trip loom's `UnsafeCell` on the
+    /// concurrent in-place reads. This is the sub-segment partition the cursor
+    /// introduces, which a whole-segment handout could not race.
+    #[test]
+    fn two_drainers_partition_one_segment() {
+        loom::model(|| {
+            // Count drops through a loom `Arc<AtomicUsize>` (the compat re-export under
+            // loom cfg) so the model tracks every payload free. `Clone` is required by
+            // `PagedRecvBuffer<T>: Clone`'s `T: Clone` bound; cloning shares the same
+            // counter, and each instance still drops exactly once.
+            #[derive(Clone)]
+            struct DropCounter(Arc<AtomicUsize>);
+            impl Drop for DropCounter {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (ring, _consumer) = PagedRecvBuffer::<DropCounter>::new_with_segment_size(2);
+            ring.set_drain_batch(1);
+            // Claim both slots up front (claim is serialized under the lock).
+            let h0 = ring.claim();
+            let h1 = ring.claim();
+
+            let ring_a = ring.clone();
+            let da = drops.clone();
+            let a = thread::spawn(move || {
+                ring_a.fill(h0, DropCounter(da));
+                if let Some(sw) = ring_a.take_drain_run(false) {
+                    sw.complete();
+                }
+            });
+            let ring_b = ring.clone();
+            let db = drops.clone();
+            let b = thread::spawn(move || {
+                ring_b.fill(h1, DropCounter(db));
+                if let Some(sw) = ring_b.take_drain_run(false) {
+                    sw.complete();
+                }
+            });
+
+            a.join().unwrap();
+            b.join().unwrap();
+
+            // Mop up any slot a drainer's scan missed (its sibling filled after the
+            // scan). Single-threaded here, so no race; terminal takes a lone slot.
+            while let Some(sw) = ring.take_drain_run(true) {
+                sw.complete();
+            }
+
+            // Every payload freed exactly once. Overlapping runs would double-free
+            // (count > 2) or be caught earlier by loom's UnsafeCell.
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                2,
+                "each slot's payload freed exactly once across partitioned runs"
             );
         });
     }

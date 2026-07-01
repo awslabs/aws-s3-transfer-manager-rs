@@ -567,13 +567,13 @@ async fn test_download_slow_consumer_does_not_wedge() {
 
 /// A disk download whose part count exceeds the read-ahead window must complete.
 ///
-/// The disk consumer drains via the block surface (`drain_sealed`), which frees a
-/// whole segment at a time and does not advance the in-order delivery cursor. The
-/// read-ahead gate must release occupancy on that drain, or issuance latches shut at
-/// the window and the transfer wedges with the buffer drained to empty. A small
-/// `ReadAhead::Parts` window makes the object exceed it cheaply (no multi-GiB
-/// object); the window is kept above the buffer's segment granularity so segments
-/// can seal and drain. Under a timeout so the wedge fails fast instead of hanging.
+/// The disk consumer drains via the block surface, which frees runs and does not
+/// advance the in-order delivery cursor. The read-ahead gate must release occupancy on
+/// that drain, or issuance latches shut at the window and the transfer wedges with the
+/// buffer drained to empty. A small `ReadAhead::Parts` window makes the object exceed
+/// it cheaply (no multi-GiB object); the window here spans more than one segment so
+/// segments seal and drain whole. Under a timeout so the wedge fails fast instead of
+/// hanging.
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
@@ -613,6 +613,56 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
     })
     .await
     .expect("disk download did not complete within 30s (gate failed to reopen on drain)");
+
+    assert_eq!(written.len(), content.len(), "size mismatch");
+    assert_eq!(written, content, "data integrity check failed");
+    server_handle.shutdown().await.expect("shutdown");
+}
+
+/// Disk download with a read-ahead window *below* the buffer's segment size — the
+/// relief regime. Here a segment can never fill within the window, so the drain batch
+/// drops below the segment size and segments drain as partial contiguous runs rather
+/// than whole. This exercises the sub-segment drain path (and proves it does not wedge:
+/// a window that cannot seal a segment must still drain and reopen the gate). A small
+/// `ReadAhead::Parts(2)` window against a multi-segment object keeps it cheap. The
+/// positioned writes must still reassemble the object byte-for-byte under a timeout.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_download_to_disk_below_segment_window_drains_in_runs() {
+    use aws_sdk_s3_transfer_manager::types::ReadAhead;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+
+    // 40 parts against a window of 3 (Parts(2) → 2 speculative + 1 demand), far below
+    // the 16-part segment. No segment ever seals within the window, so every drain is a
+    // partial run; the gate must still reopen on each run drain or the transfer wedges.
+    let size = 40 * part_size;
+    let content = deterministic_data(size);
+    server
+        .add_object("test-bucket", "disk-subseg-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let written = timeout(Duration::from_secs(30), async {
+        let handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("disk-subseg-key")
+            .read_ahead(ReadAhead::Parts(2))
+            .write_to_path(&dest_path)
+            .await
+            .unwrap();
+        handle.join().await.unwrap();
+        std::fs::read(&dest_path).unwrap()
+    })
+    .await
+    .expect("sub-segment-window disk download did not complete within 30s (gate failed to reopen on a partial-run drain)");
 
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
