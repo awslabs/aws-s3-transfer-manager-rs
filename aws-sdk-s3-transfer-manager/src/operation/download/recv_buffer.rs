@@ -1667,6 +1667,20 @@ mod tests {
                     });
                 }
             });
+            // Terminal sweep mops up any run a filler produced after its own drain
+            // scan (the fill/drain interleaving can leave a slot claimed-but-untaken).
+            while let Some(sw) = ring.take_drain_run(true) {
+                sw.complete();
+            }
+            // Beyond the underflow (a bare subtraction panics here under overflow-checks),
+            // assert the outcome is correct: every slot drained exactly once, so occupancy
+            // returns to zero. Catches a double-take or a lost run that a panic-only check
+            // would miss.
+            assert_eq!(
+                ring.released(),
+                seg_size as u64,
+                "every slot must drain exactly once under concurrent fill+drain"
+            );
         }
     }
 

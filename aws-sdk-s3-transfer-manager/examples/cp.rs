@@ -40,8 +40,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 //                           CPUs). Fewer arenas concentrate freed buffers into a
 //                           shared dirty pool, so a free on one thread can satisfy
 //                           an allocation on another; the default scatters them
-//                           per-arena and forces a fresh mmap. Fixed count, not
-//                           machine-scaled (revisit per instance, or percpu_arena).
+//                           per-arena and forces a fresh mmap. A fixed count rather
+//                           than machine-scaled or percpu_arena.
 //   dirty_decay_ms:1000     Hold a freed page mapped and reusable for 1s before
 //                           purging. This retention is the reuse window: a buffer
 //                           freed at delivery serves the next read without a fault.

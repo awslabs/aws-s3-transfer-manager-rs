@@ -62,10 +62,10 @@ impl Handle {
 
     /// Resolve the read-ahead window in parts for a download, in precedence order:
     /// the per-request [`ReadAhead`](crate::types::ReadAhead) override if set, else
-    /// the client default. `Auto` maps to [`DEFAULT_DOWNLOAD_READ_AHEAD_PARTS`] (the
-    /// fixed per-transfer cap; a future memory budget will size it). `Parts(n)` maps
-    /// to `n + 1`: `n` parts of speculation beyond the part the consumer is waiting
-    /// on, which is always admitted, so `Parts(0)` is demand paging.
+    /// the client default. `Auto` maps to the fixed per-transfer cap (a future memory
+    /// budget will size it); `Parts(n)` maps to `n + 1`: `n` parts of speculation
+    /// beyond the part the consumer is waiting on, which is always admitted, so
+    /// `Parts(0)` is demand paging. See `read_ahead::window_parts_for`.
     pub(crate) fn download_read_ahead_window(
         &self,
         input: &crate::operation::download::DownloadInput,
