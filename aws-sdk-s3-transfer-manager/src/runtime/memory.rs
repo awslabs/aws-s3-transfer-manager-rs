@@ -9,6 +9,12 @@
 //! reserved across all transfers. It grants reservations (RAII tickets whose drop
 //! returns chunks), parks callers when the budget is exhausted, and wakes them
 //! strictly FIFO as chunks are released.
+//!
+//! The primitive is complete and unit-tested but not yet wired into a transfer:
+//! the download reserve/release integration is deferred to the receive-buffer
+//! rework (see the memory-budget notes in the project workspace). Until then the
+//! whole module is dead code.
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -207,7 +213,6 @@ impl MemoryBudget {
     /// Attempt an immediate grant without parking. Returns None if the queue is
     /// non-empty (no-barge) or the request does not fit. Unlike
     /// [`reserve`](Self::reserve) it never enqueues a waiter and registers no waker.
-    #[allow(dead_code)]
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         let need = self.chunks_for(bytes);
         let mut inner = self.inner.lock();
@@ -271,7 +276,6 @@ impl MemoryBudget {
 
     /// Resize the capacity (in bytes). Growing may drain parked waiters. Shrinking
     /// is soft: never revokes already-granted chunks, just tightens future grants.
-    #[allow(dead_code)]
     pub(crate) fn set_limit(self: &Arc<Self>, capacity_bytes: usize) {
         let new_capacity = (capacity_bytes / self.chunk) as u64;
         let notifies = {
@@ -285,19 +289,16 @@ impl MemoryBudget {
     }
 
     /// Chunks currently reserved (granted and not yet released).
-    #[allow(dead_code)]
     pub(crate) fn in_use_chunks(&self) -> u64 {
         self.inner.lock().in_use
     }
 
     /// Current capacity in chunks.
-    #[allow(dead_code)]
     pub(crate) fn capacity_chunks(&self) -> u64 {
         self.inner.lock().capacity
     }
 
     /// The fixed chunk size in bytes.
-    #[allow(dead_code)]
     pub(crate) fn chunk_bytes(&self) -> usize {
         self.chunk
     }

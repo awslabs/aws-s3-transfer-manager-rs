@@ -19,11 +19,10 @@ use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::{DownloadState, PendingClaim};
+use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::DownloadInput;
-use crate::runtime::memory::{NotifyFn, Reservation, Reserve};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
 
@@ -49,16 +48,16 @@ impl DownloadWork {
     }
 }
 
-/// The next chunk's range (sliced from `remaining` at `part_size`) and its byte
-/// length. Peek only — does not advance `remaining`.
+/// The next chunk's range, sliced from `remaining` at `part_size`. Peek only —
+/// does not advance `remaining`.
 fn next_chunk_range(
     remaining: &std::ops::RangeInclusive<u64>,
     part_size: u64,
-) -> (std::ops::RangeInclusive<u64>, usize) {
+) -> std::ops::RangeInclusive<u64> {
     let start = *remaining.start();
     let end = *remaining.end();
     let chunk_end = cmp::min(start + part_size - 1, end);
-    (start..=chunk_end, (chunk_end - start + 1) as usize)
+    start..=chunk_end
 }
 
 /// `remaining` after committing `chunk`: the leftover range, or `None` when
@@ -262,7 +261,6 @@ impl DownloadTransfer {
                 ranges_in_flight,
                 etag,
                 part_size,
-                pending,
             } => {
                 // Nothing left to fetch: drain in-flight, or finish once drained.
                 if remaining.is_none() {
@@ -273,13 +271,12 @@ impl DownloadTransfer {
                     return PollWork::Done;
                 }
 
-                let (range, range_len) = next_chunk_range(remaining.as_ref().unwrap(), *part_size);
+                let range = next_chunk_range(remaining.as_ref().unwrap(), *part_size);
 
-                // Claim a slot (the prefetch-window gate — a grant means the
-                // consumer is keeping up), then reserve the memory backing it,
-                // resuming a budget-parked claim if one is held. `None` means
-                // parked; a waker is armed (consumer release or budget grant).
-                let Some(slot) = self.acquire_slot(range_len, pending) else {
+                // Claim a slot: the prefetch-window gate. A grant means the window
+                // has room (the consumer is keeping up); `None` means it is full and
+                // the transfer parks until in-order consumption frees a slot.
+                let Some(slot) = self.acquire_slot() else {
                     return self.park();
                 };
 
@@ -299,93 +296,28 @@ impl DownloadTransfer {
     }
 
     /// Park the transfer: mark it pending so the scheduler stops polling it until
-    /// a waker re-readies it — the consumer on slot release (window), the budget
-    /// `NotifyFn` on grant, or a GET completion decrementing the in-flight count.
+    /// a waker re-readies it — the consumer on slot release (window) or a GET
+    /// completion decrementing the in-flight count.
     fn park(&self) -> PollWork {
         self.inner.ctx.set_pending();
         PollWork::Pending
     }
 
-    /// Acquire a slot to fetch the next range into, with its memory reserved.
-    ///
-    /// Resumes a budget-parked claim if one is held; otherwise claims a fresh
-    /// slot (the prefetch-window gate) and reserves the backing memory. Returns
-    /// the slot with its reservation attached, or `None` when parked:
-    /// - window full (consumer lagging): `try_claim` returned `None`;
-    /// - budget exhausted: the reservation is queued and the claimed slot is
-    ///   stashed in `pending` until the budget grants it.
-    ///
-    /// Claiming before reserving makes the two states mutually exclusive — a
-    /// window-parked transfer holds nothing, a budget-parked one holds exactly
-    /// the slot it will fill — so there is no peek/claim race to handle.
-    fn acquire_slot(
-        &self,
-        range_len: usize,
-        pending: &mut Option<PendingClaim>,
-    ) -> Option<BodySlot> {
-        // Resume a budget-parked claim: the slot is already ours, just awaiting
-        // the reservation the budget queued.
-        if pending.is_some() {
-            self.set_window_blocked(false);
-            let granted = pending.as_mut().unwrap().ticket.take();
-            return match granted {
-                Some(reservation) => {
-                    let mut claim = pending.take().unwrap();
-                    claim.slot.attach_reservation(reservation);
-                    Some(claim.slot)
-                }
-                None => None, // not granted yet; the queued ticket is the waker
-            };
-        }
-
-        // Fresh: the window gate is the claim itself.
-        let Some(mut slot) = self.inner.writer.try_claim() else {
-            self.set_window_blocked(true);
-            return None;
-        };
-        self.set_window_blocked(false);
-
-        let notify: NotifyFn = {
-            let scheduler = self.inner.ctx.handle.scheduler.clone();
-            let tid = self.inner.ctx.id;
-            Arc::new(move || scheduler.wake(tid))
-        };
-        match self
-            .inner
-            .ctx
-            .handle
-            .memory_budget
-            .reserve(range_len, notify)
-        {
-            Reserve::Ready(reservation) => {
-                slot.attach_reservation(reservation);
+    /// Claim a slot to fetch the next range into. The claim is the prefetch-window
+    /// gate: `Some` when the window has room, `None` when it is full (the consumer
+    /// is lagging on in-order consumption), in which case the transfer parks and
+    /// the consumer's next slot release re-drives it. Edge-tracks the
+    /// window-blocked vital sign across the block→unblock transition.
+    fn acquire_slot(&self) -> Option<BodySlot> {
+        match self.inner.writer.try_claim() {
+            Some(slot) => {
+                self.set_window_blocked(false);
                 Some(slot)
             }
-            Reserve::Pending(ticket) => {
-                *pending = Some(PendingClaim { slot, ticket });
+            None => {
+                self.set_window_blocked(true);
                 None
             }
-        }
-    }
-
-    /// Reserve budget for a chunk of `len` bytes, awaiting the grant if the budget
-    /// is full. Backpressures by holding the caller's async context — and the
-    /// undrained response stream — rather than parking on the scheduler, so it
-    /// suits a caller running inside `execute` rather than the re-pollable
-    /// `poll_work`. Reserving seq 0 before any read-ahead range keeps it at the
-    /// FIFO head, preserving forward progress under a tight cap.
-    async fn reserve_chunk(&self, len: usize) -> Reservation {
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let waker = Arc::clone(&notify);
-        let notify_fn: NotifyFn = Arc::new(move || waker.notify_one());
-        match self.inner.ctx.handle.memory_budget.reserve(len, notify_fn) {
-            Reserve::Ready(reservation) => reservation,
-            Reserve::Pending(mut ticket) => loop {
-                notify.notified().await;
-                if let Some(reservation) = ticket.take() {
-                    return reservation;
-                }
-            },
         }
     }
 
@@ -467,17 +399,11 @@ impl DownloadTransfer {
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(stream), Some(meta)) => {
-                let mut slot = self
+                let slot = self
                     .inner
                     .writer
                     .try_claim()
                     .expect("seq window should have capacity at start");
-                // Account the discovery chunk's memory before the transition wakes
-                // poll_work, so the head (seq 0) reserves before any read-ahead
-                // range. Awaiting here backpressures: a full budget holds the
-                // discovery body undrained until a chunk frees.
-                let reservation = self.reserve_chunk(chunk_content_len as usize).await;
-                slot.attach_reservation(reservation);
                 Some((stream, meta, slot))
             }
             (None, _) => None,
@@ -493,7 +419,6 @@ impl DownloadTransfer {
                 ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
                 etag: etag.clone(),
                 part_size: effective_part_size,
-                pending: None,
             };
         }
 
@@ -1417,80 +1342,5 @@ mod tests {
     #[test]
     fn test_validate_content_range_missing() {
         assert!(validate_content_range("bytes=1024-2047", None).is_err());
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn test_budget_blocks_then_resumes() {
-        use crate::runtime::memory::BUDGET_CHUNK_BYTES;
-
-        // Object = 3 parts. Discovery fetches part 0 (seq 0) and reserves its
-        // chunk, so in_use == 1 after discovery; remaining covers parts 1+2.
-        let part_size = BUDGET_CHUNK_BYTES as u64;
-        let object_size = 3 * part_size;
-        let (transfer, consumer) = create_download_with_capacity(object_size, part_size, 8);
-
-        skip_discovery(&transfer).await;
-        let budget = &transfer.ctx().handle.memory_budget;
-        assert_eq!(budget.in_use_chunks(), 1, "discovery chunk is reserved");
-
-        // Tighten to 2 chunks: the discovery chunk plus room for exactly one range.
-        budget.set_limit(2 * BUDGET_CHUNK_BYTES);
-
-        // poll #1: part 1 fits (need 1, free 1) → Ready.
-        let _w1 = assert_ready(transfer.poll_work());
-        assert_eq!(budget.in_use_chunks(), 2);
-
-        // poll #2: part 2 does not fit (in_use 2, cap 2) → parked on the budget,
-        //          holding the claimed slot until a chunk frees.
-        assert_pending(transfer.poll_work());
-        {
-            let state = transfer.inner.state.lock().unwrap();
-            match &*state {
-                DownloadState::Transferring { pending, .. } => {
-                    assert!(pending.is_some(), "claim should be parked on the budget");
-                }
-                _ => panic!("expected Transferring"),
-            }
-        }
-
-        // Consume the discovery chunk (seq 0): its reservation drops, freeing a
-        // chunk that the budget immediately re-grants to the parked part-2 claim.
-        consumer.try_take_next().expect("discovery chunk is filled");
-        assert_eq!(
-            budget.in_use_chunks(),
-            2,
-            "freed chunk re-granted to the waiter"
-        );
-
-        // poll #3: the parked claim was granted → Ready, pending cleared.
-        let mut w2 = assert_ready(transfer.poll_work());
-        {
-            let state = transfer.inner.state.lock().unwrap();
-            match &*state {
-                DownloadState::Transferring { pending, .. } => {
-                    assert!(pending.is_none(), "parked claim should be consumed");
-                }
-                _ => panic!("expected Transferring"),
-            }
-        }
-        assert_eq!(budget.in_use_chunks(), 2);
-
-        // The resumed work carries the claimed slot with its reservation attached:
-        // it is a GetObjectRange holding a slot, and dropping the work releases the
-        // reservation (in_use falls), proving the grant rode the slot rather than
-        // being silently dropped at resume.
-        match w2.data_mut::<DownloadWork>() {
-            DownloadWork::GetObjectRange { slot, .. } => {
-                assert!(slot.is_some(), "resumed work should hold its claimed slot");
-            }
-            _ => panic!("expected GetObjectRange"),
-        }
-        drop(w2);
-        assert_eq!(
-            budget.in_use_chunks(),
-            1,
-            "dropping the resumed work releases its reservation"
-        );
     }
 }

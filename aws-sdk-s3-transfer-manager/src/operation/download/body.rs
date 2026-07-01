@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::runtime::memory::Reservation;
 use crate::runtime::sync::cell::UnsafeCell;
 use crate::runtime::sync::sync::atomic::{
     AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering,
@@ -106,23 +105,14 @@ struct SlotBuffer {
     sink: Option<Sink>,
 }
 
-/// A filled slot's payload: the chunk data and the optional memory budget
-/// reservation that accounts for this chunk's ring residency. The reservation
-/// lives here (not in `ChunkOutput`) so it drops when the chunk leaves the
-/// ring, not when the user drops the output.
-struct Filled {
-    chunk: ChunkOutput,
-    reservation: Option<Reservation>,
-}
-
 /// A single slot in the ring buffer.
 ///
-/// Holds an optional `Filled` behind `UnsafeCell`. Access is synchronized
+/// Holds an optional `ChunkOutput` behind `UnsafeCell`. Access is synchronized
 /// through the atomic `state` field: producers write data then store `FILLED`,
 /// the consumer reads data only after loading `FILLED`.
 struct Slot {
     state: AtomicU8,
-    data: UnsafeCell<Option<Filled>>,
+    data: UnsafeCell<Option<ChunkOutput>>,
 }
 
 // Safety: see SlotBuffer doc comment for the full invariant chain.
@@ -160,12 +150,12 @@ impl SlotBuffer {
     /// - `seq` must have been claimed via the `claimed` CAS (i.e. through
     ///   `BodyWriter::try_claim`). Filling an unclaimed seq is undefined behavior.
     /// - Each `seq` must be filled exactly once. Double-filling is undefined behavior.
-    fn fill(&self, seq: u64, chunk: ChunkOutput, reservation: Option<Reservation>) {
+    fn fill(&self, seq: u64, chunk: ChunkOutput) {
         let idx = (seq % self.capacity) as usize;
         // Safety: seq window guarantees exclusive access to this slot index.
         self.slots[idx]
             .data
-            .with_mut(|ptr| unsafe { *ptr = Some(Filled { chunk, reservation }) });
+            .with_mut(|ptr| unsafe { *ptr = Some(chunk) });
         self.slots[idx]
             .state
             .store(SLOT_FILLED, AtomicOrdering::Release);
@@ -236,17 +226,15 @@ impl SlotBuffer {
 
             // Start a new run with the first FILLED slot
             // Safety: state is FILLED and flush holds exclusive consumer access via CAS lock.
-            let filled = self.slots[idx]
+            let first_chunk = self.slots[idx]
                 .data
                 .with_mut(|ptr| unsafe { (*ptr).take().unwrap() });
-            let file_pos = filled.chunk.offset - sink.object_range_start;
-            let mut run_end_offset = file_pos + filled.chunk.data.remaining() as u64;
+            let file_pos = first_chunk.offset - sink.object_range_start;
+            let mut run_end_offset = file_pos + first_chunk.data.remaining() as u64;
             let mut combined = bytes_utils::SegmentedBuf::new();
-            for seg in filled.chunk.data.0.into_inner() {
+            for seg in first_chunk.data.0.into_inner() {
                 combined.push(seg);
             }
-            // Reservation drops here (filled consumed), releasing budget for this chunk.
-            drop(filled.reservation);
             self.slots[idx]
                 .state
                 .store(SLOT_FLUSHED, AtomicOrdering::Release);
@@ -259,24 +247,22 @@ impl SlotBuffer {
                     break;
                 }
                 // Safety: state is FILLED and flush holds exclusive consumer access via CAS lock.
-                let filled = self.slots[jdx]
+                let chunk = self.slots[jdx]
                     .data
                     .with_mut(|ptr| unsafe { (*ptr).take().unwrap() });
-                let chunk_file_pos = filled.chunk.offset - sink.object_range_start;
+                let chunk_file_pos = chunk.offset - sink.object_range_start;
                 if chunk_file_pos != run_end_offset {
                     // Not file-contiguous — put it back for the next iteration
                     // Safety: same CAS lock exclusion; no other thread accesses this slot.
                     self.slots[jdx]
                         .data
-                        .with_mut(|ptr| unsafe { *ptr = Some(filled) });
+                        .with_mut(|ptr| unsafe { *ptr = Some(chunk) });
                     break;
                 }
-                run_end_offset += filled.chunk.data.remaining() as u64;
-                for seg in filled.chunk.data.0.into_inner() {
+                run_end_offset += chunk.data.remaining() as u64;
+                for seg in chunk.data.0.into_inner() {
                     combined.push(seg);
                 }
-                // Reservation drops here (filled consumed), releasing budget.
-                drop(filled.reservation);
                 self.slots[jdx]
                     .state
                     .store(SLOT_FLUSHED, AtomicOrdering::Release);
@@ -323,16 +309,14 @@ impl SlotBuffer {
             return None;
         }
         // Safety: state is FILLED and only one consumer calls this.
-        let filled = self.slots[idx]
+        let chunk = self.slots[idx]
             .data
             .with_mut(|ptr| unsafe { (*ptr).take() });
         self.slots[idx]
             .state
             .store(SLOT_EMPTY, AtomicOrdering::Release);
         self.consumed.fetch_add(1, AtomicOrdering::Release);
-        // Reservation (if any) drops here when `filled` is destructured,
-        // releasing the budget as the chunk leaves the ring.
-        filled.map(|f| f.chunk)
+        chunk
     }
 }
 
@@ -359,21 +343,10 @@ pub(crate) struct BodyWriter {
 /// consumed by [`fill`](Self::fill). Cannot be constructed outside this module,
 /// preventing writes to unclaimed slots. Consuming `self` on fill prevents
 /// double-writes.
+#[derive(Debug)]
 pub(crate) struct BodySlot {
     seq: u64,
     buffer: Arc<SlotBuffer>,
-    /// Memory budget reservation held from claim until fill, then moved into
-    /// the slot's `Filled` storage. Drops when the chunk leaves the ring.
-    reservation: Option<Reservation>,
-}
-
-impl std::fmt::Debug for BodySlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BodySlot")
-            .field("seq", &self.seq)
-            .field("has_reservation", &self.reservation.is_some())
-            .finish_non_exhaustive()
-    }
 }
 
 impl BodySlot {
@@ -382,17 +355,9 @@ impl BodySlot {
         self.seq
     }
 
-    /// Attach a memory budget reservation to this slot. The reservation will
-    /// move into ring storage on fill and drop when the chunk is consumed or
-    /// flushed.
-    pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
-        self.reservation = Some(reservation);
-    }
-
     /// Write a completed chunk into this slot, consuming the claim.
-    pub(crate) fn fill(mut self, chunk: ChunkOutput) {
-        let reservation = self.reservation.take();
-        self.buffer.fill(self.seq, chunk, reservation);
+    pub(crate) fn fill(self, chunk: ChunkOutput) {
+        self.buffer.fill(self.seq, chunk);
     }
 }
 
@@ -432,7 +397,6 @@ impl BodyWriter {
                 return Some(BodySlot {
                     seq: claimed,
                     buffer: self.buffer.clone(),
-                    reservation: None,
                 });
             }
         }
@@ -1225,112 +1189,6 @@ mod tests {
                 "mismatch at seq {seq}"
             );
         }
-    }
-
-    // --- Reservation lifecycle tests ---
-
-    use crate::runtime::memory::MemoryBudget;
-
-    #[test]
-    fn test_reservation_released_on_consume() {
-        let chunk_bytes = 1024;
-        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
-        let (writer, consumer) = new_slot_body(4);
-
-        let mut slot = writer.try_claim().unwrap();
-        let reservation = budget
-            .try_reserve(chunk_bytes)
-            .expect("budget has capacity");
-        assert_eq!(budget.in_use_chunks(), 1);
-
-        slot.attach_reservation(reservation);
-        let mut seg = SegmentedBuf::new();
-        seg.push(Bytes::from("hello"));
-        slot.fill(chunk_resp(0, AggregatedBytes(seg)));
-
-        // Reservation still held while chunk is in the ring
-        assert_eq!(budget.in_use_chunks(), 1);
-
-        // Consume via streaming path
-        let chunk = consumer.try_take_next().unwrap();
-        assert_eq!(chunk.seq, 0);
-        assert_eq!(chunk.data.to_vec(), b"hello");
-
-        // Reservation released when chunk left the ring
-        assert_eq!(budget.in_use_chunks(), 0);
-    }
-
-    #[test]
-    fn test_reservation_released_on_flush() {
-        let chunk_bytes = 1024;
-        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out");
-        let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_slot_body_with_sink(16, file, 0, false);
-
-        let mut slot = writer.try_claim().unwrap();
-        let reservation = budget
-            .try_reserve(chunk_bytes)
-            .expect("budget has capacity");
-        assert_eq!(budget.in_use_chunks(), 1);
-
-        slot.attach_reservation(reservation);
-        slot.fill(chunk_at(0, 0, b"flushed"));
-
-        // Reservation still held before flush
-        assert_eq!(budget.in_use_chunks(), 1);
-
-        // Finalize flushes all filled slots to disk
-        writer.finalize().unwrap();
-
-        // Reservation released after flush
-        assert_eq!(budget.in_use_chunks(), 0);
-
-        // Data actually written
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[..7], b"flushed");
-    }
-
-    #[test]
-    fn test_reservation_released_on_slot_drop_without_fill() {
-        // The abort path: a slot is claimed and its memory reserved, but the GET
-        // fails before the slot is filled. Dropping the slot must release the
-        // reservation rather than leaking the chunk.
-        let chunk_bytes = 1024;
-        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
-        let (writer, _consumer) = new_slot_body(4);
-
-        let mut slot = writer.try_claim().unwrap();
-        let reservation = budget
-            .try_reserve(chunk_bytes)
-            .expect("budget has capacity");
-        slot.attach_reservation(reservation);
-        assert_eq!(budget.in_use_chunks(), 1);
-
-        // Drop the claimed-but-never-filled slot.
-        drop(slot);
-        assert_eq!(
-            budget.in_use_chunks(),
-            0,
-            "dropping an unfilled slot releases its reservation"
-        );
-    }
-
-    #[test]
-    fn test_no_reservation_is_harmless() {
-        let (writer, consumer) = new_slot_body(4);
-
-        // Fill without any reservation (the default path)
-        let slot = writer.try_claim().unwrap();
-        let mut seg = SegmentedBuf::new();
-        seg.push(Bytes::from("no-budget"));
-        slot.fill(chunk_resp(0, AggregatedBytes(seg)));
-
-        let chunk = consumer.try_take_next().unwrap();
-        assert_eq!(chunk.seq, 0);
-        assert_eq!(chunk.data.to_vec(), b"no-budget");
     }
 }
 
