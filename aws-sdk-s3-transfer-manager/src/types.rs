@@ -19,6 +19,29 @@ pub enum PartSize {
     Target(u64),
 }
 
+/// Point-in-time view of the global memory budget's admission state.
+///
+/// Returned by [`Client::memory_budget`](crate::Client::memory_budget). Reports
+/// what the budget has admitted against its resolved ceiling and whether
+/// transfers are parked waiting on it. `reserved_bytes` is an upper bound — it
+/// counts reserved chunks, not bytes actually resident; per-transfer resident
+/// memory is reported separately.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryBudgetSnapshot {
+    /// The resolved ceiling in bytes (what [`MemoryBudgetConfig`] produced on this
+    /// machine).
+    pub capacity_bytes: u64,
+    /// Bytes currently reserved. Admission level, not resident memory.
+    pub reserved_bytes: u64,
+    /// Requests parked waiting for a grant right now. Zero means the budget is not
+    /// currently binding.
+    pub waiters: usize,
+    /// Cumulative count of requests that ever parked. Distinguishes a budget that
+    /// has bound at least once from one that never has.
+    pub total_parked: u64,
+}
+
 /// The concurrency mode the client should use for executing requests.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
