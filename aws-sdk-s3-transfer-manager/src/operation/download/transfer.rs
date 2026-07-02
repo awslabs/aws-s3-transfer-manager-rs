@@ -17,12 +17,12 @@ use super::input::copy_fields_to_get_object_request;
 use crate::error::{self, ChunkRef, Error};
 use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
-use crate::operation::download::read_ahead::ReadAhead;
-use crate::operation::download::recv_buffer::FillOutcome;
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
+use crate::operation::download::read_ahead::ReadAhead;
+use crate::operation::download::recv_buffer::FillOutcome;
 use crate::operation::download::DownloadInput;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
@@ -91,10 +91,8 @@ impl DownloadTransfer {
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
-        let window = super::read_ahead::resolve_window(
-            input.read_ahead(),
-            ctx.handle.config.read_ahead(),
-        );
+        let window =
+            super::read_ahead::resolve_window(input.read_ahead(), ctx.handle.config.read_ahead());
         let read_ahead = ReadAhead::with_window(window);
         // Couple the disk drain batch to the initial window, so a window below the
         // segment size drains in smaller runs from the first part.
@@ -1184,7 +1182,10 @@ mod tests {
         assert_pending(transfer.poll_work());
 
         // Consume seq 0 (filled by discovery) — consumed advances 0 → 1, freeing a slot.
-        assert!(consumer.try_take_next().is_some(), "discovery chunk should deliver");
+        assert!(
+            consumer.try_take_next().is_some(),
+            "discovery chunk should deliver"
+        );
 
         // Gate reopens for exactly one more claim.
         assert_ready(transfer.poll_work());
@@ -1249,15 +1250,21 @@ mod tests {
         skip_discovery(&transfer).await;
 
         // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
-        transfer.io_ctl().set_read_ahead(crate::types::ReadAhead::Parts(4));
+        transfer
+            .io_ctl()
+            .set_read_ahead(crate::types::ReadAhead::Parts(4));
         assert_eq!(transfer.read_ahead().window(), 5);
 
         // Parts(0) is demand paging: a window of exactly one outstanding part.
-        transfer.io_ctl().set_read_ahead(crate::types::ReadAhead::Parts(0));
+        transfer
+            .io_ctl()
+            .set_read_ahead(crate::types::ReadAhead::Parts(0));
         assert_eq!(transfer.read_ahead().window(), 1);
 
         // Auto returns to the default fixed window.
-        transfer.io_ctl().set_read_ahead(crate::types::ReadAhead::Auto);
+        transfer
+            .io_ctl()
+            .set_read_ahead(crate::types::ReadAhead::Auto);
         assert_eq!(
             transfer.read_ahead().window(),
             super::super::read_ahead::DEFAULT_WINDOW_PARTS

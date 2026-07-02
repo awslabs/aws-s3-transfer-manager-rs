@@ -1330,12 +1330,20 @@ mod tests {
         }
         assert_eq!(
             outcomes,
-            vec![FillOutcome::Stored, FillOutcome::Stored, FillOutcome::DrainReady],
+            vec![
+                FillOutcome::Stored,
+                FillOutcome::Stored,
+                FillOutcome::DrainReady
+            ],
             "the fill that reaches the batch raises DrainReady"
         );
         let r0 = ring.take_drain_run(false).expect("batch-sized prefix run");
         assert_eq!(r0.base_seq(), 0);
-        assert_eq!(r0.payloads().len(), batch, "prefix run is exactly the batch");
+        assert_eq!(
+            r0.payloads().len(),
+            batch,
+            "prefix run is exactly the batch"
+        );
         r0.complete();
 
         // One slot of residue remains (slot 3). A non-terminal claim cannot take it —
@@ -1355,9 +1363,17 @@ mod tests {
         );
         let r1 = ring.take_drain_run(false).expect("segment-end residue run");
         assert_eq!(r1.base_seq(), batch as u64);
-        assert_eq!(r1.payloads().len(), seg_size - batch, "residue is the sub-batch tail");
+        assert_eq!(
+            r1.payloads().len(),
+            seg_size - batch,
+            "residue is the sub-batch tail"
+        );
         r1.complete();
-        assert_eq!(ring.released(), seg_size as u64, "every slot drained exactly once");
+        assert_eq!(
+            ring.released(),
+            seg_size as u64,
+            "every slot drained exactly once"
+        );
     }
 
     /// The block surface advances `released` (the read-ahead gate's denominator) by a
@@ -1379,14 +1395,26 @@ mod tests {
         ring.fill_at(&handles, 0, 0);
         ring.fill_at(&handles, 1, 10);
         ring.take_drain_run(false).expect("run [0,2)").complete();
-        assert_eq!(ring.released(), 2, "a block drain advances released by the run length");
-        assert_eq!(ring.consumed(), 0, "the block surface never advances the stream cursor");
+        assert_eq!(
+            ring.released(),
+            2,
+            "a block drain advances released by the run length"
+        );
+        assert_eq!(
+            ring.consumed(),
+            0,
+            "the block surface never advances the stream cursor"
+        );
 
         // Second batch of 2 arrives and drains as run [2,4).
         ring.fill_at(&handles, 2, 20);
         ring.fill_at(&handles, 3, 30);
         ring.take_drain_run(false).expect("run [2,4)").complete();
-        assert_eq!(ring.released(), 4, "released tracks total drained across runs");
+        assert_eq!(
+            ring.released(),
+            4,
+            "released tracks total drained across runs"
+        );
         assert_eq!(ring.consumed(), 0, "consumed stays put on the block path");
     }
 
@@ -1995,7 +2023,11 @@ mod loom_tests {
             // the two reclaim paths double-popping.
             let h = ring.claim();
             ring.fill(h, 100);
-            assert_eq!(ring.front_base(), 2, "drained seg0 (base 0) reclaimed exactly once");
+            assert_eq!(
+                ring.front_base(),
+                2,
+                "drained seg0 (base 0) reclaimed exactly once"
+            );
         });
     }
 
@@ -2115,7 +2147,11 @@ mod loom_tests {
             // `drained_count` and reclaim freed the right segment without double-pop.
             let h = ring.claim();
             ring.fill(h, 100);
-            assert_eq!(ring.front_base(), 2, "drop-drained seg0 (base 0) reclaimed exactly once");
+            assert_eq!(
+                ring.front_base(),
+                2,
+                "drop-drained seg0 (base 0) reclaimed exactly once"
+            );
         });
     }
 
@@ -2158,7 +2194,11 @@ mod loom_tests {
             while let Some(v) = consumer.poll_next() {
                 got.push(v);
             }
-            assert_eq!(got, vec![0, 1, 2, 3], "in-order, exactly once, across the hop");
+            assert_eq!(
+                got,
+                vec![0, 1, 2, 3],
+                "in-order, exactly once, across the hop"
+            );
         });
     }
 

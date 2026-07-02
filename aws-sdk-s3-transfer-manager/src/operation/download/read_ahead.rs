@@ -177,7 +177,11 @@ mod tests {
         // Auto -> the fixed default.
         assert_eq!(window_parts_for(&Knob::Auto), DEFAULT_WINDOW_PARTS);
         // Parts(n) -> n + 1: n speculative parts plus the always-admitted demand part.
-        assert_eq!(window_parts_for(&Knob::Parts(0)), 1, "Parts(0) is demand paging");
+        assert_eq!(
+            window_parts_for(&Knob::Parts(0)),
+            1,
+            "Parts(0) is demand paging"
+        );
         assert_eq!(window_parts_for(&Knob::Parts(1)), 2);
         assert_eq!(window_parts_for(&Knob::Parts(255)), 256);
         // The + 1 saturates rather than overflowing at the top of the range.

@@ -633,8 +633,8 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, SinkWrite,
-        RecvBodyConsumer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        RecvBodyConsumer, SinkWrite,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
@@ -938,7 +938,9 @@ mod tests {
 
         // Deterministic per-part bytes, so the assembled object is checkable.
         let part_bytes = |seq: usize| -> Vec<u8> {
-            (0..part_len).map(|b| (seq as u8).wrapping_add(b as u8)).collect()
+            (0..part_len)
+                .map(|b| (seq as u8).wrapping_add(b as u8))
+                .collect()
         };
         let mut expected = Vec::with_capacity(parts * part_len);
         for seq in 0..parts {
@@ -962,14 +964,7 @@ mod tests {
         let writer = Arc::new(writer);
         let n_threads = 4;
         let chunks: Vec<Vec<usize>> = (0..n_threads)
-            .map(|t| {
-                order
-                    .iter()
-                    .copied()
-                    .skip(t)
-                    .step_by(n_threads)
-                    .collect()
-            })
+            .map(|t| order.iter().copied().skip(t).step_by(n_threads).collect())
             .collect();
 
         std::thread::scope(|scope| {

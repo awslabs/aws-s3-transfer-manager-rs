@@ -669,4 +669,3 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
     assert_eq!(written, content, "data integrity check failed");
     server_handle.shutdown().await.expect("shutdown");
 }
-

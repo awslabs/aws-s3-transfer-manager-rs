@@ -144,11 +144,8 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_recv_body_with_sink(
-            file,
-            object_range_start,
-            owns_file,
-        );
+        let (writer, _consumer) =
+            body::new_recv_body_with_sink(file, object_range_start, owns_file);
 
         let (ctx, completion_rx) = match parent_id {
             Some(pid) => TransferContext::new_child(handle.clone(), pid),
