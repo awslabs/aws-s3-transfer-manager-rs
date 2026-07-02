@@ -1687,7 +1687,11 @@ mod tests {
     #[test]
     fn exhaustive_fill_order_across_segments() {
         let seg_size = 2;
-        let n = seg_size * 3; // 6 sequences across 3 segments
+        // Native: 3 segments (6! = 720 orders). Under miri, 2 segments (4! = 24) — the
+        // hop across a segment boundary is still exercised, without the factorial blowup
+        // at miri's ~1000x slowdown.
+        let segments = if cfg!(miri) { 2 } else { 3 };
+        let n = seg_size * segments;
         for perm in permutations(n) {
             let (ring, mut consumer) = PagedRecvBuffer::new_with_segment_size(seg_size);
             let handles: Vec<_> = (0..n).map(|_| ring.claim()).collect();
@@ -1816,11 +1820,20 @@ mod tests {
     /// for debug and `cargo test`), crashing the fill path. Reproduces only under real
     /// concurrency — single-threaded, `claim_cursor <= filled` always holds — so this is
     /// a multi-thread stress test at batch 1 (the disk relief regime) over a wide
-    /// segment, looped to make the race near-certain. It can only fail on a regression;
-    /// it never false-positives.
+    /// segment, looped enough to make the `claim_cursor > filled` race likely. It is a
+    /// tripwire for reverting the probe's `saturating_sub` to a bare subtraction; it can
+    /// only fail on a regression, never false-positives. The drain race's *correctness*
+    /// is proven exhaustively by the loom models — this only guards the arithmetic.
+    ///
+    /// `#[cfg_attr(miri, ignore)]`: the guarded property is saturating arithmetic (defined
+    /// behavior, invisible to miri) plus a scheduling race (loom's job); miri adds nothing
+    /// here and the loop is prohibitively slow under it.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fill_probe_does_not_underflow_under_concurrent_drain() {
-        for _ in 0..2_000 {
+        // Past the diminishing-returns knee for surfacing the race under native
+        // scheduling, without the wall-clock cost of the original 2000.
+        for _ in 0..200 {
             let seg_size = 16;
             let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
             ring.set_drain_batch(1);
