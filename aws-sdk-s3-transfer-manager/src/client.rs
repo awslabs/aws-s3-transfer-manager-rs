@@ -15,6 +15,9 @@ use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::runtime::memory::DEFAULT_MEMORY_BUDGET_BYTES;
+use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -23,7 +26,9 @@ pub struct Client {
     pub(crate) handle: Arc<Handle>,
 }
 
-/// Whatever is needed to carry out operations, e.g. scheduler, budgets, config, env details, etc
+/// Shared state backing every transfer operation: configuration, the S3 client,
+/// the scheduler, the execution runtime, the concurrency controller, telemetry,
+/// and the memory budget.
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
@@ -32,6 +37,7 @@ pub(crate) struct Handle {
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
+    pub(crate) memory_budget: Arc<MemoryBudget>,
 }
 
 impl Handle {
@@ -88,6 +94,7 @@ impl Handle {
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
+                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         })
     }
@@ -146,6 +153,7 @@ impl Handle {
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
+                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         })
     }
@@ -184,6 +192,9 @@ impl Client {
         #[cfg(feature = "dial9")]
         let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
 
+        // Resolve the budget once: it sizes the Handle's MemoryBudget.
+        let budget_capacity = config.memory_budget().resolve();
+
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = {
@@ -216,6 +227,7 @@ impl Client {
                 runtime,
                 controller,
                 telemetry,
+                memory_budget: MemoryBudget::new(budget_capacity, BUDGET_CHUNK_BYTES),
             }
         });
         Client { handle }
@@ -224,6 +236,13 @@ impl Client {
     /// Returns the client's configuration
     pub fn config(&self) -> &Config {
         &self.handle.config
+    }
+
+    /// Snapshot the global memory budget's resolved ceiling and current admission
+    /// state. For the configured intent (before resolution), see
+    /// [`config().memory_budget()`](Config::memory_budget).
+    pub fn memory_budget(&self) -> crate::types::MemoryBudgetSnapshot {
+        self.handle.memory_budget.stats()
     }
 
     /// Upload a single object from S3.
