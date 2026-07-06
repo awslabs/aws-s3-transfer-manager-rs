@@ -42,7 +42,8 @@ pub(crate) enum DownloadWork {
 macro_rules! bail_if_terminal {
     ($self:expr) => {
         if !$self.inner.ctx.is_active() {
-            $self.decrement_in_flight();
+            // Bailing before any drain: no occupancy freed on this path.
+            $self.decrement_in_flight(0);
             return WorkOutcome::Cancelled;
         }
     };
@@ -151,6 +152,33 @@ impl DownloadTransfer {
         self.inner.writer.sync_drain_batch(window);
     }
 
+    /// Release one part of read-ahead occupancy for a stream delivery, then wake the
+    /// issuer.
+    ///
+    /// Called from `Body::next` after `poll_next` delivers a chunk (which frees exactly
+    /// one part's payload). The release runs **under the state lock** — the same lock
+    /// `poll_work` holds while it reads the gate and arms `set_pending` — so the
+    /// mutator protocol `lock → mutate → unlock → try_wake` holds: either the gate
+    /// observes this release and returns `Ready` without parking, or it parks and the
+    /// `try_wake` below (after the lock is dropped) fires. Without the shared lock the
+    /// two are unordered and the wake can be lost (the store-buffer race).
+    ///
+    /// The wake is unconditional, mirroring the disk completion path
+    /// ([`decrement_in_flight`](Self::decrement_in_flight)): `try_wake` is a no-op
+    /// unless the issuer actually parked, so there is no need to compute whether this
+    /// release reopened the gate — waking always is correct and adds only an atomic
+    /// swap on the (cold, per-part) delivery path.
+    pub(crate) fn release_stream_occupancy(&self) {
+        {
+            let mut work = self.inner.state.lock().unwrap();
+            if let DownloadState::Transferring { gate, .. } = &mut *work {
+                gate.release(1);
+            }
+            // Terminal (or pre-transfer): no gate to release.
+        }
+        self.inner.ctx.try_wake();
+    }
+
     /// Object metadata from discovery.
     pub(crate) fn object_meta(&self) -> Option<&ObjectMetadata> {
         self.inner.object_meta.get()
@@ -217,35 +245,33 @@ impl DownloadTransfer {
                 ranges_in_flight,
                 etag,
                 part_size,
-                issued,
+                gate,
             } => {
                 if let Some(range) = remaining.as_ref() {
-                    // Apply the read-ahead gate before issuing. `issued - released` is
-                    // the count of parts claimed but not yet freed by the consumer;
-                    // issuance waits while it is at or above the window. `released`
-                    // counts both delivery surfaces (stream pull and disk drain), so a
-                    // disk download paces to its drain rate rather than to the in-order
-                    // delivery cursor.
+                    // Apply the read-ahead gate before issuing. The gate bounds resident
+                    // occupancy at `issued - released < window`, where `released` counts
+                    // both delivery surfaces (stream pull and disk drain), so a disk
+                    // download paces to its drain rate rather than to the in-order
+                    // delivery cursor. `try_issue` reads and mutates the gate under this
+                    // state lock; the consumer's `release` does the same, so the two are
+                    // ordered and a release that reopens the gate cannot be lost against
+                    // the `set_pending` below (the mutator protocol).
                     //
                     // The gate guards issuance only. Once every range is generated
                     // (`remaining` is None) the completion path below runs unconditionally,
                     // so a transfer whose last parts are still resident (e.g. a disk tail
                     // below the drain batch, freed only by the terminal drain in
                     // `complete`) does not block on the gate with nothing left to issue.
-                    let released = self.inner.writer.released();
                     let window = self.inner.read_ahead.window();
-                    if *issued - released >= window {
+                    if !gate.try_issue(window) {
                         // Gate closed: issuance is `window` parts ahead of what the
                         // consumer has freed and waits for a drain before claiming more.
-                        // A stuck transfer holds `released` frozen at
-                        // `issued - released == window` here every poll; a healthy one
-                        // shows the fields advancing in step. Trace: fires every gated
-                        // poll in steady state.
+                        // Trace: fires every gated poll in steady state.
                         tracing::trace!(
                             target: crate::telemetry::TARGET_TRANSFER,
-                            issued = *issued,
-                            released,
-                            in_flight = *issued - released,
+                            issued = gate.issued(),
+                            released = gate.released(),
+                            in_flight = gate.resident(),
                             window,
                             "read-ahead gate closed: issuance paused until the consumer drains",
                         );
@@ -264,7 +290,6 @@ impl DownloadTransfer {
                     let chunk_range = start..=chunk_end;
 
                     let slot = self.inner.writer.claim();
-                    *issued += 1;
                     *ranges_in_flight += 1;
 
                     if chunk_end < end {
@@ -276,7 +301,7 @@ impl DownloadTransfer {
                         *remaining = None;
                         tracing::debug!(
                             target: crate::telemetry::TARGET_TRANSFER,
-                            issued = *issued,
+                            issued = gate.issued(),
                             ranges_in_flight = *ranges_in_flight,
                             "all ranges issued; draining in-flight tail",
                         );
@@ -399,7 +424,7 @@ impl DownloadTransfer {
                 ranges_in_flight: initial as usize,
                 etag: etag.clone(),
                 part_size: effective_part_size,
-                issued: initial,
+                gate: super::context::OccupancyGate::with_issued(initial),
             };
         }
 
@@ -498,12 +523,17 @@ impl DownloadTransfer {
         };
 
         // Edge-triggered disk write: a fill that brings the segment's filled count to
-        // the drain batch attempts a drain of the batch-ready run(s).
+        // the drain batch attempts a drain of the batch-ready run(s). `freed` is the
+        // occupancy this drain released, accounted under the lock in decrement_in_flight.
+        let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            if let Err(e) = self.inner.writer.drain(false) {
-                // Go terminal before any wake (see fail_range).
-                let guard = self.inner.state.lock().unwrap();
-                return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            match self.inner.writer.drain(false) {
+                Ok(f) => freed = f,
+                Err(e) => {
+                    // Go terminal before any wake (see fail_range).
+                    let guard = self.inner.state.lock().unwrap();
+                    return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+                }
             }
         }
 
@@ -520,7 +550,7 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        self.decrement_in_flight();
+        self.decrement_in_flight(freed);
 
         WorkOutcome::Success { data: None }
     }
@@ -614,11 +644,17 @@ impl DownloadTransfer {
         // Edge-triggered disk write: a fill that brings the segment's filled count to
         // the drain batch attempts a drain of the batch-ready run(s) — one positioned
         // write per coalesced run, not every fill. Stream mode's drain is a no-op.
+        // `freed` is the occupancy this drain released, accounted under the lock in
+        // decrement_in_flight.
+        let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            if let Err(e) = self.inner.writer.drain(false) {
-                // Go terminal before any wake (see fail_range).
-                let guard = self.inner.state.lock().unwrap();
-                return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            match self.inner.writer.drain(false) {
+                Ok(f) => freed = f,
+                Err(e) => {
+                    // Go terminal before any wake (see fail_range).
+                    let guard = self.inner.state.lock().unwrap();
+                    return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+                }
             }
         }
 
@@ -635,7 +671,7 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        self.decrement_in_flight();
+        self.decrement_in_flight(freed);
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -656,14 +692,26 @@ impl DownloadTransfer {
         self.fail(guard, e.with_chunk(location))
     }
 
-    fn decrement_in_flight(&self) {
+    /// Complete one in-flight range: drop `ranges_in_flight` and release the
+    /// `freed` parts of read-ahead occupancy this completion drained, both under
+    /// the state lock, then wake the issuer.
+    ///
+    /// Releasing the occupancy here — under the same lock `poll_work` reads the gate
+    /// and arms `set_pending` under — is what orders this completion's release against
+    /// the issuer's park (the mutator protocol `lock → mutate → unlock → try_wake`).
+    /// `freed` is the disk drain's freed count (0 if this fill did not hit a drain
+    /// edge; the run drains on a later fill).
+    fn decrement_in_flight(&self, freed: u64) {
         {
             let mut work = self.inner.state.lock().unwrap();
             if let DownloadState::Transferring {
-                ranges_in_flight, ..
+                ranges_in_flight,
+                gate,
+                ..
             } = &mut *work
             {
                 *ranges_in_flight = ranges_in_flight.saturating_sub(1);
+                gate.release(freed);
             }
         }
         // Wake the issuer on every completion. A completed range has freed its
@@ -1169,8 +1217,10 @@ mod tests {
         assert_eq!(issued, w, "issuance should fill the window then stall");
     }
 
-    /// On the stream path, delivering a chunk advances `released`, so `issued −
-    /// released` drops below the window and the gate admits another claim.
+    /// On the stream path, delivering a chunk frees one part; the download layer
+    /// releases that occupancy under the state lock (as `Body::next` does via
+    /// `release_stream_occupancy`), so `issued − released` drops below the window and
+    /// the gate admits another claim.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_consume_reopens_gate() {
@@ -1181,11 +1231,14 @@ mod tests {
         while let PollWork::Ready(_item) = transfer.poll_work() {}
         assert_pending(transfer.poll_work());
 
-        // Consume seq 0 (filled by discovery) — consumed advances 0 → 1, freeing a slot.
+        // Consume seq 0 (filled by discovery) — the buffer delivers the chunk, then the
+        // download layer releases one part of occupancy under the state lock. This is
+        // exactly what `Body::next` does; the test drives the two steps directly.
         assert!(
             consumer.try_take_next().is_some(),
             "discovery chunk should deliver"
         );
+        transfer.release_stream_occupancy();
 
         // Gate reopens for exactly one more claim.
         assert_ready(transfer.poll_work());

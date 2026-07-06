@@ -175,16 +175,15 @@ impl BodyWriter {
         }
     }
 
-    /// Parts whose memory the consumer has freed (stream delivery or disk drain) —
-    /// the read-ahead gate's denominator. See [`PagedRecvBuffer::released`].
-    pub(crate) fn released(&self) -> u64 {
-        self.buffer.released()
-    }
-
     /// Disk mode: drain every batch-ready run to disk. Called on the `DrainReady`
     /// edge from execute tasks. A non-terminal drain claims only runs that reach the
     /// drain batch, coalescing each into one positioned write. Stream mode: no-op.
-    pub(crate) fn drain(&self, terminal: bool) -> Result<(), std::io::Error> {
+    ///
+    /// Returns the number of parts freed across the runs drained by this call — the
+    /// read-ahead occupancy the caller releases. The buffer does not track a running
+    /// total; the download layer accounts for the freed count under its state lock.
+    pub(crate) fn drain(&self, terminal: bool) -> Result<u64, std::io::Error> {
+        let mut freed = 0u64;
         if let Mode::Disk {
             sink,
             object_range_start,
@@ -192,31 +191,27 @@ impl BodyWriter {
         {
             while let Some(sw) = self.buffer.take_drain_run(terminal) {
                 write_run(sink.as_ref(), *object_range_start, &sw)?;
-                sw.complete();
+                freed += sw.complete();
             }
         }
-        Ok(())
+        Ok(freed)
     }
 
     /// Terminal drain: flush every remaining filled run, including a partial final
     /// segment below the drain batch. Called once from `complete()` / `on_terminal()`.
-    pub(crate) fn finalize(&self) -> Result<(), std::io::Error> {
+    /// Returns the parts freed by this terminal pass (the tail left resident below the
+    /// drain batch) so the caller can release the last of the read-ahead occupancy.
+    pub(crate) fn finalize(&self) -> Result<u64, std::io::Error> {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
-            return Ok(());
+            return Ok(0);
         }
-        // Report the terminal flush: how many parts this last pass wrote (those left
-        // resident below the drain batch) and the total drained over the transfer.
-        // Logged once per disk transfer.
-        let before = self.released();
-        self.drain(true)?;
-        let total = self.released();
+        let terminal_parts = self.drain(true)?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            terminal_parts = total - before,
-            parts_total = total,
+            terminal_parts,
             "terminal drain complete; tail flushed to disk",
         );
-        Ok(())
+        Ok(terminal_parts)
     }
 
     /// Couple the drain batch to the read-ahead window: a window narrower than a
@@ -440,15 +435,16 @@ impl Body {
             // Register interest BEFORE checking state (lost-wake safety).
             let notified = self.notify.notified();
             if let Some(chunk) = self.consumer.poll_next() {
-                // Delivery advances `consumed`, freeing read-ahead occupancy; wake
-                // the issuer so the reopened window admits more work.
-                self.transfer.ctx().try_wake();
+                // Delivery freed one part's payload. Release that read-ahead occupancy
+                // and wake the issuer under the state lock, so the release is ordered
+                // against the gate's park (see `release_stream_occupancy`).
+                self.transfer.release_stream_occupancy();
                 return Some(Ok(chunk));
             }
             if !self.transfer.ctx().is_active() {
                 // Terminal: drain then report.
                 if let Some(chunk) = self.consumer.poll_next() {
-                    self.transfer.ctx().try_wake();
+                    self.transfer.release_stream_occupancy();
                     return Some(Ok(chunk));
                 }
                 return self.terminal_result();
@@ -875,15 +871,15 @@ mod tests {
         }
     }
 
-    /// Draining runs on the disk path must release read-ahead occupancy.
+    /// Draining runs on the disk path must report freed parts to release read-ahead
+    /// occupancy.
     ///
-    /// The issuance gate bounds `issued - released()`. On the stream path `released`
-    /// advances as the consumer pulls; on the disk path the consumer is `drain`, which
-    /// writes and frees runs. If draining does not move the gate's occupancy, a
-    /// download larger than the read-ahead window wedges: the gate latches shut at the
-    /// window and never reopens even though the buffer has drained to empty. This
-    /// drives that path directly — no network, no large object — and asserts occupancy
-    /// falls as runs drain.
+    /// The issuance gate bounds `issued - released`, where `released` is the sum of the
+    /// freed counts `drain` reports. On the disk path the consumer is `drain`, which
+    /// writes and frees runs. If draining does not report freed parts, a download larger
+    /// than the read-ahead window wedges: the gate latches shut at the window and never
+    /// reopens even though the buffer has drained to empty. This drives that path
+    /// directly — no network, no large object — and asserts every part is reported freed.
     #[test]
     fn disk_drain_releases_read_ahead_occupancy() {
         use super::SEG_SIZE;
@@ -895,24 +891,26 @@ mod tests {
         // Fill two full segments, draining on the DrainReady edge after each fill — the
         // disk path's steady-state loop. Bounded iteration, so a regression fails fast.
         let total = (2 * SEG_SIZE) as u64;
+        let mut freed_total = 0u64;
         for i in 0..total {
             let slot = writer.claim();
             let outcome = slot.fill(chunk_at(i, i * 100, format!("d{i}").as_bytes()));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
-                writer.drain(false).unwrap();
+                freed_total += writer.drain(false).unwrap();
             }
         }
+        // A terminal drain flushes any sub-batch tail so the total accounts for every part.
+        freed_total += writer.finalize().unwrap();
 
-        // The gate measures resident occupancy as `issued - released()`. Every part
-        // has been written to disk and its memory freed, so occupancy must be 0 —
-        // otherwise the gate would still count drained parts against the window.
-        let released = writer.released();
-        let occupancy = total - released;
+        // Resident occupancy is `issued - released` = total - freed_total. Every part has
+        // been written to disk and its memory freed, so it must be 0 — otherwise the gate
+        // would still count drained parts against the window.
+        let occupancy = total - freed_total;
         assert_eq!(
             occupancy, 0,
-            "all {total} parts drained to disk, but the gate still counts {occupancy} \
-             as resident (released={released}); issuance cannot reopen past the window"
+            "all {total} parts drained to disk, but the drains reported only \
+             {freed_total} freed; issuance cannot reopen past the window"
         );
     }
 
@@ -962,6 +960,9 @@ mod tests {
             slots.into_iter().map(|s| (s.seq() as usize, s)).collect();
 
         let writer = Arc::new(writer);
+        // Sum every drain's freed count across threads, the way the download layer
+        // accumulates `released` under its state lock.
+        let freed_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let n_threads = 4;
         let chunks: Vec<Vec<usize>> = (0..n_threads)
             .map(|t| order.iter().copied().skip(t).step_by(n_threads).collect())
@@ -975,13 +976,15 @@ mod tests {
                     my_slots.push((seq, by_seq.remove(&seq).expect("slot for seq")));
                 }
                 let writer = writer.clone();
+                let freed_total = freed_total.clone();
                 scope.spawn(move || {
                     for (seq, slot) in my_slots {
                         let offset = range_start + (seq as u64) * (part_len as u64);
                         let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
                         // Mirror execute_get_range: drain on the batch edge.
                         if outcome == super::FillOutcome::DrainReady {
-                            writer.drain(false).unwrap();
+                            let freed = writer.drain(false).unwrap();
+                            freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 });
@@ -990,10 +993,17 @@ mod tests {
         assert!(by_seq.is_empty(), "every slot dispatched to a thread");
 
         // Terminal drain flushes the partial final segment and any straggler runs.
-        writer.finalize().unwrap();
+        freed_total.fetch_add(
+            writer.finalize().unwrap(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Every part written and freed.
-        assert_eq!(writer.released(), parts as u64, "all parts drained");
+        assert_eq!(
+            freed_total.load(std::sync::atomic::Ordering::Relaxed),
+            parts as u64,
+            "all parts drained"
+        );
         // The positioned writes reassemble the object exactly.
         assert_eq!(
             sink.assembled(),

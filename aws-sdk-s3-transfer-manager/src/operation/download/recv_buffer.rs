@@ -349,14 +349,6 @@ struct Inner<T> {
     /// In-order delivery cursor. Written only by the consumer, read by the issuer
     /// for reclaim, so it is atomic and padded off the lock's cache line.
     consumed: CachePadded<AtomicU64>,
-    /// Count of parts whose payload memory the consumer has freed, across both
-    /// surfaces: the stream surface frees one per in-order delivery, the block surface
-    /// frees a run's slots per drain (out of order; a segment may be several runs).
-    /// This is resident occupancy's complement — `issued - released` is the read-ahead
-    /// gate's denominator. Distinct from `consumed`, which is the in-order cursor
-    /// reclaim needs; on the stream path the two advance together, on the block path
-    /// only `released` moves.
-    released: CachePadded<AtomicU64>,
     /// Slots per segment for this instance. Fixed at construction; used to size
     /// the initial segment and every grown successor.
     seg_size: usize,
@@ -485,20 +477,27 @@ impl<T> SegmentWrite<T> {
     }
 
     /// Free the run's payloads, advance the segment's `drained_count`, and reclaim
-    /// drained front segments. Idempotent and shared by [`complete`](Self::complete)
-    /// and `Drop`, guarded on the token's `drained` flag so it runs exactly once per
-    /// token.
+    /// drained front segments. Returns the number of payloads freed **by this call**
+    /// (zero on a repeat, since the drain runs at most once per token). Idempotent and
+    /// shared by [`complete`](Self::complete) and `Drop`, guarded on the token's
+    /// `drained` flag.
+    ///
+    /// The freed count is the caller's read-ahead occupancy release: a claimed run is
+    /// entirely filled (`take_drain_run` scans only filled slots), so it equals the run
+    /// length, but counting the payloads actually taken keeps occupancy exact
+    /// regardless. The buffer does not track a running `released` total — it reports the
+    /// per-run count and lets the download layer account for it under its state lock.
     ///
     /// Dropping the payloads here — rather than at segment pop — releases the budget
     /// the bytes hold **eagerly and per-run**, decoupled from the in-order front-pop.
     /// A run written out of order (e.g. a later segment completed while an earlier one
     /// still writes) frees its memory immediately even though its shelf waits its turn
     /// at the front.
-    fn drain(&self) {
-        // Idempotency guard: complete() then drop, or a double drain, is a no-op the
+    fn drain(&self) -> u64 {
+        // Idempotency guard: complete() then drop, or a double drain, frees nothing the
         // second time. AcqRel so the freeing below happens once.
         if self.drained.swap(true, Ordering::AcqRel) {
-            return;
+            return 0;
         }
         let mut freed = 0u64;
         for slot in self.payloads() {
@@ -514,32 +513,33 @@ impl<T> SegmentWrite<T> {
                 }
             });
         }
-        // Release the read-ahead occupancy these parts held. A claimed run is entirely
-        // filled (`take_drain_run` scans only filled slots), so `freed == len`; counting
-        // the payloads actually taken keeps the occupancy exact regardless.
-        self.inner.released.fetch_add(freed, Ordering::AcqRel);
         // Publish this run as drained. `AcqRel` so a reclaimer that reads `== len`
         // (`Acquire`) has seen the payload frees above. Adds `len`, not the freed
         // count, because reclaim gates on every claimed slot being accounted for.
         self.seg.drained_count.fetch_add(self.len, Ordering::AcqRel);
         reclaim_front(&self.inner);
+        freed
     }
 
     /// Finish consuming the run: free its payloads now, advance `drained_count`, and
-    /// reclaim drained front segments. Equivalent to dropping the token, but explicit
-    /// at the call site.
-    pub(crate) fn complete(self) {
-        self.drain();
-        // `self` drops here; Drop sees the guard set and the drain is a no-op.
+    /// reclaim drained front segments. Returns the parts freed (the run length) so the
+    /// caller can release that much read-ahead occupancy. Equivalent to dropping the
+    /// token, but explicit at the call site and it hands back the freed count.
+    pub(crate) fn complete(self) -> u64 {
+        // `drain` runs the payload free + reclaim; `self` then drops here and its Drop
+        // sees the `drained` guard set, so the drop-time drain is a no-op.
+        self.drain()
     }
 }
 
 impl<T> Drop for SegmentWrite<T> {
     /// Safety net: a token dropped without [`complete`](SegmentWrite::complete) —
     /// an aborted or early-returning consumer — still drains, so the run's slots are
-    /// freed and counted toward `drained_count` and cannot stall front-reclaim.
+    /// freed and counted toward `drained_count` and cannot stall front-reclaim. The
+    /// freed count is discarded: a drop-without-complete is the IO-error/abort path,
+    /// where the transfer is heading terminal and read-ahead occupancy no longer gates.
     fn drop(&mut self) {
-        self.drain();
+        let _ = self.drain();
     }
 }
 
@@ -608,7 +608,6 @@ impl<T> PagedRecvBuffer<T> {
                 issued: 0,
             }),
             consumed: CachePadded::new(AtomicU64::new(0)),
-            released: CachePadded::new(AtomicU64::new(0)),
             seg_size,
             drain_batch: AtomicUsize::new(seg_size),
         });
@@ -779,24 +778,15 @@ impl<T> PagedRecvBuffer<T> {
     /// The in-order delivery cursor: the next sequence the consumer will deliver, i.e.
     /// the count of sequences already delivered. Lock-free read of the shared cursor.
     ///
-    /// This is the in-order reclaim threshold, not the read-ahead gate's denominator
-    /// (use [`released`](Self::released) for that): the block surface delivers to disk
-    /// without advancing this cursor.
+    /// This is the in-order reclaim threshold, not the read-ahead gate's denominator:
+    /// the block surface delivers to disk without advancing this cursor. Occupancy
+    /// accounting (`released`) is the caller's concern — the buffer reports parts freed
+    /// via the return value of [`poll_next`](RecvBufferConsumer::poll_next) (one) and
+    /// [`SegmentWrite::complete`](SegmentWrite::complete) (the run length) and does not
+    /// track a running total itself.
     #[cfg(test)]
     pub(crate) fn consumed(&self) -> u64 {
         self.inner.consumed.load(Ordering::Acquire)
-    }
-
-    /// Count of parts whose payload memory the consumer has freed, across both the
-    /// stream and block surfaces. Lock-free.
-    ///
-    /// This is the read-ahead gate's denominator: the issuer bounds resident
-    /// occupancy by `issued − released < window` (the caller tracks `issued`; this
-    /// supplies `released`). Unlike [`consumed`](Self::consumed), it advances on the
-    /// block (disk) surface too, so a download larger than the window keeps issuing as
-    /// segments drain instead of latching shut at the window.
-    pub(crate) fn released(&self) -> u64 {
-        self.inner.released.load(Ordering::Acquire)
     }
 
     // ── Introspection (advisory) ─────────────────────────────────────────────────
@@ -901,10 +891,10 @@ impl<T> RecvBufferConsumer<T> {
         self.current.slots[idx].state.set_empty();
         self.cursor += 1;
         self.inner.consumed.store(self.cursor, Ordering::Release);
-        // This delivery freed one part's payload; release its read-ahead occupancy.
-        // On the stream path `released` tracks `consumed` one-to-one.
-        self.inner.released.fetch_add(1, Ordering::AcqRel);
-
+        // This delivery freed exactly one part's payload. The caller releases that
+        // one part of read-ahead occupancy (under its state lock, ordered against the
+        // issuance gate) — the buffer does not track occupancy itself. A `Some` return
+        // is therefore also the signal "one part freed".
         Some(value)
     }
 }
@@ -1368,38 +1358,33 @@ mod tests {
             seg_size - batch,
             "residue is the sub-batch tail"
         );
-        r1.complete();
+        let freed = r1.complete();
         assert_eq!(
-            ring.released(),
-            seg_size as u64,
-            "every slot drained exactly once"
+            freed,
+            (seg_size - batch) as u64,
+            "residue run frees its tail"
         );
     }
 
-    /// The block surface advances `released` (the read-ahead gate's denominator) by a
-    /// run's filled count on each drain, while `consumed` (the in-order stream cursor)
-    /// never moves — the two counters are distinct on the block path. Two batches arrive
+    /// A block drain reports its run's filled count as `freed` (the read-ahead
+    /// occupancy the caller releases), while `consumed` (the in-order stream cursor)
+    /// never moves — the two are distinct on the block path. Two batches arrive
     /// separately (a drain between them), so the segment is claimed as two runs of 2;
     /// `take_drain_run` takes the whole contiguous filled run available, so batches must
     /// be separated to observe per-run accounting.
     #[test]
-    fn block_drain_advances_released_not_consumed() {
+    fn block_drain_reports_freed_not_consumed() {
         let seg_size = 4;
         let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
         ring.set_drain_batch(2);
         let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
-        assert_eq!(ring.released(), 0);
         assert_eq!(ring.consumed(), 0);
 
         // First batch of 2 arrives and drains as run [0,2).
         ring.fill_at(&handles, 0, 0);
         ring.fill_at(&handles, 1, 10);
-        ring.take_drain_run(false).expect("run [0,2)").complete();
-        assert_eq!(
-            ring.released(),
-            2,
-            "a block drain advances released by the run length"
-        );
+        let freed = ring.take_drain_run(false).expect("run [0,2)").complete();
+        assert_eq!(freed, 2, "a block drain frees the run length");
         assert_eq!(
             ring.consumed(),
             0,
@@ -1409,16 +1394,13 @@ mod tests {
         // Second batch of 2 arrives and drains as run [2,4).
         ring.fill_at(&handles, 2, 20);
         ring.fill_at(&handles, 3, 30);
-        ring.take_drain_run(false).expect("run [2,4)").complete();
-        assert_eq!(
-            ring.released(),
-            4,
-            "released tracks total drained across runs"
-        );
+        let freed = ring.take_drain_run(false).expect("run [2,4)").complete();
+        assert_eq!(freed, 2, "the second run frees its own length");
         assert_eq!(ring.consumed(), 0, "consumed stays put on the block path");
     }
 
-    /// `consumed()` reports the in-order delivery cursor for the read-ahead gate.
+    /// `consumed()` reports the in-order delivery cursor, distinct from occupancy
+    /// accounting (which the caller derives from per-call freed counts).
     #[test]
     fn consumed_tracks_delivery_cursor() {
         let seg_size = 2;
@@ -1468,8 +1450,10 @@ mod tests {
     }
 
     /// A `SegmentWrite` dropped without `complete()` still drains: its run's payloads
-    /// are freed, `released` advances, and the run is counted toward `drained_count` so
-    /// the segment reclaims and reclaim does not stall behind it.
+    /// are freed and the run is counted toward `drained_count` so the segment reclaims
+    /// and reclaim does not stall behind it. (Occupancy accounting is the caller's
+    /// concern via `complete()`'s return value; `Drop` discards the freed count, since a
+    /// drop-without-complete is the abort/error path where the gate no longer matters.)
     #[test]
     fn drop_without_complete_reclaims() {
         use std::sync::atomic::{AtomicUsize, Ordering as O};
@@ -1494,20 +1478,19 @@ mod tests {
         }
         let sw = ring.take_drain_run(false).expect("seg0 full");
         assert_eq!(sw.base_seq(), 0);
-        assert_eq!(ring.released(), 0, "nothing released until the run drains");
+        assert_eq!(
+            drops.load(O::SeqCst),
+            0,
+            "nothing freed until the run drains"
+        );
 
         // Drop WITHOUT complete(): the Drop safety net must free the run's payloads and
-        // advance both `released` (read-ahead occupancy) and `drained_count` (reclaim).
+        // advance `drained_count` so the segment reclaims.
         drop(sw);
         assert_eq!(
             drops.load(O::SeqCst),
             seg_size,
             "drop-without-complete must free every payload in the run"
-        );
-        assert_eq!(
-            ring.released(),
-            seg_size as u64,
-            "drop-without-complete must release the run's occupancy"
         );
 
         // `claim` runs reclaim before it grows, so the drained front pops on the
@@ -1833,19 +1816,25 @@ mod tests {
     fn fill_probe_does_not_underflow_under_concurrent_drain() {
         // Past the diminishing-returns knee for surfacing the race under native
         // scheduling, without the wall-clock cost of the original 2000.
+        use std::sync::atomic::{AtomicU64, Ordering as O};
         for _ in 0..200 {
             let seg_size = 16;
             let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
             ring.set_drain_batch(1);
             let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
             let ring = Arc::new(ring);
+            // Sum every run's freed count across all drainers. The buffer no longer
+            // tracks a running total, so the test accumulates the per-run `freed` the
+            // way the download layer does under its state lock.
+            let freed_total = Arc::new(AtomicU64::new(0));
             std::thread::scope(|s| {
                 for h in handles {
                     let ring = ring.clone();
+                    let freed_total = freed_total.clone();
                     s.spawn(move || {
                         if ring.fill(h, 0) == FillOutcome::DrainReady {
                             while let Some(sw) = ring.take_drain_run(false) {
-                                sw.complete();
+                                freed_total.fetch_add(sw.complete(), O::Relaxed);
                             }
                         }
                     });
@@ -1854,14 +1843,14 @@ mod tests {
             // Terminal sweep mops up any run a filler produced after its own drain
             // scan (the fill/drain interleaving can leave a slot claimed-but-untaken).
             while let Some(sw) = ring.take_drain_run(true) {
-                sw.complete();
+                freed_total.fetch_add(sw.complete(), O::Relaxed);
             }
             // Beyond the underflow (a bare subtraction panics here under overflow-checks),
-            // assert the outcome is correct: every slot drained exactly once, so occupancy
-            // returns to zero. Catches a double-take or a lost run that a panic-only check
-            // would miss.
+            // assert the outcome is correct: every slot drained exactly once, so the freed
+            // counts sum to the segment size. Catches a double-take or a lost run that a
+            // panic-only check would miss.
             assert_eq!(
-                ring.released(),
+                freed_total.load(O::Relaxed),
                 seg_size as u64,
                 "every slot must drain exactly once under concurrent fill+drain"
             );
