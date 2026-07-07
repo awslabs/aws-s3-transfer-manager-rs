@@ -120,6 +120,10 @@ pub struct DownloadInput {
     pub expected_bucket_owner: Option<String>,
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
     pub checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    /// How far this download may prefetch ahead of the consumer. `None` uses the
+    /// client default from [`Config`](crate::config::Config); `Some` overrides it for
+    /// this request.
+    pub read_ahead: Option<crate::types::ReadAhead>,
 }
 impl DownloadInput {
     /// <p>The bucket name containing the object.</p>
@@ -271,6 +275,11 @@ impl DownloadInput {
     pub fn checksum_mode(&self) -> Option<&aws_sdk_s3::types::ChecksumMode> {
         self.checksum_mode.as_ref()
     }
+    /// How far this download may prefetch ahead of the consumer, if overridden for
+    /// this request. `None` uses the client default.
+    pub fn read_ahead(&self) -> Option<&crate::types::ReadAhead> {
+        self.read_ahead.as_ref()
+    }
 }
 
 impl fmt::Debug for DownloadInput {
@@ -300,6 +309,7 @@ impl fmt::Debug for DownloadInput {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("read_ahead", &self.read_ahead);
         formatter.finish()
     }
 }
@@ -336,6 +346,7 @@ pub struct DownloadInputBuilder {
     pub(crate) part_number: Option<i32>,
     pub(crate) expected_bucket_owner: Option<String>,
     pub(crate) checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    pub(crate) read_ahead: Option<crate::types::ReadAhead>,
 }
 
 impl DownloadInputBuilder {
@@ -816,6 +827,22 @@ impl DownloadInputBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         &self.checksum_mode
     }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
+        self.read_ahead = Option::Some(input);
+        self
+    }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+        self.read_ahead = input;
+        self
+    }
+    /// The read-ahead override set on this builder, if any.
+    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+        &self.read_ahead
+    }
     /// Consumes the builder and constructs a [`DownloadInput`].
     pub fn build(self) -> Result<DownloadInput, ::aws_smithy_types::error::operation::BuildError> {
         if self.bucket.is_none() {
@@ -848,6 +875,7 @@ impl DownloadInputBuilder {
             part_number: self.part_number,
             expected_bucket_owner: self.expected_bucket_owner,
             checksum_mode: self.checksum_mode,
+            read_ahead: self.read_ahead,
         })
     }
 }
@@ -879,6 +907,7 @@ impl fmt::Debug for DownloadInputBuilder {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("read_ahead", &self.read_ahead);
         formatter.finish()
     }
 }
@@ -942,6 +971,7 @@ impl From<DownloadInput> for DownloadInputBuilder {
             part_number: value.part_number,
             expected_bucket_owner: value.expected_bucket_owner,
             checksum_mode: value.checksum_mode,
+            read_ahead: value.read_ahead,
         }
     }
 }

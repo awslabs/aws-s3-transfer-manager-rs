@@ -4,7 +4,7 @@
  */
 
 use crate::error::{self, ErrorKind};
-use crate::operation::download::body::{Body, SlotBodyConsumer};
+use crate::operation::download::body::{Body, RecvBodyConsumer};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
@@ -120,6 +120,41 @@ impl DownloadHandleInner {
     pub(crate) fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
     }
+
+    /// Get I/O controls for this transfer.
+    pub(crate) fn io_ctl(&self) -> DownloadIoCtl<'_> {
+        DownloadIoCtl {
+            transfer: &self.transfer,
+        }
+    }
+}
+
+/// Runtime I/O controls for a running download.
+///
+/// Adjusts how the transfer moves data, as opposed to how it is scheduled relative
+/// to other transfers (that is [`SchedulingCtl`](crate::transfer::SchedulingCtl)).
+/// Obtained via [`DownloadHandle::io_ctl()`].
+#[derive(Debug)]
+pub struct DownloadIoCtl<'a> {
+    transfer: &'a DownloadTransfer,
+}
+
+impl<'a> DownloadIoCtl<'a> {
+    /// Set how far this download prefetches ahead of the consumer, overriding the
+    /// value resolved at initiation. Takes effect on the next issuance decision.
+    ///
+    /// Lowering the window caps resident memory for a consumer that has fallen
+    /// behind; raising it restores prefetch depth once the consumer catches up.
+    pub fn set_read_ahead(&self, mode: crate::types::ReadAhead) {
+        self.transfer.set_read_ahead(&mode);
+    }
+
+    /// Construct directly from a transfer, for exercising the control surface in
+    /// transfer-level tests without a full handle.
+    #[cfg(test)]
+    pub(crate) fn for_test(transfer: &'a DownloadTransfer) -> Self {
+        Self { transfer }
+    }
 }
 
 /// Handle to an in-progress download operation.
@@ -189,7 +224,7 @@ pub struct DownloadHandle {
 impl DownloadHandle {
     pub(crate) fn new(
         transfer: DownloadTransfer,
-        consumer: SlotBodyConsumer,
+        consumer: RecvBodyConsumer,
         completion_rx: StateMachineTerminalReceiver,
     ) -> Self {
         let body = Body::new(consumer, transfer.clone());
@@ -255,6 +290,14 @@ impl DownloadHandle {
     /// </div>
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.inner.scheduling()
+    }
+
+    /// Runtime I/O controls for this download.
+    ///
+    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
+    /// controls (e.g. adjusting read-ahead on a running transfer).
+    pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
+        self.inner.io_ctl()
     }
 
     /// Current status of this transfer.
@@ -371,6 +414,14 @@ impl ManagedDownloadHandle {
         self.inner.scheduling()
     }
 
+    /// Runtime I/O controls for this download.
+    ///
+    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
+    /// controls (e.g. adjusting read-ahead on a running transfer).
+    pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
+        self.inner.io_ctl()
+    }
+
     /// Current status of this transfer.
     pub fn status(&self) -> crate::types::TransferStatus {
         self.inner.transfer.ctx().transfer_status()
@@ -418,9 +469,7 @@ impl Drop for ManagedDownloadHandle {
 mod tests {
     use super::{DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
     use crate::error::ErrorKind;
-    use crate::operation::download::body::{
-        new_slot_body, SlotBodyConsumer, DEFAULT_BODY_SLOT_CAPACITY,
-    };
+    use crate::operation::download::body::{new_recv_body, RecvBodyConsumer};
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
     use crate::transfer::TransferContext;
@@ -441,7 +490,7 @@ mod tests {
     /// a `Cancelled` terminal state. Callers assemble either a
     /// `DownloadHandle` or `ManagedDownloadHandle` around it to test the
     /// post-cancel `join()` contract.
-    fn make_cancelled_download_inner() -> (DownloadHandleInner, SlotBodyConsumer) {
+    fn make_cancelled_download_inner() -> (DownloadHandleInner, RecvBodyConsumer) {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
                 .client(aws_smithy_mocks::mock_client!(
@@ -456,7 +505,7 @@ mod tests {
             .key("test-key")
             .build()
             .unwrap();
-        let (writer, consumer) = new_slot_body(DEFAULT_BODY_SLOT_CAPACITY);
+        let (writer, consumer) = new_recv_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
 

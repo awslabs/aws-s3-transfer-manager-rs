@@ -21,6 +21,8 @@ use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::DownloadState;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
+use crate::operation::download::read_ahead::ReadAhead;
+use crate::operation::download::recv_buffer::FillOutcome;
 use crate::operation::download::DownloadInput;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
@@ -36,22 +38,12 @@ pub(crate) enum DownloadWork {
     },
 }
 
-impl DownloadWork {
-    /// Extract the slot from this work item, if present.
-    #[cfg(test)]
-    fn take_slot(&mut self) -> Option<BodySlot> {
-        match self {
-            DownloadWork::Discovery => None,
-            DownloadWork::GetObjectRange { slot, .. } => slot.take(),
-        }
-    }
-}
-
 /// Early return if transfer is terminal (failed/cancelled by another work item).
 macro_rules! bail_if_terminal {
     ($self:expr) => {
         if !$self.inner.ctx.is_active() {
-            $self.decrement_in_flight();
+            // Bailing before any drain: no occupancy freed on this path.
+            $self.decrement_in_flight(0);
             return WorkOutcome::Cancelled;
         }
     };
@@ -78,8 +70,11 @@ struct DownloadTransferInner {
     // TODO(vnext): unify bucket representation (name + kind) across operations.
     #[allow(dead_code)]
     bucket_type: BucketType,
-    /// Sequence window for backpressure control
+    /// Chunk delivery + disk-write surface.
     writer: BodyWriter,
+    /// Read-ahead window: bounds resident occupancy by holding `issued - released`
+    /// under `read_ahead.window()`.
+    read_ahead: ReadAhead,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Object-integrity result (set once discovery completes)
@@ -95,7 +90,16 @@ impl DownloadTransfer {
         input: DownloadInput,
         writer: BodyWriter,
     ) -> Self {
+        // Resolve the read-ahead knob (per-request override, else client default)
+        // to a window in parts before `ctx` and `input` are moved into the struct.
+        let window =
+            super::read_ahead::resolve_window(input.read_ahead(), ctx.handle.config.read_ahead());
+        let read_ahead = ReadAhead::with_window(window);
+        // Couple the disk drain batch to the initial window, so a window below the
+        // segment size drains in smaller runs from the first part.
+        writer.sync_drain_batch(window);
         let inner = Arc::new(DownloadTransferInner {
+            read_ahead,
             ctx,
             state: Mutex::new(DownloadState::new()),
             request: Arc::new(input),
@@ -118,9 +122,61 @@ impl DownloadTransfer {
         self.inner.ctx.id
     }
 
-    /// Body writer for backpressure control and chunk delivery.
+    /// Body writer for chunk delivery and disk writes.
     pub(crate) fn writer(&self) -> &BodyWriter {
         &self.inner.writer
+    }
+
+    /// The read-ahead window. The gate reads `self.inner.read_ahead` directly and the
+    /// control surface goes through [`set_read_ahead`](Self::set_read_ahead); this
+    /// accessor is for tests.
+    #[cfg(test)]
+    pub(crate) fn read_ahead(&self) -> &ReadAhead {
+        &self.inner.read_ahead
+    }
+
+    /// I/O controls for this transfer, for exercising the public control surface in
+    /// tests. Production access is via
+    /// [`DownloadHandle::io_ctl`](super::handle::DownloadHandle::io_ctl).
+    #[cfg(test)]
+    pub(crate) fn io_ctl(&self) -> super::handle::DownloadIoCtl<'_> {
+        super::handle::DownloadIoCtl::for_test(self)
+    }
+
+    /// Apply a dynamic read-ahead change, resolving the public knob to a window. The
+    /// next issuance-gate read observes the new value, and the disk drain batch is
+    /// re-coupled to it so a window below the segment size drains in smaller runs.
+    pub(crate) fn set_read_ahead(&self, mode: &crate::types::ReadAhead) {
+        let window = super::read_ahead::window_parts_for(mode);
+        self.inner.read_ahead.set_window(window);
+        self.inner.writer.sync_drain_batch(window);
+    }
+
+    /// Release one part of read-ahead occupancy for a stream delivery, then wake the
+    /// issuer.
+    ///
+    /// Called from `Body::next` after `poll_next` delivers a chunk (which frees exactly
+    /// one part's payload). The release runs **under the state lock** — the same lock
+    /// `poll_work` holds while it reads the gate and arms `set_pending` — so the
+    /// mutator protocol `lock → mutate → unlock → try_wake` holds: either the gate
+    /// observes this release and returns `Ready` without parking, or it parks and the
+    /// `try_wake` below (after the lock is dropped) fires. Without the shared lock the
+    /// two are unordered and the wake can be lost (the store-buffer race).
+    ///
+    /// The wake is unconditional, mirroring the disk completion path
+    /// ([`decrement_in_flight`](Self::decrement_in_flight)): `try_wake` is a no-op
+    /// unless the issuer actually parked, so there is no need to compute whether this
+    /// release reopened the gate — waking always is correct and adds only an atomic
+    /// swap on the (cold, per-part) delivery path.
+    pub(crate) fn release_stream_occupancy(&self) {
+        {
+            let mut work = self.inner.state.lock().unwrap();
+            if let DownloadState::Transferring { gate, .. } = &mut *work {
+                gate.release(1);
+            }
+            // Terminal (or pre-transfer): no gate to release.
+        }
+        self.inner.ctx.try_wake();
     }
 
     /// Object metadata from discovery.
@@ -189,15 +245,40 @@ impl DownloadTransfer {
                 ranges_in_flight,
                 etag,
                 part_size,
-                ..
+                gate,
             } => {
-                // Check seq window before generating work
-                let Some(slot) = self.inner.writer.try_claim() else {
-                    self.inner.ctx.set_pending();
-                    return PollWork::Pending;
-                };
+                if let Some(range) = remaining.as_ref() {
+                    // Apply the read-ahead gate before issuing. The gate bounds resident
+                    // occupancy at `issued - released < window`, where `released` counts
+                    // both delivery surfaces (stream pull and disk drain), so a disk
+                    // download paces to its drain rate rather than to the in-order
+                    // delivery cursor. `try_issue` reads and mutates the gate under this
+                    // state lock; the consumer's `release` does the same, so the two are
+                    // ordered and a release that reopens the gate cannot be lost against
+                    // the `set_pending` below (the mutator protocol).
+                    //
+                    // The gate guards issuance only. Once every range is generated
+                    // (`remaining` is None) the completion path below runs unconditionally,
+                    // so a transfer whose last parts are still resident (e.g. a disk tail
+                    // below the drain batch, freed only by the terminal drain in
+                    // `complete`) does not block on the gate with nothing left to issue.
+                    let window = self.inner.read_ahead.window();
+                    if !gate.try_issue(window) {
+                        // Gate closed: issuance is `window` parts ahead of what the
+                        // consumer has freed and waits for a drain before claiming more.
+                        // Trace: fires every gated poll in steady state.
+                        tracing::trace!(
+                            target: crate::telemetry::TARGET_TRANSFER,
+                            issued = gate.issued(),
+                            released = gate.released(),
+                            in_flight = gate.resident(),
+                            window,
+                            "read-ahead gate closed: issuance paused until the consumer drains",
+                        );
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
 
-                if let Some(range) = remaining.take() {
                     // `part_size` is the stored part size for a validated multipart
                     // object (so each range aligns to a stored part boundary and S3
                     // returns the part's checksum for the SDK to validate), else the
@@ -208,11 +289,23 @@ impl DownloadTransfer {
                     let chunk_end = cmp::min(start + part_size - 1, end);
                     let chunk_range = start..=chunk_end;
 
+                    let slot = self.inner.writer.claim();
+                    *ranges_in_flight += 1;
+
                     if chunk_end < end {
                         *remaining = Some((chunk_end + 1)..=end);
+                    } else {
+                        // The final range was just issued: issuance is done and the
+                        // transfer drains its in-flight tail, completing on the next
+                        // empty poll with nothing in flight. Logged once per transfer.
+                        *remaining = None;
+                        tracing::debug!(
+                            target: crate::telemetry::TARGET_TRANSFER,
+                            issued = gate.issued(),
+                            ranges_in_flight = *ranges_in_flight,
+                            "all ranges issued; draining in-flight tail",
+                        );
                     }
-
-                    *ranges_in_flight += 1;
 
                     PollWork::Ready(IoRequest {
                         data: Some(Box::new(DownloadWork::GetObjectRange {
@@ -313,11 +406,7 @@ impl DownloadTransfer {
         // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(stream), Some(meta)) => {
-                let slot = self
-                    .inner
-                    .writer
-                    .try_claim()
-                    .expect("seq window should have capacity at start");
+                let slot = self.inner.writer.claim();
                 Some((stream, meta, slot))
             }
             (None, _) => None,
@@ -327,12 +416,15 @@ impl DownloadTransfer {
         };
 
         {
+            // The discovery chunk, if present, is one claimed part already in flight.
+            let initial = u64::from(initial_work.is_some());
             let mut work = self.inner.state.lock().unwrap();
             *work = DownloadState::Transferring {
                 remaining,
-                ranges_in_flight: if initial_work.is_some() { 1 } else { 0 },
+                ranges_in_flight: initial as usize,
                 etag: etag.clone(),
                 part_size: effective_part_size,
+                gate: super::context::OccupancyGate::with_issued(initial),
             };
         }
 
@@ -430,11 +522,19 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        slot.fill(chunk);
-        if let Err(e) = self.inner.writer.try_flush() {
-            // Go terminal before any wake (see fail_range).
-            let guard = self.inner.state.lock().unwrap();
-            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        // Edge-triggered disk write: a fill that brings the segment's filled count to
+        // the drain batch attempts a drain of the batch-ready run(s). `freed` is the
+        // occupancy this drain released, accounted under the lock in decrement_in_flight.
+        let mut freed = 0u64;
+        if slot.fill(chunk) == FillOutcome::DrainReady {
+            match self.inner.writer.drain(false) {
+                Ok(f) => freed = f,
+                Err(e) => {
+                    // Go terminal before any wake (see fail_range).
+                    let guard = self.inner.state.lock().unwrap();
+                    return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+                }
+            }
         }
 
         // disk_write reflects bytes committed to the file sink buffer.
@@ -450,7 +550,7 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        self.decrement_in_flight();
+        self.decrement_in_flight(freed);
 
         WorkOutcome::Success { data: None }
     }
@@ -541,11 +641,21 @@ impl DownloadTransfer {
             metadata: chunk_meta,
         };
 
-        slot.fill(chunk);
-        if let Err(e) = self.inner.writer.try_flush() {
-            // Go terminal before any wake (see fail_range).
-            let guard = self.inner.state.lock().unwrap();
-            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        // Edge-triggered disk write: a fill that brings the segment's filled count to
+        // the drain batch attempts a drain of the batch-ready run(s) — one positioned
+        // write per coalesced run, not every fill. Stream mode's drain is a no-op.
+        // `freed` is the occupancy this drain released, accounted under the lock in
+        // decrement_in_flight.
+        let mut freed = 0u64;
+        if slot.fill(chunk) == FillOutcome::DrainReady {
+            match self.inner.writer.drain(false) {
+                Ok(f) => freed = f,
+                Err(e) => {
+                    // Go terminal before any wake (see fail_range).
+                    let guard = self.inner.state.lock().unwrap();
+                    return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+                }
+            }
         }
 
         // disk_write reflects bytes committed to the file sink buffer.
@@ -561,7 +671,7 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        self.decrement_in_flight();
+        self.decrement_in_flight(freed);
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -582,22 +692,35 @@ impl DownloadTransfer {
         self.fail(guard, e.with_chunk(location))
     }
 
-    fn decrement_in_flight(&self) {
-        let should_wake = {
+    /// Complete one in-flight range: drop `ranges_in_flight` and release the
+    /// `freed` parts of read-ahead occupancy this completion drained, both under
+    /// the state lock, then wake the issuer.
+    ///
+    /// Releasing the occupancy here — under the same lock `poll_work` reads the gate
+    /// and arms `set_pending` under — is what orders this completion's release against
+    /// the issuer's park (the mutator protocol `lock → mutate → unlock → try_wake`).
+    /// `freed` is the disk drain's freed count (0 if this fill did not hit a drain
+    /// edge; the run drains on a later fill).
+    fn decrement_in_flight(&self, freed: u64) {
+        {
             let mut work = self.inner.state.lock().unwrap();
             if let DownloadState::Transferring {
-                ranges_in_flight, ..
+                ranges_in_flight,
+                gate,
+                ..
             } = &mut *work
             {
                 *ranges_in_flight = ranges_in_flight.saturating_sub(1);
-                *ranges_in_flight == 0
-            } else {
-                false
+                gate.release(freed);
             }
-        };
-        if should_wake {
-            self.inner.ctx.try_wake();
         }
+        // Wake the issuer on every completion. A completed range has freed its
+        // read-ahead occupancy and dropped the in-flight count, so a pending poll_work
+        // can now issue another part or complete the transfer. `try_wake` is a no-op
+        // unless the issuer parked (gated on the pending flag), so waking on every
+        // completion is unconditional and covers the case where occupancy frees but
+        // nothing re-polls.
+        self.inner.ctx.try_wake();
     }
 
     /// Transition to terminal failed state. Requires holding the work lock.
@@ -822,9 +945,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (writer, _consumer) = crate::operation::download::body::new_slot_body(
-            crate::operation::download::body::DEFAULT_BODY_SLOT_CAPACITY,
-        );
+        let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
@@ -924,9 +1045,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let (writer, _consumer) = crate::operation::download::body::new_slot_body(
-            crate::operation::download::body::DEFAULT_BODY_SLOT_CAPACITY,
-        );
+        let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
@@ -1035,13 +1154,12 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
-    fn create_download_with_capacity(
+    fn create_download_for_gate(
         object_size: u64,
         part_size: u64,
-        capacity: usize,
     ) -> (
         DownloadTransfer,
-        crate::operation::download::body::SlotBodyConsumer,
+        crate::operation::download::body::RecvBodyConsumer,
     ) {
         let chunk = vec![0u8; part_size as usize];
         let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
@@ -1067,80 +1185,143 @@ mod tests {
             .build()
             .unwrap();
 
-        let (writer, consumer) = crate::operation::download::body::new_slot_body(capacity);
+        let (writer, consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
         (transfer, consumer)
     }
 
+    /// The read-ahead gate bounds issuance at the current window: with a small window,
+    /// issuance proceeds up to `issued − released == window()`, then stalls. Tests the
+    /// gate wiring; `read_ahead`'s own tests cover resolving the window value.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_seq_window_limits_work_generation() {
-        // Create download with many parts but small slot buffer capacity
-        let (transfer, _consumer) = create_download_with_capacity(128 * MB, 8 * MB, 3);
-
+    async fn test_read_ahead_gate_bounds_issuance() {
+        let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
         skip_discovery(&transfer).await;
-        // After discovery: claimed=1 (initial chunk took seq=0), consumed=0
-        // Capacity=3 means: claimed < consumed + capacity → claimed < 3
-        // So we can claim seq 1, 2 (claimed becomes 2, then 3)
+        // Force a small window so a few polls exercise the gate; the default is large.
+        transfer.read_ahead().force_window(3);
+        let w = transfer.read_ahead().window();
+        // Discovery claimed seq 0 (issued=1, consumed=0). Drive until the gate stalls.
+        let mut issued = 1u64;
+        loop {
+            match transfer.poll_work() {
+                PollWork::Ready(_item) => {
+                    issued += 1;
+                    assert!(issued <= w, "issuance ran past the window");
+                }
+                PollWork::Pending => break,
+                PollWork::Done => panic!("unexpected Done"),
+            }
+        }
+        assert_eq!(issued, w, "issuance should fill the window then stall");
+    }
 
-        let _w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
-        let _w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
+    /// On the stream path, delivering a chunk frees one part; the download layer
+    /// releases that occupancy under the state lock (as `Body::next` does via
+    /// `release_stream_occupancy`), so `issued − released` drops below the window and
+    /// the gate admits another claim.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_consume_reopens_gate() {
+        let (transfer, mut consumer) = create_download_for_gate(128 * MB, 8 * MB);
+        skip_discovery(&transfer).await;
+        transfer.read_ahead().force_window(3);
+        // Fill the window.
+        while let PollWork::Ready(_item) = transfer.poll_work() {}
+        assert_pending(transfer.poll_work());
 
-        // Window exhausted (claimed=3, consumed=0, capacity=3: 3 >= 0+3)
+        // Consume seq 0 (filled by discovery) — the buffer delivers the chunk, then the
+        // download layer releases one part of occupancy under the state lock. This is
+        // exactly what `Body::next` does; the test drives the two steps directly.
+        assert!(
+            consumer.try_take_next().is_some(),
+            "discovery chunk should deliver"
+        );
+        transfer.release_stream_occupancy();
+
+        // Gate reopens for exactly one more claim.
+        assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
     }
 
+    /// The window resolved at construction follows precedence: a per-request
+    /// `read_ahead` override wins; absent one, the client default applies.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_seq_window_consume_enables_more_work() {
-        let (transfer, consumer) = create_download_with_capacity(128 * MB, 8 * MB, 2);
+    async fn test_read_ahead_resolution_precedence() {
+        use crate::types::ReadAhead;
 
+        let build = |client_mode: ReadAhead, input_override: Option<ReadAhead>| {
+            let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(8 * MB as i64)
+                    .content_range(format!("bytes 0-{}/{}", 8 * MB - 1, 8 * MB))
+                    .e_tag("test-etag")
+                    .body(ByteStream::from(vec![0u8; 8 * MB as usize]))
+                    .build()
+            });
+            let config = crate::Config::builder()
+                .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+                .part_size(crate::types::PartSize::Target(8 * MB))
+                .read_ahead(client_mode)
+                .build();
+            let handle = crate::client::Handle::test_handle_tokio(config);
+            let input = DownloadInput::builder()
+                .bucket("test-bucket")
+                .key("test-key")
+                .set_read_ahead(input_override)
+                .build()
+                .unwrap();
+            let (writer, _consumer) = crate::operation::download::body::new_recv_body();
+            let (ctx, _rx) = TransferContext::new(handle);
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+        };
+
+        // No request override: the client default resolves.
+        let t = build(ReadAhead::Parts(9), None);
+        assert_eq!(t.read_ahead().window(), 10, "client default applies");
+
+        // Request override wins over the client default.
+        let t = build(ReadAhead::Parts(9), Some(ReadAhead::Parts(3)));
+        assert_eq!(t.read_ahead().window(), 4, "request override wins");
+
+        // Client Auto resolves to the fixed default when not overridden.
+        let t = build(ReadAhead::Auto, None);
+        assert_eq!(
+            t.read_ahead().window(),
+            super::super::read_ahead::DEFAULT_WINDOW_PARTS
+        );
+    }
+
+    /// `io_ctl().set_read_ahead` resolves the public knob to a window and applies it
+    /// to the running transfer; the gate observes the new value on the next poll.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_io_ctl_set_read_ahead_resizes_window() {
+        let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
         skip_discovery(&transfer).await;
-        // After discovery: seq 0 claimed and filled by discovery, consumed=0
-        // Capacity=2 means: claimed < consumed + 2
 
-        let mut w1 = assert_ready(transfer.poll_work()); // seq=1, claimed=2
-        assert_pending(transfer.poll_work()); // claimed=2 >= 0+2
+        // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
+        transfer
+            .io_ctl()
+            .set_read_ahead(crate::types::ReadAhead::Parts(4));
+        assert_eq!(transfer.read_ahead().window(), 5);
 
-        // Consume seq 0 (filled by discovery) to open the window
-        consumer.try_take_next(); // consume seq 0, consumed=1
+        // Parts(0) is demand paging: a window of exactly one outstanding part.
+        transfer
+            .io_ctl()
+            .set_read_ahead(crate::types::ReadAhead::Parts(0));
+        assert_eq!(transfer.read_ahead().window(), 1);
 
-        let mut w2 = assert_ready(transfer.poll_work()); // seq=2, claimed=3
-        assert_pending(transfer.poll_work()); // claimed=3 >= 1+2
-
-        // Fill seq 1 from its work item, then consume it
-        let slot1 = w1.data_mut::<DownloadWork>().take_slot().expect("has slot");
-        let mut seg = bytes_utils::SegmentedBuf::new();
-        seg.push(bytes::Bytes::from("data"));
-        slot1.fill(ChunkOutput {
-            seq: 1,
-            offset: 0,
-            data: crate::io::AggregatedBytes(seg),
-            metadata: Default::default(),
-        });
-        consumer.try_take_next(); // consume seq 1, consumed=2
-
-        let w3 = assert_ready(transfer.poll_work()); // seq=3, claimed=4
-        assert_pending(transfer.poll_work());
-
-        // Fill seq 2 from its work item, then consume it
-        let slot2 = w2.data_mut::<DownloadWork>().take_slot().expect("has slot");
-        let mut seg = bytes_utils::SegmentedBuf::new();
-        seg.push(bytes::Bytes::from("data"));
-        slot2.fill(ChunkOutput {
-            seq: 2,
-            offset: 0,
-            data: crate::io::AggregatedBytes(seg),
-            metadata: Default::default(),
-        });
-        consumer.try_take_next(); // consume seq 2
-
-        let _w4 = assert_ready(transfer.poll_work()); // seq=4
-        assert_pending(transfer.poll_work());
-
-        // Clean up remaining slots
-        drop(w3);
+        // Auto returns to the default fixed window.
+        transfer
+            .io_ctl()
+            .set_read_ahead(crate::types::ReadAhead::Auto);
+        assert_eq!(
+            transfer.read_ahead().window(),
+            super::super::read_ahead::DEFAULT_WINDOW_PARTS
+        );
     }
 
     use crate::http::header::Range;

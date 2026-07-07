@@ -36,6 +36,23 @@ pub enum ConcurrencyMode {
     Explicit(usize),
 }
 
+/// How far a download may prefetch ahead of the consumer.
+///
+/// Read-ahead is speculative issuance: parts fetched before the consumer has read
+/// up to them. This bounds that speculation. It does not gate in-order delivery or
+/// override the memory budget; those are separate bounds.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReadAhead {
+    /// Read ahead as far as available memory allows.
+    #[default]
+    Auto,
+
+    /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
+    /// the part the consumer is waiting on (no speculation). Still bounded by memory.
+    Parts(usize),
+}
+
 /// Throughput target(s)
 #[derive(Debug, Clone)]
 pub struct TargetThroughput {
