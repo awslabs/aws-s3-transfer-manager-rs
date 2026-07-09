@@ -149,7 +149,7 @@ impl BodySlot {
 
     /// Attach the memory-budget reservation backing this chunk. Held on the slot
     /// from claim until [`fill`](Self::fill) moves it into the `ChunkOutput`, so it
-    /// drops with the chunk's bytes rather than at the ring boundary.
+    /// drops with the chunk's bytes rather than at the buffer boundary.
     pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
         self.reservation = Some(reservation);
     }
@@ -1041,12 +1041,12 @@ mod tests {
 
     // --- Reservation lease-lifetime tests ---
     //
-    // The budget caps TOTAL memory the transfer manager holds, not ring residency
+    // The budget caps TOTAL memory the transfer manager holds, not buffer residency
     // (the read-ahead window already bounds that). So a reservation must live for as
     // long as the bytes it accounts for are resident: on the stream surface the bytes
     // escape to the consumer in the delivered `ChunkOutput` and stay resident until
     // the consumer drops it, so the reservation must ride the chunk and release on
-    // consumer-drop — NOT at the ring boundary. On the disk surface the drain copies
+    // consumer-drop — NOT at the buffer boundary. On the disk surface the drain copies
     // the bytes out and frees them, so the reservation releases at drain.
 
     use crate::runtime::memory::MemoryBudget;
@@ -1067,10 +1067,10 @@ mod tests {
             AggregatedBytes(seg)
         }));
 
-        // Still charged while the chunk sits in the ring.
+        // Still charged while the chunk sits in the buffer.
         assert_eq!(budget.in_use_chunks(), 1);
 
-        // Deliver to the consumer. The chunk (and its reservation) leaves the ring as
+        // Deliver to the consumer. The chunk (and its reservation) leaves the buffer as
         // an owned value — the bytes are now resident in the consumer's hands, so the
         // budget must STILL be charged. Releasing here would be the lease-lifetime bug.
         let chunk = consumer.try_take_next().expect("chunk delivered");
@@ -1142,10 +1142,10 @@ mod tests {
         slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
         slot.fill(chunk_at(0, 0, b"flushed"));
 
-        // Charged while resident in the ring, before the drain copies it out.
+        // Charged while resident in the buffer, before the drain copies it out.
         assert_eq!(budget.in_use_chunks(), 1);
 
-        // The drain writes the bytes to the sink and frees the ring payload; the disk
+        // The drain writes the bytes to the sink and frees the buffer payload; the disk
         // surface owns nothing after copy-out, so the reservation releases here.
         writer.finalize().unwrap();
         assert_eq!(

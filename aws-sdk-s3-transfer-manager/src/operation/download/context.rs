@@ -8,7 +8,7 @@ use crate::runtime::memory::WaitTicket;
 
 /// A claimed slot whose backing memory is not yet reserved. Held while a transfer
 /// is budget-blocked: the read-ahead gate admitted the slot (`gate.try_issue`
-/// already counted it as issued) and it was claimed from the ring, but it cannot be
+/// already counted it as issued) and it was claimed from the buffer, but it cannot be
 /// filled until the budget grants `ticket`. Dropping it (on terminal) releases the
 /// slot and cancels the budget wait.
 #[derive(Debug)]

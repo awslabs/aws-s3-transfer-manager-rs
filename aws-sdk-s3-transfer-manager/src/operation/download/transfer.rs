@@ -304,7 +304,7 @@ impl DownloadTransfer {
                         return self.park();
                     }
 
-                    // Gate admitted (and counted) the slot. Claim it from the ring and
+                    // Gate admitted (and counted) the slot. Claim it from the buffer and
                     // reserve its backing memory against the budget. A grant issues now;
                     // a queued reservation stashes the claimed slot in `pending` and
                     // parks until the budget wakes us. The gate's `issued` bump stays —

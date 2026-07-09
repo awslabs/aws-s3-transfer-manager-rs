@@ -188,7 +188,7 @@
 //!
 //! # Caller obligations
 //!
-//! The ring does not bound its own growth: it allocates a segment whenever a claim
+//! The buffer does not bound its own growth: it allocates a segment whenever a claim
 //! reaches a sequence past the current tail. The caller must bound outstanding
 //! (claimed-but-undelivered) sequences, or resident memory grows without limit.
 
@@ -440,7 +440,7 @@ pub(crate) enum FillOutcome {
 /// call that produced it: a synchronous consumer completes it immediately, an
 /// asynchronous one parks it and completes it on a later event.
 ///
-/// The strong ring reference keeps the buffer accounting alive for exactly the
+/// The strong buffer reference keeps the buffer accounting alive for exactly the
 /// outstanding-write window — the correct lifetime, since a write may be reading a
 /// run's bytes when every other handle has dropped. It is bounded (released at
 /// `complete` or drop) and forms no cycle (segments do not point back at `Inner`).
@@ -587,14 +587,14 @@ unsafe impl<T: Send> Send for SegmentWrite<T> {}
 unsafe impl<T: Send> Sync for SegmentWrite<T> {}
 
 impl<T> PagedRecvBuffer<T> {
-    /// Create an empty ring with the default segment size ([`DEFAULT_SEG_SIZE`]),
+    /// Create an empty buffer with the default segment size ([`DEFAULT_SEG_SIZE`]),
     /// returning the producer/block handle and the unique stream [`RecvBufferConsumer`].
     #[cfg(test)]
     pub(crate) fn new() -> (Self, RecvBufferConsumer<T>) {
         Self::new_with_segment_size(DEFAULT_SEG_SIZE)
     }
 
-    /// Create an empty ring whose segments hold `seg_size` slots each. One segment
+    /// Create an empty buffer whose segments hold `seg_size` slots each. One segment
     /// based at sequence 0 exists initially, shared by the producer/block handle and
     /// the consumer's `current`. Panics if `seg_size == 0`.
     pub(crate) fn new_with_segment_size(seg_size: usize) -> (Self, RecvBufferConsumer<T>) {
@@ -797,7 +797,7 @@ impl<T> PagedRecvBuffer<T> {
     /// is advisory and never a correctness input. Cold path.
     ///
     /// Callers that need byte offsets translate sequence numbers themselves; the
-    /// ring has no notion of payload size.
+    /// buffer has no notion of payload size.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RecvBufferSnapshot {
         let guard = self.inner.locked.lock();
@@ -924,7 +924,7 @@ pub(crate) struct RecvBufferSnapshot {
 #[cfg(test)]
 impl RecvBufferSnapshot {
     /// Number of claimed-but-undelivered sequences: `frontier - cursor`. The size of
-    /// the live window the ring is holding open.
+    /// the live window the buffer is holding open.
     pub(crate) fn outstanding(&self) -> u64 {
         self.frontier - self.cursor
     }

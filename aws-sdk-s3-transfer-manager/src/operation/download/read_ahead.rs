@@ -28,8 +28,10 @@
 //! - Fast consumer: `released` keeps pace, `issued - released` stays small, the
 //!   gate does not bind, and the transfer runs at the concurrency limit.
 //! - Slow consumer: `released` lags, `issued - released` fills to the window, the
-//!   gate closes, and issuance pauses until the consumer drains. Resident memory is
-//!   bounded at `window` parts.
+//!   gate closes, and issuance pauses until the consumer drains. This transfer's
+//!   resident occupancy is then bounded at `window` parts; aggregate memory across
+//!   transfers is bounded separately by the global budget, which typically binds a
+//!   transfer before its window fills.
 //! - Blocked consumer (a stalled or missing part): `released` cannot advance past
 //!   the hole, occupancy pins at the window, and issuance stops at `window`, leaving
 //!   a full window of slack to make progress around the hole rather than collapsing
@@ -40,10 +42,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Fixed read-ahead window, in parts. A per-transfer cap on resident occupancy:
-/// with an 8 MiB part this holds at most 8 GiB of buffer for one transfer, while
-/// staying well above the bandwidth-delay product of a 100 Gbps link (so the gate
-/// does not bind a consumer that keeps pace).
+/// Fixed read-ahead window, in parts. A per-transfer cap on how far speculative
+/// issuance runs ahead of consumption, set well above the bandwidth-delay product of
+/// a 100 Gbps link so the gate does not bind a consumer that keeps pace. It is a
+/// per-transfer prefetch-depth ceiling, not the memory bound: aggregate resident
+/// memory is bounded by the global [`MemoryBudget`](crate::runtime::memory), which
+/// under concurrency binds a transfer well before it reaches this window.
 ///
 /// The default for the public [`ReadAhead::Auto`](crate::types::ReadAhead) mode;
 /// [`window_parts_for`] resolves the knob to a window in parts.
@@ -146,8 +150,8 @@ mod tests {
     #[test]
     fn window_does_not_drift_on_its_own() {
         // The controller never changes the window itself; only an explicit
-        // set_window (the budget clamp or the dynamic knob) moves it. Repeated reads
-        // with no writer are stable.
+        // set_window (the dynamic read-ahead knob) moves it. Repeated reads with no
+        // writer are stable.
         let ra = ReadAhead::new();
         let w = ra.window();
         for _ in 0..1000 {
