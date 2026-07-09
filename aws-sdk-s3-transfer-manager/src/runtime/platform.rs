@@ -109,7 +109,7 @@ const UNDETECTABLE_MEM_BYTES: usize = 2 * ByteUnit::Gibibyte.as_bytes_usize();
 ///
 /// The budget is a backstop, not the operating point: the concurrency
 /// controller settles at line rate well below it, and it binds only when a slow
-/// consumer backs parts up in the prefetch ring. RAM is an imprecise proxy for
+/// consumer backs parts up in the prefetch buffer. RAM is an imprecise proxy for
 /// that ceiling — network bandwidth sets the real pipeline depth, and bandwidth
 /// is uncorrelated with RAM across instance families (m5.24xlarge and
 /// m5n.24xlarge share 384 GiB of RAM but differ 4x in bandwidth). The clamp
@@ -444,11 +444,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "connection_cap calls getrlimit, a syscall miri cannot emulate"
+    )]
     fn test_connection_cap_within_bounds() {
         assert!((MIN_CONN..=ABSOLUTE_MAX_CONN).contains(&connection_cap()));
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "connection_cap_with_memory calls getrlimit, a syscall miri cannot emulate"
+    )]
     fn test_connection_cap_with_memory_is_bounded_by_chunks() {
         // 16-chunk budget caps connections at 16 (or lower if descriptors are scarce).
         let chunk = 8 * 1024 * 1024;
@@ -620,6 +628,10 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "available_ram reads /proc and calls platform syscalls miri cannot emulate"
+    )]
     fn test_available_ram_detected_on_supported_platforms() {
         // The detected machine has at least 1 GiB; guards the platform syscall.
         assert!(available_ram().expect("RAM detected") >= GIB);
