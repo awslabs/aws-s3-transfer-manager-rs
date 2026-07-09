@@ -7,12 +7,25 @@
 //!
 //! `MemoryBudget` tracks how many fixed-size chunks of memory are logically
 //! reserved across all transfers. It grants reservations (RAII tickets whose drop
-//! returns chunks), parks callers when the budget is exhausted, and wakes them
-//! strictly FIFO as chunks are released.
+//! returns chunks), parks callers when the budget is exhausted, and wakes them in
+//! strict arrival order as chunks are released.
 //!
-//! The download path reserves against it (see `operation::download::transfer`); a
-//! couple of methods are consumed only by tests or future callers and carry their
-//! own gating.
+//! # Admission order
+//!
+//! Reservations are granted first-come-first-served: a request is served only once
+//! every earlier-queued request has been. A fresh request never jumps one already
+//! waiting, even when free chunks would satisfy it, and the release-time drain
+//! stops at the first queued request that does not fit rather than serving smaller
+//! ones behind it. This bounds the wait for every `need <= capacity` request: once
+//! queued it sees `in_use` only fall until its need is met, so a stream of smaller
+//! requests can never indefinitely defer a larger one ahead of them. The cost is
+//! head-of-line blocking — a large request at the front idles the budget while
+//! free chunks accumulate to its need — which arises only under mixed part sizes;
+//! a uniform part size never triggers it.
+//!
+//! The download path reserves against it (see `operation::download::transfer`).
+//! `set_limit` and a few introspection methods are not yet wired to a caller and
+//! carry their own gating.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -144,9 +157,10 @@ fn can_grant(need: u64, in_use: u64, capacity: u64) -> bool {
     need <= capacity.saturating_sub(in_use) || in_use == 0
 }
 
-/// Drain the wait queue strictly FIFO. Grants the front waiter if it fits, stops
-/// at the first that does not (no skip-ahead). Returns collected NotifyFns that
-/// callers MUST invoke AFTER releasing the budget lock.
+/// Drain the wait queue in arrival order. Grants the front waiter if it fits, stops
+/// at the first that does not (no skip-ahead, so a smaller request behind a too-large
+/// front is not served early). Returns collected NotifyFns that callers MUST invoke
+/// AFTER releasing the budget lock.
 fn drain(budget: &Arc<MemoryBudget>, inner: &mut Inner) -> Vec<NotifyFn> {
     let mut notifies = Vec::new();
     while let Some(front) = inner.waiters.front() {
@@ -216,21 +230,16 @@ impl MemoryBudget {
         bytes.div_ceil(self.chunk) as u64
     }
 
-    /// Attempt an immediate grant without parking. Returns `None` if the queue is non-empty
-    /// (no-barge) or the request does not fit; registers no waker and never enqueues a waiter.
-    /// Grants under exactly the condition [`reserve`](Self::reserve) returns `Ready`, so it is
-    /// the allocation-free fast path when a caller can re-drive itself on failure.
+    /// Attempt an immediate grant without parking. Returns `None` if a request is already
+    /// queued (arrival order is preserved) or this one does not fit; registers no waker and
+    /// never enqueues a waiter. Grants under exactly the condition [`reserve`](Self::reserve)
+    /// returns `Ready`, so it is the allocation-free fast path when a caller can re-drive
+    /// itself on failure.
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         let need = self.chunks_for(bytes);
         let mut inner = self.inner.lock();
-        // No-barge: a fresh request never jumps a queued waiter, even if it would fit.
-        // Combined with strict-FIFO drain (which stops at the first front that does not
-        // fit), this makes a front waiter see in_use only fall until its need is met, so it
-        // is never starved for need <= capacity. Bargeing would let a stream of small
-        // requests indefinitely starve a larger queued one. Cost: strict FIFO
-        // head-of-line-blocks smaller requests behind a large front waiter (the budget
-        // idles while it accumulates) — bounded, only under mixed part sizes; uniform part
-        // size never triggers it.
+        // Arrival-order admission (see module doc): a queued request is never bypassed,
+        // even by a fresh one that would fit.
         if !inner.waiters.is_empty() {
             return None;
         }
@@ -251,14 +260,8 @@ impl MemoryBudget {
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize, notify: NotifyFn) -> Reserve {
         let need = self.chunks_for(bytes);
         let mut inner = self.inner.lock();
-        // No-barge: a fresh request never jumps a queued waiter, even if it would fit.
-        // Combined with strict-FIFO drain (which stops at the first front that does not
-        // fit), this makes a front waiter see in_use only fall until its need is met, so it
-        // is never starved for need <= capacity. Bargeing would let a stream of small
-        // requests indefinitely starve a larger queued one. Cost: strict FIFO
-        // head-of-line-blocks smaller requests behind a large front waiter (the budget
-        // idles while it accumulates) — bounded, only under mixed part sizes; uniform part
-        // size never triggers it.
+        // Arrival-order admission (see module doc): a queued request is never bypassed,
+        // even by a fresh one that would fit.
         if inner.waiters.is_empty() && can_grant(need, inner.in_use, inner.capacity) {
             inner.in_use += need;
             tracing::trace!(
@@ -303,8 +306,7 @@ impl MemoryBudget {
     /// Resize the capacity (in bytes). Growing may drain parked waiters. Shrinking is soft: it
     /// never revokes already-granted chunks, only tightens future grants.
     ///
-    /// The budget is resizable by design; the measured/adaptive sizing loop that will drive this
-    /// is tracked in the memory-budget workstream. `allow(dead_code)` until that caller lands.
+    /// Resizable by design, but not yet wired to a caller, so it carries `allow(dead_code)`.
     #[allow(dead_code)]
     pub(crate) fn set_limit(self: &Arc<Self>, capacity_bytes: usize) {
         let new_capacity = (capacity_bytes / self.chunk) as u64;
@@ -860,6 +862,7 @@ mod tests {
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
     use super::*;
+    use crate::runtime::sync::sync::atomic::{AtomicBool, Ordering};
     use crate::runtime::sync::thread;
 
     fn noop_notify() -> NotifyFn {
@@ -901,15 +904,29 @@ mod loom_tests {
         // Releasing the holder (drain stores the grant) races the waiter taking it.
         // After both complete the grant is delivered exactly once and accounting is
         // consistent across release.
+        //
+        // The waiter carries a real `NotifyFn` (production passes `scheduler.wake`, which
+        // re-polls the parked transfer) rather than a no-op, so the release exercises the
+        // actual notify path: `Reservation::drop` collects notifies under the budget lock
+        // AFTER the drain has stored every grant, then fires them once the lock is dropped.
+        // A regression that fired the notify before publishing the grant — the lost-wake
+        // class this wireup is exposed to — would let the woken side take() nothing, which
+        // the `taken.or_else(take)` recovery plus the exactly-once accounting below catch.
         loom::model(|| {
             let chunk = 1024;
             let budget = MemoryBudget::new(chunk, chunk); // capacity = 1 chunk
+
+            let woken = Arc::new(AtomicBool::new(false));
+            let notify: NotifyFn = {
+                let woken = Arc::clone(&woken);
+                Arc::new(move || woken.store(true, Ordering::SeqCst))
+            };
 
             let holder = match budget.reserve(chunk, noop_notify()) {
                 Reserve::Ready(r) => r,
                 Reserve::Pending(_) => unreachable!("first reserve fits"),
             };
-            let mut ticket = match budget.reserve(chunk, noop_notify()) {
+            let mut ticket = match budget.reserve(chunk, notify) {
                 Reserve::Pending(t) => t,
                 Reserve::Ready(_) => unreachable!("budget is full"),
             };
@@ -922,6 +939,10 @@ mod loom_tests {
             // or a second take() retrieves it now.
             let granted = taken.or_else(|| ticket.take());
             assert!(granted.is_some(), "waiter must be granted after release");
+            assert!(
+                woken.load(Ordering::SeqCst),
+                "release must fire the parked waiter's notify",
+            );
             assert_eq!(budget.in_use_chunks(), 1);
 
             drop(granted);

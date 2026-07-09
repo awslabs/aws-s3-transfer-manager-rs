@@ -101,7 +101,7 @@ enum Mode {
 }
 
 /// Producer handle to the download body buffer. Held at `self.inner.writer`
-/// in the transfer. Cheap to clone (all state behind Arc).
+/// in the transfer. Clone shares all state via `Arc`.
 #[derive(Clone)]
 pub(crate) struct BodyWriter {
     buffer: PagedRecvBuffer<ChunkOutput>,

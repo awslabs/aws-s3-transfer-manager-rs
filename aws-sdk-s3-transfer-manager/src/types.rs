@@ -35,10 +35,11 @@ pub enum MemoryBudgetConfig {
     /// or non-positive value falls back to the `Auto` fraction. The result is
     /// floored at a minimum usable budget but, unlike `Auto`, is not capped.
     Fraction(f64),
-    /// An explicit byte limit. Bypasses detection, but is still floored at one
-    /// accounting chunk (8 MiB) — a smaller value would serialize transfers. Use
-    /// the [`ByteUnit`](crate::metrics::unit::ByteUnit) helpers to express it,
-    /// e.g. `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
+    /// An explicit byte limit. Bypasses detection. A value below one accounting
+    /// chunk (8 MiB) is raised to a single chunk when the budget is built, since a
+    /// smaller budget would serialize transfers. Use the
+    /// [`ByteUnit`](crate::metrics::unit::ByteUnit) helpers to express it, e.g.
+    /// `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
     Limit(usize),
 }
 

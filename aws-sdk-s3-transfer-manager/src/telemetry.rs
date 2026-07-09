@@ -8,10 +8,10 @@
 //! These targets allow filtering logs by concern rather than module path:
 //!
 //! ```text
-//! RUST_LOG=aws_s3_transfer_manager::concurrency=debug   # adaptive algorithm decisions
-//! RUST_LOG=aws_s3_transfer_manager::scheduling=debug     # scheduler + memory-budget capacity
-//! RUST_LOG=aws_s3_transfer_manager::execution=trace      # per-work-item execute/complete
-//! RUST_LOG=aws_s3_transfer_manager::transfer=debug       # transfer lifecycle events
+//! RUST_LOG=aws_sdk_s3_transfer_manager::concurrency=debug   # adaptive algorithm decisions
+//! RUST_LOG=aws_sdk_s3_transfer_manager::scheduling=debug    # scheduler + memory-budget capacity
+//! RUST_LOG=aws_sdk_s3_transfer_manager::execution=trace     # per-work-item execute/complete
+//! RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug      # transfer lifecycle events
 //! ```
 
 use crate::metrics::latency::LatencyTracker;

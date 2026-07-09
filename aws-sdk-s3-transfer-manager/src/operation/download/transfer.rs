@@ -62,7 +62,7 @@ macro_rules! bail_if_terminal {
 
 /// Download transfer that generates and executes download work.
 ///
-/// Cheap to clone - all state is behind `Arc`.
+/// Clone shares all state via `Arc`.
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadTransfer {
     inner: Arc<DownloadTransferInner>,
@@ -738,7 +738,8 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        if self.decrement_in_flight(freed) {
+        let reached_terminal = self.decrement_in_flight(freed);
+        if reached_terminal {
             return self.finalize_completion();
         }
 
@@ -863,7 +864,8 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        if self.decrement_in_flight(freed) {
+        let reached_terminal = self.decrement_in_flight(freed);
+        if reached_terminal {
             return self.finalize_completion();
         }
 
