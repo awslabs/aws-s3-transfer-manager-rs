@@ -22,19 +22,11 @@
 //! head-of-line blocking — a large request at the front idles the budget while
 //! free chunks accumulate to its need — which arises only under mixed part sizes;
 //! a uniform part size never triggers it.
-//!
-//! The download path reserves against it (see `operation::download::transfer`).
-//! `set_limit` and a few introspection methods are not yet wired to a caller and
-//! carry their own gating.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::metrics::unit::ByteUnit;
-// The compat-layer Mutex is loom-instrumented under `cfg(s3_tm_loom)`, which is
-// what exercises the budget/slot lock-ordering invariant. `Arc` stays `std`: the
-// budget is held as `std::sync::Arc` across the call graph, and loom tracks the
-// locks, not the refcount.
 use crate::runtime::sync::Mutex;
 
 /// Closure the budget invokes to wake a parked reserver (= `scheduler.wake(tid)`).
@@ -142,9 +134,6 @@ impl std::fmt::Debug for WaitTicket {
 /// Nominal 8 MiB accounting unit for budget reservations. A part costs
 /// `ceil(part_size / chunk)` chunks, so non-uniform part sizes account correctly.
 pub(crate) const BUDGET_CHUNK_BYTES: usize = 8 * ByteUnit::Mebibyte.as_bytes_usize();
-/// Non-binding budget for test handles, which size objects far below it.
-#[cfg(test)]
-pub(crate) const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
 // A request fits when the free chunks cover its need. The `in_use == 0` clause is
 // the forced grant: a request larger than the entire capacity can only ever proceed
@@ -607,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_barge_small_request_does_not_jump_queued_large() {
+    fn test_arrival_order_small_request_does_not_jump_queued_large() {
         let chunk = 1024;
         let budget = MemoryBudget::new(chunk * 4, chunk); // 4 chunks capacity
         let (n_hold, _) = notify_flag();
@@ -626,11 +615,11 @@ mod tests {
         };
 
         // A 1-chunk request WOULD fit on capacity alone (1 chunk is free), so this
-        // isolates no-barge from exhaustion: it is rejected only because a waiter
-        // is queued ahead of it.
+        // isolates arrival order from exhaustion: it is rejected only because a
+        // waiter is queued ahead of it.
         assert!(
             budget.try_reserve(chunk).is_none(),
-            "no-barge: must not jump the queued waiter even though it fits"
+            "arrival order: must not jump the queued waiter even though it fits"
         );
 
         // Drain the queue: releasing the holder frees 3 chunks; the parked 2-chunk
@@ -641,7 +630,7 @@ mod tests {
         assert_eq!(budget.in_use_chunks(), 2);
 
         // Same 1-chunk request now succeeds: the queue is empty and 2 chunks are
-        // free, confirming the earlier rejection was no-barge, not exhaustion.
+        // free, confirming the earlier rejection was arrival order, not exhaustion.
         assert!(
             budget.try_reserve(chunk).is_some(),
             "with an empty queue and free capacity the request now fits"

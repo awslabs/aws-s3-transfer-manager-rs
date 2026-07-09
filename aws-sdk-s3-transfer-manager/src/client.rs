@@ -15,10 +15,13 @@ use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use crate::runtime::memory::DEFAULT_MEMORY_BUDGET_BYTES;
 use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES};
 use crate::runtime::ExecutionRuntime;
+
+/// Non-binding budget for test handles, which size objects far below it, so the
+/// budget never gates in state-machine and mock-SDK tests.
+#[cfg(test)]
+const TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -94,7 +97,7 @@ impl Handle {
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
-                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
+                memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         })
     }
@@ -153,7 +156,7 @@ impl Handle {
                 runtime,
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
-                memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
+                memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
             }
         })
     }
