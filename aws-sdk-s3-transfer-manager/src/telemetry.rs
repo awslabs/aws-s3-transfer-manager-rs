@@ -31,6 +31,10 @@ pub(crate) const TARGET_EXECUTION: &str = "aws_sdk_s3_transfer_manager::executio
 /// Transfer lifecycle: enqueue, complete, cancel, fail, state transitions.
 pub(crate) const TARGET_TRANSFER: &str = "aws_sdk_s3_transfer_manager::transfer";
 
+/// Memory-budget admission control: reserve/grant/release flow (`trace`) and
+/// saturation edges where a reserve parks until a reservation releases (`debug`).
+pub(crate) const TARGET_MEMORY: &str = "aws_sdk_s3_transfer_manager::memory";
+
 /// Observability surface for transfer operations.
 ///
 /// Groups latency tracking and throughput counters. Transfers record

@@ -10,11 +10,9 @@
 //! returns chunks), parks callers when the budget is exhausted, and wakes them
 //! strictly FIFO as chunks are released.
 //!
-//! The primitive is complete and unit-tested but not yet wired into a transfer:
-//! the download reserve/release integration is deferred to the receive-buffer
-//! rework (see the memory-budget notes in the project workspace). Until then the
-//! whole module is dead code.
-#![allow(dead_code)]
+//! The download path reserves against it (see `operation::download::transfer`); a
+//! couple of methods are consumed only by tests or future callers and carry their
+//! own gating.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -157,6 +155,14 @@ fn drain(budget: &Arc<MemoryBudget>, inner: &mut Inner) -> Vec<NotifyFn> {
         }
         let waiter = inner.waiters.pop_front().unwrap();
         inner.in_use += waiter.need;
+        tracing::trace!(
+            target: crate::telemetry::TARGET_MEMORY,
+            need = waiter.need,
+            in_use = inner.in_use,
+            capacity = inner.capacity,
+            waiters = inner.waiters.len(),
+            "budget grant to parked waiter",
+        );
         let reservation = Reservation {
             budget: budget.clone(),
             chunks: waiter.need,
@@ -210,9 +216,10 @@ impl MemoryBudget {
         bytes.div_ceil(self.chunk) as u64
     }
 
-    /// Attempt an immediate grant without parking. Returns None if the queue is
-    /// non-empty (no-barge) or the request does not fit. Unlike
-    /// [`reserve`](Self::reserve) it never enqueues a waiter and registers no waker.
+    /// Attempt an immediate grant without parking. Returns `None` if the queue is non-empty
+    /// (no-barge) or the request does not fit; registers no waker and never enqueues a waiter.
+    /// Grants under exactly the condition [`reserve`](Self::reserve) returns `Ready`, so it is
+    /// the allocation-free fast path when a caller can re-drive itself on failure.
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         let need = self.chunks_for(bytes);
         let mut inner = self.inner.lock();
@@ -254,6 +261,13 @@ impl MemoryBudget {
         // size never triggers it.
         if inner.waiters.is_empty() && can_grant(need, inner.in_use, inner.capacity) {
             inner.in_use += need;
+            tracing::trace!(
+                target: crate::telemetry::TARGET_MEMORY,
+                need,
+                in_use = inner.in_use,
+                capacity = inner.capacity,
+                "budget reserve granted",
+            );
             return Reserve::Ready(Reservation {
                 budget: Arc::clone(self),
                 chunks: need,
@@ -268,14 +282,30 @@ impl MemoryBudget {
             notify,
         });
         inner.total_parked += 1;
+        // Saturation edge: a reserve had to park. The budget cannot admit `need`
+        // until a live reservation releases, so a caller that never sees a release
+        // waits here indefinitely. Logged per park (a parked reserve is already a
+        // backpressure event, not steady-state noise).
+        tracing::debug!(
+            target: crate::telemetry::TARGET_MEMORY,
+            need,
+            in_use = inner.in_use,
+            capacity = inner.capacity,
+            waiters = inner.waiters.len(),
+            "budget reserve parked: request queued until a reservation releases",
+        );
         Reserve::Pending(WaitTicket {
             slot,
             budget: Arc::clone(self),
         })
     }
 
-    /// Resize the capacity (in bytes). Growing may drain parked waiters. Shrinking
-    /// is soft: never revokes already-granted chunks, just tightens future grants.
+    /// Resize the capacity (in bytes). Growing may drain parked waiters. Shrinking is soft: it
+    /// never revokes already-granted chunks, only tightens future grants.
+    ///
+    /// The budget is resizable by design; the measured/adaptive sizing loop that will drive this
+    /// is tracked in the memory-budget workstream. `allow(dead_code)` until that caller lands.
+    #[allow(dead_code)]
     pub(crate) fn set_limit(self: &Arc<Self>, capacity_bytes: usize) {
         let new_capacity = (capacity_bytes / self.chunk) as u64;
         let notifies = {
@@ -288,19 +318,18 @@ impl MemoryBudget {
         }
     }
 
-    /// Chunks currently reserved (granted and not yet released).
+    /// Chunks currently reserved (granted and not yet released). Test introspection;
+    /// production reads admission state through [`stats`](Self::stats).
+    #[cfg(test)]
     pub(crate) fn in_use_chunks(&self) -> u64 {
         self.inner.lock().in_use
     }
 
-    /// Current capacity in chunks.
+    /// Current capacity in chunks. Test introspection; production reads admission
+    /// state through [`stats`](Self::stats).
+    #[cfg(test)]
     pub(crate) fn capacity_chunks(&self) -> u64 {
         self.inner.lock().capacity
-    }
-
-    /// The fixed chunk size in bytes.
-    pub(crate) fn chunk_bytes(&self) -> usize {
-        self.chunk
     }
 
     /// Snapshot the budget's admission state under a single lock. Chunk counts are
@@ -322,6 +351,14 @@ impl Drop for Reservation {
         let notifies = {
             let mut inner = self.budget.inner.lock();
             inner.in_use = inner.in_use.saturating_sub(self.chunks);
+            tracing::trace!(
+                target: crate::telemetry::TARGET_MEMORY,
+                released = self.chunks,
+                in_use = inner.in_use,
+                capacity = inner.capacity,
+                waiters = inner.waiters.len(),
+                "budget reservation released",
+            );
             drain(&self.budget, &mut inner)
         };
         for f in notifies {
