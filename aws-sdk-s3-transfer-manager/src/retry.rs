@@ -186,23 +186,31 @@ pub(crate) fn classify_upload_part_retry(
 
 /// Classifier for download body reads.
 ///
-/// A chunk's body is consumed after the SDK's GetObject orchestration
-/// completes, so the SDK's own retry never covers a mid-stream failure. This
-/// loop exists to recover exactly that: a body-read failure (connection reset,
-/// truncated or short body) re-issues the ranged GET.
+/// A chunk's body is consumed after the SDK's GetObject orchestration completes,
+/// so the SDK's own retry never covers a mid-stream failure. This loop recovers
+/// exactly that, re-issuing the ranged GET, and it is the SOLE retrier for the
+/// body path.
 ///
-/// Within the body-read closure the error kind already separates the cases: a
-/// body-stream failure is an [`ErrorKind::IOError`], while a send-time failure
-/// arrives as an `SdkError`-derived kind that the SDK already retried before
-/// surfacing — re-issuing those is redundant, so they are terminal. A checksum
-/// mismatch arrives as [`ErrorKind::IntegrityError`] (classified at the body-read
-/// boundary) and is terminal: a corrupt body must never be re-fetched and masked.
+/// Retries three cases, all with full-jittered backoff except the straggler:
+///   - a **latency-deadline timeout** (a straggler on one connection) → retry
+///     **immediately** on a fresh connection; nothing shared to de-correlate.
+///   - a **transient transport** failure on the re-issue's send (connection IO
+///     error or client-side timeout) → **backoff**. These correlate under load —
+///     a system-wide resource exhaustion (e.g. macOS mbuf/ENOBUFS) fails many
+///     connections at once, and immediate re-issue re-collides on the same empty
+///     pool. Full jitter spreads the retries, same as the upload-part path.
+///   - a **body-stream** failure ([`ErrorKind::IOError`]: reset, truncated, short
+///     body) → **backoff** too. Under a saturated link these also cluster, so a
+///     jittered re-issue avoids marching the whole batch back into the congestion.
 ///
-/// This loop is the SOLE retrier for body reads (no inner SDK retry covers
-/// them), so it re-issues immediately; `_retry_index` is unused. The burst
-/// de-correlation that the upload path needs does not apply — body-read
-/// failures are independent connection events, not a shared-quota contention.
-pub(crate) fn classify_body_retry(ge: &GuardError<Error>, _retry_index: u32) -> RetryDecision {
+/// A checksum mismatch ([`ErrorKind::IntegrityError`], classified at the body-read
+/// boundary) is terminal: a corrupt body must never be re-fetched and masked.
+/// Everything else is terminal.
+pub(crate) fn classify_body_retry(
+    ge: &GuardError<Error>,
+    retry_index: u32,
+    backoff: &Backoff,
+) -> RetryDecision {
     let err = match ge {
         GuardError::DeadlineExceeded(_) => return RetryDecision::Retry { delay: None },
         GuardError::Inner(e) => e,
@@ -211,7 +219,16 @@ pub(crate) fn classify_body_retry(ge: &GuardError<Error>, _retry_index: u32) -> 
     match err.kind() {
         // A checksum mismatch must never be re-fetched and masked.
         ErrorKind::IntegrityError(_) => RetryDecision::NoRetry,
-        ErrorKind::IOError => RetryDecision::Retry { delay: None },
+        // Transient transport on the send (surfaced as ServiceError with the
+        // transient-transport flag): correlated under resource exhaustion, so
+        // back off to de-correlate the burst.
+        ErrorKind::ServiceError if err.is_transient_transport() => RetryDecision::Retry {
+            delay: Some(backoff.delay(retry_index, fastrand::f64())),
+        },
+        // Mid-stream body-read failure: back off too (clusters under load).
+        ErrorKind::IOError => RetryDecision::Retry {
+            delay: Some(backoff.delay(retry_index, fastrand::f64())),
+        },
         _ => RetryDecision::NoRetry,
     }
 }
@@ -360,7 +377,10 @@ mod tests {
         let b = Backoff::transient();
         for _ in 0..10_000 {
             let d = b.delay(2, fastrand::f64());
-            assert!(d <= Duration::from_millis(400), "delay {d:?} exceeded ceiling");
+            assert!(
+                d <= Duration::from_millis(400),
+                "delay {d:?} exceeded ceiling"
+            );
         }
     }
 
@@ -418,23 +438,42 @@ mod tests {
 
     #[test]
     fn body_retry_deadline_exceeded_retries_immediately() {
-        let d = classify_body_retry(&GuardError::DeadlineExceeded(Duration::from_secs(1)), 0);
+        let b = Backoff::transient();
+        let d = classify_body_retry(&GuardError::DeadlineExceeded(Duration::from_secs(1)), 0, &b);
+        // A straggler retries immediately — no backoff.
         assert_eq!(retry_delay(d), Some(None));
     }
 
     #[test]
     fn body_retry_cancellation_does_not_retry() {
+        let b = Backoff::transient();
         let err = Error::new(ErrorKind::OperationCancelled, "cancelled mid body");
-        let d = classify_body_retry(&GuardError::Inner(err), 0);
+        let d = classify_body_retry(&GuardError::Inner(err), 0, &b);
         assert!(matches!(d, RetryDecision::NoRetry));
     }
 
     #[test]
-    fn body_retry_unrecognized_io_error_retries_now() {
-        // A transport/byte-stream error that isn't an SdkError or checksum
-        // mismatch falls through to immediate retry (no backoff on the body path).
+    fn body_retry_io_error_backs_off() {
+        // A body-stream failure retries with backoff (clusters under load).
+        let b = Backoff::transient();
         let err = Error::new(ErrorKind::IOError, "connection reset by peer");
-        let d = classify_body_retry(&GuardError::Inner(err), 0);
-        assert_eq!(retry_delay(d), Some(None));
+        let d = classify_body_retry(&GuardError::Inner(err), 0, &b);
+        assert!(
+            matches!(retry_delay(d), Some(Some(_))),
+            "IOError should retry with a backoff delay"
+        );
+    }
+
+    #[test]
+    fn body_retry_transient_transport_backs_off() {
+        // A transient-transport send failure (ENOBUFS/connect/timeout class)
+        // retries with backoff, de-correlating a correlated burst.
+        let b = Backoff::transient();
+        let err = Error::test_transient_transport();
+        let d = classify_body_retry(&GuardError::Inner(err), 0, &b);
+        assert!(
+            matches!(retry_delay(d), Some(Some(_))),
+            "transient-transport ServiceError should retry with a backoff delay"
+        );
     }
 }

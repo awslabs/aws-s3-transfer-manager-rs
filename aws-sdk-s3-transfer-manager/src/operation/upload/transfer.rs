@@ -411,9 +411,7 @@ impl UploadTransfer {
         let backoff = crate::retry::Backoff::transient();
         let result = crate::retry::retry_guarded(
             send_latencies,
-            |ge, retry_index| {
-                crate::retry::classify_upload_part_retry(ge, retry_index, &backoff)
-            },
+            |ge, retry_index| crate::retry::classify_upload_part_retry(ge, retry_index, &backoff),
             || {
                 let body = ByteStream::from(data_bytes.clone());
                 let req = copy_fields_to_upload_part_request(
@@ -439,8 +437,9 @@ impl UploadTransfer {
                         .await
                         .map_err(crate::error::Error::from)
                 }
-            })
-            .await;
+            },
+        )
+        .await;
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => return self.fail(e),

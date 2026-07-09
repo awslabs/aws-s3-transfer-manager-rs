@@ -246,9 +246,7 @@ impl Error {
     /// retry (e.g. its shared retry token bucket was exhausted under a concurrent
     /// burst). Always `false` for throttling and modeled service errors.
     pub(crate) fn is_transient_transport(&self) -> bool {
-        self.extra
-            .as_ref()
-            .is_some_and(|e| e.transient_transport)
+        self.extra.as_ref().is_some_and(|e| e.transient_transport)
     }
 
     /// The chunk this failure is attributable to, if known.

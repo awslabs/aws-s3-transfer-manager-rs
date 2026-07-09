@@ -55,11 +55,7 @@ async fn setup_with_fault(
 
     // Rebuild the mock's S3 client with our fault connector as the http_client.
     let base = handle.client().await;
-    let conf = base
-        .config()
-        .to_builder()
-        .http_client(http_client)
-        .build();
+    let conf = base.config().to_builder().http_client(http_client).build();
     let s3_client = aws_sdk_s3::Client::from_conf(conf);
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()

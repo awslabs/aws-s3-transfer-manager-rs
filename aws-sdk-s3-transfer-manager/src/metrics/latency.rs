@@ -20,6 +20,18 @@ use hdrhistogram::Histogram;
 ///     5s+ stragglers are caught and retried.
 const WARM_DEADLINE_MULTIPLIER: f64 = 2.0;
 
+/// Floor on the adaptive deadline, independent of observed P99.
+///
+/// A single tracker mixes all request sizes on its direction, so for small
+/// objects P99 can be a few milliseconds and `P99 × 2` lands in the tens of
+/// milliseconds — below the normal spread of a healthy request under load,
+/// which false-positive-cancels requests that are merely slow, not stuck. The
+/// floor keeps the deadline above that noise: a same-region S3 request taking
+/// longer than this is stuck rather than jittery (a cold TCP+TLS connect can
+/// approach it; the SDK connect timeout is ~3.1s). Applied to the base P99
+/// deadline; rate-based widening still adds on top.
+const DEADLINE_FLOOR: Duration = Duration::from_millis(275);
+
 /// Number of samples required before switching to the adaptive P99-based
 /// deadline. Needs enough data for a meaningful P99 estimate.
 const WARM_THRESHOLD: usize = 10;
@@ -114,8 +126,8 @@ impl LatencyTracker {
     ///
     /// Returns `None` when cold (fewer than [`WARM_THRESHOLD`] samples) or
     /// when the average latency exceeds [`RETRY_COST_THRESHOLD`] (escape hatch
-    /// for large parts). Otherwise returns P99 × [`WARM_DEADLINE_MULTIPLIER`],
-    /// widened by rate-based backoff when timeouts are frequent.
+    /// for large parts). Otherwise returns `max(P99 × `[`WARM_DEADLINE_MULTIPLIER`]`,
+    /// `[`DEADLINE_FLOOR`]`)`, widened by rate-based backoff when timeouts are frequent.
     pub(crate) fn deadline(&self) -> Option<Duration> {
         let samples = self.sample_count.load(Ordering::Relaxed);
         if samples < WARM_THRESHOLD {
@@ -141,7 +153,10 @@ impl LatencyTracker {
         }
 
         let p99 = Duration::from_micros(hist.value_at_percentile(99.0));
-        let mut deadline = p99.mul_f64(WARM_DEADLINE_MULTIPLIER);
+        // Floor the base deadline before rate-based widening: a small-object P99
+        // can be single-digit ms, and P99 × 2 there cancels healthy-but-slow
+        // requests. Widening still adds on top of the floored base.
+        let mut deadline = p99.mul_f64(WARM_DEADLINE_MULTIPLIER).max(DEADLINE_FLOOR);
 
         // Rate-based backoff: widen deadline when timeouts are frequent.
         // Prevents cascading cancellations that destroy connections faster
@@ -235,13 +250,28 @@ mod tests {
     #[test]
     fn test_warm_transition() {
         let tracker = LatencyTracker::new();
-        warm_tracker(&tracker, Duration::from_millis(100));
-        // All samples at 100ms → P99 ≈ 100ms, deadline ≈ 200ms
-        // HdrHistogram quantizes values to 3 significant digits, so allow ±1ms.
+        // Samples at 200ms → P99 ≈ 200ms, P99 × 2 ≈ 400ms, clear of the floor so
+        // this exercises the multiplier rather than DEADLINE_FLOOR.
+        warm_tracker(&tracker, Duration::from_millis(200));
+        // HdrHistogram quantizes values to 3 significant digits, so allow ±2ms.
         let deadline = tracker.deadline().expect("should be warm");
         assert!(
-            (deadline.as_millis() as i64 - 200).unsigned_abs() <= 1,
-            "expected ~200ms, got {deadline:?}"
+            (deadline.as_millis() as i64 - 400).unsigned_abs() <= 2,
+            "expected ~400ms, got {deadline:?}"
+        );
+    }
+
+    #[test]
+    fn test_deadline_floored_for_small_p99() {
+        let tracker = LatencyTracker::new();
+        // Small-object latencies: P99 ≈ 5ms → P99 × 2 ≈ 10ms, far below the floor.
+        // Without the floor this would false-positive-cancel healthy-but-slow
+        // requests under load; the floor holds the deadline at DEADLINE_FLOOR.
+        warm_tracker(&tracker, Duration::from_millis(5));
+        let deadline = tracker.deadline().expect("should be warm");
+        assert_eq!(
+            deadline, DEADLINE_FLOOR,
+            "small-P99 deadline must be floored, got {deadline:?}"
         );
     }
 
@@ -277,51 +307,51 @@ mod tests {
         let tracker = LatencyTracker::new();
         // Record many samples — histogram handles arbitrary counts
         for _ in 0..1000 {
-            tracker.record(Duration::from_millis(100));
+            tracker.record(Duration::from_millis(200));
         }
-        // All uniform at 100ms → deadline ≈ 200ms. Allow ±1ms for quantization.
+        // All uniform at 200ms → deadline ≈ 400ms (clear of the floor). Allow ±2ms.
         let deadline = tracker.deadline().expect("should be warm");
         assert!(
-            (deadline.as_millis() as i64 - 200).unsigned_abs() <= 1,
-            "expected ~200ms, got {deadline:?}"
+            (deadline.as_millis() as i64 - 400).unsigned_abs() <= 2,
+            "expected ~400ms, got {deadline:?}"
         );
     }
 
     #[test]
     fn test_rate_backoff_moderate() {
         let tracker = LatencyTracker::new();
-        // 1000 samples at 100ms → P99 ≈ 100ms, base deadline ≈ 200ms
+        // 1000 samples at 200ms → P99 ≈ 200ms, base deadline ≈ 400ms (clear of floor)
         for _ in 0..1000 {
-            tracker.record(Duration::from_millis(100));
+            tracker.record(Duration::from_millis(200));
         }
         // 2 timeouts out of 1002 total ≈ 0.2% > TIMEOUT_RATE_MODERATE (0.1%)
         tracker.record_timeout();
         tracker.record_timeout();
 
         let deadline = tracker.deadline().expect("should be warm");
-        // Base ~200ms + 100ms backoff = ~300ms
+        // Base ~400ms + 100ms backoff = ~500ms
         assert!(
-            deadline.as_millis() >= 290,
-            "expected >= 290ms with moderate backoff, got {deadline:?}"
+            deadline.as_millis() >= 490,
+            "expected >= 490ms with moderate backoff, got {deadline:?}"
         );
     }
 
     #[test]
     fn test_rate_backoff_high() {
         let tracker = LatencyTracker::new();
-        // 100 samples at 100ms → P99 ≈ 100ms, base deadline ≈ 200ms
+        // 100 samples at 200ms → P99 ≈ 200ms, base deadline ≈ 400ms (clear of floor)
         for _ in 0..100 {
-            tracker.record(Duration::from_millis(100));
+            tracker.record(Duration::from_millis(200));
         }
         // 2 timeouts out of 102 total ≈ 1.96% > TIMEOUT_RATE_HIGH (1%)
         tracker.record_timeout();
         tracker.record_timeout();
 
         let deadline = tracker.deadline().expect("should be warm");
-        // Base ~200ms + 1s backoff = ~1200ms
+        // Base ~400ms + 1s backoff = ~1400ms
         assert!(
-            deadline.as_millis() >= 1190,
-            "expected >= 1190ms with high backoff, got {deadline:?}"
+            deadline.as_millis() >= 1390,
+            "expected >= 1390ms with high backoff, got {deadline:?}"
         );
     }
 
