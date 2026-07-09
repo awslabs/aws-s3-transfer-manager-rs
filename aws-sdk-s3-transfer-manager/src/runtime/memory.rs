@@ -156,7 +156,7 @@ fn drain(budget: &Arc<MemoryBudget>, inner: &mut Inner) -> Vec<NotifyFn> {
         let waiter = inner.waiters.pop_front().unwrap();
         inner.in_use += waiter.need;
         tracing::trace!(
-            target: crate::telemetry::TARGET_MEMORY,
+            target: crate::telemetry::TARGET_SCHEDULING,
             need = waiter.need,
             in_use = inner.in_use,
             capacity = inner.capacity,
@@ -262,7 +262,7 @@ impl MemoryBudget {
         if inner.waiters.is_empty() && can_grant(need, inner.in_use, inner.capacity) {
             inner.in_use += need;
             tracing::trace!(
-                target: crate::telemetry::TARGET_MEMORY,
+                target: crate::telemetry::TARGET_SCHEDULING,
                 need,
                 in_use = inner.in_use,
                 capacity = inner.capacity,
@@ -287,7 +287,7 @@ impl MemoryBudget {
         // waits here indefinitely. Logged per park (a parked reserve is already a
         // backpressure event, not steady-state noise).
         tracing::debug!(
-            target: crate::telemetry::TARGET_MEMORY,
+            target: crate::telemetry::TARGET_SCHEDULING,
             need,
             in_use = inner.in_use,
             capacity = inner.capacity,
@@ -352,7 +352,7 @@ impl Drop for Reservation {
             let mut inner = self.budget.inner.lock();
             inner.in_use = inner.in_use.saturating_sub(self.chunks);
             tracing::trace!(
-                target: crate::telemetry::TARGET_MEMORY,
+                target: crate::telemetry::TARGET_SCHEDULING,
                 released = self.chunks,
                 in_use = inner.in_use,
                 capacity = inner.capacity,

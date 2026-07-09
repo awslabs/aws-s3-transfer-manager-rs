@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! RUST_LOG=aws_s3_transfer_manager::concurrency=debug   # adaptive algorithm decisions
-//! RUST_LOG=aws_s3_transfer_manager::scheduling=debug     # scheduler capacity, worker pool
+//! RUST_LOG=aws_s3_transfer_manager::scheduling=debug     # scheduler + memory-budget capacity
 //! RUST_LOG=aws_s3_transfer_manager::execution=trace      # per-work-item execute/complete
 //! RUST_LOG=aws_s3_transfer_manager::transfer=debug       # transfer lifecycle events
 //! ```
@@ -22,7 +22,8 @@ use std::time::Duration;
 /// Adaptive concurrency controller: phase transitions, target changes, probe results.
 pub(crate) const TARGET_CONCURRENCY: &str = "aws_sdk_s3_transfer_manager::concurrency";
 
-/// Scheduler capacity decisions, worker pool growth.
+/// Scheduler capacity decisions, worker pool growth, and memory-budget admission
+/// (reserve/grant/release flow, and saturation edges where a reserve parks).
 pub(crate) const TARGET_SCHEDULING: &str = "aws_sdk_s3_transfer_manager::scheduling";
 
 /// Per-work-item execution: dispatch, complete, skip, panic.
@@ -30,10 +31,6 @@ pub(crate) const TARGET_EXECUTION: &str = "aws_sdk_s3_transfer_manager::executio
 
 /// Transfer lifecycle: enqueue, complete, cancel, fail, state transitions.
 pub(crate) const TARGET_TRANSFER: &str = "aws_sdk_s3_transfer_manager::transfer";
-
-/// Memory-budget admission control: reserve/grant/release flow (`trace`) and
-/// saturation edges where a reserve parks until a reservation releases (`debug`).
-pub(crate) const TARGET_MEMORY: &str = "aws_sdk_s3_transfer_manager::memory";
 
 /// Observability surface for transfer operations.
 ///

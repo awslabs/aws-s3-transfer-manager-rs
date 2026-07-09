@@ -473,7 +473,7 @@ impl DownloadTransfer {
                 let terminal_wake = self.inner.discovery_notify.notified();
                 if let Some(reservation) = ticket.take() {
                     tracing::debug!(
-                        target: crate::telemetry::TARGET_MEMORY,
+                        target: crate::telemetry::TARGET_SCHEDULING,
                         tid = %self.inner.ctx.id,
                         len,
                         "discovery chunk reservation granted; resuming",
