@@ -6,11 +6,12 @@
 use bytes::Buf;
 
 use crate::io::AggregatedBytes;
+use crate::runtime::memory::Reservation;
 use crate::runtime::sync::sync::Arc;
 
 use super::chunk_meta::ChunkMetadata;
 use super::recv_buffer::{
-    FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
+    DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
 };
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
@@ -100,7 +101,7 @@ enum Mode {
 }
 
 /// Producer handle to the download body buffer. Held at `self.inner.writer`
-/// in the transfer. Cheap to clone (all state behind Arc).
+/// in the transfer. Clone shares all state via `Arc`.
 #[derive(Clone)]
 pub(crate) struct BodyWriter {
     buffer: PagedRecvBuffer<ChunkOutput>,
@@ -123,6 +124,13 @@ pub(crate) struct BodySlot {
     handle: Option<SlotHandle<ChunkOutput>>,
     buffer: PagedRecvBuffer<ChunkOutput>,
     notify: Arc<WakeNotify>,
+    /// Memory-budget reservation held from claim, moved into the chunk at
+    /// [`fill`](Self::fill). The reservation then rides the `ChunkOutput` through
+    /// the buffer and drops with it: on the stream surface when the consumer drops
+    /// the delivered chunk (its true residency), on the disk surface when the drain
+    /// frees the payload after copy-out. `None` until [`attach_reservation`], and on
+    /// paths that do not reserve (tests).
+    reservation: Option<Reservation>,
 }
 
 impl std::fmt::Debug for BodySlot {
@@ -139,10 +147,20 @@ impl BodySlot {
         self.handle.as_ref().expect("slot already consumed").seq()
     }
 
+    /// Attach the memory-budget reservation backing this chunk. Held on the slot
+    /// from claim until [`fill`](Self::fill) moves it into the `ChunkOutput`, so it
+    /// drops with the chunk's bytes rather than at the buffer boundary.
+    pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
+        self.reservation = Some(reservation);
+    }
+
     /// Publish a completed chunk into this slot. Wakes the stream consumer
-    /// and returns the fill outcome (whether a segment was sealed).
-    pub(crate) fn fill(mut self, chunk: ChunkOutput) -> FillOutcome {
+    /// and returns the fill outcome (whether a segment was sealed). The slot's
+    /// reservation moves into the chunk so it rides through the buffer and drops
+    /// with the delivered bytes.
+    pub(crate) fn fill(mut self, mut chunk: ChunkOutput) -> FillOutcome {
         let handle = self.handle.take().expect("slot already consumed");
+        chunk.reservation = self.reservation.take().map(Arc::new);
         let outcome = self.buffer.fill(handle, chunk);
         self.notify.notify_one();
         outcome
@@ -172,6 +190,7 @@ impl BodyWriter {
             handle: Some(handle),
             buffer: self.buffer.clone(),
             notify: self.notify.clone(),
+            reservation: None,
         }
     }
 
@@ -182,14 +201,14 @@ impl BodyWriter {
     /// Returns the number of parts freed across the runs drained by this call — the
     /// read-ahead occupancy the caller releases. The buffer does not track a running
     /// total; the download layer accounts for the freed count under its state lock.
-    pub(crate) fn drain(&self, terminal: bool) -> Result<u64, std::io::Error> {
+    pub(crate) fn drain(&self, mode: DrainMode) -> Result<u64, std::io::Error> {
         let mut freed = 0u64;
         if let Mode::Disk {
             sink,
             object_range_start,
         } = &*self.mode
         {
-            while let Some(sw) = self.buffer.take_drain_run(terminal) {
+            while let Some(sw) = self.buffer.take_drain_run(mode) {
                 write_run(sink.as_ref(), *object_range_start, &sw)?;
                 freed += sw.complete();
             }
@@ -205,13 +224,29 @@ impl BodyWriter {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
             return Ok(0);
         }
-        let terminal_parts = self.drain(true)?;
+        let terminal_parts = self.drain(DrainMode::Eager)?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             terminal_parts,
             "terminal drain complete; tail flushed to disk",
         );
         Ok(terminal_parts)
+    }
+
+    /// Whether a forced eager drain would free at least one resident part right now:
+    /// the disk surface holds a contiguous filled run at some segment's claim cursor.
+    /// Stream mode returns false — its consumer drives release, so it never pins budget
+    /// behind the drain batch. Gates budget-pressure relief (`drain_or_park`).
+    pub(crate) fn has_drainable_resident(&self) -> bool {
+        matches!(&*self.mode, Mode::Disk { .. }) && self.buffer.has_drainable_prefix()
+    }
+
+    /// Flush the resident filled prefix to disk now, below the drain batch — budget
+    /// backpressure relief, distinct in intent from the terminal `finalize` but using
+    /// the same eager take. Returns the parts freed so the caller releases their
+    /// read-ahead occupancy. Not terminal: the transfer keeps issuing after this.
+    pub(crate) fn flush_resident(&self) -> Result<u64, std::io::Error> {
+        self.drain(DrainMode::Eager)
     }
 
     /// Couple the drain batch to the read-ahead window: a window narrower than a
@@ -395,6 +430,12 @@ pub struct ChunkOutput {
     /// The metadata associated with this particular ranged GetObject request. This contains all the
     /// metadata returned by the S3 GetObject operation.
     pub metadata: ChunkMetadata,
+    /// Memory-budget reservation accounting for this chunk's bytes. Rides the chunk
+    /// from fill through delivery; the budget is charged until the last clone of the
+    /// delivered chunk drops (`AggregatedBytes` clones share the same backing bytes,
+    /// so an `Arc` reservation matches that residency exactly). `None` on paths that
+    /// do not reserve against the budget.
+    pub(crate) reservation: Option<Arc<Reservation>>,
 }
 
 impl std::fmt::Debug for ChunkOutput {
@@ -487,6 +528,7 @@ mod tests {
             offset: 0,
             data,
             metadata: Default::default(),
+            reservation: None,
         }
     }
 
@@ -629,7 +671,7 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, DrainMode,
         RecvBodyConsumer, SinkWrite,
     };
     use bytes::Buf as _;
@@ -644,6 +686,7 @@ mod tests {
             offset,
             data: AggregatedBytes(seg),
             metadata: Default::default(),
+            reservation: None,
         }
     }
 
@@ -707,6 +750,33 @@ mod tests {
         (writer, consumer, sink)
     }
 
+    /// `has_drainable_resident` gates budget-relief draining. It is true only on the
+    /// disk surface with a filled run at the cursor: stream mode returns false (the
+    /// consumer drives release there, so an eager drain would be a no-op that spins),
+    /// and a resident run only exists once a slot at the cursor is filled.
+    #[test]
+    fn has_drainable_resident_only_on_disk_with_a_filled_run() {
+        // Stream mode: even with a filled slot, never drainable-resident.
+        let (stream_writer, _consumer) = new_recv_body();
+        stream_writer.claim().fill(chunk_at(0, 0, b"streamed"));
+        assert!(
+            !stream_writer.has_drainable_resident(),
+            "stream mode has no drainable-resident run (consumer drives release)"
+        );
+
+        // Disk mode: empty → false; filled at the cursor → true.
+        let (disk_writer, _consumer, _sink) = new_recv_body_with_capture(0);
+        assert!(
+            !disk_writer.has_drainable_resident(),
+            "disk mode with nothing filled is not drainable-resident"
+        );
+        disk_writer.claim().fill(chunk_at(0, 0, b"resident"));
+        assert!(
+            disk_writer.has_drainable_resident(),
+            "disk mode with a filled run at the cursor is drainable-resident"
+        );
+    }
+
     #[test]
     fn disk_writes_full_segment() {
         use super::SEG_SIZE;
@@ -724,7 +794,7 @@ mod tests {
         }
 
         // The last fill sealed the segment; drain it.
-        writer.drain(false).unwrap();
+        writer.drain(DrainMode::Batched).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for i in 0..SEG_SIZE as u64 {
@@ -817,7 +887,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, data.as_bytes()));
         }
 
-        writer.drain(false).unwrap();
+        writer.drain(DrainMode::Batched).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for i in 0..n as u64 {
@@ -897,7 +967,7 @@ mod tests {
             let outcome = slot.fill(chunk_at(i, i * 100, format!("d{i}").as_bytes()));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
-                freed_total += writer.drain(false).unwrap();
+                freed_total += writer.drain(DrainMode::Batched).unwrap();
             }
         }
         // A terminal drain flushes any sub-batch tail so the total accounts for every part.
@@ -983,7 +1053,7 @@ mod tests {
                         let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
                         // Mirror execute_get_range: drain on the batch edge.
                         if outcome == super::FillOutcome::DrainReady {
-                            let freed = writer.drain(false).unwrap();
+                            let freed = writer.drain(DrainMode::Batched).unwrap();
                             freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
@@ -1010,5 +1080,122 @@ mod tests {
             expected,
             "out-of-order concurrent drain must reassemble the object byte-for-byte"
         );
+    }
+
+    // --- Reservation lease-lifetime tests ---
+    //
+    // The budget caps TOTAL memory the transfer manager holds, not buffer residency
+    // (the read-ahead window already bounds that). So a reservation must live for as
+    // long as the bytes it accounts for are resident: on the stream surface the bytes
+    // escape to the consumer in the delivered `ChunkOutput` and stay resident until
+    // the consumer drops it, so the reservation must ride the chunk and release on
+    // consumer-drop — NOT at the buffer boundary. On the disk surface the drain copies
+    // the bytes out and frees them, so the reservation releases at drain.
+
+    use crate::runtime::memory::MemoryBudget;
+
+    #[test]
+    fn stream_reservation_rides_chunk_and_releases_on_consumer_drop() {
+        let chunk_bytes = 1024;
+        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
+        let (writer, mut consumer) = new_recv_body();
+
+        // Claim, reserve, fill — the producer path. One chunk charged.
+        let mut slot = writer.claim();
+        slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
+        assert_eq!(budget.in_use_chunks(), 1);
+        slot.fill(chunk_resp(0, {
+            let mut seg = SegmentedBuf::new();
+            seg.push(Bytes::from("hello"));
+            AggregatedBytes(seg)
+        }));
+
+        // Still charged while the chunk sits in the buffer.
+        assert_eq!(budget.in_use_chunks(), 1);
+
+        // Deliver to the consumer. The chunk (and its reservation) leaves the buffer as
+        // an owned value — the bytes are now resident in the consumer's hands, so the
+        // budget must STILL be charged. Releasing here would be the lease-lifetime bug.
+        let chunk = consumer.try_take_next().expect("chunk delivered");
+        assert_eq!(chunk.data.clone().to_vec(), b"hello");
+        assert_eq!(
+            budget.in_use_chunks(),
+            1,
+            "reservation must survive delivery: the bytes are resident in the consumer"
+        );
+
+        // Consumer drops the chunk: the bytes are freed, so the reservation releases.
+        drop(chunk);
+        assert_eq!(
+            budget.in_use_chunks(),
+            0,
+            "reservation must release when the consumer drops the delivered chunk"
+        );
+    }
+
+    #[test]
+    fn stream_reservation_holds_until_last_chunk_clone_drops() {
+        // `ChunkOutput` is Clone and its `AggregatedBytes` clone shares the same backing
+        // `Bytes` (a refcount bump, no copy), so the bytes stay resident until the last
+        // clone drops. The `Arc<Reservation>` matches that: the budget stays charged
+        // until the final clone is gone, never double-charged for the shared buffer.
+        let chunk_bytes = 1024;
+        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
+        let (writer, mut consumer) = new_recv_body();
+
+        let mut slot = writer.claim();
+        slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
+        slot.fill(chunk_resp(0, {
+            let mut seg = SegmentedBuf::new();
+            seg.push(Bytes::from("shared"));
+            AggregatedBytes(seg)
+        }));
+
+        let chunk = consumer.try_take_next().expect("chunk delivered");
+        let clone = chunk.clone();
+        assert_eq!(
+            budget.in_use_chunks(),
+            1,
+            "one physical buffer, charged once"
+        );
+
+        // Dropping one clone does not release: the other still holds the bytes.
+        drop(chunk);
+        assert_eq!(
+            budget.in_use_chunks(),
+            1,
+            "a surviving clone still holds the resident bytes"
+        );
+
+        // The last clone drops: now the bytes are gone and the reservation releases.
+        drop(clone);
+        assert_eq!(budget.in_use_chunks(), 0, "released on last clone drop");
+    }
+
+    #[test]
+    fn disk_reservation_releases_on_drain() {
+        let chunk_bytes = 1024;
+        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+
+        let mut slot = writer.claim();
+        slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
+        slot.fill(chunk_at(0, 0, b"flushed"));
+
+        // Charged while resident in the buffer, before the drain copies it out.
+        assert_eq!(budget.in_use_chunks(), 1);
+
+        // The drain writes the bytes to the sink and frees the buffer payload; the disk
+        // surface owns nothing after copy-out, so the reservation releases here.
+        writer.finalize().unwrap();
+        assert_eq!(
+            budget.in_use_chunks(),
+            0,
+            "disk drain copies out and frees the bytes; the reservation releases at drain"
+        );
+        assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");
     }
 }

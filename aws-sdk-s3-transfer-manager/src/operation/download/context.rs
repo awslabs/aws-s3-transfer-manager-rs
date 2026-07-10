@@ -3,6 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::operation::download::body::BodySlot;
+use crate::runtime::memory::WaitTicket;
+
+/// A claimed slot whose backing memory is not yet reserved. Held while a transfer
+/// is budget-blocked: the read-ahead gate admitted the slot (`gate.try_issue`
+/// already counted it as issued) and it was claimed from the buffer, but it cannot be
+/// filled until the budget grants `ticket`. Dropping it (on terminal) releases the
+/// slot and cancels the budget wait.
+#[derive(Debug)]
+pub(crate) struct PendingClaim {
+    pub(crate) slot: BodySlot,
+    pub(crate) ticket: WaitTicket,
+}
+
 /// Mutable state for tracking download work progress
 #[derive(Debug)]
 pub(crate) enum DownloadState {
@@ -28,6 +42,12 @@ pub(crate) enum DownloadState {
         /// Read-ahead occupancy accounting. Bounds resident memory by gating
         /// issuance on `issued - released < window`.
         gate: OccupancyGate,
+        /// A claimed-but-unfilled slot whose memory reservation is still pending,
+        /// held only while budget-blocked. `Some` after the gate admitted a slot
+        /// (already counted in `gate.issued`) but the budget queued the reservation;
+        /// taken once the budget grants. Dropping the state on terminal releases the
+        /// slot and cancels the wait.
+        pending: Option<PendingClaim>,
     },
 
     /// Terminal state - transfer ended (success, failure, or cancelled)
@@ -38,6 +58,21 @@ pub(crate) enum DownloadState {
 impl DownloadState {
     pub(crate) fn new() -> Self {
         DownloadState::PendingDiscovery
+    }
+
+    /// The sanctioned transition to `Terminal`. Extracts a budget-parked claim, if any, so the
+    /// caller can drop it AFTER releasing the state lock. `WaitTicket::drop` takes the budget
+    /// lock, which must never nest under the state lock this state is guarded by; returning the
+    /// claim here makes releasing the lock first the only way to use this method. Assign
+    /// `Terminal` through this method rather than directly.
+    #[must_use = "drop the returned PendingClaim only after releasing the state lock"]
+    pub(crate) fn enter_terminal(&mut self) -> Option<PendingClaim> {
+        let pending = match self {
+            DownloadState::Transferring { pending, .. } => pending.take(),
+            _ => None,
+        };
+        *self = DownloadState::Terminal;
+        pending
     }
 }
 

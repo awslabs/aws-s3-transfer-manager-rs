@@ -188,7 +188,7 @@
 //!
 //! # Caller obligations
 //!
-//! The ring does not bound its own growth: it allocates a segment whenever a claim
+//! The buffer does not bound its own growth: it allocates a segment whenever a claim
 //! reaches a sequence past the current tail. The caller must bound outstanding
 //! (claimed-but-undelivered) sequences, or resident memory grows without limit.
 
@@ -430,6 +430,18 @@ pub(crate) enum FillOutcome {
     DrainReady,
 }
 
+/// How aggressively [`take_drain_run`](PagedRecvBuffer::take_drain_run) claims a run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DrainMode {
+    /// Steady-state coalescing: claim a run only once it reaches the drain batch (or a
+    /// full segment's residue). The fill-triggered drain uses this so writes coalesce.
+    Batched,
+    /// Take any contiguous filled prefix now, however short. Used by the terminal flush
+    /// (drain the tail below the batch at end-of-stream) and by budget-pressure relief
+    /// (release resident chunks a transfer would otherwise pin while parked).
+    Eager,
+}
+
 /// An owned token granting consumption of one claimed run of a segment's payloads.
 ///
 /// A run is the contiguous slice `[start, start + len)` of a segment's slots, claimed
@@ -440,7 +452,7 @@ pub(crate) enum FillOutcome {
 /// call that produced it: a synchronous consumer completes it immediately, an
 /// asynchronous one parks it and completes it on a later event.
 ///
-/// The strong ring reference keeps the buffer accounting alive for exactly the
+/// The strong buffer reference keeps the buffer accounting alive for exactly the
 /// outstanding-write window — the correct lifetime, since a write may be reading a
 /// run's bytes when every other handle has dropped. It is bounded (released at
 /// `complete` or drop) and forms no cycle (segments do not point back at `Inner`).
@@ -587,14 +599,14 @@ unsafe impl<T: Send> Send for SegmentWrite<T> {}
 unsafe impl<T: Send> Sync for SegmentWrite<T> {}
 
 impl<T> PagedRecvBuffer<T> {
-    /// Create an empty ring with the default segment size ([`DEFAULT_SEG_SIZE`]),
+    /// Create an empty buffer with the default segment size ([`DEFAULT_SEG_SIZE`]),
     /// returning the producer/block handle and the unique stream [`RecvBufferConsumer`].
     #[cfg(test)]
     pub(crate) fn new() -> (Self, RecvBufferConsumer<T>) {
         Self::new_with_segment_size(DEFAULT_SEG_SIZE)
     }
 
-    /// Create an empty ring whose segments hold `seg_size` slots each. One segment
+    /// Create an empty buffer whose segments hold `seg_size` slots each. One segment
     /// based at sequence 0 exists initially, shared by the producer/block handle and
     /// the consumer's `current`. Panics if `seg_size == 0`.
     pub(crate) fn new_with_segment_size(seg_size: usize) -> (Self, RecvBufferConsumer<T>) {
@@ -719,12 +731,13 @@ impl<T> PagedRecvBuffer<T> {
     /// Claim the frontmost drainable run as an owned [`SegmentWrite`], or `None`.
     ///
     /// Walks segments front to back under the lock. For each segment, scans the
-    /// contiguous `FILLED` run beyond its `claim_cursor`. A non-terminal call claims
-    /// that run only if it spans at least the drain batch, and then claims the whole
-    /// run (coalescing greedily, bounded by the segment). A terminal call claims
+    /// contiguous `FILLED` run beyond its `claim_cursor`. [`DrainMode::Batched`] claims
+    /// that run only if it spans at least the drain batch, and then claims the whole run
+    /// (coalescing greedily, bounded by the segment). [`DrainMode::Eager`] claims
     /// whatever contiguous filled run exists, however short — this is what drains the
-    /// partial final segment at end-of-stream, which a non-terminal call would leave
-    /// below the batch forever. The run is `[claim_cursor, claim_cursor + len)`.
+    /// partial final segment at end-of-stream (which `Batched` would leave below the
+    /// batch forever) and what relieves budget pressure. The run is
+    /// `[claim_cursor, claim_cursor + len)`.
     ///
     /// Advancing `claim_cursor` under the lock makes a run claimed at most once: a
     /// second caller, racing or sequential, observes the advanced cursor and scans
@@ -733,11 +746,13 @@ impl<T> PagedRecvBuffer<T> {
     /// `publish_filled` `Release` — the same handoff [`poll_next`](RecvBufferConsumer::poll_next)
     /// relies on — so the claimed run's payloads are safe to read.
     ///
-    /// # Terminal caller obligation
-    /// Pass `terminal` only once issuance is complete and all outstanding fills have
-    /// landed: a slot claimed here must not receive a later fill (it would race the
-    /// block consumer reading the run). Unfilled trailing slots are simply not claimed.
-    pub(crate) fn take_drain_run(&self, terminal: bool) -> Option<SegmentWrite<T>> {
+    /// # Eager caller obligation (end-of-stream)
+    /// The terminal flush passes [`DrainMode::Eager`] only once issuance is complete and
+    /// all outstanding fills have landed: a slot claimed here must not receive a later
+    /// fill (it would race the block consumer reading the run). Unfilled trailing slots
+    /// are not claimed. The budget-relief caller also passes `Eager` but only for
+    /// a prefix with no outstanding fill ahead of it (guaranteed by its own gating).
+    pub(crate) fn take_drain_run(&self, mode: DrainMode) -> Option<SegmentWrite<T>> {
         let guard = self.inner.locked.lock();
         let batch = self.inner.drain_batch.load(Ordering::Relaxed);
         for seg in guard.segments.iter() {
@@ -754,7 +769,10 @@ impl<T> PagedRecvBuffer<T> {
             // window smaller than a segment would pin that residue forever). A terminal
             // claim takes whatever contiguous filled prefix exists.
             let at_segment_end = end == seg.slots.len();
-            let take = if terminal || avail >= batch || (avail > 0 && at_segment_end) {
+            let take = if matches!(mode, DrainMode::Eager)
+                || avail >= batch
+                || (avail > 0 && at_segment_end)
+            {
                 avail
             } else {
                 0
@@ -773,6 +791,18 @@ impl<T> PagedRecvBuffer<T> {
             }
         }
         None
+    }
+
+    /// Whether a [`DrainMode::Eager`] `take_drain_run` would claim a run right now: some
+    /// segment has a `FILLED` slot at its `claim_cursor`. Peek only — does not advance
+    /// the cursor. Gates budget-relief draining so a transfer only emits a drain work
+    /// item when a drain would actually free a chunk (no empty-drain spin).
+    pub(crate) fn has_drainable_prefix(&self) -> bool {
+        let guard = self.inner.locked.lock();
+        guard.segments.iter().any(|seg| {
+            let start = seg.claim_cursor.load(Ordering::Relaxed);
+            start < seg.slots.len() && seg.slots[start].state.is_filled()
+        })
     }
 
     /// The in-order delivery cursor: the next sequence the consumer will deliver, i.e.
@@ -797,7 +827,7 @@ impl<T> PagedRecvBuffer<T> {
     /// is advisory and never a correctness input. Cold path.
     ///
     /// Callers that need byte offsets translate sequence numbers themselves; the
-    /// ring has no notion of payload size.
+    /// buffer has no notion of payload size.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RecvBufferSnapshot {
         let guard = self.inner.locked.lock();
@@ -924,7 +954,7 @@ pub(crate) struct RecvBufferSnapshot {
 #[cfg(test)]
 impl RecvBufferSnapshot {
     /// Number of claimed-but-undelivered sequences: `frontier - cursor`. The size of
-    /// the live window the ring is holding open.
+    /// the live window the buffer is holding open.
     pub(crate) fn outstanding(&self) -> u64 {
         self.frontier - self.cursor
     }
@@ -1121,7 +1151,7 @@ mod tests {
         }
     }
 
-    /// At the default batch (the segment size), `take_drain_run(false)` yields a whole
+    /// At the default batch (the segment size), `take_drain_run(DrainMode::Batched)` yields a whole
     /// segment as one run, exactly once, and the next segment after completion.
     #[test]
     fn block_path_take_and_complete() {
@@ -1135,13 +1165,13 @@ mod tests {
 
         // Claim the full segment as one run.
         let sw = ring
-            .take_drain_run(false)
+            .take_drain_run(DrainMode::Batched)
             .expect("should have a full segment");
         assert_eq!(sw.base_seq(), 0);
         assert_eq!(sw.payloads().len(), seg_size);
 
         // Second immediate take returns None (whole segment already claimed).
-        assert!(ring.take_drain_run(false).is_none());
+        assert!(ring.take_drain_run(DrainMode::Batched).is_none());
 
         // Complete it.
         sw.complete();
@@ -1152,7 +1182,7 @@ mod tests {
             ring.fill(h, (seg_size + i) as u64);
         }
         let sw2 = ring
-            .take_drain_run(false)
+            .take_drain_run(DrainMode::Batched)
             .expect("second full segment should be takeable");
         assert_eq!(sw2.base_seq(), seg_size as u64);
         sw2.complete();
@@ -1169,7 +1199,7 @@ mod tests {
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, i as u64);
         }
-        assert!(ring.take_drain_run(false).is_none());
+        assert!(ring.take_drain_run(DrainMode::Batched).is_none());
     }
 
     /// A relief-regime batch below the segment size drains a segment in disjoint runs
@@ -1186,22 +1216,25 @@ mod tests {
         // First batch arrives: slots 0,1.
         ring.fill_at(&handles, 0, 0);
         ring.fill_at(&handles, 1, 10);
-        let r0 = ring.take_drain_run(false).expect("first run");
+        let r0 = ring.take_drain_run(DrainMode::Batched).expect("first run");
         assert_eq!(r0.base_seq(), 0);
         let seen0: Vec<u64> = r0.payloads().iter().map(|s| *s.get().unwrap()).collect();
         assert_eq!(seen0, vec![0, 10]);
         // Nothing more until the next batch arrives.
-        assert!(ring.take_drain_run(false).is_none());
+        assert!(ring.take_drain_run(DrainMode::Batched).is_none());
 
         // Second batch arrives: slots 2,3.
         ring.fill_at(&handles, 2, 20);
         ring.fill_at(&handles, 3, 30);
-        let r1 = ring.take_drain_run(false).expect("second run");
+        let r1 = ring.take_drain_run(DrainMode::Batched).expect("second run");
         assert_eq!(r1.base_seq(), 2);
         let seen1: Vec<u64> = r1.payloads().iter().map(|s| *s.get().unwrap()).collect();
         assert_eq!(seen1, vec![20, 30]);
 
-        assert!(ring.take_drain_run(false).is_none(), "segment exhausted");
+        assert!(
+            ring.take_drain_run(DrainMode::Batched).is_none(),
+            "segment exhausted"
+        );
         r0.complete();
         r1.complete();
     }
@@ -1221,20 +1254,65 @@ mod tests {
         ring.fill_at(&handles, 3, 30);
 
         // The contiguous run from 0 is [0,2); slot 2 blocks the rest.
-        let r0 = ring.take_drain_run(false).expect("prefix before the gap");
+        let r0 = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("prefix before the gap");
         assert_eq!(r0.base_seq(), 0);
         assert_eq!(r0.payloads().len(), 2);
         // Nothing more: the run beyond the cursor starts at the unfilled slot 2.
-        assert!(ring.take_drain_run(false).is_none());
+        assert!(ring.take_drain_run(DrainMode::Batched).is_none());
 
         // Fill the gap; now [2,4) is a contiguous run of the batch size.
         ring.fill_at(&handles, 2, 20);
-        let r1 = ring.take_drain_run(false).expect("run after the gap fills");
+        let r1 = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("run after the gap fills");
         assert_eq!(r1.base_seq(), 2);
         let seen: Vec<u64> = r1.payloads().iter().map(|s| *s.get().unwrap()).collect();
         assert_eq!(seen, vec![20, 30]);
         r0.complete();
         r1.complete();
+    }
+
+    /// `has_drainable_prefix` reports whether an `Eager` take would claim a run: true
+    /// exactly when a `FILLED` slot sits at some segment's claim cursor. It is the peek
+    /// that gates budget-relief draining, so a leading gap (in-flight part ahead of a
+    /// filled one) must read false — that prefix is not drainable until the gap fills,
+    /// and its in-flight GET carries the drain instead.
+    #[test]
+    fn has_drainable_prefix_tracks_the_cursor_slot() {
+        let seg_size = 4;
+        let (ring, _consumer) = PagedRecvBuffer::<u64>::new_with_segment_size(seg_size);
+        let handles: Vec<_> = (0..seg_size).map(|_| ring.claim()).collect();
+
+        // Empty: nothing filled at the cursor.
+        assert!(!ring.has_drainable_prefix(), "empty buffer has no prefix");
+
+        // Leading gap: slot 1 filled, slot 0 (the cursor) still in flight → false.
+        ring.fill_at(&handles, 1, 10);
+        assert!(
+            !ring.has_drainable_prefix(),
+            "a filled slot behind an unfilled cursor slot is not a drainable prefix"
+        );
+
+        // Fill the cursor slot → now a run starts at the cursor → true.
+        ring.fill_at(&handles, 0, 0);
+        assert!(
+            ring.has_drainable_prefix(),
+            "a FILLED slot at the cursor is a drainable prefix"
+        );
+
+        // Claim the run (advancing the cursor past it); the remaining slots 2,3 are
+        // unfilled, so the cursor slot is again empty → false.
+        let sw = ring
+            .take_drain_run(DrainMode::Eager)
+            .expect("prefix [0,2) is claimable");
+        assert_eq!(sw.payloads().len(), 2);
+        assert!(
+            !ring.has_drainable_prefix(),
+            "after claiming the prefix the cursor slot is unfilled again"
+        );
+        sw.complete();
     }
 
     /// A terminal claim takes a partial prefix below the batch that a non-terminal
@@ -1249,15 +1327,17 @@ mod tests {
             ring.fill(h, (i * 10) as u64);
         }
         // Non-terminal: below batch, nothing.
-        assert!(ring.take_drain_run(false).is_none());
+        assert!(ring.take_drain_run(DrainMode::Batched).is_none());
         // Terminal: take the filled prefix.
-        let sw = ring.take_drain_run(true).expect("partial tail run");
+        let sw = ring
+            .take_drain_run(DrainMode::Eager)
+            .expect("partial tail run");
         assert_eq!(sw.base_seq(), 0);
         let seen: Vec<u64> = sw.payloads().iter().map(|s| *s.get().unwrap()).collect();
         assert_eq!(seen, vec![0, 10]);
         sw.complete();
         // Once claimed, a second terminal call finds nothing more here.
-        assert!(ring.take_drain_run(true).is_none());
+        assert!(ring.take_drain_run(DrainMode::Eager).is_none());
     }
 
     /// Reclaim gates on every claimed slot being drained: a segment split into two runs
@@ -1271,10 +1351,10 @@ mod tests {
         // Two batches arrive separately, so each is claimed as its own run.
         ring.fill_at(&handles, 0, 0);
         ring.fill_at(&handles, 1, 1);
-        let r0 = ring.take_drain_run(false).expect("run [0,2)");
+        let r0 = ring.take_drain_run(DrainMode::Batched).expect("run [0,2)");
         ring.fill_at(&handles, 2, 2);
         ring.fill_at(&handles, 3, 3);
-        let r1 = ring.take_drain_run(false).expect("run [2,4)");
+        let r1 = ring.take_drain_run(DrainMode::Batched).expect("run [2,4)");
 
         // Complete only the first run, then grow + reclaim. seg0 is not fully drained
         // (drained_count == 2 < 4), so it must not be reclaimed.
@@ -1327,7 +1407,9 @@ mod tests {
             ],
             "the fill that reaches the batch raises DrainReady"
         );
-        let r0 = ring.take_drain_run(false).expect("batch-sized prefix run");
+        let r0 = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("batch-sized prefix run");
         assert_eq!(r0.base_seq(), 0);
         assert_eq!(
             r0.payloads().len(),
@@ -1339,7 +1421,7 @@ mod tests {
         // One slot of residue remains (slot 3). A non-terminal claim cannot take it —
         // it is below the batch and the segment is not yet full.
         assert!(
-            ring.take_drain_run(false).is_none(),
+            ring.take_drain_run(DrainMode::Batched).is_none(),
             "sub-batch residue is not drainable while the segment is incomplete"
         );
 
@@ -1351,7 +1433,9 @@ mod tests {
             FillOutcome::DrainReady,
             "the fill that completes the segment raises the edge for the tail residue"
         );
-        let r1 = ring.take_drain_run(false).expect("segment-end residue run");
+        let r1 = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("segment-end residue run");
         assert_eq!(r1.base_seq(), batch as u64);
         assert_eq!(
             r1.payloads().len(),
@@ -1383,7 +1467,10 @@ mod tests {
         // First batch of 2 arrives and drains as run [0,2).
         ring.fill_at(&handles, 0, 0);
         ring.fill_at(&handles, 1, 10);
-        let freed = ring.take_drain_run(false).expect("run [0,2)").complete();
+        let freed = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("run [0,2)")
+            .complete();
         assert_eq!(freed, 2, "a block drain frees the run length");
         assert_eq!(
             ring.consumed(),
@@ -1394,7 +1481,10 @@ mod tests {
         // Second batch of 2 arrives and drains as run [2,4).
         ring.fill_at(&handles, 2, 20);
         ring.fill_at(&handles, 3, 30);
-        let freed = ring.take_drain_run(false).expect("run [2,4)").complete();
+        let freed = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("run [2,4)")
+            .complete();
         assert_eq!(freed, 2, "the second run frees its own length");
         assert_eq!(ring.consumed(), 0, "consumed stays put on the block path");
     }
@@ -1425,7 +1515,9 @@ mod tests {
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, (i * 10) as u64);
         }
-        let sw = ring.take_drain_run(false).expect("full segment");
+        let sw = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("full segment");
         let seen: Vec<u64> = sw.payloads().iter().map(|s| *s.get().unwrap()).collect();
         assert_eq!(seen, vec![0, 10, 20, 30]);
         sw.complete();
@@ -1442,7 +1534,9 @@ mod tests {
         for (i, h) in handles.into_iter().enumerate() {
             ring.fill(h, (i * 7) as u64);
         }
-        let sw = ring.take_drain_run(false).expect("full segment");
+        let sw = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("full segment");
         for (i, slot) in sw.payloads().iter().enumerate() {
             assert_eq!(*slot.get().expect("filled"), (i * 7) as u64);
         }
@@ -1476,7 +1570,7 @@ mod tests {
             let h = ring.claim();
             ring.fill(h, DropCounter(drops.clone()));
         }
-        let sw = ring.take_drain_run(false).expect("seg0 full");
+        let sw = ring.take_drain_run(DrainMode::Batched).expect("seg0 full");
         assert_eq!(sw.base_seq(), 0);
         assert_eq!(
             drops.load(O::SeqCst),
@@ -1535,7 +1629,7 @@ mod tests {
             let h = ring.claim();
             ring.fill(h, DropCounter(drops.clone()));
         }
-        let sw = ring.take_drain_run(false).expect("full");
+        let sw = ring.take_drain_run(DrainMode::Batched).expect("full");
         // complete() frees both payloads.
         sw.complete();
         assert_eq!(
@@ -1581,7 +1675,9 @@ mod tests {
         ring.fill(h3, DropCounter(drops.clone()));
         // seg1 is now full while seg0 has no contiguous filled run. take_drain_run
         // skips seg0 (its run from the cursor is empty) and claims seg1.
-        let sw = ring.take_drain_run(false).expect("seg1 is full");
+        let sw = ring
+            .take_drain_run(DrainMode::Batched)
+            .expect("seg1 is full");
         assert_eq!(
             sw.base_seq(),
             seg_size as u64,
@@ -1833,7 +1929,7 @@ mod tests {
                     let freed_total = freed_total.clone();
                     s.spawn(move || {
                         if ring.fill(h, 0) == FillOutcome::DrainReady {
-                            while let Some(sw) = ring.take_drain_run(false) {
+                            while let Some(sw) = ring.take_drain_run(DrainMode::Batched) {
                                 freed_total.fetch_add(sw.complete(), O::Relaxed);
                             }
                         }
@@ -1842,7 +1938,7 @@ mod tests {
             });
             // Terminal sweep mops up any run a filler produced after its own drain
             // scan (the fill/drain interleaving can leave a slot claimed-but-untaken).
-            while let Some(sw) = ring.take_drain_run(true) {
+            while let Some(sw) = ring.take_drain_run(DrainMode::Eager) {
                 freed_total.fetch_add(sw.complete(), O::Relaxed);
             }
             // Beyond the underflow (a bare subtraction panics here under overflow-checks),
@@ -2006,7 +2102,7 @@ mod loom_tests {
             let ring2 = ring.clone();
             let taker = thread::spawn(move || {
                 let sw = ring2
-                    .take_drain_run(false)
+                    .take_drain_run(DrainMode::Batched)
                     .expect("seg0 is full and drainable");
                 assert_eq!(sw.base_seq(), 0);
                 sw.complete(); // frees payloads, drained_count += len, reclaim_front
@@ -2080,7 +2176,7 @@ mod loom_tests {
 
     /// Model 5 — two drainers race one full segment at the default batch.
     ///
-    /// seg0 is filled full, then two threads call `take_drain_run(false)` concurrently
+    /// seg0 is filled full, then two threads call `take_drain_run(DrainMode::Batched)` concurrently
     /// with the batch equal to the segment size, so the only drainable run is the whole
     /// segment. Advancing `claim_cursor` under the lock must hand that run to exactly
     /// one: one thread gets `Some(SegmentWrite)` based at 0, the other `None`. This
@@ -2096,8 +2192,15 @@ mod loom_tests {
             }
 
             let ring2 = ring.clone();
-            let t1 = thread::spawn(move || ring2.take_drain_run(false).map(|sw| sw.base_seq()));
-            let t2 = thread::spawn(move || ring.take_drain_run(false).map(|sw| sw.base_seq()));
+            let t1 = thread::spawn(move || {
+                ring2
+                    .take_drain_run(DrainMode::Batched)
+                    .map(|sw| sw.base_seq())
+            });
+            let t2 = thread::spawn(move || {
+                ring.take_drain_run(DrainMode::Batched)
+                    .map(|sw| sw.base_seq())
+            });
 
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
@@ -2132,7 +2235,7 @@ mod loom_tests {
             let ring2 = ring.clone();
             let taker = thread::spawn(move || {
                 let sw = ring2
-                    .take_drain_run(false)
+                    .take_drain_run(DrainMode::Batched)
                     .expect("seg0 is full and drainable");
                 assert_eq!(sw.base_seq(), 0);
                 // Drop without complete(): Drop must drain and reclaim safely.
@@ -2256,7 +2359,7 @@ mod loom_tests {
 
     /// Model 9 — two drainers race two distinct full segments.
     ///
-    /// seg0 and seg1 are both full, then two threads call `take_drain_run(false)`
+    /// seg0 and seg1 are both full, then two threads call `take_drain_run(DrainMode::Batched)`
     /// concurrently at the default batch (so each segment is one run). The forward
     /// scan plus the `claim_cursor` advance must hand the two segments' runs to the two
     /// drainers — one each, no duplicate, no segment skipped. Model 5 proves
@@ -2273,8 +2376,15 @@ mod loom_tests {
             }
 
             let ring2 = ring.clone();
-            let t1 = thread::spawn(move || ring2.take_drain_run(false).map(|sw| sw.base_seq()));
-            let t2 = thread::spawn(move || ring.take_drain_run(false).map(|sw| sw.base_seq()));
+            let t1 = thread::spawn(move || {
+                ring2
+                    .take_drain_run(DrainMode::Batched)
+                    .map(|sw| sw.base_seq())
+            });
+            let t2 = thread::spawn(move || {
+                ring.take_drain_run(DrainMode::Batched)
+                    .map(|sw| sw.base_seq())
+            });
 
             let r1 = t1.join().unwrap();
             let r2 = t2.join().unwrap();
@@ -2330,7 +2440,7 @@ mod loom_tests {
             let da = drops.clone();
             let a = thread::spawn(move || {
                 ring_a.fill(h0, DropCounter(da));
-                if let Some(sw) = ring_a.take_drain_run(false) {
+                if let Some(sw) = ring_a.take_drain_run(DrainMode::Batched) {
                     sw.complete();
                 }
             });
@@ -2338,7 +2448,7 @@ mod loom_tests {
             let db = drops.clone();
             let b = thread::spawn(move || {
                 ring_b.fill(h1, DropCounter(db));
-                if let Some(sw) = ring_b.take_drain_run(false) {
+                if let Some(sw) = ring_b.take_drain_run(DrainMode::Batched) {
                     sw.complete();
                 }
             });
@@ -2348,7 +2458,7 @@ mod loom_tests {
 
             // Mop up any slot a drainer's scan missed (its sibling filled after the
             // scan). Single-threaded here, so no race; terminal takes a lone slot.
-            while let Some(sw) = ring.take_drain_run(true) {
+            while let Some(sw) = ring.take_drain_run(DrainMode::Eager) {
                 sw.complete();
             }
 
@@ -2358,6 +2468,68 @@ mod loom_tests {
                 drops.load(Ordering::SeqCst),
                 2,
                 "each slot's payload freed exactly once across partitioned runs"
+            );
+        });
+    }
+
+    /// Model 11 — two concurrent `Eager` drainers partition one segment.
+    ///
+    /// The budget-relief path (`DrainResident`) drains with [`DrainMode::Eager`], so a
+    /// mid-stream `flush_resident` on one transfer can race a concurrent drain on
+    /// another against the same segment. `Eager` takes any contiguous filled prefix
+    /// rather than waiting for the batch, so it claims more aggressively than `Batched`
+    /// — this checks that the under-lock `claim_cursor` advance still partitions the
+    /// segment into disjoint runs under that aggression. Mirror of Model 10 with both
+    /// racing drainers switched to `Eager` (the mode the deadlock fix introduced to a
+    /// concurrent path). A `DropCounter` proves each slot's payload frees exactly once;
+    /// an overlap would double-free or trip loom's `UnsafeCell` on the in-place reads.
+    #[test]
+    fn two_eager_drainers_partition_one_segment() {
+        loom::model(|| {
+            #[derive(Clone)]
+            struct DropCounter(Arc<AtomicUsize>);
+            impl Drop for DropCounter {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (ring, _consumer) = PagedRecvBuffer::<DropCounter>::new_with_segment_size(2);
+            // Batch left at the default (segment size 2); Eager ignores it and takes any
+            // filled prefix, which is the point of the race.
+            let h0 = ring.claim();
+            let h1 = ring.claim();
+
+            let ring_a = ring.clone();
+            let da = drops.clone();
+            let a = thread::spawn(move || {
+                ring_a.fill(h0, DropCounter(da));
+                if let Some(sw) = ring_a.take_drain_run(DrainMode::Eager) {
+                    sw.complete();
+                }
+            });
+            let ring_b = ring.clone();
+            let db = drops.clone();
+            let b = thread::spawn(move || {
+                ring_b.fill(h1, DropCounter(db));
+                if let Some(sw) = ring_b.take_drain_run(DrainMode::Eager) {
+                    sw.complete();
+                }
+            });
+
+            a.join().unwrap();
+            b.join().unwrap();
+
+            // Mop up any slot whose filler had not reached its own scan.
+            while let Some(sw) = ring.take_drain_run(DrainMode::Eager) {
+                sw.complete();
+            }
+
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                2,
+                "each slot's payload freed exactly once across partitioned Eager runs"
             );
         });
     }
