@@ -22,7 +22,7 @@ use crate::operation::download::context::{DownloadState, PendingClaim};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::read_ahead::ReadAhead;
-use crate::operation::download::recv_buffer::FillOutcome;
+use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
 use crate::operation::download::DownloadInput;
 use crate::runtime::memory::{NotifyFn, Reservation, Reserve};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
@@ -37,6 +37,11 @@ pub(crate) enum DownloadWork {
         slot: Option<BodySlot>,
         etag: Option<Arc<str>>,
     },
+    /// Budget-pressure relief: flush the resident filled run to disk, releasing its
+    /// reservations, so a budget-parked transfer does not pin chunks it has no other
+    /// path to release. Emitted by [`drain_or_park`](DownloadTransfer::drain_or_park)
+    /// and handled in `execute`; carries no data (operates on the writer).
+    DrainResident,
 }
 
 /// Bytes in the next chunk sliced from `remaining` at `part_size`: the reservation
@@ -270,8 +275,9 @@ impl DownloadTransfer {
                     // the reservation the budget queued.
                     match self.resume_pending_claim(pending) {
                         Some(slot) => slot,
-                        // Not granted yet; the queued ticket is the waker.
-                        None => return self.park(),
+                        // Not granted yet; the queued ticket is the waker. Flush any
+                        // resident run first so we do not pin budget while parked.
+                        None => return self.drain_or_park(),
                     }
                 } else if let Some(range) = remaining.as_ref() {
                     // Read-ahead gate. The gate bounds resident occupancy at
@@ -313,8 +319,9 @@ impl DownloadTransfer {
                     let range_len = chunk_len(range, *part_size);
                     match self.reserve_claim(range_len, pending) {
                         Some(slot) => slot,
-                        // Budget-parked; `pending` now holds the claimed slot.
-                        None => return self.park(),
+                        // Budget-parked; `pending` now holds the claimed slot. Flush any
+                        // resident run first so we do not pin budget while parked.
+                        None => return self.drain_or_park(),
                     }
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete.
@@ -377,6 +384,30 @@ impl DownloadTransfer {
     fn park(&self) -> PollWork {
         self.inner.ctx.set_pending();
         PollWork::Pending
+    }
+
+    /// Budget-park decision. A transfer that parks on the budget while holding a
+    /// drainable resident run pins those chunks with no path to release them: the run
+    /// is below the drain batch (so no fill-triggered drain frees it) and the transfer
+    /// cannot reach terminal (its `remaining` part is what is blocked on the budget).
+    /// Spread across concurrent disk transfers this deadlocks — none can release, so
+    /// none is granted. To avoid it, flush the resident run first (releasing its budget)
+    /// by emitting a `DrainResident` work item, and only park when there is nothing to
+    /// flush. The drain runs in `execute` (poll_work does no I/O); its completion
+    /// re-polls this transfer via `generate_work`, and the freed budget re-grants FIFO.
+    ///
+    /// Only the budget-park sites call this. A `has_drainable_resident` guard keeps it a
+    /// no-op-to-park when the resident prefix is blocked behind an in-flight gap (that
+    /// GET's completion carries the drain instead) or in stream mode (the consumer
+    /// drives release), so it never spins emitting empty drains.
+    fn drain_or_park(&self) -> PollWork {
+        if self.inner.writer.has_drainable_resident() {
+            PollWork::Ready(IoRequest {
+                data: Some(Box::new(DownloadWork::DrainResident)),
+            })
+        } else {
+            self.park()
+        }
     }
 
     /// Resume a budget-parked claim. The gate already admitted and counted the slot
@@ -506,7 +537,36 @@ impl DownloadTransfer {
                 )
                 .await
             }
+            DownloadWork::DrainResident => self.execute_drain_resident(),
         }
+    }
+
+    /// Flush the resident filled run to disk, releasing its budget reservations, then
+    /// release the freed read-ahead occupancy. Emitted by [`drain_or_park`] when a
+    /// transfer would otherwise park on the budget while pinning a resident run.
+    ///
+    /// Unlike a fill-triggered drain, no GET completed here, so `ranges_in_flight` is
+    /// untouched; only occupancy is released (matching the gate side of
+    /// [`decrement_in_flight`](Self::decrement_in_flight), under the same state lock so
+    /// the release is ordered against the issuer's park). Dropping the drained
+    /// `ChunkOutput`s frees their reservations, which the budget re-grants FIFO; the
+    /// `on_completion -> generate_work` after this returns re-polls this transfer.
+    fn execute_drain_resident(&self) -> WorkOutcome {
+        let freed = match self.inner.writer.flush_resident() {
+            Ok(f) => f,
+            Err(e) => {
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            }
+        };
+        {
+            let mut work = self.inner.state.lock().unwrap();
+            if let DownloadState::Transferring { gate, .. } = &mut *work {
+                gate.release(freed);
+            }
+        }
+        self.inner.ctx.try_wake();
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_discovery(&self) -> WorkOutcome {
@@ -715,7 +775,7 @@ impl DownloadTransfer {
         // occupancy this drain released, accounted under the lock in decrement_in_flight.
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            match self.inner.writer.drain(false) {
+            match self.inner.writer.drain(DrainMode::Batched) {
                 Ok(f) => freed = f,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
@@ -841,7 +901,7 @@ impl DownloadTransfer {
         // decrement_in_flight.
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            match self.inner.writer.drain(false) {
+            match self.inner.writer.drain(DrainMode::Batched) {
                 Ok(f) => freed = f,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
@@ -1550,6 +1610,35 @@ mod tests {
         assert_eq!(budget.in_use_chunks(), 2);
     }
 
+    /// A stream-mode transfer that budget-parks must return `Pending`, never a
+    /// `DrainResident` work item. `drain_or_park` gates on `has_drainable_resident`,
+    /// which is false in stream mode (the consumer drives release), so the budget
+    /// deadlock relief does not apply and must not spin emitting empty drains.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn stream_budget_park_does_not_emit_drain_resident() {
+        use crate::runtime::memory::BUDGET_CHUNK_BYTES;
+
+        // Stream-mode transfer (create_download_for_gate uses new_recv_body). 3 parts.
+        let part_size = BUDGET_CHUNK_BYTES as u64;
+        let object_size = 3 * part_size;
+        let (transfer, _consumer) = create_download_for_gate(object_size, part_size);
+
+        skip_discovery(&transfer).await;
+        let budget = transfer.ctx().handle.memory_budget.clone();
+        // Tighten to the discovery chunk only: the next range reservation cannot fit.
+        budget.set_limit(BUDGET_CHUNK_BYTES);
+
+        // The transfer holds a filled seq-0 (resident on the stream surface) and parks
+        // on the budget for part 1. Because it is stream mode, the relief path is off:
+        // poll_work returns Pending, not Ready(DrainResident).
+        match transfer.poll_work() {
+            PollWork::Pending => {}
+            PollWork::Ready(_) => panic!("stream-mode budget park must not emit DrainResident"),
+            PollWork::Done => panic!("unexpected Done"),
+        }
+    }
+
     /// Cancelling a transfer while it is budget-parked must cancel the queued budget
     /// wait and release the held slot — otherwise the `WaitTicket` lingers in the
     /// shared budget (and could be granted a live reservation into a dead transfer),
@@ -1735,6 +1824,246 @@ mod tests {
             part_size as usize,
             "all bytes should be flushed to disk"
         );
+    }
+
+    /// Build a disk-mode download transfer on an already-constructed (shared) handle,
+    /// so several transfers can contend for one budget. Returns the transfer plus the
+    /// tempdir/consumer guards the caller must keep alive for the transfer's lifetime.
+    #[cfg(test)]
+    fn build_disk_transfer_on(
+        handle: Arc<crate::client::Handle>,
+    ) -> (
+        DownloadTransfer,
+        crate::operation::download::body::RecvBodyConsumer,
+        tempfile::TempDir,
+    ) {
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("out")).unwrap();
+        let (writer, consumer) =
+            crate::operation::download::body::new_recv_body_with_sink(file, 0, false);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        (transfer, consumer, dir)
+    }
+
+    /// Drive several transfers on a shared budget to completion by round-robin
+    /// poll+execute, standing in for the scheduler's generate_work loop. Returns once
+    /// every transfer is `Done`. A bounded step budget converts a genuine deadlock into
+    /// a test failure (all transfers `Pending` with no progress) rather than a hang.
+    #[cfg(test)]
+    async fn drive_to_completion(transfers: &[&DownloadTransfer]) {
+        let mut done = vec![false; transfers.len()];
+        // Generous ceiling: each transfer needs O(parts) poll+execute steps, plus drain
+        // relief steps. Far above any real count here; exceeding it means no progress.
+        let max_steps = 10_000;
+        for _ in 0..max_steps {
+            if done.iter().all(|d| *d) {
+                return;
+            }
+            let mut progressed = false;
+            for (i, t) in transfers.iter().enumerate() {
+                if done[i] {
+                    continue;
+                }
+                match t.poll_work() {
+                    PollWork::Ready(mut work) => {
+                        execute(t, &mut work).await;
+                        progressed = true;
+                    }
+                    PollWork::Done => {
+                        done[i] = true;
+                        progressed = true;
+                    }
+                    PollWork::Pending => {}
+                }
+            }
+            if !progressed {
+                panic!(
+                    "no transfer made progress: all Pending with work outstanding \
+                     (budget deadlock regressed)"
+                );
+            }
+        }
+        panic!("drive_to_completion exceeded {max_steps} steps without completing");
+    }
+
+    /// REGRESSION (PR #154 review, landonxjames): the fungible-budget deadlock for
+    /// concurrent multi-part disk transfers below the drain batch must NOT wedge.
+    ///
+    /// Before the fix: a disk chunk's reservation released only on a drain (fires at the
+    /// batch `min(SEG_SIZE=16, window)` or a full segment) or the terminal finalize. A
+    /// multi-part object below a segment (2..15 parts) held ALL parts resident until
+    /// terminal — which needs every part issued, which needs budget. Spread across
+    /// concurrent transfers under a tight shared budget, none could reach its part count,
+    /// so none finalized/drained/released and the `in_use == 0` forced-grant never fired.
+    ///
+    /// The fix (`drain_or_park` → `DownloadWork::DrainResident`): a transfer about to
+    /// park on the budget while holding a resident run flushes it first, releasing the
+    /// chunks FIFO. This test drives two 2-part transfers on a 2-chunk shared budget to
+    /// completion; pre-fix it would spin all-`Pending` (caught by `drive_to_completion`'s
+    /// no-progress panic), post-fix both finish and the budget fully releases.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn concurrent_multipart_disk_below_drain_batch_completes() {
+        use crate::runtime::memory::BUDGET_CHUNK_BYTES;
+
+        let part_size = BUDGET_CHUNK_BYTES as u64; // 1 part == 1 chunk
+        let object_size = 2 * part_size; // 2 parts, below the 16-part drain batch
+
+        // Range-echoing mock: the content-range must match the requested range or
+        // execute_get_range fails validation. (Fixed body works only for single-chunk.)
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
+            let start = req
+                .range()
+                .and_then(|r| r.parse::<crate::http::header::Range>().ok())
+                .map(|r| match r.0 {
+                    crate::http::header::ByteRange::Inclusive(s, _) => s,
+                    crate::http::header::ByteRange::AllFrom(s) => s,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            let end = std::cmp::min(start + part_size, object_size) - 1;
+            let chunk = vec![0u8; (end - start + 1) as usize];
+            aws_smithy_mocks::MockResponse::Output(
+                GetObjectOutput::builder()
+                    .content_length((end - start + 1) as i64)
+                    .content_range(format!("bytes {}-{}/{}", start, end, object_size))
+                    .e_tag("test-etag")
+                    .body(ByteStream::from(chunk))
+                    .build(),
+            )
+        });
+        let config = crate::Config::builder()
+            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let budget = handle.memory_budget.clone();
+        // Tight shared budget: exactly two chunks (one discovery chunk per transfer).
+        budget.set_limit(2 * BUDGET_CHUNK_BYTES);
+
+        let (a, _ca, _da) = build_disk_transfer_on(handle.clone());
+        let (b, _cb, _db) = build_disk_transfer_on(handle.clone());
+
+        // Pre-fix this wedges (both park holding an undrainable resident seq-0 while
+        // queued for part-1). Post-fix each flushes its resident run before parking, so
+        // both complete under the 2-chunk budget.
+        drive_to_completion(&[&a, &b]).await;
+
+        assert!(!a.ctx().is_active(), "transfer A completed");
+        assert!(!b.ctx().is_active(), "transfer B completed");
+        assert_eq!(
+            budget.in_use_chunks(),
+            0,
+            "all reservations released after both transfers complete"
+        );
+        assert_eq!(budget.stats().waiters, 0, "no budget waiters remain");
+    }
+
+    /// REGRESSION (PR #154 review generalization, aajtodd): the budget deadlock is
+    /// NOT specific to small objects (`total_parts < batch`). It is the general
+    /// "park holding undrained resident parts" wedge, reachable with LARGE multipart
+    /// objects that are nowhere near terminal.
+    ///
+    /// Two transfers, each a 20-part object (far above the 16-part drain batch, so the
+    /// small-object predicate `total_parts < batch` does NOT apply). Drive each to hold
+    /// 3 filled-undrained resident parts (3 < 16, so no non-terminal drain), then let a
+    /// tight shared budget cap them mid-stream with 17 parts still remaining. Neither
+    /// can issue (budget full), drain (below batch), or reach terminal (`remaining` far
+    /// from done). Each is waiting on the other to release, and neither can — the exact
+    /// wedge, with objects an order of magnitude larger than the drain batch.
+    ///
+    /// Drives both to completion under the tight budget: pre-fix this wedges (caught by
+    /// `drive_to_completion`'s no-progress panic), post-fix the `DrainResident` relief
+    /// lets both finish. Proves the fix is not the small-object special case.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn concurrent_large_multipart_partial_fills_completes() {
+        use crate::runtime::memory::BUDGET_CHUNK_BYTES;
+
+        let part_size = BUDGET_CHUNK_BYTES as u64; // 1 part == 1 chunk
+        let parts_per_object = 20u64; // WELL above the 16-part drain batch
+        let object_size = parts_per_object * part_size;
+        let resident_per_transfer = 3u64; // 3 < 16: never drains non-terminally
+
+        // Range-echoing mock: each GET's content-range must match the requested range,
+        // or execute_get_range's validate_content_range fails the transfer. (A fixed
+        // `then_output` body works only for single-chunk objects.)
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
+            let start = req
+                .range()
+                .and_then(|r| r.parse::<crate::http::header::Range>().ok())
+                .map(|r| match r.0 {
+                    crate::http::header::ByteRange::Inclusive(s, _) => s,
+                    crate::http::header::ByteRange::AllFrom(s) => s,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            let end = std::cmp::min(start + part_size, object_size) - 1;
+            let chunk = vec![0u8; (end - start + 1) as usize];
+            aws_smithy_mocks::MockResponse::Output(
+                GetObjectOutput::builder()
+                    .content_length((end - start + 1) as i64)
+                    .content_range(format!("bytes {}-{}/{}", start, end, object_size))
+                    .e_tag("test-etag")
+                    .body(ByteStream::from(chunk))
+                    .build(),
+            )
+        });
+        let config = crate::Config::builder()
+            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let budget = handle.memory_budget.clone();
+
+        let (a, _ca, _da) = build_disk_transfer_on(handle.clone());
+        let (b, _cb, _db) = build_disk_transfer_on(handle.clone());
+
+        // Budget room for exactly the resident parts of both transfers, nothing more.
+        // Once both fill to that depth neither can reserve another part without a drain.
+        let cap_chunks = 2 * resident_per_transfer;
+        budget.set_limit(cap_chunks as usize * BUDGET_CHUNK_BYTES);
+
+        // Drive each transfer to hold `resident_per_transfer` filled-undrained parts:
+        // discovery fills seq 0, then (resident-1) range GETs fill seqs 1.. . Each fill's
+        // in-execute Batched drain frees nothing (below batch), so all stay resident.
+        async fn fill_resident(t: &DownloadTransfer, resident: u64) {
+            skip_discovery(t).await; // seq 0 filled + reserved
+            for _ in 1..resident {
+                let mut w = assert_ready(t.poll_work());
+                execute(t, &mut w).await;
+            }
+        }
+        fill_resident(&a, resident_per_transfer).await;
+        fill_resident(&b, resident_per_transfer).await;
+
+        assert_eq!(
+            budget.in_use_chunks(),
+            cap_chunks,
+            "both transfers hold their resident parts; budget is exactly full"
+        );
+
+        // Both are mid-stream (17 parts each remaining) with the budget full. Pre-fix
+        // this wedges — neither can issue, drain (below batch), or reach terminal, and
+        // each waits on the other. Post-fix each flushes its resident run before parking,
+        // so both complete under the tight budget. `drive_to_completion` panics on a
+        // no-progress wedge instead of hanging.
+        drive_to_completion(&[&a, &b]).await;
+
+        assert!(!a.ctx().is_active(), "large-object transfer A completed");
+        assert!(!b.ctx().is_active(), "large-object transfer B completed");
+        assert_eq!(
+            budget.in_use_chunks(),
+            0,
+            "all reservations released after both large multipart transfers complete"
+        );
+        assert_eq!(budget.stats().waiters, 0, "no budget waiters remain");
     }
 
     /// The window resolved at construction follows precedence: a per-request

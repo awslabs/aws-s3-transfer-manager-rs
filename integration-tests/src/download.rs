@@ -669,3 +669,98 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
     assert_eq!(written, content, "data integrity check failed");
     server_handle.shutdown().await.expect("shutdown");
 }
+
+// ── Global memory budget: concurrent disk transfers below the drain batch ─────
+//
+// The memory budget is fungible across all transfers. A disk transfer's chunk
+// reservation releases only when the drain copies it out, and a non-terminal drain
+// fires only at the drain batch (16 parts) or a full segment. Concurrent multi-part
+// disk transfers each below that batch hold their parts resident until terminal —
+// which needs every part issued, which needs budget. Under a shared budget too tight
+// for all of them at once, none could finalize/drain/release: a global stall. The fix
+// flushes a transfer's resident run before it parks on the budget. This drives the
+// exact wedge from the public API (real HTTP, real scheduler, real disk writes) and
+// asserts every transfer completes with bytes intact.
+
+/// Several concurrent multi-part downloads to disk, each below the drain batch, sharing
+/// a budget too small to hold them all at once, must all complete. A regression
+/// re-wedges and the timeout fires.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge() {
+    use aws_sdk_s3_transfer_manager::types::MemoryBudgetConfig;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let parts_per_object = 6; // multi-part, below the 16-part drain batch
+    let object_size = parts_per_object * part_size;
+    let transfers = 4;
+
+    // The budget accounting chunk is 8 MiB, so a 5 MiB part costs one chunk. The four
+    // objects together need `transfers * parts_per_object` = 24 chunks; cap at 8 — far
+    // below that, so no object can hold its full part count and the pre-fix wedge is
+    // reachable, while leaving room for a few resident parts per transfer.
+    let budget_bytes = 8 * 8 * ByteUnit::Mebibyte.as_bytes_usize();
+
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+    let server_handle = server.start().await.expect("start mock server");
+    let s3_client = server_handle.client().await;
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(s3_client)
+            .part_size(PartSize::Target(part_size as u64))
+            .concurrency(ConcurrencyMode::Explicit(transfers))
+            .memory_budget(MemoryBudgetConfig::Limit(budget_bytes))
+            .build(),
+    );
+
+    let mut expected = Vec::with_capacity(transfers);
+    for i in 0..transfers {
+        let content = deterministic_data(object_size);
+        server
+            .add_object("test-bucket", &format!("obj-{i}"), content.clone(), None)
+            .await
+            .expect("add object");
+        expected.push(content);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let results = timeout(Duration::from_secs(30), async {
+        let mut tasks = Vec::with_capacity(transfers);
+        for i in 0..transfers {
+            let tm = tm.clone();
+            let dest = dir.path().join(format!("out-{i}.dat"));
+            tasks.push(tokio::spawn(async move {
+                let handle = tm
+                    .download()
+                    .bucket("test-bucket")
+                    .key(format!("obj-{i}"))
+                    .write_to_path(&dest)
+                    .await
+                    .expect("initiate download");
+                handle.join().await.expect("join download");
+                std::fs::read(&dest).expect("read output")
+            }));
+        }
+        let mut out = Vec::with_capacity(transfers);
+        for t in tasks {
+            out.push(t.await.expect("task join"));
+        }
+        out
+    })
+    .await
+    .expect(
+        "concurrent disk downloads did not complete within 30s \
+         (budget deadlock: resident parts pinned across transfers)",
+    );
+
+    for (i, (got, want)) in results.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(got.len(), want.len(), "obj-{i} size mismatch");
+        assert_eq!(got, want, "obj-{i} data integrity check failed");
+    }
+    server_handle.shutdown().await.expect("shutdown");
+}

@@ -11,7 +11,7 @@ use crate::runtime::sync::sync::Arc;
 
 use super::chunk_meta::ChunkMetadata;
 use super::recv_buffer::{
-    FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
+    DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
 };
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
@@ -201,14 +201,14 @@ impl BodyWriter {
     /// Returns the number of parts freed across the runs drained by this call — the
     /// read-ahead occupancy the caller releases. The buffer does not track a running
     /// total; the download layer accounts for the freed count under its state lock.
-    pub(crate) fn drain(&self, terminal: bool) -> Result<u64, std::io::Error> {
+    pub(crate) fn drain(&self, mode: DrainMode) -> Result<u64, std::io::Error> {
         let mut freed = 0u64;
         if let Mode::Disk {
             sink,
             object_range_start,
         } = &*self.mode
         {
-            while let Some(sw) = self.buffer.take_drain_run(terminal) {
+            while let Some(sw) = self.buffer.take_drain_run(mode) {
                 write_run(sink.as_ref(), *object_range_start, &sw)?;
                 freed += sw.complete();
             }
@@ -224,13 +224,29 @@ impl BodyWriter {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
             return Ok(0);
         }
-        let terminal_parts = self.drain(true)?;
+        let terminal_parts = self.drain(DrainMode::Eager)?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             terminal_parts,
             "terminal drain complete; tail flushed to disk",
         );
         Ok(terminal_parts)
+    }
+
+    /// Whether a forced eager drain would free at least one resident part right now:
+    /// the disk surface holds a contiguous filled run at some segment's claim cursor.
+    /// Stream mode returns false — its consumer drives release, so it never pins budget
+    /// behind the drain batch. Gates budget-pressure relief (`drain_or_park`).
+    pub(crate) fn has_drainable_resident(&self) -> bool {
+        matches!(&*self.mode, Mode::Disk { .. }) && self.buffer.has_drainable_prefix()
+    }
+
+    /// Flush the resident filled prefix to disk now, below the drain batch — budget
+    /// backpressure relief, distinct in intent from the terminal `finalize` but using
+    /// the same eager take. Returns the parts freed so the caller releases their
+    /// read-ahead occupancy. Not terminal: the transfer keeps issuing after this.
+    pub(crate) fn flush_resident(&self) -> Result<u64, std::io::Error> {
+        self.drain(DrainMode::Eager)
     }
 
     /// Couple the drain batch to the read-ahead window: a window narrower than a
@@ -655,7 +671,7 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, DrainMode,
         RecvBodyConsumer, SinkWrite,
     };
     use bytes::Buf as _;
@@ -734,6 +750,33 @@ mod tests {
         (writer, consumer, sink)
     }
 
+    /// `has_drainable_resident` gates budget-relief draining. It is true only on the
+    /// disk surface with a filled run at the cursor: stream mode returns false (the
+    /// consumer drives release there, so an eager drain would be a no-op that spins),
+    /// and a resident run only exists once a slot at the cursor is filled.
+    #[test]
+    fn has_drainable_resident_only_on_disk_with_a_filled_run() {
+        // Stream mode: even with a filled slot, never drainable-resident.
+        let (stream_writer, _consumer) = new_recv_body();
+        stream_writer.claim().fill(chunk_at(0, 0, b"streamed"));
+        assert!(
+            !stream_writer.has_drainable_resident(),
+            "stream mode has no drainable-resident run (consumer drives release)"
+        );
+
+        // Disk mode: empty → false; filled at the cursor → true.
+        let (disk_writer, _consumer, _sink) = new_recv_body_with_capture(0);
+        assert!(
+            !disk_writer.has_drainable_resident(),
+            "disk mode with nothing filled is not drainable-resident"
+        );
+        disk_writer.claim().fill(chunk_at(0, 0, b"resident"));
+        assert!(
+            disk_writer.has_drainable_resident(),
+            "disk mode with a filled run at the cursor is drainable-resident"
+        );
+    }
+
     #[test]
     fn disk_writes_full_segment() {
         use super::SEG_SIZE;
@@ -751,7 +794,7 @@ mod tests {
         }
 
         // The last fill sealed the segment; drain it.
-        writer.drain(false).unwrap();
+        writer.drain(DrainMode::Batched).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for i in 0..SEG_SIZE as u64 {
@@ -844,7 +887,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, data.as_bytes()));
         }
 
-        writer.drain(false).unwrap();
+        writer.drain(DrainMode::Batched).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for i in 0..n as u64 {
@@ -924,7 +967,7 @@ mod tests {
             let outcome = slot.fill(chunk_at(i, i * 100, format!("d{i}").as_bytes()));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
-                freed_total += writer.drain(false).unwrap();
+                freed_total += writer.drain(DrainMode::Batched).unwrap();
             }
         }
         // A terminal drain flushes any sub-batch tail so the total accounts for every part.
@@ -1010,7 +1053,7 @@ mod tests {
                         let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
                         // Mirror execute_get_range: drain on the batch edge.
                         if outcome == super::FillOutcome::DrainReady {
-                            let freed = writer.drain(false).unwrap();
+                            let freed = writer.drain(DrainMode::Batched).unwrap();
                             freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
