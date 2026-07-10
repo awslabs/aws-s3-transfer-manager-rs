@@ -393,9 +393,21 @@ impl Drop for WaitTicket {
                 drop(res);
             }
             WaitState::Waiting => {
-                // Cancel: remove this waiter from the queue.
-                let mut inner = self.budget.inner.lock();
-                inner.waiters.retain(|w| !Arc::ptr_eq(&w.slot, &self.slot));
+                // Cancel: remove this waiter from the queue, then drain. Removing a
+                // queued waiter can unblock those behind it — cancelling the front
+                // exposes the next waiter to free capacity that arrival order had held
+                // it back from — so the queue must be re-evaluated here, or that waiter
+                // stays parked until an unrelated reservation happens to release.
+                // Notifies fire after the budget lock is dropped (the same discipline
+                // `Reservation::drop` follows).
+                let notifies = {
+                    let mut inner = self.budget.inner.lock();
+                    inner.waiters.retain(|w| !Arc::ptr_eq(&w.slot, &self.slot));
+                    drain(&self.budget, &mut inner)
+                };
+                for f in notifies {
+                    f();
+                }
             }
             WaitState::Taken => {}
         }
@@ -812,6 +824,58 @@ mod tests {
     }
 
     #[test]
+    fn test_cancel_front_waiter_grants_next_that_now_fits() {
+        // Arrival order can park a waiter that would fit on free capacity behind a
+        // larger front waiter. If the front is then cancelled, the freed head-of-line
+        // must let the next waiter through immediately — the cancel is what unblocks
+        // it, so the cancel path must drain. Otherwise it stays parked until some
+        // unrelated reservation happens to release (a liveness gap).
+        let chunk = 1024;
+        let budget = MemoryBudget::new(chunk * 4, chunk); // capacity = 4 chunks
+        let (n_hold, _) = notify_flag();
+        let (n_big, flag_big) = notify_flag();
+        let (n_small, flag_small) = notify_flag();
+
+        // Hold 3 of 4 chunks: 1 free.
+        let _holder = match budget.reserve(chunk * 3, n_hold) {
+            Reserve::Ready(r) => r,
+            Reserve::Pending(_) => panic!("expected Ready"),
+        };
+
+        // Front waiter needs 2 (does not fit: 1 free < 2) → parks.
+        let ticket_big = match budget.reserve(chunk * 2, n_big) {
+            Reserve::Pending(t) => t,
+            Reserve::Ready(_) => panic!("expected Pending"),
+        };
+        // Next waiter needs 1 (would fit on the 1 free chunk) but parks behind the
+        // larger front — arrival order forbids jumping it.
+        let mut ticket_small = match budget.reserve(chunk, n_small) {
+            Reserve::Pending(t) => t,
+            Reserve::Ready(_) => panic!("expected Pending"),
+        };
+        assert_eq!(budget.stats().waiters, 2);
+
+        // Cancel the FRONT waiter. No reservation releases here — `_holder` still holds
+        // its 3 chunks. The small waiter is now the front and fits on the 1 free chunk.
+        drop(ticket_big);
+
+        // The cancel must have drained the queue and granted the small waiter.
+        assert!(
+            flag_small.load(Ordering::Acquire),
+            "cancelling the front waiter must grant the next one that now fits"
+        );
+        assert!(
+            !flag_big.load(Ordering::Acquire),
+            "cancelled waiter is not granted"
+        );
+        let _res_small = ticket_small
+            .take()
+            .expect("small waiter granted by the cancel");
+        assert_eq!(budget.in_use_chunks(), 4, "3 held + 1 just granted");
+        assert_eq!(budget.stats().waiters, 0);
+    }
+
+    #[test]
     fn test_wait_ticket_drop_after_granted_returns_chunks() {
         let chunk = 1024;
         let budget = MemoryBudget::new(chunk * 2, chunk); // 2 chunks
@@ -936,6 +1000,54 @@ mod loom_tests {
 
             drop(granted);
             drop(ticket);
+            assert_eq!(budget.in_use_chunks(), 0);
+        });
+    }
+
+    #[test]
+    fn cancel_front_grants_next_races_take() {
+        // Cancelling the front waiter drains the queue and can grant the next waiter,
+        // so the cancel path takes `budget -> slot` (to store the grant) just like a
+        // release. This races that cancel against the granted waiter's `take`. The
+        // cancelling thread already released its own slot lock before taking the budget
+        // lock (WaitTicket::drop extracts state first), so no `slot -> budget` inversion
+        // exists; loom exhausts the interleavings and would report a deadlock or a
+        // double/lost grant.
+        loom::model(|| {
+            let chunk = 1024;
+            let budget = MemoryBudget::new(chunk, chunk); // capacity = 1 chunk
+
+            // Holder pins the single chunk; front and next both park behind it.
+            let holder = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Ready(r) => r,
+                Reserve::Pending(_) => unreachable!("first reserve fits"),
+            };
+            let front = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Pending(t) => t,
+                Reserve::Ready(_) => unreachable!("budget is full"),
+            };
+            let mut next = match budget.reserve(chunk, noop_notify()) {
+                Reserve::Pending(t) => t,
+                Reserve::Ready(_) => unreachable!("budget is full"),
+            };
+
+            // Free the chunk, then race cancelling the front (which drains and grants
+            // `next`) against `next.take()`.
+            drop(holder);
+            let h = thread::spawn(move || drop(front));
+            let taken = next.take();
+            h.join().unwrap();
+
+            // The freed chunk reaches `next` exactly once, via whichever side wins.
+            let granted = taken.or_else(|| next.take());
+            assert!(
+                granted.is_some(),
+                "cancelling the front must grant the next waiter that now fits"
+            );
+            assert_eq!(budget.in_use_chunks(), 1);
+
+            drop(granted);
+            drop(next);
             assert_eq!(budget.in_use_chunks(), 0);
         });
     }
