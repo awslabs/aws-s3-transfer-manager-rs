@@ -5,22 +5,23 @@
 
 //! Upload-part transient-transport retry contract.
 //!
-//! Reproduces the macOS CI `ENOBUFS`-on-`UploadPart` failure deterministically
-//! by injecting a dispatch-layer IO error at the client connector (see
-//! `fault_connector`) — the faithful client-side shape, not a server fault. The
-//! contract: an isolated transient recovers; a correlated transient burst (which
-//! starves the SDK's shared retry token bucket) recovers via the TM's outer
-//! retry + full-jittered backoff; a persistent outage fails cleanly without
-//! hanging. Full analysis: `networking/retry-ownership-and-token-bucket.md`.
+//! Injects a local (client-side) dispatch IO error on `UploadPart` sends via the
+//! fault connector (see `fault_connector`) — a client send failure, not a server
+//! fault. The contract: an isolated transient recovers; a correlated transient
+//! burst (which starves the SDK's shared retry token bucket) recovers via the
+//! TM's outer retry + full-jittered backoff; a persistent outage fails cleanly
+//! without hanging. Full analysis: `networking/retry-ownership-and-token-bucket.md`.
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::PartSize;
 use s3_mock_server::S3MockServer;
 
-use crate::fault_connector::{io_fault_http_client, is_upload_part, FailCount};
+mod fault_connector;
 
-/// 5 MiB parts, matching the failing CI test's `ALIGNED_PART_SIZE`.
+use fault_connector::{io_fault_http_client, is_upload_part, FailCount};
+
+/// 5 MiB parts (the minimum S3 multipart part size).
 const PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// A multi-part object: enough parts that at least one `UploadPart` is in flight
@@ -29,12 +30,12 @@ fn many_part_body() -> Vec<u8> {
     vec![0u8; 8 * PART_SIZE as usize] // 8 parts
 }
 
-/// Matches the failing CI test (`MANY_PARTS = 64`): a 64-part object. 64 retries
-/// at 14 tokens each (896) exceeds the SDK token bucket's 500 capacity, so a
-/// correlated burst over all 64 parts cannot all retry — the bucket starves.
-const CI_MANY_PARTS: usize = 64;
-fn ci_scale_body() -> Vec<u8> {
-    vec![0u8; CI_MANY_PARTS * PART_SIZE as usize]
+/// A 64-part object, sized to starve the SDK's shared retry token bucket under a
+/// correlated burst: 64 retries at 14 tokens each (896) exceeds the bucket's 500
+/// capacity, so not all parts can retry through the SDK's inner retry alone.
+const MANY_PARTS: usize = 64;
+fn many_parts_burst_body() -> Vec<u8> {
+    vec![0u8; MANY_PARTS * PART_SIZE as usize]
 }
 
 /// Build a TM client wired to the mock server through the IO-fault connector.
@@ -43,7 +44,7 @@ async fn setup_with_fault(
 ) -> (
     s3_mock_server::ServerHandle,
     aws_sdk_s3_transfer_manager::Client,
-    crate::fault_connector::InjectionTally,
+    fault_connector::InjectionTally,
 ) {
     let server = S3MockServer::builder()
         .with_in_memory_store()
@@ -94,21 +95,20 @@ async fn upload_part_single_dispatch_io_error_recovers() {
     result.expect("a single transient UploadPart dispatch IO error must recover");
 }
 
-/// Correlated transient burst: fault every part's first dispatch at once (the
-/// macOS CI ENOBUFS scenario). The SDK's shared retry token bucket starves under
-/// the simultaneous draw and surfaces some parts un-recovered; the TM outer retry
-/// + full-jittered backoff must then recover the whole transfer. Reproduced the
-/// CI failure before the fix; teeth-checked (fails when the transient-transport
-/// retry arm is removed).
+/// Correlated transient burst: fault every part's first dispatch at once. The
+/// SDK's shared retry token bucket starves under the simultaneous draw and
+/// surfaces some parts un-recovered; the TM outer retry + full-jittered backoff
+/// must then recover the whole transfer. Teeth-checked: fails when the
+/// transient-transport retry arm is removed.
 #[tokio::test]
 async fn upload_part_correlated_burst_dispatch_io_error() {
-    // CI scale: 64 parts. Fault each part's FIRST dispatch once (transient
-    // ENOBUFS burst: every part's initial write fails, pressure then clears).
-    // This drives the SDK's shared retry quota to starvation (some parts surface
-    // un-recovered), which the TM outer retry + backoff must then recover.
+    // Fault each of the 64 parts' FIRST dispatch once (transient burst: every
+    // part's initial write fails, pressure then clears). This drives the SDK's
+    // shared retry quota to starvation (some parts surface un-recovered), which
+    // the TM outer retry + backoff must then recover.
     let (_server, tm, tally) = setup_with_fault(FailCount::EachPartOnce).await;
 
-    let body = ci_scale_body();
+    let body = many_parts_burst_body();
     let result = tm
         .upload()
         .bucket("test-bucket")
@@ -121,14 +121,14 @@ async fn upload_part_correlated_burst_dispatch_io_error() {
         .await;
 
     assert!(
-        tally.count() >= CI_MANY_PARTS as u32,
+        tally.count() >= MANY_PARTS as u32,
         "expected every part's first dispatch to be faulted (got {})",
         tally.count()
     );
-    // Regression: this exact configuration reproduced the macOS CI ENOBUFS
-    // failure before the TM transient-transport retry existed (the SDK's shared
-    // retry token bucket starved under the correlated burst). With the TM outer
-    // retry + full-jittered backoff, the re-issues de-correlate and recover.
+    // Without the TM's outer transient-transport retry, the SDK's shared retry
+    // token bucket starves under the correlated burst and the transfer fails.
+    // With the TM outer retry + full-jittered backoff, the re-issues de-correlate
+    // and recover.
     result.expect("correlated UploadPart dispatch-IO burst must recover via TM retry");
 }
 

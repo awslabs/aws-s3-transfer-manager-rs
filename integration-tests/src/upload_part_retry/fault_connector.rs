@@ -3,21 +3,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Client-side connector that injects a dispatch-layer IO error.
+//! Connector that injects a *local* (client-side) IO dispatch failure.
 //!
-//! The CI failure was `hyper::Error(BodyWrite, Os { code: 55 })` (`ENOBUFS`) on
-//! an `UploadPart` send: the client's kernel could not allocate socket buffer
-//! space while writing the request body. The SDK surfaces that as
-//! `SdkError::DispatchFailure(ConnectorError { kind: Io, .. })`. The mock server's
-//! `socket_fault` wraps the *server* socket, so it cannot reproduce a *client*
-//! send failure; this connector injects at the client connector instead, which is
-//! the faithful side of the wire.
+//! This models a failure originating on the client before/while the request is
+//! written to the socket — the client's kernel refusing the send (e.g. `ENOBUFS`,
+//! socket-buffer exhaustion), a connect error, or a client-side write error. The
+//! SDK surfaces this class as `SdkError::DispatchFailure(ConnectorError { kind:
+//! Io, .. })`, and the retry path keys on `ConnectorError::is_io()`.
 //!
-//! What the retry path keys on is `ConnectorError::is_io()`, so returning
-//! `ConnectorError::io(..)` from `call` on a targeted attempt reproduces the
-//! classification-relevant shape exactly. Non-targeted requests delegate to a
-//! real loopback HTTP connector, so a retried `UploadPart` actually succeeds and
-//! a test can assert recovery (transient) vs exhaustion (persistent).
+//! It is deliberately distinct from the mock server's fault modeling: those
+//! faults inject on the *server* side (reset, truncate, stall, service error) on
+//! requests that already reached the server, so they cannot reproduce a client
+//! send that never completes. Returning `ConnectorError::io(..)` from `call` on a
+//! targeted attempt reproduces the local-failure classification path exactly.
+//! `ENOBUFS` (errno 55) is used as a concrete instance of the class.
+//!
+//! Non-targeted requests delegate to a real loopback HTTP connector, so a retried
+//! request actually succeeds and a test can assert recovery (transient) vs
+//! exhaustion (persistent).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -43,10 +46,10 @@ pub(crate) enum FailCount {
     Always,
     /// Fail the FIRST dispatch of each distinct part exactly once, then let
     /// every re-issue of that part through. This is the faithful transient-burst
-    /// model: every part's initial write fails (as under mbuf saturation), but
-    /// the pressure clears so a retry of the same part succeeds. Requires the
-    /// request to carry a `partNumber` (UploadPart); requests without one are
-    /// never faulted.
+    /// model: every part's initial write fails (as under system-wide socket-buffer
+    /// exhaustion), but the pressure clears so a retry of the same part succeeds.
+    /// Requires the request to carry a `partNumber` (UploadPart); requests without
+    /// one are never faulted.
     EachPartOnce,
 }
 
@@ -109,7 +112,8 @@ impl HttpConnector for IoFaultConnector {
             };
         if should_fail {
             return HttpConnectorFuture::ready(Err(ConnectorError::io(
-                // errno 55 = ENOBUFS on macOS, matching the CI failure source.
+                // errno 55 = ENOBUFS: a representative local socket-buffer
+                // exhaustion error for this transient-transport class.
                 std::io::Error::from_raw_os_error(55).into(),
             )));
         }

@@ -739,7 +739,7 @@ impl DownloadTransfer {
                             resp.body
                         }
                     };
-                    Self::read_body_stream(&ctx, seq, body).await
+                    Self::read_body_stream(&ctx, body).await
                 }
             },
         )
@@ -817,44 +817,14 @@ impl DownloadTransfer {
     /// cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`].
     async fn read_body_stream(
         ctx: &TransferContext,
-        seq: u64,
         body: aws_sdk_s3::primitives::ByteStream,
     ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
         let mut segmented = SegmentedBuf::new();
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
 
-        // Per-chunk body-delivery timing. Stalls are mid-body (TTFB is ~0), so the
-        // signal is the inter-chunk gap, not whole-request latency. Emit gap-floored
-        // (only gaps over the threshold) to keep the trace cheap on the hot path;
-        // always emit the first chunk (TTFB) and the part summary. No target — shows
-        // under this module's path in normal trace logs. Feeds the offline dead-gap
-        // replay (see download/per-body-progress-instrumentation-spec.md).
-        const GAP_FLOOR: std::time::Duration = std::time::Duration::from_millis(1);
-        let part_start = std::time::Instant::now();
-        let mut last_chunk = part_start;
-        let mut chunk_idx: u64 = 0;
-
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
-            let now = std::time::Instant::now();
-            let gap = now.duration_since(last_chunk);
-            let is_first = chunk_idx == 0;
-            if is_first || gap > GAP_FLOOR {
-                tracing::trace!(
-                    seq,
-                    chunk_idx,
-                    chunk_bytes = data.len(),
-                    cum_bytes = bytes_received + data.len() as u64,
-                    t_since_part_start_us = now.duration_since(part_start).as_micros() as u64,
-                    t_since_last_chunk_us = gap.as_micros() as u64,
-                    is_first,
-                    "body.chunk",
-                );
-            }
-            last_chunk = now;
-            chunk_idx += 1;
-
             bytes_received += data.len() as u64;
             segmented.push(data);
             if !ctx.is_active() {
@@ -865,13 +835,6 @@ impl DownloadTransfer {
             }
         }
 
-        tracing::trace!(
-            seq,
-            total_us = part_start.elapsed().as_micros() as u64,
-            total_bytes = bytes_received,
-            n_chunks = chunk_idx,
-            "body.part_done",
-        );
         Ok((segmented, bytes_received))
     }
 
@@ -911,7 +874,7 @@ impl DownloadTransfer {
                     validate_content_range(&rh, resp.content_range())?;
                     let chunk_meta = ChunkMetadata::from(&resp);
                     let (segmented, bytes_received) =
-                        Self::read_body_stream(&ctx, seq, resp.body).await?;
+                        Self::read_body_stream(&ctx, resp.body).await?;
                     Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
                 }
             },

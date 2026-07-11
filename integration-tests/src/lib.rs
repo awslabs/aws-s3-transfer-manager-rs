@@ -12,7 +12,6 @@
 
 mod assertions;
 mod download;
-mod fault_connector;
 mod harness;
 mod integrity;
 mod metrics;

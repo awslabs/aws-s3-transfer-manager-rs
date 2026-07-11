@@ -24,13 +24,13 @@ use crate::metrics::latency::{GuardError, LatencyTracker};
 /// until this budget is spent.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Base delay for the upload part-send transient-transport backoff. The first
-/// retry waits a full-jittered value in `[0, INITIAL_BACKOFF]`, doubling each
-/// attempt. Sized above the SDK's own 50ms transient base because this loop is
-/// an *outer* retry that fires only after the SDK's inner retry already
-/// exhausted — a re-issue should span the window in which in-flight work
-/// completes and returns retry-quota tokens, not collide with the drained
-/// bucket again. See `networking/retry-ownership-and-token-bucket.md`.
+/// Base delay for transient-transport backoff (both the upload part-send and the
+/// download body-read paths use it). The first retry waits a full-jittered value
+/// in `[0, INITIAL_BACKOFF]`, doubling each attempt. Sized above the SDK's own
+/// 50ms transient base because this loop is an *outer* retry that fires only after
+/// the SDK's inner retry already exhausted — a re-issue should span the window in
+/// which in-flight work completes and returns retry-quota tokens, not collide with
+/// the drained bucket again. See `networking/retry-ownership-and-token-bucket.md`.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Ceiling for a single backoff delay (applied before jitter). The SDK SEP uses
@@ -58,7 +58,8 @@ pub(crate) struct Backoff {
 }
 
 impl Backoff {
-    /// Backoff tuned for transient-transport retries on the upload part path.
+    /// Backoff tuned for transient-transport retries (upload part-send and
+    /// download body-read paths).
     pub(crate) const fn transient() -> Self {
         Self {
             initial: INITIAL_BACKOFF,
@@ -125,6 +126,9 @@ where
                 }
                 RetryDecision::Retry { delay } => {
                     if let Some(delay) = delay {
+                        // TODO: thread the runtime's `AsyncSleep` impl (via
+                        // RuntimeComponents, as the SDK does) instead of binding
+                        // directly to tokio, so the backoff sleep is runtime-agnostic.
                         tokio::time::sleep(delay).await;
                     }
                     attempt += 1;
