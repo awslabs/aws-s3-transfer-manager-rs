@@ -226,7 +226,9 @@ jobs:
         with:
           tool: cargo-deny
       - name: cargo-deny
-        run: cargo deny --all-features check --hide-inclusion-graph --config .cargo-deny-config.toml licenses bans sources
+        # --config is a global flag: it must precede the `check` subcommand.
+        # Newer cargo-deny rejects it after `check` (unexpected argument).
+        run: cargo deny --all-features --config .cargo-deny-config.toml check --hide-inclusion-graph licenses bans sources
 
   sanitizers:
     name: saniters (${{ matrix.sanitizer }})
