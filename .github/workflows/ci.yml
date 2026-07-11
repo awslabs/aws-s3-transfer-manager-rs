@@ -101,9 +101,13 @@ jobs:
           cargo test --doc --workspace --no-fail-fast
 
       - name: test s3-transfer-manager e2e
+        # --nocapture surfaces the transfer manager's diagnostic tracing (the
+        # harness installs a curated-filter subscriber for real-S3 runs) so an
+        # e2e failure is debuggable from its own CI log. Override the filter with
+        # RUST_LOG here when a run needs a different level or target.
         run: |
           RUSTFLAGS="--cfg e2e_test" cargo test --test e2e_transfer_test
-          RUSTFLAGS="--cfg e2e_test" cargo test -p integration-tests
+          RUSTFLAGS="--cfg e2e_test" cargo test -p integration-tests -- --nocapture
 
   fmt:
     name: fmt
