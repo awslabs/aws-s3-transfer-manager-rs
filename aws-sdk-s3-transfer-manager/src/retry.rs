@@ -101,6 +101,11 @@ pub(crate) enum RetryDecision {
 /// is spent, then the last error is returned. `build` must produce an identical
 /// request each call (same range, etag, version) so a retry reads the same data.
 ///
+/// The entire `build` future is under the deadline. Use this when the whole
+/// operation is the unit being timed (e.g. an upload part-send). For a download,
+/// where the deadline should cover only time-to-first-byte and NOT the body-read
+/// (whose duration scales with part size), use [`retry_guarded_response`].
+///
 /// `classify` sees the [`GuardError`] directly, so a deadline timeout is a
 /// distinct arm from inner errors. [`into_error`] renders a terminal
 /// `DeadlineExceeded` into the returned `Error` only at the return path.
@@ -113,9 +118,50 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, Error>>,
 {
+    // The whole operation is the timed unit: guard it, with an identity tail.
+    retry_guarded_response(tracker, classify, || {
+        (build(), |v| std::future::ready(Ok(v)))
+    })
+    .await
+}
+
+/// Retry loop where the latency deadline covers only the first phase (the
+/// response), not the untimed tail that consumes it.
+///
+/// Each attempt calls `build` to get `(send, consume)`, both fresh so `consume`
+/// can capture per-attempt state:
+///   - `send` is run under the deadline — for a download GET this resolves when
+///     response headers arrive, i.e. time-to-first-byte. A deadline timeout here
+///     is a `DeadlineExceeded` straggler (slow to respond / bad connection),
+///     re-issued on a fresh connection.
+///   - `consume` runs on `send`'s success value WITHOUT a deadline — for a
+///     download this is the body-read, whose duration scales with part size and
+///     link speed and must not be cancelled as if it were a straggler. A dead
+///     mid-body stream is caught by stalled-stream protection, not this deadline.
+///
+/// An error from either phase is classified and retried identically (a
+/// body-read `IOError` re-issues the whole GET). `build` must produce an
+/// identical request each call so a retry reads the same data.
+pub(crate) async fn retry_guarded_response<T, U, F, C, SendFut, ConsumeFut>(
+    tracker: &LatencyTracker,
+    classify: impl Fn(&GuardError<Error>, u32) -> RetryDecision,
+    mut build: F,
+) -> Result<U, Error>
+where
+    F: FnMut() -> (SendFut, C),
+    C: FnOnce(T) -> ConsumeFut,
+    SendFut: Future<Output = Result<T, Error>>,
+    ConsumeFut: Future<Output = Result<U, Error>>,
+{
     let mut attempt = 1u32;
     loop {
-        match tracker.guarded(build()).await {
+        let (send, consume) = build();
+        // Time only the response (TTFB); on success, consume the body untimed.
+        let outcome = match tracker.guarded(send).await {
+            Ok(resp) => consume(resp).await.map_err(GuardError::Inner),
+            Err(ge) => Err(ge),
+        };
+        match outcome {
             Ok(val) => return Ok(val),
             // `attempt - 1` is the 0-based retry index for backoff: 0 on the
             // first failure, so the classifier's first computed delay uses 2^0.
@@ -260,6 +306,34 @@ pub(crate) fn bucket_partition_override(bucket: Option<&str>) -> aws_sdk_s3::con
     }
 }
 
+/// Stalled-stream grace period for download GET bodies.
+///
+/// Stalled-stream protection cancels a response body that delivers zero bytes
+/// for this long, so a dead mid-body connection is dropped and the GET re-issued
+/// on a fresh one — the head-of-line-blocking case the latency deadline no longer
+/// covers (the deadline now guards only time-to-first-byte, not the body read).
+/// The SDK default is 5s; downloads tighten it because a multi-second dead gap on
+/// one part stalls the whole transfer, and the check triggers only on *zero*
+/// throughput — a slow-but-progressing stream is never affected, so tightening
+/// cannot false-cancel a healthy slow link.
+///
+// TODO(vnext): ground this value in measured dead-gap data (the parked dead-gap
+// detector work) rather than a chosen constant; 2s is a conservative first cut.
+const DOWNLOAD_STALL_GRACE: Duration = Duration::from_secs(2);
+
+/// Per-operation config override for a download GET: the bucket retry partition
+/// plus a tightened stalled-stream grace period on the response body.
+///
+/// Attach unconditionally via `.config_override(...)`; with no bucket the retry
+/// partition is left at the client default and only the grace period is set.
+pub(crate) fn download_get_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+    bucket_partition_override(bucket).stalled_stream_protection(
+        aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+            .grace_period(DOWNLOAD_STALL_GRACE)
+            .build(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +376,110 @@ mod tests {
         assert_eq!(result.unwrap(), 42);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
         assert_eq!(tracker.timeout_count(), 1);
+    }
+
+    // --- split-timing (retry_guarded_response) ----------------------------
+    //
+    // The deadline must cover only the `send` phase (TTFB), never the `consume`
+    // tail (body-read). These pin that boundary: a slow consume must NOT trip the
+    // deadline (the large-part false-cancel bug), while a slow send must.
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn slow_consume_does_not_trip_deadline() {
+        let tracker = LatencyTracker::new();
+        warm_tracker(&tracker); // deadline ≈ 200ms
+
+        // send resolves immediately; consume (the "body read") takes 30s — far
+        // past the deadline. It must still succeed: the body read is untimed.
+        let attempts = AtomicUsize::new(0);
+        let result = retry_guarded_response(&tracker, deadline_only, || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            (std::future::ready(Ok::<_, Error>(())), |()| async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<_, Error>(42)
+            })
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "no retry: consume is untimed"
+        );
+        assert_eq!(
+            tracker.timeout_count(),
+            0,
+            "a slow body read is not a timeout"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn slow_send_trips_deadline_then_retries() {
+        let tracker = LatencyTracker::new();
+        warm_tracker(&tracker); // deadline ≈ 200ms
+
+        // First attempt's send stalls 30s (slow TTFB) → deadline fires → retry;
+        // second attempt's send is immediate and consume succeeds.
+        let attempts = AtomicUsize::new(0);
+        let result = retry_guarded_response(&tracker, deadline_only, || {
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            let send = async move {
+                if n == 0 {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                Ok::<_, Error>(())
+            };
+            (send, |()| std::future::ready(Ok::<_, Error>(7)))
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "slow send trips deadline → one retry"
+        );
+        assert_eq!(tracker.timeout_count(), 1);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn consume_error_is_classified_and_retried() {
+        let tracker = LatencyTracker::new();
+        warm_tracker(&tracker);
+
+        // A body-read (consume) IOError must re-enter the retry loop exactly like
+        // a send error would — proving the untimed tail is still retryable.
+        let attempts = AtomicUsize::new(0);
+        let classify = |ge: &GuardError<Error>, _i: u32| match ge {
+            GuardError::Inner(e) if *e.kind() == ErrorKind::IOError => {
+                RetryDecision::Retry { delay: None }
+            }
+            _ => RetryDecision::NoRetry,
+        };
+        let result = retry_guarded_response(&tracker, classify, || {
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            (
+                std::future::ready(Ok::<_, Error>(())),
+                move |()| async move {
+                    if n == 0 {
+                        return Err(Error::new(ErrorKind::IOError, "body read reset"));
+                    }
+                    Ok::<_, Error>(99)
+                },
+            )
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "consume error re-issues the GET"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
