@@ -44,6 +44,10 @@ pub enum FaultType {
     /// token-bucket layer rather than the TM body-read loop. Retryable statuses
     /// (500/503) drive the SDK to spend retry tokens.
     ServiceError { status: u16 },
+    /// While reading the request (upload) body, consume up to `after_bytes` then
+    /// stall (stop reading, never complete). The client's request-body poll parks
+    /// indefinitely, which stalled-stream protection observes as a stall.
+    StallRequestRead { after_bytes: u64 },
 }
 
 /// How many times an eligible fault fires before it is consumed.

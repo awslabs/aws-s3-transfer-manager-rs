@@ -286,9 +286,17 @@ impl<S: StorageBackend + 'static> Inner<S> {
                 };
                 return Err(s3s::S3Error::new(code));
             }
+            // Upload-only faults are no-ops on the GET path.
+            Some(crate::faults::FaultType::StallRequestRead { .. }) => {}
             None => {}
         }
         Ok(())
+    }
+
+    /// Consume the next fault for an upload request and return it. Both upload
+    /// handlers call this once so the queue advances deterministically.
+    fn next_upload_fault(&self, bucket: &str, key: &str) -> Option<crate::faults::FaultType> {
+        self.faults.next_fault(bucket, key)
     }
 }
 
@@ -475,12 +483,53 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             return Err(s3s::s3_error!(InvalidRequest));
         }
 
+        let fault = self.next_upload_fault(&input.bucket, &input.key);
+
+        // ServiceError: return before consuming the body.
+        if let Some(crate::faults::FaultType::ServiceError { status }) = fault {
+            let code = match status {
+                500 => s3s::S3ErrorCode::InternalError,
+                503 => s3s::S3ErrorCode::SlowDown,
+                _ => s3s::S3ErrorCode::ServiceUnavailable,
+            };
+            return Err(s3s::S3Error::new(code));
+        }
+
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
         // Create storage request with configured checksums
         let mut request = crate::storage::StoreObjectRequest::from(input);
         request.integrity_checks = integrity_checks;
+
+        // StallRequestRead: wrap the body stream to stall after `after_bytes`.
+        if let Some(crate::faults::FaultType::StallRequestRead { after_bytes }) = fault {
+            let inner_body =
+                std::mem::replace(&mut request.body, Box::pin(futures_util::stream::empty()));
+            let stalled = futures_util::stream::unfold(
+                (inner_body, after_bytes),
+                |(mut stream, remaining)| async move {
+                    if remaining == 0 {
+                        std::future::pending::<()>().await;
+                        unreachable!("pending future never resolves");
+                    }
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            if (chunk.len() as u64) <= remaining {
+                                let rem = remaining - chunk.len() as u64;
+                                Some((Ok(chunk), (stream, rem)))
+                            } else {
+                                let head = chunk.slice(0..remaining as usize);
+                                Some((Ok(head), (stream, 0)))
+                            }
+                        }
+                        Some(Err(e)) => Some((Err(e), (stream, 0))),
+                        None => None,
+                    }
+                },
+            );
+            request.body = Box::pin(stalled);
+        }
 
         let stored_meta = self.storage.put_object(request).await?;
 
@@ -597,15 +646,50 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let part_number = input.part_number;
         tracing::trace!(%upload_id, part_number, "UploadPart");
 
+        let fault = self.next_upload_fault(&input.bucket, &input.key);
+
+        // ServiceError: return before consuming the body.
+        if let Some(crate::faults::FaultType::ServiceError { status }) = fault {
+            let code = match status {
+                500 => s3s::S3ErrorCode::InternalError,
+                503 => s3s::S3ErrorCode::SlowDown,
+                _ => s3s::S3ErrorCode::ServiceUnavailable,
+            };
+            return Err(s3s::S3Error::new(code));
+        }
+
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
-        // Read the part content and calculate checksums
+        // Read the part content and calculate checksums.
+        // StallRequestRead: after consuming `after_bytes`, pend forever.
+        let stall_after = match fault {
+            Some(crate::faults::FaultType::StallRequestRead { after_bytes }) => Some(after_bytes),
+            _ => None,
+        };
+        let mut bytes_consumed: u64 = 0;
         let mut content = BytesMut::new();
         if let Some(mut body) = input.body {
             while let Some(chunk) = body.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        if let Some(limit) = stall_after {
+                            if bytes_consumed >= limit {
+                                // Stall: stop reading, pend forever.
+                                std::future::pending::<()>().await;
+                                unreachable!("pending future never resolves");
+                            }
+                            let new_total = bytes_consumed + chunk.len() as u64;
+                            if new_total > limit {
+                                // Consume up to the limit, then stall.
+                                let allowed = (limit - bytes_consumed) as usize;
+                                integrity_checks.update(&chunk[..allowed]);
+                                content.extend_from_slice(&chunk[..allowed]);
+                                std::future::pending::<()>().await;
+                                unreachable!("pending future never resolves");
+                            }
+                            bytes_consumed = new_total;
+                        }
                         integrity_checks.update(&chunk);
                         content.extend_from_slice(&chunk);
                     }
