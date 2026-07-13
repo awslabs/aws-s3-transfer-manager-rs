@@ -696,13 +696,13 @@ impl DownloadTransfer {
     ) -> WorkOutcome {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
-        // The discovery GET already fetched this chunk's bytes; the first read
-        // consumes that stream with no extra request (preserving time-to-first-
-        // byte). A retry has no stream to reuse, so it re-issues a ranged GET for
-        // exactly the bytes this chunk covers, taken from the discovery response's
-        // content-range. A partNumber=1 discovery maps to the same byte range, so
-        // the re-issued aligned range returns the same per-part checksum the SDK
-        // validates against.
+        // The discovery GET already received this chunk's response headers; the
+        // first read consumes its (lazy, not-yet-read) body stream with no extra
+        // request. A retry has no stream to reuse, so it re-issues a ranged GET
+        // for exactly the bytes this chunk covers, taken from the discovery
+        // response's content-range. A partNumber=1 discovery maps to the same
+        // byte range, so the re-issued aligned range returns the same per-part
+        // checksum the SDK validates against.
         let reissue_range = chunk_meta
             .content_range
             .as_deref()
@@ -710,45 +710,50 @@ impl DownloadTransfer {
 
         let mut initial = Some(stream);
         let backoff = crate::retry::Backoff::transient();
-        // As in execute_get_range, the deadline guards only the GET response
-        // (TTFB); the body-read is untimed. The first attempt's body was already
-        // fetched during discovery (no send to time), so its timed phase is a
-        // no-op; only re-issues actually send and are TTFB-guarded.
-        let result = crate::retry::retry_guarded_response(
-            &self.inner.ctx.handle.telemetry.recv_latencies,
-            |ge, retry_index| crate::retry::classify_body_retry(ge, retry_index, &backoff),
-            || {
-                let pre_issued = initial.take();
-                let etag = etag.clone();
-                let ctx = self.inner.ctx.clone();
-                let reissue_range = reissue_range.clone();
-                let mut builder =
-                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
-                if let Some(r) = reissue_range.as_ref() {
-                    builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
-                }
-                if let Some(etag) = etag.as_ref() {
-                    builder = builder.if_match(etag.as_ref());
-                }
-                let req = builder
-                    .customize()
-                    .config_override(crate::retry::download_get_override(input.bucket()));
-                // Timed: obtain the body stream. First attempt reuses the
-                // discovery body (no send); a retry re-issues and times the send.
-                let send = async move {
-                    match pre_issued {
-                        Some(s) => Ok::<_, crate::error::Error>(s),
-                        None => {
-                            let resp = req.send().await.map_err(crate::error::Error::from)?;
-                            Ok(resp.body)
-                        }
+        let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        // The deadline guards only the GET response (TTFB); the body-read is
+        // untimed. The first attempt reuses the discovery body — no network send
+        // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
+        // "send" would drag the TTFB percentile toward zero). Only a genuine
+        // re-issue goes through `guarded`, which times and records its TTFB.
+        let result = crate::retry::retry(crate::retry::classify_body_retry, &backoff, || {
+            let pre_issued = initial.take();
+            let etag = etag.clone();
+            let ctx = self.inner.ctx.clone();
+            let reissue_range = reissue_range.clone();
+            let mut builder =
+                copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+            if let Some(r) = reissue_range.as_ref() {
+                builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
+            }
+            if let Some(etag) = etag.as_ref() {
+                builder = builder.if_match(etag.as_ref());
+            }
+            let req = builder
+                .customize()
+                .config_override(crate::retry::download_get_override(input.bucket()));
+            async move {
+                // Obtain the body stream. First attempt reuses the discovery body
+                // (no send, untimed); a re-issue is TTFB-guarded (times + records).
+                let body = match pre_issued {
+                    Some(s) => s,
+                    None => {
+                        recv_latencies
+                            .guarded(async {
+                                req.send()
+                                    .await
+                                    .map(|resp| resp.body)
+                                    .map_err(crate::error::Error::from)
+                            })
+                            .await?
                     }
                 };
-                // Untimed: drain the body.
-                let consume = move |body| async move { Self::read_body_stream(&ctx, body).await };
-                (send, consume)
-            },
-        )
+                // Untimed: drain the body. Errors here are inner (retryable IO).
+                Self::read_body_stream(&ctx, body)
+                    .await
+                    .map_err(crate::retry::GuardError::Inner)
+            }
+        })
         .await;
 
         let (segmented, bytes_received) = match result {
@@ -855,51 +860,54 @@ impl DownloadTransfer {
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
         let backoff = crate::retry::Backoff::transient();
-        // The deadline guards only the GET response (send → headers ≈ TTFB); the
-        // body-read runs untimed in the consume tail. A large part on a slow-but-
-        // healthy link takes a long time to drain and must not be cancelled as a
-        // straggler; a dead mid-body stream is caught by stalled-stream protection.
-        let result =
-            crate::retry::retry_guarded_response(
-                &self.inner.ctx.handle.telemetry.recv_latencies,
-                |ge, retry_index| crate::retry::classify_body_retry(ge, retry_index, &backoff),
-                || {
-                    let rh = range_header.clone();
-                    let etag = etag.clone();
-                    let ctx = self.inner.ctx.clone();
-                    // Every chunk GET must carry the same request fields as discovery
-                    // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
-                    // conversion, then pin this chunk's range and the discovered etag.
-                    let mut builder =
-                        copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
-                    builder = builder.set_range(Some(rh.clone()));
-                    if let Some(etag) = etag.as_ref() {
-                        builder = builder.if_match(etag.as_ref());
-                    }
-                    let req = builder
-                        .customize()
-                        .config_override(crate::retry::download_get_override(input.bucket()));
-
-                    // Timed: response headers (TTFB). Validate the range here so a
-                    // mismatch is classified before we commit to reading the body.
-                    let rh_validate = rh.clone();
-                    let send = async move {
+        let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        // The deadline guards only the GET response (send → headers ≈ TTFB): the
+        // `recv_latencies.guarded(send)` wrapper times the send, then the body is
+        // read UNTIMED. A large part on a slow-but-healthy link takes a long time
+        // to drain and must not be cancelled as a straggler; a dead mid-body
+        // stream is caught by stalled-stream protection. A `GuardError`
+        // (deadline timeout OR inner error from either phase) is classified by
+        // the retry loop.
+        let result = crate::retry::retry(crate::retry::classify_body_retry, &backoff, || {
+            let rh = range_header.clone();
+            let etag = etag.clone();
+            let ctx = self.inner.ctx.clone();
+            // Every chunk GET must carry the same request fields as discovery
+            // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
+            // conversion, then pin this chunk's range and the discovered etag.
+            let mut builder =
+                copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+            builder = builder.set_range(Some(rh.clone()));
+            if let Some(etag) = etag.as_ref() {
+                builder = builder.if_match(etag.as_ref());
+            }
+            let req = builder
+                .customize()
+                .config_override(crate::retry::download_get_override(input.bucket()));
+            async move {
+                // Timed (TTFB): obtain response headers. Validate the range here
+                // so a mismatch is classified before we commit to the body read.
+                let rh_validate = rh.clone();
+                let resp = recv_latencies
+                    .guarded(async move {
                         let resp = req.send().await.map_err(crate::error::Error::from)?;
                         validate_content_range(&rh_validate, resp.content_range())?;
                         Ok::<_, crate::error::Error>(resp)
-                    };
-                    // Untimed: drain the body.
-                    let consume =
-                        move |resp: aws_sdk_s3::operation::get_object::GetObjectOutput| async move {
-                            let chunk_meta = ChunkMetadata::from(&resp);
-                            let (segmented, bytes_received) =
-                                Self::read_body_stream(&ctx, resp.body).await?;
-                            Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
-                        };
-                    (send, consume)
-                },
-            )
-            .await;
+                    })
+                    .await?;
+                // Untimed: drain the body. Errors here are inner (retryable IO).
+                let chunk_meta = ChunkMetadata::from(&resp);
+                let (segmented, bytes_received) = Self::read_body_stream(&ctx, resp.body)
+                    .await
+                    .map_err(crate::retry::GuardError::Inner)?;
+                Ok::<_, crate::retry::GuardError<crate::error::Error>>((
+                    chunk_meta,
+                    segmented,
+                    bytes_received,
+                ))
+            }
+        })
+        .await;
 
         let (chunk_meta, segmented, bytes_received) = match result {
             Ok(val) => val,

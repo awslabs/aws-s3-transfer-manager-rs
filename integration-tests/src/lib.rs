@@ -18,4 +18,4 @@ mod metrics;
 mod retry;
 mod upload;
 mod upload_objects;
-mod upload_part_retry;
+mod upload_retry;
