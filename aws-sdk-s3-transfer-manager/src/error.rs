@@ -50,12 +50,11 @@ struct ErrorExtra {
     failed_downloads: Option<Vec<FailedDownload>>,
     /// `true` when the underlying `SdkError` was a transient transport failure
     /// (a connect/read/write IO error or a client-side timeout) rather than a
-    /// service response. Set at conversion from the typed `SdkError`, where the
-    /// distinction is still available before type erasure. Drives the upload
-    /// part-send retry: such failures may not have been recovered by the SDK
-    /// (e.g. the shared retry token bucket was exhausted under a concurrent
-    /// burst), and a re-issue can succeed. Never set for throttling/service
-    /// errors — see `retry::classify_upload_part_retry`.
+    /// service response — a re-issuable failure the SDK's own retry may not have
+    /// recovered (e.g. its shared retry token bucket was exhausted under a
+    /// concurrent burst). Set at conversion from the typed `SdkError`, where the
+    /// distinction is still available before type erasure. Never set for
+    /// throttling/service errors — see `retry::classify_upload_part_retry`.
     transient_transport: bool,
 }
 

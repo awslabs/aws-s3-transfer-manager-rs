@@ -8,8 +8,9 @@
 //! [`retry`] re-issues an operation up to [`MAX_ATTEMPTS`] times, deciding per
 //! failure via a caller-supplied classifier and backing off per [`Backoff`].
 //! The loop is deadline-agnostic: any latency deadline is composed by the caller
-//! inside the built future (see [`LatencyTracker::guarded`]), surfacing a timeout
-//! as [`GuardError::DeadlineExceeded`].
+//! inside the built future (see
+//! [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded)),
+//! surfacing a timeout as [`GuardError::DeadlineExceeded`].
 
 use std::future::Future;
 use std::time::Duration;
@@ -90,7 +91,8 @@ pub(crate) enum RetryDecision {
 ///
 /// Each attempt calls `build()` for a fresh future; `build` must produce an
 /// identical request each call so a retry re-sends/re-reads the same data. Any
-/// latency deadline is composed inside `build` (via [`LatencyTracker::guarded`])
+/// latency deadline is composed inside `build` (via
+/// [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded))
 /// and surfaces as [`GuardError::DeadlineExceeded`]; other errors surface as
 /// [`GuardError::Inner`]. On [`RetryDecision::Retry`] the loop sleeps a
 /// full-jittered [`Backoff`] delay keyed on the 0-based retry index; on
@@ -115,9 +117,8 @@ where
                 RetryDecision::Retry => {
                     // `attempt - 1` is the 0-based retry index: 0 on the first
                     // failure, so the first backoff uses 2^0.
-                    // TODO: thread the runtime's `AsyncSleep` impl (via
-                    // RuntimeComponents, as the SDK does) instead of binding
-                    // directly to tokio, so the backoff sleep is runtime-agnostic.
+                    // The backoff sleep binds to tokio directly rather than the
+                    // runtime's `AsyncSleep`, so the loop requires a tokio reactor.
                     tokio::time::sleep(backoff.delay(attempt - 1, fastrand::f64())).await;
                     attempt += 1;
                 }
@@ -155,8 +156,10 @@ fn into_error(ge: GuardError<Error>) -> Error {
 ///
 /// Everything else is terminal: a modeled service error (including throttling /
 /// 503 `SlowDown`, which the SDK's shared token bucket exists to handle — a TM
-/// re-issue would amplify the storm) and any non-transport inner error. Upload
-/// has no latency deadline, so [`GuardError::DeadlineExceeded`] never arises here.
+/// re-issue would amplify the storm) and any non-transport inner error.
+///
+/// [`GuardError::DeadlineExceeded`] is retried: a straggler dropped at its
+/// deadline is re-issued on a fresh connection rather than surfaced as a failure.
 pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecision {
     match ge {
         GuardError::DeadlineExceeded(_) => RetryDecision::Retry,
@@ -214,8 +217,7 @@ pub(crate) fn bucket_retry_partition(bucket: &str) -> RetryPartition {
 
 /// Per-operation config override that keys the retry token bucket by bucket.
 ///
-/// Returns an empty override when no bucket is set (a no-op merge), so call
-/// sites can attach it unconditionally via `.config_override(...)`.
+/// Returns an empty override when no bucket is set, which merges as a no-op.
 pub(crate) fn bucket_partition_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
     let builder = aws_sdk_s3::config::Builder::default();
     match bucket {

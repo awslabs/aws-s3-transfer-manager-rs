@@ -714,8 +714,8 @@ impl DownloadTransfer {
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
-        // "send" would drag the TTFB percentile toward zero). Only a genuine
-        // re-issue goes through `guarded`, which times and records its TTFB.
+        // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
+        // goes through `guarded`, which times and records its TTFB.
         let result = crate::retry::retry(crate::retry::classify_body_retry, &backoff, || {
             let pre_issued = initial.take();
             let etag = etag.clone();
@@ -738,6 +738,20 @@ impl DownloadTransfer {
                 let body = match pre_issued {
                     Some(s) => s,
                     None => {
+                        // A re-issue without a byte range would fetch the whole
+                        // object into this chunk's slot. S3 always returns a
+                        // content-range for a ranged/partNumber GET, so a missing
+                        // range is a contract violation — fail the chunk rather
+                        // than issue an unbounded GET. Use a terminal kind
+                        // (`RuntimeError`, NoRetry in `classify_body_retry`): the
+                        // range cannot appear on a re-issue, so retrying would
+                        // deterministically fail again and waste a backoff.
+                        if reissue_range.is_none() {
+                            return Err(crate::retry::GuardError::Inner(crate::error::Error::new(
+                                crate::error::ErrorKind::RuntimeError,
+                                "cannot re-issue discovery chunk: response carried no content-range",
+                            )));
+                        }
                         recv_latencies
                             .guarded(async {
                                 req.send()
