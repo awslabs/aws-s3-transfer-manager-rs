@@ -485,3 +485,85 @@ async fn test_upload_objects_abort_terminates() {
 /// Suppress unused warning on `Path` in case the test matrix rotates.
 #[allow(dead_code)]
 fn _touch(_: &Path) {}
+
+// throttle storm (token-bucket starvation) ------------------------------------
+
+/// Characterizes how `upload_objects` behaves when a concurrent fan-out of small
+/// PutObjects is throttled (503 `SlowDown`) across every key — the shape that
+/// fails the `256KiB x 10k` benchmark workload.
+///
+/// Mechanism: the SDK's standard retry shares one token bucket per retry
+/// partition (default capacity 500, 5 tokens/retry). Under a simultaneous 503
+/// storm the bucket drains in the first wave; once empty, the SDK stops retrying
+/// and returns the 503 to the caller. `classify_upload_part_retry` treats a
+/// throttle as terminal (it is the SDK bucket's job, not the TM's), so the child
+/// upload fails, and the default `FailedTransferPolicy::Abort` fails the whole
+/// transfer.
+///
+/// This is a CHARACTERIZATION test: it pins the current abort-on-throttle-storm
+/// behavior deterministically (no real S3 needed), and is the target the throttle
+/// fix must change. The `timeout` guards against a hang regression.
+#[tokio::test]
+async fn upload_objects_throttle_storm_aborts_transfer() {
+    timeout(TEST_TIMEOUT, async {
+        let (server, server_handle, tm) = setup().await;
+
+        let count = 200usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let dataset = make_flat_dataset(count, size);
+        let bucket = "test-bucket";
+        let key_prefix = "storm/";
+
+        // 503 on every object's PutObject, on every attempt: the SDK spends the
+        // shared bucket retrying the first objects, then the rest surface the 503
+        // un-retried once the bucket is drained.
+        for i in 0..count {
+            let key = format!("{key_prefix}{i:04}.bin");
+            server.insert_fault(
+                bucket,
+                &key,
+                s3_mock_server::FaultType::ServiceError { status: 503 },
+                0,
+                s3_mock_server::Occurrence::Always,
+            );
+        }
+
+        let handle = tm
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix(key_prefix)
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let result = handle.join().await;
+
+        // Current behavior: a persistent throttle storm aborts the whole transfer.
+        let err = result.expect_err(
+            "a persistent 503 storm across the fan-out currently aborts the transfer",
+        );
+        assert_eq!(
+            *err.kind(),
+            aws_sdk_s3_transfer_manager::error::ErrorKind::ChildOperationFailed,
+            "a throttle storm aborts via a failed child operation, got {err:?}",
+        );
+        // The throttle cause is not in the top-level Display (`child operation
+        // failed`) but is carried on the error source chain. Walk it to confirm
+        // the SlowDown is recoverable by a caller who inspects `source()`.
+        let mut chain = String::new();
+        let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
+        while let Some(e) = src {
+            chain.push_str(&format!("{e}\n"));
+            src = e.source();
+        }
+        assert!(
+            chain.contains("SlowDown") || chain.contains("503"),
+            "the throttle cause must be on the source chain; chain was:\n{chain}",
+        );
+
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("upload_objects_throttle_storm_aborts_transfer timed out");
+}

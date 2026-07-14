@@ -3,13 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Download body-read retry contract tests.
+//! Download retry and failure-surfacing contract tests.
 //!
 //! A chunk's body is consumed after the SDK's GetObject orchestration completes,
 //! so the SDK's own retry does not cover a mid-stream body failure. The transfer
 //! manager wraps each ranged GET in its own retry loop
 //! (`crate::retry::classify_body_retry`): a transient body-read failure re-issues
 //! the GET; a checksum mismatch does not retry.
+//!
+//! Beyond the body-read path, these tests also cover how a failing discovery GET
+//! surfaces to the caller (the error carries the underlying service error, not a
+//! generic "discovery failed") and how throttling (503 `SlowDown`) is handled on
+//! the download path.
 //!
 //! These tests inject real transport faults via the mock server and assert the
 //! transfer outcome. A fault injected `Once` lets a single download succeed (the
@@ -607,4 +612,87 @@ async fn tm_download(tm: &TmClient, bucket: &str, key: &str) -> Result<Vec<u8>, 
         }
     }
     handle.join().await.map(|_| data).map_err(|_| ())
+}
+
+// discovery failure surfacing + throttling ------------------------------------
+
+/// A discovery GET that always returns 503 `SlowDown` must surface the underlying
+/// service error to the caller, not a generic "object discovery failed".
+///
+/// Discovery for an un-ranged download is a ranged GET (`RangedGet(None)`), the
+/// first GET the transfer issues. Injected `Always`, it 503s on every attempt so
+/// the SDK's own retry is exhausted and the error reaches the transfer, which
+/// fails discovery with the real cause. The caller must see that cause.
+///
+/// KNOWN GAP (this test currently FAILS): discovery failure is reported by
+/// reading an unset `object_meta` `OnceLock` in `download::handle`, which
+/// fabricates `ObjectNotDiscoverable("discovery failed")` and discards the real
+/// error the transfer already stored via `fail()`. The fix is to surface the
+/// transfer's stored failure; this test is the target for it.
+#[tokio::test]
+async fn discovery_service_error_surfaces_underlying_cause() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    let data = single_range_chunk_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::ServiceError { status: 503 },
+        0,
+        Occurrence::Always,
+    );
+
+    let err = t
+        .download("obj", Some(ChecksumMode::Enabled))
+        .await
+        .expect_err("a persistently-throttled discovery must fail the download");
+
+    assert_eq!(
+        *err.kind(),
+        aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError,
+        "discovery failure must surface the underlying service error (SlowDown), \
+         got {err:?}",
+    );
+
+    t.shutdown().await;
+}
+
+/// A single 503 on discovery is transparently recovered by the SDK's own retry:
+/// the download still succeeds. Pins that a transient throttle does not surface
+/// as a failure, and distinguishes the `Always` test above (persistent) from a
+/// one-off blip.
+#[tokio::test]
+async fn discovery_single_service_error_recovers() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    let data = single_range_chunk_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::ServiceError { status: 503 },
+        0,
+        Occurrence::Once,
+    );
+
+    let (bytes, _output) = t
+        .download("obj", Some(ChecksumMode::Enabled))
+        .await
+        .expect("a single 503 on discovery must recover via SDK retry");
+    assert_same_content(&data, &bytes);
+
+    t.shutdown().await;
 }
