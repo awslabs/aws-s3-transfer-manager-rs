@@ -709,14 +709,13 @@ impl DownloadTransfer {
             .and_then(crate::http::header::parse_content_range);
 
         let mut initial = Some(stream);
-        let backoff = crate::retry::Backoff::transient();
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
         // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
         // goes through `guarded`, which times and records its TTFB.
-        let result = crate::retry::retry(crate::retry::classify_body_retry, &backoff, || {
+        let result = crate::retry::retry(crate::retry::classify_body_retry, || {
             let pre_issued = initial.take();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();
@@ -873,7 +872,6 @@ impl DownloadTransfer {
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
-        let backoff = crate::retry::Backoff::transient();
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (send → headers ≈ TTFB): the
         // `recv_latencies.guarded(send)` wrapper times the send, then the body is
@@ -882,7 +880,7 @@ impl DownloadTransfer {
         // stream is caught by stalled-stream protection. A `GuardError`
         // (deadline timeout OR inner error from either phase) is classified by
         // the retry loop.
-        let result = crate::retry::retry(crate::retry::classify_body_retry, &backoff, || {
+        let result = crate::retry::retry(crate::retry::classify_body_retry, || {
             let rh = range_header.clone();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();

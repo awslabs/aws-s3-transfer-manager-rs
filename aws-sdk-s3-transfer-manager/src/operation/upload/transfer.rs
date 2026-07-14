@@ -14,8 +14,13 @@
 //! - **Transient transport** (connection IO error, client-side timeout,
 //!   ENOBUFS-style dispatch failure): the SDK retries, and this module's outer
 //!   [`retry`](crate::retry::retry) loop re-issues past a drained shared retry
-//!   token bucket.
-//! - **Throttling / 503**: the SDK's retry token bucket; never re-issued here.
+//!   token bucket with a fast backoff.
+//! - **Throttling** (503 `SlowDown`): the SDK's retry token bucket handles it
+//!   first; when that bucket drains under a high fan-out the outer
+//!   [`retry`](crate::retry::retry) loop re-issues with a hard throttle backoff,
+//!   bounded by the loop's attempt budget. The per-bucket token bucket
+//!   ([`bucket_retry_partition`](crate::retry::bucket_retry_partition)) is given
+//!   a time-based refill so a drained budget recovers.
 //! - **Mid-upload-body stall** (the peer stops making progress on the request
 //!   body): stalled-stream protection ([`upload_override`](crate::retry::upload_override)).
 //! - **Response never arrives after the body is fully sent**: NOT bounded. This
@@ -400,13 +405,12 @@ impl UploadTransfer {
         let data_bytes = data.data;
         let checksum = data.checksum;
 
-        // Retry transient transport errors. The SDK normally retries an
-        // UploadPart dispatch over the rewindable in-memory body, but a
-        // concurrent ENOBUFS-style burst can exhaust its shared retry token
-        // bucket and surface some parts un-recovered; this outer loop re-issues
-        // those with jittered backoff, landing after in-flight parts refill the
-        // quota. Throttling/503 is left to the SDK token bucket (a TM re-issue
-        // would amplify the storm).
+        // Retry transient transport errors and throttles (the classifier picks
+        // the backoff: fast for transient, hard for a throttle). The SDK normally
+        // retries an UploadPart dispatch over the rewindable in-memory body, but a
+        // concurrent ENOBUFS-style burst or a throttle storm can exhaust its
+        // shared retry token bucket and surface parts un-recovered; this outer
+        // loop re-issues those, landing after in-flight parts refill the quota.
         //
         // No adaptive latency deadline on the upload path: timing the whole
         // part-send (body-push + response) is size-blind and false-cancels large
@@ -414,32 +418,30 @@ impl UploadTransfer {
         // bounds a mid-upload-body stall; a response that never arrives after the
         // body is fully sent is not bounded here (see the module docs on the
         // response-first-byte gap).
-        let backoff = crate::retry::Backoff::transient();
-        let result =
-            crate::retry::retry(crate::retry::classify_upload_part_retry, &backoff, || {
-                let req = copy_fields_to_upload_part_request(
-                    &self.inner.request,
-                    self.inner
-                        .ctx
-                        .s3_client()
-                        .upload_part()
-                        .upload_id(&upload_id)
-                        .part_number(part_num_i32)
-                        .content_length(content_length)
-                        .body(ByteStream::from(data_bytes.clone())),
-                    checksum.as_ref(),
-                );
-                async move {
-                    req.customize()
-                        .config_override(crate::retry::upload_override(self.inner.request.bucket()))
-                        .disable_payload_signing()
-                        .send()
-                        .instrument(tracing::debug_span!("send-upload-part", part_number))
-                        .await
-                        .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
-                }
-            })
-            .await;
+        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, || {
+            let req = copy_fields_to_upload_part_request(
+                &self.inner.request,
+                self.inner
+                    .ctx
+                    .s3_client()
+                    .upload_part()
+                    .upload_id(&upload_id)
+                    .part_number(part_num_i32)
+                    .content_length(content_length)
+                    .body(ByteStream::from(data_bytes.clone())),
+                checksum.as_ref(),
+            );
+            async move {
+                req.customize()
+                    .config_override(crate::retry::upload_override(self.inner.request.bucket()))
+                    .disable_payload_signing()
+                    .send()
+                    .instrument(tracing::debug_span!("send-upload-part", part_number))
+                    .await
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+            }
+        })
+        .await;
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => return self.fail(e),
@@ -552,36 +554,34 @@ impl UploadTransfer {
             "put_object.send_enter",
         );
 
-        // Retry transient transport (same rationale as UploadPart). No adaptive
-        // latency deadline; a mid-upload-body stall is bounded by stalled-stream
-        // protection (`upload_override`), a post-send response-wait is not (see
-        // the module docs on the response-first-byte gap).
-        let backoff = crate::retry::Backoff::transient();
-        let result =
-            crate::retry::retry(crate::retry::classify_upload_part_retry, &backoff, || {
-                let body = sdk_body
-                    .try_clone()
-                    .expect("PutObject SdkBody must be retryable");
-                let put_req = copy_fields_to_put_object_request(
-                    &self.inner.request,
-                    self.inner
-                        .ctx
-                        .s3_client()
-                        .put_object()
-                        .body(ByteStream::new(body)),
-                );
-                async move {
-                    put_req
-                        .customize()
-                        .config_override(crate::retry::upload_override(self.inner.request.bucket()))
-                        .disable_payload_signing()
-                        .send()
-                        .instrument(tracing::debug_span!("send-put-object"))
-                        .await
-                        .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
-                }
-            })
-            .await;
+        // Retry transient transport and throttles (same rationale as UploadPart).
+        // No adaptive latency deadline; a mid-upload-body stall is bounded by
+        // stalled-stream protection (`upload_override`), a post-send response-wait
+        // is not (see the module docs on the response-first-byte gap).
+        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, || {
+            let body = sdk_body
+                .try_clone()
+                .expect("PutObject SdkBody must be retryable");
+            let put_req = copy_fields_to_put_object_request(
+                &self.inner.request,
+                self.inner
+                    .ctx
+                    .s3_client()
+                    .put_object()
+                    .body(ByteStream::new(body)),
+            );
+            async move {
+                put_req
+                    .customize()
+                    .config_override(crate::retry::upload_override(self.inner.request.bucket()))
+                    .disable_payload_signing()
+                    .send()
+                    .instrument(tracing::debug_span!("send-put-object"))
+                    .await
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+            }
+        })
+        .await;
         let resp = match result {
             Ok(resp) => {
                 tracing::debug!(

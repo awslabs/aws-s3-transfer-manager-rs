@@ -193,6 +193,28 @@ impl Error {
         }
     }
 
+    /// Test-only: a `ServiceError` carrying the given service error code,
+    /// mirroring what `service_error` produces from an `SdkError` (which cannot
+    /// be constructed directly in a unit test). Lets retry classifiers be tested
+    /// against a code (e.g. throttle detection) without a live wire error.
+    #[cfg(test)]
+    pub(crate) fn test_service_error(code: &str) -> Error {
+        Error {
+            kind: ErrorKind::ServiceError,
+            source: "injected service error".into(),
+            extra: Some(Box::new(ErrorExtra {
+                service: Some(ServiceMetadata {
+                    operation: "TestOperation",
+                    code: Some(code.to_owned()),
+                    message: None,
+                    request_id: None,
+                    extended_request_id: None,
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
     fn service(&self) -> Option<&ServiceMetadata> {
         self.extra.as_ref().and_then(|e| e.service.as_ref())
     }
