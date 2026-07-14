@@ -529,8 +529,7 @@ mod tests {
     #[test]
     fn resolve_target_throughput_derives_from_download() {
         // 100 Gbps target -> ceil(100 / 0.4) = 250 in-flight.
-        let mode =
-            ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(100));
+        let mode = ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(100));
         assert_eq!(resolve_concurrency_target(&mode, &profile(None, 8)), 250);
     }
 
@@ -552,7 +551,10 @@ mod tests {
     fn resolve_explicit_zero_is_clamped_not_panic() {
         // `FixedConcurrency::new(0)` would panic; resolution must guard it.
         let p = profile(None, 8);
-        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Explicit(0), &p), 1);
+        assert_eq!(
+            resolve_concurrency_target(&ConcurrencyMode::Explicit(0), &p),
+            1
+        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri
@@ -574,9 +576,15 @@ mod tests {
     #[test]
     fn client_new_bypass_path_detects_locally() {
         // No profile on the config (built directly, not via the loader):
-        // Client::new detects locally and still resolves a valid, clamped target.
+        // Client::new detects locally. Off EC2 (the test host) DMI yields no
+        // instance type, so the resolved target must equal the vCPU fallback for
+        // the detected core count — pinning it, so a regression that stops
+        // feeding local vCPU into resolution is caught (not just a clamp-range
+        // check that holds by construction).
+        use crate::runtime::platform;
+        let expected = platform::auto_concurrency_seed(None, platform::local_vcpus());
         let config = config_with(ConcurrencyMode::Auto, None);
         let client = Client::new(config);
-        assert!((10..=10_000).contains(&client.handle.controller.target()));
+        assert_eq!(client.handle.controller.target(), expected);
     }
 }

@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 
 // Connection-cap sizing from the descriptor limit and memory budget. The
 // consumer is the managed-runtime connection pool, which caps `max_connections`
-// from these. Each item below carries `#[allow(dead_code)]` until that wiring
-// exists.
+// from these. The pool wiring does not exist yet, so the fd-budget items below
+// carry `#[allow(dead_code)]`; `MIN_CONN`/`ABSOLUTE_MAX_CONN` are already live as
+// the concurrency-seed bounds (in-flight requests are connection-bound under
+// HTTP/1, so the connection bounds bound the seed too).
 
 /// Fraction of the process file-descriptor limit the connection pool may use.
 /// The remainder is headroom for disk sinks, the directory walker, logging, and
@@ -22,14 +24,13 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 const POOL_FD_BUDGET_FRACTION: f64 = 0.5;
 
-/// Ceiling on pooled connections regardless of descriptor headroom. Bounds the
-/// request fan-out against a single S3 endpoint, and is the cap on platforms
-/// with no low descriptor limit.
-#[allow(dead_code)]
+/// Ceiling on pooled connections regardless of descriptor headroom, and the
+/// upper bound on the concurrency seed. Bounds request fan-out against a single
+/// S3 endpoint, and is the cap on platforms with no low descriptor limit.
 const ABSOLUTE_MAX_CONN: usize = 10_000;
 
-/// Floor so a low descriptor limit does not cap the pool below a usable count.
-#[allow(dead_code)]
+/// Floor so a low descriptor limit does not cap the pool below a usable count,
+/// and the lower bound on the concurrency seed.
 const MIN_CONN: usize = 10;
 
 /// Global cap on pooled connections from the descriptor limit alone, used where
@@ -408,26 +409,28 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 // Concurrency seeding
 //
 // Resolves `ConcurrencyMode::Auto` (and `TargetThroughput`) to a fixed in-flight
-// request target for the preview, in lieu of an adaptive controller. The target
-// is derived from an estimate of the machine's network bandwidth: recognized EC2
-// instance families map to a per-vCPU Gbps rate (NIC bandwidth scales linearly
-// with vCPU count within a family), and `target = ceil(gbps / GBPS_PER_CONN)`.
+// request target, in lieu of an adaptive controller. The target is derived from
+// an estimate of the machine's network bandwidth: recognized EC2 instance
+// families map to a per-vCPU Gbps rate (NIC bandwidth scales linearly with vCPU
+// count within a family), and `target = ceil(gbps / GBPS_PER_CONN)`.
 //
-// This is `N` = target *in-flight requests* (the scheduler's `poll_work` gate),
-// not connections; the pool sizes connections separately.
+// `N` is target *in-flight requests* (the scheduler's `poll_work` gate), which
+// the pool sizes connections separately from. In-flight work is nonetheless
+// connection-bound under HTTP/1 (one request per connection on the wire), so the
+// connection bounds `[MIN_CONN, ABSOLUTE_MAX_CONN]` are the correct bounds for
+// the seed and are reused rather than duplicated.
 // ---------------------------------------------------------------------------
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
 /// figure (`100 / 250`), which lines up with the measured ~250-in-flight knee at
-/// ~100 Gbps. Preview constant; a measured value may replace it later.
+/// ~100 Gbps. Estimated, not measured for this client.
 const GBPS_PER_CONN: f64 = 0.4;
 
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Chosen
 /// to match the ratio recognized network-optimized families already get
 /// (`m6idn.16xlarge`: 64 vCPU -> 250 ~= 3.9/vCPU), so an unrecognized box is
-/// seeded continuously with a recognized one rather than far below it. Preview
-/// constant; a measured value may replace it later.
+/// seeded continuously with a recognized one rather than far below it.
 const FALLBACK_INFLIGHT_PER_VCPU: usize = 4;
 
 /// Peak network bandwidth of each EC2 instance family, as the raw spec of its
@@ -573,6 +576,23 @@ pub(crate) enum DmiDetection {
     Unknown,
 }
 
+/// Classify DMI reads into a [`DmiDetection`]. `vendor` is the `sys_vendor`
+/// contents; `product` is `product_name`, `None` when that read failed. Split
+/// from the file I/O so the three-state logic is testable without `/sys`.
+///
+/// A readable vendor that is not "Amazon EC2" is a definitive `NotEc2` (skip
+/// IMDS). Vendor is EC2 but product is missing/empty ⇒ `Unknown` (let IMDS try).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn classify_dmi(vendor: &str, product: Option<&str>) -> DmiDetection {
+    if !vendor.trim().eq_ignore_ascii_case("Amazon EC2") {
+        return DmiDetection::NotEc2;
+    }
+    match product.map(str::trim) {
+        Some(ty) if !ty.is_empty() => DmiDetection::Instance(ty.to_string()),
+        _ => DmiDetection::Unknown,
+    }
+}
+
 /// Detect the EC2 instance type from DMI, without any network call.
 ///
 /// Reads `/sys/devices/virtual/dmi/id/sys_vendor` to confirm the host is EC2,
@@ -584,21 +604,8 @@ pub(crate) fn detect_instance_type_dmi() -> DmiDetection {
     let Ok(vendor) = std::fs::read_to_string("/sys/devices/virtual/dmi/id/sys_vendor") else {
         return DmiDetection::Unknown;
     };
-    if !vendor.trim().eq_ignore_ascii_case("Amazon EC2") {
-        return DmiDetection::NotEc2;
-    }
-    match std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name") {
-        Ok(product) => {
-            let ty = product.trim();
-            if ty.is_empty() {
-                // Vendor says EC2 but no product name — inconclusive, let IMDS try.
-                DmiDetection::Unknown
-            } else {
-                DmiDetection::Instance(ty.to_string())
-            }
-        }
-        Err(_) => DmiDetection::Unknown,
-    }
+    let product = std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name").ok();
+    classify_dmi(&vendor, product.as_deref())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -910,6 +917,22 @@ mod tests {
     }
 
     #[test]
+    fn test_seed_recognizes_hyphenated_family() {
+        // The family split is on '.', so a hyphenated family (`p6-b300`) must
+        // still be recognized. Pick a vCPU count where the recognized result is
+        // distinct from BOTH the clamp ceiling and the fallback, so the test
+        // fails if the hyphenated key stops matching (falling through to
+        // fallback) rather than passing via a coincident clamp.
+        // p6-b300 = 6400/192 = 33.333 Gbps/vCPU. At 24 vCPU: 800 Gbps ->
+        // ceil(800/0.4) = 2000. Fallback would be 4*24 = 96. Distinct.
+        assert_eq!(auto_concurrency_seed(Some("p6-b300.6xlarge"), 24), 2000);
+        assert_ne!(
+            auto_concurrency_seed(Some("p6-b300.6xlarge"), 24),
+            FALLBACK_INFLIGHT_PER_VCPU * 24
+        );
+    }
+
+    #[test]
     fn test_seed_fallback_scales_with_vcpu() {
         // Unknown family -> FALLBACK_INFLIGHT_PER_VCPU (4) * vcpus.
         assert_eq!(auto_concurrency_seed(Some("t3.2xlarge"), 8), 32);
@@ -1007,5 +1030,30 @@ mod tests {
     #[test]
     fn test_dmi_detection_unknown_off_linux() {
         assert_eq!(detect_instance_type_dmi(), DmiDetection::Unknown);
+    }
+
+    #[test]
+    fn test_classify_dmi_three_states() {
+        // EC2 vendor + product -> Instance (trimmed, case-insensitive vendor).
+        assert_eq!(
+            classify_dmi("Amazon EC2\n", Some("m6idn.16xlarge\n")),
+            DmiDetection::Instance("m6idn.16xlarge".to_string())
+        );
+        assert_eq!(
+            classify_dmi("amazon ec2", Some("c7gn.16xlarge")),
+            DmiDetection::Instance("c7gn.16xlarge".to_string())
+        );
+        // Readable non-EC2 vendor -> NotEc2 (the gate that skips IMDS).
+        assert_eq!(
+            classify_dmi("QEMU", Some("Standard PC")),
+            DmiDetection::NotEc2
+        );
+        assert_eq!(classify_dmi("", Some("whatever")), DmiDetection::NotEc2);
+        // EC2 vendor but missing/empty product -> Unknown (let IMDS try).
+        assert_eq!(classify_dmi("Amazon EC2", None), DmiDetection::Unknown);
+        assert_eq!(
+            classify_dmi("Amazon EC2", Some("  ")),
+            DmiDetection::Unknown
+        );
     }
 }

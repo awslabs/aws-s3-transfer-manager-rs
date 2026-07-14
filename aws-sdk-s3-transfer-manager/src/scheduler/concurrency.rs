@@ -43,8 +43,9 @@ pub(crate) struct CompletionSample {
 /// The scheduler calls `target()` before generating work. Work is only
 /// generated when total in-flight + pending is below the target.
 ///
-/// Implementations: [`FixedConcurrency`] (constant target),
-/// [`AdaptiveConcurrencyController`] (adjusts based on observed throughput).
+/// Implementations: [`FixedConcurrency`] (constant target), and
+/// `adaptive::AdaptiveConcurrencyController` (adjusts based on observed
+/// throughput; retained but not currently wired).
 pub(crate) trait ConcurrencyController: Send + Sync + fmt::Debug {
     /// Current concurrency target. May change between calls.
     ///
