@@ -74,6 +74,10 @@ pub struct Config {
     memory_budget: MemoryBudgetConfig,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
+    /// Machine facts detected once by the async config loader, off the
+    /// `Client::new` hot path. `None` when the config was built directly
+    /// (bypassing the loader); consumers then fall back to cheap local detection.
+    machine_profile: Option<crate::runtime::platform::MachineProfile>,
     #[cfg(feature = "dial9")]
     pub(crate) telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
 }
@@ -114,6 +118,12 @@ impl Config {
         &self.memory_budget
     }
 
+    /// Machine facts detected by the async config loader, if this config was
+    /// built through it. `None` when built directly.
+    pub(crate) fn machine_profile(&self) -> Option<&crate::runtime::platform::MachineProfile> {
+        self.machine_profile.as_ref()
+    }
+
     /// Returns the framework metadata setting when using transfer manager.
     #[doc(hidden)]
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
@@ -147,6 +157,7 @@ pub struct Builder {
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
+    machine_profile: Option<crate::runtime::platform::MachineProfile>,
     #[cfg(feature = "dial9")]
     telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
 }
@@ -279,6 +290,17 @@ impl Builder {
         self
     }
 
+    /// Set the machine profile detected by the async config loader. Internal:
+    /// populated by [`ConfigLoader`](crate::config::loader::ConfigLoader), not a
+    /// public builder method.
+    pub(crate) fn machine_profile(
+        mut self,
+        profile: Option<crate::runtime::platform::MachineProfile>,
+    ) -> Self {
+        self.machine_profile = profile;
+        self
+    }
+
     /// Consumes the builder and constructs a [`Config`]
     pub fn build(self) -> Config {
         let s3_client_source = match (self.client, self.s3_client_config) {
@@ -294,6 +316,7 @@ impl Builder {
             memory_budget: self.memory_budget,
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
+            machine_profile: self.machine_profile,
             #[cfg(feature = "dial9")]
             telemetry_guard: self.telemetry_guard,
         }

@@ -10,8 +10,7 @@ mod scheduler;
 mod transfer;
 
 pub(crate) use concurrency::{
-    classify_error, AdaptiveConcurrencyController, AdaptiveConfig, CompletionSample,
-    ConcurrencyController, FixedConcurrency,
+    classify_error, CompletionSample, ConcurrencyController, FixedConcurrency,
 };
 pub(crate) use scheduler::Scheduler;
 

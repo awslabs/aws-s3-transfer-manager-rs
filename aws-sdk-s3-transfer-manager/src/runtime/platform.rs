@@ -402,6 +402,214 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency seeding
+//
+// Resolves `ConcurrencyMode::Auto` (and `TargetThroughput`) to a fixed in-flight
+// request target for the preview, in lieu of an adaptive controller. The target
+// is derived from an estimate of the machine's network bandwidth: recognized EC2
+// instance families map to a per-vCPU Gbps rate (NIC bandwidth scales linearly
+// with vCPU count within a family), and `target = ceil(gbps / GBPS_PER_CONN)`.
+//
+// This is `N` = target *in-flight requests* (the scheduler's `poll_work` gate),
+// not connections; the pool sizes connections separately.
+// ---------------------------------------------------------------------------
+
+/// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
+/// figure (`100 / 250`), which lines up with the measured ~250-in-flight knee at
+/// ~100 Gbps. Preview constant; a measured value may replace it later.
+const GBPS_PER_CONN: f64 = 0.4;
+
+/// In-flight requests per vCPU for the fallback seed, used when the instance
+/// family is unknown (unrecognized type, or detection failed / off-EC2). Chosen
+/// to match the ratio recognized network-optimized families already get
+/// (`m6idn.16xlarge`: 64 vCPU -> 250 ~= 3.9/vCPU), so an unrecognized box is
+/// seeded continuously with a recognized one rather than far below it. Preview
+/// constant; a measured value may replace it later.
+const FALLBACK_INFLIGHT_PER_VCPU: usize = 4;
+
+/// Peak network bandwidth of each EC2 instance family, as the raw spec of its
+/// largest member: `(family, max_nic_gbps, vcpus_at_that_size)`.
+///
+/// There is no formula for a family's bandwidth — it is assigned per hardware
+/// generation and read from the published EC2 network-performance spec (e.g.
+/// c6gn tops out at 100 Gbps, c7gn at 200, same name stem). So this is a lookup
+/// table, and each row is the spec verbatim: `("m6idn", 200.0, 128)` means
+/// "m6idn's largest size delivers 200 Gbps on 128 vCPU." Storing the two source
+/// numbers (rather than a pre-divided per-vCPU rate) keeps every row directly
+/// checkable against the docs and avoids hand-computed quotients.
+///
+/// Within a family NIC bandwidth scales linearly with vCPU count, so the flagship
+/// reproduces every smaller size: `gbps = max_gbps * (local_vcpus / vcpus_at_max)`
+/// (see [`family_gbps_per_vcpu`]).
+///
+/// **Adding a family:** if a family's NIC is large enough that the seed matters,
+/// add a row with its flagship's Gbps and vCPU count from the spec. Families left
+/// out fall through to the vCPU-scaled fallback (fine — they are modest-NIC boxes
+/// where the seed is low-stakes). Sustained figures only; burstable ("up to")
+/// families are excluded so we never seed off a burst ceiling.
+const FAMILY_NIC_GBPS: &[(&str, f64, u32)] = &[
+    // Ultra-high (GPU / ML training / inference accelerators)
+    ("p6-b300", 6400.0, 192),
+    ("p5", 3200.0, 192),
+    ("p5en", 3200.0, 192),
+    ("p6-b200", 3200.0, 192),
+    ("trn1n", 1600.0, 128),
+    ("p6e-gb200", 1700.0, 144),
+    ("g7e", 1600.0, 192),
+    ("trn1", 800.0, 128),
+    ("dl1", 400.0, 96),
+    ("p4d", 400.0, 96),
+    ("p4de", 400.0, 96),
+    ("g7", 700.0, 192),
+    // Network-optimized (Graviton *gn, bandwidth-boost *gb)
+    ("c7gn", 200.0, 64),
+    ("c8gn", 600.0, 192),
+    ("m8gn", 600.0, 192),
+    ("r8gn", 600.0, 192),
+    ("hpc7g", 200.0, 64),
+    ("c8gb", 400.0, 192),
+    ("m8gb", 400.0, 192),
+    ("r8gb", 400.0, 192),
+    ("m8azn", 200.0, 96),
+    // Network-optimized *n / *dn / *idn (the S3-throughput workhorses)
+    ("c6in", 200.0, 128),
+    ("c8in", 600.0, 384),
+    ("m6idn", 200.0, 128),
+    ("m6in", 200.0, 128),
+    ("m8idn", 600.0, 384),
+    ("m8in", 600.0, 384),
+    ("r6idn", 200.0, 128),
+    ("r6in", 200.0, 128),
+    ("r8idn", 600.0, 384),
+    ("r8in", 600.0, 384),
+    ("c6gn", 100.0, 64),
+    ("im4gn", 100.0, 64),
+    ("i8ge", 300.0, 192),
+    ("c5n", 100.0, 72),
+    // 100 Gbps-class general / storage / inference / *ib bandwidth-boost
+    ("i3en", 100.0, 96),
+    ("inf1", 100.0, 96),
+    ("p3dn", 100.0, 96),
+    ("c8ib", 400.0, 384),
+    ("m8ib", 400.0, 384),
+    ("m8idb", 400.0, 384),
+    ("r8ib", 400.0, 384),
+    ("r8idb", 400.0, 384),
+    ("x2idn", 100.0, 128),
+    ("x2iedn", 100.0, 128),
+    ("i4i", 75.0, 128),
+    ("f2", 100.0, 192),
+    ("i7ie", 100.0, 192),
+    ("inf2", 100.0, 192),
+];
+
+/// Machine facts detected once, off the client-construction hot path (in the
+/// async config loader), and consumed when resolving auto-sized settings.
+#[derive(Debug, Clone)]
+pub(crate) struct MachineProfile {
+    /// EC2 instance type (e.g. `"m6idn.16xlarge"`), from DMI or IMDS. `None`
+    /// off-EC2 or when detection failed.
+    pub(crate) instance_type: Option<String>,
+    /// Usable vCPU count, honoring cgroup CPU quota and affinity.
+    pub(crate) vcpus: usize,
+}
+
+/// Usable vCPU count. `std::thread::available_parallelism` honors both the CPU
+/// affinity mask and the cgroup CPU quota (CFS bandwidth) on Linux, so a
+/// CPU-limited container reports its slice, not the host's core count. Falls
+/// back to 1 if the count can't be determined.
+pub(crate) fn local_vcpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Outcome of local (DMI) instance-type detection. Distinguishes "known" and
+/// "definitely not EC2" from "couldn't tell" so the caller can decide whether an
+/// IMDS network fallback is worthwhile: a positive non-EC2 reading (readable DMI,
+/// vendor is not Amazon) means IMDS would fail too, so it is skipped; only an
+/// `Unknown` (unreadable DMI, e.g. a container or non-Linux) is worth an IMDS try.
+// `Instance` and `NotEc2` are only constructed on Linux (the DMI-bearing
+// target); the non-Linux stub returns `Unknown`. Allow dead code so non-Linux
+// dev builds stay warning-clean without hiding real dead code on Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DmiDetection {
+    /// Instance type read from DMI.
+    Instance(String),
+    /// DMI is readable and says this host is not EC2.
+    NotEc2,
+    /// DMI could not be read (container without DMI, non-Linux); inconclusive.
+    Unknown,
+}
+
+/// Detect the EC2 instance type from DMI, without any network call.
+///
+/// Reads `/sys/devices/virtual/dmi/id/sys_vendor` to confirm the host is EC2,
+/// then `product_name` for the instance type. Mirrors the CRT S3 client's
+/// primary detection path. Returns [`DmiDetection`] so the caller can gate the
+/// IMDS fallback on `Unknown` vs `NotEc2`.
+#[cfg(target_os = "linux")]
+pub(crate) fn detect_instance_type_dmi() -> DmiDetection {
+    let Ok(vendor) = std::fs::read_to_string("/sys/devices/virtual/dmi/id/sys_vendor") else {
+        return DmiDetection::Unknown;
+    };
+    if !vendor.trim().eq_ignore_ascii_case("Amazon EC2") {
+        return DmiDetection::NotEc2;
+    }
+    match std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name") {
+        Ok(product) => {
+            let ty = product.trim();
+            if ty.is_empty() {
+                // Vendor says EC2 but no product name — inconclusive, let IMDS try.
+                DmiDetection::Unknown
+            } else {
+                DmiDetection::Instance(ty.to_string())
+            }
+        }
+        Err(_) => DmiDetection::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn detect_instance_type_dmi() -> DmiDetection {
+    DmiDetection::Unknown
+}
+
+/// Per-vCPU Gbps for an instance type's family, or `None` if the family is not
+/// in [`FAMILY_NIC_GBPS`]. The family is the substring before the first `.`
+/// (`m6idn.16xlarge` -> `m6idn`); the rate is the flagship's
+/// `max_nic_gbps / vcpus_at_max` (the linear within-family scale).
+fn family_gbps_per_vcpu(instance_type: &str) -> Option<f64> {
+    let family = instance_type.split('.').next()?;
+    FAMILY_NIC_GBPS
+        .iter()
+        .find(|(name, _, _)| name.eq_ignore_ascii_case(family))
+        .map(|(_, max_gbps, vcpus_at_max)| max_gbps / *vcpus_at_max as f64)
+}
+
+/// In-flight-request target from a throughput estimate: `ceil(gbps /
+/// GBPS_PER_CONN)`, clamped to `[MIN_CONN, ABSOLUTE_MAX_CONN]`.
+pub(crate) fn seed_from_gbps(gbps: f64) -> usize {
+    let n = (gbps / GBPS_PER_CONN).ceil();
+    // f64 -> usize saturates negatives/NaN to 0; the clamp floor fixes that.
+    (n as usize).clamp(MIN_CONN, ABSOLUTE_MAX_CONN)
+}
+
+/// Resolve the `Auto` concurrency seed from detected machine facts.
+///
+/// Recognized family -> bandwidth estimate (`per_vcpu x vcpus`) -> connection
+/// derivation. Unknown/undetected -> `FALLBACK_INFLIGHT_PER_VCPU x vcpus`
+/// (a concurrency heuristic, not a bandwidth estimate). Both are clamped to
+/// `[MIN_CONN, ABSOLUTE_MAX_CONN]`. Pure function of its inputs.
+pub(crate) fn auto_concurrency_seed(instance_type: Option<&str>, vcpus: usize) -> usize {
+    match instance_type.and_then(family_gbps_per_vcpu) {
+        Some(per_vcpu) => seed_from_gbps(per_vcpu * vcpus as f64),
+        None => (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(MIN_CONN, ABSOLUTE_MAX_CONN),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +843,117 @@ mod tests {
     fn test_available_ram_detected_on_supported_platforms() {
         // The detected machine has at least 1 GiB; guards the platform syscall.
         assert!(available_ram().expect("RAM detected") >= GIB);
+    }
+
+    // --- concurrency seeding ---
+
+    #[test]
+    fn test_family_lookup_parses_family_from_type() {
+        // Family is the prefix before the first '.'; size-independent.
+        assert_eq!(family_gbps_per_vcpu("m6idn.16xlarge"), Some(1.5625));
+        assert_eq!(family_gbps_per_vcpu("m6idn.32xlarge"), Some(1.5625));
+        assert_eq!(family_gbps_per_vcpu("m6idn.metal"), Some(1.5625));
+        // Case-insensitive.
+        assert_eq!(family_gbps_per_vcpu("C8GN.48XLARGE"), Some(3.125));
+        // Unknown family and malformed strings miss.
+        assert_eq!(family_gbps_per_vcpu("t3.large"), None);
+        assert_eq!(family_gbps_per_vcpu("nonsense"), None);
+    }
+
+    #[test]
+    fn test_seed_recognized_family_scales_with_vcpu() {
+        // m6idn: 1.5625 Gbps/vCPU, GBPS_PER_CONN=0.4.
+        // 16xlarge = 64 vCPU -> 100 Gbps -> ceil(100/0.4) = 250.
+        assert_eq!(auto_concurrency_seed(Some("m6idn.16xlarge"), 64), 250);
+        // 32xlarge = 128 vCPU -> 200 Gbps -> 500.
+        assert_eq!(auto_concurrency_seed(Some("m6idn.32xlarge"), 128), 500);
+        // c8gn: 3.125 Gbps/vCPU. 16xlarge = 64 vCPU -> 200 Gbps -> 500.
+        assert_eq!(auto_concurrency_seed(Some("c8gn.16xlarge"), 64), 500);
+    }
+
+    #[test]
+    fn test_seed_uses_realized_vcpu_not_instance_size() {
+        // A CPU-limited container on an m6idn.32xlarge reports its slice via
+        // available_parallelism. Seed scales to the slice, not the host: a
+        // 4-vCPU slice can't drive the box's 200 Gbps NIC. 4 * 1.5625 = 6.25
+        // Gbps -> ceil(6.25/0.4) = 16.
+        assert_eq!(auto_concurrency_seed(Some("m6idn.32xlarge"), 4), 16);
+    }
+
+    #[test]
+    fn test_seed_fallback_scales_with_vcpu() {
+        // Unknown family -> FALLBACK_INFLIGHT_PER_VCPU (4) * vcpus.
+        assert_eq!(auto_concurrency_seed(Some("t3.2xlarge"), 8), 32);
+        assert_eq!(auto_concurrency_seed(Some("gcp-n2-standard-64"), 64), 256);
+        // No detection at all falls through the same path.
+        assert_eq!(auto_concurrency_seed(None, 16), 64);
+    }
+
+    #[test]
+    fn test_seed_clamps_to_bounds() {
+        // Tiny machine: fallback below MIN_CONN floors to MIN_CONN (10).
+        assert_eq!(auto_concurrency_seed(None, 1), MIN_CONN);
+        assert_eq!(auto_concurrency_seed(Some("t3.micro"), 2), MIN_CONN);
+        // Recognized tiny estimate also floors.
+        assert_eq!(auto_concurrency_seed(Some("i4i.large"), 2), MIN_CONN);
+        // Enormous estimate caps at ABSOLUTE_MAX_CONN.
+        assert_eq!(
+            auto_concurrency_seed(Some("p6-b300.48xlarge"), 100_000),
+            ABSOLUTE_MAX_CONN
+        );
+    }
+
+    #[test]
+    fn test_seed_from_gbps_edges() {
+        assert_eq!(seed_from_gbps(100.0), 250);
+        assert_eq!(seed_from_gbps(0.0), MIN_CONN); // floors, no underflow
+        assert_eq!(seed_from_gbps(f64::NAN), MIN_CONN); // NaN -> 0 -> floor
+        assert_eq!(seed_from_gbps(1.0e9), ABSOLUTE_MAX_CONN); // caps
+    }
+
+    #[test]
+    fn test_family_rate_is_flagship_gbps_over_vcpu() {
+        // The per-vCPU rate is exactly the flagship spec divided out. Seeding at
+        // the flagship vCPU count reproduces the family's headline NIC number.
+        // m6idn flagship: 200 Gbps @ 128 vCPU -> ceil(200/0.4) = 500.
+        assert_eq!(auto_concurrency_seed(Some("m6idn.metal"), 128), 500);
+        // c8gn flagship: 600 Gbps @ 192 vCPU -> ceil(600/0.4) = 1500.
+        assert_eq!(auto_concurrency_seed(Some("c8gn.48xlarge"), 192), 1500);
+        // i4i flagship: 75 Gbps @ 128 vCPU -> ceil(75/0.4) = 188.
+        assert_eq!(auto_concurrency_seed(Some("i4i.32xlarge"), 128), 188);
+    }
+
+    #[test]
+    fn test_family_nic_table_is_well_formed() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for (family, gbps, vcpus) in FAMILY_NIC_GBPS {
+            assert!(seen.insert(*family), "duplicate family entry: {family:?}");
+            assert!(!family.is_empty(), "empty family name");
+            assert!(
+                !family.contains('.'),
+                "family {family:?} must be a bare family, not an instance type"
+            );
+            assert_eq!(
+                family.to_ascii_lowercase(),
+                *family,
+                "family {family:?} must be lowercase for case-insensitive lookup"
+            );
+            // Sanity bounds: sustained NIC figures are >0 and within EC2's range,
+            // vCPU counts are plausible flagship sizes.
+            assert!(*gbps > 0.0 && *gbps <= 6400.0, "{family}: gbps {gbps}");
+            assert!(*vcpus > 0 && *vcpus <= 1024, "{family}: vcpus {vcpus}");
+        }
+    }
+
+    #[test]
+    fn test_local_vcpus_is_at_least_one() {
+        assert!(local_vcpus() >= 1);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_dmi_detection_unknown_off_linux() {
+        assert_eq!(detect_instance_type_dmi(), DmiDetection::Unknown);
     }
 }
