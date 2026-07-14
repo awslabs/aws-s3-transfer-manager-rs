@@ -170,6 +170,7 @@ async fn detect_machine_profile() -> crate::runtime::platform::MachineProfile {
     platform::MachineProfile {
         instance_type,
         vcpus: platform::local_vcpus(),
+        ram_bytes: platform::available_ram(),
     }
 }
 

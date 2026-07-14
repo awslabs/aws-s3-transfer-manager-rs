@@ -105,7 +105,8 @@ const UNDETECTABLE_MEM_BYTES: usize = 2 * ByteUnit::Gibibyte.as_bytes_usize();
 /// Memory budget under `MemoryBudgetConfig::Auto`: `SAFE_MEM_FRACTION` of
 /// detected RAM, rounded to a power of two and clamped to
 /// `[MIN_BUDGET_BYTES, MAX_BUDGET_BYTES]`; `UNDETECTABLE_MEM_BYTES` when RAM is
-/// unknown.
+/// unknown. `ram_bytes` comes from the [`MachineProfile`] so detection happens
+/// once, not re-read here.
 ///
 /// The budget is a backstop, not the operating point: the concurrency
 /// controller settles at line rate well below it, and it binds only when a slow
@@ -114,8 +115,8 @@ const UNDETECTABLE_MEM_BYTES: usize = 2 * ByteUnit::Gibibyte.as_bytes_usize();
 /// is uncorrelated with RAM across instance families (m5.24xlarge and
 /// m5n.24xlarge share 384 GiB of RAM but differ 4x in bandwidth). The clamp
 /// keeps the estimate safe at both ends; NIC-aware sizing is a separate refinement.
-pub(crate) fn machine_safe_mem() -> usize {
-    auto_budget(available_ram())
+pub(crate) fn machine_safe_mem(ram_bytes: Option<usize>) -> usize {
+    auto_budget(ram_bytes)
 }
 
 /// `Auto` policy as a pure function of detected RAM.
@@ -132,15 +133,16 @@ fn auto_budget(ram: Option<usize>) -> usize {
 /// clamped to `(0.0, 1.0]` (a non-finite or non-positive value falls back to
 /// `SAFE_MEM_FRACTION`); the result is floored at `MIN_BUDGET_BYTES` but not
 /// capped — an explicit fraction is taken at the caller's word.
-/// `UNDETECTABLE_MEM_BYTES` when RAM is unknown.
-pub(crate) fn mem_for_fraction(fraction: f64) -> usize {
+/// `UNDETECTABLE_MEM_BYTES` when RAM is unknown. `ram_bytes` comes from the
+/// [`MachineProfile`].
+pub(crate) fn mem_for_fraction(ram_bytes: Option<usize>, fraction: f64) -> usize {
     if !(fraction.is_finite() && fraction > 0.0) || fraction > 1.0 {
         tracing::debug!(
             requested = fraction,
             "memory budget fraction outside (0.0, 1.0]; clamping"
         );
     }
-    mem_for_fraction_from(available_ram(), fraction)
+    mem_for_fraction_from(ram_bytes, fraction)
 }
 
 /// `Fraction` policy as a pure function of detected RAM.
@@ -186,7 +188,7 @@ fn round_pow2(n: usize) -> usize {
 /// only; `None` elsewhere or on a read failure, in which case the caller falls
 /// back to a conservative default.
 #[cfg(target_os = "linux")]
-fn available_ram() -> Option<usize> {
+pub(crate) fn available_ram() -> Option<usize> {
     match (meminfo_total(), cgroup_mem_limit()) {
         (Some(total), Some(cgroup)) => Some(total.min(cgroup)),
         (total, None) => total,
@@ -195,12 +197,12 @@ fn available_ram() -> Option<usize> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn available_ram() -> Option<usize> {
+pub(crate) fn available_ram() -> Option<usize> {
     None
 }
 
 #[cfg(target_os = "macos")]
-fn available_ram() -> Option<usize> {
+pub(crate) fn available_ram() -> Option<usize> {
     // hw.memsize is total physical memory in bytes; macOS has no cgroup.
     // Ref: sysctl(3), hw.memsize key
     // <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/sysctl.3.html>
@@ -225,7 +227,7 @@ fn available_ram() -> Option<usize> {
 }
 
 #[cfg(target_os = "windows")]
-fn available_ram() -> Option<usize> {
+pub(crate) fn available_ram() -> Option<usize> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // ullTotalPhys is total physical memory in bytes.
     // Ref: GlobalMemoryStatusEx / MEMORYSTATUSEX
@@ -513,6 +515,33 @@ pub(crate) struct MachineProfile {
     pub(crate) instance_type: Option<String>,
     /// Usable vCPU count, honoring cgroup CPU quota and affinity.
     pub(crate) vcpus: usize,
+    /// Usable RAM in bytes (cgroup-aware), or `None` when undetectable. Sizes the
+    /// `Auto`/`Fraction` memory budget.
+    pub(crate) ram_bytes: Option<usize>,
+}
+
+impl MachineProfile {
+    /// Detect machine facts from local sources only: DMI instance type, vCPU
+    /// count, and RAM. All are cheap pseudo-file reads (sysfs / procfs) or a
+    /// syscall — no network — so this is safe to call synchronously on the
+    /// `Client::new` path when no loader-detected profile is present.
+    ///
+    /// This does not attempt the IMDS instance-type fallback: IMDS is a network
+    /// call and belongs to the async config loader, which assembles its own
+    /// profile from these same primitives plus the IMDS step. A local DMI
+    /// `NotEc2`/`Unknown` result therefore collapses to `instance_type: None`
+    /// here — correct on the bypass path, where there is no IMDS to gate.
+    pub(crate) fn detect_local() -> Self {
+        let instance_type = match detect_instance_type_dmi() {
+            DmiDetection::Instance(ty) => Some(ty),
+            DmiDetection::NotEc2 | DmiDetection::Unknown => None,
+        };
+        Self {
+            instance_type,
+            vcpus: local_vcpus(),
+            ram_bytes: available_ram(),
+        }
+    }
 }
 
 /// Usable vCPU count. `std::thread::available_parallelism` honors both the CPU
@@ -949,6 +978,29 @@ mod tests {
     #[test]
     fn test_local_vcpus_is_at_least_one() {
         assert!(local_vcpus() >= 1);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "detect_local reads /sys and /proc and calls platform syscalls miri cannot emulate"
+    )]
+    #[test]
+    fn test_detect_local_fills_profile() {
+        // Local-only detection: vCPU is always present; instance_type/ram are
+        // environment-dependent (None off-EC2 / on read failure), so we only
+        // assert the always-true invariant and that it does not panic.
+        let p = MachineProfile::detect_local();
+        assert!(p.vcpus >= 1);
+        // No IMDS on this path: off-EC2, instance_type must be None (DMI-only).
+        // On EC2 it may be Some; either is valid, so this is not asserted here.
+    }
+
+    #[test]
+    fn test_machine_safe_mem_takes_ram_from_caller() {
+        // The wrapper no longer reads the environment; it sizes from the passed
+        // RAM (from the MachineProfile). 64 GiB -> 25% -> 16 GiB (pow2, in range).
+        assert_eq!(machine_safe_mem(Some(64 * GIB)), 16 * GIB);
+        assert_eq!(machine_safe_mem(None), UNDETECTABLE_MEM_BYTES);
     }
 
     #[cfg(not(target_os = "linux"))]
