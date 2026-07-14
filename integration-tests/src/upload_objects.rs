@@ -540,9 +540,8 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
         let result = handle.join().await;
 
         // Current behavior: a persistent throttle storm aborts the whole transfer.
-        let err = result.expect_err(
-            "a persistent 503 storm across the fan-out currently aborts the transfer",
-        );
+        let err = result
+            .expect_err("a persistent 503 storm across the fan-out currently aborts the transfer");
         assert_eq!(
             *err.kind(),
             aws_sdk_s3_transfer_manager::error::ErrorKind::ChildOperationFailed,
@@ -575,4 +574,62 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
     })
     .await
     .expect("upload_objects_throttle_storm_aborts_transfer timed out");
+}
+
+/// A transient throttle storm that RELENTS is recovered: the transfer completes
+/// despite mid-flight 503s. This is the payoff of the throttle handling — the
+/// per-bucket token bucket's refill + the outer throttle-backoff re-issue carry
+/// the transfer through a storm that clears, where the permanent-storm test above
+/// aborts.
+///
+/// The schedule lets the first requests through (transfer starts healthy), then
+/// throttles a window, then relents — modeling S3 pushing back part-way through a
+/// running transfer. Deterministic (request-counted), no real S3.
+#[tokio::test]
+async fn upload_objects_transient_throttle_storm_recovers() {
+    timeout(TEST_TIMEOUT, async {
+        let (server, server_handle, tm) = setup().await;
+
+        let count = 200usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let dataset = make_flat_dataset(count, size);
+        let bucket = "test-bucket";
+
+        // Healthy warmup, then a throttled window, then recovery. Sized so the
+        // window is survivable within the throttle-retry budget + bucket refill:
+        // a burst that clears, not a sustained outage.
+        server.set_throttle_schedule(
+            s3_mock_server::ThrottleSchedule::builder()
+                .healthy(30)
+                .throttled(60, 1.0)
+                .build(),
+        );
+
+        let handle = tm
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix("recover/")
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a throttle storm that relents must be recovered, not aborted");
+        assert_eq!(
+            output.objects_uploaded(),
+            count as u64,
+            "every object must land once the throttle relents"
+        );
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no object should be left failed after recovery"
+        );
+
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("upload_objects_transient_throttle_storm_recovers timed out");
 }

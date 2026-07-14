@@ -17,6 +17,7 @@ mod server;
 mod socket_fault;
 mod storage;
 mod streaming;
+mod throttle;
 mod types;
 
 pub use error::Error;
@@ -26,4 +27,5 @@ pub use server::{
     AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
     ServerHandle,
 };
+pub use throttle::{ThrottleSchedule, ThrottleScheduleBuilder};
 pub use types::composite_checksum;

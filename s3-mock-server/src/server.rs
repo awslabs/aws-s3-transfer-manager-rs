@@ -18,7 +18,7 @@ use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -152,6 +152,7 @@ impl S3MockServerBuilder {
             storage,
             faults: Arc::new(crate::faults::FaultRegistry::default()),
             connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            throttle: Arc::new(Mutex::new(None)),
             config: self.config,
         })
     }
@@ -232,6 +233,10 @@ pub struct S3MockServer {
     /// exists at connect time; decremented per reset. Shared with the serving task.
     connect_reset: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Server-wide request-counted throttle. Shared with the serving task; `None`
+    /// until a schedule is installed via [`set_throttle_schedule`](Self::set_throttle_schedule).
+    throttle: Arc<Mutex<Option<Arc<crate::throttle::ThrottleState>>>>,
+
     /// Server configuration.
     config: ServerConfig,
 }
@@ -309,6 +314,21 @@ impl S3MockServer {
     /// Drop the entire fault queue for `(bucket, key)`.
     pub fn clear_fault(&self, bucket: &str, key: &str) {
         self.faults.clear(bucket, key);
+    }
+
+    /// Install a server-wide throttle schedule (see [`ThrottleSchedule`]).
+    ///
+    /// Applies to every S3 operation, advancing by a global request ordinal:
+    /// throttled requests return 503 `SlowDown` before touching storage. Resets
+    /// the ordinal, so calling it starts a fresh schedule. Distinct from the
+    /// per-`(bucket, key)` fault queue and from the permanent
+    /// [`Always`](crate::faults::Occurrence) service-error fault — a schedule
+    /// always recovers once its phases are consumed.
+    ///
+    /// [`ThrottleSchedule`]: crate::throttle::ThrottleSchedule
+    pub fn set_throttle_schedule(&self, schedule: crate::throttle::ThrottleSchedule) {
+        *self.throttle.lock().unwrap() =
+            Some(Arc::new(crate::throttle::ThrottleState::new(schedule)));
     }
 
     /// Abort (RST) the next `count` freshly accepted connections immediately,
@@ -409,11 +429,12 @@ impl S3MockServer {
         let storage = self.storage.clone();
         let faults = self.faults.clone();
         let connect_reset = self.connect_reset.clone();
+        let throttle = self.throttle.clone();
         let server_task = tokio::spawn(async move {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-            let inner = Inner::with_faults(storage, faults);
+            let inner = Inner::with_faults_and_throttle(storage, faults, throttle);
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
