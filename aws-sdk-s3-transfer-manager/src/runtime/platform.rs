@@ -409,10 +409,10 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 // Concurrency seeding
 //
 // Resolves `ConcurrencyMode::Auto` (and `TargetThroughput`) to a fixed in-flight
-// request target, in lieu of an adaptive controller. The target is derived from
-// an estimate of the machine's network bandwidth: recognized EC2 instance
-// families map to a per-vCPU Gbps rate (NIC bandwidth scales linearly with vCPU
-// count within a family), and `target = ceil(gbps / GBPS_PER_CONN)`.
+// request target. The target is derived from an estimate of the machine's
+// network bandwidth: recognized EC2 instance families map to a per-vCPU Gbps rate
+// (NIC bandwidth scales linearly with vCPU count within a family), and
+// `target = ceil(gbps / GBPS_PER_CONN)`.
 //
 // `N` is target *in-flight requests* (the scheduler's `poll_work` gate), which
 // the pool sizes connections separately from. In-flight work is nonetheless
@@ -422,8 +422,7 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
-/// figure (`100 / 250`), which lines up with the measured ~250-in-flight knee at
-/// ~100 Gbps. Estimated, not measured for this client.
+/// figure (`100 / 250`).
 const GBPS_PER_CONN: f64 = 0.4;
 
 /// In-flight requests per vCPU for the fallback seed, used when the instance
