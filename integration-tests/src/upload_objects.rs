@@ -548,18 +548,27 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
             aws_sdk_s3_transfer_manager::error::ErrorKind::ChildOperationFailed,
             "a throttle storm aborts via a failed child operation, got {err:?}",
         );
-        // The throttle cause is not in the top-level Display (`child operation
-        // failed`) but is carried on the error source chain. Walk it to confirm
-        // the SlowDown is recoverable by a caller who inspects `source()`.
-        let mut chain = String::new();
-        let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
-        while let Some(e) = src {
-            chain.push_str(&format!("{e}\n"));
-            src = e.source();
-        }
+        // The top-level Display names the first failing object (not a bare "child
+        // operation failed"), so the message points at what to inspect.
         assert!(
-            chain.contains("SlowDown") || chain.contains("503"),
-            "the throttle cause must be on the source chain; chain was:\n{chain}",
+            err.to_string().starts_with("child operation failed: "),
+            "the abort message must name the failing object, got: {err}",
+        );
+        // The structured throttle cause is reachable via `failed_uploads()`: each
+        // entry's `error()` is the child's real `ServiceError` (SlowDown), with
+        // its own source chain intact. (The root `source()` is only a string
+        // today — see the TODO(vnext) in upload_objects/transfer.rs `abort`.)
+        let failed = err
+            .failed_uploads()
+            .expect("abort under Abort policy attaches the per-object failures");
+        assert!(!failed.is_empty(), "at least one child failure recorded");
+        let throttled = failed.iter().any(|f| {
+            *f.error().kind() == aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError
+                && f.error().code() == Some("SlowDown")
+        });
+        assert!(
+            throttled,
+            "a failed_uploads entry must carry the structured SlowDown ServiceError",
         );
 
         server_handle.shutdown().await.expect("shutdown");

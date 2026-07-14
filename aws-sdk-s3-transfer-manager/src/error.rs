@@ -296,7 +296,37 @@ impl fmt::Display for Error {
             ErrorKind::IOError => write!(f, "I/O error")?,
             ErrorKind::RuntimeError => write!(f, "runtime error")?,
             ErrorKind::ObjectNotDiscoverable => write!(f, "object discovery failed")?,
-            ErrorKind::ChildOperationFailed => write!(f, "child operation failed")?,
+            ErrorKind::ChildOperationFailed => {
+                write!(f, "child operation failed")?;
+                // A bulk transfer failed on one or more objects. Name the first
+                // failure and the total so the top-level message is actionable;
+                // the full per-object detail (including each object's own error)
+                // is reached via `failed_uploads` / `failed_downloads`.
+                let first_and_count = self
+                    .failed_uploads()
+                    .map(|f| {
+                        let id = f
+                            .first()
+                            .and_then(|u| u.source_path())
+                            .map(|p| p.display().to_string());
+                        (id, f.len())
+                    })
+                    .or_else(|| {
+                        self.failed_downloads().map(|f| {
+                            let id = f.first().and_then(|d| d.input().key()).map(str::to_owned);
+                            (id, f.len())
+                        })
+                    });
+                if let Some((id, n)) = first_and_count {
+                    match id {
+                        Some(id) => write!(f, ": {id}")?,
+                        None => write!(f, ": 1 object")?,
+                    }
+                    if n > 1 {
+                        write!(f, " (and {} more)", n - 1)?;
+                    }
+                }
+            }
             ErrorKind::OperationCancelled => write!(f, "operation cancelled")?,
             ErrorKind::ServiceError => {
                 write!(f, "service error")?;
@@ -663,5 +693,45 @@ mod tests {
     fn is_not_found_matches_codes() {
         assert!(service("GetObject", Some("NoSuchKey"), None, None).is_not_found());
         assert!(!service("GetObject", Some("AccessDenied"), None, None).is_not_found());
+    }
+
+    #[test]
+    fn display_child_operation_failed_bare() {
+        // No attached failure list: the bare kind message, no trailing detail.
+        let e = Error::new(ErrorKind::ChildOperationFailed, "x");
+        assert_eq!(e.to_string(), "child operation failed");
+    }
+
+    #[test]
+    fn display_child_operation_failed_names_first_and_count() {
+        let failed = vec![
+            FailedUpload {
+                input: None,
+                error: Error::new(ErrorKind::ServiceError, "boom"),
+                source_path: Some(std::path::PathBuf::from("/data/a.bin")),
+            },
+            FailedUpload {
+                input: None,
+                error: Error::new(ErrorKind::ServiceError, "boom"),
+                source_path: Some(std::path::PathBuf::from("/data/b.bin")),
+            },
+        ];
+        let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
+        assert_eq!(
+            e.to_string(),
+            "child operation failed: /data/a.bin (and 1 more)"
+        );
+    }
+
+    #[test]
+    fn display_child_operation_failed_single_no_path() {
+        // A failure list carrying no source path still reports a count.
+        let failed = vec![FailedUpload {
+            input: None,
+            error: Error::new(ErrorKind::ServiceError, "boom"),
+            source_path: None,
+        }];
+        let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
+        assert_eq!(e.to_string(), "child operation failed: 1 object");
     }
 }
