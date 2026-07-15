@@ -542,9 +542,9 @@ mod tests {
 
     #[test]
     fn resolve_auto_profile_without_instance_type_uses_vcpu_fallback() {
-        // Detected vCPU but no instance type (DMI/IMDS miss): fallback 4 * 16 = 64.
+        // Detected vCPU but no instance type (DMI/IMDS miss): fallback 5 * 16 = 80.
         let p = profile(None, 16);
-        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Auto, &p), 64);
+        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Auto, &p), 80);
     }
 
     #[test]
