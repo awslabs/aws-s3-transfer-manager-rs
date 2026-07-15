@@ -575,11 +575,11 @@ impl UploadObjectsTransfer {
             tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
-        // TODO(vnext): the triggering child's error is preserved structurally in
+        // TODO: the triggering child's error is preserved structurally in
         // `state.failed` (reachable via `Error::failed_uploads`), but the root
-        // error's `source()` is only this string. Revisit connecting the root
-        // `source()` to the failing child's error — needs a shareable error
-        // (`Arc`) since `Error` is not `Clone` and the child is also owned by the
+        // error's `source()` is only this string. Connecting the root `source()`
+        // to the failing child's error needs a shareable error (`Arc`) since
+        // `Error` is not `Clone` and the child is also owned by the
         // failed-uploads list.
         self.inner
             .ctx

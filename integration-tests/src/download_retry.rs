@@ -616,19 +616,13 @@ async fn tm_download(tm: &TmClient, bucket: &str, key: &str) -> Result<Vec<u8>, 
 
 // discovery failure surfacing + throttling ------------------------------------
 
-/// A discovery GET that always returns 503 `SlowDown` must surface the underlying
-/// service error to the caller, not a generic "object discovery failed".
+/// A persistent discovery throttle surfaces the underlying ServiceError to the
+/// caller, not a generic "object discovery failed".
 ///
 /// Discovery for an un-ranged download is a ranged GET (`RangedGet(None)`), the
 /// first GET the transfer issues. Injected `Always`, it 503s on every attempt so
 /// the SDK's own retry is exhausted and the error reaches the transfer, which
-/// fails discovery with the real cause. The caller must see that cause.
-///
-/// KNOWN GAP (this test currently FAILS): discovery failure is reported by
-/// reading an unset `object_meta` `OnceLock` in `download::handle`, which
-/// fabricates `ObjectNotDiscoverable("discovery failed")` and discards the real
-/// error the transfer already stored via `fail()`. The fix is to surface the
-/// transfer's stored failure; this test is the target for it.
+/// fails discovery with the real cause. The caller sees that cause.
 #[tokio::test]
 async fn discovery_service_error_surfaces_underlying_cause() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
