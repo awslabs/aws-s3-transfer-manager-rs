@@ -19,14 +19,10 @@
 /// returns the admit/shed verdict; mapping a shed to a 503 `SlowDown` response is
 /// the caller's job (see the server's request handlers).
 ///
-/// Models S3's per-prefix request-rate limit. A high-fan-out burst arrives faster
-/// than the bucket refills, so the excess is shed; the transfer recovers because
-/// its own backoff paces re-issues back under the refill rate — not because a
-/// fixed number of requests elapsed. Recovery is therefore contingent on client
-/// behavior, which is what makes it a faithful proxy: a transfer that never backs
-/// off never lets the rate drop. Rate (not in-flight concurrency) is what
-/// accumulates under a burst of near-instant requests, so it produces real
-/// backpressure the mock's fast in-memory serving otherwise would not.
+/// Recovery is contingent on client behavior: a transfer that never backs off
+/// never lets the rate drop. Rate (not in-flight concurrency) is what accumulates
+/// under a burst of near-instant requests, so it produces real backpressure the
+/// mock's fast in-memory serving otherwise would not.
 ///
 /// Which request is shed is not fixed — it depends on arrival timing. The
 /// invariant is behavioral: an arrival rate above `rate` throttles, and dropping

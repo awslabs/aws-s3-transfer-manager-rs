@@ -316,18 +316,10 @@ impl S3MockServer {
         self.faults.clear(bucket, key);
     }
 
-    /// Install a server-wide load-driven throttle: a token bucket admitting a
-    /// sustained `rate` requests/sec (with a `burst` allowance) and shedding the
-    /// rest with 503 `SlowDown`, relenting as the client's arrival rate drops.
-    ///
-    /// Models S3's per-prefix request-rate limit: a high-fan-out burst arrives
-    /// faster than the bucket refills and the excess is shed, and the transfer
-    /// recovers only because its own backoff paces re-issues back under `rate`.
-    /// Which request is shed depends on arrival timing; the behavior (over rate →
-    /// shed, rate drops → recover) is deterministic. Applies to every S3 operation,
-    /// before touching storage. Distinct from the per-`(bucket, key)` fault queue
-    /// and from the persistent [`Always`](crate::faults::Occurrence) service-error
-    /// fault, which never relents.
+    /// Install a server-wide load-driven throttle admitting a sustained `rate`
+    /// requests/sec with a `burst` allowance; a shed request returns 503
+    /// `SlowDown`. Checked on every S3 operation before touching storage, and
+    /// replaces any previously installed throttle.
     pub fn set_rate_throttle(&self, rate: f64, burst: f64) {
         *self.throttle.lock().unwrap() =
             Some(Arc::new(crate::throttle::RateThrottle::new(rate, burst)));

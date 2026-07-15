@@ -7,7 +7,7 @@
 
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
 use bytes::Bytes;
-use s3_mock_server::{FaultType, Occurrence, S3MockServer, ServerHandle};
+use s3_mock_server::{BodyCadence, FaultType, Occurrence, S3MockServer, ServerHandle};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -252,10 +252,10 @@ async fn client_with_short_ssp(handle: &ServerHandle) -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(config)
 }
 
-/// `StallBody` yields some bytes then stalls. With stalled-stream protection
-/// enabled, the SDK aborts the read (`ThroughputBelowMinimum`) rather than
-/// hanging. Bounded by an outer timeout so a non-firing-SSP regression fails fast
-/// instead of hanging.
+/// `PaceBody` with `BodyCadence::Stall` delivers bytes then stalls. With
+/// stalled-stream protection enabled, the SDK aborts the read
+/// (`ThroughputBelowMinimum`) rather than hanging. Bounded by an outer timeout so
+/// a non-firing-SSP regression fails fast instead of hanging.
 #[tokio::test]
 async fn test_stall_body_triggers_stalled_stream_protection() -> Result<()> {
     let server = S3MockServer::builder().with_in_memory_store().build()?;
@@ -280,8 +280,9 @@ async fn test_stall_body_triggers_stalled_stream_protection() -> Result<()> {
     server.insert_fault(
         B,
         BIG_KEY,
-        FaultType::StallBody {
-            after_bytes: 64 * 1024,
+        FaultType::PaceBody {
+            piece_bytes: 64 * 1024,
+            cadence: BodyCadence::Stall,
         },
         0,
         Occurrence::Always,

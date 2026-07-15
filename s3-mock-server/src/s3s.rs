@@ -230,35 +230,55 @@ impl<S: StorageBackend + 'static> Inner<S> {
                     output.body = Some(StreamingBlob::wrap(faulted));
                 }
             }
-            Some(crate::faults::FaultType::StallBody { after_bytes }) => {
+            Some(crate::faults::FaultType::PaceBody {
+                piece_bytes,
+                cadence,
+            }) => {
                 if let Some(body) = output.body.take() {
-                    // Yield body bytes up to `after_bytes`, then stall the stream
-                    // (no further byte, no EOF).
+                    // Re-chunk the body into `piece_bytes`-sized pieces delivered
+                    // on the given cadence.
                     //
-                    // State: (inner stream, remaining passthrough bytes).
+                    // State: (inner stream, buffer of pending bytes from the
+                    // underlying stream, whether the first piece has been emitted,
+                    // bytes remaining in the current piece).
                     let faulted = futures_util::stream::unfold(
-                        (body, after_bytes),
-                        |(mut stream, remaining)| async move {
-                            if remaining == 0 {
-                                // Allotment delivered: pend forever.
-                                std::future::pending::<()>().await;
-                                unreachable!("pending future never resolves");
+                        (body, bytes::BytesMut::new(), false, piece_bytes),
+                        move |(mut stream, mut buf, first_emitted, piece_size)| async move {
+                            // Fill the buffer until we have a full piece or EOF.
+                            while (buf.len() as u64) < piece_size {
+                                match stream.next().await {
+                                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                                    Some(Err(e)) => {
+                                        return Some((
+                                            Err(std::io::Error::other(e)),
+                                            (stream, buf, first_emitted, piece_size),
+                                        ));
+                                    }
+                                    None => break,
+                                }
                             }
-                            match stream.next().await {
-                                Some(Ok(chunk)) => {
-                                    if (chunk.len() as u64) <= remaining {
-                                        let rem = remaining - chunk.len() as u64;
-                                        Some((Ok(chunk), (stream, rem)))
-                                    } else {
-                                        // Emit the partial head; stall on next poll.
-                                        let head = chunk.slice(0..remaining as usize);
-                                        Some((Ok(head), (stream, 0)))
+
+                            if buf.is_empty() {
+                                // Underlying body exhausted and buffer drained: EOF.
+                                return None;
+                            }
+
+                            // Apply cadence before delivering subsequent pieces.
+                            if first_emitted {
+                                match cadence {
+                                    crate::faults::BodyCadence::Slow(delay) => {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                    crate::faults::BodyCadence::Stall => {
+                                        std::future::pending::<()>().await;
+                                        unreachable!("pending future never resolves");
                                     }
                                 }
-                                Some(Err(e)) => Some((Err(std::io::Error::other(e)), (stream, 0))),
-                                // Real EOF before the stall point: nothing to fault.
-                                None => None,
                             }
+
+                            let take = std::cmp::min(buf.len() as u64, piece_size) as usize;
+                            let piece = buf.split_to(take).freeze();
+                            Some((Ok(piece), (stream, buf, true, piece_size)))
                         },
                     );
                     output.body = Some(StreamingBlob::wrap(faulted));
