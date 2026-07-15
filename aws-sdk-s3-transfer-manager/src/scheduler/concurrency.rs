@@ -3,9 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// The adaptive controller is retained but not wired: the dev preview resolves
+// `ConcurrencyMode::Auto` to a fixed instance-aware seed (see
+// `runtime::platform` concurrency seeding). This module is the base for the
+// adaptive controller redesign (a later release), so it is kept in-tree rather
+// than deleted. `dead_code` until it is wired back as the `Auto` engine; the
+// re-export is dropped meanwhile (re-add when a consumer references it again).
+#[allow(dead_code)]
 mod adaptive;
-
-pub(crate) use adaptive::{AdaptiveConcurrencyController, AdaptiveConfig};
 
 use std::fmt;
 
@@ -38,8 +43,9 @@ pub(crate) struct CompletionSample {
 /// The scheduler calls `target()` before generating work. Work is only
 /// generated when total in-flight + pending is below the target.
 ///
-/// Implementations: [`FixedConcurrency`] (constant target),
-/// [`AdaptiveConcurrencyController`] (adjusts based on observed throughput).
+/// Implementations: [`FixedConcurrency`] (constant target), and
+/// `adaptive::AdaptiveConcurrencyController` (adjusts based on observed
+/// throughput; retained but not currently wired).
 pub(crate) trait ConcurrencyController: Send + Sync + fmt::Debug {
     /// Current concurrency target. May change between calls.
     ///

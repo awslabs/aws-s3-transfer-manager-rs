@@ -5,10 +5,7 @@
 
 use crate::metrics::unit::ByteUnit;
 use crate::runtime::ManagedThreadRuntime;
-use crate::scheduler::{
-    AdaptiveConcurrencyController, AdaptiveConfig, ConcurrencyController, FixedConcurrency,
-    Scheduler,
-};
+use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
 use crate::types::{ConcurrencyMode, PartSize};
 use crate::Config;
@@ -171,32 +168,36 @@ impl Drop for Handle {
 impl Client {
     /// Creates a new client from a transfer manager config.
     pub fn new(mut config: Config) -> Client {
+        // Machine facts for auto-sizing: use the loader-detected profile if the
+        // config came through `ConfigLoader::load`, else detect locally (DMI +
+        // vCPU + RAM — cheap pseudo-file reads, no network). Detected once and
+        // shared by both the concurrency seed and the memory budget.
+        let profile = config
+            .machine_profile()
+            .cloned()
+            .unwrap_or_else(crate::runtime::platform::MachineProfile::detect_local);
+
         // 1. Create concurrency controller and telemetry
-        let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) =
-            match config.concurrency() {
-                ConcurrencyMode::Explicit(n) => (
-                    Arc::new(FixedConcurrency::new(*n)),
-                    Arc::new(Telemetry::new(Duration::from_millis(500))),
-                ),
-                // TODO: implement support for target throughput
-                _ => {
-                    let adaptive_config = AdaptiveConfig::default();
-                    let telemetry = Arc::new(Telemetry::new(adaptive_config.window.duration));
-                    let controller = Arc::new(AdaptiveConcurrencyController::new(
-                        adaptive_config,
-                        Arc::clone(&telemetry.io_counters),
-                    ));
-                    (controller, telemetry)
-                }
-            };
+        let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = {
+            // Resolve the concurrency target once, at construction. The preview
+            // ships a fixed instance-aware seed rather than the adaptive
+            // controller (which is left in the tree for a later release); see
+            // `runtime::platform` concurrency seeding.
+            let target = resolve_concurrency_target(config.concurrency(), &profile);
+            (
+                Arc::new(FixedConcurrency::new(target)),
+                Arc::new(Telemetry::new(Duration::from_millis(500))),
+            )
+        };
 
         // 2. Build Handle with Arc::new_cyclic so scheduler and runtime
         //    can hold Weak<Handle> without creating a reference cycle.
         #[cfg(feature = "dial9")]
         let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
 
-        // Resolve the budget once: it sizes the Handle's MemoryBudget.
-        let budget_capacity = config.memory_budget().resolve();
+        // Resolve the budget once from the same detected RAM: it sizes the
+        // Handle's MemoryBudget.
+        let budget_capacity = config.memory_budget().resolve(profile.ram_bytes);
 
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
@@ -390,6 +391,52 @@ impl Client {
     }
 }
 
+/// Resolve the fixed in-flight concurrency target from the concurrency mode and
+/// the detected machine profile. Called by [`Client::new`] to build the
+/// [`FixedConcurrency`] controller.
+///
+/// - [`ConcurrencyMode::Explicit`] — the caller's value verbatim.
+/// - [`ConcurrencyMode::TargetThroughput`] — derived from the download target
+///   (the scheduler has one global concurrency target; independent up/down
+///   limiting is not yet supported).
+/// - [`ConcurrencyMode::Auto`] — instance-aware seed from the profile's instance
+///   type and vCPU count; falls back to a vCPU-scaled seed when the family is
+///   unknown or the instance type was not detected.
+fn resolve_concurrency_target(
+    mode: &ConcurrencyMode,
+    profile: &crate::runtime::platform::MachineProfile,
+) -> usize {
+    use crate::runtime::platform;
+    match mode {
+        // Guard the trait's `target >= 1` invariant: `Explicit(0)` would panic in
+        // `FixedConcurrency::new`. Clamp to 1 rather than panic on a config value.
+        ConcurrencyMode::Explicit(n) => (*n).max(1),
+        ConcurrencyMode::TargetThroughput(t) => {
+            let gbps = t.download().as_unit_per_sec(ByteUnit::Gigabit);
+            let target = platform::seed_from_gbps(gbps);
+            tracing::debug!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                gbps,
+                seed = target,
+                "resolved TargetThroughput concurrency",
+            );
+            target
+        }
+        ConcurrencyMode::Auto => {
+            let target =
+                platform::auto_concurrency_seed(profile.instance_type.as_deref(), profile.vcpus);
+            tracing::debug!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                instance_type = ?profile.instance_type,
+                vcpus = profile.vcpus,
+                seed = target,
+                "resolved Auto concurrency seed",
+            );
+            target
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +492,99 @@ mod tests {
             weak.upgrade().is_none(),
             "Weak should be invalid after Handle drop"
         );
+    }
+
+    // --- concurrency resolution wiring ---
+
+    use crate::runtime::platform::MachineProfile;
+    use crate::types::{ConcurrencyMode, TargetThroughput};
+
+    /// A profile with the given instance type and vCPU count; RAM is irrelevant
+    /// to concurrency resolution.
+    fn profile(instance_type: Option<&str>, vcpus: usize) -> MachineProfile {
+        MachineProfile {
+            instance_type: instance_type.map(str::to_string),
+            vcpus,
+            ram_bytes: None,
+        }
+    }
+
+    fn config_with(mode: ConcurrencyMode, profile: Option<MachineProfile>) -> crate::Config {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        crate::config::Config::builder()
+            .client(s3_client)
+            .concurrency(mode)
+            .machine_profile(profile)
+            .build()
+    }
+
+    #[test]
+    fn resolve_explicit_is_verbatim() {
+        assert_eq!(
+            resolve_concurrency_target(&ConcurrencyMode::Explicit(42), &profile(None, 8)),
+            42
+        );
+    }
+
+    #[test]
+    fn resolve_target_throughput_derives_from_download() {
+        // 100 Gbps target -> ceil(100 / 0.4) = 250 in-flight.
+        let mode = ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(100));
+        assert_eq!(resolve_concurrency_target(&mode, &profile(None, 8)), 250);
+    }
+
+    #[test]
+    fn resolve_auto_uses_profile_instance_type() {
+        // m6idn.16xlarge @ 64 vCPU -> 100 Gbps -> 250.
+        let p = profile(Some("m6idn.16xlarge"), 64);
+        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Auto, &p), 250);
+    }
+
+    #[test]
+    fn resolve_auto_profile_without_instance_type_uses_vcpu_fallback() {
+        // Detected vCPU but no instance type (DMI/IMDS miss): fallback 5 * 16 = 80.
+        let p = profile(None, 16);
+        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Auto, &p), 80);
+    }
+
+    #[test]
+    fn resolve_explicit_zero_is_clamped_not_panic() {
+        // `FixedConcurrency::new(0)` would panic; resolution must guard it.
+        let p = profile(None, 8);
+        assert_eq!(
+            resolve_concurrency_target(&ConcurrencyMode::Explicit(0), &p),
+            1
+        );
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn client_new_wires_resolved_target_into_controller() {
+        // End-to-end: the resolved seed reaches the live controller's target().
+        // c8gn.16xlarge: 3.125 Gbps/vCPU * 64 = 200 Gbps -> 500.
+        let config = config_with(
+            ConcurrencyMode::Auto,
+            Some(profile(Some("c8gn.16xlarge"), 64)),
+        );
+        let client = Client::new(config);
+        assert_eq!(client.handle.controller.target(), 500);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn client_new_bypass_path_detects_locally() {
+        // No profile on the config (built directly, not via the loader):
+        // Client::new detects locally. Off EC2 (the test host) DMI yields no
+        // instance type, so the resolved target must equal the vCPU fallback for
+        // the detected core count — pinning it, so a regression that stops
+        // feeding local vCPU into resolution is caught (not just a clamp-range
+        // check that holds by construction).
+        use crate::runtime::platform;
+        let expected = platform::auto_concurrency_seed(None, platform::local_vcpus());
+        let config = config_with(ConcurrencyMode::Auto, None);
+        let client = Client::new(config);
+        assert_eq!(client.handle.controller.target(), expected);
     }
 }

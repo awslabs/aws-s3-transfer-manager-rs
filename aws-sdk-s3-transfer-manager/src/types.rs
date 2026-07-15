@@ -67,11 +67,15 @@ pub struct MemoryBudgetSnapshot {
 }
 
 impl MemoryBudgetConfig {
-    /// Resolve to the budget capacity in bytes.
-    pub(crate) fn resolve(&self) -> usize {
+    /// Resolve to the budget capacity in bytes. `ram_bytes` is the detected
+    /// usable RAM from the [`MachineProfile`](crate::runtime::platform::MachineProfile)
+    /// (`None` when undetectable), used only by the `Auto` and `Fraction` policies.
+    pub(crate) fn resolve(&self, ram_bytes: Option<usize>) -> usize {
         match self {
-            MemoryBudgetConfig::Auto => crate::runtime::platform::machine_safe_mem(),
-            MemoryBudgetConfig::Fraction(f) => crate::runtime::platform::mem_for_fraction(*f),
+            MemoryBudgetConfig::Auto => crate::runtime::platform::machine_safe_mem(ram_bytes),
+            MemoryBudgetConfig::Fraction(f) => {
+                crate::runtime::platform::mem_for_fraction(ram_bytes, *f)
+            }
             MemoryBudgetConfig::Limit(bytes) => *bytes,
         }
     }
