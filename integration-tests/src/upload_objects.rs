@@ -617,10 +617,10 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
 ///   throttles classified `NoRetry` the shed children fail and the transfer aborts
 ///   (mutation-verified).
 /// - The TM's throttle backoff paces re-issues back under `rate`, so the bucket
-///   keeps up and requests are served again. Recovery is caused by the backoff, and
-///   completion proves it. (Rate — not in-flight concurrency — is what accumulates
-///   under a burst of near-instant in-memory requests, so it produces real
-///   backpressure a concurrency limit would not at this object size.)
+///   keeps up and requests are served again. Recovery is caused by the backoff.
+///   (Rate — not in-flight concurrency — is what accumulates under a burst of
+///   near-instant in-memory requests, so it produces real backpressure a
+///   concurrency limit would not at this object size.)
 /// - Concurrency is fixed (16) so the sustained offered load stays bounded: a
 ///   throttled object's re-issues are not drowned out by hundreds of peers
 ///   retrying into the same rate limit, so each recovers within the retry budget.

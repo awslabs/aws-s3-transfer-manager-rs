@@ -48,7 +48,7 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::PartSize;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
-use s3_mock_server::{FaultType, Occurrence, S3MockServer};
+use s3_mock_server::{BodyCadence, FaultType, Occurrence, S3MockServer};
 
 /// Part size pinned equally for upload and download so multipart download ranges
 /// align to the uploaded part boundaries (the precondition for per-part
@@ -251,8 +251,9 @@ async fn cold_tracker_body_stall_does_not_hang() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::StallBody {
-            after_bytes: FAULT_AFTER_BYTES,
+        FaultType::PaceBody {
+            piece_bytes: FAULT_AFTER_BYTES,
+            cadence: BodyCadence::Stall,
         },
         SKIP_DISCOVERY,
         Occurrence::Always,
@@ -272,6 +273,93 @@ async fn cold_tracker_body_stall_does_not_hang() {
              catch the silent body"
         ),
     }
+
+    t.shutdown().await;
+}
+
+// slow-but-progressing body -> must not trip the latency deadline -------------
+
+/// Warm-up downloads for the deadline-arming test. Only a *range-chunk* GET
+/// records a latency sample; the discovery GET reuses its body untimed. A
+/// `multipart_data` object (40 MiB at an 8 MiB part size) is discovery + four
+/// range chunks = four samples, so four warm-up downloads yield sixteen samples,
+/// comfortably above `WARM_THRESHOLD` (10). The chunks serve from memory in
+/// microseconds, so the armed deadline seeds near the offset floor.
+const WARMUP_COUNT: usize = 4;
+
+/// Piece size for the slow body: the lone 4 MiB range chunk is delivered in
+/// 256 KiB pieces (sixteen pieces, fifteen inter-piece gaps).
+const SLOW_PIECE_BYTES: u64 = 256 * 1024;
+
+/// Delay before each piece after the first. Fifteen gaps at 300 ms is ~4.5 s of
+/// body delivery — longer than the deadline can reach across three attempts
+/// (seeded near the offset, widened at most twice before the budget exhausts),
+/// so a body-timing regression trips every attempt. Each gap is well under the
+/// 2 s stalled-stream-protection grace, and throughput stays positive, so SSP
+/// (zero-throughput only) never fires on the healthy stream.
+const SLOW_PIECE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// A slow-but-progressing body must not trip the latency deadline: the deadline
+/// guards only the GET send (TTFB), the body read is untimed. Warm the tracker
+/// past its threshold on fast chunks so a sub-second deadline is armed, then
+/// serve a single range chunk whose body streams slowly (~4.5 s) but never
+/// stalls. The download succeeds because the untimed body outlives the deadline.
+///
+/// Fails if the body read is folded back under `guarded()`: the body then
+/// exceeds the deadline on every attempt, exhausts the retry budget, and the
+/// lone chunk aborts the download. A single range chunk bounds the deadline's
+/// per-timeout widening to the attempt budget, so the widened deadline cannot
+/// climb past the body time and let a mutated build pass.
+#[tokio::test]
+async fn slow_progressing_body_does_not_trip_deadline() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+
+    // Warm the latency tracker so the adaptive deadline is armed. Each
+    // multipart object contributes four range-chunk samples.
+    let warmup_data = multipart_data();
+    for i in 0..WARMUP_COUNT {
+        let key = format!("warmup-{i}");
+        t.put(
+            &key,
+            warmup_data.clone(),
+            ChecksumStrategy::with_calculated_crc32(),
+        )
+        .await;
+        t.download(&key, Some(ChecksumMode::Enabled))
+            .await
+            .expect("warm-up download must succeed");
+    }
+
+    // A single-range-chunk object so the fault targets exactly one chunk and the
+    // deadline's per-timeout widening is bounded by the attempt budget.
+    let data = single_range_chunk_data();
+    t.put(
+        "slow",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("slow"),
+        FaultType::PaceBody {
+            piece_bytes: SLOW_PIECE_BYTES,
+            cadence: BodyCadence::Slow(SLOW_PIECE_DELAY),
+        },
+        SKIP_DISCOVERY,
+        Occurrence::Always,
+    );
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        t.download("slow", Some(ChecksumMode::Enabled)).await
+    })
+    .await
+    .expect("timed out — download hung instead of completing");
+
+    let (bytes, _output) = outcome.expect("slow-but-progressing body must succeed");
+    assert_same_content(&data, &bytes);
 
     t.shutdown().await;
 }
