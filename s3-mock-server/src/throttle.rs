@@ -3,213 +3,136 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Server-wide, request-counted throttling that recovers.
+//! Server-wide, load-driven throttling that recovers.
 //!
-//! Models an S3 prefix throttling a burst of load and then relenting — the
-//! shape a high-fan-out transfer provokes. Unlike the per-`(bucket, key)`
-//! [`FaultRegistry`](crate::faults::FaultRegistry), a [`ThrottleSchedule`] is
-//! scoped to the whole server and advances by a global request ordinal, so it
-//! models "the service is throttling *you*" across every object in a fan-out.
-//!
-//! Deterministic and repeatable: the verdict for the Nth qualifying request is a
-//! pure function of the ordinal ([`ThrottleSchedule::verdict`]), never of timing
-//! or randomness. Request *order* across concurrent handlers is not fixed, but
-//! the *count* of throttled requests is — tests assert transfer-level outcome,
-//! not which object was throttled. A permanent storm is the
-//! [`Always`](crate::faults::Occurrence::Always) fault's job; a `ThrottleSchedule`
-//! always recovers once its phases are consumed.
+//! Models an S3 prefix shedding a burst of load and then relenting — the shape a
+//! high-fan-out transfer provokes. Unlike the per-`(bucket, key)`
+//! [`FaultRegistry`](crate::faults::FaultRegistry), a [`RateThrottle`] is scoped
+//! to the whole server, so it models "the service is throttling *you*" across
+//! every object in a fan-out. A persistent storm (one that never relents) is the
+//! [`Always`](crate::faults::Occurrence::Always) service-error fault's job; a
+//! [`RateThrottle`] always recovers once the client's arrival rate drops.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// One phase of a [`ThrottleSchedule`]: for its `count` requests, throttle
-/// `fraction` of them (0.0 = none, 1.0 = all).
-#[derive(Debug, Clone, Copy)]
-struct Phase {
-    count: u64,
-    fraction: f64,
-}
-
-/// A server-wide throttle that advances by request count through a sequence of
-/// phases, then passes all further requests (recovers).
+/// A load-driven throttle: a token bucket that admits requests up to a sustained
+/// `rate` per second (with a `burst` allowance) and sheds the rest, relenting as
+/// the client's arrival rate drops back under `rate`. [`try_take`](Self::try_take)
+/// returns the admit/shed verdict; mapping a shed to a 503 `SlowDown` response is
+/// the caller's job (see the server's request handlers).
 ///
-/// Build with [`builder`](Self::builder). The schedule holds no state; the
-/// running ordinal lives in [`ThrottleState`].
-#[derive(Debug, Clone, Default)]
-pub struct ThrottleSchedule {
-    phases: Vec<Phase>,
-}
-
-impl ThrottleSchedule {
-    /// Start building a schedule.
-    pub fn builder() -> ThrottleScheduleBuilder {
-        ThrottleScheduleBuilder { phases: Vec::new() }
-    }
-
-    /// Whether the request at zero-based `ordinal` is throttled.
-    ///
-    /// Pure and deterministic. Walks the phases in order: `ordinal` past all
-    /// phases returns `false` (recovered). Within a phase, `fraction` is applied
-    /// by position — throttle iff `floor(k · f) != floor((k − 1) · f)` for `k`
-    /// the 1-based position within the phase — which throttles exactly `fraction`
-    /// of the phase's requests, evenly spread, with no randomness.
-    pub(crate) fn verdict(&self, ordinal: u64) -> bool {
-        let mut start = 0u64;
-        for phase in &self.phases {
-            let end = start.saturating_add(phase.count);
-            if ordinal < end {
-                let k = ordinal - start + 1; // 1-based position within the phase
-                let f = phase.fraction;
-                return (k as f64 * f).floor() as i64 != ((k - 1) as f64 * f).floor() as i64;
-            }
-            start = end;
-        }
-        false
-    }
-}
-
-/// Builder for a [`ThrottleSchedule`]. Phases apply in the order added; once all
-/// are consumed the schedule recovers (further requests pass).
+/// Models S3's per-prefix request-rate limit. A high-fan-out burst arrives faster
+/// than the bucket refills, so the excess is shed; the transfer recovers because
+/// its own backoff paces re-issues back under the refill rate — not because a
+/// fixed number of requests elapsed. Recovery is therefore contingent on client
+/// behavior, which is what makes it a faithful proxy: a transfer that never backs
+/// off never lets the rate drop. Rate (not in-flight concurrency) is what
+/// accumulates under a burst of near-instant requests, so it produces real
+/// backpressure the mock's fast in-memory serving otherwise would not.
+///
+/// Which request is shed is not fixed — it depends on arrival timing. The
+/// invariant is behavioral: an arrival rate above `rate` throttles, and dropping
+/// under it recovers. The non-determinism is deliberate — across runs it exercises
+/// the client's retry/backoff path against varied interleavings rather than one
+/// fixed schedule.
 #[derive(Debug)]
-pub struct ThrottleScheduleBuilder {
-    phases: Vec<Phase>,
+pub struct RateThrottle {
+    /// `(available_tokens, last_refill)` under one lock. Tokens are fractional so
+    /// a sub-second gap refills proportionally.
+    state: std::sync::Mutex<(f64, std::time::Instant)>,
+    /// Sustained admits per second (token refill rate).
+    rate: f64,
+    /// Maximum token accumulation, bounding the instantaneous burst admitted.
+    burst: f64,
 }
 
-impl ThrottleScheduleBuilder {
-    /// The next `count` requests pass untouched. Sugar for `throttled(count, 0.0)`.
-    pub fn healthy(self, count: u64) -> Self {
-        self.throttled(count, 0.0)
-    }
-
-    /// The next `count` requests throttle `fraction` of themselves (0.0 = none,
-    /// 1.0 = all), applied deterministically by position.
-    pub fn throttled(mut self, count: u64, fraction: f64) -> Self {
-        self.phases.push(Phase {
-            count,
-            fraction: fraction.clamp(0.0, 1.0),
-        });
-        self
-    }
-
-    /// Finish the schedule.
-    pub fn build(self) -> ThrottleSchedule {
-        ThrottleSchedule {
-            phases: self.phases,
-        }
-    }
-}
-
-/// A [`ThrottleSchedule`] plus the running request ordinal, shared across the
-/// server's request handlers.
-#[derive(Debug, Default)]
-pub(crate) struct ThrottleState {
-    schedule: ThrottleSchedule,
-    next_ordinal: AtomicU64,
-}
-
-impl ThrottleState {
-    pub(crate) fn new(schedule: ThrottleSchedule) -> Self {
+impl RateThrottle {
+    /// A token bucket refilling at `rate` tokens/sec, capped at `burst` tokens,
+    /// starting full.
+    pub(crate) fn new(rate: f64, burst: f64) -> Self {
         Self {
-            schedule,
-            next_ordinal: AtomicU64::new(0),
+            state: std::sync::Mutex::new((burst, std::time::Instant::now())),
+            rate,
+            burst,
         }
     }
 
-    /// Claim the next request ordinal and return whether it is throttled. The
-    /// ordinal is monotonic across concurrent handlers, so the count throttled is
-    /// deterministic even when request order is not.
-    pub(crate) fn throttle_next(&self) -> bool {
-        let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
-        self.schedule.verdict(ordinal)
+    /// Refill by elapsed time, then take one token. `true` admits the request;
+    /// `false` sheds it (bucket empty). Time is a parameter so callers pass the
+    /// wall clock in production and a fixed instant in tests.
+    pub(crate) fn try_take(&self, now: std::time::Instant) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let (tokens, last) = &mut *guard;
+        let elapsed = now.saturating_duration_since(*last).as_secs_f64();
+        *tokens = (*tokens + elapsed * self.rate).min(self.burst);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn empty_schedule_never_throttles() {
-        let s = ThrottleSchedule::builder().build();
-        for ordinal in [0, 1, 100, 10_000] {
-            assert!(!s.verdict(ordinal));
+    fn rate_admits_up_to_burst_then_sheds() {
+        // Starts full at `burst`; with no time advance only `burst` requests are
+        // admitted, then the bucket is empty and the rest are shed.
+        let rt = RateThrottle::new(10.0, 5.0);
+        let t0 = Instant::now();
+        let admitted = (0..20).filter(|_| rt.try_take(t0)).count();
+        assert_eq!(admitted, 5, "exactly `burst` admitted with no refill");
+    }
+
+    #[test]
+    fn rate_refills_over_time() {
+        // Drain the burst, then a one-second gap refills `rate` tokens. Burst is
+        // set to `rate` so the refill is not clipped by the cap (see the cap test).
+        let rt = RateThrottle::new(10.0, 10.0);
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            assert!(rt.try_take(t0));
         }
+        assert!(!rt.try_take(t0), "bucket drained");
+        let t1 = t0 + Duration::from_secs(1);
+        let admitted = (0..30).filter(|_| rt.try_take(t1)).count();
+        assert_eq!(admitted, 10, "one second refills exactly `rate` tokens");
     }
 
     #[test]
-    fn healthy_then_storm_then_recovered_boundaries() {
-        // 50 healthy, 100 storm, then recovered — pin the off-by-one at each edge.
-        let s = ThrottleSchedule::builder()
-            .healthy(50)
-            .throttled(100, 1.0)
-            .build();
-
-        assert!(!s.verdict(0), "first request is healthy");
-        assert!(!s.verdict(49), "last healthy request");
-        assert!(s.verdict(50), "first storm request");
-        assert!(s.verdict(149), "last storm request");
-        assert!(!s.verdict(150), "recovered immediately after the storm");
-        assert!(!s.verdict(10_000), "recovered stays recovered");
-    }
-
-    #[test]
-    fn fraction_is_deterministic_and_evenly_spread() {
-        // fraction 0.5 over a phase throttles exactly every other request, and the
-        // same set on every call (no randomness).
-        let s = ThrottleSchedule::builder().throttled(10, 0.5).build();
-        let throttled: Vec<u64> = (0..10).filter(|&o| s.verdict(o)).collect();
-        assert_eq!(throttled.len(), 5, "exactly half of 10 throttled");
-        // Repeatable: identical set on a second pass.
-        let again: Vec<u64> = (0..10).filter(|&o| s.verdict(o)).collect();
-        assert_eq!(throttled, again);
-    }
-
-    #[test]
-    fn fraction_edges_none_and_all() {
-        let none = ThrottleSchedule::builder().throttled(20, 0.0).build();
-        assert!((0..20).all(|o| !none.verdict(o)));
-
-        let all = ThrottleSchedule::builder().throttled(20, 1.0).build();
-        assert!((0..20).all(|o| all.verdict(o)));
-    }
-
-    #[test]
-    fn fraction_count_is_exact_across_rates() {
-        // For a range of fractions, the number throttled in a 1000-request phase
-        // is floor(1000 * fraction) — exact, not approximate.
-        for (f, expected) in [(0.1, 100), (0.25, 250), (0.333, 333), (0.9, 900)] {
-            let s = ThrottleSchedule::builder().throttled(1000, f).build();
-            let n = (0..1000).filter(|&o| s.verdict(o)).count();
-            assert_eq!(n, expected, "fraction {f} over 1000 requests");
+    fn rate_refill_is_capped_at_burst() {
+        // A long idle gap cannot accumulate more than `burst` tokens.
+        let rt = RateThrottle::new(10.0, 5.0);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(rt.try_take(t0));
         }
-    }
-
-    #[test]
-    fn tiered_recovery_phases_apply_in_order() {
-        // storm (all) -> partial (half) -> recovered.
-        let s = ThrottleSchedule::builder()
-            .throttled(100, 1.0)
-            .throttled(200, 0.5)
-            .build();
-
-        assert!(s.verdict(0) && s.verdict(99), "storm phase all throttled");
-        let partial = (100..300).filter(|&o| s.verdict(o)).count();
-        assert_eq!(partial, 100, "partial phase throttles half of 200");
-        assert!(!s.verdict(300), "recovered after both phases");
-    }
-
-    #[test]
-    fn state_ordinal_is_monotonic_and_maps_to_verdict() {
-        // ThrottleState claims ordinals in order and applies the schedule.
-        let state = ThrottleState::new(
-            ThrottleSchedule::builder()
-                .healthy(2)
-                .throttled(2, 1.0)
-                .build(),
+        let t1 = t0 + Duration::from_secs(100); // would refill 1000 uncapped
+        let admitted = (0..20).filter(|_| rt.try_take(t1)).count();
+        assert_eq!(
+            admitted, 5,
+            "accumulation is capped at `burst`, not rate*elapsed"
         );
-        assert!(!state.throttle_next(), "ordinal 0 healthy");
-        assert!(!state.throttle_next(), "ordinal 1 healthy");
-        assert!(state.throttle_next(), "ordinal 2 storm");
-        assert!(state.throttle_next(), "ordinal 3 storm");
-        assert!(!state.throttle_next(), "ordinal 4 recovered");
+    }
+
+    #[test]
+    fn rate_sub_second_gap_refills_proportionally() {
+        // Fractional tokens: at 10/sec, 100ms refills exactly one token.
+        let rt = RateThrottle::new(10.0, 1.0);
+        let t0 = Instant::now();
+        assert!(rt.try_take(t0), "first (burst) token");
+        assert!(!rt.try_take(t0), "drained");
+        assert!(
+            !rt.try_take(t0 + Duration::from_millis(50)),
+            "50ms = 0.5 token, still below 1"
+        );
+        assert!(
+            rt.try_take(t0 + Duration::from_millis(100)),
+            "100ms accumulates a whole token"
+        );
     }
 }

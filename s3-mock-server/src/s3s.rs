@@ -108,10 +108,10 @@ pub(crate) struct Inner<S: StorageBackend + 'static> {
     storage: S,
     /// Key-scoped fault injection registry.
     faults: std::sync::Arc<crate::faults::FaultRegistry>,
-    /// Server-wide request-counted throttle, shared with the owning server.
-    /// `None` until a schedule is installed.
+    /// Server-wide load-driven throttle, shared with the owning server. `None`
+    /// until one is installed.
     throttle:
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::throttle::ThrottleState>>>>,
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>>,
 }
 
 impl<S: StorageBackend + 'static> Inner<S> {
@@ -130,7 +130,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
         storage: S,
         faults: std::sync::Arc<crate::faults::FaultRegistry>,
         throttle: std::sync::Arc<
-            std::sync::Mutex<Option<std::sync::Arc<crate::throttle::ThrottleState>>>,
+            std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
         >,
     ) -> Self {
         Self {
@@ -140,18 +140,19 @@ impl<S: StorageBackend + 'static> Inner<S> {
         }
     }
 
-    /// Consume the next global throttle ordinal; on a throttled request return a
-    /// 503 `SlowDown`, else `Ok(())`. Called first in every S3 handler so the
-    /// server-wide schedule counts and throttles all operations uniformly.
+    /// Decide whether to serve or shed this request under the installed throttle;
+    /// a shed request returns 503 `SlowDown`. Called first in every S3 handler so
+    /// the throttle applies to all operations uniformly. The throttle lock is
+    /// released before consulting the rate limiter, so it is never held across the
+    /// handler body.
     fn check_throttle(&self) -> S3Result<()> {
-        let throttled = {
-            let guard = self.throttle.lock().unwrap();
-            guard.as_ref().is_some_and(|state| state.throttle_next())
-        };
-        if throttled {
-            return Err(s3s::S3Error::new(s3s::S3ErrorCode::SlowDown));
+        let throttle = self.throttle.lock().unwrap().clone();
+        match throttle {
+            Some(rt) if !rt.try_take(std::time::Instant::now()) => {
+                Err(s3s::S3Error::new(s3s::S3ErrorCode::SlowDown))
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Apply a registered fault to a GET response, if one fires for this request.

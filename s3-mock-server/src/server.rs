@@ -233,9 +233,9 @@ pub struct S3MockServer {
     /// exists at connect time; decremented per reset. Shared with the serving task.
     connect_reset: Arc<std::sync::atomic::AtomicU64>,
 
-    /// Server-wide request-counted throttle. Shared with the serving task; `None`
-    /// until a schedule is installed via [`set_throttle_schedule`](Self::set_throttle_schedule).
-    throttle: Arc<Mutex<Option<Arc<crate::throttle::ThrottleState>>>>,
+    /// Server-wide load-driven throttle. Shared with the serving task; `None`
+    /// until one is installed via [`set_rate_throttle`](Self::set_rate_throttle).
+    throttle: Arc<Mutex<Option<Arc<crate::throttle::RateThrottle>>>>,
 
     /// Server configuration.
     config: ServerConfig,
@@ -316,19 +316,21 @@ impl S3MockServer {
         self.faults.clear(bucket, key);
     }
 
-    /// Install a server-wide throttle schedule (see [`ThrottleSchedule`]).
+    /// Install a server-wide load-driven throttle: a token bucket admitting a
+    /// sustained `rate` requests/sec (with a `burst` allowance) and shedding the
+    /// rest with 503 `SlowDown`, relenting as the client's arrival rate drops.
     ///
-    /// Applies to every S3 operation, advancing by a global request ordinal:
-    /// throttled requests return 503 `SlowDown` before touching storage. Resets
-    /// the ordinal, so calling it starts a fresh schedule. Distinct from the
-    /// per-`(bucket, key)` fault queue and from the permanent
-    /// [`Always`](crate::faults::Occurrence) service-error fault — a schedule
-    /// always recovers once its phases are consumed.
-    ///
-    /// [`ThrottleSchedule`]: crate::throttle::ThrottleSchedule
-    pub fn set_throttle_schedule(&self, schedule: crate::throttle::ThrottleSchedule) {
+    /// Models S3's per-prefix request-rate limit: a high-fan-out burst arrives
+    /// faster than the bucket refills and the excess is shed, and the transfer
+    /// recovers only because its own backoff paces re-issues back under `rate`.
+    /// Which request is shed depends on arrival timing; the behavior (over rate →
+    /// shed, rate drops → recover) is deterministic. Applies to every S3 operation,
+    /// before touching storage. Distinct from the per-`(bucket, key)` fault queue
+    /// and from the persistent [`Always`](crate::faults::Occurrence) service-error
+    /// fault, which never relents.
+    pub fn set_rate_throttle(&self, rate: f64, burst: f64) {
         *self.throttle.lock().unwrap() =
-            Some(Arc::new(crate::throttle::ThrottleState::new(schedule)));
+            Some(Arc::new(crate::throttle::RateThrottle::new(rate, burst)));
     }
 
     /// Abort (RST) the next `count` freshly accepted connections immediately,
