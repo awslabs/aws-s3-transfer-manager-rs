@@ -7,7 +7,7 @@ use aws_runtime::user_agent::FrameworkMetadata;
 use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, ReadAhead};
+use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, ReadAhead, RuntimeMode};
 
 pub(crate) mod loader;
 
@@ -70,6 +70,7 @@ pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    runtime_mode: RuntimeMode,
     read_ahead: ReadAhead,
     memory_budget: MemoryBudgetConfig,
     framework_metadata: Option<FrameworkMetadata>,
@@ -103,6 +104,14 @@ impl Config {
     /// This is the mode used for concurrent in-flight requests across _all_ operations.
     pub fn concurrency(&self) -> &ConcurrencyMode {
         &self.concurrency
+    }
+
+    /// Returns the execution runtime the client runs transfers on.
+    ///
+    /// See [`RuntimeMode`] for the tradeoff between managed threads and the
+    /// caller's runtime.
+    pub fn runtime_mode(&self) -> &RuntimeMode {
+        &self.runtime_mode
     }
 
     /// Returns the read-ahead mode used for downloads.
@@ -152,6 +161,7 @@ pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    runtime_mode: RuntimeMode,
     read_ahead: ReadAhead,
     memory_budget: MemoryBudgetConfig,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
@@ -223,6 +233,14 @@ impl Builder {
     /// Default is [ConcurrencyMode::Auto].
     pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
         self.concurrency = mode;
+        self
+    }
+
+    /// Set the execution runtime mode.
+    ///
+    /// Default is [`RuntimeMode::Managed`].
+    pub fn runtime_mode(mut self, mode: RuntimeMode) -> Self {
+        self.runtime_mode = mode;
         self
     }
 
@@ -312,6 +330,7 @@ impl Builder {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
+            runtime_mode: self.runtime_mode,
             read_ahead: self.read_ahead,
             memory_budget: self.memory_budget,
             framework_metadata: self.framework_metadata,

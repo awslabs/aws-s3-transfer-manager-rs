@@ -7,7 +7,7 @@ use crate::metrics::unit::ByteUnit;
 use crate::runtime::ManagedThreadRuntime;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
-use crate::types::{ConcurrencyMode, PartSize};
+use crate::types::{ConcurrencyMode, PartSize, RuntimeMode};
 use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
@@ -267,14 +267,19 @@ impl Client {
 
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
-            let runtime: Arc<dyn ExecutionRuntime> = {
-                #[allow(unused_mut)]
-                let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
-                #[cfg(feature = "dial9")]
-                if let Some(guard) = telemetry_guard {
-                    builder = builder.telemetry_guard(guard);
+            let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
+                RuntimeMode::Managed => {
+                    #[allow(unused_mut)]
+                    let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
+                    #[cfg(feature = "dial9")]
+                    if let Some(guard) = telemetry_guard {
+                        builder = builder.telemetry_guard(guard);
+                    }
+                    Arc::new(builder.build())
                 }
-                Arc::new(builder.build())
+                RuntimeMode::CurrentTokio => Arc::new(
+                    crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
+                ),
             };
 
             let s3_client = match config.take_s3_client_source() {
@@ -683,5 +688,37 @@ mod tests {
         let map = handle.retry_partitions.lock().unwrap();
         assert_eq!(map.len(), 2, "each distinct bucket caches one partition");
         assert!(map.contains_key("bucket-a") && map.contains_key("bucket-b"));
+    }
+
+    // --- runtime mode selection ---
+
+    #[test]
+    fn config_default_runtime_mode_is_managed() {
+        let config = config_with(ConcurrencyMode::Auto, None);
+        assert!(matches!(config.runtime_mode(), RuntimeMode::Managed));
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn client_new_with_managed_runtime_mode() {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .runtime_mode(RuntimeMode::Managed)
+            .build();
+        let _client = Client::new(config);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_new_with_current_tokio_runtime_mode() {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .runtime_mode(RuntimeMode::CurrentTokio)
+            .build();
+        let _client = Client::new(config);
     }
 }

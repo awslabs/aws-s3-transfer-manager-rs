@@ -20,7 +20,6 @@ struct WorkQueue {
     in_flight: usize,
 }
 
-#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl WorkQueue {
     fn new() -> Self {
         Self {
@@ -72,7 +71,6 @@ pub(super) struct WorkerPool {
     started: AtomicBool,
 }
 
-#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl WorkerPool {
     pub(super) fn new() -> Self {
         Self {
@@ -124,7 +122,6 @@ impl WorkerPool {
     }
 
     /// Signal shutdown. Workers will exit after current work.
-    #[allow(dead_code)] // TODO: scheduler observability + lifecycle
     pub(super) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         // Wake all waiting workers so they can exit
