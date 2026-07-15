@@ -730,7 +730,7 @@ impl DownloadTransfer {
             }
             let req = builder
                 .customize()
-                .config_override(crate::retry::download_get_override(input.bucket()));
+                .config_override(ctx.handle.download_get_override(input.bucket()));
             async move {
                 // Obtain the body stream. First attempt reuses the discovery body
                 // (no send, untimed); a re-issue is TTFB-guarded (times + records).
@@ -895,7 +895,7 @@ impl DownloadTransfer {
             }
             let req = builder
                 .customize()
-                .config_override(crate::retry::download_get_override(input.bucket()));
+                .config_override(ctx.handle.download_get_override(input.bucket()));
             async move {
                 // Timed (TTFB): obtain response headers. Validate the range here
                 // so a mismatch is classified before we commit to the body read.

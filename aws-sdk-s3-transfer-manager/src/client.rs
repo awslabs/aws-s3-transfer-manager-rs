@@ -38,6 +38,17 @@ pub(crate) struct Handle {
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
     pub(crate) memory_budget: Arc<MemoryBudget>,
+    /// Per-bucket retry token bucket, cached so all operations and retries to a
+    /// given bucket share one live token bucket. The SDK does not share a bucket
+    /// across custom retry partitions, and a partition built per operation would
+    /// start full every time, defeating the shared throttle budget and its refill.
+    /// Unbounded: a client targets few distinct buckets, and entries are cheap
+    /// (Arc-shared bucket + name). Invariant: an entry that operations may still be
+    /// retrying against must not be dropped — replacing a live draining bucket with
+    /// a fresh full one reintroduces the per-operation-fresh-bucket bug.
+    retry_partitions: std::sync::Mutex<
+        std::collections::HashMap<String, aws_sdk_s3::config::retry::RetryPartition>,
+    >,
 }
 
 impl Handle {
@@ -74,6 +85,59 @@ impl Handle {
         matches!(self.config.part_size(), PartSize::Target(_))
     }
 
+    /// Per-operation config override that keys the retry token bucket by bucket.
+    ///
+    /// Returns an empty override when no bucket is set, which merges as a no-op.
+    /// The partition is cached so all operations to the same bucket share one
+    /// live token bucket (and its refill): under a total outage the sustained
+    /// retry rate to S3 is `REFILL_RATE / throttling_retry_cost` (approx 2
+    /// retries/sec per bucket), independent of concurrency.
+    pub(crate) fn bucket_partition_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        let builder = aws_sdk_s3::config::Builder::default();
+        match bucket {
+            Some(b) => {
+                let partition = {
+                    let mut map = self.retry_partitions.lock().expect("lock poisoned");
+                    map.entry(b.to_owned())
+                        .or_insert_with(|| crate::retry::bucket_retry_partition(b))
+                        .clone()
+                };
+                builder.retry_partition(partition)
+            }
+            None => builder,
+        }
+    }
+
+    /// Per-operation config override for a transfer body (download GET or upload):
+    /// bucket retry partition plus the tightened stalled-stream grace.
+    fn transfer_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+        self.bucket_partition_override(bucket)
+            .stalled_stream_protection(crate::retry::tightened_ssp())
+    }
+
+    /// Per-operation config override for a download GET: bucket retry partition
+    /// plus the tightened stalled-stream grace on the response body. Intentionally
+    /// identical to [`upload_override`](Self::upload_override) (both delegate to
+    /// `transfer_override`); the two names document the call site's direction.
+    pub(crate) fn download_get_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.transfer_override(bucket)
+    }
+
+    /// Per-operation config override for an upload (UploadPart / PutObject):
+    /// bucket retry partition plus the tightened stalled-stream grace on the
+    /// request body. Intentionally identical to
+    /// [`download_get_override`](Self::download_get_override); the two names
+    /// document the call site's direction.
+    pub(crate) fn upload_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+        self.transfer_override(bucket)
+    }
+
     /// Create a Handle for testing with a custom scheduler factory.
     #[cfg(test)]
     pub(crate) fn new_for_test(mut config: crate::Config, concurrency: usize) -> Arc<Self> {
@@ -95,6 +159,7 @@ impl Handle {
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
+                retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         })
     }
@@ -154,6 +219,7 @@ impl Handle {
                 controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
+                retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         })
     }
@@ -232,6 +298,7 @@ impl Client {
                 controller,
                 telemetry,
                 memory_budget: MemoryBudget::new(budget_capacity, BUDGET_CHUNK_BYTES),
+                retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         });
         Client { handle }
@@ -586,5 +653,35 @@ mod tests {
         let config = config_with(ConcurrencyMode::Auto, None);
         let client = Client::new(config);
         assert_eq!(client.handle.controller.target(), expected);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn retry_partition_is_cached_per_bucket() {
+        // The retry partition (and its refilling token bucket) must be built once
+        // per bucket and reused, not rebuilt per operation — a fresh partition
+        // would carry a fresh full bucket, defeating the shared budget and refill.
+        // The map is the observable of that reuse: repeated calls for one bucket
+        // add exactly one entry, and distinct buckets each add their own. A
+        // build-fresh-per-call regression never populates the map (stays empty).
+        let handle = Handle::new_for_test(test_config(), 2);
+
+        // Same bucket, three calls: one cache entry, populated once.
+        for _ in 0..3 {
+            let _ = handle.bucket_partition_override(Some("bucket-a"));
+        }
+        assert_eq!(
+            handle.retry_partitions.lock().unwrap().len(),
+            1,
+            "repeated calls for one bucket must reuse a single cached partition"
+        );
+
+        // A second bucket adds its own entry; `None` adds nothing.
+        let _ = handle.bucket_partition_override(Some("bucket-b"));
+        let _ = handle.bucket_partition_override(None);
+        let map = handle.retry_partitions.lock().unwrap();
+        assert_eq!(map.len(), 2, "each distinct bucket caches one partition");
+        assert!(map.contains_key("bucket-a") && map.contains_key("bucket-b"));
     }
 }

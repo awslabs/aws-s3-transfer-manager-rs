@@ -166,7 +166,12 @@ async fn discover_obj_with_get_first_part(
         .set_range(None)
         .set_part_number(Some(1))
         .customize()
-        .config_override(crate::retry::bucket_partition_override(input.bucket()))
+        .config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        )
         .send()
         .await
         .map_err(error::Error::from)?;
@@ -185,7 +190,12 @@ async fn discover_obj_with_head(
         .set_bucket(input.bucket().map(str::to_string))
         .set_key(input.key().map(str::to_string))
         .customize()
-        .config_override(crate::retry::bucket_partition_override(input.bucket()))
+        .config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        )
         .send()
         .await
         .map_err(error::Error::from)?;
@@ -219,7 +229,12 @@ async fn discover_obj_with_get(
     let resp = builder
         .range(header::Range::bytes(byte_range))
         .customize()
-        .config_override(crate::retry::bucket_partition_override(input.bucket()))
+        .config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        )
         .send()
         .await;
     match resp {

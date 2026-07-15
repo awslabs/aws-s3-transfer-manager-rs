@@ -22,7 +22,7 @@
 //!   ([`bucket_retry_partition`](crate::retry::bucket_retry_partition)) is given
 //!   a time-based refill so a drained budget recovers.
 //! - **Mid-upload-body stall** (the peer stops making progress on the request
-//!   body): stalled-stream protection ([`upload_override`](crate::retry::upload_override)).
+//!   body): stalled-stream protection ([`Handle::upload_override`](crate::client::Handle::upload_override)).
 //! - **Response never arrives after the body is fully sent**: NOT bounded. This
 //!   is the response-first-byte gap — stalled-stream protection watches
 //!   request-body throughput, which has already completed, and the SDK sets no
@@ -290,9 +290,12 @@ impl UploadTransfer {
 
         let resp = match mpu_req
             .customize()
-            .config_override(crate::retry::bucket_partition_override(
-                self.inner.request.bucket(),
-            ))
+            .config_override(
+                self.inner
+                    .ctx
+                    .handle
+                    .bucket_partition_override(self.inner.request.bucket()),
+            )
             .send()
             .instrument(tracing::debug_span!("send-create-multipart-upload"))
             .await
@@ -433,7 +436,12 @@ impl UploadTransfer {
             );
             async move {
                 req.customize()
-                    .config_override(crate::retry::upload_override(self.inner.request.bucket()))
+                    .config_override(
+                        self.inner
+                            .ctx
+                            .handle
+                            .upload_override(self.inner.request.bucket()),
+                    )
                     .disable_payload_signing()
                     .send()
                     .instrument(tracing::debug_span!("send-upload-part", part_number))
@@ -573,7 +581,12 @@ impl UploadTransfer {
             async move {
                 put_req
                     .customize()
-                    .config_override(crate::retry::upload_override(self.inner.request.bucket()))
+                    .config_override(
+                        self.inner
+                            .ctx
+                            .handle
+                            .upload_override(self.inner.request.bucket()),
+                    )
                     .disable_payload_signing()
                     .send()
                     .instrument(tracing::debug_span!("send-put-object"))
@@ -676,9 +689,12 @@ impl UploadTransfer {
 
         let resp = match complete_req
             .customize()
-            .config_override(crate::retry::bucket_partition_override(
-                self.inner.request.bucket(),
-            ))
+            .config_override(
+                self.inner
+                    .ctx
+                    .handle
+                    .bucket_partition_override(self.inner.request.bucket()),
+            )
             .send()
             .instrument(tracing::debug_span!("send-complete-multipart-upload"))
             .await

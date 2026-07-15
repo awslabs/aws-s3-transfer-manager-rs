@@ -34,7 +34,7 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Base of the full-jitter backoff for a throttle retry.
 ///
-/// The SEP backs off a throttling error with a 1s base — 20× the transient base
+/// The SEP backs off a throttling error with a 1s base — 10× the transient base
 /// — so a service shedding load is given room to recover before a re-issue. A
 /// transient transport error (a body-part IO failure) is safe to re-issue fast;
 /// a throttle is not, so the two retry reasons carry distinct bases while
@@ -73,7 +73,7 @@ impl Backoff {
 
     /// Backoff tuned for throttle retries.
     ///
-    /// Uses the SEP's 1s throttling base (20× the transient base), giving a
+    /// Uses the SEP's 1s throttling base (10× the transient base), giving a
     /// service that is shedding load room to recover before a re-issue. The SDK
     /// applies this base on its own inner retries, but when its retry quota is
     /// drained it returns the throttle without retrying (and without backoff), so
@@ -196,11 +196,12 @@ fn into_error(ge: GuardError<Error>) -> Error {
 /// Everything else is terminal: a non-throttle modeled service error and any
 /// non-transport inner error.
 ///
-/// [`GuardError::DeadlineExceeded`] is retried: a straggler dropped at its
-/// deadline is re-issued on a fresh connection rather than surfaced as a failure.
+/// [`GuardError::DeadlineExceeded`]: uploads carry no latency deadline (no
+/// `guarded` composition), so this arm is unreachable in practice; retained for
+/// exhaustiveness over the shared [`GuardError`].
 pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecision {
     match ge {
-        GuardError::DeadlineExceeded(_) => RetryDecision::Retry,
+        GuardError::DeadlineExceeded(_) => RetryDecision::NoRetry,
         GuardError::Inner(e) if e.is_transient_transport() => RetryDecision::Retry,
         GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
         GuardError::Inner(_) => RetryDecision::NoRetry,
@@ -273,9 +274,10 @@ pub(crate) fn classify_body_retry(ge: &GuardError<Error>) -> RetryDecision {
 /// recovery path — the transfer aborts. A low refill restores a bounded retry
 /// budget over time so re-issues proceed once the throttle relents.
 ///
-/// Bounds the worst case: under a total outage (no successes) the sustained
-/// retry rate to S3 is `REFILL_RATE / throttling_retry_cost` (the SDK's throttle
-/// cost is 5) ≈ 2 retries/sec per bucket partition, independent of transfer
+/// Cached per bucket on the Handle so the budget and its refill are shared
+/// across all operations and retries to that bucket; under a total outage the
+/// sustained retry rate to S3 is `REFILL_RATE / throttling_retry_cost` (the
+/// SDK's throttle cost is 5) ≈ 2 retries/sec per bucket, independent of
 /// concurrency. Kept low to trickle-probe recovery rather than re-flood a
 /// service that is shedding load; per-operation attempts remain bounded by
 /// [`MAX_ATTEMPTS`].
@@ -294,8 +296,12 @@ const RETRY_BUCKET_CAPACITY: usize = 500;
 /// bucket isolates them: each bucket gets its own token bucket, matching CRT,
 /// which partitions per S3 host. The bucket is given a time-based refill
 /// ([`RETRY_BUCKET_REFILL_RATE`]) the SDK default lacks, so a drained bucket
-/// recovers a bounded retry budget over time. Applied per operation via
-/// `config_override`.
+/// recovers a bounded retry budget over time.
+///
+/// Callers MUST NOT call this per-operation: the returned partition carries a
+/// freshly-allocated token bucket. Cache the partition on the Handle (via
+/// [`Handle::bucket_partition_override`](crate::client::Handle::bucket_partition_override))
+/// so all operations to a bucket share one live bucket instance.
 pub(crate) fn bucket_retry_partition(bucket: &str) -> RetryPartition {
     RetryPartition::custom(format!("s3-tm-{bucket}"))
         .token_bucket(
@@ -305,17 +311,6 @@ pub(crate) fn bucket_retry_partition(bucket: &str) -> RetryPartition {
                 .build(),
         )
         .build()
-}
-
-/// Per-operation config override that keys the retry token bucket by bucket.
-///
-/// Returns an empty override when no bucket is set, which merges as a no-op.
-pub(crate) fn bucket_partition_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
-    let builder = aws_sdk_s3::config::Builder::default();
-    match bucket {
-        Some(b) => builder.retry_partition(bucket_retry_partition(b)),
-        None => builder,
-    }
 }
 
 /// Stalled-stream grace period applied to transfer bodies.
@@ -330,25 +325,10 @@ pub(crate) fn bucket_partition_override(bucket: Option<&str>) -> aws_sdk_s3::con
 const STALL_GRACE: Duration = Duration::from_secs(2);
 
 /// Stalled-stream protection enabled with the tightened [`STALL_GRACE`].
-fn tightened_ssp() -> aws_sdk_s3::config::StalledStreamProtectionConfig {
+pub(crate) fn tightened_ssp() -> aws_sdk_s3::config::StalledStreamProtectionConfig {
     aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
         .grace_period(STALL_GRACE)
         .build()
-}
-
-/// Per-operation config override for a download GET: bucket retry partition plus
-/// the tightened stalled-stream grace on the response body.
-///
-/// Attach unconditionally via `.config_override(...)`; with no bucket the retry
-/// partition is left at the client default and only the grace period is set.
-pub(crate) fn download_get_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
-    bucket_partition_override(bucket).stalled_stream_protection(tightened_ssp())
-}
-
-/// Per-operation config override for an upload (UploadPart / PutObject): bucket
-/// retry partition plus the tightened stalled-stream grace on the request body.
-pub(crate) fn upload_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
-    bucket_partition_override(bucket).stalled_stream_protection(tightened_ssp())
 }
 
 #[cfg(test)]
@@ -441,15 +421,24 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn throttle_decision_retries_and_uses_the_throttle_backoff() {
-        // A `RetryThrottle` decision re-issues up to MAX_ATTEMPTS, and the loop
-        // paces it with the throttle base: total elapsed reflects ~1s+2s of
-        // (un-jittered-max) backoff, distinguishing it from the transient base.
+        // A `RetryThrottle` decision re-issues up to MAX_ATTEMPTS AND the loop
+        // paces it with the throttle base (1s), not the transient base (100ms).
+        // This times the REAL loop, so it fails if the loop selects the wrong
+        // backoff for a throttle decision.
+        //
+        // Full jitter makes an unseeded lower bound flaky, so seed `fastrand`:
+        // with seed 2 the two throttle draws (ceilings 1s, 2s) sum to ~2.03s of
+        // paused-time sleep. The transient base (ceilings 100ms, 200ms) can sleep
+        // at most 300ms total for ANY draw, so a `>= 1s` lower bound is reachable
+        // only by the throttle schedule and cannot false-pass under transient.
         fn classify_throttle(ge: &GuardError<Error>) -> RetryDecision {
             match ge {
                 GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
                 _ => RetryDecision::NoRetry,
             }
         }
+        fastrand::seed(2);
+
         let attempts = AtomicUsize::new(0);
         let start = tokio::time::Instant::now();
         let result: Result<(), _> = retry(classify_throttle, || {
@@ -460,14 +449,18 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
-        // Two backoffs at the throttle base (indices 0,1): ceilings 1s + 2s. With
-        // full jitter the actual sleeps are in [0, ceiling], so elapsed is bounded
-        // above by 3s; the point is it uses the throttle schedule, not that it
-        // hits the max. Assert it did not exceed the throttle ceiling sum.
+        let elapsed = start.elapsed();
+        // Lower bound only the throttle base can reach (transient tops out at 300ms
+        // across both retries): proves the loop selected the throttle backoff.
         assert!(
-            start.elapsed() <= Duration::from_secs(3),
-            "elapsed {:?} exceeds the throttle backoff ceiling",
-            start.elapsed()
+            elapsed >= Duration::from_secs(1),
+            "elapsed {elapsed:?} is below the throttle base; the loop must use the \
+             throttle backoff (1s), not the transient backoff (max 300ms total)"
+        );
+        // Upper bound: the two throttle ceilings (1s + 2s) cap total sleep at 3s.
+        assert!(
+            elapsed <= Duration::from_secs(3),
+            "elapsed {elapsed:?} exceeds the throttle backoff ceiling sum"
         );
     }
 
@@ -519,7 +512,7 @@ mod tests {
 
     #[test]
     fn throttle_backoff_uses_the_1s_base_and_shares_the_cap() {
-        // The throttle base is 1s (20× the transient base); the same 5s cap.
+        // The throttle base is 1s (10× the transient base); the same 5s cap.
         let b = Backoff::throttle();
         assert_eq!(b.delay(0, 1.0), Duration::from_secs(1));
         assert_eq!(b.delay(1, 1.0), Duration::from_secs(2));
