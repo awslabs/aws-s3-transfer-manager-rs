@@ -131,6 +131,12 @@ pub(crate) enum RetryDecision {
 /// throttle base — and sleeps a full-jittered delay keyed on the 0-based retry
 /// index. Both retry decisions share [`MAX_ATTEMPTS`]; on [`RetryDecision::NoRetry`]
 /// or after the last attempt it returns the error via [`into_error`].
+///
+/// The one-time hedge (the first [`GuardError::DeadlineExceeded`]) does not
+/// consume an attempt: a genuine failure gets the full [`MAX_ATTEMPTS`] whether
+/// or not the operation also hedged, so a speculative cancel never steals a
+/// transport retry. The loop still terminates — at most one exceedance is free
+/// (hedge-once), bounding it to [`MAX_ATTEMPTS`] + 1 iterations.
 pub(crate) async fn retry<T, F, Fut>(
     classify: impl Fn(&GuardError<Error>) -> RetryDecision,
     mut build: F,
@@ -153,22 +159,35 @@ where
         match build(!hedged).await {
             Ok(val) => return Ok(val),
             Err(ge) => {
-                if matches!(ge, GuardError::DeadlineExceeded(_)) {
-                    hedged = true;
-                }
+                let is_hedge = matches!(ge, GuardError::DeadlineExceeded(_));
+                // The one-time hedge does not consume a retry attempt: a genuine
+                // failure still gets the full MAX_ATTEMPTS whether or not the
+                // operation also hedged. "Free" applies only to the first deadline
+                // exceedance (hedge-once); `guarded` runs untimed thereafter, so a
+                // further exceedance should not occur, but if one does it consumes
+                // an attempt so the loop is still bounded (at most MAX_ATTEMPTS + 1
+                // iterations).
+                let free_hedge = is_hedge && !hedged;
                 // Select the backoff by retry reason; both share MAX_ATTEMPTS.
                 let backoff = match classify(&ge) {
                     RetryDecision::NoRetry => return Err(into_error(ge)),
-                    _ if attempt >= MAX_ATTEMPTS => return Err(into_error(ge)),
+                    _ if !free_hedge && attempt >= MAX_ATTEMPTS => return Err(into_error(ge)),
                     RetryDecision::Retry => &transient,
                     RetryDecision::RetryThrottle => &throttle,
                 };
                 // `attempt - 1` is the 0-based retry index: 0 on the first
-                // failure, so the first backoff uses 2^0.
+                // failure, so the first backoff uses 2^0. A free hedge reissues at
+                // the current index without advancing it, so genuine retries keep
+                // their normal backoff progression.
                 // The backoff sleep binds to tokio directly rather than the
                 // runtime's `AsyncSleep`, so the loop requires a tokio reactor.
                 tokio::time::sleep(backoff.delay(attempt - 1, fastrand::f64())).await;
-                attempt += 1;
+                if is_hedge {
+                    hedged = true;
+                }
+                if !free_hedge {
+                    attempt += 1;
+                }
             }
         }
     }
@@ -407,6 +426,10 @@ mod tests {
     async fn deadline_exceeded_is_retried() {
         // A `DeadlineExceeded` (what a composed `guarded` produces on timeout) is
         // a retryable arm; the terminal one renders to an IOError via `into_error`.
+        // The first exceedance is a free hedge (no attempt consumed), so a build
+        // that keeps tripping the deadline runs MAX_ATTEMPTS + 1 times before the
+        // last error surfaces. (A real `guarded` cannot exceed the deadline once
+        // `allow_hedge` is cleared; this build ignores the flag to drive the loop.)
         let attempts = AtomicUsize::new(0);
         let result: Result<(), _> = retry(classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
@@ -416,7 +439,7 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.kind(), &ErrorKind::IOError);
-        assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
+        assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize + 1);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -429,8 +452,10 @@ mod tests {
         let flags = std::sync::Mutex::new(Vec::new());
         let result: Result<(), _> = retry(classify_test, |allow_hedge| {
             flags.lock().unwrap().push(allow_hedge);
-            // Every attempt trips the deadline, so after attempt 1 the loop must
-            // clear the flag.
+            // Every call trips the deadline, so after the first (free) hedge the
+            // loop must clear the flag. The free hedge does not consume an attempt,
+            // so the loop runs MAX_ATTEMPTS + 1 times: one hedge + MAX_ATTEMPTS
+            // untimed attempts.
             async { Err::<(), _>(GuardError::DeadlineExceeded(Duration::from_millis(200))) }
         })
         .await;
@@ -438,8 +463,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             *flags.lock().unwrap(),
-            vec![true, false, false],
-            "hedge allowed on attempt 1 only, then cleared for MAX_ATTEMPTS"
+            vec![true, false, false, false],
+            "hedge allowed on the first call only, then cleared; the free hedge \
+             adds one iteration on top of MAX_ATTEMPTS"
         );
     }
 
@@ -468,6 +494,46 @@ mod tests {
             *flags.lock().unwrap(),
             vec![true, true, true],
             "inner errors are not hedges; the hedge allowance stays open"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn hedge_does_not_consume_a_transport_retry() {
+        // The seq-700 case: a chunk hedges once (deadline exceedance) and then
+        // hits genuine transient-transport failures. The hedge must not steal a
+        // transport attempt — the operation still gets the full MAX_ATTEMPTS
+        // genuine retries after the free hedge, succeeding on the last one.
+        let attempts = AtomicUsize::new(0);
+        let result = retry(classify_test, |allow_hedge| {
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                // Call 0: the one-time hedge (deadline exceedance), free.
+                if n == 0 {
+                    assert!(allow_hedge, "hedge must be allowed on the first call");
+                    return Err(GuardError::DeadlineExceeded(Duration::from_millis(200)));
+                }
+                // Calls 1..MAX_ATTEMPTS: genuine transport failures (untimed).
+                assert!(!allow_hedge, "hedge cleared after the first exceedance");
+                if (n as u32) < MAX_ATTEMPTS {
+                    return Err(GuardError::Inner(Error::new(ErrorKind::IOError, "connect")));
+                }
+                // The MAX_ATTEMPTS-th genuine attempt succeeds.
+                Ok::<_, GuardError<Error>>(7)
+            }
+        })
+        .await;
+
+        assert_eq!(
+            result.unwrap(),
+            7,
+            "the full transport-retry budget survives a hedge"
+        );
+        // 1 free hedge + MAX_ATTEMPTS genuine attempts (last succeeds).
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            MAX_ATTEMPTS as usize + 1,
+            "hedge is free; genuine failures keep the full MAX_ATTEMPTS"
         );
     }
 
