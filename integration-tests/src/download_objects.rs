@@ -17,34 +17,14 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
+use aws_sdk_s3_transfer_manager::types::{FailedTransferPolicy, RuntimeMode};
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
+
+use crate::harness::mock_tm;
 use tokio::time::timeout;
 
 /// Default test timeout.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Setup transfer manager with mock server.
-async fn setup() -> (
-    S3MockServer,
-    s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("build mock server");
-
-    let handle = server.start().await.expect("start mock server");
-    let s3_client = handle.client().await;
-
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    (server, handle, tm)
-}
 
 /// Seed `count` objects into the mock bucket under `prefix`, each `size` bytes.
 /// Objects are named `{prefix}{NNNN}.bin` with distinct per-index byte patterns.
@@ -139,20 +119,20 @@ fn count_files_inner(dir: &Path, count: &mut usize) {
 // ---------------------------------------------------------------------------
 
 /// Seed N small objects, download them all, verify count and disk presence.
-#[tokio::test]
-async fn test_download_objects_many_small_files() {
+async fn test_download_objects_many_small_files(rt: RuntimeMode) {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(rt).await;
 
         let count = 500usize;
         let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
         let bucket = "test-bucket";
         let prefix = "small/";
 
-        seed_bucket(&server, bucket, prefix, count, size).await;
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -167,35 +147,46 @@ async fn test_download_objects_many_small_files() {
         let files_on_disk = count_files(dest.path());
         assert_eq!(count, files_on_disk, "all objects should land on disk");
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_many_small_files timed out");
+}
+
+#[tokio::test]
+async fn test_download_objects_many_small_files_mock_gp() {
+    test_download_objects_many_small_files(RuntimeMode::Managed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_download_objects_many_small_files_tokio_mt() {
+    test_download_objects_many_small_files(RuntimeMode::CurrentTokio).await;
 }
 
 /// Per-file byte-content integrity after download.
 #[tokio::test]
 async fn test_download_objects_flat_content_roundtrip() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let count = 20usize;
         let size = 2 * ByteUnit::Kibibyte.as_bytes_usize();
         let bucket = "test-bucket";
         let prefix = "roundtrip/";
 
-        server.create_bucket(bucket).await.expect("create bucket");
+        m.server.create_bucket(bucket).await.expect("create bucket");
         for i in 0..count {
             let key = format!("{prefix}{i:03}.bin");
             let body = vec![i as u8; size];
-            server
+            m.server
                 .add_object(bucket, &key, body, None)
                 .await
                 .expect("seed object");
         }
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -221,7 +212,7 @@ async fn test_download_objects_flat_content_roundtrip() {
             );
         }
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_flat_content_roundtrip timed out");
@@ -231,7 +222,7 @@ async fn test_download_objects_flat_content_roundtrip() {
 #[tokio::test]
 async fn test_download_objects_nested_prefixes() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let bucket = "test-bucket";
         let prefix = "tree/";
@@ -242,10 +233,11 @@ async fn test_download_objects_nested_prefixes() {
             ("tree/b/inner/deep.txt", b"deep-content"),
             ("tree/c/1/2/3/leaf.bin", b"leaf"),
         ];
-        seed_objects(&server, bucket, objects).await;
+        seed_objects(&m.server, bucket, objects).await;
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -266,17 +258,16 @@ async fn test_download_objects_nested_prefixes() {
         expected.insert("c/1/2/3/leaf.bin", b"leaf".to_vec());
         verify_dir(dest.path(), &expected);
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_nested_prefixes timed out");
 }
 
 /// Objects large enough to trigger multipart download, content verified.
-#[tokio::test]
-async fn test_download_objects_multipart_children() {
+async fn test_download_objects_multipart_children(rt: RuntimeMode) {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(rt).await;
 
         let part = 8 * ByteUnit::Mebibyte.as_bytes_usize();
         let count = 3usize;
@@ -284,19 +275,20 @@ async fn test_download_objects_multipart_children() {
         let bucket = "test-bucket";
         let prefix = "mpu/";
 
-        server.create_bucket(bucket).await.expect("create bucket");
+        m.server.create_bucket(bucket).await.expect("create bucket");
         for i in 0..count {
             let key = format!("{prefix}{i:04}.bin");
             // Deterministic content pattern (byte index mod 256).
             let body: Vec<u8> = (0..size).map(|b| (b % 256) as u8).collect();
-            server
+            m.server
                 .add_object(bucket, &key, body, None)
                 .await
                 .expect("seed object");
         }
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -327,23 +319,34 @@ async fn test_download_objects_multipart_children() {
             assert_eq!(got, expected_body, "content mismatch for {:04}.bin", i);
         }
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_multipart_children timed out");
+}
+
+#[tokio::test]
+async fn test_download_objects_multipart_children_mock_gp() {
+    test_download_objects_multipart_children(RuntimeMode::Managed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_download_objects_multipart_children_tokio_mt() {
+    test_download_objects_multipart_children(RuntimeMode::CurrentTokio).await;
 }
 
 /// Empty prefix yields zero downloads with no error.
 #[tokio::test]
 async fn test_download_objects_empty_prefix() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let bucket = "test-bucket";
-        server.create_bucket(bucket).await.expect("create bucket");
+        m.server.create_bucket(bucket).await.expect("create bucket");
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -363,7 +366,7 @@ async fn test_download_objects_empty_prefix() {
         let files_on_disk = count_files(dest.path());
         assert_eq!(0, files_on_disk);
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_empty_prefix timed out");
@@ -375,11 +378,11 @@ async fn test_download_objects_empty_prefix() {
 #[tokio::test]
 async fn test_download_objects_deep_wide_tree() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let bucket = "test-bucket";
         let root_prefix = "deep/";
-        server.create_bucket(bucket).await.expect("create bucket");
+        m.server.create_bucket(bucket).await.expect("create bucket");
 
         let mut expected_count = 0u64;
 
@@ -388,7 +391,7 @@ async fn test_download_objects_deep_wide_tree() {
         while let Some((pfx, depth)) = prefixes_to_seed.pop() {
             for i in 0..2usize {
                 let key = format!("{pfx}f{i}.bin");
-                server
+                m.server
                     .add_object(bucket, &key, vec![0u8; 64], None)
                     .await
                     .expect("seed");
@@ -403,7 +406,8 @@ async fn test_download_objects_deep_wide_tree() {
         }
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -418,7 +422,7 @@ async fn test_download_objects_deep_wide_tree() {
         let files_on_disk = count_files(dest.path());
         assert_eq!(expected_count as usize, files_on_disk);
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_deep_wide_tree timed out");
@@ -428,17 +432,17 @@ async fn test_download_objects_deep_wide_tree() {
 #[tokio::test]
 async fn test_download_objects_abort_terminates() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let count = 200usize;
         let size = 1024usize;
         let bucket = "test-bucket";
         let prefix = "abort/";
 
-        seed_bucket(&server, bucket, prefix, count, size).await;
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
 
         // Inject faults on the first key so the download hangs/fails if not aborted.
-        server.insert_fault(
+        m.server.insert_fault(
             bucket,
             &format!("{prefix}0000.bin"),
             FaultType::ServiceError { status: 503 },
@@ -447,7 +451,8 @@ async fn test_download_objects_abort_terminates() {
         );
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -465,7 +470,7 @@ async fn test_download_objects_abort_terminates() {
             "expected error due to faulted key under Abort policy"
         );
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_abort_terminates timed out");
@@ -478,22 +483,22 @@ async fn test_download_objects_abort_terminates() {
 /// Seed enough objects to force ListObjectsV2 pagination, verify all objects
 /// across pages are discovered and downloaded. Uses `S3Walker::builder().page_size()`
 /// to force a small page size rather than seeding >1000 objects.
-#[tokio::test]
-async fn test_download_objects_listing_pagination() {
+async fn test_download_objects_listing_pagination(rt: RuntimeMode) {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(rt).await;
 
         let count = 50usize;
         let size = 128usize;
         let bucket = "test-bucket";
         let prefix = "paginated/";
 
-        seed_bucket(&server, bucket, prefix, count, size).await;
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
 
         let dest = tempfile::tempdir().expect("tempdir");
         // Force page_size=5 so that 50 objects require 10 list pages.
         let walker = S3Walker::builder().page_size(5).build();
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -517,10 +522,20 @@ async fn test_download_objects_listing_pagination() {
         let got = std::fs::read(&sample_path).expect("read sample file");
         assert_eq!(got, vec![25u8; size], "sample content should match");
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_listing_pagination timed out");
+}
+
+#[tokio::test]
+async fn test_download_objects_listing_pagination_mock_gp() {
+    test_download_objects_listing_pagination(RuntimeMode::Managed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_download_objects_listing_pagination_tokio_mt() {
+    test_download_objects_listing_pagination(RuntimeMode::CurrentTokio).await;
 }
 
 /// FailedTransferPolicy::Continue with one faulted key: the other objects
@@ -528,23 +543,23 @@ async fn test_download_objects_listing_pagination() {
 #[tokio::test]
 async fn test_download_objects_continue_policy_partial_failure() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let bucket = "test-bucket";
         let prefix = "partial/";
         let good_count = 10usize;
         let size = 512usize;
 
-        seed_bucket(&server, bucket, prefix, good_count, size).await;
+        seed_bucket(&m.server, bucket, prefix, good_count, size).await;
         // Add one extra object that will be faulted.
         let bad_key = format!("{prefix}bad.bin");
-        server
+        m.server
             .add_object(bucket, &bad_key, vec![0xFFu8; size], None)
             .await
             .expect("seed bad object");
 
         // Inject a permanent service error on the bad key.
-        server.insert_fault(
+        m.server.insert_fault(
             bucket,
             &bad_key,
             FaultType::ServiceError { status: 500 },
@@ -553,7 +568,8 @@ async fn test_download_objects_continue_policy_partial_failure() {
         );
 
         let dest = tempfile::tempdir().expect("tempdir");
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
@@ -582,7 +598,7 @@ async fn test_download_objects_continue_policy_partial_failure() {
         let files_on_disk = count_files(dest.path());
         assert_eq!(good_count, files_on_disk);
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_continue_policy_partial_failure timed out");
@@ -595,7 +611,7 @@ async fn test_download_objects_continue_policy_partial_failure() {
 #[tokio::test]
 async fn test_download_objects_key_path_safety() {
     timeout(TEST_TIMEOUT, async {
-        let (server, server_handle, tm) = setup().await;
+        let m = mock_tm(RuntimeMode::Managed).await;
 
         let bucket = "test-bucket";
         let prefix = "safe/";
@@ -606,13 +622,14 @@ async fn test_download_objects_key_path_safety() {
             ("safe/../../etc/passwd", b"escape-attempt-2"),
             ("safe/sub/../../other.bin", b"escape-attempt-3"),
         ];
-        seed_objects(&server, bucket, objects).await;
+        seed_objects(&m.server, bucket, objects).await;
 
         let dest = tempfile::tempdir().expect("tempdir");
         let dest_path = dest.path().to_path_buf();
 
         // Use Continue policy so we can inspect which keys failed vs succeeded.
-        let handle = tm
+        let handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(&dest_path)
@@ -661,7 +678,7 @@ async fn test_download_objects_key_path_safety() {
             "at least the safe object should download"
         );
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_key_path_safety timed out");
@@ -673,10 +690,9 @@ async fn test_download_objects_key_path_safety() {
 
 /// Build a nested directory tree, upload it, download it to a fresh dir,
 /// and assert the two trees are byte-identical.
-#[tokio::test]
-async fn test_upload_then_download_objects_roundtrip() {
+async fn test_upload_then_download_objects_roundtrip(rt: RuntimeMode) {
     timeout(Duration::from_secs(120), async {
-        let (_server, server_handle, tm) = setup().await;
+        let m = mock_tm(rt).await;
 
         let bucket = "test-bucket";
         let prefix = "rt/";
@@ -701,7 +717,8 @@ async fn test_upload_then_download_objects_roundtrip() {
 
         // Upload the directory tree.
         use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
-        let upload_handle = tm
+        let upload_handle = m
+            .client
             .upload_objects()
             .bucket(bucket)
             .source(src_dir.path())
@@ -716,7 +733,8 @@ async fn test_upload_then_download_objects_roundtrip() {
 
         // Download to a fresh directory.
         let dest_dir = tempfile::tempdir().expect("tempdir");
-        let download_handle = tm
+        let download_handle = m
+            .client
             .download_objects()
             .bucket(bucket)
             .destination(dest_dir.path())
@@ -731,8 +749,18 @@ async fn test_upload_then_download_objects_roundtrip() {
         // Verify the downloaded tree matches the source tree exactly.
         verify_dir(dest_dir.path(), &expected_content);
 
-        server_handle.shutdown().await.expect("shutdown");
+        m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_upload_then_download_objects_roundtrip timed out");
+}
+
+#[tokio::test]
+async fn test_upload_then_download_objects_roundtrip_mock_gp() {
+    test_upload_then_download_objects_roundtrip(RuntimeMode::Managed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
+    test_upload_then_download_objects_roundtrip(RuntimeMode::CurrentTokio).await;
 }
