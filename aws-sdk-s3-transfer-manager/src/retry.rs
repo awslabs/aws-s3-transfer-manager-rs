@@ -116,12 +116,16 @@ pub(crate) enum RetryDecision {
 /// Retry an operation up to [`MAX_ATTEMPTS`] times, deciding each failure via
 /// `classify` and backing off per `backoff`.
 ///
-/// Each attempt calls `build()` for a fresh future; `build` must produce an
-/// identical request each call so a retry re-sends/re-reads the same data. Any
-/// latency deadline is composed inside `build` (via
-/// [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded))
-/// and surfaces as [`GuardError::DeadlineExceeded`]; other errors surface as
-/// [`GuardError::Inner`]. `classify` decides per failure; the loop owns the
+/// Each attempt calls `build(allow_hedge)` for a fresh future; `build` must
+/// produce an identical request each call so a retry re-sends/re-reads the same
+/// data. Any latency deadline is composed inside `build` (via
+/// [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded),
+/// which arms only when `allow_hedge` is set) and surfaces as
+/// [`GuardError::DeadlineExceeded`]; other errors surface as
+/// [`GuardError::Inner`]. `allow_hedge` is `false` after the first deadline
+/// exceedance (hedge-once), so a build with no deadline can ignore the flag.
+///
+/// `classify` decides per failure; the loop owns the
 /// schedule, selecting the [`Backoff`] by decision — [`RetryDecision::Retry`]
 /// uses the fast transient base, [`RetryDecision::RetryThrottle`] the hard
 /// throttle base — and sleeps a full-jittered delay keyed on the 0-based retry
@@ -132,16 +136,26 @@ pub(crate) async fn retry<T, F, Fut>(
     mut build: F,
 ) -> Result<T, Error>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(bool) -> Fut,
     Fut: Future<Output = Result<T, GuardError<Error>>>,
 {
     let transient = Backoff::transient();
     let throttle = Backoff::throttle();
     let mut attempt = 1u32;
+    // Hedge at most once per operation: the first deadline exceedance cancels and
+    // re-issues (the hedge), but a second would mean speculatively cancelling a
+    // path already shown to be slow — so once hedged, later attempts run untimed
+    // (via `allow_hedge = false`) and ride to completion. This bounds a single
+    // operation's deadline-driven cancels to one, so no operation can exhaust its
+    // attempt budget on the deadline; the budget bounds aggregate speculation.
+    let mut hedged = false;
     loop {
-        match build().await {
+        match build(!hedged).await {
             Ok(val) => return Ok(val),
             Err(ge) => {
+                if matches!(ge, GuardError::DeadlineExceeded(_)) {
+                    hedged = true;
+                }
                 // Select the backoff by retry reason; both share MAX_ATTEMPTS.
                 let backoff = match classify(&ge) {
                     RetryDecision::NoRetry => return Err(into_error(ge)),
@@ -353,7 +367,7 @@ mod tests {
     async fn retries_then_succeeds() {
         // First attempt fails retryably (IOError), second succeeds.
         let attempts = AtomicUsize::new(0);
-        let result = retry(classify_test, || {
+        let result = retry(classify_test, |_| {
             let n = attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 if n == 0 {
@@ -374,7 +388,7 @@ mod tests {
         // A `DeadlineExceeded` (what a composed `guarded` produces on timeout) is
         // a retryable arm; the terminal one renders to an IOError via `into_error`.
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, || {
+        let result: Result<(), _> = retry(classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async { Err::<(), _>(GuardError::DeadlineExceeded(Duration::from_millis(200))) }
         })
@@ -387,9 +401,61 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
+    async fn hedge_allowed_only_until_first_deadline_exceedance() {
+        // hedge-once: the loop passes `allow_hedge = true` until a
+        // `DeadlineExceeded` fires, then `false` for every later attempt — so a
+        // chunk is speculatively cancelled at most once and later attempts run
+        // untimed. Record the flag each attempt.
+        let flags = std::sync::Mutex::new(Vec::new());
+        let result: Result<(), _> = retry(classify_test, |allow_hedge| {
+            flags.lock().unwrap().push(allow_hedge);
+            // Every attempt trips the deadline, so after attempt 1 the loop must
+            // clear the flag.
+            async { Err::<(), _>(GuardError::DeadlineExceeded(Duration::from_millis(200))) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *flags.lock().unwrap(),
+            vec![true, false, false],
+            "hedge allowed on attempt 1 only, then cleared for MAX_ATTEMPTS"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn non_deadline_failures_do_not_clear_the_hedge_flag() {
+        // Only a `DeadlineExceeded` is a hedge; a transient inner error must not
+        // consume the once-per-operation hedge allowance.
+        let flags = std::sync::Mutex::new(Vec::new());
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry(classify_test, |allow_hedge| {
+            flags.lock().unwrap().push(allow_hedge);
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                // Two inner IO errors (not hedges), then succeed.
+                if n < 2 {
+                    return Err(GuardError::Inner(Error::new(ErrorKind::IOError, "reset")));
+                }
+                Ok::<(), GuardError<Error>>(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *flags.lock().unwrap(),
+            vec![true, true, true],
+            "inner errors are not hedges; the hedge allowance stays open"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
     async fn exhausts_attempts_on_persistent_retryable_error() {
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, || {
+        let result: Result<(), _> = retry(classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async { Err::<(), _>(GuardError::Inner(Error::new(ErrorKind::IOError, "reset"))) }
         })
@@ -403,7 +469,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn does_not_retry_terminal_inner_error() {
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, || {
+        let result: Result<(), _> = retry(classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async {
                 Err::<(), _>(GuardError::Inner(Error::new(
@@ -441,7 +507,7 @@ mod tests {
 
         let attempts = AtomicUsize::new(0);
         let start = tokio::time::Instant::now();
-        let result: Result<(), _> = retry(classify_throttle, || {
+        let result: Result<(), _> = retry(classify_throttle, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async { Err::<(), _>(GuardError::Inner(Error::test_service_error("SlowDown"))) }
         })

@@ -421,7 +421,7 @@ impl UploadTransfer {
         // bounds a mid-upload-body stall; a response that never arrives after the
         // body is fully sent is not bounded here (see the module docs on the
         // response-first-byte gap).
-        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, || {
+        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, |_hedge| {
             let req = copy_fields_to_upload_part_request(
                 &self.inner.request,
                 self.inner
@@ -566,7 +566,7 @@ impl UploadTransfer {
         // No adaptive latency deadline; a mid-upload-body stall is bounded by
         // stalled-stream protection (`upload_override`), a post-send response-wait
         // is not (see the module docs on the response-first-byte gap).
-        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, || {
+        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, |_hedge| {
             let body = sdk_body
                 .try_clone()
                 .expect("PutObject SdkBody must be retryable");

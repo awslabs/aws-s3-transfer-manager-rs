@@ -715,7 +715,7 @@ impl DownloadTransfer {
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
         // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
         // goes through `guarded`, which times and records its TTFB.
-        let result = crate::retry::retry(crate::retry::classify_body_retry, || {
+        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();
@@ -752,7 +752,7 @@ impl DownloadTransfer {
                             )));
                         }
                         recv_latencies
-                            .guarded(async {
+                            .guarded(allow_hedge, async {
                                 req.send()
                                     .await
                                     .map(|resp| resp.body)
@@ -880,7 +880,7 @@ impl DownloadTransfer {
         // stream is caught by stalled-stream protection. A `GuardError`
         // (deadline timeout OR inner error from either phase) is classified by
         // the retry loop.
-        let result = crate::retry::retry(crate::retry::classify_body_retry, || {
+        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
             let rh = range_header.clone();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();
@@ -901,7 +901,7 @@ impl DownloadTransfer {
                 // so a mismatch is classified before we commit to the body read.
                 let rh_validate = rh.clone();
                 let resp = recv_latencies
-                    .guarded(async move {
+                    .guarded(allow_hedge, async move {
                         let resp = req.send().await.map_err(crate::error::Error::from)?;
                         validate_content_range(&rh_validate, resp.content_range())?;
                         Ok::<_, crate::error::Error>(resp)

@@ -57,6 +57,25 @@ const ESCAPE_US: f64 = 5_000_000.0;
 /// Deadline increment at the moderate timeout-rate tier (> 0.1% of completions).
 const MODERATE_BUMP_US: f64 = 100_000.0;
 
+/// Hedge budget: tokens a hedge (a deadline-driven cancel-and-reissue) costs.
+/// The unit; only [`HEDGE_REWARD`]/`HEDGE_COST` and [`HEDGE_CAPACITY`] carry meaning.
+const HEDGE_COST: f64 = 1.0;
+
+/// Hedge budget: tokens a successful request returns. `reward/(reward+cost)` is
+/// the sustainable hedge fraction — 0.05/1.05 ≈ 4.8%, matching *The Tail at
+/// Scale*'s ~5% speculative-load bound. Normal tail-hedging (candidacy at
+/// `estimate + offset` ≈ p99+, so ~1% of requests) fits under it and the budget
+/// stays full; a sustained candidate rate above it (a broad slowdown) drains the
+/// budget faster than successes refill it, halting hedging — the give-up.
+const HEDGE_REWARD: f64 = 0.05;
+
+/// Hedge budget: maximum tokens. Burst depth is `capacity/cost` simultaneous
+/// hedges from full; empty→full takes `capacity/reward` successes. A fixed
+/// absolute cap self-scales — a larger concurrent fleet drains it faster,
+/// giving up sooner, which is the safe direction. Bounds aggregate speculative
+/// reissues in flight; per-request correctness is the separate hedge-once rule.
+const HEDGE_CAPACITY: f64 = 10.0;
+
 /// Deadline increment at the high timeout-rate tier (> 1% of completions).
 const HIGH_BUMP_US: f64 = 1_000_000.0;
 
@@ -166,6 +185,10 @@ struct DeadlineController {
     rate_failed: u64,
     /// Lifetime timeout count; not read by the control loop (Debug + tests).
     lifetime_timeouts: u64,
+    /// Hedge budget tokens, `[0, HEDGE_CAPACITY]`. A success rewards, a hedge
+    /// costs, and a hedge is only armed while at least one token is available —
+    /// so a broad slowdown drains it and stops speculative reissues. Starts full.
+    hedge_tokens: f64,
 }
 
 impl DeadlineController {
@@ -179,12 +202,23 @@ impl DeadlineController {
             rate_completed: 0,
             rate_failed: 0,
             lifetime_timeouts: 0,
+            hedge_tokens: HEDGE_CAPACITY,
         }
     }
 
     /// The current deadline, or `None` when cold or escaped.
     fn deadline(&self) -> Option<Duration> {
         self.deadline_us.map(|us| Duration::from_micros(us as u64))
+    }
+
+    /// Whether the hedge budget can afford one hedge.
+    fn can_hedge(&self) -> bool {
+        self.hedge_tokens >= HEDGE_COST
+    }
+
+    /// Charge one hedge against the budget (a deadline-driven cancel fired).
+    fn charge_hedge(&mut self) {
+        self.hedge_tokens = (self.hedge_tokens - HEDGE_COST).max(0.0);
     }
 
     /// Fold a successful request's latency in: age the mean, advance the rate
@@ -195,6 +229,10 @@ impl DeadlineController {
         let mean = self.mean_ttfb.observe(sample_us);
         self.successes += 1;
         self.record_completion();
+        // A success replenishes the hedge budget (capped). Tying replenishment to
+        // success — not the clock — is what makes the budget dry up under a broad
+        // slowdown, halting speculation exactly when it stops paying off.
+        self.hedge_tokens = (self.hedge_tokens + HEDGE_REWARD).min(HEDGE_CAPACITY);
 
         // Warmup: buffer the sample and arm nothing.
         if self.successes < WARM_THRESHOLD {
@@ -343,9 +381,25 @@ impl LatencyTracker {
     }
 
     /// Record a timed-out request. `issued` is the deadline the attempt ran
-    /// under, used to gate tier bumps against concurrent stragglers.
+    /// under, used to gate tier bumps against concurrent stragglers. Test-only:
+    /// production times out through [`guarded`](Self::guarded), which charges the
+    /// hedge budget and records the timeout together.
+    #[cfg(test)]
     pub(crate) fn record_timeout(&self, issued: Duration) {
         self.controller.lock().unwrap().record_timeout(issued);
+    }
+
+    /// The deadline to arm this attempt with: the current deadline if one is
+    /// armed AND a hedge is both allowed for this request and affordable from the
+    /// budget; otherwise `None` (run untimed). Does not charge — the budget is
+    /// charged only when a hedge actually fires (a timeout), since an armed
+    /// request that succeeds issued no reissue and cost S3 nothing.
+    fn hedge_deadline(&self, allow_hedge: bool) -> Option<Duration> {
+        if !allow_hedge {
+            return None;
+        }
+        let c = self.controller.lock().unwrap();
+        c.can_hedge().then(|| c.deadline()).flatten()
     }
 
     /// Number of recorded timeouts over the tracker's lifetime. Test-only.
@@ -354,28 +408,38 @@ impl LatencyTracker {
         self.controller.lock().unwrap().lifetime_timeouts
     }
 
-    /// The current adaptive deadline, or `None` when cold or escaped.
+    /// The current adaptive deadline, or `None` when cold or escaped. Test-only:
+    /// production consults the deadline through [`hedge_deadline`](Self::hedge_deadline).
+    #[cfg(test)]
     fn deadline(&self) -> Option<Duration> {
         self.controller.lock().unwrap().deadline()
     }
 
-    /// Run `fut` once under the adaptive deadline.
+    /// Run `fut` once, hedging it against the adaptive deadline when affordable.
     ///
-    /// On success records the latency (warming the controller) and returns the
-    /// value. When cold (no deadline) runs without a timeout, so the only
-    /// failure is the inner error. When warm, races `fut` against the deadline:
-    /// if it elapses, the in-flight future is dropped, a timeout is recorded
-    /// against the issued deadline, and [`GuardError::DeadlineExceeded`] carries
-    /// the deadline that was exceeded.
+    /// A hedge (cancel-and-reissue on deadline exceedance) is armed only when
+    /// `allow_hedge` is set, the controller is warm, and the hedge budget can
+    /// afford one — otherwise `fut` runs untimed and can only fail with its inner
+    /// error. `allow_hedge` is the caller's per-request gate (the retry loop
+    /// clears it after a chunk has already hedged once); the budget is the
+    /// client-wide aggregate gate.
     ///
-    /// A single attempt: the inner error is returned verbatim as
-    /// [`GuardError::Inner`]. Retry and classification live in [`crate::retry`].
-    pub(crate) async fn guarded<T, E, Fut>(&self, fut: Fut) -> Result<T, GuardError<E>>
+    /// On success records the latency (warming the controller and replenishing
+    /// the budget). When armed and the deadline elapses, the in-flight future is
+    /// dropped, the budget is charged, a timeout is recorded against the issued
+    /// deadline, and [`GuardError::DeadlineExceeded`] carries it. A single
+    /// attempt: the inner error is returned verbatim as [`GuardError::Inner`].
+    /// Retry and classification live in [`crate::retry`].
+    pub(crate) async fn guarded<T, E, Fut>(
+        &self,
+        allow_hedge: bool,
+        fut: Fut,
+    ) -> Result<T, GuardError<E>>
     where
         Fut: Future<Output = Result<T, E>>,
     {
         let start = Instant::now();
-        match self.deadline() {
+        match self.hedge_deadline(allow_hedge) {
             None => match fut.await {
                 Ok(val) => {
                     self.record(start.elapsed());
@@ -390,7 +454,12 @@ impl LatencyTracker {
                 }
                 Ok(Err(e)) => Err(GuardError::Inner(e)),
                 Err(_timeout) => {
-                    self.record_timeout(dl);
+                    // A hedge fired: charge the budget and record the timeout.
+                    {
+                        let mut c = self.controller.lock().unwrap();
+                        c.charge_hedge();
+                        c.record_timeout(dl);
+                    }
                     tracing::debug!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         deadline_ms = dl.as_millis() as u64,
@@ -946,6 +1015,66 @@ mod tests {
         );
     }
 
+    // --- hedge budget ---------------------------------------------------------
+
+    #[test]
+    fn hedge_budget_starts_full_and_caps_at_capacity() {
+        let mut c = DeadlineController::new();
+        assert_eq!(c.hedge_tokens, HEDGE_CAPACITY, "starts full");
+        // Successes cannot push the budget above capacity.
+        warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD + 50);
+        assert!(
+            c.hedge_tokens <= HEDGE_CAPACITY,
+            "reward must not exceed capacity, got {}",
+            c.hedge_tokens
+        );
+    }
+
+    #[test]
+    fn sustained_hedging_drains_the_budget_despite_successes() {
+        // The setpoint: above a candidate fraction of reward/(reward+cost) the
+        // budget drains even with successes interleaved — the property the
+        // value-based escape lacked. Model a run where a fixed fraction hedges.
+        let mut c = DeadlineController::new();
+        warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
+        let start = c.hedge_tokens;
+
+        // 20 hedges against 100 successes = 20% candidate rate, far above the
+        // ~4.8% setpoint: net drain. (charge_hedge is what a fired hedge calls.)
+        for _ in 0..100 {
+            c.record_success(Duration::from_millis(100));
+        }
+        for _ in 0..20 {
+            c.charge_hedge();
+        }
+        assert!(
+            c.hedge_tokens < start,
+            "a candidate rate above the setpoint must net-drain the budget: \
+             start {start}, got {}",
+            c.hedge_tokens
+        );
+    }
+
+    #[test]
+    fn drained_budget_cannot_afford_a_hedge_until_successes_refill() {
+        let mut c = DeadlineController::new();
+        warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
+        // Drain below one token.
+        for _ in 0..(HEDGE_CAPACITY as u32 + 1) {
+            c.charge_hedge();
+        }
+        assert!(!c.can_hedge(), "a drained budget cannot afford a hedge");
+
+        // Reward is fractional, so it takes many successes to re-afford one hedge.
+        let needed = (HEDGE_COST / HEDGE_REWARD).ceil() as u32;
+        for _ in 0..needed - 1 {
+            c.record_success(Duration::from_millis(100));
+        }
+        assert!(!c.can_hedge(), "one token needs ~cost/reward successes");
+        c.record_success(Duration::from_millis(100));
+        assert!(c.can_hedge(), "enough successes re-afford a hedge");
+    }
+
     // --- guarded() integration ------------------------------------------------
 
     #[cfg_attr(miri, ignore)]
@@ -956,7 +1085,7 @@ mod tests {
 
         // 100ms would exceed a warm deadline, but cold applies none.
         let result = tracker
-            .guarded(async {
+            .guarded(true, async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok::<_, crate::error::Error>(42)
             })
@@ -977,7 +1106,7 @@ mod tests {
         assert_eq!(tracker.deadline(), None, "precondition: one sample short");
 
         let result = tracker
-            .guarded(async { Ok::<_, crate::error::Error>(42) })
+            .guarded(true, async { Ok::<_, crate::error::Error>(42) })
             .await;
         assert!(matches!(result, Ok(42)));
         assert!(
@@ -995,7 +1124,7 @@ mod tests {
             tracker.record(Duration::from_millis(100));
         }
         let result: Result<(), _> = tracker
-            .guarded(async {
+            .guarded(true, async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok::<_, crate::error::Error>(())
             })
@@ -1006,10 +1135,59 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
+    async fn guarded_disallowed_hedge_runs_untimed() {
+        // A warm tracker whose deadline would trip: with `allow_hedge = false`
+        // (the retry loop's hedge-once gate after a prior hedge) the request runs
+        // untimed and completes instead of being cancelled.
+        let tracker = LatencyTracker::new();
+        for _ in 0..WARM_THRESHOLD {
+            tracker.record(Duration::from_millis(100));
+        }
+        let result = tracker
+            .guarded(false, async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<_, crate::error::Error>(7)
+            })
+            .await;
+        assert!(matches!(result, Ok(7)), "disallowed hedge must run untimed");
+        assert_eq!(tracker.timeout_count(), 0, "no hedge, no timeout");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn guarded_drained_budget_runs_untimed() {
+        // A warm tracker whose deadline would trip, but the hedge budget is
+        // drained: even with `allow_hedge = true` the request runs untimed. This
+        // is the aggregate cap — under a broad slowdown the budget empties and
+        // further candidates ride to completion instead of being cancelled.
+        let tracker = LatencyTracker::new();
+        for _ in 0..WARM_THRESHOLD {
+            tracker.record(Duration::from_millis(100));
+        }
+        // Drain the budget below one token.
+        {
+            let mut c = tracker.controller.lock().unwrap();
+            for _ in 0..(HEDGE_CAPACITY as u32 + 1) {
+                c.charge_hedge();
+            }
+            assert!(!c.can_hedge(), "precondition: drained");
+        }
+        let result = tracker
+            .guarded(true, async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<_, crate::error::Error>(9)
+            })
+            .await;
+        assert!(matches!(result, Ok(9)), "drained budget must run untimed");
+        assert_eq!(tracker.timeout_count(), 0, "no hedge, no timeout");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
     async fn guarded_inner_error_passed_through() {
         let tracker = LatencyTracker::new();
         let result: Result<(), _> = tracker
-            .guarded(async {
+            .guarded(true, async {
                 Err::<(), _>(crate::error::Error::new(
                     crate::error::ErrorKind::RuntimeError,
                     "simulated SDK error",
@@ -1035,7 +1213,7 @@ mod tests {
 
         // Resolves immediately with an error — well within the ~800ms deadline.
         let result: Result<(), _> = tracker
-            .guarded(async {
+            .guarded(true, async {
                 Err::<(), _>(crate::error::Error::new(
                     crate::error::ErrorKind::RuntimeError,
                     "simulated SDK error",

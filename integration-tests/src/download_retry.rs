@@ -292,26 +292,25 @@ const WARMUP_COUNT: usize = 4;
 const SLOW_PIECE_BYTES: u64 = 256 * 1024;
 
 /// Delay before each piece after the first. Fifteen gaps at 300 ms is ~4.5 s of
-/// body delivery — longer than the deadline can reach across three attempts
-/// (seeded near the offset, widened at most twice before the budget exhausts),
-/// so a body-timing regression trips every attempt. Each gap is well under the
-/// 2 s stalled-stream-protection grace, and throughput stays positive, so SSP
+/// body delivery — far longer than the armed deadline, so the whole span is a
+/// meaningful test of the untimed body path. Each gap is well under the 2 s
+/// stalled-stream-protection grace, and throughput stays positive, so SSP
 /// (zero-throughput only) never fires on the healthy stream.
 const SLOW_PIECE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// A slow-but-progressing body must not trip the latency deadline: the deadline
-/// guards only the GET send (TTFB), the body read is untimed. Warm the tracker
-/// past its threshold on fast chunks so a sub-second deadline is armed, then
-/// serve a single range chunk whose body streams slowly (~4.5 s) but never
-/// stalls. The download succeeds because the untimed body outlives the deadline.
+/// A slow-but-progressing body download completes rather than hanging or
+/// aborting. Warm the tracker past its threshold on fast chunks so a deadline is
+/// armed, then serve a range chunk whose body streams slowly (~4.5 s) but never
+/// stalls; the download must finish with correct bytes.
 ///
-/// Fails if the body read is folded back under `guarded()`: the body then
-/// exceeds the deadline on every attempt, exhausts the retry budget, and the
-/// lone chunk aborts the download. A single range chunk bounds the deadline's
-/// per-timeout widening to the attempt budget, so the widened deadline cannot
-/// climb past the body time and let a mutated build pass.
+/// End-to-end guard against the workload regressing to a hang or abort. That the
+/// body read is untimed (only the GET send is deadline-guarded) is structural —
+/// the read runs after `guarded` returns — so it needs no behavioral test; and
+/// hedge-once independently bounds any single chunk to one deadline-driven
+/// cancel, so even a mistimed body could not abort the transfer. This exercises
+/// the composed path against a real slow stream.
 #[tokio::test]
-async fn slow_progressing_body_does_not_trip_deadline() {
+async fn slow_progressing_body_download_completes() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
 
     // Warm the latency tracker so the adaptive deadline is armed. Each
