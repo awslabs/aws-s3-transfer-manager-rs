@@ -73,9 +73,7 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          # TEMPORARY: ubuntu removed while debugging the windows/macos large-object
-          # latency-deadline failure; restore before merge.
-          # - ubuntu-24.04
+          - ubuntu-24.04
           - windows-2022
           - macos-14
     needs: basics
@@ -103,20 +101,9 @@ jobs:
           cargo test --doc --workspace --no-fail-fast
 
       - name: test s3-transfer-manager e2e
-        # --nocapture surfaces the transfer manager's diagnostic tracing (the
-        # harness installs a curated-filter subscriber for real-S3 runs) so an
-        # e2e failure is debuggable from its own CI log. Override the filter with
-        # RUST_LOG here when a run needs a different level or target.
-        #
-        # TEMPORARY (diagnostic): widen RUST_LOG to the SDK's own timing spans so
-        # we can tell whether a large-object latency-deadline abort is genuine
-        # send()/TTFB latency or executor-scheduling delay on the managed runtime.
-        # Revert to the harness default filter before merge.
-        env:
-          RUST_LOG: "info,aws_sdk_s3_transfer_manager::concurrency=debug,aws_sdk_s3_transfer_manager::scheduling=debug,aws_sdk_s3_transfer_manager::transfer=debug,aws_smithy_runtime=debug,aws_smithy_runtime::client::orchestrator=trace"
         run: |
           RUSTFLAGS="--cfg e2e_test" cargo test --test e2e_transfer_test
-          RUSTFLAGS="--cfg e2e_test" cargo test -p integration-tests -- --nocapture
+          RUSTFLAGS="--cfg e2e_test" cargo test -p integration-tests
 
   fmt:
     name: fmt
