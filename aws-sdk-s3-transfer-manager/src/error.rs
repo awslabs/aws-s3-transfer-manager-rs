@@ -17,6 +17,8 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartError;
 use aws_sdk_s3::operation::RequestIdExt;
 use aws_sdk_s3::types::ChecksumAlgorithm;
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_types::retry::ErrorKind as RetryErrorKind;
 use aws_types::request_id::RequestId;
 
 use crate::types::{FailedDownload, FailedUpload};
@@ -518,21 +520,55 @@ where
     }
 }
 
+/// Whether a single [`ConnectorError`] frame denotes a transient transport
+/// failure: an IO error, a client-side timeout, or one the http client tagged
+/// [`RetryErrorKind::TransientError`] (an incomplete/truncated response, TLS
+/// negotiation timeout, and similar). A bare `Other(None)` connector error
+/// carries no marker and is not transient on its own.
+fn connector_error_is_transient(conn: &ConnectorError) -> bool {
+    conn.is_io() || conn.is_timeout() || conn.as_other() == Some(RetryErrorKind::TransientError)
+}
+
 /// Whether an `SdkError` is a transient transport failure — a connection-level
-/// IO error or a client-side timeout — rather than a service response. Mirrors
-/// the predicate in the SDK's own `TransientErrorClassifier`
-/// (`is_io() || is_timeout()` on the connector error), captured here because the
+/// IO error, a client-side timeout, or a connector error the http client tagged
+/// [`RetryErrorKind::TransientError`] (e.g. an incomplete/truncated HTTP
+/// response) — rather than a service response. Captured here because the
 /// flattening into [`ErrorKind::ServiceError`] erases the `SdkError` variant.
+///
+/// Walks the error source chain rather than inspecting only the outermost
+/// [`ConnectorError`]. A nested dispatch can re-wrap a fully-classified inner
+/// connector error inside an outer `ConnectorError::Other(None)`, which carries
+/// no transient marker; the SDK's own `TransientErrorClassifier` inspects only
+/// that outer frame and misclassifies the error as non-retryable. Scanning every
+/// `ConnectorError` in the chain recovers the inner classification.
 ///
 /// Deliberately excludes service responses: a 503 `SlowDown` arrives as a
 /// `ServiceError`, not a `DispatchFailure`, so throttling is never classified
 /// transient here (see `retry::classify_upload_part_retry` for why that matters).
 fn is_sdk_transient_transport<E, R>(e: &SdkError<E, R>) -> bool {
-    match e {
-        SdkError::TimeoutError(_) => true,
-        SdkError::DispatchFailure(df) => df.is_io() || df.is_timeout(),
-        _ => false,
+    if let SdkError::TimeoutError(_) = e {
+        return true;
     }
+    // A DispatchFailure carries a ConnectorError; scan it and every nested
+    // ConnectorError in the source chain for a transient classification.
+    let conn = match e {
+        SdkError::DispatchFailure(df) => df.as_connector_error(),
+        _ => return false,
+    };
+    let Some(conn) = conn else { return false };
+    if connector_error_is_transient(conn) {
+        return true;
+    }
+    let mut source = std::error::Error::source(conn);
+    while let Some(err) = source {
+        if let Some(conn) = err.downcast_ref::<ConnectorError>() {
+            if connector_error_is_transient(conn) {
+                return true;
+            }
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Converts an `SdkError` into a [`ErrorKind::ServiceError`], capturing the
@@ -755,5 +791,65 @@ mod tests {
         }];
         let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
         assert_eq!(e.to_string(), "child operation failed: 1 object");
+    }
+
+    // --- transient-transport classification -----------------------------------
+
+    use aws_sdk_s3::operation::get_object::GetObjectError;
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+
+    fn dispatch(conn: ConnectorError) -> SdkError<GetObjectError, HttpResponse> {
+        SdkError::dispatch_failure(conn)
+    }
+
+    #[test]
+    fn transient_nested_transient_marker_under_other_none_is_transient() {
+        // The Windows failure shape: the http client classified an incomplete
+        // response as ConnectorError::Other(TransientError), but a nested dispatch
+        // re-wrapped it inside an outer ConnectorError::Other(None). The outer
+        // frame carries no marker; the classifier must walk the chain to the inner
+        // marker. Inspecting only the outer frame (the previous behavior) would
+        // classify this non-transient and abort a retryable error.
+        let inner = ConnectorError::other(
+            "incomplete message".into(),
+            Some(RetryErrorKind::TransientError),
+        );
+        let inner_sdk: SdkError<GetObjectError, HttpResponse> = SdkError::dispatch_failure(inner);
+        let outer = ConnectorError::other(Box::new(inner_sdk), None);
+        assert!(
+            is_sdk_transient_transport(&dispatch(outer)),
+            "a TransientError marker nested under an outer Other(None) must classify transient"
+        );
+    }
+
+    #[test]
+    fn transient_outer_io_is_transient() {
+        assert!(is_sdk_transient_transport(&dispatch(ConnectorError::io(
+            "reset".into()
+        ))));
+    }
+
+    #[test]
+    fn transient_outer_timeout_is_transient() {
+        assert!(is_sdk_transient_transport(&dispatch(
+            ConnectorError::timeout("connect".into())
+        )));
+    }
+
+    #[test]
+    fn transient_bare_other_none_is_not_transient() {
+        // A connector Other(None) with no transient marker anywhere in the chain
+        // is not transient — the fix must not blanket-retry every Other error.
+        assert!(!is_sdk_transient_transport(&dispatch(
+            ConnectorError::other("unclassified".into(), None)
+        )));
+    }
+
+    #[test]
+    fn transient_user_error_is_not_transient() {
+        // A user error (e.g. malformed request) must never be treated transient.
+        assert!(!is_sdk_transient_transport(&dispatch(
+            ConnectorError::user("bad request".into())
+        )));
     }
 }
