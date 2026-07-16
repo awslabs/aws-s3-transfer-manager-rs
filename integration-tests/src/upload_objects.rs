@@ -678,3 +678,53 @@ async fn upload_objects_transient_throttle_storm_recovers() {
     .await
     .expect("upload_objects_transient_throttle_storm_recovers timed out");
 }
+
+/// Download counterpart to `upload_objects_transient_throttle_storm_recovers`.
+/// For a small single-part object, discovery is the sole request, so a
+/// throttle storm on discovery must recover via the TM retry loop — parity with
+/// the upload path. Drives the same load-driven storm the upload test survives.
+#[tokio::test]
+async fn download_objects_transient_throttle_storm_recovers() {
+    timeout(TEST_TIMEOUT, async {
+        let (server, server_handle, tm) = setup_with_concurrency(16).await;
+        let count = 200usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "recover-dl/";
+
+        // Seed the store with no throttle installed.
+        let dataset = make_flat_dataset(count, size);
+        tm.upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix(prefix)
+            .initiate()
+            .expect("initiate seed upload")
+            .join()
+            .await
+            .expect("seed upload must succeed");
+
+        // Install the load-driven storm: every request is rate-limited server-wide.
+        server.set_rate_throttle(50.0, 15.0);
+
+        let dest = TempDir::new().expect("dest tempdir");
+        let handle = tm
+            .download_objects()
+            .bucket(bucket)
+            .key_prefix(prefix)
+            .destination(dest.path())
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a load-driven throttle storm on download must recover (parity with upload)");
+        assert_eq!(output.objects_downloaded(), count as u64);
+        assert!(output.failed_transfers().is_empty());
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("download_objects_transient_throttle_storm_recovers timed out");
+}

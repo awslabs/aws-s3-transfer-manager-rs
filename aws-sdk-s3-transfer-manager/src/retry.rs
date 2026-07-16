@@ -223,10 +223,14 @@ pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecisio
 }
 
 /// Whether a transfer error is an S3 throttle (a service error whose code denotes
-/// throttling). Code-only: the flattened [`Error`] carries the service code but
-/// not the HTTP status, which is sufficient because S3 throttles carry a code
-/// (`SlowDown`). The set mirrors the scheduler's throttle classifier
-/// (`scheduler::concurrency`); a status-only throttle would not be caught here.
+/// throttling).
+///
+/// Matches on service error code only: the flattened [`Error`] carries the parsed
+/// code but not the raw HTTP status. A throttle that arrives as an HTTP status
+/// (429 or 503) without a recognized throttle code (e.g. some `HeadObject` 503
+/// responses) is not classified as a throttle here and falls through to the SDK's
+/// inner retry only. The set mirrors the scheduler's throttle classifier
+/// (`scheduler::concurrency`).
 fn is_throttle(e: &Error) -> bool {
     matches!(
         e.code(),
@@ -238,6 +242,22 @@ fn is_throttle(e: &Error) -> bool {
                 | "BandwidthLimitExceeded"
         )
     )
+}
+
+/// Classifier for the download discovery send path.
+///
+/// Discovery is a single send (GetObject, HeadObject, or GetObject with
+/// partNumber) with no body read and no latency deadline. Retries a throttle
+/// with the hard throttle backoff and a transient transport error with the fast
+/// backoff. Everything else (including `InvalidRange`, `NotFound`, and other
+/// modeled service errors) is terminal.
+pub(crate) fn classify_discovery_retry(ge: &GuardError<Error>) -> RetryDecision {
+    match ge {
+        GuardError::DeadlineExceeded(_) => RetryDecision::NoRetry,
+        GuardError::Inner(e) if e.is_transient_transport() => RetryDecision::Retry,
+        GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
+        GuardError::Inner(_) => RetryDecision::NoRetry,
+    }
 }
 
 /// Classifier for download body reads.

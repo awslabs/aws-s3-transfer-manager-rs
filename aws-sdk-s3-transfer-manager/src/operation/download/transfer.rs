@@ -1129,28 +1129,46 @@ impl Transfer for DownloadTransfer {
     }
 }
 
+/// Parse a byte range from either the request format (`bytes=START-END`) or the
+/// response format (`bytes START-END/TOTAL` or `bytes START-END/*`).
+///
+/// Strips a leading `bytes=` or `bytes ` prefix, discards a `/TOTAL` suffix if
+/// present, splits on `-`, and parses both halves as `u64`. Returns `Some((start, end))`
+/// only when both parse and `start <= end`; returns `None` for any malformed input.
+fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
+    let s = s
+        .strip_prefix("bytes=")
+        .or_else(|| s.strip_prefix("bytes "))
+        .unwrap_or(s);
+    // Strip "/TOTAL" or "/*" suffix (Content-Range format).
+    let range_part = s.split('/').next()?;
+    let (start_str, end_str) = range_part.split_once('-')?;
+    let start: u64 = start_str.trim().parse().ok()?;
+    let end: u64 = end_str.trim().parse().ok()?;
+    (start <= end).then_some((start, end))
+}
+
 /// Validate that the response Content-Range matches the requested range.
+///
+/// Both the requested range and the response are parsed to numeric `(start, end)` and
+/// compared for equality. Returns `Err` when either side is absent or unparseable, or
+/// when the parsed ranges differ.
 fn validate_content_range(
     requested_range: &str,
     response_content_range: Option<&str>,
 ) -> Result<(), Error> {
-    let normalized = requested_range
-        .strip_prefix("bytes=")
-        .unwrap_or(requested_range);
+    let requested = parse_byte_range(requested_range);
+    let response = response_content_range.and_then(parse_byte_range);
 
-    if response_content_range
-        .map(|range| range.contains(normalized))
-        .unwrap_or(false)
-    {
-        Ok(())
-    } else {
-        Err(error::Error::new(
+    match (requested, response) {
+        (Some(req), Some(resp)) if req == resp => Ok(()),
+        _ => Err(error::Error::new(
             error::ErrorKind::RuntimeError,
             format!(
                 "content range mismatch: requested {}, response {:?}",
                 requested_range, response_content_range
             ),
-        ))
+        )),
     }
 }
 
@@ -2302,5 +2320,58 @@ mod tests {
     #[test]
     fn test_validate_content_range_missing() {
         assert!(validate_content_range("bytes=1024-2047", None).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_substring_false_positive() {
+        // The substring "0-9" appears in "bytes 10-99/100", but the ranges differ.
+        // A naive `.contains()` match would wrongly pass this.
+        assert!(validate_content_range("bytes=0-9", Some("bytes 10-99/100")).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_exact_match_small_range() {
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/100")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_unsized_total() {
+        // RFC 7233 allows `bytes START-END/*` when the total is unknown.
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/*")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_large_range_match() {
+        assert!(validate_content_range("bytes=100-199", Some("bytes 100-199/500")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_response_none() {
+        assert!(validate_content_range("bytes=0-9", None).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_garbage_response() {
+        assert!(validate_content_range("bytes=0-9", Some("bytes abc")).is_err());
+    }
+
+    #[test]
+    fn test_parse_byte_range_request_format() {
+        assert_eq!(parse_byte_range("bytes=0-9"), Some((0, 9)));
+        assert_eq!(parse_byte_range("bytes=100-199"), Some((100, 199)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_response_format() {
+        assert_eq!(parse_byte_range("bytes 0-9/100"), Some((0, 9)));
+        assert_eq!(parse_byte_range("bytes 100-199/500"), Some((100, 199)));
+        assert_eq!(parse_byte_range("bytes 0-9/*"), Some((0, 9)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_invalid() {
+        assert_eq!(parse_byte_range("bytes abc"), None);
+        assert_eq!(parse_byte_range(""), None);
+        assert_eq!(parse_byte_range("bytes 9-0"), None); // start > end
     }
 }
