@@ -5,11 +5,12 @@
 
 //! Adaptive per-request deadline for the retryable data plane.
 //!
-//! The deadline is a control variable, not a percentile recomputed per call:
-//! successful requests relax it toward observed latency, clustered timeouts
-//! widen it in tiers, and the widening decays back out as successes resume. The
-//! design is adapted from CRT's upload-part timeout controller
-//! (`aws_s3_client_update_upload_part_timeout`, aws-c-s3 `s3_client.c`).
+//! The deadline is a control variable seeded once at the p90 of warmup latencies
+//! and thereafter relaxed toward `mean + offset` by each success. A uniformly
+//! slow link (warmup mean >= 5s) is latched off at seed time (`stop_timeout`).
+//! Give-up under broad slowness is the success-replenished hedge budget: when
+//! hedges fire faster than successes refill, the budget drains to zero and
+//! speculation halts.
 
 use std::future::Future;
 use std::sync::Mutex;
@@ -25,21 +26,19 @@ const WARM_THRESHOLD: u64 = 10;
 /// tolerance rather than a sub-`offset` deadline. CRT's `1s` init floor.
 const SEED_FLOOR_US: f64 = 1_000_000.0;
 
-/// Aging factor for the observed-latency mean: `mean ← (1−α)·mean + α·sample`.
+/// Aging factor for the observed-latency mean: `mean <- (1-a)*mean + a*sample`.
 ///
 /// CRT uses a lifetime cumulative mean that never ages; this ages it so a
 /// lasting shift in network conditions moves the deadline target instead of
-/// being diluted by all-time history. α = 1/64 gives an effective memory of
+/// being diluted by all-time history. a = 1/64 gives an effective memory of
 /// ~64 recent requests.
 const MEAN_EWMA_ALPHA: f64 = 1.0 / 64.0;
 
-/// Damping factor for the deadline as it tracks its target: `deadline ←
-/// (1−α)·deadline + α·(mean + offset)`.
+/// Damping factor for the deadline as it tracks its target: `deadline <-
+/// (1-a)*deadline + a*(mean + offset)`.
 ///
-/// CRT's value (`0.99·current + 0.01·expected`). Small on purpose: a tier bump
-/// applied on a timeout decays back out over ~100 subsequent successes rather
-/// than being erased by the next one, so a burst of timeouts leaves a lasting
-/// widening.
+/// Small on purpose: the deadline converges slowly, so a transient latency spike
+/// does not whip the control variable.
 const VALUE_EWMA_ALPHA: f64 = 0.01;
 
 /// Safety margin added to the observed mean to form the deadline target.
@@ -49,13 +48,10 @@ const VALUE_EWMA_ALPHA: f64 = 0.01;
 /// margin, which is not separately tuned.
 const EXPECTED_OFFSET_US: f64 = 700_000.0;
 
-/// Escape hatch: once the deadline target or a widened deadline reaches this,
-/// the deadline is disabled. Past it, re-issuing costs more than waiting for the
-/// slow response. CRT's 5s `s_upload_timeout_threshold_ns`.
+/// Threshold for the warmup-mean gate (`stop_timeout`). When the arithmetic
+/// mean of the buffered warmup samples reaches this, the link is uniformly too
+/// slow to benefit from deadline-driven reissues and no deadline is ever armed.
 const ESCAPE_US: f64 = 5_000_000.0;
-
-/// Deadline increment at the moderate timeout-rate tier (> 0.1% of completions).
-const MODERATE_BUMP_US: f64 = 100_000.0;
 
 /// Hedge budget: tokens a hedge (a deadline-driven cancel-and-reissue) costs.
 /// The unit; only [`HEDGE_REWARD`]/`HEDGE_COST` and [`HEDGE_CAPACITY`] carry meaning.
@@ -69,26 +65,20 @@ const HEDGE_COST: f64 = 1.0;
 /// budget faster than successes refill it, halting hedging — the give-up.
 const HEDGE_REWARD: f64 = 0.05;
 
-/// Hedge budget: maximum tokens. Burst depth is `capacity/cost` simultaneous
-/// hedges from full; empty→full takes `capacity/reward` successes. A fixed
-/// absolute cap self-scales — a larger concurrent fleet drains it faster,
-/// giving up sooner, which is the safe direction. Bounds aggregate speculative
-/// reissues in flight; per-request correctness is the separate hedge-once rule.
-const HEDGE_CAPACITY: f64 = 10.0;
-
-/// Deadline increment at the high timeout-rate tier (> 1% of completions).
-const HIGH_BUMP_US: f64 = 1_000_000.0;
-
-/// Completion count at which the rate window halves both counters.
+/// Hedge budget: maximum tokens.
 ///
-/// The tier denominator (`rate_completed`) would otherwise grow with a
-/// long-lived client's lifetime volume, so a later burst — measured against
-/// millions of past completions — could never reach `completed/100`, defeating
-/// the widening on exactly the clients it targets. Halving at this cap keeps the
-/// denominator recent. CRT resets only on a high-tier crossing, which suffices
-/// for its short-lived per-session stat block but not for a client handle shared
-/// across many transfers.
-const RATE_WINDOW: u64 = 10_000;
+/// The budget bounds the SUSTAINED hedge fraction (via `reward/(reward+cost)`),
+/// not the instantaneous count of simultaneously-armed deadlines. Every warm
+/// request arms its deadline (the budget is checked, not reserved); a token is
+/// charged only when a hedge fires (a timeout). Under a correlated broad
+/// slowdown, up to the concurrent-request count can hedge in one transient wave,
+/// after which the budget drains to zero and speculation halts — the give-up.
+///
+/// A fixed absolute cap self-scales: a larger concurrent fleet drains it faster,
+/// giving up sooner, which is the safe direction. Empty-to-full takes
+/// `capacity/reward` successes. Per-request correctness (at most one reissue per
+/// chunk) is the separate hedge-once rule.
+const HEDGE_CAPACITY: f64 = 10.0;
 
 /// Outcome of a single [`LatencyTracker::guarded`] attempt that did not succeed.
 pub(crate) enum GuardError<E> {
@@ -103,7 +93,7 @@ pub(crate) enum GuardError<E> {
 /// The `q`-quantile of `samples` by nearest-rank, sorting in place.
 ///
 /// `q` is clamped to `[0, 1]`. Panics if `samples` is empty; the seed path calls
-/// it only at [`WARM_THRESHOLD`] samples. The rank is `ceil(q · n)` clamped to a
+/// it only at [`WARM_THRESHOLD`] samples. The rank is `ceil(q * n)` clamped to a
 /// valid index, so `p90` of 10 samples is the 9th smallest — the min of the
 /// slowest tenth, matching CRT's p90 min-heap.
 fn percentile(samples: &mut [f64], q: f64) -> f64 {
@@ -151,38 +141,27 @@ impl Ewma {
 /// from `mean_ttfb`, the aging EWMA that drives the steady-state target below.
 ///
 /// Thereafter:
-///   - **success** relaxes the deadline toward `mean + `[`EXPECTED_OFFSET_US`] by
-///     [`VALUE_EWMA_ALPHA`], and ages the mean by [`MEAN_EWMA_ALPHA`];
-///   - **timeout** widens the deadline in tiers keyed on the recent timeout
-///     rate (`failed`/`completed` over a bounded window, see [`RATE_WINDOW`]):
-///     `+`[`MODERATE_BUMP_US`] above 0.1%, `+`[`HIGH_BUMP_US`] above 1%.
+///   - **success** ages the mean by [`MEAN_EWMA_ALPHA`] and relaxes the deadline
+///     toward `mean + `[`EXPECTED_OFFSET_US`] by [`VALUE_EWMA_ALPHA`];
+///   - **timeout** counts toward the lifetime total but does not update the mean
+///     or the deadline value — a bad regime cannot ratchet the deadline tighter.
 ///
-/// A timed-out request never updates the mean, so a bad regime cannot ratchet
-/// the deadline tighter — the failure mode of a percentile computed only over
-/// successes. When the value that would apply reaches [`ESCAPE_US`] the deadline
-/// is disabled: a link that genuinely takes this long is not worth re-issuing.
-/// The escape is not sticky — the mean keeps updating on the untimed path, so a
-/// later healthy run re-arms the deadline, which matters for a client handle
-/// shared across a long-lived client's transfers.
+/// Give-up under broad slowness is the hedge budget: when hedges fire faster
+/// than successes refill, the budget drains to zero and speculation halts.
 struct DeadlineController {
     /// Aging mean of observed successful-request latency, microseconds.
     mean_ttfb: Ewma,
     /// Successful samples, gating warmup.
     successes: u64,
-    /// Warmup latencies (µs), buffered until [`WARM_THRESHOLD`] and consumed once
+    /// Warmup latencies (us), buffered until [`WARM_THRESHOLD`] and consumed once
     /// to seed the deadline at their p90, then cleared. Empty outside warmup.
     warmup_samples: Vec<f64>,
-    /// Set at the seed point when the arithmetic warmup mean reaches [`ESCAPE_US`]:
-    /// the link is uniformly slower than re-issuing helps, so no deadline is ever
-    /// armed. Distinct from the escape, which re-arms; this startup decision does
-    /// not.
+    /// Set at the seed point when the arithmetic warmup mean reaches
+    /// [`ESCAPE_US`]: no deadline is ever armed for the client's life.
     stop_timeout: bool,
-    /// The control variable, microseconds. `None` while cold or escaped.
+    /// The control variable, microseconds. `None` while cold (before warmup) or
+    /// when the link is latched off by `stop_timeout`.
     deadline_us: Option<f64>,
-    /// Completions in the current rate window (the tier denominator).
-    rate_completed: u64,
-    /// Timeouts in the current rate window (the tier numerator).
-    rate_failed: u64,
     /// Lifetime timeout count; not read by the control loop (Debug + tests).
     lifetime_timeouts: u64,
     /// Hedge budget tokens, `[0, HEDGE_CAPACITY]`. A success rewards, a hedge
@@ -199,14 +178,12 @@ impl DeadlineController {
             warmup_samples: Vec::new(),
             stop_timeout: false,
             deadline_us: None,
-            rate_completed: 0,
-            rate_failed: 0,
             lifetime_timeouts: 0,
             hedge_tokens: HEDGE_CAPACITY,
         }
     }
 
-    /// The current deadline, or `None` when cold or escaped.
+    /// The current deadline, or `None` when cold or latched off.
     fn deadline(&self) -> Option<Duration> {
         self.deadline_us.map(|us| Duration::from_micros(us as u64))
     }
@@ -221,14 +198,12 @@ impl DeadlineController {
         self.hedge_tokens = (self.hedge_tokens - HEDGE_COST).max(0.0);
     }
 
-    /// Fold a successful request's latency in: age the mean, advance the rate
-    /// window, then seed the deadline once at warm and thereafter relax it toward
-    /// `mean + offset`, decaying out prior tier bumps.
+    /// Fold a successful request's latency in: age the mean, seed the deadline
+    /// once at warm, and thereafter relax it toward `mean + offset`.
     fn record_success(&mut self, latency: Duration) {
         let sample_us = latency.as_micros() as f64;
         let mean = self.mean_ttfb.observe(sample_us);
         self.successes += 1;
-        self.record_completion();
         // A success replenishes the hedge budget (capped). Tying replenishment to
         // success — not the clock — is what makes the budget dry up under a broad
         // slowdown, halting speculation exactly when it stops paying off.
@@ -256,12 +231,10 @@ impl DeadlineController {
             }
             // Seed at the tail (p90), floored: the deadline must clear the slow
             // tail of a high-variance link, which a mean-based seed would sit
-            // under and false-cancel. A p90 past the escape (tail-slow but not
-            // uniformly slow) arms nothing yet stays re-armable, unlike the
-            // uniformly-slow latch above.
+            // under and false-cancel.
             let seed = percentile(&mut self.warmup_samples, 0.90).max(SEED_FLOOR_US);
             self.warmup_samples = Vec::new();
-            self.deadline_us = (seed < ESCAPE_US).then_some(seed);
+            self.deadline_us = Some(seed);
             return;
         }
         // A link classified too slow to time at seed stays untimed for life.
@@ -269,92 +242,16 @@ impl DeadlineController {
             return;
         }
         let target = mean + EXPECTED_OFFSET_US;
-        // Damp toward the target from the active deadline; re-seed at the target
-        // when re-arming after an escape (the warmup buffer is long gone).
-        let next = match self.deadline_us {
-            Some(current) => (1.0 - VALUE_EWMA_ALPHA) * current + VALUE_EWMA_ALPHA * target,
-            None => target,
-        };
-        // Escape is not sticky: disable the deadline while the value that would
-        // apply reaches the threshold, and re-arm automatically once observed
-        // latency (which keeps updating on the untimed path) recovers. Checked
-        // on the damped `next`, not the raw target, so a transient spike does
-        // not latch the deadline off.
-        let re_arming = self.deadline_us.is_none();
-        self.deadline_us = (next < ESCAPE_US).then_some(next);
-        // Clear the rate window when re-arming from an escape that accumulated
-        // failures: while escaped, in-flight stragglers keep incrementing
-        // `rate_failed` (record_timeout increments before its no-deadline early
-        // return) with no tier reset, so a re-armed deadline would otherwise
-        // inherit an outage-era failure count and the first post-recovery timeout
-        // would over-bump or immediately re-escape. Gated on `rate_failed > 0` so
-        // the initial cold→warm arming (an all-success window, nothing to clear)
-        // keeps its accumulated denominator.
-        if re_arming && self.deadline_us.is_some() && self.rate_failed > 0 {
-            self.rate_completed = 0;
-            self.rate_failed = 0;
-        }
+        // Damp toward the target from the active deadline.
+        let current = self.deadline_us.unwrap_or(target);
+        let next = (1.0 - VALUE_EWMA_ALPHA) * current + VALUE_EWMA_ALPHA * target;
+        self.deadline_us = Some(next);
     }
 
-    /// Fold a timed-out request in and widen the deadline per the recent rate.
-    ///
-    /// `issued` is the deadline the timed-out attempt was launched with. It
-    /// gates the bump so that concurrent stragglers issued at the same value do
-    /// not each stack a bump a peer already applied (CRT's stale-timeout guard):
-    /// a bump lands only if `issued + bump` would exceed the current deadline.
-    fn record_timeout(&mut self, issued: Duration) {
-        self.rate_failed = self.rate_failed.saturating_add(1);
-        self.record_completion();
+    /// Count a timed-out request. The deadline value is not adjusted on timeout;
+    /// give-up is the hedge budget.
+    fn record_timeout(&mut self) {
         self.lifetime_timeouts += 1;
-
-        let Some(current) = self.deadline_us else {
-            return; // cold or escaped: nothing to widen
-        };
-        let issued_us = issued.as_micros() as f64;
-
-        // `ceil` denominators so an isolated timeout cannot trip a tier on a
-        // small sample: high needs failed > completed/100, moderate > /1000. The
-        // `issued + bump > current` gate suppresses a straggler issued under an
-        // older, smaller deadline from stacking a bump a peer already applied.
-        let failed = self.rate_failed as f64;
-        let high = failed > (self.rate_completed as f64 / 100.0).ceil();
-        let moderate = failed > (self.rate_completed as f64 / 1000.0).ceil();
-        let (widened, high_applied) = if high && issued_us + HIGH_BUMP_US > current {
-            (Some(current + HIGH_BUMP_US), true)
-        } else if moderate && issued_us + MODERATE_BUMP_US > current {
-            (Some(current + MODERATE_BUMP_US), false)
-        } else {
-            (None, false)
-        };
-
-        // Reset the window only when a HIGH bump actually lands, so the next rate
-        // is measured against the widened deadline. Resetting on a gate-suppressed
-        // crossing would discard legitimate failure evidence and delay the next
-        // real escalation.
-        if high_applied {
-            self.rate_completed = 0;
-            self.rate_failed = 0;
-        }
-
-        // Escape is not sticky (see `record_success`): a bump past the threshold
-        // disables the deadline; a later healthy run re-arms it.
-        if let Some(w) = widened {
-            self.deadline_us = (w < ESCAPE_US).then_some(w);
-        }
-    }
-
-    /// Count one completion (success or timeout) into the rate window, halving
-    /// both counters when the window fills. Halving preserves the failure ratio
-    /// while bounding the denominator, so the tier thresholds stay sensitive to
-    /// a recent burst instead of being diluted by a long-lived client's lifetime
-    /// volume — without the sensitivity discontinuity a reset-to-zero would add
-    /// at the window boundary.
-    fn record_completion(&mut self) {
-        self.rate_completed = self.rate_completed.saturating_add(1);
-        if self.rate_completed >= RATE_WINDOW {
-            self.rate_completed /= 2;
-            self.rate_failed /= 2;
-        }
     }
 }
 
@@ -380,13 +277,12 @@ impl LatencyTracker {
         self.controller.lock().unwrap().record_success(latency);
     }
 
-    /// Record a timed-out request. `issued` is the deadline the attempt ran
-    /// under, used to gate tier bumps against concurrent stragglers. Test-only:
-    /// production times out through [`guarded`](Self::guarded), which charges the
-    /// hedge budget and records the timeout together.
+    /// Record a timed-out request. Test-only: production times out through
+    /// [`guarded`](Self::guarded), which charges the hedge budget and records the
+    /// timeout together.
     #[cfg(test)]
-    pub(crate) fn record_timeout(&self, issued: Duration) {
-        self.controller.lock().unwrap().record_timeout(issued);
+    pub(crate) fn record_timeout(&self) {
+        self.controller.lock().unwrap().record_timeout();
     }
 
     /// The deadline to arm this attempt with: the current deadline if one is
@@ -408,8 +304,9 @@ impl LatencyTracker {
         self.controller.lock().unwrap().lifetime_timeouts
     }
 
-    /// The current adaptive deadline, or `None` when cold or escaped. Test-only:
-    /// production consults the deadline through [`hedge_deadline`](Self::hedge_deadline).
+    /// The current adaptive deadline, or `None` when cold or latched off.
+    /// Test-only: production consults the deadline through
+    /// [`hedge_deadline`](Self::hedge_deadline).
     #[cfg(test)]
     fn deadline(&self) -> Option<Duration> {
         self.controller.lock().unwrap().deadline()
@@ -458,7 +355,7 @@ impl LatencyTracker {
                     {
                         let mut c = self.controller.lock().unwrap();
                         c.charge_hedge();
-                        c.record_timeout(dl);
+                        c.record_timeout();
                     }
                     tracing::debug!(
                         target: crate::telemetry::TARGET_TRANSFER,
@@ -514,7 +411,7 @@ mod tests {
         let seeded = dl_us(&c);
         assert!(
             (seeded - SEED_FLOOR_US).abs() < 1.0,
-            "a fast warmup must seed at the floor ≈ {SEED_FLOOR_US}, got {seeded}"
+            "a fast warmup must seed at the floor = {SEED_FLOOR_US}, got {seeded}"
         );
     }
 
@@ -536,7 +433,7 @@ mod tests {
             (seeded - 3_000_000.0).abs() < 1.0,
             "seed must be the p90 tail (3s), got {seeded}"
         );
-        // A mean-based seed would have landed near 680ms+700ms ≈ 1.38s, below the
+        // A mean-based seed would have landed near 680ms+700ms = 1.38s, below the
         // tail — the exact clip this change prevents.
         assert!(
             seeded > 1_380_000.0,
@@ -546,9 +443,8 @@ mod tests {
 
     #[test]
     fn slow_warmup_never_arms_a_deadline() {
-        // CRT's stop_timeout: if the warmup mean already reaches the escape, the
-        // link is slower than re-issuing helps, so no deadline is ever armed and
-        // later timeouts cannot arm one either.
+        // A link whose warmup mean reaches the escape is slower than re-issuing
+        // helps: `stop_timeout` is a permanent latch — no deadline is ever armed.
         let mut c = DeadlineController::new();
         warm(&mut c, Duration::from_millis(5500), WARM_THRESHOLD);
         assert_eq!(
@@ -558,14 +454,9 @@ mod tests {
         );
         assert!(c.stop_timeout, "the slow-link gate must latch");
 
-        // Even a healthy run afterward stays untimed: the decision is permanent
-        // (unlike the escape, which re-arms).
+        // Even a healthy run afterward stays untimed: the decision is permanent.
         warm(&mut c, Duration::from_millis(50), 500);
-        assert_eq!(
-            c.deadline(),
-            None,
-            "stop_timeout is not re-armable, unlike the escape"
-        );
+        assert_eq!(c.deadline(), None, "stop_timeout is a permanent latch");
     }
 
     #[test]
@@ -607,13 +498,13 @@ mod tests {
         // Seed high off a slow tail (p90 = 3s) while the target (mean+offset) is
         // far lower, so a healthy run relaxes the deadline DOWN toward the target,
         // fractionally per sample (VALUE_EWMA_ALPHA = 0.01). Eight fast + two slow
-        // warmup samples: p90 = 3s seed, mean ≈ 680ms → target ≈ 1.38s.
+        // warmup samples: p90 = 3s seed, mean ~ 680ms -> target ~ 1.38s.
         for _ in 0..WARM_THRESHOLD - 2 {
             c.record_success(Duration::from_millis(100));
         }
         c.record_success(Duration::from_millis(3000));
         c.record_success(Duration::from_millis(3000));
-        let seeded = dl_us(&c); // ≈ 3s
+        let seeded = dl_us(&c); // ~ 3s
         assert!(
             (seeded - 3_000_000.0).abs() < 1.0,
             "precondition: p90 seed = 3s"
@@ -632,331 +523,12 @@ mod tests {
             "one success should move the deadline <2%, moved {moved_fraction}"
         );
 
-        // Over many fast samples it converges toward mean(→100ms) + 700ms.
+        // Over many fast samples it converges toward mean(->100ms) + 700ms.
         warm(&mut c, Duration::from_millis(100), 2000);
         let converged = dl_us(&c);
         assert!(
             (converged - (100_000.0 + EXPECTED_OFFSET_US)).abs() < 50_000.0,
             "should converge near 100ms+700ms, got {converged}"
-        );
-    }
-
-    // --- timeout rate tiers ---------------------------------------------------
-
-    #[test]
-    fn isolated_timeout_after_long_healthy_run_does_not_widen() {
-        let mut c = DeadlineController::new();
-        warm(&mut c, Duration::from_millis(100), 5000);
-        let before = dl_us(&c);
-
-        // A single timeout against 5000 completions is 1/5001 ≈ 0.02% — below
-        // both tiers (ceil(5001/1000) = 6, failed = 1). No widening.
-        c.record_timeout(c.deadline().unwrap());
-        assert_eq!(
-            dl_us(&c),
-            before,
-            "one timeout in thousands must not widen the deadline"
-        );
-    }
-
-    #[test]
-    fn moderate_tier_widens_by_100ms_without_tripping_high() {
-        let mut c = DeadlineController::new();
-        // ~1000 completions separates the tiers: high needs failed >
-        // ceil(1000/100)=11, moderate needs failed > ceil(1000/1000)=2. All
-        // samples are 100ms, so after the p90 seed (1s) relaxes over ~990
-        // successes the deadline converges to the target (100ms+700ms=800ms);
-        // only tier bumps move it thereafter.
-        warm(&mut c, Duration::from_millis(100), 1000);
-        let base = dl_us(&c);
-        assert!(
-            (base - (100_000.0 + EXPECTED_OFFSET_US)).abs() < 100.0,
-            "base must converge to the target ≈800ms, got {base}"
-        );
-        let issued = c.deadline().unwrap();
-
-        // failed=1 (>ceil(1001/1000)=2? no) and failed=2 (>ceil(1002/1000)=2? no)
-        // stay below MODERATE.
-        c.record_timeout(issued);
-        c.record_timeout(issued);
-        assert_eq!(dl_us(&c), base, "failed ≤ 0.1% must not widen");
-
-        // failed=3 > ceil(1003/1000)=2 trips MODERATE; well below high's 11.
-        c.record_timeout(issued);
-        let widened = dl_us(&c);
-        assert!(
-            (widened - (base + MODERATE_BUMP_US)).abs() < 1.0,
-            "crossing 0.1% must add exactly MODERATE (+100ms): base {base}, got {widened}"
-        );
-    }
-
-    #[test]
-    fn high_tier_bump_resets_the_rate_window() {
-        let mut c = DeadlineController::new();
-        warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
-        let issued = c.deadline().unwrap();
-
-        // With completed ≈ 10, high threshold = ceil(10/100) = 1. The 2nd
-        // timeout (failed=2 > 1) trips HIGH and resets the counters.
-        c.record_timeout(issued);
-        c.record_timeout(issued);
-        assert_eq!(c.rate_completed, 0, "high tier must reset completions");
-        assert_eq!(c.rate_failed, 0, "high tier must reset failures");
-        assert!(
-            dl_us(&c) >= 100_000.0 + EXPECTED_OFFSET_US + HIGH_BUMP_US - 1.0,
-            "HIGH must add ~1s to the deadline"
-        );
-    }
-
-    /// The `issued + bump > current` stale-timeout gate: a straggler that was
-    /// launched under an OLD (smaller) deadline must not stack a bump the
-    /// deadline has already grown past, while a straggler at the CURRENT deadline
-    /// still widens. Driven through the MODERATE tier, which does not reset the
-    /// rate counters, so the gate — not a counter reset — is what suppresses.
-    #[test]
-    fn stale_concurrent_timeout_is_gated_but_current_still_widens() {
-        let mut c = DeadlineController::new();
-        // ~1000 completions: MODERATE trips at failed > 2, HIGH at failed > 11,
-        // so the burst below stays in MODERATE (no counter reset) throughout.
-        warm(&mut c, Duration::from_millis(100), 1000);
-        let stale = c.deadline().unwrap(); // 800ms — the "old" issued value
-
-        // Raise the deadline via MODERATE bumps, each timeout carrying the
-        // then-current deadline (a fresh straggler), until current is well above
-        // `stale + MODERATE_BUMP`.
-        for _ in 0..5 {
-            let fresh = c.deadline().unwrap();
-            c.record_timeout(fresh);
-        }
-        let raised = dl_us(&c);
-        assert!(
-            raised > stale.as_micros() as f64 + MODERATE_BUMP_US,
-            "precondition: deadline {raised} must exceed stale+bump so the gate can bite"
-        );
-
-        // A straggler issued under the STALE deadline trips the tier but the gate
-        // suppresses the bump: stale + MODERATE_BUMP <= current, so no change.
-        c.record_timeout(stale);
-        assert_eq!(
-            dl_us(&c),
-            raised,
-            "a timeout from the pre-bump deadline must not re-widen (gate)"
-        );
-
-        // A straggler issued at the CURRENT deadline still widens: the gate only
-        // suppresses stale ones. This is the teeth — deleting the gate makes the
-        // assert above fail, deleting the tier makes this one fail.
-        let fresh = c.deadline().unwrap();
-        c.record_timeout(fresh);
-        assert!(
-            dl_us(&c) > raised,
-            "a timeout at the current deadline must still widen"
-        );
-    }
-
-    // --- escape hatch ---------------------------------------------------------
-
-    /// A steady-state escape (widened past 5s by tier bumps) is NOT sticky: a
-    /// healthy run must re-arm the deadline. Distinct from `stop_timeout`, which a
-    /// slow *warmup* latches permanently (see `slow_warmup_never_arms_a_deadline`).
-    /// Critical for a client handle shared across a long-lived client's transfers.
-    #[test]
-    fn escape_re_arms_after_latency_recovers() {
-        let mut c = DeadlineController::new();
-        // Arm at a fast seed, then stack HIGH bumps until the deadline widens past
-        // the 5s escape and disables. Bump-escape does not set stop_timeout, so it
-        // stays re-armable — unlike a slow-warmup escape.
-        warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
-        while c.deadline().is_some() {
-            c.record_timeout(c.deadline().unwrap());
-            c.record_timeout(c.deadline().unwrap());
-        }
-        assert_eq!(c.deadline(), None, "precondition: escaped via bumps");
-
-        // The mean is still ~100ms (timeouts never feed it), so the next success
-        // re-seeds the deadline at the low target and it re-arms immediately.
-        c.record_success(Duration::from_millis(50));
-        let rearmed = c
-            .deadline()
-            .expect("a healthy success must re-arm after a bump escape");
-        assert!(
-            rearmed.as_micros() as f64 <= 1_500_000.0,
-            "re-armed deadline should recover well below the 5s escape, got {rearmed:?}"
-        );
-    }
-
-    #[test]
-    fn escape_via_stacked_bumps_disables_deadline() {
-        let mut c = DeadlineController::new();
-        // Seed just under the escape so a few HIGH bumps push over it.
-        warm(&mut c, Duration::from_millis(3500), WARM_THRESHOLD); // target ≈ 4.2s
-        for _ in 0..10 {
-            let Some(issued) = c.deadline() else { break };
-            // Each pair of timeouts trips HIGH (+1s) and resets the window.
-            c.record_timeout(issued);
-            c.record_timeout(issued);
-        }
-        assert_eq!(
-            c.deadline(),
-            None,
-            "bumps past 5s must disable the deadline"
-        );
-    }
-
-    // --- rate window (bounded denominator) -----------------------------------
-
-    #[test]
-    fn rate_window_bounds_the_denominator() {
-        // The tier denominator must not grow with lifetime volume, or a burst on
-        // a long-lived client could never reach `completed/100`.
-        let mut c = DeadlineController::new();
-        warm(&mut c, Duration::from_millis(100), 50_000);
-        assert!(
-            c.rate_completed <= RATE_WINDOW,
-            "denominator must stay bounded by the window, got {}",
-            c.rate_completed
-        );
-    }
-
-    #[test]
-    fn burst_after_long_healthy_run_still_escalates() {
-        // The bug the window fixes: a lifetime denominator would make a burst
-        // after a long healthy run unable to move the deadline. 200_000 healthy
-        // completions land the window exactly on a halving boundary, so the
-        // denominator is RATE_WINDOW/2 = 5_000 at burst start: MODERATE trips at
-        // failed > ceil(5000/1000)=5, HIGH at failed > ceil(5000/100)=50 (rising
-        // to 8/75 as completions refill toward RATE_WINDOW). The burst escalates
-        // through HIGH and stacks past the 5s escape. With the OLD unbounded
-        // denominator (200_000) MODERATE alone needs failed > 200, so this
-        // 150-timeout burst would leave the deadline UNCHANGED.
-        let mut c = DeadlineController::new();
-        warm(&mut c, Duration::from_millis(100), 200_000);
-        let seed = dl_us(&c); // ~800ms
-
-        for _ in 0..150 {
-            // Once HIGH bumps stack past 5s the deadline escapes (None) — the
-            // strongest possible evidence the burst reached the HIGH tier.
-            let Some(issued) = c.deadline() else { return };
-            c.record_timeout(issued);
-        }
-        // If it did not escape, it must at least have climbed a full HIGH bump —
-        // either outcome proves the burst escalated, which the old scheme could
-        // not do at this denominator.
-        assert!(
-            dl_us(&c) >= seed + HIGH_BUMP_US * 0.9,
-            "a burst after a long healthy run must escalate (HIGH or escape); \
-             seed {seed}, got {}",
-            dl_us(&c)
-        );
-    }
-
-    #[test]
-    fn halving_preserves_the_failure_ratio() {
-        // The window's whole point: halving must scale BOTH counters so the
-        // ratio (not just the denominator) is preserved. A mutation that halved
-        // only `rate_completed` would inflate the rate and this must catch it.
-        let mut c = DeadlineController::new();
-        // Drive to one completion short of the window with a ~1% failure salted
-        // in, then trip the boundary and check the ratio survives.
-        for i in 0..RATE_WINDOW - 1 {
-            if i % 100 == 0 {
-                c.rate_failed += 1; // ~1% synthetic failures, directly
-            }
-            c.record_completion();
-        }
-        let (c_before, f_before) = (c.rate_completed, c.rate_failed);
-        assert_eq!(
-            c_before,
-            RATE_WINDOW - 1,
-            "precondition: one short of window"
-        );
-        // The completion that crosses RATE_WINDOW halves both.
-        c.record_completion();
-        assert_eq!(c.rate_completed, RATE_WINDOW / 2, "denominator must halve");
-        assert_eq!(
-            c.rate_failed,
-            f_before / 2,
-            "numerator must halve in lockstep"
-        );
-        // Ratio preserved within integer-truncation of one unit.
-        let before = f_before as f64 / c_before as f64;
-        let after = c.rate_failed as f64 / c.rate_completed as f64;
-        assert!(
-            (before - after).abs() < 0.0005,
-            "halving must preserve the failure ratio: {before} vs {after}"
-        );
-    }
-
-    #[test]
-    fn re_arm_after_escape_clears_the_poisoned_rate_window() {
-        // Regression for the escape→re-arm thrash: while escaped, in-flight
-        // stragglers keep incrementing `rate_failed` with no tier reset, so a
-        // naive re-arm would inherit that count and the first post-recovery
-        // timeout would over-bump or instantly re-escape. The re-arm must clear
-        // the window.
-        let mut c = DeadlineController::new();
-        // Arm near the escape, then trip MODERATE repeatedly to escape (MODERATE
-        // does not reset the window).
-        warm(&mut c, Duration::from_millis(4250), 1000);
-        while c.deadline().is_some() {
-            c.record_timeout(c.deadline().unwrap());
-        }
-        // Escape-period stragglers accumulate failures with the deadline None.
-        for _ in 0..50 {
-            c.record_timeout(Duration::from_millis(4950));
-        }
-        assert!(
-            c.rate_failed > 0,
-            "precondition: escaped window is poisoned"
-        );
-
-        // Recover: a healthy run pulls the mean down and re-arms the deadline.
-        warm(&mut c, Duration::from_millis(50), 500);
-        assert!(c.deadline().is_some(), "precondition: re-armed");
-        assert_eq!(
-            c.rate_failed, 0,
-            "re-arm must clear the poisoned failure count"
-        );
-        let rearmed = dl_us(&c);
-
-        // The first timeout after recovery must NOT over-bump off a stale count:
-        // with the window cleared it takes a real burst to trip a tier again, so
-        // one isolated timeout leaves the re-armed deadline unchanged.
-        c.record_timeout(c.deadline().unwrap());
-        assert_eq!(
-            dl_us(&c),
-            rearmed,
-            "one timeout after re-arm must not widen a freshly recovered deadline"
-        );
-    }
-
-    #[test]
-    fn gate_suppressed_high_crossing_does_not_reset_the_window() {
-        // The window must reset only when a HIGH bump actually lands: a HIGH
-        // crossing whose bump the `issued` gate suppresses must NOT discard the
-        // accumulated failure evidence.
-        let mut c = DeadlineController::new();
-        warm(&mut c, Duration::from_millis(100), 1000);
-        // Raise the deadline well above a stale `issued` via fresh HIGH bumps.
-        let stale = c.deadline().unwrap();
-        // Trip HIGH once with a fresh straggler to grow the deadline and reset.
-        // (2 timeouts: failed 2 > ceil(~1002/100)=11? no — need a real burst.)
-        for _ in 0..12 {
-            let fresh = c.deadline().unwrap();
-            c.record_timeout(fresh);
-        }
-        // Now the deadline is ≥1s above `stale`. Feed timeouts carrying the stale
-        // (small) issued value: they cross HIGH on the rate but the gate
-        // suppresses the bump. The window must keep accumulating, not reset.
-        let completed_before = c.rate_completed;
-        let failed_before = c.rate_failed;
-        c.record_timeout(stale);
-        assert!(
-            c.rate_failed > failed_before && c.rate_completed > completed_before,
-            "a gate-suppressed crossing must not zero the window: \
-             failed {failed_before}->{}, completed {completed_before}->{}",
-            c.rate_failed,
-            c.rate_completed
         );
     }
 
@@ -984,7 +556,7 @@ mod tests {
                         t.record(Duration::from_millis(100));
                     }
                     for _ in 0..timeouts_per_thread {
-                        t.record_timeout(Duration::from_millis(800));
+                        t.record_timeout();
                     }
                 })
             })
@@ -1007,7 +579,7 @@ mod tests {
         let mut c = DeadlineController::new();
         warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
         let mean_before = c.mean_ttfb.value.unwrap();
-        c.record_timeout(c.deadline().unwrap());
+        c.record_timeout();
         assert_eq!(
             c.mean_ttfb.value.unwrap(),
             mean_before,
@@ -1032,26 +604,32 @@ mod tests {
 
     #[test]
     fn sustained_hedging_drains_the_budget_despite_successes() {
-        // The setpoint: above a candidate fraction of reward/(reward+cost) the
-        // budget drains even with successes interleaved — the property the
-        // value-based escape lacked. Model a run where a fixed fraction hedges.
+        // The setpoint: a candidate rate above reward/(reward+cost) net-drains the
+        // budget even with successes interleaved and counting — the property the
+        // value-based escape lacked. Start BELOW capacity so rewards are not clipped,
+        // then run a candidate rate well above the ~4.8% setpoint.
         let mut c = DeadlineController::new();
         warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
-        let start = c.hedge_tokens;
-
-        // 20 hedges against 100 successes = 20% candidate rate, far above the
-        // ~4.8% setpoint: net drain. (charge_hedge is what a fired hedge calls.)
-        for _ in 0..100 {
-            c.record_success(Duration::from_millis(100));
-        }
-        for _ in 0..20 {
+        // Drop below capacity so every subsequent reward actually accrues.
+        for _ in 0..5 {
             c.charge_hedge();
         }
+        // One hedge per 5 successes = 16.7% candidate rate, far above the ~4.8%
+        // setpoint. Each round nets 5*REWARD - COST = -0.75, so the budget drains
+        // toward zero DESPITE the interleaved successes refilling it. If REWARD were
+        // large enough to make a round net non-negative, this would never drain.
+        let mut rounds = 0;
+        while c.can_hedge() && rounds < 100 {
+            for _ in 0..5 {
+                c.record_success(Duration::from_millis(100));
+            }
+            c.charge_hedge();
+            rounds += 1;
+        }
         assert!(
-            c.hedge_tokens < start,
-            "a candidate rate above the setpoint must net-drain the budget: \
-             start {start}, got {}",
-            c.hedge_tokens
+            !c.can_hedge(),
+            "a candidate rate above the setpoint must drain the budget despite \
+             interleaved successes (drained in {rounds} rounds)"
         );
     }
 
@@ -1099,7 +677,7 @@ mod tests {
         let tracker = LatencyTracker::new();
         // Warm to just below the threshold so the guarded success is the sample
         // that crosses it: a warm deadline afterward proves the success path
-        // recorded (dropping `record()` would leave the tracker cold → None).
+        // recorded (dropping `record()` would leave the tracker cold -> None).
         for _ in 0..WARM_THRESHOLD - 1 {
             tracker.record(Duration::from_millis(100));
         }
@@ -1119,7 +697,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn guarded_deadline_exceeded_records_timeout() {
         let tracker = LatencyTracker::new();
-        // Warm at 100ms → deadline ≈ 800ms; a 30s future trips it.
+        // Warm at 100ms -> deadline ~ 800ms; a 30s future trips it.
         for _ in 0..WARM_THRESHOLD {
             tracker.record(Duration::from_millis(100));
         }
