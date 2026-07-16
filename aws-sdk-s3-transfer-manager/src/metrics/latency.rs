@@ -16,8 +16,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Successful samples required before a deadline is applied. Below this the
-/// controller only observes latency; [`LatencyTracker::guarded`] runs untimed.
+/// controller only observes latency and buffers samples for the seed;
+/// [`LatencyTracker::guarded`] runs untimed.
 const WARM_THRESHOLD: u64 = 10;
+
+/// Floor for the initial deadline seed. The seed is `max(p90, SEED_FLOOR_US)`,
+/// so a link whose warmup is uniformly fast still starts with a full second of
+/// tolerance rather than a sub-`offset` deadline. CRT's `1s` init floor.
+const SEED_FLOOR_US: f64 = 1_000_000.0;
 
 /// Aging factor for the observed-latency mean: `mean ← (1−α)·mean + α·sample`.
 ///
@@ -75,6 +81,21 @@ pub(crate) enum GuardError<E> {
     Inner(E),
 }
 
+/// The `q`-quantile of `samples` by nearest-rank, sorting in place.
+///
+/// `q` is clamped to `[0, 1]`. Panics if `samples` is empty; the seed path calls
+/// it only at [`WARM_THRESHOLD`] samples. The rank is `ceil(q · n)` clamped to a
+/// valid index, so `p90` of 10 samples is the 9th smallest — the min of the
+/// slowest tenth, matching CRT's p90 min-heap.
+fn percentile(samples: &mut [f64], q: f64) -> f64 {
+    assert!(!samples.is_empty(), "percentile of no samples");
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let n = samples.len();
+    let rank = (q.clamp(0.0, 1.0) * n as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(n - 1);
+    samples[idx]
+}
+
 /// One exponentially-weighted moving average. `None` until the first sample, so
 /// the first `observe` seeds the average rather than blending against a
 /// synthetic zero.
@@ -101,9 +122,17 @@ impl Ewma {
 
 /// Adaptive per-request deadline held as a control variable.
 ///
-/// After [`WARM_THRESHOLD`] successful samples the deadline is seeded at
-/// `mean + `[`EXPECTED_OFFSET_US`] and thereafter:
-///   - **success** relaxes the deadline toward `mean + offset` by
+/// The first [`WARM_THRESHOLD`] successes are buffered, not timed. At the
+/// threshold the deadline is seeded once at `max(p90, `[`SEED_FLOOR_US`]`)` over
+/// the buffered samples — a tail percentile, not the mean, so a high-variance
+/// link whose fast requests dominate the mean still starts with a deadline that
+/// clears its slow tail. If the arithmetic mean of the buffered samples reaches
+/// [`ESCAPE_US`] the link is uniformly too slow to time and no deadline is ever
+/// armed (`stop_timeout`). This gate uses the arithmetic warmup mean, distinct
+/// from `mean_ttfb`, the aging EWMA that drives the steady-state target below.
+///
+/// Thereafter:
+///   - **success** relaxes the deadline toward `mean + `[`EXPECTED_OFFSET_US`] by
 ///     [`VALUE_EWMA_ALPHA`], and ages the mean by [`MEAN_EWMA_ALPHA`];
 ///   - **timeout** widens the deadline in tiers keyed on the recent timeout
 ///     rate (`failed`/`completed` over a bounded window, see [`RATE_WINDOW`]):
@@ -121,6 +150,14 @@ struct DeadlineController {
     mean_ttfb: Ewma,
     /// Successful samples, gating warmup.
     successes: u64,
+    /// Warmup latencies (µs), buffered until [`WARM_THRESHOLD`] and consumed once
+    /// to seed the deadline at their p90, then cleared. Empty outside warmup.
+    warmup_samples: Vec<f64>,
+    /// Set at the seed point when the arithmetic warmup mean reaches [`ESCAPE_US`]:
+    /// the link is uniformly slower than re-issuing helps, so no deadline is ever
+    /// armed. Distinct from the escape, which re-arms; this startup decision does
+    /// not.
+    stop_timeout: bool,
     /// The control variable, microseconds. `None` while cold or escaped.
     deadline_us: Option<f64>,
     /// Completions in the current rate window (the tier denominator).
@@ -136,6 +173,8 @@ impl DeadlineController {
         Self {
             mean_ttfb: Ewma::new(MEAN_EWMA_ALPHA),
             successes: 0,
+            warmup_samples: Vec::new(),
+            stop_timeout: false,
             deadline_us: None,
             rate_completed: 0,
             rate_failed: 0,
@@ -149,19 +188,51 @@ impl DeadlineController {
     }
 
     /// Fold a successful request's latency in: age the mean, advance the rate
-    /// window, then (once warm) relax the deadline toward `mean + offset`,
-    /// decaying out prior tier bumps.
+    /// window, then seed the deadline once at warm and thereafter relax it toward
+    /// `mean + offset`, decaying out prior tier bumps.
     fn record_success(&mut self, latency: Duration) {
-        let mean = self.mean_ttfb.observe(latency.as_micros() as f64);
+        let sample_us = latency.as_micros() as f64;
+        let mean = self.mean_ttfb.observe(sample_us);
         self.successes += 1;
         self.record_completion();
 
+        // Warmup: buffer the sample and arm nothing.
         if self.successes < WARM_THRESHOLD {
+            self.warmup_samples.push(sample_us);
+            return;
+        }
+        // Seed once, at the warm threshold.
+        if self.successes == WARM_THRESHOLD {
+            self.warmup_samples.push(sample_us);
+            // A link whose warmup is UNIFORMLY slower than the escape is slower
+            // than re-issuing helps: never arm a deadline for it. Gated on the
+            // arithmetic mean of the buffered samples, not `mean_ttfb` (the aging
+            // EWMA, which weights the first sample ~0.87 over ten samples) — so a
+            // single cold-start request cannot latch a healthy link off.
+            let warmup_mean =
+                self.warmup_samples.iter().sum::<f64>() / self.warmup_samples.len() as f64;
+            if warmup_mean >= ESCAPE_US {
+                self.stop_timeout = true;
+                self.warmup_samples = Vec::new();
+                return;
+            }
+            // Seed at the tail (p90), floored: the deadline must clear the slow
+            // tail of a high-variance link, which a mean-based seed would sit
+            // under and false-cancel. A p90 past the escape (tail-slow but not
+            // uniformly slow) arms nothing yet stays re-armable, unlike the
+            // uniformly-slow latch above.
+            let seed = percentile(&mut self.warmup_samples, 0.90).max(SEED_FLOOR_US);
+            self.warmup_samples = Vec::new();
+            self.deadline_us = (seed < ESCAPE_US).then_some(seed);
+            return;
+        }
+        // A link classified too slow to time at seed stays untimed for life.
+        if self.stop_timeout {
             return;
         }
         let target = mean + EXPECTED_OFFSET_US;
-        // Damp toward the target from the active deadline; seed at the target
-        // when cold or re-arming after an escape.
+        // Damp toward the target from the active deadline; re-seed at the target
+        // when re-arming after an escape (the warmup buffer is long gone).
         let next = match self.deadline_us {
             Some(current) => (1.0 - VALUE_EWMA_ALPHA) * current + VALUE_EWMA_ALPHA * target,
             None => target,
@@ -368,13 +439,86 @@ mod tests {
         warm(&mut c, Duration::from_millis(50), WARM_THRESHOLD - 1);
         assert_eq!(c.deadline(), None, "must stay cold below WARM_THRESHOLD");
 
-        // The warm-th sample seeds the deadline at mean + offset.
+        // The warm-th sample seeds the deadline at max(p90, floor). Uniform 50ms
+        // samples give p90 = 50ms, so the SEED_FLOOR_US (1s) floor applies.
         c.record_success(Duration::from_millis(50));
         let seeded = dl_us(&c);
-        let expected = 50_000.0 + EXPECTED_OFFSET_US; // mean == 50ms (uniform samples)
         assert!(
-            (seeded - expected).abs() < 1.0,
-            "seed should be mean+offset ≈ {expected}, got {seeded}"
+            (seeded - SEED_FLOOR_US).abs() < 1.0,
+            "a fast warmup must seed at the floor ≈ {SEED_FLOOR_US}, got {seeded}"
+        );
+    }
+
+    #[test]
+    fn seed_tracks_the_warmup_tail_not_the_mean() {
+        // A high-variance warmup: fast mass with a slow tail. The mean sits near
+        // the fast floor, but the seed must clear the tail (p90), so a genuinely
+        // slow-but-healthy request is not immediately cancelled. Eight samples at
+        // 100ms and two at 3s: nearest-rank p90 of 10 is the 9th smallest = 3s
+        // (the slowest tenth), well above both the mean (~680ms) and the 1s floor.
+        let mut c = DeadlineController::new();
+        for _ in 0..WARM_THRESHOLD - 2 {
+            c.record_success(Duration::from_millis(100));
+        }
+        c.record_success(Duration::from_millis(3000));
+        c.record_success(Duration::from_millis(3000));
+        let seeded = dl_us(&c);
+        assert!(
+            (seeded - 3_000_000.0).abs() < 1.0,
+            "seed must be the p90 tail (3s), got {seeded}"
+        );
+        // A mean-based seed would have landed near 680ms+700ms ≈ 1.38s, below the
+        // tail — the exact clip this change prevents.
+        assert!(
+            seeded > 1_380_000.0,
+            "seed must exceed the mean-based value it replaces"
+        );
+    }
+
+    #[test]
+    fn slow_warmup_never_arms_a_deadline() {
+        // CRT's stop_timeout: if the warmup mean already reaches the escape, the
+        // link is slower than re-issuing helps, so no deadline is ever armed and
+        // later timeouts cannot arm one either.
+        let mut c = DeadlineController::new();
+        warm(&mut c, Duration::from_millis(5500), WARM_THRESHOLD);
+        assert_eq!(
+            c.deadline(),
+            None,
+            "a warmup mean past the escape must never arm a deadline"
+        );
+        assert!(c.stop_timeout, "the slow-link gate must latch");
+
+        // Even a healthy run afterward stays untimed: the decision is permanent
+        // (unlike the escape, which re-arms).
+        warm(&mut c, Duration::from_millis(50), 500);
+        assert_eq!(
+            c.deadline(),
+            None,
+            "stop_timeout is not re-armable, unlike the escape"
+        );
+    }
+
+    #[test]
+    fn cold_first_sample_does_not_latch_a_healthy_link() {
+        // The stop_timeout gate uses the arithmetic warmup mean, not the aging
+        // EWMA. One cold first request (8s TLS/DNS setup) then nine fast ones:
+        // arithmetic mean = (8000 + 9*50)/10 = 845ms, well under the escape, so
+        // the link is timed normally. The EWMA weights that first sample ~0.87,
+        // reporting ~7s and would falsely latch stop_timeout — the skew this gate
+        // must not have.
+        let mut c = DeadlineController::new();
+        c.record_success(Duration::from_millis(8000));
+        for _ in 0..WARM_THRESHOLD - 1 {
+            c.record_success(Duration::from_millis(50));
+        }
+        assert!(
+            !c.stop_timeout,
+            "a single cold-start sample must not latch a healthy link off"
+        );
+        assert!(
+            c.deadline().is_some(),
+            "a link whose arithmetic warmup mean is under the escape must be timed"
         );
     }
 
@@ -391,17 +535,26 @@ mod tests {
     #[test]
     fn success_relaxes_deadline_toward_target_slowly() {
         let mut c = DeadlineController::new();
-        // Warm at a high latency so the seed is high, then feed low-latency
-        // successes: the deadline should drift DOWN toward the new target, but
-        // only fractionally per sample (VALUE_EWMA_ALPHA = 0.01).
-        warm(&mut c, Duration::from_millis(1000), WARM_THRESHOLD);
-        let seeded = dl_us(&c); // ≈ 1000ms + 700ms
+        // Seed high off a slow tail (p90 = 3s) while the target (mean+offset) is
+        // far lower, so a healthy run relaxes the deadline DOWN toward the target,
+        // fractionally per sample (VALUE_EWMA_ALPHA = 0.01). Eight fast + two slow
+        // warmup samples: p90 = 3s seed, mean ≈ 680ms → target ≈ 1.38s.
+        for _ in 0..WARM_THRESHOLD - 2 {
+            c.record_success(Duration::from_millis(100));
+        }
+        c.record_success(Duration::from_millis(3000));
+        c.record_success(Duration::from_millis(3000));
+        let seeded = dl_us(&c); // ≈ 3s
+        assert!(
+            (seeded - 3_000_000.0).abs() < 1.0,
+            "precondition: p90 seed = 3s"
+        );
 
         c.record_success(Duration::from_millis(100));
         let after_one = dl_us(&c);
         assert!(
             after_one < seeded,
-            "a faster sample must relax the deadline"
+            "a target below the seed must relax the deadline down"
         );
         // One step moves at most ~1% of the gap: nowhere near the new target.
         let moved_fraction = (seeded - after_one) / seeded;
@@ -442,11 +595,15 @@ mod tests {
         let mut c = DeadlineController::new();
         // ~1000 completions separates the tiers: high needs failed >
         // ceil(1000/100)=11, moderate needs failed > ceil(1000/1000)=2. All
-        // samples are 100ms so mean/target never move — the deadline sits at the
-        // seed (800ms) and only tier bumps can change it.
+        // samples are 100ms, so after the p90 seed (1s) relaxes over ~990
+        // successes the deadline converges to the target (100ms+700ms=800ms);
+        // only tier bumps move it thereafter.
         warm(&mut c, Duration::from_millis(100), 1000);
         let base = dl_us(&c);
-        assert!((base - (100_000.0 + EXPECTED_OFFSET_US)).abs() < 1.0);
+        assert!(
+            (base - (100_000.0 + EXPECTED_OFFSET_US)).abs() < 100.0,
+            "base must converge to the target ≈800ms, got {base}"
+        );
         let issued = c.deadline().unwrap();
 
         // failed=1 (>ceil(1001/1000)=2? no) and failed=2 (>ceil(1002/1000)=2? no)
@@ -530,45 +687,29 @@ mod tests {
 
     // --- escape hatch ---------------------------------------------------------
 
-    #[test]
-    fn escape_via_slow_mean_disables_deadline() {
-        let mut c = DeadlineController::new();
-        // mean + 700ms >= 5s once mean >= 4.3s.
-        warm(&mut c, Duration::from_millis(4500), WARM_THRESHOLD);
-        assert_eq!(
-            c.deadline(),
-            None,
-            "a >=5s target must disable the deadline"
-        );
-    }
-
-    /// Escape is NOT sticky: after a slow window disables the deadline, a healthy
-    /// run must re-arm it. The mean keeps updating on the untimed path, so once
-    /// `mean + offset` falls back under the escape the deadline re-seeds. Critical
-    /// for a client handle shared across a long-lived client's transfers.
+    /// A steady-state escape (widened past 5s by tier bumps) is NOT sticky: a
+    /// healthy run must re-arm the deadline. Distinct from `stop_timeout`, which a
+    /// slow *warmup* latches permanently (see `slow_warmup_never_arms_a_deadline`).
+    /// Critical for a client handle shared across a long-lived client's transfers.
     #[test]
     fn escape_re_arms_after_latency_recovers() {
         let mut c = DeadlineController::new();
-        warm(&mut c, Duration::from_millis(4500), WARM_THRESHOLD);
-        assert_eq!(c.deadline(), None, "precondition: escaped");
+        // Arm at a fast seed, then stack HIGH bumps until the deadline widens past
+        // the 5s escape and disables. Bump-escape does not set stop_timeout, so it
+        // stays re-armable — unlike a slow-warmup escape.
+        warm(&mut c, Duration::from_millis(100), WARM_THRESHOLD);
+        while c.deadline().is_some() {
+            c.record_timeout(c.deadline().unwrap());
+            c.record_timeout(c.deadline().unwrap());
+        }
+        assert_eq!(c.deadline(), None, "precondition: escaped via bumps");
 
-        // A single fast success does not immediately re-arm — the mean (α=1/64)
-        // still carries the slow history, so the target stays above escape.
+        // The mean is still ~100ms (timeouts never feed it), so the next success
+        // re-seeds the deadline at the low target and it re-arms immediately.
         c.record_success(Duration::from_millis(50));
-        assert_eq!(
-            c.deadline(),
-            None,
-            "one fast sample cannot erase a slow mean"
-        );
-
-        // A sustained healthy run pulls the mean down; the deadline re-arms once
-        // mean + offset drops back under the escape threshold. It re-seeds from a
-        // still-elevated mean and damps down (VALUE_EWMA_ALPHA), so it lands well
-        // below escape and tracks toward mean+offset without being pinned to it.
-        warm(&mut c, Duration::from_millis(50), 500);
         let rearmed = c
             .deadline()
-            .expect("a healthy run must re-arm the deadline");
+            .expect("a healthy success must re-arm after a bump escape");
         assert!(
             rearmed.as_micros() as f64 <= 1_500_000.0,
             "re-armed deadline should recover well below the 5s escape, got {rearmed:?}"
