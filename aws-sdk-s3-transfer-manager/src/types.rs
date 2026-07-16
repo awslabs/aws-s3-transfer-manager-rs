@@ -97,6 +97,10 @@ pub enum RuntimeMode {
     /// spawn its own OS threads. This is not a performance tuning knob —
     /// `Managed` is faster by design; prefer it unless you specifically need
     /// the transfer manager to run on your existing runtime.
+    ///
+    /// Requires a multi-threaded runtime: transfer workers run via
+    /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
+    /// thread and throughput collapses.
     CurrentTokio,
 }
 

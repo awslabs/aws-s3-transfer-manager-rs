@@ -277,9 +277,26 @@ impl Client {
                     }
                     Arc::new(builder.build())
                 }
-                RuntimeMode::CurrentTokio => Arc::new(
-                    crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
-                ),
+                RuntimeMode::CurrentTokio => {
+                    // CurrentTokio runs transfer workers on the caller's runtime via
+                    // `tokio::spawn`. On a current-thread runtime they all serialize onto
+                    // the one thread, collapsing throughput with no other symptom. Warn
+                    // loudly rather than let that happen silently.
+                    if matches!(
+                        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                        Ok(tokio::runtime::RuntimeFlavor::CurrentThread)
+                    ) {
+                        tracing::warn!(
+                            target: crate::telemetry::TARGET_SCHEDULING,
+                            "RuntimeMode::CurrentTokio selected on a current-thread runtime; \
+                             transfer workers will serialize onto one thread. Use a \
+                             multi-threaded runtime or RuntimeMode::Managed."
+                        );
+                    }
+                    Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                        weak_handle.clone(),
+                    ))
+                }
             };
 
             let s3_client = match config.take_s3_client_source() {
