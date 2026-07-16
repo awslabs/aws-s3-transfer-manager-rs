@@ -9,30 +9,13 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::TransferStatus;
-use s3_mock_server::S3MockServer;
+use aws_sdk_s3_transfer_manager::types::{RuntimeMode, TransferStatus};
 use tokio::time::timeout;
 
-/// Setup transfer manager with mock server (upload-style: returns server + handle + tm).
-async fn setup() -> (
-    S3MockServer,
-    s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("build mock server");
+use crate::harness::{mock_tm, MockTm};
 
-    let handle = server.start().await.expect("start mock server");
-    let s3_client = handle.client().await;
-
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    (server, handle, tm)
+async fn setup() -> MockTm {
+    mock_tm(RuntimeMode::Managed).await
 }
 
 /// Poll handle status until terminal, with timeout.
@@ -51,12 +34,13 @@ async fn wait_for_terminal(status_fn: impl Fn() -> TransferStatus) {
 
 #[tokio::test]
 async fn test_upload_metrics_and_status() {
-    let (_server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
 
-    let handle = tm
+    let handle = m
+        .client
         .upload()
         .bucket("test-bucket")
         .key("metrics-upload")
@@ -76,12 +60,12 @@ async fn test_upload_metrics_and_status() {
     let output = handle.join().await.expect("join");
     assert_eq!(output.metrics.network_tx, size as u64);
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
 async fn test_upload_from_file_metrics() {
-    let (_server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
     let dir = tempfile::tempdir().unwrap();
@@ -90,7 +74,8 @@ async fn test_upload_from_file_metrics() {
 
     let stream = InputStream::from_path(&file_path).expect("open file");
 
-    let handle = tm
+    let handle = m
+        .client
         .upload()
         .bucket("test-bucket")
         .key("metrics-file-upload")
@@ -108,21 +93,22 @@ async fn test_upload_from_file_metrics() {
     assert_eq!(output.metrics.network_tx, size as u64);
     assert_eq!(output.metrics.disk_read, size as u64);
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
 async fn test_download_metrics_and_status() {
-    let (server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
-    server
+    m.server
         .add_object("test-bucket", "metrics-download", content, None)
         .await
         .expect("add object");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("metrics-download")
@@ -147,17 +133,16 @@ async fn test_download_metrics_and_status() {
     assert_eq!(output.metrics.total_bytes, Some(size as u64));
     assert!(output.metrics.finished_at.is_some());
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 #[cfg(any(unix, windows))]
-#[tokio::test]
-async fn test_download_to_file_metrics() {
-    let (server, server_handle, tm) = setup().await;
+async fn test_download_to_file_metrics(rt: RuntimeMode) {
+    let m = mock_tm(rt).await;
 
     let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
-    server
+    m.server
         .add_object("test-bucket", "metrics-file-download", content, None)
         .await
         .expect("add object");
@@ -165,7 +150,8 @@ async fn test_download_to_file_metrics() {
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("output.dat");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("metrics-file-download")
@@ -182,17 +168,30 @@ async fn test_download_to_file_metrics() {
     assert_eq!(output.metrics.disk_write, size as u64);
     assert_eq!(output.metrics.total_bytes, Some(size as u64));
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_to_file_metrics_mock_gp() {
+    test_download_to_file_metrics(RuntimeMode::Managed).await;
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_download_to_file_metrics_tokio_mt() {
+    test_download_to_file_metrics(RuntimeMode::CurrentTokio).await;
 }
 
 #[tokio::test]
 async fn test_upload_abort_metrics() {
-    let (_server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
 
-    let handle = tm
+    let handle = m
+        .client
         .upload()
         .bucket("test-bucket")
         .key("metrics-abort-upload")
@@ -211,21 +210,22 @@ async fn test_upload_abort_metrics() {
         .expect("abort timed out")
         .expect("abort");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
 async fn test_download_abort_status() {
-    let (server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
-    server
+    m.server
         .add_object("test-bucket", "metrics-abort-download", content, None)
         .await
         .expect("add object");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("metrics-abort-download")
@@ -239,5 +239,5 @@ async fn test_download_abort_status() {
         .await
         .expect("abort timed out");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }

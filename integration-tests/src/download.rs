@@ -6,66 +6,23 @@
 //! Download integration tests.
 
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
-use s3_mock_server::S3MockServer;
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, RuntimeMode};
 
-/// Setup transfer manager with mock server
-async fn setup() -> (
-    S3MockServer,
-    s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("build mock server");
+use crate::harness::{mock_tm, mock_tm_with, MockTm};
 
-    let handle = server.start().await.expect("start mock server");
-    let s3_client = handle.client().await;
-
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    (server, handle, tm)
+async fn setup() -> MockTm {
+    mock_tm(RuntimeMode::Managed).await
 }
 
-/// Setup with custom part size and concurrency
-async fn setup_concurrent(
-    part_size: usize,
-    concurrency: usize,
-) -> (
-    S3MockServer,
-    s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("build mock server");
-
-    let handle = server.start().await.expect("start mock server");
-    let s3_client = handle.client().await;
-
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
-        .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencyMode::Explicit(concurrency))
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    (server, handle, tm)
+async fn setup_concurrent(part_size: usize, concurrency: usize) -> MockTm {
+    mock_tm_with(RuntimeMode::Managed, |b| {
+        b.part_size(PartSize::Target(part_size as u64))
+            .concurrency(ConcurrencyMode::Explicit(concurrency))
+    })
+    .await
 }
 
-/// Setup with custom part size for testing ranged downloads (sequential)
-async fn setup_with_part_size(
-    part_size: usize,
-) -> (
-    S3MockServer,
-    s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
+async fn setup_with_part_size(part_size: usize) -> MockTm {
     setup_concurrent(part_size, 1).await
 }
 
@@ -85,7 +42,7 @@ async fn drain_body(
 #[tokio::test]
 async fn test_download_basic() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_with_part_size(part_size).await;
+    let m = setup_with_part_size(part_size).await;
 
     // Create test data that spans multiple parts (12MB = 3 parts at 5MB)
     let content: Vec<u8> = (0..12 * ByteUnit::Mebibyte.as_bytes_usize())
@@ -93,12 +50,13 @@ async fn test_download_basic() {
         .collect();
     let expected = content.clone();
 
-    server
+    m.server
         .add_object("test-bucket", "test-key", content, None)
         .await
         .expect("add object");
 
-    let mut handle = tm
+    let mut handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("test-key")
@@ -110,21 +68,22 @@ async fn test_download_basic() {
     assert_eq!(body.len(), expected.len(), "size mismatch");
     assert_eq!(body, expected, "data integrity check failed");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test that handle can be dropped without consuming body
 #[tokio::test]
 async fn test_download_body_not_consumed() {
-    let (server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let content = vec![0u8; 16 * ByteUnit::Mebibyte.as_bytes_usize()];
-    server
+    m.server
         .add_object("test-bucket", "test-key", content, None)
         .await
         .expect("add object");
 
-    let mut handle = tm
+    let mut handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("test-key")
@@ -136,22 +95,23 @@ async fn test_download_body_not_consumed() {
     drop(handle);
 
     // If we get here without hanging/panicking, test passes
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test abort cancels in-flight work
 #[tokio::test]
 async fn test_download_abort() {
     let part_size = ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_with_part_size(part_size).await;
+    let m = setup_with_part_size(part_size).await;
 
     let content = vec![0u8; 25 * ByteUnit::Mebibyte.as_bytes_usize()];
-    server
+    m.server
         .add_object("test-bucket", "test-key", content, None)
         .await
         .expect("add object");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("test-key")
@@ -165,15 +125,16 @@ async fn test_download_abort() {
     handle.abort().await;
 
     // If we get here without hanging, abort worked
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test download of non-existent object returns error
 #[tokio::test]
 async fn test_download_not_found() {
-    let (_server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
-    let mut handle = tm
+    let mut handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("non-existent-key")
@@ -183,21 +144,22 @@ async fn test_download_not_found() {
     let result = drain_body(&mut handle).await;
     assert!(result.is_err(), "should fail for non-existent object");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test object metadata is available after discovery
 #[tokio::test]
 async fn test_download_object_meta() {
-    let (server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let content = vec![42u8; ByteUnit::Mebibyte.as_bytes_usize()];
-    server
+    m.server
         .add_object("test-bucket", "test-key", content.clone(), None)
         .await
         .expect("add object");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("test-key")
@@ -211,20 +173,19 @@ async fn test_download_object_meta() {
         "content length should match"
     );
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test concurrent downloads
-#[tokio::test]
-async fn test_download_concurrent() {
-    let (server, server_handle, tm) = setup().await;
+async fn test_download_concurrent(rt: RuntimeMode) {
+    let m = mock_tm(rt).await;
 
     // Add multiple objects directly to server
     for i in 0..5 {
         let content: Vec<u8> = (0..2 * ByteUnit::Mebibyte.as_bytes_usize())
             .map(|j| ((i + j) % 256) as u8)
             .collect();
-        server
+        m.server
             .add_object(
                 "test-bucket",
                 &format!("concurrent-key-{}", i),
@@ -238,7 +199,8 @@ async fn test_download_concurrent() {
     // Start concurrent downloads
     let mut handles = Vec::new();
     for i in 0..5 {
-        let handle = tm
+        let handle = m
+            .client
             .download()
             .bucket("test-bucket")
             .key(format!("concurrent-key-{}", i))
@@ -258,7 +220,17 @@ async fn test_download_concurrent() {
         );
     }
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn test_download_concurrent_mock_gp() {
+    test_download_concurrent(RuntimeMode::Managed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_download_concurrent_tokio_mt() {
+    test_download_concurrent(RuntimeMode::CurrentTokio).await;
 }
 
 /// Generate deterministic data using prime 251 to avoid alignment patterns.
@@ -271,11 +243,11 @@ fn deterministic_data(size: usize) -> Vec<u8> {
 #[tokio::test]
 async fn test_download_write_to_path() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+    let m = setup_concurrent(part_size, 8).await;
 
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "write-to-path-key", content.clone(), None)
         .await
         .expect("add object");
@@ -283,7 +255,8 @@ async fn test_download_write_to_path() {
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("output.dat");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("write-to-path-key")
@@ -305,7 +278,7 @@ async fn test_download_write_to_path() {
         .collect();
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test download to caller-provided file handle (50 MB, 5 MB parts, 8 workers).
@@ -313,11 +286,11 @@ async fn test_download_write_to_path() {
 #[tokio::test]
 async fn test_download_write_to_file() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+    let m = setup_concurrent(part_size, 8).await;
 
     let size = 50 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "write-to-file-key", content.clone(), None)
         .await
         .expect("add object");
@@ -326,7 +299,8 @@ async fn test_download_write_to_file() {
     let file_path = dir.path().join("file_output.dat");
     let file = std::fs::File::create(&file_path).unwrap();
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("write-to-file-key")
@@ -339,7 +313,7 @@ async fn test_download_write_to_file() {
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test ranged download to file path (bytes 10000000-59999999 of 100 MB object).
@@ -347,11 +321,11 @@ async fn test_download_write_to_file() {
 #[tokio::test]
 async fn test_download_write_to_path_ranged() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+    let m = setup_concurrent(part_size, 8).await;
 
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "ranged-key", content.clone(), None)
         .await
         .expect("add object");
@@ -359,7 +333,8 @@ async fn test_download_write_to_path_ranged() {
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("ranged_output.dat");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("ranged-key")
@@ -379,7 +354,7 @@ async fn test_download_write_to_path_ranged() {
         "ranged data integrity check failed"
     );
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Test single-part download to file (2 MB object, 5 MB part size — no range splitting).
@@ -387,11 +362,11 @@ async fn test_download_write_to_path_ranged() {
 #[tokio::test]
 async fn test_download_write_to_path_single_part() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+    let m = setup_concurrent(part_size, 8).await;
 
     let size = 2 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "single-part-key", content.clone(), None)
         .await
         .expect("add object");
@@ -399,7 +374,8 @@ async fn test_download_write_to_path_single_part() {
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("single_part.dat");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("single-part-key")
@@ -413,7 +389,7 @@ async fn test_download_write_to_path_single_part() {
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Integrity stress test: 100 MB, 5 MB parts, 16 concurrent workers.
@@ -422,11 +398,11 @@ async fn test_download_write_to_path_single_part() {
 #[tokio::test]
 async fn test_download_write_to_path_integrity() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 16).await;
+    let m = setup_concurrent(part_size, 16).await;
 
     let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "integrity-key", content.clone(), None)
         .await
         .expect("add object");
@@ -434,7 +410,8 @@ async fn test_download_write_to_path_integrity() {
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("integrity.dat");
 
-    let handle = tm
+    let handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("integrity-key")
@@ -448,7 +425,7 @@ async fn test_download_write_to_path_integrity() {
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "byte-for-byte integrity check failed");
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 // TODO(vnext): integration tests to add
@@ -482,14 +459,15 @@ async fn test_download_write_to_path_integrity() {
 /// Test downloading an empty (0-byte) object completes without hanging.
 #[tokio::test]
 async fn test_download_empty_object() {
-    let (server, server_handle, tm) = setup().await;
+    let m = setup().await;
 
-    server
+    m.server
         .add_object("test-bucket", "empty-key", vec![], None)
         .await
         .expect("add object");
 
-    let mut handle = tm
+    let mut handle = m
+        .client
         .download()
         .bucket("test-bucket")
         .key("empty-key")
@@ -504,7 +482,7 @@ async fn test_download_empty_object() {
 
     assert_eq!(data.len(), 0);
     handle.join().await.expect("join should succeed");
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 // ── Read-ahead window gate: slow-consumer progress ───────────────────────────
@@ -530,17 +508,18 @@ async fn test_download_slow_consumer_does_not_wedge() {
     let part_size = ByteUnit::Mebibyte.as_bytes_usize();
     // 64 parts at 1 MiB, 16-way concurrency: the issuer runs well ahead of the slow
     // in-order consumer, exercising the gate's reopen path repeatedly.
-    let (server, server_handle, tm) = setup_concurrent(part_size, 16).await;
+    let m = setup_concurrent(part_size, 16).await;
 
     let content: Vec<u8> = (0..64 * part_size).map(|i| (i % 256) as u8).collect();
     let expected = content.clone();
-    server
+    m.server
         .add_object("test-bucket", "slow-key", content, None)
         .await
         .expect("add object");
 
     let result = timeout(Duration::from_secs(30), async {
-        let mut handle = tm
+        let mut handle = m
+            .client
             .download()
             .bucket("test-bucket")
             .key("slow-key")
@@ -563,7 +542,7 @@ async fn test_download_slow_consumer_does_not_wedge() {
 
     assert_eq!(result.len(), expected.len(), "size mismatch");
     assert_eq!(result, expected, "data integrity check failed");
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// A disk download whose part count exceeds the read-ahead window must complete.
@@ -583,7 +562,7 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
     use tokio::time::timeout;
 
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+    let m = setup_concurrent(part_size, 8).await;
 
     // 40 parts (200 MiB) against a window of 32 (Parts(31) → 31 speculative + 1
     // demand): the gate fills and must reopen on disk drains. The window spans two
@@ -592,7 +571,7 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
     // minimum part size makes larger objects costly on the test filesystem.
     let size = 40 * part_size;
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "disk-window-key", content.clone(), None)
         .await
         .expect("add object");
@@ -601,7 +580,8 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
     let dest_path = dir.path().join("output.dat");
 
     let written = timeout(Duration::from_secs(30), async {
-        let handle = tm
+        let handle = m
+            .client
             .download()
             .bucket("test-bucket")
             .key("disk-window-key")
@@ -617,7 +597,7 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
 
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Disk download with a read-ahead window *below* the buffer's segment size — the
@@ -635,14 +615,14 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
     use tokio::time::timeout;
 
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let (server, server_handle, tm) = setup_concurrent(part_size, 8).await;
+    let m = setup_concurrent(part_size, 8).await;
 
     // 40 parts against a window of 3 (Parts(2) → 2 speculative + 1 demand), far below
     // the 16-part segment. No segment ever seals within the window, so every drain is a
     // partial run; the gate must still reopen on each run drain or the transfer wedges.
     let size = 40 * part_size;
     let content = deterministic_data(size);
-    server
+    m.server
         .add_object("test-bucket", "disk-subseg-key", content.clone(), None)
         .await
         .expect("add object");
@@ -651,7 +631,8 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
     let dest_path = dir.path().join("output.dat");
 
     let written = timeout(Duration::from_secs(30), async {
-        let handle = tm
+        let handle = m
+            .client
             .download()
             .bucket("test-bucket")
             .key("disk-subseg-key")
@@ -667,7 +648,7 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
 
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
 // ── Global memory budget: concurrent disk transfers below the drain batch ─────
@@ -686,8 +667,7 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
 /// a budget too small to hold them all at once, must all complete. A regression
 /// re-wedges and the timeout fires.
 #[cfg(any(unix, windows))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge() {
+async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: RuntimeMode) {
     use aws_sdk_s3_transfer_manager::types::MemoryBudgetConfig;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -703,25 +683,17 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge() {
     // reachable, while leaving room for a few resident parts per transfer.
     let budget_bytes = 8 * 8 * ByteUnit::Mebibyte.as_bytes_usize();
 
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("build mock server");
-    let server_handle = server.start().await.expect("start mock server");
-    let s3_client = server_handle.client().await;
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3_client)
-            .part_size(PartSize::Target(part_size as u64))
+    let m = mock_tm_with(rt, |b| {
+        b.part_size(PartSize::Target(part_size as u64))
             .concurrency(ConcurrencyMode::Explicit(transfers))
             .memory_budget(MemoryBudgetConfig::Limit(budget_bytes))
-            .build(),
-    );
+    })
+    .await;
 
     let mut expected = Vec::with_capacity(transfers);
     for i in 0..transfers {
         let content = deterministic_data(object_size);
-        server
+        m.server
             .add_object("test-bucket", &format!("obj-{i}"), content.clone(), None)
             .await
             .expect("add object");
@@ -732,7 +704,7 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge() {
     let results = timeout(Duration::from_secs(30), async {
         let mut tasks = Vec::with_capacity(transfers);
         for i in 0..transfers {
-            let tm = tm.clone();
+            let tm = m.client.clone();
             let dest = dir.path().join(format!("out-{i}.dat"));
             tasks.push(tokio::spawn(async move {
                 let handle = tm
@@ -762,5 +734,17 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge() {
         assert_eq!(got.len(), want.len(), "obj-{i} size mismatch");
         assert_eq!(got, want, "obj-{i} data integrity check failed");
     }
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_mock_gp() {
+    test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::Managed).await;
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_tokio_mt() {
+    test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::CurrentTokio).await;
 }

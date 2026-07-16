@@ -7,37 +7,23 @@
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use s3_mock_server::S3MockServer;
+use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 
-/// Setup transfer manager with mock server
-async fn setup() -> (
-    s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("build mock server");
+use crate::harness::{mock_tm, MockTm};
 
-    let handle = server.start().await.expect("start mock server");
-    let s3_client = handle.client().await;
-
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-
-    (handle, tm)
+async fn setup() -> MockTm {
+    mock_tm(RuntimeMode::Managed).await
 }
 
 #[tokio::test]
 async fn test_mpu_upload_small_file() {
-    let (server_handle, tm) = setup().await;
+    let m = setup().await;
 
     let content = vec![0u8; 16 * ByteUnit::Mebibyte.as_bytes_usize()]; // 16MB = 2 parts at 8MB default
     let expected_content = content.clone();
 
-    let upload_handle = tm
+    let upload_handle = m
+        .client
         .upload()
         .bucket("test-bucket")
         .key("test-key")
@@ -52,9 +38,7 @@ async fn test_mpu_upload_small_file() {
         "should have upload_id for MPU"
     );
 
-    // TODO(redux): Use mock server's get_object API instead of going through S3 client
-    // once that API is available on ServerHandle
-    let s3_client = server_handle.client().await;
+    let s3_client = m.handle.client().await;
     let get_result = s3_client
         .get_object()
         .bucket("test-bucket")
@@ -66,12 +50,11 @@ async fn test_mpu_upload_small_file() {
     let body = get_result.body.collect().await.expect("collect body");
     assert_eq!(body.to_vec(), expected_content);
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
 
-#[tokio::test]
-async fn test_mpu_upload_concurrent() {
-    let (server_handle, tm) = setup().await;
+async fn test_mpu_upload_concurrent(rt: RuntimeMode) {
+    let m = mock_tm(rt).await;
 
     let mut handles = Vec::new();
 
@@ -80,7 +63,8 @@ async fn test_mpu_upload_concurrent() {
         let content = vec![i as u8; 8 * ByteUnit::Mebibyte.as_bytes_usize()];
         let key = format!("concurrent-key-{}", i);
 
-        let upload_handle = tm
+        let upload_handle = m
+            .client
             .upload()
             .bucket("test-bucket")
             .key(&key)
@@ -102,12 +86,22 @@ async fn test_mpu_upload_concurrent() {
         );
     }
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn test_mpu_upload_concurrent_mock_gp() {
+    test_mpu_upload_concurrent(RuntimeMode::Managed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpu_upload_concurrent_tokio_mt() {
+    test_mpu_upload_concurrent(RuntimeMode::CurrentTokio).await;
 }
 
 #[tokio::test]
 async fn test_upload_verify_data_integrity() {
-    let (server_handle, tm) = setup().await;
+    let m = setup().await;
 
     // Create content with recognizable pattern
     let content: Vec<u8> = (0..24 * ByteUnit::Mebibyte.as_bytes_usize()) // 24MB = 3 parts
@@ -115,7 +109,8 @@ async fn test_upload_verify_data_integrity() {
         .collect();
     let expected_content = content.clone();
 
-    let upload_handle = tm
+    let upload_handle = m
+        .client
         .upload()
         .bucket("test-bucket")
         .key("integrity-test")
@@ -125,9 +120,7 @@ async fn test_upload_verify_data_integrity() {
 
     upload_handle.join().await.expect("upload complete");
 
-    // TODO(redux): Use mock server's get_object API instead of going through S3 client
-    // once that API is available on ServerHandle
-    let s3_client = server_handle.client().await;
+    let s3_client = m.handle.client().await;
     let get_result = s3_client
         .get_object()
         .bucket("test-bucket")
@@ -143,5 +136,5 @@ async fn test_upload_verify_data_integrity() {
         "data integrity check failed"
     );
 
-    server_handle.shutdown().await.expect("shutdown");
+    m.handle.shutdown().await.expect("shutdown");
 }
