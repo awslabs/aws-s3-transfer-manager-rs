@@ -120,8 +120,11 @@ impl UploadObjectsInputBuilder {
             key_prefix: self.key_prefix,
             delimiter: self.delimiter,
             failure_policy: self.failure_policy,
+            // Clamp to 1: an explicit 0 would wedge the transfer by never
+            // admitting children (mirrors the global ConcurrencyMode::Explicit guard).
             max_concurrent_uploads: self
                 .max_concurrent_uploads
+                .map(|n| n.max(1))
                 .unwrap_or(crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN),
         })
     }
@@ -248,5 +251,49 @@ impl UploadObjectsInputBuilder {
     /// child upload transfers, if any.
     pub fn get_max_concurrent_uploads(&self) -> Option<usize> {
         self.max_concurrent_uploads
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_concurrent_uploads_zero_clamped_to_one() {
+        let input = UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source("/tmp/test")
+            .max_concurrent_uploads(0)
+            .build()
+            .expect("valid input");
+        assert_eq!(
+            1,
+            input.max_concurrent_uploads(),
+            "an explicit 0 must be clamped to 1 to avoid wedging the transfer"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_uploads_none_uses_default() {
+        let input = UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source("/tmp/test")
+            .build()
+            .expect("valid input");
+        assert_eq!(
+            crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN,
+            input.max_concurrent_uploads(),
+        );
+    }
+
+    #[test]
+    fn max_concurrent_uploads_nonzero_preserved() {
+        let input = UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source("/tmp/test")
+            .max_concurrent_uploads(4)
+            .build()
+            .expect("valid input");
+        assert_eq!(4, input.max_concurrent_uploads());
     }
 }

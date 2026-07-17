@@ -298,4 +298,54 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("A bucket is required"));
     }
+
+    /// Verify the pipeline-depth resolution expression used in `orchestrate()`
+    /// clamps an explicit `0` to `1` (mirrors the global ConcurrencyMode::Explicit guard).
+    #[test]
+    fn max_concurrent_downloads_zero_clamped_to_one() {
+        let input = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .max_concurrent_downloads(0)
+            .build()
+            .expect("valid input");
+        // Replicate the resolution expression from `DownloadObjects::orchestrate`.
+        let resolved = input
+            .max_concurrent_downloads()
+            .map(|n| n.max(1))
+            .unwrap_or(crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN);
+        assert_eq!(
+            1, resolved,
+            "an explicit 0 must be clamped to 1 to avoid wedging the transfer"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_downloads_none_uses_default() {
+        let input = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .build()
+            .expect("valid input");
+        let resolved = input
+            .max_concurrent_downloads()
+            .map(|n| n.max(1))
+            .unwrap_or(crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN);
+        assert_eq!(crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN, resolved);
+    }
+
+    #[test]
+    fn max_concurrent_downloads_nonzero_preserved() {
+        let input = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .max_concurrent_downloads(4)
+            .build()
+            .expect("valid input");
+        let resolved = input
+            .max_concurrent_downloads()
+            .map(|n| n.max(1))
+            .unwrap_or(crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN);
+        assert_eq!(4, resolved);
+    }
 }

@@ -315,7 +315,7 @@ impl Client {
         self.handle.memory_budget.stats()
     }
 
-    /// Upload a single object from S3.
+    /// Upload a single object to S3.
     ///
     /// Constructs a fluent builder for the
     /// [`Upload`](crate::operation::upload::builders::UploadFluentBuilder) operation.
@@ -373,8 +373,11 @@ impl Client {
     ///         .key("my-key")
     ///         .initiate()?;
     ///
-    ///     // process data off handle...
-    ///
+    ///     // initiate() will return before the transfer is complete.
+    ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
+    ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
+    ///     let response = handle.join().await?;
+    ///     // ... do something with response
     ///     Ok(())
     /// }
     /// ```

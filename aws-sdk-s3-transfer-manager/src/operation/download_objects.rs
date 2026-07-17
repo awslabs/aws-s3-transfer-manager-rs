@@ -49,8 +49,11 @@ impl DownloadObjects {
             .bucket()
             .ok_or_else(|| crate::error::invalid_input("bucket is required"))?
             .to_string();
+        // Clamp to 1: an explicit 0 would wedge the transfer by never
+        // admitting children (mirrors the global ConcurrencyMode::Explicit guard).
         let pipeline_depth = input
             .max_concurrent_downloads()
+            .map(|n| n.max(1))
             .unwrap_or(super::DEFAULT_MAX_CONCURRENT_CHILDREN);
 
         let walker = input.walker().cloned().unwrap_or_else(|| {

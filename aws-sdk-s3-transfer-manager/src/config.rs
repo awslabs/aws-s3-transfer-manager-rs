@@ -190,7 +190,7 @@ impl Builder {
 
     /// The target size of each part when using a multipart upload to complete the request.
     ///
-    /// When a request's content length is les than [`multipart_threshold`],
+    /// When a request's content length is less than [`multipart_threshold`],
     /// this setting is ignored and a single [`PutObject`] request will be made instead.
     ///
     /// NOTE: The actual part size used may be larger than the configured part size if

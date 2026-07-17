@@ -6,6 +6,7 @@
 use crate::metrics::{unit::ByteUnit, Throughput};
 
 /// The target part size for an upload or download request.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
     /// Automatically configure an optimal target part size based on the execution environment.
@@ -38,7 +39,7 @@ pub enum MemoryBudgetConfig {
     /// An explicit byte limit. Bypasses detection. A value below one accounting
     /// chunk (8 MiB) is raised to a single chunk when the budget is built, since a
     /// smaller budget would serialize transfers. Use the
-    /// [`ByteUnit`](crate::metrics::unit::ByteUnit) helpers to express it, e.g.
+    /// [`ByteUnit`] helpers to express it, e.g.
     /// `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
     Limit(usize),
 }
@@ -178,6 +179,7 @@ impl TargetThroughput {
 /// Policy for how to handle a failed multipart upload
 ///
 /// Default is to abort the upload.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum FailedMultipartUploadPolicy {
     /// Abort the upload on any individual part failure
@@ -211,10 +213,11 @@ impl AbortedUpload {
     }
 }
 
-/// Policy for how to handle a failure of any indiviudal object in a transfer
+/// Policy for how to handle a failure of any individual object in a transfer
 /// involving multiple objects.
 ///
 /// Default is to abort the transfer.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum FailedTransferPolicy {
     /// Abort the transfer on any individual failure to upload or download an object
