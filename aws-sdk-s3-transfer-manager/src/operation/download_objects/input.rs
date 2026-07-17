@@ -44,7 +44,7 @@ pub struct DownloadObjectsInput {
     /// Acts as a memory backstop: the scheduler's hierarchical fair-share
     /// scheduling drives throughput and rate-limits the walker naturally,
     /// so this knob primarily bounds the working-set size of in-flight
-    /// child handles. Defaults to 4096.
+    /// child handles. Defaults to 512.
     pub max_concurrent_downloads: Option<usize>,
 }
 
@@ -220,7 +220,7 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// Per-request cap on concurrently-materialized child download transfers.
-    /// Defaults to 4096.
+    /// Defaults to 512.
     pub fn max_concurrent_downloads(mut self, input: usize) -> Self {
         self.max_concurrent_downloads = Some(input);
         self

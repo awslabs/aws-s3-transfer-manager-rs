@@ -178,12 +178,50 @@ impl IoRequest {
 #[derive(Debug)]
 pub(crate) enum PollWork {
     /// Work is available to execute.
-    Ready(IoRequest),
+    ///
+    /// `spawned` records whether this same poll ALSO spawned a child (a
+    /// composite that reaped terminal children and refilled in one turn). When
+    /// true, the scheduler dispatches `io` as usual (one dispatch ticket, full
+    /// `work_generated`) AND additionally charges one spawn's reduced vruntime
+    /// ([`work_generated_spawn`]) -- WITHOUT an extra dispatch ticket, since the
+    /// spawned child accounts for itself when later polled (the `Spawned`
+    /// contract). It is a bool, not a count: single-ticket spawning means a poll
+    /// spawns at most one child. Non-composite transfers always set it false;
+    /// use [`PollWork::ready`] for that common case.
+    ///
+    /// Fusing reap and spawn into one poll lets a composite retire a terminal
+    /// child and spawn its replacement in the same turn instead of alternating
+    /// turns, so a continuous completion stream cannot starve refill by
+    /// monopolizing the parent's poll turns with reaping.
+    ///
+    /// [`work_generated_spawn`]: crate::scheduler::descriptor::TransferDescriptor::work_generated_spawn
+    Ready { io: IoRequest, spawned: bool },
+    /// The transfer enqueued one child transfer into the scheduler this poll. It
+    /// produced no dispatchable `IoRequest` and is not blocked: re-poll while
+    /// capacity remains (next poll may spawn again, block, or complete). Distinct
+    /// from `Ready` (which carries a work item and consumes a dispatch ticket) --
+    /// `Spawned` dispatches nothing and does not count against the concurrency
+    /// target; the spawned child accounts for itself when it is later polled. The
+    /// scheduler charges spawn vruntime (the reduced [`work_generated_spawn`]
+    /// cost) so a composite parent stays scheduling-competitive with its
+    /// children.
+    ///
+    /// [`work_generated_spawn`]: crate::scheduler::descriptor::TransferDescriptor::work_generated_spawn
+    Spawned,
     /// Transfer is blocked waiting for in-flight work to complete.
     /// Scheduler should not poll again until `wake(transfer_id)` is called.
     Pending,
     /// Transfer has completed all work.
     Done,
+}
+
+impl PollWork {
+    /// Construct a `Ready` that dispatched work but did not spawn a child --
+    /// the common case for non-composite transfers and for composite polls that
+    /// only reaped. Equivalent to `Ready { io, spawned: false }`.
+    pub(crate) fn ready(io: IoRequest) -> Self {
+        PollWork::Ready { io, spawned: false }
+    }
 }
 
 /// Result of executing a work item.

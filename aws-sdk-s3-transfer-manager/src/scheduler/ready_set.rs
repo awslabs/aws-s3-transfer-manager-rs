@@ -466,9 +466,10 @@ impl ReadySet {
 
     /// Test-only helper: advance a group's `group_vruntime` by `units`.
     ///
-    /// Useful when a test wants to set up a specific gv state without
-    /// running through pop. Production code does not need to call this:
-    /// `pop` advances gv as part of running-cost accounting.
+    /// Useful when a test wants to set up a specific gv state directly.
+    /// Production code does not need to call this: `group_vruntime` is advanced
+    /// by `work_generated`/`work_generated_spawn` when a member generates work,
+    /// not by `pop` (which advances only the `min_vruntime` floor).
     /// No-op if `group_id` is not found.
     #[cfg(test)]
     pub(super) fn advance_group_vruntime(&self, group_id: u64, units: u64) {
