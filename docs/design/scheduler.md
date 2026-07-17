@@ -107,10 +107,11 @@ pub(crate) trait Transfer: Send + Sync {
 }
 ```
 
-`poll_work()` returns `Ready(work)`, `Pending`, or `Done`. `execute(work)` returns `Success`,
-`Failed`, or `Cancelled`. The scheduler calls `poll_work()` when it has capacity and the transfer
-is in the ready set; it never calls `poll_work()` on a transfer that returned `Pending` until that
-transfer is explicitly woken.
+`poll_work()` returns `Ready { io, spawned }` (a work item to dispatch, optionally fused with a
+child spawn), `Spawned` (a composite enqueued one child, no work item), `Pending`, or `Done`.
+`execute(work)` returns `Success`, `Failed`, or `Cancelled`. The scheduler calls `poll_work()` when
+it has capacity and the transfer is in the ready set; it never calls `poll_work()` on a transfer
+that returned `Pending` until that transfer is explicitly woken.
 
 **Lazy generation.** Transfers produce work on demand, not all upfront. A 10,000-part upload
 generates one work item per `poll_work()` call. Memory and in-flight work are naturally bounded
@@ -137,18 +138,34 @@ own state machine. Upload of a directory and download of a prefix are the
 current examples. A composite is both a consumer of `poll_work` calls and a
 producer of transfers in the same call stack.
 
-A leaf `poll_work` is O(1); a composite `poll_work` is `O(batch x enqueue_cost)` 
-where the batch is the number of children it spawns per call (`SPAWN_BATCH_SIZE`
-caps this at 32). The scheduler groups a composite and all its descendants into
-a single scheduling entity at the root level (see "Fair Scheduling" below), so
-a composite's fan-out does not affect its share of dispatch relative to peers.
+A composite `poll_work` spawns **at most one child per call** and returns
+`PollWork::Spawned`: the scheduler charges the spawn against the parent's
+virtual runtime, re-inserts the parent under its held claim, and re-polls it
+while dispatch capacity remains — so child materialization tracks the
+concurrency target implicitly rather than a per-call batch. Both leaf and
+composite `poll_work` are therefore O(1): one claim, one spawn, one merge.
 
-The `max_concurrent_uploads` knob on composite transfers is a per-request
-memory cap: how many children may be simultaneously materialized. It does not
-control scheduling rate (the hierarchical CFS handles that). Memory cost
-scales with this bound; the default (10000) is large enough that the scheduler's
-fair-share rate-limiting naturally keeps the working set well below it for
-typical workloads.
+`PollWork::Spawned` dispatches no work item and consumes no dispatch ticket;
+the spawned child accounts for its own ticket when it is later polled to
+`Ready`. This is what keeps a composite from starving its own children under a
+tight concurrency target — if a spawn consumed a ticket, a composite could fill
+every slot with spawns and leave no capacity to poll those children into real
+work. Spawn and reap fuse: a `Ready { spawned: true }` poll both dispatches a
+child-reaping work item and charges a spawn in one call, so a steady stream of
+child completions cannot crowd out refill.
+
+The scheduler groups a composite and all its descendants into a single
+scheduling entity at the root level (see "Fair Scheduling" below), so a
+composite's fan-out does not affect its share of dispatch relative to peers.
+
+The **max composite children** cap (`DEFAULT_MAX_CONCURRENT_CHILDREN`, default
+512) bounds how many children a composite may have materialized at once, shared
+by directory upload and download alike. It is a memory backstop, not the
+operating point: hierarchical CFS governs the steady-state spawn rate, and the
+fair-share rate-limiting keeps the working set well below the cap for typical
+workloads. Directory listing is gated separately, on a low-water mark in the
+discovered-key buffer, so discovery runs ahead of spawning without being
+coupled to the child cap.
 
 ### Fair Scheduling
 
@@ -169,12 +186,15 @@ advances by `vruntime_delta_for_priority(member.priority)`. This mirrors Linux C
 accounting: when a task in a cgroup runs, the cgroup entity itself runs. The priority-scaled delta
 means a higher-priority group advances more slowly and wins more dispatch share at the root.
 
-**Priority scaling.** Virtual runtime advances by `(WORK_COST * PRIORITY_SCALE) / priority` per
-unit of work. `WORK_COST = 128` is the base cost; `PRIORITY_SCALE = 256` is a precision-preserving
-multiplier that prevents integer division from collapsing to zero at high priorities. A priority-255
-transfer accumulates vruntime at rate 128 per work unit; a priority-1 transfer at rate 32768.
-The ratio gives priority-255 roughly 256x the scheduling share of priority-1, but priority-1 still
-makes progress because its vruntime stays low while it waits.
+**Priority scaling.** Virtual runtime advances by `(cost * PRIORITY_SCALE) / priority` per unit of
+work. `IO_WORK_COST = 128` is the base cost charged when a transfer dispatches one unit of IO work;
+`PRIORITY_SCALE = 256` is a precision-preserving multiplier that prevents integer division from
+collapsing to zero at high priorities. A priority-255 transfer accumulates vruntime at rate 128 per
+IO work unit; a priority-1 transfer at rate 32768. The ratio gives priority-255 roughly 256x the
+scheduling share of priority-1, but priority-1 still makes progress because its vruntime stays low
+while it waits. A composite spawning a child is charged `SPAWN_WORK_COST = 64` — half the IO cost —
+so spawn cadence enters CFS as a first-class cost rather than being governed by a batch constant
+(see "Spawn-cost accounting").
 
 New transfers start at the current minimum virtual runtime across all active groups, preventing
 a newly enqueued transfer from monopolizing the scheduler while it "catches up." Groups that
@@ -291,9 +311,16 @@ poller and mutator:
   calls `scheduler.wake(id)` only if the flag was set. Spurious calls are
   cheap: the swap is a single atomic op.
 
-A second layer at the scheduler protects `generate_work` itself against wakes
-that arrive while it is releasing a descriptor's claim after a `Pending`
-return. See "Concurrency and Threading" below.
+A second layer guards `generate_work` itself. Work generation runs
+**single-runner**: one runner drains generation passes while concurrent wakes
+coalesce onto it via a request epoch, rather than each wake starting a competing
+pass. Single-runner generation is what makes CFS ordering exact — the
+pop-highest-priority / dispatch / re-insert loop is never interleaved across
+threads — and it closes the lost-wake window when a runner releases its claim
+after a `Pending` return: a wake arriving mid-release bumps the epoch, and the
+runner re-checks the epoch before retiring rather than exiting with work left
+unqueued. Parallel fill of the submission queue is a deliberate non-goal today;
+see [Future Work](#future-work).
 
 ### Cancellation
 
@@ -377,14 +404,16 @@ hot path of every execution thread.
 
 **`poll_work` is O(1) per call.** The leaf case (upload, download) touches
 transfer state under a short critical section and returns immediately.
-Composite transfers pay `O(batch × enqueue_cost)` when they spawn children;
-the batch size must be bounded by the composite (e.g. a per-call bound).
+Composite transfers spawn at most one child per call — a single claim,
+orchestrate, and enqueue — so they are O(1) too; spawn throughput across a
+generation pass comes from the scheduler re-polling the parent while capacity
+remains, not from batching inside one poll.
 
 **`enqueue_transfer` is O(1) but not free.** Inserts into the ready set,
-writes to the transfers map, and conditionally drives `generate_work`. At
-typical fan-out rates the cost is a few microseconds; at batch scale
-(up to `SPAWN_BATCH_SIZE` per composite `poll_work` call) the aggregate
-cost is still bounded but non-trivial.
+writes to the transfers map, and conditionally drives `generate_work`. A
+composite calls it once per `poll_work`, so the per-poll cost is one enqueue;
+the aggregate over a pass is bounded by the concurrency target that gates how
+many times the parent is re-polled.
 
 **`on_completion` is O(1) + one `generate_work` pass.** The generate_work
 pass pops at most the number of descriptors that fit under the current
@@ -515,9 +544,8 @@ caller still owns the claim.
 ### Bounded per-call cost
 
 **Invariant.** `poll_work` is O(1) per call with a bounded critical
-section. A composite transfer whose `poll_work` recursively calls
-`enqueue_transfer` pays `O(batch × enqueue_cost)` and must bound `batch`
-explicitly.
+section. A composite transfer's `poll_work` spawns at most one child per
+call, so it is O(1) as well — there is no per-call batch to bound.
 
 **What it rules out.** A loop inside `poll_work` whose termination depends
 on exhausting an input queue (pending directory entries, retry buffer,
@@ -527,10 +555,11 @@ executing scheduler code and not polling its runtime; other transfers
 cannot be polled. At high concurrency this converges on runtime
 starvation.
 
-**Mechanism.** Composite transfers carry an explicit per-poll batch cap
-(`SPAWN_BATCH_SIZE = 32`) and a per-request memory cap (`max_concurrent_uploads`)
-that together bound the loop. Any `while`/`loop` inside a `poll_work`
-implementation is a place to audit against this invariant.
+**Mechanism.** A composite spawns at most one child per `poll_work` call and
+returns immediately (`Spawned`), so there is no spawn loop to bound — per-call
+cost is structurally O(1). The max-children cap (default 512) is a backstop on
+total materialized children, not a per-call bound. Any `while`/`loop` inside a
+`poll_work` implementation is a place to audit against this invariant.
 
 ### Design choice: scheduler work on the execution thread
 
@@ -563,11 +592,15 @@ group at the root. Both groups advance `group_vruntime` at the same rate
 Within the composite's group, children compete against each other and
 against the composite itself via individual vruntime.
 
-**Spawn-cost accounting.** When a composite spawns a child, the parent's
-individual vruntime advances by one work unit. This pushes the parent
-down within its own group's inner queue so children (which have actual
-work to execute) pop before the parent (which would just return Pending).
-The group's `group_vruntime` is not advanced on spawn - only on pop.
+**Spawn-cost accounting.** When a composite spawns a child, both the parent's
+individual vruntime and its group's `group_vruntime` advance by
+`vruntime_delta_for_cost(SPAWN_WORK_COST, priority)` — the priority-scaled
+formula at half the IO cost. Charging the group makes a composite's spawn
+cadence visible to cross-group fairness: a spawn-heavy composite accrues group
+vruntime faster and self-limits its dispatch share against peers. The reduced
+individual charge (half the IO cost) keeps the parent scheduling-competitive
+with its own children, so it wins enough poll turns to keep the pipeline
+refilled rather than spawning in bursts and stalling.
 
 **Alternative considered: flat peer model.** The prior design treated
 children as independent peers at the root level. A composite with N
@@ -582,10 +615,6 @@ expectations and the Linux cgroup analogy.
 
 ## Future Work
 
-**Hedging.** Speculative retry of slow requests. Two options: scheduler duplicates the work item
-(both compete, loser cancelled), or execution layer races two HTTP requests within a single work
-item. Needs design when we get there.
-
 **Request consolidation.** Merging overlapping byte range requests. Transfer-level concern.
 
 **Placement and NUMA awareness.** Execution layer concern. The scheduler generates work; the
@@ -593,3 +622,9 @@ execution layer decides which thread/core/NIC runs it based on affinity hints in
 
 **Batching.** Time-based, count-based, or opportunistic batching for io_uring submissions and
 vectored I/O. Depends on workload characteristics.
+
+**Parallel submission-queue fill.** Generation is single-runner today, which makes priority ordering
+exact at the cost of serializing the pop / dispatch / re-insert loop. At very high dispatch rates
+that serialization is a potential throughput ceiling. Parallel fill — multiple runners generating
+concurrently, trading some ordering precision for throughput — is the known evolution; the
+single-runner epoch gate is the seam that would change to support it.
