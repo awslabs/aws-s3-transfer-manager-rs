@@ -449,6 +449,12 @@ impl UploadTransfer {
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "upload-part",
+            tid = %self.inner.ctx.id,
+            part_number
+        ))
         .await;
         let resp = match result {
             Ok(resp) => resp,
@@ -594,6 +600,11 @@ impl UploadTransfer {
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "put-object",
+            tid = %transfer_id
+        ))
         .await;
         let resp = match result {
             Ok(resp) => {

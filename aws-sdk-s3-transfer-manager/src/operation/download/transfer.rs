@@ -27,6 +27,7 @@ use crate::operation::download::DownloadInput;
 use crate::runtime::memory::{NotifyFn, Reservation, Reserve};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
+use tracing::Instrument;
 
 /// Download-specific work data.
 #[derive(Debug)]
@@ -767,6 +768,11 @@ impl DownloadTransfer {
                     .map_err(crate::retry::GuardError::Inner)
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download-part",
+            tid = %self.id()
+        ))
         .await;
 
         let (segmented, bytes_received) = match result {
@@ -919,6 +925,11 @@ impl DownloadTransfer {
                 ))
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download-part-reissue",
+            tid = %self.id()
+        ))
         .await;
 
         let (chunk_meta, segmented, bytes_received) = match result {

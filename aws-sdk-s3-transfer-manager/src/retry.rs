@@ -169,9 +169,19 @@ where
                 // iterations).
                 let free_hedge = is_hedge && !hedged;
                 // Select the backoff by retry reason; both share MAX_ATTEMPTS.
-                let backoff = match classify(&ge) {
+                let decision = classify(&ge);
+                let backoff = match decision {
                     RetryDecision::NoRetry => return Err(into_error(ge)),
-                    _ if !free_hedge && attempt >= MAX_ATTEMPTS => return Err(into_error(ge)),
+                    _ if !free_hedge && attempt >= MAX_ATTEMPTS => {
+                        tracing::debug!(
+                            target: crate::telemetry::TARGET_TRANSFER,
+                            attempts = attempt,
+                            max_attempts = MAX_ATTEMPTS,
+                            cause = %retry_cause(&ge),
+                            "retry budget exhausted, returning last error"
+                        );
+                        return Err(into_error(ge));
+                    }
                     RetryDecision::Retry => &transient,
                     RetryDecision::RetryThrottle => &throttle,
                 };
@@ -179,9 +189,27 @@ where
                 // failure, so the first backoff uses 2^0. A free hedge reissues at
                 // the current index without advancing it, so genuine retries keep
                 // their normal backoff progression.
+                let delay = backoff.delay(attempt - 1, fastrand::f64());
+                if free_hedge {
+                    tracing::debug!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        backoff_ms = delay.as_millis() as u64,
+                        "hedging request after latency deadline (free reissue)"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        throttled = matches!(decision, RetryDecision::RetryThrottle),
+                        backoff_ms = delay.as_millis() as u64,
+                        cause = %retry_cause(&ge),
+                        "retrying operation"
+                    );
+                }
                 // The backoff sleep binds to tokio directly rather than the
                 // runtime's `AsyncSleep`, so the loop requires a tokio reactor.
-                tokio::time::sleep(backoff.delay(attempt - 1, fastrand::f64())).await;
+                tokio::time::sleep(delay).await;
                 if is_hedge {
                     hedged = true;
                 }
@@ -208,6 +236,16 @@ fn into_error(ge: GuardError<Error>) -> Error {
             ),
         ),
         GuardError::Inner(e) => e,
+    }
+}
+
+/// Render the cause of a failed attempt for retry log events. `Error`'s
+/// `Display` prints only its own context (kind, operation, service error code,
+/// request ids), not object keys, buckets, urls, or credentials.
+fn retry_cause(ge: &GuardError<Error>) -> String {
+    match ge {
+        GuardError::DeadlineExceeded(dl) => format!("deadline exceeded ({}ms)", dl.as_millis()),
+        GuardError::Inner(e) => e.to_string(),
     }
 }
 

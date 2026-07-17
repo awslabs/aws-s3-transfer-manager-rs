@@ -179,6 +179,11 @@ async fn discover_obj_with_get_first_part(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        "discover-get-first-part",
+        tid = %transfer.ctx().id
+    ))
     .await?;
     first_chunk_response_handler(resp, None)
 }
@@ -208,6 +213,11 @@ async fn discover_obj_with_head(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        "discover-head",
+        tid = %transfer.ctx().id
+    ))
     .await?;
     let object_meta: ObjectMetadata = resp.into();
 
@@ -253,6 +263,11 @@ async fn discover_obj_with_get(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        "discover-ranged-get",
+        tid = %transfer.ctx().id
+    ))
     .await;
     match result {
         Err(error) if error.code() == Some("InvalidRange") && range_from_user.is_none() => {
