@@ -92,6 +92,16 @@ impl WorkerPool {
     /// Pull next work item. Returns None on shutdown.
     pub(super) async fn next_work(&self) -> Option<ScheduledWork> {
         loop {
+            // Register for notification BEFORE observing shutdown/queue state.
+            // `shutdown` wakes workers with `notify_waiters`, which stores no
+            // permit: a worker that checked the state and then parked on a
+            // freshly-created `notified()` would miss a wake that fired in the
+            // gap and block forever. Creating the `Notified` future first closes
+            // that window -- a notify after this point is delivered to the
+            // already-registered future, so the `await` returns and the loop
+            // re-checks shutdown.
+            let notified = self.work_available.notified();
+
             if self.shutdown.load(Ordering::Acquire) {
                 return None;
             }
@@ -102,7 +112,7 @@ impl WorkerPool {
                     return Some(work);
                 }
             }
-            self.work_available.notified().await;
+            notified.await;
         }
     }
 

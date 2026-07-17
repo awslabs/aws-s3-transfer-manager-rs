@@ -167,7 +167,7 @@ impl UploadTransfer {
     /// Poll for the next work item.
     ///
     /// Returns:
-    /// - `PollWork::Ready(work)` - work available to execute
+    /// - `PollWork::Ready { .. }` - work available to execute
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     pub(crate) fn poll_work(&self) -> PollWork {
@@ -192,13 +192,13 @@ impl UploadTransfer {
                     || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
                 if use_mpu {
                     *init_in_flight = true;
-                    PollWork::Ready(IoRequest {
+                    PollWork::ready(IoRequest {
                         data: Some(Box::new(UploadWork::CreateMPU)),
                     })
                 } else {
                     let taken_stream = stream.take().expect("stream already taken");
                     *state = UploadState::PutObjectInFlight;
-                    PollWork::Ready(IoRequest {
+                    PollWork::ready(IoRequest {
                         data: Some(Box::new(UploadWork::PutObject {
                             stream: Some(taken_stream),
                         })),
@@ -239,7 +239,7 @@ impl UploadTransfer {
                 }
                 *parts_dispatched += 1;
                 *parts_in_flight += 1;
-                PollWork::Ready(IoRequest {
+                PollWork::ready(IoRequest {
                     data: Some(Box::new(UploadWork::UploadPart)),
                 })
             }
@@ -251,7 +251,7 @@ impl UploadTransfer {
                     return PollWork::Pending;
                 }
                 *complete_in_flight = true;
-                PollWork::Ready(IoRequest {
+                PollWork::ready(IoRequest {
                     data: Some(Box::new(UploadWork::CompleteMPU)),
                 })
             }
@@ -449,6 +449,12 @@ impl UploadTransfer {
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "upload-part",
+            tid = %self.inner.ctx.id,
+            part_number
+        ))
         .await;
         let resp = match result {
             Ok(resp) => resp,
@@ -594,6 +600,11 @@ impl UploadTransfer {
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "put-object",
+            tid = %transfer_id
+        ))
         .await;
         let resp = match result {
             Ok(resp) => {

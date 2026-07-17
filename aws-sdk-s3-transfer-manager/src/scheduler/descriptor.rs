@@ -89,26 +89,62 @@ use claim::ClaimState;
 
 /// Default priority assigned to new transfers
 const DEFAULT_PRIORITY: u8 = 128;
-/// Fixed work cost per unit of generated work
-pub(super) const WORK_COST: u64 = 128;
+
+/// Vruntime cost charged when a transfer dispatches one unit of real IO work
+/// (a network/disk request).
+pub(super) const IO_WORK_COST: u64 = 128;
+
+/// Vruntime cost charged when a composite *spawns a child* (as opposed to
+/// dispatching real IO). A spawn is cheap coordination — it enqueues a
+/// schedulable child but performs no IO itself — so it is charged less than an
+/// IO unit. Charging spawn the full [`IO_WORK_COST`] makes a composite parent
+/// accumulate vruntime as fast as its own children, so CFS stops selecting the
+/// parent after a few spawns and it loses the poll-turns it needs to keep the
+/// pipeline filled. A reduced spawn cost keeps the parent scheduling-competitive
+/// with its children so it can refill continuously. This integrates spawn
+/// cadence *into* CFS rather than governing it with ad-hoc spawn-batch-size
+/// constants.
+///
+/// Charged to both individual and group vruntime (like all work). Composites
+/// with the same spawn-to-IO ratio charge spawn identically, so their relative
+/// `group_vruntime` ordering is unchanged. Composites with different ratios
+/// accrue group vruntime at different rates per dispatched IO, producing a
+/// bounded cross-group dispatch skew that penalizes the spawn-heavier group —
+/// self-limiting, since a group cannot spawn its way to a larger dispatch
+/// share, only a smaller one.
+///
+/// The `SPAWN_WORK_COST : IO_WORK_COST` ratio sets the steady-state in-flight
+/// level: a smaller spawn cost lets a composite parent win more poll turns and
+/// hold more children in flight.
+pub(super) const SPAWN_WORK_COST: u64 = IO_WORK_COST / 2;
+
 /// Precision-preserving scale factor for priority-weighted vruntime deltas.
 ///
-/// `delta = (WORK_COST * PRIORITY_SCALE) / priority`. Without scaling, integer
-/// division would collapse to zero for priorities above `WORK_COST` (e.g.,
-/// priority 200 with `WORK_COST = 128` would yield `delta = 0`, starving all
+/// `delta = (IO_WORK_COST * PRIORITY_SCALE) / priority`. Without scaling, integer
+/// division would collapse to zero for priorities above `IO_WORK_COST` (e.g.,
+/// priority 200 with `IO_WORK_COST = 128` would yield `delta = 0`, starving all
 /// peers). Scaling by 256 keeps the formula resolution-correct across the
 /// full `u8` priority range (1..=255). Mirrors the role of `NICE_0_LOAD` in
 /// Linux CFS.
 pub(super) const PRIORITY_SCALE: u64 = 256;
 
-/// Compute the vruntime delta for a given priority.
+/// Compute the vruntime delta for a given priority at the full [`IO_WORK_COST`].
 ///
 /// Higher priority yields a smaller delta, so the descriptor accumulates
-/// vruntime more slowly and wins more dispatch share. Used both for an
-/// individual transfer's vruntime ([`TransferDescriptor::work_generated`])
-/// and for its group's vruntime when popped from the ready set.
+/// vruntime more slowly and wins more dispatch share. Used for an individual
+/// transfer's vruntime ([`TransferDescriptor::work_generated`]) and, via the
+/// same charge, its group's vruntime when it generates work.
 pub(super) fn vruntime_delta_for_priority(priority: u8) -> u64 {
-    (WORK_COST * PRIORITY_SCALE) / (priority as u64).max(1)
+    vruntime_delta_for_cost(IO_WORK_COST, priority)
+}
+
+/// Compute the vruntime delta for a given work cost and priority.
+///
+/// `delta = (cost * PRIORITY_SCALE) / priority`. Generalizes
+/// [`vruntime_delta_for_priority`] so the spawn path can charge the reduced
+/// [`SPAWN_WORK_COST`] while preserving the same priority scaling.
+pub(super) fn vruntime_delta_for_cost(cost: u64, priority: u8) -> u64 {
+    (cost * PRIORITY_SCALE) / (priority as u64).max(1)
 }
 
 /// The scheduler's handle to a transfer.
@@ -224,6 +260,17 @@ impl TransferDescriptor {
     /// Higher priority = slower vruntime accumulation = more work share.
     pub(crate) fn work_generated(&self) {
         let delta = vruntime_delta_for_priority(self.priority());
+        self.add_vruntime(delta);
+    }
+
+    /// Record a *spawn* (a composite enqueued a child) and update vruntime at
+    /// the reduced [`SPAWN_WORK_COST`] rather than the full [`IO_WORK_COST`].
+    /// Charges both individual and group vruntime (via [`Self::add_vruntime`]),
+    /// so the discount is uniform across composites and preserves cross-group
+    /// fairness. Keeps a composite parent scheduling-competitive with its own
+    /// children so it can refill the pipeline continuously instead of in bursts.
+    pub(crate) fn work_generated_spawn(&self) {
+        let delta = vruntime_delta_for_cost(SPAWN_WORK_COST, self.priority());
         self.add_vruntime(delta);
     }
 
@@ -561,6 +608,57 @@ mod tests {
                 high_vrt,
                 low_vrt,
                 ratio
+            );
+        }
+
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn test_work_generated_spawn_charges_both_individual_and_group_vruntime() {
+            let desc = test_descriptor(1);
+            let group = desc.group_vruntime_arc();
+            assert_eq!(desc.vruntime(), 0);
+            assert_eq!(group.load(Ordering::SeqCst), 0);
+
+            desc.work_generated_spawn();
+
+            // A spawn charges the reduced spawn cost to BOTH the individual and
+            // the group vruntime. The group charge is what makes a composite's
+            // spawn cadence visible to cross-group CFS fairness; dropping it
+            // (charging individual only) would silently change cross-group
+            // dispatch share for composites with differing spawn:IO ratios.
+            let expected = vruntime_delta_for_cost(SPAWN_WORK_COST, desc.priority());
+            assert_eq!(
+                desc.vruntime(),
+                expected,
+                "spawn must charge individual vruntime by the spawn delta"
+            );
+            assert_eq!(
+                group.load(Ordering::SeqCst),
+                expected,
+                "spawn must charge group vruntime by the same spawn delta"
+            );
+        }
+
+        // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn test_spawn_charge_is_less_than_io_charge() {
+            // The spawn discount is what keeps a composite parent scheduling-
+            // competitive with its own children. If SPAWN_WORK_COST ever equaled
+            // IO_WORK_COST the parent would accumulate vruntime as fast as the
+            // work it dispatches and lose the poll turns it needs to refill.
+            let spawn = test_descriptor(1);
+            let io = test_descriptor(2);
+
+            spawn.work_generated_spawn();
+            io.work_generated();
+
+            assert!(
+                spawn.vruntime() < io.vruntime(),
+                "spawn charge ({}) must be less than IO charge ({})",
+                spawn.vruntime(),
+                io.vruntime()
             );
         }
     }

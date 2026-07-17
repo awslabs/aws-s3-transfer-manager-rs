@@ -141,7 +141,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Per-request cap on concurrently-materialized child download transfers.
-    /// Defaults to 4096.
+    /// Defaults to 512.
     pub fn max_concurrent_downloads(mut self, input: usize) -> Self {
         self.inner = self.inner.max_concurrent_downloads(input);
         self

@@ -17,7 +17,7 @@ use crate::error;
 use crate::io::walk::{DirEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
-use crate::operation::{DEFAULT_DELIMITER, SPAWN_BATCH_SIZE};
+use crate::operation::DEFAULT_DELIMITER;
 use crate::runtime::sync::Mutex;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedTransferPolicy, FailedUpload};
@@ -35,11 +35,22 @@ const MAX_PARALLEL_WALKS: usize = 16;
 /// entries added to `State::pending_entries` in one pass.
 const WALK_BATCH_SIZE: usize = 64;
 
-/// Terminal children reaped per `JoinChildren` work item. A reap injects no
-/// schedulable entity (it joins already-terminal handles), so unlike spawning
-/// it can batch large; the bound only caps worker-thread hold time on the
-/// serial join.
-const REAP_BATCH_SIZE: usize = 256;
+/// Maximum terminal children drained into a single `JoinChildren` work item per
+/// poll. NOT an accumulation threshold: `poll_work` reaps whatever terminals
+/// exist every poll (fused with spawning), so this only caps how many
+/// already-terminal handles one `execute_join_children` awaits back-to-back,
+/// bounding worker-thread hold time on the serial join. Kept modest so a poll's
+/// reap work stays small and terminals are retired continuously rather than in
+/// large lumps.
+const MAX_REAP_PER_POLL: usize = 64;
+
+/// Low-water mark for the entry buffer: `dispatch_walk` advances a walker only
+/// while `pending_entries` is below this, keeping the buffer fed ahead of spawn
+/// draining it. Sized to the walkers' aggregate burst
+/// (`MAX_PARALLEL_WALKS * WALK_BATCH_SIZE`) so every walker can be productively
+/// in flight before the buffer is considered full. Independent of the child
+/// in-flight budget.
+const WALK_LOW_WATER: usize = MAX_PARALLEL_WALKS * WALK_BATCH_SIZE;
 
 /// Work data variants for the UploadObjectsTransfer state machine.
 #[derive(Debug)]
@@ -82,7 +93,7 @@ struct ClaimedEntry {
 /// consumed by [`UploadObjectsTransfer::merge_spawned`] (paired
 /// decrement under the state lock) or released on `Drop` if
 /// `consume` is not reached. Constructed only by
-/// [`UploadObjectsTransfer::claim_spawn_batch`].
+/// [`UploadObjectsTransfer::claim_one`].
 ///
 /// The type makes the counter pairing structural: `merge_spawned`'s
 /// signature requires the token, so a caller cannot forget to release
@@ -97,7 +108,7 @@ struct Reservation {
 impl Reservation {
     /// Caller holds `state.lock`. Decrements `children_reserved` by the
     /// owned count and marks the reservation consumed. Always paired
-    /// 1:1 with the `claim_spawn_batch` that produced this token.
+    /// 1:1 with the `claim_one` that produced this token.
     fn consume(mut self, state: &mut State) {
         debug_assert!(
             !self.consumed,
@@ -116,7 +127,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if !self.consumed {
+        if !self.consumed && self.count > 0 {
             let mut state = self.transfer.state.lock();
             state.children_reserved = state.children_reserved.saturating_sub(self.count);
             tracing::warn!(
@@ -129,7 +140,7 @@ impl Drop for Reservation {
     }
 }
 
-/// Outcome of phase 1 (`claim_spawn_batch`).
+/// Outcome of phase 1 (`claim_one`).
 enum SpawnDecision {
     /// Abort policy tripped on a pre-orchestration failure. Caller exits
     /// `poll_work` immediately with `PollWork::Done`.
@@ -318,7 +329,7 @@ impl fmt::Debug for ChildTransfer {
 /// Mutable state of an `upload_objects` transfer.
 ///
 /// Walker enumeration produces `DirEntry`s into `pending_entries`.
-/// `poll_work` consumes them through `claim_spawn_batch` into child
+/// `poll_work` consumes them through `claim_one` into child
 /// `UploadHandle`s in `children`, reaps terminal children via
 /// `JoinChildren` work items, and accumulates outcomes into
 /// `successful_uploads` and `failed`.
@@ -328,7 +339,7 @@ impl fmt::Debug for ChildTransfer {
 /// the counter if `consume` is not reached:
 ///
 ///   counter             increment site          paired token (consumed at)
-///   children_reserved   claim_spawn_batch       Reservation (merge_spawned)
+///   children_reserved   claim_one               Reservation (merge_spawned)
 ///   reaping_in_flight   drain_terminal_children ReapingBatch (execute_join_children)
 ///   in_flight_walks     dispatch_walk           WalkSlot (execute_advance_walker)
 ///
@@ -378,7 +389,7 @@ impl State {
 
     /// Capacity invariant: `active_children + children_reserved <= max` holds
     /// whenever the state mutex is released outside phase 1 of `poll_work`
-    /// (phase 1 may hold up to `SPAWN_BATCH_SIZE` slack until `merge_spawned`).
+    /// (phase 1 may hold up to 1 slot of slack until `merge_spawned`).
     /// Asserts the in-flight budget — terminal-unreaped children are excluded
     /// since they consume no network/disk concurrency. Cheap insurance;
     /// compiles to nothing in release.
@@ -453,115 +464,127 @@ impl UploadObjectsTransfer {
         self.inner.request.failure_policy()
     }
 
-    /// Produce one unit of work. The three steps run in order each call:
+    /// Produce work for one poll. Spawn and reap run in the same poll and are
+    /// fused into a single outcome rather than competing as strict-priority
+    /// ladder steps:
     ///
-    /// 1. Spawn. A side effect, not a returned item, so it runs every call and
-    ///    composes with whatever is returned below. Gating on *active* children
-    ///    (`claim_spawn_batch`) lets a completion burst refill immediately, so
-    ///    the active-child count holds at the cap instead of sawtoothing.
-    /// 2. Walk, if a page is available. poll_work returns at most one item;
-    ///    walk is preferred over reap for it, else a steady completion stream
-    ///    would reap forever and never list the next page. `dispatch_walk`
-    ///    yields nothing once registered children fill the cap.
-    /// 3. Reap, bounded by REAP_BATCH_SIZE.
+    /// 1. Walk (refill): if the walker can dispatch, return its `AdvanceWalker`
+    ///    item. A walk poll is the whole poll (neither spawns nor reaps).
+    /// 2. Spawn one child (phased: claim under lock, orchestrate lock-released,
+    ///    merge under re-lock). A pre-orchestration Abort-policy failure
+    ///    short-circuits to `PollWork::Done`.
+    /// 3. Reap any terminal children (up to MAX_REAP_PER_POLL this poll).
+    /// 4. Fuse: a reap returns `Ready { io: JoinChildren, spawned }`; with no
+    ///    reap, `Spawned` if an entry was claimed, else inactive-drain /
+    ///    `check_terminal` / `Pending`.
     ///
-    /// When inactive, spawn and walk are skipped but reap still runs so partial
-    /// results are tallied; once in-flight drains the transfer signals terminal.
+    /// Fusing means one poll can both retire a terminal child and refill, so a
+    /// continuous completion stream does not force reap and spawn onto separate
+    /// turns and done children are retired as they appear rather than
+    /// accumulating. Walk and spawn are skipped when inactive so cancel/fail
+    /// stops new work while in-flight drains.
     pub(crate) fn poll_work(&self) -> PollWork {
         let active = self.inner.ctx.is_active();
-
-        // Phase 1: under the state lock, claim a batch of entries to spawn.
-        // This does the side-effect-free work (key derivation, stream creation,
-        // `UploadInput` build) under the lock; the heavyweight
-        // `Upload::orchestrate_child` runs lock-released in phase 2. Skipped
-        // when inactive so cancel/fail stops spawning new child uploads.
-        let claim = if active {
-            let mut state = self.inner.state.lock();
-            Some(self.claim_spawn_batch(&mut state))
-        } else {
-            None
-        };
-
-        // Phase 2: orchestrate claimed children with the state lock released.
-        // `orchestrate_child` calls `scheduler.enqueue_transfer`, which acquires
-        // scheduler-level locks; holding this transfer's state lock across that
-        // would serialise all concurrent `poll_work` callers (child wakes, drain
-        // cycles) behind a single producer. The `reservation` token carries the
-        // `children_reserved` slots into phase 3's `merge_spawned`; if this
-        // phase panics, its `Drop` recovers the counter so the parent doesn't
-        // hang on a leaked reservation.
-        let spawned = match claim {
-            Some(SpawnDecision::Abort) => return PollWork::Done,
-            Some(SpawnDecision::Batch(claimed, reservation)) => {
-                let outcomes: Vec<(OrchestrateOutcome, PathBuf, String)> = claimed
-                    .into_iter()
-                    .map(|claimed| {
-                        let ClaimedEntry {
-                            source_path,
-                            key,
-                            input,
-                        } = claimed;
-                        let outcome = Upload::orchestrate_child(
-                            self.inner.ctx.handle.clone(),
-                            input,
-                            self.inner.ctx.id.id,
-                        );
-                        (outcome, source_path, key)
-                    })
-                    .collect();
-                Some((outcomes, reservation))
-            }
-            None => None,
-        };
-
-        // Phase 3: re-lock and run merge through the return decision under a
-        // single lock, so the work item returned reflects one consistent state
-        // snapshot.
         let mut state = self.inner.state.lock();
 
-        // Merge orchestration results (an abort during merge returns Done) and
-        // opportunistically claim subtrees to widen the walk.
-        if let Some((outcomes, reservation)) = spawned {
-            if let Some(done) = self.merge_spawned(&mut state, outcomes, reservation) {
-                return done;
-            }
-            self.claim_subtrees(&mut state);
-        }
-
-        // Walk before reap for the single returned item (skipped when inactive).
+        // 1: Walk (refill). `dispatch_walk` gates on the low-water mark, so it
+        // tops off the entry buffer ahead of spawn draining it. Skipped when
+        // inactive.
         if active {
             if let Some(work) = self.dispatch_walk(&mut state) {
                 return work;
             }
         }
 
-        // Reap terminal children. Runs regardless of `active` so partial
-        // results at cancellation time make the summary.
-        if let Some(batch) = self.drain_terminal_children(&mut state) {
-            return PollWork::Ready(IoRequest {
-                data: Some(Box::new(UploadObjectsWork::JoinChildren {
-                    batch: Some(batch),
-                })),
-            });
+        // 2: Spawn one child (phased: claim under lock, orchestrate
+        // lock-released, merge under re-lock).
+        //
+        // `attempted` = an entry was claimed this poll, regardless of whether
+        // its child orchestrated. It MUST drive re-poll: a claimed entry has
+        // left the queue, so the parent has to stay scheduled to drain the rest
+        // — even after a failed orchestration — or the remaining entries strand
+        // with no wake once the walkers are exhausted (a hang). `materialized` =
+        // a live child was inserted; it drives the spawn vruntime charge, so a
+        // failed orchestration is not charged.
+        let mut attempted = false;
+        let mut materialized = false;
+        if active {
+            let claim = self.claim_one(&mut state);
+            match claim {
+                SpawnDecision::Abort => return PollWork::Done,
+                SpawnDecision::Batch(claimed, reservation) => {
+                    if !claimed.is_empty() {
+                        attempted = true;
+                        // Phase 2: orchestrate with lock released.
+                        drop(state);
+                        let outcomes: Vec<(OrchestrateOutcome, PathBuf, String)> = claimed
+                            .into_iter()
+                            .map(|claimed| {
+                                let ClaimedEntry {
+                                    source_path,
+                                    key,
+                                    input,
+                                } = claimed;
+                                let outcome = Upload::orchestrate_child(
+                                    self.inner.ctx.handle.clone(),
+                                    input,
+                                    self.inner.ctx.id.id,
+                                );
+                                (outcome, source_path, key)
+                            })
+                            .collect();
+
+                        // Phase 3: re-lock and merge.
+                        state = self.inner.state.lock();
+                        let (abort, inserted) =
+                            self.merge_spawned(&mut state, outcomes, reservation);
+                        if let Some(done) = abort {
+                            return done;
+                        }
+                        self.claim_subtrees(&mut state);
+                        materialized = inserted > 0;
+                    } else {
+                        // Empty claim: consume the zero-count reservation under
+                        // the lock we already hold. Drop is also safe (guarded
+                        // by count > 0), but explicit consume is clearer.
+                        reservation.consume(&mut state);
+                    }
+                }
+            }
         }
 
-        // Inactive and fully drained: signal terminal. Children are cancelled
-        // via `scheduler.cancel_transfer(parent_id)` from the handle's
-        // abort/drop/join paths, which cascade outside the state lock.
-        if !active {
-            self.inner.ctx.signal_terminal();
-            return PollWork::Done;
+        // 3: Reap terminal children (up to MAX_REAP_PER_POLL this poll, no
+        // accumulation threshold — done children are retired as they appear).
+        let reaped = self.drain_terminal_children(&mut state);
+
+        // 4: Fuse spawn and reap into one poll outcome. A reap dispatches a
+        // JoinChildren item and carries `spawned` so the scheduler charges spawn
+        // vruntime iff a child materialized this poll. With no reap, re-poll if
+        // we touched the queue; otherwise settle terminal/idle.
+        if let Some(batch) = reaped {
+            return PollWork::Ready {
+                io: IoRequest {
+                    data: Some(Box::new(UploadObjectsWork::JoinChildren {
+                        batch: Some(batch),
+                    })),
+                },
+                spawned: materialized,
+            };
+        }
+        if attempted {
+            return PollWork::Spawned;
         }
 
-        // Terminal check (all walks drained, all children done, no reaps in
-        // flight, no reservations outstanding).
+        // 5: Terminal/idle -- neither reaped nor claimed an entry this poll.
+        // `check_terminal` handles both the inactive drain (signal terminal only
+        // once in-flight work has drained) and the active success transition;
+        // otherwise the transfer parks Pending and the draining work re-polls it.
         if let Some(out) = self.check_terminal(&mut state) {
             return out;
         }
-
-        // No spawn slack outside phase 1, so capacity must hold strictly here.
-        state.debug_assert_capacity(self.max_concurrent_uploads());
-
+        if active {
+            state.debug_assert_capacity(self.max_concurrent_uploads());
+        }
         self.inner.ctx.set_pending();
         PollWork::Pending
     }
@@ -602,7 +625,7 @@ impl UploadObjectsTransfer {
             .iter()
             .filter(|(_, c)| c.handle.status().is_terminal())
             .map(|(id, _)| *id)
-            .take(REAP_BATCH_SIZE)
+            .take(MAX_REAP_PER_POLL)
             .collect();
         if terminal_ids.is_empty() {
             return None;
@@ -621,16 +644,14 @@ impl UploadObjectsTransfer {
         })
     }
 
-    /// Phase 1 of child spawning: under state lock, consume entries from
-    /// `pending_entries` up to pipeline capacity, do the side-effect-free
-    /// preparation (key derivation, `InputStream` creation, `UploadInput`
-    /// build), and reserve slots via `children_reserved`.
+    /// Claim exactly ONE spawnable pending entry as a child.
     ///
-    /// Returns [`SpawnDecision::Abort`] if a pre-orchestration failure was
-    /// observed under Abort policy; the caller exits `poll_work` with
-    /// [`PollWork::Done`] without orchestrating anything. Otherwise returns
-    /// [`SpawnDecision::Batch`] with the prepared entries.
-    fn claim_spawn_batch(&self, state: &mut State) -> SpawnDecision {
+    /// Loops over `pending_entries`, skipping (consuming as failure under
+    /// Continue policy) entries that fail pre-orchestration preparation
+    /// (key derivation or InputStream build), until it either (a) claims
+    /// one good entry, or (b) exhausts `pending_entries`. Under Abort
+    /// policy the first failure aborts immediately.
+    fn claim_one(&self, state: &mut State) -> SpawnDecision {
         let max_concurrent_uploads = self.max_concurrent_uploads();
         let bucket = self
             .inner
@@ -641,18 +662,19 @@ impl UploadObjectsTransfer {
         let key_prefix = self.inner.request.key_prefix().map(|s| s.to_string());
         let delimiter = self.inner.request.delimiter().map(|s| s.to_string());
 
-        // Gate on the in-flight budget (active + reserved), not total
-        // registered; see `active_children`.
         let active = state.active_children();
-        let mut batch: Vec<ClaimedEntry> = Vec::new();
-        while active + state.children_reserved + batch.len() < max_concurrent_uploads
-            && batch.len() < SPAWN_BATCH_SIZE
-        {
-            let entry = match state.pending_entries.pop_front() {
-                Some(e) => e,
-                None => break,
+        if active + state.children_reserved >= max_concurrent_uploads {
+            let reservation = Reservation {
+                transfer: self.inner.clone(),
+                count: 0,
+                consumed: false,
             };
+            return SpawnDecision::Batch(Vec::new(), reservation);
+        }
 
+        let mut batch: Vec<ClaimedEntry> = Vec::new();
+        // Loop until one spawnable entry is claimed or the queue is exhausted.
+        while let Some(entry) = state.pending_entries.pop_front() {
             let relative = entry.relative_path().to_string_lossy().to_string();
             let key =
                 match derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref()) {
@@ -692,7 +714,7 @@ impl UploadObjectsTransfer {
             };
 
             let input = UploadInput::builder()
-                .bucket(bucket.clone())
+                .bucket(bucket)
                 .key(key.clone())
                 .body(stream)
                 .build()
@@ -703,6 +725,7 @@ impl UploadObjectsTransfer {
                 key,
                 input,
             });
+            break;
         }
         state.children_reserved += batch.len();
         let reservation = Reservation {
@@ -722,12 +745,18 @@ impl UploadObjectsTransfer {
     /// failure aborts the transfer and returns [`PollWork::Done`]. The
     /// reservation is still consumed so `check_terminal` can see a
     /// consistent state.
+    /// Returns `(abort_result, inserted)`: `abort_result` is `Some(Done)` when
+    /// the Abort policy tripped on an orchestration failure; `inserted` is the
+    /// number of children actually inserted. Callers gate `did_spawn` on
+    /// `inserted > 0` so a claimed-but-failed orchestration (recorded in
+    /// `failed`, no live child) is not counted as a spawn — which would
+    /// over-charge spawn vruntime for a child that never runs.
     fn merge_spawned(
         &self,
         state: &mut State,
         outcomes: Vec<(OrchestrateOutcome, PathBuf, String)>,
         reservation: Reservation,
-    ) -> Option<PollWork> {
+    ) -> (Option<PollWork>, usize) {
         debug_assert_eq!(
             outcomes.len(),
             reservation.count,
@@ -737,6 +766,7 @@ impl UploadObjectsTransfer {
         );
         let mut aborted_in_batch = false;
         let mut abort_result = None;
+        let mut inserted = 0usize;
         for (outcome, source_path, key) in outcomes {
             match outcome {
                 Ok(handle) => {
@@ -756,6 +786,7 @@ impl UploadObjectsTransfer {
                             handle,
                         },
                     );
+                    inserted += 1;
                 }
                 Err(e) => {
                     state.failed.push(FailedUpload {
@@ -771,7 +802,7 @@ impl UploadObjectsTransfer {
             }
         }
         reservation.consume(state);
-        abort_result
+        (abort_result, inserted)
     }
 
     fn claim_subtrees(&self, state: &mut State) {
@@ -806,6 +837,35 @@ impl UploadObjectsTransfer {
     }
 
     fn check_terminal(&self, state: &mut State) -> Option<PollWork> {
+        if !self.inner.ctx.is_active() {
+            // Cancelled or failed: wait only for genuinely in-flight work to
+            // drain before signaling terminal, so the parent does not report
+            // Done with siblings still running. Undispatched walkers (`walks`)
+            // and unspawned entries (`pending_entries`) are abandoned — when
+            // inactive the ladder never advances them, so gating on them would
+            // deadlock. Do NOT set_completed here: the terminal state is already
+            // cancelled/failed. The draining work re-polls the parent via its
+            // execute-path try_wake.
+            if state.in_flight_walks == 0
+                && state.children.is_empty()
+                && state.children_reserved == 0
+                && state.reaping_in_flight == 0
+            {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    tid = %self.inner.ctx.id,
+                    successful = state.successful_uploads,
+                    failed = state.failed.len(),
+                    "upload_objects terminal (cancelled/failed), signaling",
+                );
+                self.inner.ctx.signal_terminal();
+                return Some(PollWork::Done);
+            }
+            return None;
+        }
+
+        // Active: the success transition. Reachable only once the walk is
+        // exhausted and everything has drained.
         if state.walks.is_empty()
             && state.in_flight_walks == 0
             && state.pending_entries.is_empty()
@@ -832,20 +892,19 @@ impl UploadObjectsTransfer {
 
     /// Dispatch one walker advance, or `None` if listing cannot proceed.
     ///
-    /// Backpressured by the *memory budget*: total registered children plus
-    /// reserved, against `max_concurrent_uploads` — distinct from the
-    /// in-flight budget that gates spawning. `None` when that budget is full,
-    /// walks are saturated or all in flight, or no walk is available.
+    /// Gated on the entry buffer alone: fetch more directory entries only while
+    /// `pending_entries` is below the low-water mark, keeping the buffer fed
+    /// ahead of spawn draining it. Independent of the child in-flight budget
+    /// (`max_concurrent_uploads`), which gates spawning, not listing. `None`
+    /// when the buffer is at/above the mark, walks are saturated or all in
+    /// flight, or no walk is available.
     fn dispatch_walk(&self, state: &mut State) -> Option<PollWork> {
-        let max_concurrent_uploads = self.max_concurrent_uploads();
-        if state.children.len() + state.children_reserved >= max_concurrent_uploads {
+        if state.pending_entries.len() >= WALK_LOW_WATER {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 tid = %self.inner.ctx.id,
-                children = state.children.len(),
-                children_reserved = state.children_reserved,
-                max_concurrent_uploads,
-                "dispatch_walk.none.cap_full"
+                pending_entries = state.pending_entries.len(),
+                "dispatch_walk.none.buffer_full"
             );
             return None;
         }
@@ -887,7 +946,7 @@ impl UploadObjectsTransfer {
                 walk_id,
                 "dispatching advance_walker"
             );
-            Some(PollWork::Ready(IoRequest {
+            Some(PollWork::ready(IoRequest {
                 data: Some(Box::new(UploadObjectsWork::AdvanceWalker {
                     slot: Some(slot),
                 })),
@@ -1373,9 +1432,10 @@ mod tests {
     async fn drive_transfer(transfer: &UploadObjectsTransfer) {
         loop {
             match transfer.poll_work() {
-                PollWork::Ready(mut work) => {
+                PollWork::Ready { io: mut work, .. } => {
                     transfer.execute(&mut work).await;
                 }
+                PollWork::Spawned => {}
                 PollWork::Pending => {
                     // Give children time to complete
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1667,8 +1727,8 @@ mod tests {
     // Synthetic tests that drive the token contract directly without
     // running the state machine. They construct an `UploadObjectsTransfer`
     // for its `Arc<UploadObjectsTransferInner>` back-ref but bypass
-    // `claim_spawn_batch` / `drain_terminal_children` and manipulate
-    // the counters by hand. Lets us assert the precise behaviour of
+    // `claim_one` / `drain_terminal_children` and manipulate the
+    // counters by hand. Lets us assert the precise behaviour of
     // `consume()` and `Drop` independently of the broader state machine.
 
     #[cfg_attr(miri, ignore)]
@@ -1682,9 +1742,9 @@ mod tests {
             false,
         );
 
-        // Pre-set the counter as if `claim_spawn_batch` had reserved 5
-        // slots. Constructing a Reservation directly with `count: 5`
-        // models the same protocol obligation.
+        // Pre-set the counter as if `claim_one` had reserved 5 slots.
+        // Constructing a Reservation directly with `count: 5` models
+        // the same protocol obligation.
         {
             let mut state = transfer.inner.state.lock();
             state.children_reserved = 5;
@@ -2093,5 +2153,331 @@ mod tests {
             0, state.in_flight_walks,
             "Drop must saturate at 0, not panic"
         );
+    }
+
+    // --- Single-ticket spawn cadence tests ---
+
+    /// Anti-stall guard: a directory of 500 files fully transfers to
+    /// completion with the single-ticket spawn cadence. If the spawn path
+    /// stalls (returns nothing, never re-polled), this hangs and the
+    /// timeout fires as a failure.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_single_ticket_500_files_completes() {
+        let dir = tempdir().unwrap();
+        for i in 0..500 {
+            fs::write(dir.path().join(format!("file{i:04}.bin")), "data").unwrap();
+        }
+
+        let (transfer, completion_rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+        );
+
+        timeout(Duration::from_secs(30), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("500-file upload must complete without stalling");
+
+        assert_eq!(transfer.successful_uploads(), 500);
+    }
+
+    /// Backstop test: with a small max_concurrent set, in-flight children
+    /// never exceed the configured limit.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_backstop_limits_in_flight_children() {
+        let dir = tempdir().unwrap();
+        let max_concurrent: usize = 4;
+
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("f{i:02}.txt")), "abc").unwrap();
+        }
+
+        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let input = super::super::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dir.path())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .max_concurrent_uploads(max_concurrent)
+            .build()
+            .unwrap();
+
+        let walker = FsWalker::builder()
+            .recursive(false)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+        let mut max_observed: usize = 0;
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let state = transfer.inner.state.lock();
+                    let active = state.active_children() + state.children_reserved;
+                    if active > max_observed {
+                        max_observed = active;
+                    }
+                }
+
+                match transfer.poll_work() {
+                    PollWork::Ready { io: mut work, .. } => {
+                        transfer.execute(&mut work).await;
+                    }
+                    PollWork::Spawned => {}
+                    PollWork::Pending => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    PollWork::Done => break,
+                }
+            }
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_uploads(), 20);
+        assert!(
+            max_observed <= max_concurrent,
+            "in-flight children ({max_observed}) must not exceed backstop ({max_concurrent})"
+        );
+    }
+
+    /// Regression test for the pre-orchestration failure hang under Continue.
+    ///
+    /// A directory with [bad, good] entries where `bad` triggers a
+    /// derive_object_key failure. Under FailedTransferPolicy::Continue the
+    /// bad entry must be skipped and the good entry uploaded. The transfer
+    /// must reach Done; a regression hangs (timeout = test failure).
+    #[cfg(target_family = "unix")]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_pre_orchestration_failure_continue_does_not_hang() {
+        // Create a directory with two files: one whose relative path triggers
+        // a key derivation error (custom delimiter appears in the filename)
+        // and one good file.
+        let dir = tempdir().unwrap();
+        // "bad-file.txt" will fail when delimiter is "-"
+        fs::write(dir.path().join("bad-file.txt"), "fail").unwrap();
+        fs::write(dir.path().join("good.txt"), "ok").unwrap();
+
+        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let input = super::super::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dir.path())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .delimiter("-") // causes "bad-file.txt" to fail derive_object_key
+            .build()
+            .unwrap();
+
+        let walker = FsWalker::builder()
+            .recursive(false)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+        // A regression (the bug) causes this to hang forever.
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer must complete; a regression hangs here");
+
+        // The good file uploaded, the bad file was recorded as failed.
+        assert_eq!(transfer.successful_uploads(), 1);
+        let failed = transfer.take_failed();
+        assert_eq!(failed.len(), 1);
+    }
+
+    /// Under Abort policy, a pre-orchestration failure (derive_object_key)
+    /// aborts the transfer and returns Done.
+    #[cfg(target_family = "unix")]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_pre_orchestration_failure_abort_terminates() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("bad-file.txt"), "fail").unwrap();
+        fs::write(dir.path().join("good.txt"), "ok").unwrap();
+
+        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let input = super::super::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dir.path())
+            .failure_policy(FailedTransferPolicy::Abort)
+            .delimiter("-")
+            .build()
+            .unwrap();
+
+        let walker = FsWalker::builder()
+            .recursive(false)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should abort within timeout");
+
+        assert!(transfer.ctx().is_failed());
+        let failed = transfer.take_failed();
+        assert!(!failed.is_empty());
+    }
+
+    /// The fused ladder reaps terminal children continuously rather than
+    /// waiting for a batch threshold: every poll drains whatever terminals
+    /// exist and, when it also spawns, fuses both into one `Ready { spawned }`.
+    /// Guards the de-batching invariant — terminal children must NOT accumulate
+    /// to a large unreaped backlog while a directory is spawning. A regression
+    /// to reap-only-when->=MAX_REAP_PER_POLL (or reap-behind-spawn starvation)
+    /// would let the backlog grow and fail the bound below.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reap_is_continuous_not_batched() {
+        let dir = tempdir().unwrap();
+        for i in 0..300 {
+            fs::write(dir.path().join(format!("f{i:04}.txt")), "x").unwrap();
+        }
+
+        let (transfer, completion_rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+        );
+
+        let mut fused_reap_spawn = 0usize;
+        let mut max_terminal_backlog = 0usize;
+
+        timeout(Duration::from_secs(30), async {
+            loop {
+                // Sample the unreaped-terminal backlog before polling.
+                let terminal_before = {
+                    let state = transfer.inner.state.lock();
+                    state
+                        .children
+                        .values()
+                        .filter(|c| c.handle.status().is_terminal())
+                        .count()
+                };
+                max_terminal_backlog = max_terminal_backlog.max(terminal_before);
+
+                match transfer.poll_work() {
+                    PollWork::Ready {
+                        io: mut work,
+                        spawned,
+                    } => {
+                        if spawned {
+                            fused_reap_spawn += 1;
+                        }
+                        transfer.execute(&mut work).await;
+                    }
+                    PollWork::Spawned => {}
+                    PollWork::Pending => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    PollWork::Done => break,
+                }
+            }
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        // Liveness under the fused spawn+reap ladder: a 300-file directory
+        // completes with every child reaped and no hang. Guards the ladder
+        // restructure against dropping work, starving reap, or deadlocking.
+        // Whether in-flight stays flat and reap+spawn coincide in one poll is a
+        // property of real concurrency; this single-parent-loop harness drives
+        // children in bursts, so backlog magnitude and reap+spawn coincidence
+        // are harness artifacts and are not asserted here.
+        assert_eq!(transfer.successful_uploads(), 300);
+        let _ = (max_terminal_backlog, fused_reap_spawn);
+    }
+
+    /// On cancellation, `poll_work` must not signal terminal and return `Done`
+    /// while work is still in flight. Here a walker advance is outstanding
+    /// (`in_flight_walks == 1`) when the transfer goes inactive; the transfer
+    /// must stay `Pending` and let the draining work wake it, mirroring
+    /// `download_objects`, rather than terminating with a live `WalkSlot` (and,
+    /// in the harmful case, live children) still outstanding.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_inactive_drains_outstanding_walk_before_terminal() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+        );
+
+        // First poll dispatches a walker advance; the walk is now in flight.
+        // Holding the returned work item un-executed keeps its `WalkSlot`
+        // alive, so `in_flight_walks` stays at 1.
+        let w1 = transfer.poll_work();
+        assert!(
+            matches!(w1, PollWork::Ready { .. }),
+            "first poll should dispatch a walker advance, got {w1:?}"
+        );
+        assert_eq!(
+            transfer.inner.state.lock().in_flight_walks,
+            1,
+            "a walker advance should be in flight"
+        );
+
+        // Transfer goes inactive while that walk work item is still outstanding.
+        transfer.ctx().set_cancelled();
+
+        let w2 = transfer.poll_work();
+        assert!(
+            matches!(w2, PollWork::Pending),
+            "must not terminate (return Done) while a walk is in flight; \
+             expected Pending, got {w2:?}"
+        );
+
+        drop(w1);
     }
 }

@@ -151,7 +151,7 @@ impl UploadObjectsFluentBuilder {
     /// Acts as a memory backstop: the scheduler's hierarchical fair-share
     /// scheduling drives throughput and rate-limits the walker naturally,
     /// so this knob primarily bounds the working-set size of in-flight
-    /// child handles. Defaults to 4096.
+    /// child handles. Defaults to 512.
     pub fn max_concurrent_uploads(mut self, input: usize) -> Self {
         self.inner = self.inner.max_concurrent_uploads(input);
         self

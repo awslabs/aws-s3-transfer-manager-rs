@@ -145,7 +145,7 @@ impl MockStateMachine for FixedWorkCount {
             return PollWork::Done;
         }
 
-        PollWork::Ready(IoRequest { data: None })
+        PollWork::ready(IoRequest { data: None })
     }
 
     fn execute<'a>(
@@ -288,7 +288,7 @@ impl MockStateMachine for CountedWork {
         if gen >= self.total {
             return PollWork::Done;
         }
-        PollWork::Ready(IoRequest { data: None })
+        PollWork::ready(IoRequest { data: None })
     }
 
     fn execute<'a>(
@@ -345,7 +345,7 @@ impl MockStateMachine for BlockingWork {
         if gen >= self.total {
             return PollWork::Done;
         }
-        PollWork::Ready(IoRequest { data: None })
+        PollWork::ready(IoRequest { data: None })
     }
 
     fn execute<'a>(
@@ -385,6 +385,10 @@ pub(crate) struct ChildMockTransfer {
     /// (not merely on `execute` having run, which fires before the
     /// child's terminating poll).
     terminated_counter: Option<Arc<AtomicU64>>,
+    /// If set, this transfer's `TransferId.id` is appended each time its
+    /// `poll_work` is entered. Shared with the parent composite so a test can
+    /// observe the parent/child poll interleaving order.
+    poll_log: Option<Arc<Mutex<Vec<u64>>>>,
 }
 
 impl std::fmt::Debug for ChildMockTransfer {
@@ -414,6 +418,7 @@ impl ChildMockTransfer {
             notify: None,
             state_lock: Mutex::new(()),
             terminated_counter: None,
+            poll_log: None,
         }
     }
 
@@ -434,6 +439,7 @@ impl ChildMockTransfer {
             notify: Some(notify),
             state_lock: Mutex::new(()),
             terminated_counter: None,
+            poll_log: None,
         }
     }
 
@@ -445,6 +451,13 @@ impl ChildMockTransfer {
         self.terminated_counter = Some(counter);
         self
     }
+
+    /// Share a poll-order log. This transfer's id is appended on each
+    /// `poll_work` entry so a test can observe parent/child interleaving.
+    pub(crate) fn with_poll_log(mut self, log: Arc<Mutex<Vec<u64>>>) -> Self {
+        self.poll_log = Some(log);
+        self
+    }
 }
 
 impl Transfer for ChildMockTransfer {
@@ -453,6 +466,9 @@ impl Transfer for ChildMockTransfer {
     }
 
     fn poll_work(&self) -> PollWork {
+        if let Some(ref log) = self.poll_log {
+            log.lock().unwrap().push(self.ctx.id.id);
+        }
         // Only generate work if we haven't generated all items yet
         let gen = self.generated.load(Ordering::SeqCst);
         if gen >= self.total {
@@ -479,7 +495,7 @@ impl Transfer for ChildMockTransfer {
             return PollWork::Pending;
         }
         self.generated.fetch_add(1, Ordering::SeqCst);
-        PollWork::Ready(IoRequest { data: None })
+        PollWork::ready(IoRequest { data: None })
     }
 
     fn execute<'a>(
@@ -654,7 +670,7 @@ impl CompositeMock {
         let in_flight = state.spawned.saturating_sub(terminated);
         let available = self.memory_cap.saturating_sub(in_flight);
         let remaining = state.total_children - state.spawned;
-        let to_spawn = available.min(remaining).min(32); // SPAWN_BATCH_SIZE cap
+        let to_spawn = available.min(remaining).min(32); // batch cap
 
         for _ in 0..to_spawn {
             let child_id_num = self.next_child_id.fetch_add(1, Ordering::Relaxed);
@@ -956,7 +972,7 @@ impl Transfer for TerminalWithoutSignalMock {
             };
             let (child, _term_rx) = NoopChild::new(child_id, self.handle.clone());
             self.handle.scheduler.enqueue_transfer(Box::new(child));
-            return PollWork::Ready(IoRequest { data: None });
+            return PollWork::ready(IoRequest { data: None });
         }
         // No further work; the transfer is already terminal (set in execute).
         self.ctx.set_pending();
@@ -974,6 +990,278 @@ impl Transfer for TerminalWithoutSignalMock {
             self.ctx.set_failed(crate::error::from_kind(
                 crate::error::ErrorKind::RuntimeError,
             )("terminal without signal"));
+            WorkOutcome::Success { data: None }
+        })
+    }
+}
+
+/// A composite transfer mock that spawns exactly one child per `poll_work` call,
+/// returning `PollWork::Spawned` each time, so the scheduler re-polls it while
+/// capacity remains.
+///
+/// This exercises the single-ticket spawn path: the scheduler's `Spawned` arm
+/// charges vruntime (spin guard) and re-inserts without incrementing `dispatched`,
+/// letting the spawned child account for itself when it later yields a work item.
+pub(crate) struct SingleTicketCompositeMock {
+    ctx: TransferContext,
+    handle: Arc<crate::client::Handle>,
+    state: Mutex<CompositeMockState>,
+    work_per_child: u64,
+    memory_cap: u64,
+    counter: DispatchCounter,
+    child_notify: Option<Arc<tokio::sync::Notify>>,
+    next_child_id: AtomicU64,
+    terminated_counter: Arc<AtomicU64>,
+    /// Mirror of `state.spawned` as an Arc-wrapped atomic, allowing external
+    /// observation after the composite is moved into the scheduler.
+    spawned_counter: Arc<AtomicU64>,
+    /// If set, this composite's id (on each `poll_work`) and each spawned
+    /// child's id (on each of its `poll_work`s) are appended, so a test can
+    /// observe the parent/child poll interleaving order.
+    poll_log: Option<Arc<Mutex<Vec<u64>>>>,
+}
+
+impl std::fmt::Debug for SingleTicketCompositeMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleTicketCompositeMock")
+            .field("id", &self.ctx.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SingleTicketCompositeMock {
+    /// Create a new single-ticket composite mock transfer.
+    ///
+    /// Identical arguments to `CompositeMock::new`, but `poll_work` spawns exactly
+    /// one child per call and returns `PollWork::Spawned` instead of batching.
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        total_children: u64,
+        work_per_child: u64,
+        memory_cap: u64,
+        counter: DispatchCounter,
+    ) -> Self {
+        let (ctx, _rx) = TransferContext::with_id(id, handle.clone());
+        Self {
+            ctx,
+            handle,
+            state: Mutex::new(CompositeMockState {
+                total_children,
+                spawned: 0,
+            }),
+            work_per_child,
+            memory_cap,
+            counter,
+            child_notify: None,
+            next_child_id: AtomicU64::new(id.id * 1_000_000 + 1),
+            terminated_counter: Arc::new(AtomicU64::new(0)),
+            spawned_counter: Arc::new(AtomicU64::new(0)),
+            poll_log: None,
+        }
+    }
+
+    /// Create a single-ticket composite whose children block in execute until
+    /// `notify` is signaled.
+    pub(crate) fn new_blocking(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        total_children: u64,
+        memory_cap: u64,
+        counter: DispatchCounter,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        let (ctx, _rx) = TransferContext::with_id(id, handle.clone());
+        Self {
+            ctx,
+            handle,
+            state: Mutex::new(CompositeMockState {
+                total_children,
+                spawned: 0,
+            }),
+            work_per_child: 1,
+            memory_cap,
+            counter,
+            child_notify: Some(notify),
+            next_child_id: AtomicU64::new(id.id * 1_000_000 + 1),
+            terminated_counter: Arc::new(AtomicU64::new(0)),
+            spawned_counter: Arc::new(AtomicU64::new(0)),
+            poll_log: None,
+        }
+    }
+
+    /// Share a poll-order log with this composite and every child it spawns.
+    /// Each `poll_work` entry (parent or child) appends its `TransferId.id`,
+    /// so a test can observe the parent/child poll interleaving order.
+    pub(crate) fn with_poll_log(mut self, log: Arc<Mutex<Vec<u64>>>) -> Self {
+        self.poll_log = Some(log);
+        self
+    }
+
+    /// Total children spawned so far.
+    #[allow(dead_code)]
+    pub(crate) fn total_spawned(&self) -> u64 {
+        self.state.lock().unwrap().spawned
+    }
+
+    /// Total children that have terminated (their `poll_work` returned `Done`).
+    #[allow(dead_code)]
+    pub(crate) fn total_terminated(&self) -> u64 {
+        self.terminated_counter.load(Ordering::SeqCst)
+    }
+
+    /// Whether all children have been spawned and terminated.
+    #[allow(dead_code)]
+    pub(crate) fn is_complete(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        let terminated = self.terminated_counter.load(Ordering::SeqCst);
+        terminated >= s.total_children && s.spawned >= s.total_children
+    }
+
+    /// The dispatch counter shared with all children.
+    #[allow(dead_code)]
+    pub(crate) fn dispatch_counter(&self) -> &DispatchCounter {
+        &self.counter
+    }
+
+    /// Cloneable handles for observing spawned/terminated counts after the
+    /// composite is moved into the scheduler. Returns (spawned_arc, terminated_arc).
+    #[allow(dead_code)]
+    pub(crate) fn observer_handles(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            self.spawned_counter.clone(),
+            self.terminated_counter.clone(),
+        )
+    }
+
+    /// Spawn exactly one child. Returns true if a child was spawned.
+    fn spawn_one_child(&self, state: &mut CompositeMockState) -> bool {
+        let terminated = self.terminated_counter.load(Ordering::SeqCst);
+        let in_flight = state.spawned.saturating_sub(terminated);
+        if in_flight >= self.memory_cap {
+            return false;
+        }
+        if state.spawned >= state.total_children {
+            return false;
+        }
+
+        let child_id_num = self.next_child_id.fetch_add(1, Ordering::Relaxed);
+        let child_id = TransferId {
+            id: child_id_num,
+            parent: Some(self.ctx.id.id),
+        };
+
+        let mut child = if let Some(ref notify) = self.child_notify {
+            ChildMockTransfer::new_blocking(
+                child_id,
+                self.handle.clone(),
+                self.counter.clone(),
+                notify.clone(),
+            )
+            .with_terminated_counter(self.terminated_counter.clone())
+        } else {
+            ChildMockTransfer::new(
+                child_id,
+                self.handle.clone(),
+                self.work_per_child,
+                self.counter.clone(),
+            )
+            .with_terminated_counter(self.terminated_counter.clone())
+        };
+        if let Some(ref log) = self.poll_log {
+            child = child.with_poll_log(log.clone());
+        }
+        let child: Box<dyn Transfer> = Box::new(child);
+
+        self.handle.scheduler.enqueue_transfer(child);
+        state.spawned += 1;
+        self.spawned_counter.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+
+impl Transfer for SingleTicketCompositeMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        if let Some(ref log) = self.poll_log {
+            log.lock().unwrap().push(self.ctx.id.id);
+        }
+        let mut state = self.state.lock().unwrap();
+
+        // Done condition: all children spawned AND all children terminated.
+        let terminated = self.terminated_counter.load(Ordering::SeqCst);
+        if terminated >= state.total_children && state.spawned >= state.total_children {
+            drop(state);
+            self.ctx.set_completed();
+            self.ctx.signal_terminal();
+            return PollWork::Done;
+        }
+
+        // Try to spawn exactly one child.
+        if self.spawn_one_child(&mut state) {
+            return PollWork::Spawned;
+        }
+
+        // Cannot spawn (at memory cap or all spawned but not all terminated).
+        drop(state);
+        self.ctx.set_pending();
+        PollWork::Pending
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("SingleTicketCompositeMock never returns PollWork::Ready")
+    }
+}
+
+/// A mock that returns `PollWork::Ready { io, spawned: true }` on its first
+/// poll and `Pending` thereafter. Exercises the scheduler's fused reap+spawn
+/// arm which charges both `work_generated` (for the IO) and
+/// `work_generated_spawn` (for the fused child spawn) in one pass. Returns
+/// `Pending` (rather than `Done`) so the descriptor stays in `transfers` for
+/// vruntime observation.
+#[derive(Debug)]
+pub(crate) struct FusedReadySpawnedMock {
+    polled: AtomicBool,
+    completed: AtomicU64,
+}
+
+impl FusedReadySpawnedMock {
+    pub(crate) fn new() -> Self {
+        Self {
+            polled: AtomicBool::new(false),
+            completed: AtomicU64::new(0),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn completed_count(&self) -> u64 {
+        self.completed.load(Ordering::SeqCst)
+    }
+}
+
+impl MockStateMachine for FusedReadySpawnedMock {
+    fn poll_work(&self, _id: TransferId) -> PollWork {
+        if !self.polled.swap(true, Ordering::SeqCst) {
+            return PollWork::Ready {
+                io: IoRequest { data: None },
+                spawned: true,
+            };
+        }
+        PollWork::Pending
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.completed.fetch_add(1, Ordering::SeqCst);
             WorkOutcome::Success { data: None }
         })
     }
@@ -997,7 +1285,7 @@ mod tests {
         let id = test_id();
 
         for _ in 0..3 {
-            assert!(matches!(sm.poll_work(id), PollWork::Ready(_)));
+            assert!(matches!(sm.poll_work(id), PollWork::Ready { .. }));
         }
         assert!(matches!(sm.poll_work(id), PollWork::Done));
     }
@@ -1009,7 +1297,7 @@ mod tests {
         let id = test_id();
 
         let mut work = match sm.poll_work(id) {
-            PollWork::Ready(w) => w,
+            PollWork::Ready { io, .. } => io,
             _ => panic!("expected Ready"),
         };
 

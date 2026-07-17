@@ -30,7 +30,6 @@ use s3_mock_server::S3MockServer;
 /// Global (not a thread-local `set_default`) so it captures events from the
 /// managed threads and tokio workers the transfer runs on, not just the test
 /// thread. Idempotent: the first call wins, later calls are no-ops.
-#[cfg(e2e_test)]
 pub(crate) fn init_e2e_logs() {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -184,6 +183,7 @@ impl TmTestClient {
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
         configure: Option<impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder>,
     ) -> Self {
+        init_e2e_logs();
         let server = S3MockServer::builder()
             .with_in_memory_store()
             .build()

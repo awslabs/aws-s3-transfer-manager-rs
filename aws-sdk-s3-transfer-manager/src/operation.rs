@@ -22,15 +22,16 @@ pub mod upload_objects;
 // The default delimiter of the S3 object key
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
-/// Default per-request cap on concurrently-materialized child transfers
-/// (shared by upload_objects and download_objects).
-pub(crate) const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 4096;
-
-/// Children spawned per `poll_work` cycle (shared by upload_objects and
-/// download_objects). Each spawn injects a schedulable CFS entity, so a small
-/// batch bounds ready-set flooding. The scheduler re-polls the parent after
-/// each `Ready`, so refill stays fast across cycles.
-pub(crate) const SPAWN_BATCH_SIZE: usize = 32;
+/// Conservative per-transfer backstop on concurrently-materialized child
+/// transfers (shared by upload_objects and download_objects).
+///
+/// The scheduler's hierarchical fair-share drives throughput and the walker
+/// provides natural rate-limiting, so this cap primarily bounds working-set
+/// memory. 512 covers the highest useful concurrency observed in practice
+/// (100 Gbps links sustain ~200-250 concurrent transfers; 600 Gbps multi-NIC
+/// configurations stay below 500). Callers that genuinely need more can
+/// override via `max_concurrent_downloads` / `max_concurrent_uploads`.
+pub(crate) const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 512;
 
 // Checks if the target path at `path`, with the provided `metadata`, represents a directory.
 //

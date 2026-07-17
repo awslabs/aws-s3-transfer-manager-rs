@@ -10,7 +10,8 @@ use crate::transfer::{IoRequest, PollWork};
 /// Assert poll returns Ready and extract the work item.
 pub(crate) fn assert_ready(poll: PollWork) -> IoRequest {
     match poll {
-        PollWork::Ready(w) => w,
+        PollWork::Ready { io, .. } => io,
+        PollWork::Spawned => panic!("expected Ready, got Spawned"),
         PollWork::Pending => panic!("expected Ready, got Pending"),
         PollWork::Done => panic!("expected Ready, got Done"),
     }

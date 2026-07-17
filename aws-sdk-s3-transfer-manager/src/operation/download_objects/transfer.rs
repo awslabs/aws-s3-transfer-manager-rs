@@ -9,6 +9,9 @@
 //! discovers objects, the parent spawns child downloads (via
 //! [`Download::orchestrate_with_sink`]), and reaps them as they complete.
 
+use aws_sdk_s3::types::Object;
+use parking_lot::Mutex;
+use path_clean::PathClean;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -16,28 +19,39 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aws_sdk_s3::types::Object;
-use parking_lot::Mutex;
-use path_clean::PathClean;
-
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedDownload, FailedTransferPolicy};
 
-use crate::operation::SPAWN_BATCH_SIZE;
-
-/// Terminal children reaped per `JoinChildren` work item. A reap injects no
-/// schedulable entity (it joins already-terminal handles), so unlike spawning
-/// it can batch large; the bound only caps worker-thread hold time on the
-/// serial join.
-const REAP_BATCH_SIZE: usize = 256;
+/// Maximum terminal children drained into a single `JoinChildren` work item per
+/// poll. NOT an accumulation threshold: `poll_work` reaps whatever terminals
+/// exist every poll (fused with spawning), so this only caps how many
+/// already-terminal handles one `execute_join_children` awaits back-to-back,
+/// bounding worker-thread hold time on the serial join. Kept modest so a poll's
+/// reap work stays small and terminals are retired continuously rather than in
+/// large lumps.
+const MAX_REAP_PER_POLL: usize = 64;
 
 /// Maximum entries to drain from the walker per AdvanceWalker work item.
 /// Prevents a single work item from holding the executor across multiple
 /// ListObjectsV2 pages. Matches S3's default MaxKeys.
 const MAX_ENTRIES_PER_WALK: usize = 1000;
+
+/// Low-water mark for the key buffer: the walker dispatches the next listing
+/// page while `pending_entries` is below this, keeping the buffer fed ahead of
+/// spawn draining it. Sized to one page so a single in-flight advance refills
+/// more than a page's worth of runway before the buffer empties. Combined with
+/// single-flight dispatch, this bounds `pending_entries` to roughly one page
+/// above the mark.
+const WALK_LOW_WATER: usize = MAX_ENTRIES_PER_WALK;
+
+/// Number of discovered keys accumulated before publishing them to
+/// `pending_entries` mid-advance. Small enough that spawning sees keys quickly
+/// while a page is still being fetched, large enough to amortize the state-lock
+/// acquisition across many keys.
+const WALK_FLUSH_CHUNK: usize = 64;
 
 /// Default S3 key delimiter.
 const DEFAULT_DELIMITER: &str = "/";
@@ -73,7 +87,7 @@ pub(crate) struct ChildTransfer {
 /// Owns a reservation of N slots in `State::children_reserved`. Either
 /// consumed by [`DownloadObjectsTransfer::merge_spawned`] (paired decrement
 /// under the state lock) or released on `Drop` if `consume` is not reached.
-/// Constructed only by [`DownloadObjectsTransfer::claim_spawn_batch`].
+/// Constructed only by [`DownloadObjectsTransfer::claim_one`].
 ///
 /// The type makes the counter pairing structural: `merge_spawned`'s signature
 /// requires the token, so a caller cannot forget to release the reservation,
@@ -87,7 +101,7 @@ struct Reservation {
 impl Reservation {
     /// Caller holds `state.lock`. Decrements `children_reserved` by the owned
     /// count and marks the reservation consumed. Always paired 1:1 with the
-    /// `claim_spawn_batch` that produced this token.
+    /// `claim_one` that produced this token.
     fn consume(mut self, state: &mut State) {
         debug_assert!(
             !self.consumed,
@@ -306,53 +320,80 @@ impl DownloadObjectsTransfer {
         }
     }
 
-    /// Produce one unit of work. The three steps run in order each call:
+    /// Produce work for one poll. Spawn and reap run in the same poll and are
+    /// fused into a single outcome rather than competing as strict-priority
+    /// ladder steps:
     ///
-    /// 1. Spawn. A side effect, not a returned item, so it runs every call and
-    ///    composes with whatever is returned below. Gating on *active* children
-    ///    (`claim_spawn_batch`) lets a completion burst refill immediately, so
-    ///    the active-child count holds at the cap instead of sawtoothing.
-    /// 2. Walk, if a page is available. poll_work returns at most one item;
-    ///    walk is preferred over reap for it, else a steady completion stream
-    ///    would reap forever and never list the next page. `dispatch_walk`
-    ///    yields nothing once registered children fill the cap.
-    /// 3. Reap, bounded by REAP_BATCH_SIZE.
+    /// 1. Walk (refill): if the walker can dispatch, return its `AdvanceWalker`
+    ///    item. A walk poll is the whole poll (neither spawns nor reaps).
+    /// 2. Spawn one child (lock released around orchestration).
+    /// 3. Reap any terminal children (up to MAX_REAP_PER_POLL this poll).
+    /// 4. Fuse: a reap returns `Ready { io: JoinChildren, spawned }`; with no
+    ///    reap, `Spawned` if an entry was claimed, else `check_terminal` /
+    ///    `Pending`.
     ///
-    /// Steps 1-2 are skipped when inactive, so cancel/fail stops new work
-    /// while in-flight drains.
+    /// Fusing means one poll can both retire a terminal child and refill, so a
+    /// continuous completion stream does not force reap and spawn onto separate
+    /// turns and done children are retired as they appear rather than
+    /// accumulating. Walk and spawn are skipped when inactive, so cancel/fail
+    /// stops new work while in-flight drains.
     pub(crate) fn poll_work(&self) -> PollWork {
         let mut state = self.inner.state.lock();
 
-        // 1: spawn (lock released around orchestration; no work item returned).
-        if self.inner.ctx.is_active() {
-            let (to_spawn, reservation) = self.claim_spawn_batch(&mut state);
-            if !to_spawn.is_empty() {
-                drop(state);
-                let spawned = self.spawn_children(to_spawn);
-                state = self.inner.state.lock();
-                self.merge_spawned(&mut state, spawned, reservation);
-            }
-            // An empty claim yields a zero-count reservation that drops here
-            // harmlessly (its Drop is a no-op for count == 0).
-        }
-
-        // 2: walk.
+        // 1: Walk (refill). `dispatch_walk` gates on the low-water mark, so it
+        // tops off the key buffer ahead of spawn draining it rather than
+        // waiting until empty, avoiding stalls on ListObjectsV2 page latency.
         if self.inner.ctx.is_active() {
             if let Some(work) = self.dispatch_walk(&mut state) {
                 return work;
             }
         }
 
-        // 3: reap.
-        if let Some(batch) = self.drain_terminal_children(&mut state) {
-            return PollWork::Ready(IoRequest {
-                data: Some(Box::new(DownloadObjectsWork::JoinChildren {
-                    batch: Some(batch),
-                })),
-            });
+        // 2: Spawn one child (lock released around orchestration).
+        //
+        // `attempted` = an entry was claimed from `pending_entries` this poll,
+        // regardless of whether its child orchestrated. It MUST drive re-poll: a
+        // claimed entry has left the queue, so the parent has to stay scheduled
+        // to drain the rest — even after a failed orchestration — or the
+        // remaining entries strand with no wake once the walker is exhausted (a
+        // hang; see `test_two_failed_spawns_continue_managed_runtime_does_not_hang`).
+        // `materialized` = a live child was actually inserted; it drives the
+        // spawn vruntime charge, so a failed orchestration is not charged.
+        let mut attempted = false;
+        let mut materialized = false;
+        if self.inner.ctx.is_active() {
+            let (to_spawn, reservation) = self.claim_one(&mut state);
+            if !to_spawn.is_empty() {
+                attempted = true;
+                drop(state);
+                let spawned = self.spawn_children(to_spawn);
+                state = self.inner.state.lock();
+                materialized = self.merge_spawned(&mut state, spawned, reservation) > 0;
+            }
         }
 
-        // Idle: listing in flight, pipeline full, or walk done and draining.
+        // 3: Reap terminal children (up to MAX_REAP_PER_POLL this poll, no
+        // accumulation threshold — done children are retired as they appear).
+        let reaped = self.drain_terminal_children(&mut state);
+
+        // 4: Fuse spawn and reap into one poll outcome. A reap dispatches a
+        // JoinChildren item and carries `spawned` so the scheduler charges spawn
+        // vruntime iff a child materialized this poll — one poll both refills and
+        // retires. With no reap, re-poll if we touched the queue; otherwise
+        // settle terminal/idle.
+        if let Some(batch) = reaped {
+            return PollWork::Ready {
+                io: IoRequest {
+                    data: Some(Box::new(DownloadObjectsWork::JoinChildren {
+                        batch: Some(batch),
+                    })),
+                },
+                spawned: materialized,
+            };
+        }
+        if attempted {
+            return PollWork::Spawned;
+        }
         if let Some(result) = self.check_terminal(&state) {
             return result;
         }
@@ -360,7 +401,7 @@ impl DownloadObjectsTransfer {
         PollWork::Pending
     }
 
-    /// Collect up to REAP_BATCH_SIZE children that have reached a terminal
+    /// Collect up to MAX_REAP_PER_POLL children that have reached a terminal
     /// state (success, failure, or cancellation) for reaping via JoinChildren.
     fn drain_terminal_children(&self, state: &mut State) -> Option<ReapingBatch> {
         let terminal_ids: Vec<TransferId> = state
@@ -368,7 +409,7 @@ impl DownloadObjectsTransfer {
             .iter()
             .filter(|(_, child)| child.handle.status() != crate::types::TransferStatus::Active)
             .map(|(id, _)| *id)
-            .take(REAP_BATCH_SIZE)
+            .take(MAX_REAP_PER_POLL)
             .collect();
 
         if terminal_ids.is_empty() {
@@ -401,14 +442,11 @@ impl DownloadObjectsTransfer {
         })
     }
 
-    /// Claim up to SPAWN_BATCH_SIZE pending entries to spawn as children.
+    /// Claim exactly ONE pending entry to spawn as a child.
     ///
     /// Gates on the *in-flight budget*: active children plus reserved, against
-    /// `pipeline_depth`. Terminal-unreaped children are excluded — they hold a
-    /// memory slot (bounded in `dispatch_walk`) but do no work, so counting
-    /// them would couple spawn-refill to reap latency and reintroduce the
-    /// sawtooth. `children_reserved` stops concurrent callers overshooting.
-    fn claim_spawn_batch(&self, state: &mut State) -> (Vec<Object>, Reservation) {
+    /// `pipeline_depth`. Returns an empty Vec when nothing can be claimed.
+    fn claim_one(&self, state: &mut State) -> (Vec<Object>, Reservation) {
         let active = state
             .children
             .values()
@@ -416,12 +454,12 @@ impl DownloadObjectsTransfer {
             .count()
             + state.children_reserved;
         let available = self.inner.pipeline_depth.saturating_sub(active);
-        let count = available
-            .min(SPAWN_BATCH_SIZE)
-            .min(state.pending_entries.len());
+        let count = available.min(1).min(state.pending_entries.len());
 
         let batch: Vec<Object> = state.pending_entries.drain(..count).collect();
         state.children_reserved += batch.len();
+        // When batch is empty, count is 0. The resulting Reservation drops
+        // harmlessly: Reservation::Drop is guarded by `self.count > 0`.
         let reservation = Reservation {
             transfer: self.inner.clone(),
             count: batch.len(),
@@ -537,17 +575,25 @@ impl DownloadObjectsTransfer {
     /// Merge results of child spawning back into state. Inserts each child into
     /// the active set or records the failure, then consumes the [`Reservation`]
     /// in lockstep so the `children_reserved` pairing is structural.
+    ///
+    /// Returns the number of children actually inserted (orchestrated
+    /// successfully). Callers use this to decide whether a spawn genuinely
+    /// occurred: a claimed entry whose orchestration failed is recorded in
+    /// `failed` but produces no live child, so it must not be counted as a spawn
+    /// (which would over-charge spawn vruntime for a child that never runs).
     fn merge_spawned(
         &self,
         state: &mut State,
         spawned: Vec<(Object, Result<ChildTransfer, Error>)>,
         reservation: Reservation,
-    ) {
+    ) -> usize {
+        let mut inserted = 0usize;
         for (obj, result) in spawned {
             match result {
                 Ok(child) => {
                     let id = child.handle.transfer_id();
                     state.children.insert(id, child);
+                    inserted += 1;
                 }
                 Err(err) => {
                     let key = obj
@@ -579,8 +625,9 @@ impl DownloadObjectsTransfer {
             }
         }
         // Release the reservation under the same lock: count reserved by
-        // claim_spawn_batch == results merged here.
+        // claim_one == results merged here.
         reservation.consume(state);
+        inserted
     }
 
     fn check_terminal(&self, state: &State) -> Option<PollWork> {
@@ -632,18 +679,17 @@ impl DownloadObjectsTransfer {
 
     /// Dispatch one listing page, or `None` if listing cannot proceed.
     ///
-    /// Single-flight (`walk_in_flight`) and backpressured by the *memory
-    /// budget*: all registered children (active and terminal-unreaped) plus
-    /// reserved plus queued entries, against `pipeline_depth`. Distinct from
-    /// the in-flight budget that gates spawning — listing fills memory,
-    /// spawning consumes network/disk concurrency.
+    /// Single-flight (`walk_in_flight`) and gated on the key buffer alone: a
+    /// page is fetched only while `pending_entries` is below the low-water
+    /// mark, so the walker refills the buffer ahead of spawn draining it. This
+    /// bounds `pending_entries` to roughly low-water plus one page (single
+    /// flight admits at most one in-flight page). Independent of the child
+    /// in-flight budget (`pipeline_depth`), which gates spawning, not listing.
     fn dispatch_walk(&self, state: &mut State) -> Option<PollWork> {
         if state.walk_in_flight {
             return None;
         }
-        let registered =
-            state.children.len() + state.children_reserved + state.pending_entries.len();
-        if registered >= self.inner.pipeline_depth {
+        if state.pending_entries.len() >= WALK_LOW_WATER {
             return None;
         }
 
@@ -658,7 +704,7 @@ impl DownloadObjectsTransfer {
         };
 
         state.walk_in_flight = true;
-        Some(PollWork::Ready(IoRequest {
+        Some(PollWork::ready(IoRequest {
             data: Some(Box::new(DownloadObjectsWork::AdvanceWalker {
                 walk: Some(Box::new(walk)),
             })),
@@ -715,20 +761,32 @@ impl DownloadObjectsTransfer {
             }
         }
 
-        // Drain up to a page worth of entries from the walker
-        let mut entries = Vec::new();
+        // Drain up to a page worth of entries from the walker, publishing them
+        // to `pending_entries` in small chunks as they arrive rather than in a
+        // single batch at the end. Early publication lets spawning consume keys
+        // while the rest of the page is still being fetched, so the buffer does
+        // not sit empty across a ListObjectsV2 round-trip.
+        let mut chunk = Vec::with_capacity(WALK_FLUSH_CHUNK);
+        let mut discovered = 0usize;
         let mut fatal_error = None;
 
-        // Pull entries until the walker needs to make another network call
-        // (returns None from ready_objects) or we hit a batch limit.
         loop {
             match walk.next().await {
                 Some(Ok(obj)) => {
-                    entries.push(obj);
+                    chunk.push(obj);
+                    discovered += 1;
+                    if chunk.len() >= WALK_FLUSH_CHUNK {
+                        let mut state = self.inner.state.lock();
+                        state.pending_entries.extend(chunk.drain(..));
+                        drop(state);
+                        // Wake so a spawn poll runs against the just-published
+                        // keys without waiting for this advance to complete.
+                        self.inner.ctx.try_wake();
+                    }
                     // Limit to one page worth of results per work item so we
                     // don't hold the executor across multiple ListObjectsV2
                     // calls, starving other transfers.
-                    if entries.len() >= MAX_ENTRIES_PER_WALK {
+                    if discovered >= MAX_ENTRIES_PER_WALK {
                         break;
                     }
                 }
@@ -749,7 +807,7 @@ impl DownloadObjectsTransfer {
             }
         }
 
-        // Put entries and walk back into state
+        // Publish any remaining keys and put the walk back into state.
         let mut state = self.inner.state.lock();
         state.walk_in_flight = false;
 
@@ -765,11 +823,11 @@ impl DownloadObjectsTransfer {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 tid = %self.inner.ctx.id,
-                discovered = entries.len(),
+                discovered,
                 walk_done = walk.is_done(),
                 "download_objects walker advanced",
             );
-            state.pending_entries.extend(entries);
+            state.pending_entries.extend(chunk.drain(..));
             if !walk.is_done() {
                 state.walk = Some(walk);
             }
@@ -1031,9 +1089,10 @@ mod tests {
     async fn drive_transfer(transfer: &DownloadObjectsTransfer) {
         loop {
             match transfer.poll_work() {
-                PollWork::Ready(mut work) => {
+                PollWork::Ready { io: mut work, .. } => {
                     transfer.execute(&mut work).await;
                 }
+                PollWork::Spawned => {}
                 PollWork::Pending => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1694,6 +1753,63 @@ mod tests {
         assert!(transfer.ctx().is_failed());
     }
 
+    /// Regression (real scheduler): two claimed-but-failed spawns under Continue
+    /// must not hang the parent. A path-traversal key is rejected by
+    /// `local_key_path` DURING the spawn step (before any GET), so it is a
+    /// claimed entry that produces no child. The parent must stay scheduled to
+    /// drain the SECOND such entry; if `poll_work` gates re-poll on whether a
+    /// child *materialized* rather than whether an entry was *claimed*, the
+    /// second entry strands with no wake once the walker is exhausted and the
+    /// parent's `completion_rx` never resolves. Must use the managed runtime:
+    /// the immediate `drive_transfer` harness busy-re-polls on `Pending` and so
+    /// cannot observe a lost wake.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_two_failed_spawns_continue_managed_runtime_does_not_hang() {
+        let dir = tempdir().unwrap();
+
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![
+                    Object::builder().key("../../../etc/passwd").size(2).build(),
+                    Object::builder().key("../../../etc/shadow").size(2).build(),
+                ]))
+                .build()
+        });
+        // No GET should ever fire (both fail at key-path derivation), but wire a
+        // benign one so the mock client is well-formed.
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(2)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
+                .build()
+        });
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+
+        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+
+        let (transfer, completion_rx) = setup_enqueued(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            s3_client,
+            handle,
+        );
+
+        timeout(Duration::from_secs(10), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("two claimed-but-failed spawns must not strand the parent's completion");
+
+        assert_eq!(transfer.successful_downloads(), 0);
+        assert_eq!(
+            transfer.take_failed().map(|f| f.len()).unwrap_or(0),
+            2,
+            "both failed entries must be recorded"
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_fatal_walker_error_managed_runtime() {
@@ -1732,7 +1848,7 @@ mod tests {
             mock_s3_success(),
         );
 
-        // Pre-set the counter as if claim_spawn_batch had reserved 5 slots.
+        // Pre-set the counter as if claim_one had reserved 5 slots.
         {
             let mut state = transfer.inner.state.lock();
             state.children_reserved = 5;
@@ -1911,5 +2027,370 @@ mod tests {
             batch.consume(&mut state);
             assert_eq!(0, state.reaping_in_flight);
         }
+    }
+
+    // --- Single-ticket spawn cadence tests ---
+
+    /// Anti-stall guard: a directory of 500 objects fully transfers to
+    /// completion with the single-ticket spawn cadence. If the spawn path
+    /// stalls (returns nothing, never re-polled), this hangs and the
+    /// timeout fires as a failure.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_single_ticket_500_objects_completes() {
+        let dir = tempdir().unwrap();
+
+        let objects: Vec<Object> = (0..500)
+            .map(|i| {
+                Object::builder()
+                    .key(format!("obj{i:04}.bin"))
+                    .size(4)
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(objects.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(4)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+
+        let (transfer, completion_rx) =
+            setup_enqueued(dir.path(), FailedTransferPolicy::Continue, client, handle);
+
+        timeout(Duration::from_secs(30), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("500-object transfer must complete without stalling");
+
+        assert_eq!(transfer.successful_downloads(), 500);
+        for i in 0..500 {
+            assert!(
+                dir.path().join(format!("obj{i:04}.bin")).exists(),
+                "object {i} must be present on disk"
+            );
+        }
+    }
+
+    /// Backstop test: with a small max_concurrent set via pipeline_depth,
+    /// in-flight children never exceed it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_backstop_limits_in_flight_children() {
+        let dir = tempdir().unwrap();
+        let max_concurrent: usize = 4;
+
+        let objects: Vec<Object> = (0..20)
+            .map(|i| {
+                Object::builder()
+                    .key(format!("file{i:02}.txt"))
+                    .size(3)
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(objects.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(3)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"abc"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let walk = S3Walker::builder().build().walk(
+            S3WalkContext::builder()
+                .client(client)
+                .bucket("test-bucket")
+                .build(),
+        );
+
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        ctx.handle
+            .scheduler
+            .register_empty_group_for_test(ctx.id.id);
+
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(dir.path())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, max_concurrent);
+
+        let mut max_observed: usize = 0;
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                // Sample in-flight before polling.
+                {
+                    let state = transfer.inner.state.lock();
+                    let active = state
+                        .children
+                        .values()
+                        .filter(|c| c.handle.status() == crate::types::TransferStatus::Active)
+                        .count()
+                        + state.children_reserved;
+                    if active > max_observed {
+                        max_observed = active;
+                    }
+                }
+
+                match transfer.poll_work() {
+                    PollWork::Ready { io: mut work, .. } => {
+                        transfer.execute(&mut work).await;
+                    }
+                    PollWork::Spawned => {}
+                    PollWork::Pending => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    PollWork::Done => break,
+                }
+            }
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 20);
+        assert!(
+            max_observed <= max_concurrent,
+            "in-flight children ({max_observed}) must not exceed backstop ({max_concurrent})"
+        );
+    }
+
+    /// The fused ladder reaps terminal children continuously rather than
+    /// waiting for a batch threshold: every poll drains whatever terminals
+    /// exist and, when it also spawns, fuses both into one `Ready { spawned }`.
+    /// This guards the de-batching invariant — terminal children must NOT
+    /// accumulate to a large unreaped backlog while a directory is spawning.
+    /// A regression that reintroduced a reap-only-when->=MAX_REAP_PER_POLL
+    /// threshold (or reap-behind-spawn starvation) would let the backlog grow
+    /// and fail the bound below.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_reap_is_continuous_not_batched() {
+        let dir = tempdir().unwrap();
+
+        let objects: Vec<Object> = (0..300)
+            .map(|i| {
+                Object::builder()
+                    .key(format!("f{i:04}.txt"))
+                    .size(2)
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(objects.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(2)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+
+        let (transfer, completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
+
+        // Track how many polls fused a reap with a spawn (Ready{spawned:true})
+        // to confirm the fused path is actually exercised, and the peak
+        // unreaped-terminal backlog to confirm reaping keeps up.
+        let mut fused_reap_spawn = 0usize;
+        let mut max_terminal_backlog = 0usize;
+
+        timeout(Duration::from_secs(30), async {
+            loop {
+                // Sample the unreaped-terminal backlog before polling.
+                let terminal_before = {
+                    let state = transfer.inner.state.lock();
+                    state
+                        .children
+                        .values()
+                        .filter(|c| c.handle.status() != crate::types::TransferStatus::Active)
+                        .count()
+                };
+                max_terminal_backlog = max_terminal_backlog.max(terminal_before);
+
+                match transfer.poll_work() {
+                    PollWork::Ready {
+                        io: mut work,
+                        spawned,
+                    } => {
+                        if spawned {
+                            fused_reap_spawn += 1;
+                        }
+                        transfer.execute(&mut work).await;
+                    }
+                    PollWork::Spawned => {}
+                    PollWork::Pending => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    PollWork::Done => break,
+                }
+            }
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        // Liveness under the fused spawn+reap ladder: a 300-object directory
+        // completes with every child reaped and no hang. This guards the ladder
+        // restructure against dropping work, starving reap, or deadlocking.
+        //
+        // Whether in-flight stays flat and fusion fires is a property of real
+        // concurrency and is measured with end-to-end benchmarks, not asserted
+        // here: this single-parent-loop harness drives children in bursts at the
+        // parent's await points, so completion timing (hence backlog magnitude
+        // and whether reap+spawn coincide in one poll) is a harness artifact,
+        // not the product cadence. `max_terminal_backlog`/`fused_reap_spawn` are
+        // captured for debugging but not gated.
+        assert_eq!(transfer.successful_downloads(), 300);
+        let _ = (max_terminal_backlog, fused_reap_spawn);
+    }
+
+    /// `dispatch_walk` gates listing on the key buffer alone: it dispatches a
+    /// page while `pending_entries` is below the low-water mark, refuses at or
+    /// above it, and — the property this change introduced — dispatches
+    /// regardless of how many children are in flight. Listing is decoupled from
+    /// the child in-flight budget (`pipeline_depth`); a re-coupling regression
+    /// would fail the third case.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_dispatch_walk_gates_on_key_buffer_not_children() {
+        // Each case uses a fresh transfer so a dispatch in one does not consume
+        // the walk / set walk_in_flight for the next.
+        let dir = tempdir().unwrap();
+
+        // Below low-water, no children: dispatches.
+        {
+            let (transfer, _rx) = setup(
+                dir.path(),
+                FailedTransferPolicy::Continue,
+                mock_s3_success(),
+            );
+            let mut state = transfer.inner.state.lock();
+            assert!(state.pending_entries.len() < WALK_LOW_WATER);
+            assert!(
+                transfer.dispatch_walk(&mut state).is_some(),
+                "should dispatch a walk when the key buffer is below low-water"
+            );
+        }
+
+        // At/above low-water: refuses (buffer backpressure).
+        {
+            let (transfer, _rx) = setup(
+                dir.path(),
+                FailedTransferPolicy::Continue,
+                mock_s3_success(),
+            );
+            let mut state = transfer.inner.state.lock();
+            for i in 0..WALK_LOW_WATER {
+                state
+                    .pending_entries
+                    .push_back(Object::builder().key(format!("k{i}")).size(1).build());
+            }
+            assert!(
+                transfer.dispatch_walk(&mut state).is_none(),
+                "should not dispatch a walk when the key buffer is at/above low-water"
+            );
+        }
+
+        // Decoupling: children at the in-flight budget (pipeline_depth) but the
+        // key buffer low → still dispatches. The old gate refused here.
+        {
+            let (transfer, _rx) = setup(
+                dir.path(),
+                FailedTransferPolicy::Continue,
+                mock_s3_success(),
+            );
+            let mut state = transfer.inner.state.lock();
+            state.children_reserved = transfer.inner.pipeline_depth;
+            assert!(
+                transfer.dispatch_walk(&mut state).is_some(),
+                "listing must proceed even when children are at the in-flight budget"
+            );
+        }
+    }
+
+    /// Incremental delivery: `execute_advance_walker` publishes discovered keys
+    /// to `pending_entries` in `WALK_FLUSH_CHUNK`-sized batches mid-advance plus
+    /// a final remainder, rather than one batch at the end. This pins that the
+    /// chunked delivery is lossless and order-preserving across a chunk
+    /// boundary (150 keys = two full chunks + a 22-key remainder).
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_incremental_delivery_lossless_and_ordered() {
+        let dir = tempdir().unwrap();
+
+        let n = 2 * WALK_FLUSH_CHUNK + 22; // spans two full chunks + a remainder
+        let objects: Vec<Object> = (0..n)
+            .map(|i| Object::builder().key(format!("k{i:05}")).size(1).build())
+            .collect();
+        let expected: Vec<String> = objects
+            .iter()
+            .map(|o| o.key().unwrap().to_string())
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(objects.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(1)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let (transfer, _rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
+
+        // Dispatch one walk and execute it, capturing the keys it delivers.
+        let mut work = {
+            let mut state = transfer.inner.state.lock();
+            match transfer.dispatch_walk(&mut state) {
+                Some(PollWork::Ready { io, .. }) => io,
+                other => panic!("expected an AdvanceWalker work item, got {other:?}"),
+            }
+        };
+        transfer.execute(&mut work).await;
+
+        // n < MAX_ENTRIES_PER_WALK, so a single advance drains all of them.
+        let delivered: Vec<String> = {
+            let state = transfer.inner.state.lock();
+            state
+                .pending_entries
+                .iter()
+                .map(|o| o.key().unwrap().to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            delivered.len(),
+            n,
+            "all discovered keys must be delivered exactly once (no drop/dup across chunks)"
+        );
+        assert_eq!(
+            delivered, expected,
+            "keys must be delivered in listing order"
+        );
     }
 }

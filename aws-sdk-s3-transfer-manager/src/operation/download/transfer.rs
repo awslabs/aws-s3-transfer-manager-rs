@@ -27,6 +27,7 @@ use crate::operation::download::DownloadInput;
 use crate::runtime::memory::{NotifyFn, Reservation, Reserve};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
+use tracing::Instrument;
 
 /// Download-specific work data.
 #[derive(Debug)]
@@ -233,7 +234,7 @@ impl DownloadTransfer {
     /// Poll for the next work item.
     ///
     /// Returns:
-    /// - `PollWork::Ready(work)` - work available to execute
+    /// - `PollWork::Ready { .. }` - work available to execute
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
@@ -248,7 +249,7 @@ impl DownloadTransfer {
         match &mut *state {
             DownloadState::PendingDiscovery => {
                 *state = DownloadState::DiscoveryInFlight;
-                PollWork::Ready(IoRequest {
+                PollWork::ready(IoRequest {
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
@@ -366,7 +367,7 @@ impl DownloadTransfer {
                     );
                 }
 
-                PollWork::Ready(IoRequest {
+                PollWork::ready(IoRequest {
                     data: Some(Box::new(DownloadWork::GetObjectRange {
                         range: chunk_range,
                         slot: Some(slot),
@@ -402,7 +403,7 @@ impl DownloadTransfer {
     /// drives release), so it never spins emitting empty drains.
     fn drain_or_park(&self) -> PollWork {
         if self.inner.writer.has_drainable_resident() {
-            PollWork::Ready(IoRequest {
+            PollWork::ready(IoRequest {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
@@ -767,6 +768,11 @@ impl DownloadTransfer {
                     .map_err(crate::retry::GuardError::Inner)
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download-part",
+            tid = %self.id()
+        ))
         .await;
 
         let (segmented, bytes_received) = match result {
@@ -919,6 +925,11 @@ impl DownloadTransfer {
                 ))
             }
         })
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download-part-reissue",
+            tid = %self.id()
+        ))
         .await;
 
         let (chunk_meta, segmented, bytes_received) = match result {
@@ -1435,7 +1446,7 @@ mod tests {
         skip_discovery(&transfer).await;
 
         let mut seqs = Vec::new();
-        while let PollWork::Ready(mut w) = transfer.poll_work() {
+        while let PollWork::Ready { io: mut w, .. } = transfer.poll_work() {
             let data = w.data_mut::<DownloadWork>();
             if let DownloadWork::GetObjectRange { slot, .. } = data {
                 seqs.push(slot.as_ref().unwrap().seq());
@@ -1569,10 +1580,11 @@ mod tests {
         let mut issued = 1u64;
         loop {
             match transfer.poll_work() {
-                PollWork::Ready(_item) => {
+                PollWork::Ready { .. } => {
                     issued += 1;
                     assert!(issued <= w, "issuance ran past the window");
                 }
+                PollWork::Spawned => {}
                 PollWork::Pending => break,
                 PollWork::Done => panic!("unexpected Done"),
             }
@@ -1591,7 +1603,7 @@ mod tests {
         skip_discovery(&transfer).await;
         transfer.read_ahead().force_window(3);
         // Fill the window.
-        while let PollWork::Ready(_item) = transfer.poll_work() {}
+        while let PollWork::Ready { .. } = transfer.poll_work() {}
         assert_pending(transfer.poll_work());
 
         // Consume seq 0 (filled by discovery) — the buffer delivers the chunk, then the
@@ -1696,7 +1708,8 @@ mod tests {
         // poll_work returns Pending, not Ready(DrainResident).
         match transfer.poll_work() {
             PollWork::Pending => {}
-            PollWork::Ready(_) => panic!("stream-mode budget park must not emit DrainResident"),
+            PollWork::Spawned => panic!("unexpected Spawned"),
+            PollWork::Ready { .. } => panic!("stream-mode budget park must not emit DrainResident"),
             PollWork::Done => panic!("unexpected Done"),
         }
     }
@@ -1933,12 +1946,15 @@ mod tests {
                     continue;
                 }
                 match t.poll_work() {
-                    PollWork::Ready(mut work) => {
+                    PollWork::Ready { io: mut work, .. } => {
                         execute(t, &mut work).await;
                         progressed = true;
                     }
                     PollWork::Done => {
                         done[i] = true;
+                        progressed = true;
+                    }
+                    PollWork::Spawned => {
                         progressed = true;
                     }
                     PollWork::Pending => {}
