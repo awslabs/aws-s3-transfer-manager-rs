@@ -12,6 +12,7 @@
 
 mod assertions;
 mod download;
+mod download_objects;
 mod download_retry;
 mod harness;
 mod integrity;

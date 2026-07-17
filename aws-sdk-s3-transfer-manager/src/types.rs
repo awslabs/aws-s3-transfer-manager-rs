@@ -81,6 +81,29 @@ impl MemoryBudgetConfig {
     }
 }
 
+/// Selects the execution runtime the transfer manager runs on.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum RuntimeMode {
+    /// Managed OS threads owned by the transfer manager (default, recommended).
+    ///
+    /// Spawns and owns its own worker threads; the performance path.
+    #[default]
+    Managed,
+    /// Run on the caller's tokio multi-threaded runtime instead of spawning
+    /// dedicated threads.
+    ///
+    /// An escape hatch for embedding the transfer manager where it must not
+    /// spawn its own OS threads. This is not a performance tuning knob —
+    /// `Managed` is faster by design; prefer it unless you specifically need
+    /// the transfer manager to run on your existing runtime.
+    ///
+    /// Requires a multi-threaded runtime: transfer workers run via
+    /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
+    /// thread and throughput collapses.
+    MultiThreadTokio,
+}
+
 /// The concurrency mode the client should use for executing requests.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]

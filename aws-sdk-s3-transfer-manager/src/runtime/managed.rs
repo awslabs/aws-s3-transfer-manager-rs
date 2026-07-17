@@ -473,7 +473,7 @@ mod tests {
             crate::Config::builder()
                 .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
                 .build(),
-            num_cores,
+            Arc::new(crate::scheduler::FixedConcurrency::new(num_cores)),
             move |weak| {
                 let rt = Arc::new(
                     ManagedThreadRuntime::builder(weak)

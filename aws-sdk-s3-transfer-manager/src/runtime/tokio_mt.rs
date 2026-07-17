@@ -24,7 +24,6 @@ use worker_pool::WorkerPool;
 ///
 /// Assumes it is running within an existing tokio multi-threaded runtime context.
 /// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
-#[allow(dead_code)] // TODO: expose runtime selection on public config
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
@@ -33,7 +32,6 @@ pub(crate) struct TokioMultiThreadRuntime {
     components: RuntimeComponents,
 }
 
-#[allow(dead_code)] // TODO: expose runtime selection on public config
 impl TokioMultiThreadRuntime {
     pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
         Self {
@@ -44,7 +42,12 @@ impl TokioMultiThreadRuntime {
         }
     }
 
-    /// Ensure workers are spawned. Called lazily on first dispatch.
+    /// Ensure workers are spawned on first dispatch.
+    ///
+    /// The `mark_started` CAS (AcqRel) guarantees exactly one caller wins the
+    /// genesis spawn. The subsequent `Release` store to `worker_count` publishes
+    /// `target` so that a concurrent `ensure_worker_capacity` load (Acquire)
+    /// observes the post-genesis count and does not re-spawn.
     fn ensure_workers_started(&self) {
         if self.pool.mark_started() {
             let target = self
@@ -53,32 +56,67 @@ impl TokioMultiThreadRuntime {
                 .expect("Handle dropped")
                 .controller
                 .target();
-            self.spawn_workers(target);
+
+            // Emit the current-thread guardrail warning once, at the site where
+            // workers actually execute (not at Client::new, which may observe a
+            // different runtime).
+            if matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::CurrentThread)
+            ) {
+                tracing::warn!(
+                    target: crate::telemetry::TARGET_SCHEDULING,
+                    "RuntimeMode::MultiThreadTokio selected on a current-thread runtime; \
+                     transfer workers will serialize onto one thread. Use a \
+                     multi-threaded runtime or RuntimeMode::Managed."
+                );
+            }
+
+            self.spawn_workers_raw(target);
+            // Release: publish the genesis count so growth-path Acquire loads see it.
+            self.worker_count.store(target, Ordering::Release);
         }
     }
 
     /// Spawn additional workers if the concurrency target has grown beyond
     /// the current worker count.
+    ///
+    /// The CAS claims the growth atomically: it publishes `target` into
+    /// `worker_count` so concurrent callers observe the new count and skip.
+    /// Only the CAS winner spawns the delta. Acquire on load pairs with the
+    /// Release in genesis and in the CAS success ordering, preventing a stale
+    /// read of 0 after genesis has completed.
     fn ensure_worker_capacity(&self) {
+        // Only attempt growth after genesis; avoids a spurious load/CAS before
+        // `mark_started` has published the initial count.
+        if !self.pool.is_started() {
+            return;
+        }
+
         let target = self
             .handle
             .upgrade()
             .expect("Handle dropped")
             .controller
             .target();
-        let current = self.worker_count.load(Ordering::Relaxed);
+        let current = self.worker_count.load(Ordering::Acquire);
         if target > current
             && self
                 .worker_count
-                .compare_exchange(current, target, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(current, target, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
         {
-            self.spawn_workers(target - current);
+            self.spawn_workers_raw(target - current);
             tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING, old = current, new = target, "spawning additional workers");
         }
     }
 
-    fn spawn_workers(&self, count: usize) {
+    /// Spawn `count` tokio tasks that pull from the shared worker pool.
+    ///
+    /// Does NOT update `worker_count` — callers own the counter update
+    /// so each path (genesis / growth) can publish the authoritative value
+    /// without double-counting.
+    fn spawn_workers_raw(&self, count: usize) {
         for _ in 0..count {
             let pool = Arc::clone(&self.pool);
             let handle = self.handle.clone();
@@ -86,7 +124,14 @@ impl TokioMultiThreadRuntime {
                 worker_loop(pool, handle).await;
             });
         }
-        self.worker_count.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+impl TokioMultiThreadRuntime {
+    /// Current value of the worker counter. Test-only.
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_count.load(Ordering::Acquire)
     }
 }
 
@@ -112,7 +157,7 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
     }
 }
 
-/// Worker loop — pulls work from pool and executes it.
+/// Worker loop -- pulls work from pool and executes it.
 async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>) {
     static WORKER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let wid = WORKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -169,5 +214,115 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
         let elapsed = started.elapsed();
         pool.complete();
         h.scheduler.on_completion(work, outcome, elapsed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Handle;
+    use crate::scheduler::ConcurrencyController;
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
+    use std::sync::OnceLock;
+
+    /// Concurrency controller with a mutable target for testing growth.
+    #[derive(Debug)]
+    struct AdjustableConcurrency(StdAtomicUsize);
+
+    impl AdjustableConcurrency {
+        fn new(target: usize) -> Self {
+            Self(StdAtomicUsize::new(target))
+        }
+
+        fn set_target(&self, target: usize) {
+            self.0.store(target, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl ConcurrencyController for AdjustableConcurrency {
+        fn target(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    fn test_config() -> crate::Config {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        crate::Config::builder().client(s3_client).build()
+    }
+
+    /// Helper: builds a Handle with a TokioMultiThreadRuntime and an adjustable
+    /// concurrency controller, returning the runtime reference for counter checks.
+    fn build_handle_with_adjustable_concurrency(
+        initial_target: usize,
+    ) -> (
+        Arc<Handle>,
+        Arc<TokioMultiThreadRuntime>,
+        Arc<AdjustableConcurrency>,
+    ) {
+        let controller = Arc::new(AdjustableConcurrency::new(initial_target));
+        let slot: Arc<OnceLock<Arc<TokioMultiThreadRuntime>>> = Arc::new(OnceLock::new());
+        let slot_clone = slot.clone();
+
+        let handle = Handle::new_for_test_with_runtime(test_config(), controller.clone(), |weak| {
+            let rt = Arc::new(TokioMultiThreadRuntime::new(weak));
+            slot_clone.set(rt.clone()).ok();
+            rt
+        });
+        let runtime = slot.get().unwrap().clone();
+        (handle, runtime, controller)
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn genesis_spawns_exact_target_workers() {
+        let (_handle, runtime, _controller) = build_handle_with_adjustable_concurrency(4);
+        assert_eq!(
+            runtime.worker_count(),
+            0,
+            "no workers before first dispatch"
+        );
+
+        // Trigger genesis via dispatch with an empty batch.
+        let sq = crate::runtime::sync::SubmissionQueue::new(8);
+        let sub = sq.enter();
+        if let Some(mut guard) = sub.submit() {
+            runtime.dispatch(&mut guard);
+        }
+
+        assert_eq!(
+            runtime.worker_count(),
+            4,
+            "genesis must spawn exactly target workers"
+        );
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn growth_does_not_double_count() {
+        let (_handle, runtime, controller) = build_handle_with_adjustable_concurrency(4);
+
+        // Genesis dispatch.
+        let sq = crate::runtime::sync::SubmissionQueue::new(8);
+        let sub = sq.enter();
+        if let Some(mut guard) = sub.submit() {
+            runtime.dispatch(&mut guard);
+        }
+        assert_eq!(runtime.worker_count(), 4);
+
+        // Grow target from 4 to 8.
+        controller.set_target(8);
+
+        // Second dispatch triggers growth.
+        let sub = sq.enter();
+        if let Some(mut guard) = sub.submit() {
+            runtime.dispatch(&mut guard);
+        }
+        assert_eq!(
+            runtime.worker_count(),
+            8,
+            "after growth 4 -> 8, counter must be 8 (not 12)"
+        );
     }
 }

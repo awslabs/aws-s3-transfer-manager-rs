@@ -7,7 +7,7 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
 use aws_sdk_s3_transfer_manager::types::{
-    ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput,
+    ConcurrencyMode, MemoryBudgetConfig, PartSize, RuntimeMode, TargetThroughput,
 };
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
@@ -64,6 +64,25 @@ enum OutputFormat {
     Json,
 }
 
+/// Execution runtime selection, mapped to `RuntimeMode`.
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
+enum RuntimeArg {
+    /// Managed OS threads owned by the transfer manager (default).
+    #[default]
+    Managed,
+    /// Run on the ambient tokio multi-threaded runtime.
+    MultiThreadTokio,
+}
+
+impl RuntimeArg {
+    fn mode(&self) -> RuntimeMode {
+        match self {
+            RuntimeArg::Managed => RuntimeMode::Managed,
+            RuntimeArg::MultiThreadTokio => RuntimeMode::MultiThreadTokio,
+        }
+    }
+}
+
 #[derive(Debug, Clone, clap::Parser)]
 #[command(name = "cp")]
 #[command(about = "Copies a local file or S3 object to another location locally or in S3.")]
@@ -78,6 +97,10 @@ pub struct Args {
 
     #[command(flatten)]
     concurrency: ConcurrencyModeArg,
+
+    /// Execution runtime: managed threads (default) or the ambient tokio runtime
+    #[arg(long, value_enum, default_value_t = RuntimeArg::Managed)]
+    runtime: RuntimeArg,
 
     /// Part size to use
     #[arg(long, default_value_t = 8388608)]
@@ -379,9 +402,29 @@ async fn do_manifest_upload(
     Ok(total)
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    let args = Args::parse();
+    // Runtime flavor must match the selected execution runtime. `Managed` spawns
+    // and owns its own worker threads, so main only drives orchestration — a
+    // current-thread runtime is correct and matches prior behavior.
+    // `MultiThreadTokio` runs the transfer workers on THIS runtime via
+    // `tokio::spawn`, so it needs a multi-threaded runtime or all workers
+    // serialize onto one thread.
+    let rt = match args.runtime {
+        RuntimeArg::Managed => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime"),
+        RuntimeArg::MultiThreadTokio => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build multi-thread runtime"),
+    };
+    rt.block_on(async_main(args));
+}
+
+async fn async_main(args: Args) {
+    if let Err(e) = run(args).await {
         // The top-level Display already carries a TM error's operation, code, and
         // request ids; the source chain carries the underlying detail (SdkError
         // message, checksum values).
@@ -395,8 +438,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), BoxError> {
-    let args = Args::parse();
+async fn run(args: Args) -> Result<(), BoxError> {
     if args.tokio_console {
         console_subscriber::init();
     } else {
@@ -451,6 +493,7 @@ async fn run() -> Result<(), BoxError> {
     #[allow(unused_mut)]
     let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
+        .runtime_mode(args.runtime.mode())
         .part_size(PartSize::Target(args.part_size));
 
     // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory budget at N GiB

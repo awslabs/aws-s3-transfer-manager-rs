@@ -10,7 +10,7 @@ use aws_sdk_s3::config::{Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
 use crate::config::{Builder, Config};
-use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize};
+use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, RuntimeMode};
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
@@ -83,6 +83,14 @@ impl ConfigLoader {
     /// Default is [ConcurrencyMode::Auto].
     pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
         self.builder = self.builder.concurrency(mode);
+        self
+    }
+
+    /// Set the execution runtime this client should use.
+    ///
+    /// Default is [RuntimeMode::Managed].
+    pub fn runtime_mode(mut self, mode: RuntimeMode) -> Self {
+        self.builder = self.builder.runtime_mode(mode);
         self
     }
 

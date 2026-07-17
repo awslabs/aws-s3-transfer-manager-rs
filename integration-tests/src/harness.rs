@@ -5,15 +5,21 @@
 
 //! Test harness for driving the transfer manager against a backend.
 //!
-//! A [`Target`] is a `Backend` (mock server or real S3) crossed with a
-//! `BucketKind` (general purpose or S3 Express). [`Target::connect`] yields a
-//! [`TmTestClient`] that exposes a transfer manager wired to that backend plus
-//! the bucket name to use. The same test body runs across every target.
+//! Two ways to get a test client:
+//!
+//! - [`mock_tm`] / [`mock_tm_with`] — lightweight, mock-only. The default for
+//!   tests that only need a mock server (download_objects, upload_objects, etc.).
+//!
+//! - [`Target`] — the mock x real-S3 x bucket-kind matrix, for tests that must
+//!   run against real S3 (integrity, etc.). [`Target::connect`] yields a
+//!   [`TmTestClient`] that exposes a transfer manager wired to that backend plus
+//!   the bucket name to use.
 //!
 //! Real-S3 targets are compiled only under `--cfg e2e_test` and require the
 //! account setup the existing e2e tests use (`S3_TEST_BUCKET_NAME_RS`). Mock
 //! targets run in normal CI.
 
+use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
 use s3_mock_server::S3MockServer;
 
@@ -48,6 +54,55 @@ pub(crate) fn init_e2e_logs() {
             .try_init();
     });
 }
+
+// ---------------------------------------------------------------------------
+// Lightweight mock-only path
+// ---------------------------------------------------------------------------
+
+/// A transfer-manager client wired to a fresh in-memory mock server.
+///
+/// The mock-only counterpart to [`Target`]: no bucket-kind / real-S3 / express
+/// machinery, just the boilerplate every mock test repeats. Holds the server
+/// and handle (for fault injection and direct inspection) alongside the client.
+pub(crate) struct MockTm {
+    pub(crate) server: S3MockServer,
+    pub(crate) handle: s3_mock_server::ServerHandle,
+    pub(crate) client: TmClient,
+}
+
+/// Build a mock TM on the given runtime with default config.
+pub(crate) async fn mock_tm(runtime: RuntimeMode) -> MockTm {
+    mock_tm_with(runtime, |b| b).await
+}
+
+/// Build a mock TM, applying `configure` to the TM Config builder (part size,
+/// concurrency, ...). The runtime mode is set by the harness after `configure`.
+pub(crate) async fn mock_tm_with(
+    runtime: RuntimeMode,
+    configure: impl FnOnce(
+        aws_sdk_s3_transfer_manager::config::Builder,
+    ) -> aws_sdk_s3_transfer_manager::config::Builder,
+) -> MockTm {
+    init_e2e_logs();
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+    let handle = server.start().await.expect("start mock server");
+    let s3_client = handle.client().await;
+    let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().client(s3_client))
+        .runtime_mode(runtime)
+        .build();
+    MockTm {
+        server,
+        handle,
+        client: TmClient::new(cfg),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Target-based path (mock x real-S3 x bucket-kind matrix)
+// ---------------------------------------------------------------------------
 
 /// Which backend serves S3 requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

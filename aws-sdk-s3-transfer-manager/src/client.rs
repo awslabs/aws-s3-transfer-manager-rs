@@ -7,7 +7,7 @@ use crate::metrics::unit::ByteUnit;
 use crate::runtime::ManagedThreadRuntime;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
-use crate::types::{ConcurrencyMode, PartSize};
+use crate::types::{ConcurrencyMode, PartSize, RuntimeMode};
 use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,30 +138,17 @@ impl Handle {
         self.transfer_override(bucket)
     }
 
-    /// Create a Handle for testing with a custom scheduler factory.
+    /// Create a Handle for testing on the ambient tokio runtime with a fixed
+    /// concurrency target. The ergonomic common case; tests that need a custom
+    /// runtime or a controller they drive directly use
+    /// [`new_for_test_with_runtime`](Self::new_for_test_with_runtime).
     #[cfg(test)]
-    pub(crate) fn new_for_test(mut config: crate::Config, concurrency: usize) -> Arc<Self> {
-        Arc::new_cyclic(|weak| {
-            let scheduler = Scheduler::new(weak.clone());
-            let runtime: Arc<dyn ExecutionRuntime> =
-                Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak.clone()));
-            let s3_client = match config.take_s3_client_source() {
-                crate::config::S3ClientSource::Provided(client) => client,
-                crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    aws_sdk_s3::Client::from_conf(s3_config.builder.build())
-                }
-            };
-            Self {
-                config,
-                s3_client,
-                scheduler,
-                runtime,
-                controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-                telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
-                memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
-                retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            }
-        })
+    pub(crate) fn new_for_test(config: crate::Config, concurrency: usize) -> Arc<Self> {
+        Self::new_for_test_with_runtime(
+            config,
+            Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
+            |weak| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak)),
+        )
     }
 
     /// Test handle using the ambient tokio runtime (no OS threads spawned).
@@ -186,20 +173,27 @@ impl Handle {
     /// threads own their own runtimes independently.
     #[cfg(test)]
     pub(crate) fn test_handle_managed(config: crate::Config) -> Arc<Self> {
-        Self::new_for_test_with_runtime(config, 128, |weak| {
-            Arc::new(
-                crate::runtime::ManagedThreadRuntime::builder(weak)
-                    .topology(crate::runtime::Topology::uniform(4))
-                    .build(),
-            )
-        })
+        Self::new_for_test_with_runtime(
+            config,
+            Arc::new(crate::scheduler::FixedConcurrency::new(128)),
+            |weak| {
+                Arc::new(
+                    crate::runtime::ManagedThreadRuntime::builder(weak)
+                        .topology(crate::runtime::Topology::uniform(4))
+                        .build(),
+                )
+            },
+        )
     }
 
-    /// Create a Handle for testing with a custom runtime factory.
+    /// Create a Handle for testing with a custom concurrency controller and
+    /// runtime factory. The controller is an axis because some tests drive its
+    /// target directly (e.g. an adjustable controller); most pass a
+    /// [`FixedConcurrency`](crate::scheduler::FixedConcurrency).
     #[cfg(test)]
     pub(crate) fn new_for_test_with_runtime(
         mut config: crate::Config,
-        concurrency: usize,
+        controller: Arc<dyn ConcurrencyController>,
         runtime_factory: impl FnOnce(std::sync::Weak<Handle>) -> Arc<dyn ExecutionRuntime>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
@@ -216,7 +210,7 @@ impl Handle {
                 s3_client,
                 scheduler,
                 runtime,
-                controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
+                controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -267,14 +261,19 @@ impl Client {
 
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
-            let runtime: Arc<dyn ExecutionRuntime> = {
-                #[allow(unused_mut)]
-                let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
-                #[cfg(feature = "dial9")]
-                if let Some(guard) = telemetry_guard {
-                    builder = builder.telemetry_guard(guard);
+            let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
+                RuntimeMode::Managed => {
+                    #[allow(unused_mut)]
+                    let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
+                    #[cfg(feature = "dial9")]
+                    if let Some(guard) = telemetry_guard {
+                        builder = builder.telemetry_guard(guard);
+                    }
+                    Arc::new(builder.build())
                 }
-                Arc::new(builder.build())
+                RuntimeMode::MultiThreadTokio => Arc::new(
+                    crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
+                ),
             };
 
             let s3_client = match config.take_s3_client_source() {
@@ -683,5 +682,37 @@ mod tests {
         let map = handle.retry_partitions.lock().unwrap();
         assert_eq!(map.len(), 2, "each distinct bucket caches one partition");
         assert!(map.contains_key("bucket-a") && map.contains_key("bucket-b"));
+    }
+
+    // --- runtime mode selection ---
+
+    #[test]
+    fn config_default_runtime_mode_is_managed() {
+        let config = config_with(ConcurrencyMode::Auto, None);
+        assert!(matches!(config.runtime_mode(), RuntimeMode::Managed));
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn client_new_with_managed_runtime_mode() {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .runtime_mode(RuntimeMode::Managed)
+            .build();
+        let _client = Client::new(config);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_new_with_multi_thread_tokio_runtime_mode() {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .runtime_mode(RuntimeMode::MultiThreadTokio)
+            .build();
+        let _client = Client::new(config);
     }
 }
