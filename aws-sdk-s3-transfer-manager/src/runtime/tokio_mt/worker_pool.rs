@@ -135,6 +135,11 @@ impl WorkerPool {
             .is_ok()
     }
 
+    /// Whether genesis has completed (workers have been started at least once).
+    pub(super) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
     /// Number of pending work items.
     #[allow(dead_code)] // TODO: runtime observability
     pub(super) fn pending_count(&self) -> usize {

@@ -277,26 +277,9 @@ impl Client {
                     }
                     Arc::new(builder.build())
                 }
-                RuntimeMode::CurrentTokio => {
-                    // CurrentTokio runs transfer workers on the caller's runtime via
-                    // `tokio::spawn`. On a current-thread runtime they all serialize onto
-                    // the one thread, collapsing throughput with no other symptom. Warn
-                    // loudly rather than let that happen silently.
-                    if matches!(
-                        tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
-                        Ok(tokio::runtime::RuntimeFlavor::CurrentThread)
-                    ) {
-                        tracing::warn!(
-                            target: crate::telemetry::TARGET_SCHEDULING,
-                            "RuntimeMode::CurrentTokio selected on a current-thread runtime; \
-                             transfer workers will serialize onto one thread. Use a \
-                             multi-threaded runtime or RuntimeMode::Managed."
-                        );
-                    }
-                    Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
-                        weak_handle.clone(),
-                    ))
-                }
+                RuntimeMode::MultiThreadTokio => Arc::new(
+                    crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
+                ),
             };
 
             let s3_client = match config.take_s3_client_source() {
@@ -730,11 +713,11 @@ mod tests {
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn client_new_with_current_tokio_runtime_mode() {
+    async fn client_new_with_multi_thread_tokio_runtime_mode() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
             .client(s3_client)
-            .runtime_mode(RuntimeMode::CurrentTokio)
+            .runtime_mode(RuntimeMode::MultiThreadTokio)
             .build();
         let _client = Client::new(config);
     }

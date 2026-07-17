@@ -71,14 +71,14 @@ enum RuntimeArg {
     #[default]
     Managed,
     /// Run on the ambient tokio multi-threaded runtime.
-    CurrentTokio,
+    MultiThreadTokio,
 }
 
 impl RuntimeArg {
     fn mode(&self) -> RuntimeMode {
         match self {
             RuntimeArg::Managed => RuntimeMode::Managed,
-            RuntimeArg::CurrentTokio => RuntimeMode::CurrentTokio,
+            RuntimeArg::MultiThreadTokio => RuntimeMode::MultiThreadTokio,
         }
     }
 }
@@ -406,15 +406,16 @@ fn main() {
     let args = Args::parse();
     // Runtime flavor must match the selected execution runtime. `Managed` spawns
     // and owns its own worker threads, so main only drives orchestration — a
-    // current-thread runtime is correct and matches prior behavior. `CurrentTokio`
-    // runs the transfer workers on THIS runtime via `tokio::spawn`, so it needs a
-    // multi-threaded runtime or all workers serialize onto one thread.
+    // current-thread runtime is correct and matches prior behavior.
+    // `MultiThreadTokio` runs the transfer workers on THIS runtime via
+    // `tokio::spawn`, so it needs a multi-threaded runtime or all workers
+    // serialize onto one thread.
     let rt = match args.runtime {
         RuntimeArg::Managed => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build current-thread runtime"),
-        RuntimeArg::CurrentTokio => tokio::runtime::Builder::new_multi_thread()
+        RuntimeArg::MultiThreadTokio => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("build multi-thread runtime"),
