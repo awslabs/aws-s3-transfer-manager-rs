@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use std::cmp;
+use std::fs::File;
 use std::ops::DerefMut;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
 
@@ -22,6 +23,9 @@ use super::stream::{BoxStream, StreamContext};
 pub(crate) struct Builder {
     stream: Option<RawInputStream>,
     part_size: usize,
+    direct_io: bool,
+    metrics: Option<std::sync::Arc<crate::transfer::MetricsState>>,
+    telemetry: Option<std::sync::Arc<crate::telemetry::Telemetry>>,
 }
 
 impl Builder {
@@ -29,6 +33,9 @@ impl Builder {
         Self {
             stream: None,
             part_size: 5 * ByteUnit::Mebibyte.as_bytes_u64() as usize,
+            direct_io: false,
+            metrics: None,
+            telemetry: None,
         }
     }
 
@@ -46,9 +53,35 @@ impl Builder {
         self
     }
 
-    pub(crate) fn build(self) -> PartReader {
+    /// Set direct I/O mode (read on calling thread vs spawn_blocking).
+    pub(crate) fn direct_io(mut self, direct: bool) -> Self {
+        self.direct_io = direct;
+        self
+    }
+
+    /// Set the metrics state for recording I/O metrics.
+    pub(crate) fn metrics(
+        mut self,
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Set the per-client telemetry for forwarding I/O samples.
+    pub(crate) fn telemetry(
+        mut self,
+        telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    pub(crate) fn build(self) -> Result<PartReader, Error> {
         let stream = self.stream.expect("input stream set");
-        PartReader::new(stream, self.part_size)
+        let metrics = self.metrics.expect("metrics set");
+        let telemetry = self.telemetry.expect("telemetry set");
+        PartReader::new(stream, self.part_size, self.direct_io, metrics, telemetry)
     }
 }
 
@@ -59,17 +92,24 @@ pub(crate) struct PartReader {
 }
 
 impl PartReader {
-    fn new(raw: RawInputStream, part_size: usize) -> Self {
+    fn new(
+        raw: RawInputStream,
+        part_size: usize,
+        direct_io: bool,
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+        telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
+    ) -> Result<Self, Error> {
         let inner = match raw {
             RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
-            RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)),
+            RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)?),
             RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
         };
 
-        let stream_cx = StreamContext::new(part_size);
-        Self { inner, stream_cx }
+        let stream_cx = StreamContext::new(part_size, direct_io, metrics, telemetry);
+        Ok(Self { inner, stream_cx })
     }
 
+    #[allow(dead_code)] // TODO: re-wire upload part validation
     pub(crate) fn part_size(&self) -> usize {
         self.stream_cx.part_size()
     }
@@ -178,16 +218,29 @@ impl BytesPartReader {
 struct PathBodyPartReader {
     body: PathBody,
     state: Mutex<PartReaderState>, // std Mutex
+    file: Arc<File>,
 }
 
 impl PathBodyPartReader {
-    fn new(body: PathBody) -> Self {
+    fn new(body: PathBody) -> Result<Self, Error> {
+        // TODO(vnext): Consider O_DIRECT for large sequential uploads (requires aligned
+        // buffers from buffer pool). Also consider fadvise(POSIX_FADV_SEQUENTIAL) — generation
+        // order is sequential so kernel readahead would help, but concurrent execution creates
+        // some scatter. Benchmark before adding.
+        // TODO(vnext): does this need to be async now?
+        let file = Arc::new(File::open(&body.path).map_err(|e| {
+            Error::from(std::io::Error::new(
+                e.kind(),
+                format!("failed to open {}: {e}", body.path.display()),
+            ))
+        })?);
         let offset = body.offset;
         let content_length = body.length;
-        Self {
+        Ok(Self {
             body,
-            state: Mutex::new(PartReaderState::new(content_length).with_offset(offset)), // std Mutex
-        }
+            state: Mutex::new(PartReaderState::new(content_length).with_offset(offset)),
+            file,
+        })
     }
 }
 
@@ -202,28 +255,37 @@ impl PathBodyPartReader {
             }) => (offset, part_number, part_size, is_last),
             None => return Ok(None),
         };
-        let path = self.body.path.clone();
         // grab a buffer to fill from the context
         let mut dst = stream_cx.new_buffer(part_size as usize);
-        let handle = tokio::task::spawn_blocking(move || {
-            // SAFETY:  std::io::Read and FileExt traits take `&mut [u8]` buffer arguments (i.e.
-            // initialized). The `Deref` and `DerefMut` implementations of `Buffer`
-            // only return a slice of the _initialized_ portion of the buffer though.
-            // We need to set the length so that the raw `&[u8]` slice has the correct
-            // size. We are guaranteed to read exactly part_size data from file on success so
-            // any read of that slice after `read_file_chunk_sync` returns successfully will have
-            // been initialized.
-            unsafe { dst.set_len(dst.capacity()) }
-            file_util::read_file_chunk_sync(dst.deref_mut(), path, offset)?;
-            Ok::<PartData, Error>(PartData::new(part_number, dst).mark_last(is_last))
+        // SAFETY: We set the length to capacity so the read has a full slice to fill.
+        // read_file_chunk reads exactly part_size bytes on success, so the buffer
+        // will be fully initialized after a successful read.
+        unsafe { dst.set_len(dst.capacity()) }
+
+        if stream_cx.direct_io() {
+            // Managed threads: read directly, no thread pool hop.
+            file_util::read_file_chunk(&self.file, dst.deref_mut(), offset)?;
+        } else {
+            // Shared runtime: offload to blocking thread pool.
+            let fd = Arc::clone(&self.file);
+            dst = tokio::task::spawn_blocking(move || {
+                file_util::read_file_chunk(&fd, dst.deref_mut(), offset)?;
+                Ok::<_, std::io::Error>(dst)
+            })
+            .await??;
+        }
+
+        stream_cx.record_io(&crate::metrics::IoSample {
+            disk_read: part_size,
+            ..Default::default()
         });
 
-        handle.await?.map(Some)
+        Ok(Some(PartData::new(part_number, dst).mark_last(is_last)))
     }
 
     // Advances the `PartReaderState` to the next state and returns `PathBodyReadCursor`
     // (offset, part_number, part_size, is_last), which will be used in the upcoming
-    // `read_file_chunk_sync` execution.
+    // `read_file_chunk` execution.
     fn advance(&self, stream_cx: &StreamContext) -> Result<Option<PathBodyReadCursor>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
@@ -261,25 +323,23 @@ struct PathBodyReadCursor {
     is_last: bool,
 }
 
-mod file_util {
+pub(crate) mod file_util {
     #[cfg(unix)]
-    pub(super) use unix::read_file_chunk_sync;
+    pub(crate) use unix::read_file_chunk;
     #[cfg(windows)]
-    pub(super) use windows::read_file_chunk_sync;
+    pub(crate) use windows::read_file_chunk;
 
     #[cfg(unix)]
     mod unix {
         use std::fs::File;
         use std::io;
         use std::os::unix::fs::FileExt;
-        use std::path::Path;
 
-        pub(crate) fn read_file_chunk_sync(
+        pub(crate) fn read_file_chunk(
+            file: &File,
             dst: &mut [u8],
-            path: impl AsRef<Path>,
             offset: u64,
         ) -> Result<(), io::Error> {
-            let file = File::open(path)?;
             file.read_exact_at(dst, offset)
         }
     }
@@ -288,17 +348,25 @@ mod file_util {
     mod windows {
         use std::fs::File;
         use std::io;
-        use std::io::{Read, Seek, SeekFrom};
-        use std::path::Path;
+        use std::os::windows::fs::FileExt;
 
-        pub(crate) fn read_file_chunk_sync(
+        pub(crate) fn read_file_chunk(
+            file: &File,
             dst: &mut [u8],
-            path: impl AsRef<Path>,
             offset: u64,
         ) -> Result<(), io::Error> {
-            let mut file = File::open(path)?;
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(dst)
+            let mut pos = 0;
+            while pos < dst.len() {
+                let n = file.seek_read(&mut dst[pos..], offset + pos as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected end of file",
+                    ));
+                }
+                pos += n;
+            }
+            Ok(())
         }
     }
 }
@@ -333,7 +401,6 @@ impl DynPartReader {
 #[cfg(test)]
 mod test {
     use std::io::Write;
-    use std::path::PathBuf;
     use std::task::Poll;
 
     use bytes::{Buf, Bytes};
@@ -346,6 +413,20 @@ mod test {
     use crate::io::stream::{PartStream, StreamContext};
     use crate::io::InputStream;
 
+    fn test_stream_cx(part_size: usize) -> StreamContext {
+        StreamContext::new(part_size, false, test_metrics(), test_telemetry())
+    }
+
+    fn test_metrics() -> std::sync::Arc<crate::transfer::MetricsState> {
+        std::sync::Arc::new(crate::transfer::MetricsState::new())
+    }
+
+    fn test_telemetry() -> std::sync::Arc<crate::telemetry::Telemetry> {
+        std::sync::Arc::new(crate::telemetry::Telemetry::new(
+            std::time::Duration::from_secs(1),
+        ))
+    }
+
     async fn collect_parts(reader: PartReader) -> Vec<PartData> {
         let mut parts = Vec::new();
         let mut expected_part_number = 1;
@@ -357,12 +438,19 @@ mod test {
         parts
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader() {
         let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
         let stream = InputStream::from(data.clone());
         let expected = data.chunks(5).collect::<Vec<_>>();
-        let reader = Builder::new().part_size(5).stream(stream).build();
+        let reader = Builder::new()
+            .part_size(5)
+            .stream(stream)
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
+            .build()
+            .unwrap();
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
 
@@ -389,7 +477,13 @@ mod test {
         let expected = data.chunks(part_size).collect::<Vec<_>>();
 
         let stream = builder.build().unwrap();
-        let reader = Builder::new().part_size(part_size).stream(stream).build();
+        let reader = Builder::new()
+            .part_size(part_size)
+            .stream(stream)
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
+            .build()
+            .unwrap();
 
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
@@ -397,21 +491,25 @@ mod test {
         assert_eq!(expected, actual);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader() {
         path_reader_test(None, None).await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader_with_offset() {
         path_reader_test(None, Some(8)).await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader_with_explicit_length() {
         path_reader_test(Some(12), None).await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_path_part_reader_with_length_and_offset() {
         path_reader_test(Some(23), Some(4)).await;
@@ -450,6 +548,7 @@ mod test {
     }
 
     // sanity test custom PollPart is wired up and can be supplied to input stream
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_dyn_reader() {
         let data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
@@ -460,17 +559,24 @@ mod test {
                 .collect::<Vec<_>>(),
         );
         let stream = InputStream::from_part_stream(stream);
-        let reader = Builder::new().part_size(5).stream(stream).build();
+        let reader = Builder::new()
+            .part_size(5)
+            .stream(stream)
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
+            .build()
+            .unwrap();
         let parts = collect_parts(reader).await;
         let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
         assert_eq!(expected, actual);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader_offset_not_aligned_error() {
         let data = Bytes::from("test data for alignment error");
         let reader = BytesPartReader::new(data);
-        let stream_cx = StreamContext::new(5);
+        let stream_cx = test_stream_cx(5);
 
         // First call should succeed
         let result = reader.next_part(&stream_cx).await;
@@ -487,11 +593,12 @@ mod test {
         assert!(result.is_err());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader_detects_last_true() {
         let data = Bytes::from("test");
         let reader = BytesPartReader::new(data);
-        let stream_cx = StreamContext::new(10);
+        let stream_cx = test_stream_cx(10);
 
         let result = reader.next_part(&stream_cx).await.unwrap().unwrap();
         assert!(result.is_last.unwrap());
@@ -499,13 +606,16 @@ mod test {
 
     #[test]
     fn test_path_body_part_reader_advance() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 30]).unwrap();
+
         let path_body = PathBody {
-            path: PathBuf::from("test"),
+            path: tmp.path().to_path_buf(),
             offset: 10,
             length: 20,
         };
-        let reader = PathBodyPartReader::new(path_body);
-        let stream_cx = StreamContext::new(5);
+        let reader = PathBodyPartReader::new(path_body).unwrap();
+        let stream_cx = test_stream_cx(5);
 
         // First advance should succeed
         let result = reader.advance(&stream_cx).unwrap().unwrap();
@@ -534,13 +644,16 @@ mod test {
 
     #[test]
     fn test_path_body_part_reader_advance_detects_last_part() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 3]).unwrap();
+
         let path_body = PathBody {
-            path: PathBuf::from("test"),
+            path: tmp.path().to_path_buf(),
             offset: 0,
             length: 3,
         };
-        let reader = PathBodyPartReader::new(path_body);
-        let stream_cx = StreamContext::new(10);
+        let reader = PathBodyPartReader::new(path_body).unwrap();
+        let stream_cx = test_stream_cx(10);
 
         let result = reader.advance(&stream_cx).unwrap().unwrap();
         assert!(result.is_last);

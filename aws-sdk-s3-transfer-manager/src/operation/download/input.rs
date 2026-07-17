@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
 use aws_smithy_types::error::operation::BuildError;
 
 /// Input type for downloading a single object
@@ -120,6 +120,10 @@ pub struct DownloadInput {
     pub expected_bucket_owner: Option<String>,
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
     pub checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    /// How far this download may prefetch ahead of the consumer. `None` uses the
+    /// client default from [`Config`](crate::config::Config); `Some` overrides it for
+    /// this request.
+    pub read_ahead: Option<crate::types::ReadAhead>,
 }
 impl DownloadInput {
     /// <p>The bucket name containing the object.</p>
@@ -271,6 +275,11 @@ impl DownloadInput {
     pub fn checksum_mode(&self) -> Option<&aws_sdk_s3::types::ChecksumMode> {
         self.checksum_mode.as_ref()
     }
+    /// How far this download may prefetch ahead of the consumer, if overridden for
+    /// this request. `None` uses the client default.
+    pub fn read_ahead(&self) -> Option<&crate::types::ReadAhead> {
+        self.read_ahead.as_ref()
+    }
 }
 
 impl fmt::Debug for DownloadInput {
@@ -300,12 +309,13 @@ impl fmt::Debug for DownloadInput {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("read_ahead", &self.read_ahead);
         formatter.finish()
     }
 }
 
 impl DownloadInput {
-    /// Creates a new builder-style object to manufacture [`DownloadInput`](crate::operation::download::DownloadInput).
+    /// Creates a new builder-style object to manufacture [`DownloadInput`].
     pub fn builder() -> DownloadInputBuilder {
         DownloadInputBuilder::default()
     }
@@ -336,6 +346,7 @@ pub struct DownloadInputBuilder {
     pub(crate) part_number: Option<i32>,
     pub(crate) expected_bucket_owner: Option<String>,
     pub(crate) checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    pub(crate) read_ahead: Option<crate::types::ReadAhead>,
 }
 
 impl DownloadInputBuilder {
@@ -816,6 +827,22 @@ impl DownloadInputBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         &self.checksum_mode
     }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
+        self.read_ahead = Option::Some(input);
+        self
+    }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+        self.read_ahead = input;
+        self
+    }
+    /// The read-ahead override set on this builder, if any.
+    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+        &self.read_ahead
+    }
     /// Consumes the builder and constructs a [`DownloadInput`].
     pub fn build(self) -> Result<DownloadInput, ::aws_smithy_types::error::operation::BuildError> {
         if self.bucket.is_none() {
@@ -848,6 +875,7 @@ impl DownloadInputBuilder {
             part_number: self.part_number,
             expected_bucket_owner: self.expected_bucket_owner,
             checksum_mode: self.checksum_mode,
+            read_ahead: self.read_ahead,
         })
     }
 }
@@ -879,34 +907,44 @@ impl fmt::Debug for DownloadInputBuilder {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("read_ahead", &self.read_ahead);
         formatter.finish()
     }
 }
 
-impl From<DownloadInput> for GetObjectInputBuilder {
-    fn from(value: DownloadInput) -> Self {
-        GetObjectInputBuilder::default()
-            .set_bucket(value.bucket)
-            .set_if_match(value.if_match)
-            .set_if_modified_since(value.if_modified_since)
-            .set_if_none_match(value.if_none_match)
-            .set_if_unmodified_since(value.if_unmodified_since)
-            .set_key(value.key)
-            .set_range(value.range)
-            .set_response_cache_control(value.response_cache_control)
-            .set_response_content_disposition(value.response_content_disposition)
-            .set_response_content_encoding(value.response_content_encoding)
-            .set_response_content_language(value.response_content_language)
-            .set_response_content_type(value.response_content_type)
-            .set_response_expires(value.response_expires)
-            .set_version_id(value.version_id)
-            .set_sse_customer_algorithm(value.sse_customer_algorithm)
-            .set_sse_customer_key(value.sse_customer_key)
-            .set_sse_customer_key_md5(value.sse_customer_key_md5)
-            .set_request_payer(value.request_payer)
-            .set_expected_bucket_owner(value.expected_bucket_owner)
-            .set_checksum_mode(value.checksum_mode)
-    }
+/// Forward all `DownloadInput` fields onto a `GetObject` fluent builder.
+///
+/// The fluent builder (not the input builder) is used because it is the only
+/// form that exposes `.customize().config_override(...)` — which the download
+/// paths need to set a per-bucket retry partition. Every `GetObject` the
+/// transfer issues (discovery, partNumber re-issue, range chunk, range retry)
+/// routes through here so the full field set is forwarded uniformly; callers
+/// then layer the per-request range / partNumber / if_match / config_override.
+pub(crate) fn copy_fields_to_get_object_request(
+    input: &DownloadInput,
+    builder: GetObjectFluentBuilder,
+) -> GetObjectFluentBuilder {
+    builder
+        .set_bucket(input.bucket.clone())
+        .set_if_match(input.if_match.clone())
+        .set_if_modified_since(input.if_modified_since)
+        .set_if_none_match(input.if_none_match.clone())
+        .set_if_unmodified_since(input.if_unmodified_since)
+        .set_key(input.key.clone())
+        .set_range(input.range.clone())
+        .set_response_cache_control(input.response_cache_control.clone())
+        .set_response_content_disposition(input.response_content_disposition.clone())
+        .set_response_content_encoding(input.response_content_encoding.clone())
+        .set_response_content_language(input.response_content_language.clone())
+        .set_response_content_type(input.response_content_type.clone())
+        .set_response_expires(input.response_expires)
+        .set_version_id(input.version_id.clone())
+        .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
+        .set_sse_customer_key(input.sse_customer_key.clone())
+        .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
+        .set_request_payer(input.request_payer.clone())
+        .set_expected_bucket_owner(input.expected_bucket_owner.clone())
+        .set_checksum_mode(input.checksum_mode.clone())
 }
 
 impl From<DownloadInput> for DownloadInputBuilder {
@@ -933,40 +971,11 @@ impl From<DownloadInput> for DownloadInputBuilder {
             part_number: value.part_number,
             expected_bucket_owner: value.expected_bucket_owner,
             checksum_mode: value.checksum_mode,
+            read_ahead: value.read_ahead,
         }
     }
 }
 
-impl DownloadInputBuilder {
-    /// Create an operation fluent builder for the rust SDK S3 client from this transfer manager
-    /// download input and the given client
-    pub(crate) fn into_sdk_operation(
-        self,
-        client: &aws_sdk_s3::Client,
-    ) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
-        client
-            .get_object()
-            .set_bucket(self.bucket)
-            .set_if_match(self.if_match)
-            .set_if_modified_since(self.if_modified_since)
-            .set_if_none_match(self.if_none_match)
-            .set_if_unmodified_since(self.if_unmodified_since)
-            .set_key(self.key)
-            .set_range(self.range)
-            .set_response_cache_control(self.response_cache_control)
-            .set_response_content_disposition(self.response_content_disposition)
-            .set_response_content_encoding(self.response_content_encoding)
-            .set_response_content_language(self.response_content_language)
-            .set_response_content_type(self.response_content_type)
-            .set_response_expires(self.response_expires)
-            .set_version_id(self.version_id)
-            .set_sse_customer_algorithm(self.sse_customer_algorithm)
-            .set_sse_customer_key(self.sse_customer_key)
-            .set_sse_customer_key_md5(self.sse_customer_key_md5)
-            .set_request_payer(self.request_payer)
-            .set_expected_bucket_owner(self.expected_bucket_owner)
-            .set_checksum_mode(self.checksum_mode)
-    }
-}
+impl DownloadInputBuilder {}
 
 // TODO - implement TryFrom<GetObjectInput> and TryFrom<GetObjectInputBuilder> for DownloadInput and DownloadInputBuilder respectively (TryFrom due to checksums)

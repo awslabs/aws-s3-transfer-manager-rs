@@ -4,7 +4,7 @@
  */
 use std::sync::Arc;
 
-use super::{DownloadHandle, DownloadInputBuilder};
+use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
 
 /// Fluent builder for constructing a single object upload transfer
 #[derive(Debug)]
@@ -29,6 +29,40 @@ impl DownloadFluentBuilder {
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input, false)
+    }
+
+    /// Download the object and write it to the given file path.
+    ///
+    /// Data is written to a temporary file in the same directory, then
+    /// atomically renamed to the destination on success. The temporary file
+    /// is deleted on failure, cancellation, or drop.
+    #[cfg(any(unix, windows))]
+    pub async fn write_to_path(
+        self,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<ManagedDownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
+        crate::operation::download::Download::orchestrate_to_path(
+            self.handle,
+            input,
+            path.into(),
+            None,
+        )
+        .await
+    }
+
+    /// Download the object and write it to the given open file.
+    ///
+    /// The caller is responsible for the file lifecycle (creation, cleanup).
+    /// The transfer manager writes to the file using positioned writes at
+    /// offsets starting from 0.
+    #[cfg(any(unix, windows))]
+    pub fn write_to_file(
+        self,
+        file: std::fs::File,
+    ) -> Result<ManagedDownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
+        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file)
     }
 
     /// <p>The bucket name containing the object.</p>
@@ -505,6 +539,23 @@ impl DownloadFluentBuilder {
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         self.inner.get_checksum_mode()
+    }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request. Default defers to the client's
+    /// [`Config`](crate::config::Config).
+    pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
+        self.inner = self.inner.read_ahead(input);
+        self
+    }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+        self.inner = self.inner.set_read_ahead(input);
+        self
+    }
+    /// The read-ahead override set on this builder, if any.
+    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+        self.inner.get_read_ahead()
     }
 }
 

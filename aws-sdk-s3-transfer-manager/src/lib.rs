@@ -4,7 +4,7 @@
  */
 
 /* Automatically managed default lints */
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 /* End of automatically managed default lints */
 #![warn(
     missing_debug_implementations,
@@ -44,8 +44,7 @@
 //!     .download_objects()
 //!     .bucket("my-bucket")
 //!     .destination("/tmp/my-bucket")
-//!     .send()
-//!     .await?;
+//!     .initiate()?;
 //!
 //! // wait for transfer to complete
 //! handle.join().await?;
@@ -61,9 +60,6 @@
 //! * [`upload`](crate::Client::upload) - upload a single object
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
-
-/// Default in-flight concurrency
-pub(crate) const DEFAULT_CONCURRENCY: usize = 128;
 
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
@@ -83,21 +79,32 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
-/// Tower related middleware and components
-pub(crate) mod middleware;
-
 /// HTTP related components and utils
 pub(crate) mod http;
 
-/// Internal runtime components
+/// Transfer types
+pub(crate) mod transfer;
+
+/// Work scheduler
+pub(crate) mod scheduler;
+
+/// Execution runtime
 pub(crate) mod runtime;
+
+/// Telemetry target constants
+pub(crate) mod telemetry;
 
 /// Metrics
 pub mod metrics;
 
+/// Body-read retry loop layered over the latency deadline guard
+pub(crate) mod retry;
+
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::Config;
+pub use self::config::S3ClientConfig;
+pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader
 pub fn from_env() -> ConfigLoader {

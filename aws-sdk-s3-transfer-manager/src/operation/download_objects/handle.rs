@@ -3,75 +3,103 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use tokio::task;
+use super::{DownloadObjectsOutput, DownloadObjectsTransfer};
+use crate::error::{Error, ErrorKind};
+use crate::transfer::StateMachineTerminalReceiver;
 
-use crate::{error::ErrorKind, types::FailedTransferPolicy};
-
-use super::{DownloadObjectsContext, DownloadObjectsOutput};
-
-/// Handle for `DownloadObjects` transfer operation
+/// Handle for an in-progress `DownloadObjects` operation.
+///
+/// Returned when initiating a multi-object download. Provides methods to wait
+/// for completion ([`join`](Self::join)) or cancel ([`abort`](Self::abort)).
+///
+/// # Cancellation
+///
+/// The operation can be cancelled by calling [`abort`](Self::abort) or by
+/// dropping this handle. Dropping cancels immediately without waiting for
+/// in-flight child downloads to settle; call `abort()` for a clean shutdown.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DownloadObjectsHandle {
-    /// All child tasks spawned for this download
-    pub(crate) tasks: task::JoinSet<Result<(), crate::error::Error>>,
-    /// The context used to drive an upload to completion
-    pub(crate) ctx: DownloadObjectsContext,
+    pub(crate) completion_rx: Option<StateMachineTerminalReceiver>,
+    pub(crate) transfer: DownloadObjectsTransfer,
 }
 
 impl DownloadObjectsHandle {
-    /// Consume the handle and wait for download transfer to complete
+    /// Consume the handle and wait for all downloads to complete.
     ///
-    /// When the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Abort`], this method
-    /// will return the first error if any of the spawned tasks encounter one. The other tasks
-    /// will be canceled, but their cancellations will not be reported as errors by this method;
-    /// they will be logged as errors, instead.
-    ///
-    /// If the `FailedTransferPolicy` is set to [`FailedTransferPolicy::Continue`], the
-    /// [`DownloadObjectsOutput`] will include a detailed breakdown, including the number of
-    /// successful downloads and the number of failed ones.
-    ///
-    // TODO(aws-sdk-rust#1159) - Consider if we want to return other all errors encountered during cancellation.
-    #[tracing::instrument(skip_all, level = "debug", name = "join-download-objects")]
-    pub async fn join(mut self) -> Result<DownloadObjectsOutput, crate::error::Error> {
-        let mut first_error_to_report = None;
-        // join all tasks
-        while let Some(join_result) = self.tasks.join_next().await {
-            let result = join_result.expect("task completed");
-            if let Err(e) = result {
-                match self.ctx.state.input.failure_policy() {
-                    FailedTransferPolicy::Abort
-                        if first_error_to_report.is_none()
-                            && e.kind() != &ErrorKind::OperationCancelled =>
-                    {
-                        first_error_to_report = Some(e);
-                    }
-                    FailedTransferPolicy::Continue => {
-                        tracing::warn!("encountered but dismissed error when the failure policy is `Continue`: {e}")
-                    }
-                    _ => {}
-                }
-            }
+    /// Returns aggregated output on success. Under
+    /// [`FailedTransferPolicy::Abort`](crate::types::FailedTransferPolicy::Abort),
+    /// returns the error that triggered the abort. When cancelled, returns
+    /// `ErrorKind::OperationCancelled`.
+    pub async fn join(mut self) -> Result<DownloadObjectsOutput, Error> {
+        if let Some(rx) = self.completion_rx.take() {
+            let _ = rx.await;
         }
 
-        if let Some(e) = first_error_to_report {
-            Err(e)
-        } else {
-            Ok(DownloadObjectsOutput::from(self.ctx.state.as_ref()))
+        let ctx = self.transfer.ctx();
+
+        if ctx.is_failed() {
+            ctx.handle
+                .scheduler
+                .cancel_transfer(ctx.id)
+                .wait_for_idle()
+                .await;
+            let err = ctx.take_error().expect("failed transfer must have error");
+            // The per-object failures would otherwise be unreachable on the Err
+            // path; attach them so a caller can inspect what failed under Abort.
+            return Err(err.with_failed_downloads(self.transfer.take_failed().unwrap_or_default()));
         }
+
+        if ctx.is_cancelled() {
+            return Err(Error::new(
+                ErrorKind::OperationCancelled,
+                "download_objects cancelled",
+            ));
+        }
+
+        let m = ctx.metrics();
+        Ok(DownloadObjectsOutput::builder()
+            .objects_downloaded(self.transfer.successful_downloads())
+            .set_failed_transfers(self.transfer.take_failed().unwrap_or_default())
+            .metrics(m)
+            .build())
     }
 
-    /// Aborts all tasks owned by the handle.
-    pub async fn abort(&mut self) -> Result<(), crate::error::Error> {
-        if self.ctx.state.input.failure_policy() == &FailedTransferPolicy::Abort {
-            if self.ctx.state.cancel_tx.send(true).is_err() {
-                tracing::debug!(
-                    "all receiver ends have been dropped, unable to send a cancellation signal"
-                );
-            }
-            while (self.tasks.join_next().await).is_some() {}
-        }
+    /// Abort the multi-object download and cancel all in-progress child downloads.
+    ///
+    /// Waits for any in-flight child downloads to complete or be cancelled
+    /// before returning.
+    pub async fn abort(self) {
+        let ctx = self.transfer.ctx();
+        ctx.handle
+            .scheduler
+            .cancel_transfer(ctx.id)
+            .wait_for_idle()
+            .await;
+    }
 
-        Ok(())
+    /// Current status of this transfer.
+    pub fn status(&self) -> crate::types::TransferStatus {
+        self.transfer.ctx().transfer_status()
+    }
+
+    /// Snapshot of aggregated transfer metrics across every completed child.
+    pub fn metrics(&self) -> crate::types::TransferMetrics {
+        self.transfer.ctx().metrics()
+    }
+
+    /// Get scheduling controls for this transfer.
+    pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
+        self.transfer.ctx().scheduling()
+    }
+}
+
+impl Drop for DownloadObjectsHandle {
+    fn drop(&mut self) {
+        let ctx = self.transfer.ctx();
+        if ctx.is_active() {
+            ctx.set_cancelled();
+            ctx.handle.scheduler.cancel_transfer(ctx.id);
+        }
     }
 }

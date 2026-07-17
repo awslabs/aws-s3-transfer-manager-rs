@@ -18,7 +18,7 @@ use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -66,6 +66,7 @@ impl ServerHandle {
 
     /// Shutdown the server.
     pub async fn shutdown(self) -> Result<()> {
+        tracing::debug!(addr = %self.address, "shutting down mock server");
         let _ = self.shutdown_tx.send(());
         match self.server_task.await {
             Ok(result) => result,
@@ -149,8 +150,73 @@ impl S3MockServerBuilder {
 
         Ok(S3MockServer {
             storage,
+            faults: Arc::new(crate::faults::FaultRegistry::default()),
+            connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            throttle: Arc::new(Mutex::new(None)),
             config: self.config,
         })
+    }
+}
+
+/// Object data returned from direct storage inspection.
+pub struct ObjectData {
+    /// The object body.
+    pub body: bytes::Bytes,
+    /// Content type of the object.
+    pub content_type: Option<String>,
+    /// Size of the object in bytes.
+    pub content_length: u64,
+    /// ETag of the object.
+    pub etag: String,
+    /// Last modified time.
+    pub last_modified: std::time::SystemTime,
+    /// User-defined metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Summary information about an object in a listing.
+pub struct ObjectListEntry {
+    /// The object key.
+    pub key: String,
+    /// Size of the object in bytes.
+    pub size: u64,
+    /// Last modified time.
+    pub last_modified: std::time::SystemTime,
+    /// ETag of the object.
+    pub etag: String,
+}
+
+/// Request for adding an object via the direct (non-S3-protocol) API.
+pub struct AddObjectRequest {
+    pub content: bytes::Bytes,
+    pub content_type: Option<String>,
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+    pub last_modified: Option<std::time::SystemTime>,
+}
+
+impl AddObjectRequest {
+    pub fn new(content: impl Into<bytes::Bytes>) -> Self {
+        Self {
+            content: content.into(),
+            content_type: None,
+            metadata: None,
+            last_modified: None,
+        }
+    }
+
+    pub fn content_type(mut self, ct: impl Into<String>) -> Self {
+        self.content_type = Some(ct.into());
+        self
+    }
+
+    pub fn metadata(mut self, meta: std::collections::HashMap<String, String>) -> Self {
+        self.metadata = Some(meta);
+        self
+    }
+
+    pub fn last_modified(mut self, time: std::time::SystemTime) -> Self {
+        self.last_modified = Some(time);
+        self
     }
 }
 
@@ -158,6 +224,18 @@ impl S3MockServerBuilder {
 pub struct S3MockServer {
     /// Storage backend.
     storage: Arc<dyn StorageBackend>,
+
+    /// Key-scoped fault injection registry (shared with the serving task).
+    faults: Arc<crate::faults::FaultRegistry>,
+
+    /// Connect-time reset: number of freshly accepted connections to abort (RST)
+    /// immediately, before serving any request. Server-scoped because no request
+    /// exists at connect time; decremented per reset. Shared with the serving task.
+    connect_reset: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Server-wide load-driven throttle. Shared with the serving task; `None`
+    /// until one is installed via [`set_rate_throttle`](Self::set_rate_throttle).
+    throttle: Arc<Mutex<Option<Arc<crate::throttle::RateThrottle>>>>,
 
     /// Server configuration.
     config: ServerConfig,
@@ -172,24 +250,156 @@ impl S3MockServer {
     /// Add an object to the mock server storage.
     pub async fn add_object(
         &self,
+        bucket: &str,
         key: &str,
         content: impl Into<bytes::Bytes>,
         metadata: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<()> {
+        let mut req = AddObjectRequest::new(content);
+        req.metadata = metadata;
+        self.add_object_with(bucket, key, req).await
+    }
+
+    /// Add an object with full control over metadata fields.
+    pub async fn add_object_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        request: AddObjectRequest,
     ) -> Result<()> {
         use crate::storage::StoreObjectRequest;
         use crate::types::ObjectIntegrityChecks;
         use futures::stream;
 
-        let bytes = content.into();
+        let bytes = request.content;
         let stream = stream::once(async move { Ok(bytes) });
         let boxed_stream = Box::pin(stream);
 
-        let request =
-            StoreObjectRequest::new(key.to_string(), boxed_stream, ObjectIntegrityChecks::new())
-                .with_user_metadata(metadata.unwrap_or_default());
+        // Match HTTP PutObject path's default integrity checks so seeded
+        // objects have the same HeadObject state (ETag via md5, default
+        // CRC64NVME checksum) as objects uploaded via the S3 API.
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5().with_crc64nvme();
 
-        self.storage.put_object(request).await?;
+        let mut store_req =
+            StoreObjectRequest::new(bucket, key.to_string(), boxed_stream, integrity_checks)
+                .with_user_metadata(request.metadata.unwrap_or_default());
+        store_req.content_type = request.content_type;
+        store_req.last_modified = request.last_modified;
+
+        self.storage.put_object(store_req).await?;
         Ok(())
+    }
+
+    /// Create a bucket in the mock server.
+    pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        self.storage.create_bucket(bucket).await
+    }
+
+    /// Register a fault for `(bucket, key)`. Faults form an ordered queue
+    /// consumed over successive matching requests: the first `skip` matching
+    /// requests pass cleanly, then the fault fires per `occurrence`. Firing is
+    /// deterministic; every fire logs the request number under
+    /// `target: "s3_mock_server::fault"`.
+    pub fn insert_fault(
+        &self,
+        bucket: &str,
+        key: &str,
+        fault: crate::faults::FaultType,
+        skip: u32,
+        occurrence: crate::faults::Occurrence,
+    ) {
+        self.faults.insert(bucket, key, fault, skip, occurrence);
+    }
+
+    /// Drop the entire fault queue for `(bucket, key)`.
+    pub fn clear_fault(&self, bucket: &str, key: &str) {
+        self.faults.clear(bucket, key);
+    }
+
+    /// Install a server-wide load-driven throttle admitting a sustained `rate`
+    /// requests/sec with a `burst` allowance; a shed request returns 503
+    /// `SlowDown`. Checked on every S3 operation before touching storage, and
+    /// replaces any previously installed throttle.
+    pub fn set_rate_throttle(&self, rate: f64, burst: f64) {
+        *self.throttle.lock().unwrap() =
+            Some(Arc::new(crate::throttle::RateThrottle::new(rate, burst)));
+    }
+
+    /// Abort (RST) the next `count` freshly accepted connections immediately,
+    /// before serving any request, simulating a connect-time connection reset.
+    /// Server-scoped because no request exists at connect time.
+    pub fn reset_next_connections(&self, count: u64) {
+        self.connect_reset
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check if an object exists.
+    pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        Ok(self.storage.head_object(bucket, key).await?.is_some())
+    }
+
+    /// Get object content and metadata directly from storage.
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectData>> {
+        use crate::storage::GetObjectRequest;
+        use futures::StreamExt;
+
+        let request = GetObjectRequest {
+            bucket,
+            key,
+            range: None,
+        };
+        let response = match self.storage.get_object(request).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let mut body = Vec::new();
+        let mut stream = response.stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(Some(ObjectData {
+            body: bytes::Bytes::from(body),
+            content_type: response.metadata.content_type,
+            content_length: response.metadata.content_length,
+            etag: response.metadata.etag,
+            last_modified: response.metadata.last_modified,
+            metadata: response.metadata.user_metadata,
+        }))
+    }
+
+    /// List objects in a bucket with optional prefix.
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ObjectListEntry>> {
+        use crate::storage::ListObjectsRequest;
+
+        let request = ListObjectsRequest { bucket, prefix };
+        let response = self.storage.list_objects(request).await?;
+        Ok(response
+            .objects
+            .into_iter()
+            .map(|o| ObjectListEntry {
+                key: o.key,
+                size: o.metadata.content_length,
+                last_modified: o.metadata.last_modified,
+                etag: o.metadata.etag,
+            })
+            .collect())
+    }
+
+    /// Delete an object.
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.storage.delete_object(bucket, key).await
+    }
+
+    /// Reset all state (clear all buckets, objects, and in-flight uploads).
+    pub async fn reset(&self) -> Result<()> {
+        self.storage.reset().await
     }
 
     /// Start the server.
@@ -211,18 +421,21 @@ impl S3MockServer {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let storage = self.storage.clone();
+        let faults = self.faults.clone();
+        let connect_reset = self.connect_reset.clone();
+        let throttle = self.throttle.clone();
         let server_task = tokio::spawn(async move {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-            let inner = Inner::new(storage);
+            let inner = Inner::with_faults_and_throttle(storage, faults, throttle);
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-                b.build().into_shared()
+                b.build()
             };
             loop {
-                let (socket, _) = tokio::select! {
+                let (socket, peer) = tokio::select! {
                         res =  listener.accept() => {
                             match res {
                                 Ok(conn) => conn,
@@ -233,14 +446,48 @@ impl S3MockServer {
                             }
                         }
                         _ =  &mut shutdown_rx => {
+                            tracing::debug!("shutdown signal received, breaking accept loop");
                             break;
                         }
                 };
+                tracing::trace!(port = %addr.port(), %peer, "accepted connection");
 
-                let conn = http_server.serve_connection(TokioIo::new(socket), service.clone());
-                let conn = graceful.watch(conn.into_owned());
+                // Connect-time reset: abort this connection immediately (RST)
+                // before serving, if armed. Decrement the remaining count.
+                {
+                    use std::sync::atomic::Ordering;
+                    let remaining = connect_reset.load(Ordering::Relaxed);
+                    if remaining > 0
+                        && connect_reset
+                            .compare_exchange(
+                                remaining,
+                                remaining - 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        let _ = socket.set_zero_linger();
+                        drop(socket);
+                        continue;
+                    }
+                }
+
+                // Per-connection fault control: the socket wrapper reads it, the
+                // service wrapper injects it into each request's extensions so the
+                // handler can arm it for this connection.
+                let fault = Arc::new(crate::socket_fault::ConnectionFault::new());
+                let socket = crate::socket_fault::AbortAfterWrite::new(socket, fault.clone());
+                let service =
+                    crate::socket_fault::InjectConnectionFault::new(service.clone(), fault);
+                let conn = http_server
+                    .serve_connection(TokioIo::new(socket), service)
+                    .into_owned();
+                let conn = graceful.watch(conn);
                 tokio::spawn(async move {
-                    let _ = conn.await;
+                    if let Err(e) = conn.await {
+                        tracing::trace!("connection error: {e}");
+                    }
                 });
             }
 

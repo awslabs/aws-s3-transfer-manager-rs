@@ -11,12 +11,20 @@
 //! concurrent operations, error handling, and performance characteristics.
 
 mod error;
+mod faults;
 mod s3s;
 mod server;
+mod socket_fault;
 mod storage;
 mod streaming;
+mod throttle;
 mod types;
 
 pub use error::Error;
 pub use error::Result;
-pub use server::{S3MockServer, S3MockServerBuilder, ServerConfig, ServerHandle};
+pub use faults::{BodyCadence, FaultType, Occurrence};
+pub use server::{
+    AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
+    ServerHandle,
+};
+pub use types::composite_checksum;

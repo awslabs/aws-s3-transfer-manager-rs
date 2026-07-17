@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
@@ -13,8 +12,9 @@ use std::{cmp, mem};
 use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
+use super::input::copy_fields_to_get_object_request;
 use super::object_meta::ObjectMetadata;
-use super::DownloadContext;
+use super::transfer::DownloadTransfer;
 use super::DownloadInput;
 use crate::error;
 use crate::http::header::{self, ByteRange};
@@ -41,6 +41,20 @@ pub(super) struct ObjectDiscovery {
 
     /// the first chunk of data if fetched during discovery
     pub(super) initial_chunk: Option<ByteStream>,
+
+    /// Per-chunk size the transfer should slice remaining ranges at. Normally the
+    /// configured download part size; for a validated multipart object it is the
+    /// object's stored part size so every range aligns to a stored part boundary
+    /// (the precondition for per-part download validation).
+    pub(super) effective_part_size: u64,
+}
+
+/// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
+/// Returns `None` for a single-part ETag (no `-N` suffix) or unparseable input.
+fn parts_from_etag(etag: &str) -> Option<u32> {
+    let trimmed = etag.trim_matches('"');
+    let (_, n) = trimmed.rsplit_once('-')?;
+    n.parse::<u32>().ok().filter(|&n| n > 1)
 }
 
 impl ObjectDiscoveryStrategy {
@@ -69,62 +83,142 @@ impl ObjectDiscoveryStrategy {
 /// Returns object metadata, the remaining range of data
 /// to be fetched, and _(if available)_ the first chunk of data.
 pub(super) async fn discover_obj(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
+    validation_enabled: bool,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
+    let configured_part_size = transfer.ctx().handle.download_part_size_bytes();
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     tracing::trace!("discovering object with strategy {:?}", strategy);
-    let discovery = match strategy {
+    let user_explicit_part_size = transfer.ctx().handle.user_set_part_size();
+    let mut discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject => {
-            discover_obj_with_head(ctx, input)
+            discover_obj_with_head(transfer, input)
                 .instrument(tracing::debug_span!("send-head-object-for-discovery"))
                 .await
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
-            discover_obj_with_get(ctx, input, range)
+            discover_obj_with_get(transfer, input, range)
                 .instrument(tracing::debug_span!("send-ranged-get-for-discovery"))
                 .await
         }
     }?;
+    // Default: slice at the configured download part size. The alignment path
+    // below overrides this with the stored part size when validating a multipart
+    // object.
+    discovery.effective_part_size = configured_part_size;
+
+    // Align download ranges to the object's stored part size so each ranged GET
+    // matches a stored part boundary and S3 returns the part's checksum for the
+    // SDK to validate. Only for: validation on, no user range, a multipart object
+    // (ETag carries `-N`), and the user did not pin an explicit part size.
+    //
+    // The initial ranged discovery fetched `[0, configured)`, whose chunk length
+    // is the CONFIGURED size, not the stored part size, so it cannot tell us the
+    // stored layout. Re-issue via partNumber=1, whose response reports the exact
+    // first-part (= stored part) size via Content-Range; slice every range at that
+    // size so all chunks align to stored boundaries (incl. the ragged tail). One
+    // extra request, only on this path.
+    //
+    // TODO(vnext): a wire checksum over arbitrary response bytes removes the need
+    // to align, so this partNumber re-issue can go away once that exists.
+    let is_multipart = discovery
+        .object_meta
+        .e_tag
+        .as_deref()
+        .and_then(parts_from_etag)
+        .is_some();
+    if validation_enabled && input.range().is_none() && is_multipart && !user_explicit_part_size {
+        let mut aligned = discover_obj_with_get_first_part(transfer, input).await?;
+        let stored_part_size = aligned
+            .chunk_meta
+            .as_ref()
+            .and_then(|m| m.content_length)
+            .map(|len| len as u64)
+            .filter(|&len| len != 0)
+            .unwrap_or(configured_part_size);
+        tracing::debug!(
+            configured_part_size,
+            stored_part_size,
+            "realigned multipart download to stored part size for validation"
+        );
+        aligned.effective_part_size = stored_part_size;
+        discovery = aligned;
+    }
 
     tracing::trace!(
-        "discovered object, remaining: {:?}; initial chunk set: {}",
-        discovery.remaining,
-        discovery.initial_chunk.is_some()
+        remaining = ?discovery.remaining,
+        initial_chunk = discovery.initial_chunk.is_some(),
+        effective_part_size = discovery.effective_part_size,
+        "discovered object",
     );
 
     Ok(discovery)
 }
 
 async fn discover_obj_with_get_first_part(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::Error> {
-    // Get object first part.
-    let builder: GetObjectInputBuilder = input.clone().into();
-    // S3 index starts with 1
-    let resp = builder
-        .set_range(None)
-        .set_part_number(Some(1))
-        .send_with(ctx.client())
-        .await
-        .map_err(error::discovery_failed)?;
+    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let builder =
+            copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        let req = builder
+            .set_range(None)
+            .set_part_number(Some(1))
+            .customize()
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+        }
+    })
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        "discover-get-first-part",
+        tid = %transfer.ctx().id
+    ))
+    .await?;
     first_chunk_response_handler(resp, None)
 }
 
 async fn discover_obj_with_head(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let resp = ctx
-        .client()
-        .head_object()
-        .set_range(input.range.clone())
-        .set_bucket(input.bucket().map(str::to_string))
-        .set_key(input.key().map(str::to_string))
-        .send()
-        .await
-        .map_err(error::discovery_failed)?;
+    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let req = transfer
+            .ctx()
+            .s3_client()
+            .head_object()
+            .set_range(input.range.clone())
+            .set_bucket(input.bucket().map(str::to_string))
+            .set_key(input.key().map(str::to_string))
+            .customize()
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+        }
+    })
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        "discover-head",
+        tid = %transfer.ctx().id
+    ))
+    .await?;
     let object_meta: ObjectMetadata = resp.into();
 
     Ok(ObjectDiscovery {
@@ -132,41 +226,56 @@ async fn discover_obj_with_head(
         chunk_meta: None,
         object_meta,
         initial_chunk: None,
+        // Filled in by discover_obj (configured size, or stored size when aligning).
+        effective_part_size: 0,
     })
 }
 
 async fn discover_obj_with_get(
-    ctx: &DownloadContext,
+    transfer: &DownloadTransfer,
     input: &DownloadInput,
     range_from_user: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
+    let target_part_size = transfer.ctx().handle.download_part_size_bytes();
     // Convert input to builder and set the range properly as the first range get.
     let byte_range = match range_from_user.as_ref() {
         Some(r) => ByteRange::Inclusive(
             *r.start(),
-            cmp::min(*r.start() + ctx.target_part_size_bytes() - 1, *r.end()),
+            cmp::min(*r.start() + target_part_size - 1, *r.end()),
         ),
-        None => ByteRange::Inclusive(0, ctx.target_part_size_bytes() - 1),
+        None => ByteRange::Inclusive(0, target_part_size - 1),
     };
-    let builder: GetObjectInputBuilder = input.clone().into();
-    let resp = builder
-        .range(header::Range::bytes(byte_range))
-        .send_with(ctx.client())
-        .await;
-    match resp {
-        Err(error) => {
-            match error.as_service_error() {
-                Some(service_error)
-                    if service_error.meta().code() == Some("InvalidRange")
-                        && range_from_user.is_none() =>
-                {
-                    // Invalid Range Error found and no Range passed in it's an empty object.
-                    // discover the object with the first part instead for empty object.
-                    discover_obj_with_get_first_part(ctx, input).await
-                }
-                _ => Err(error::discovery_failed(error)),
-            }
+    let result = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let builder =
+            copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        let req = builder
+            .range(header::Range::bytes(byte_range.clone()))
+            .customize()
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
+    })
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        "discover-ranged-get",
+        tid = %transfer.ctx().id
+    ))
+    .await;
+    match result {
+        Err(error) if error.code() == Some("InvalidRange") && range_from_user.is_none() => {
+            // InvalidRange with no user-supplied range indicates an empty object.
+            // Discover via partNumber=1 instead.
+            discover_obj_with_get_first_part(transfer, input).await
+        }
+        Err(error) => Err(error),
         Ok(response) => first_chunk_response_handler(response, range_from_user),
     }
 }
@@ -181,9 +290,10 @@ fn first_chunk_response_handler(
     let chunk_meta: ChunkMetadata = resp.into();
     let chunk_content_len = chunk_meta
         .content_length
-        .expect("expected content_length in chunk") as u64;
+        .ok_or_else(|| error::discovery_failed("response missing content-length"))?
+        as u64;
     let remaining = object_meta
-        .content_length()
+        .total_object_size()
         .checked_sub(1)
         .and_then(|object_end| {
             // Calculate start and end based on user range (if any)
@@ -205,6 +315,8 @@ fn first_chunk_response_handler(
         chunk_meta: Some(chunk_meta),
         object_meta,
         initial_chunk,
+        // Filled in by discover_obj (configured size, or stored size when aligning).
+        effective_part_size: 0,
     })
 }
 
@@ -214,8 +326,9 @@ mod tests {
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
     };
-    use crate::operation::download::DownloadContext;
+    use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
+    use crate::transfer::TransferContext;
     use crate::types::BucketType;
     use crate::types::PartSize;
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
@@ -250,6 +363,24 @@ mod tests {
         tm.handle.clone()
     }
 
+    // Handle with an Auto part size (download Auto = 5 MiB), so the multipart
+    // alignment branch (gated on `!user_set_part_size`) can be exercised.
+    fn test_handle_auto(client: aws_sdk_s3::Client) -> Arc<crate::client::Handle> {
+        let tm_config = crate::Config::builder().client(client).build();
+        let tm = crate::Client::new(tm_config);
+        tm.handle.clone()
+    }
+
+    fn test_transfer(
+        handle: Arc<crate::client::Handle>,
+        input: &DownloadInput,
+    ) -> DownloadTransfer {
+        use crate::operation::download::body;
+        let (writer, _consumer) = body::new_recv_body();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer)
+    }
+
     #[test]
     fn test_strategy_from_req() {
         assert_eq!(
@@ -271,6 +402,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_head() {
         // Returns the first 500 bytes from a 10MB object
@@ -282,23 +414,24 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
 
-        let ctx = DownloadContext::new(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            BucketType::Standard,
-        );
-
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj_with_head(&ctx, &input).await.unwrap();
+        let transfer = test_transfer(
+            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
+            &input,
+        );
+
+        let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(500, remaining.clone().count());
         assert_eq!(0..=499, remaining);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_full_range() {
         let target_part_size = 500;
@@ -314,15 +447,15 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(200, remaining.clone().count());
         assert_eq!(500..=699, remaining);
@@ -336,6 +469,7 @@ mod tests {
         assert_eq!(500, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_single_part() {
         let target_part_size = 500;
@@ -351,15 +485,15 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
@@ -371,6 +505,90 @@ mod tests {
         assert_eq!(400, initial_chunk.remaining());
     }
 
+    // A validating download of a multipart object (ETag `-N`) with an Auto part
+    // size re-issues discovery via partNumber=1 to learn the exact stored part
+    // size and aligns subsequent ranges to it. Download Auto = 5 MiB, but the
+    // stored part is 8 MiB; effective_part_size must become 8 MiB.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_discover_obj_aligns_multipart_when_validating() {
+        const MIB: u64 = 1024 * 1024;
+        let download_default = 5 * MIB; // Auto download part size
+        let stored_part = 8 * MIB;
+        let total = 20 * MIB; // 8 + 8 + 4 -> 3 parts
+        let ranged = mock!(Client::get_object)
+            .match_requests(move |r| {
+                r.range() == Some(format!("bytes=0-{}", download_default - 1).as_str())
+                    && r.part_number().is_none()
+            })
+            .then_output(move || {
+                GetObjectOutput::builder()
+                    .content_length(download_default as i64)
+                    .content_range(format!("0-{}/{}", download_default - 1, total))
+                    .e_tag("\"abc-3\"")
+                    .body(ByteStream::from_static(&[0u8; 8]))
+                    .build()
+            });
+        let part1 = mock!(Client::get_object)
+            .match_requests(|r| r.part_number() == Some(1))
+            .then_output(move || {
+                GetObjectOutput::builder()
+                    .content_length(stored_part as i64)
+                    .content_range(format!("0-{}/{}", stored_part - 1, total))
+                    .e_tag("\"abc-3\"")
+                    .parts_count(3)
+                    .body(ByteStream::from_static(&[0u8; 8]))
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part1]);
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let transfer = test_transfer(test_handle_auto(client), &request);
+
+        let discovery = discover_obj(&transfer, &request, true).await.unwrap();
+
+        // Aligned to the stored part size (8 MiB), not the Auto default (5 MiB).
+        assert_eq!(discovery.effective_part_size, stored_part);
+        // remaining starts at the first stored boundary (after part 1).
+        assert_eq!(discovery.remaining, Some(stored_part..=total - 1));
+    }
+
+    // Without validation, no partNumber re-issue: the slice size stays the
+    // configured part size even for a multipart object.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_discover_obj_no_align_when_validation_disabled() {
+        let configured = 500;
+        let ranged = mock!(Client::get_object)
+            .match_requests(|r| r.range() == Some("bytes=0-499"))
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .content_length(500)
+                    .content_range("0-499/700")
+                    .e_tag("\"abc-2\"")
+                    .body(ByteStream::from_static(&[0u8; 500]))
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, &[&ranged]);
+
+        let request = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let transfer = test_transfer(test_handle(client, configured), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
+
+        assert_eq!(discovery.effective_part_size, configured);
+        assert_eq!(discovery.remaining, Some(500..=699));
+    }
+
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_partial_range() {
         let target_part_size = 100;
@@ -386,8 +604,6 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
@@ -395,7 +611,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         let remaining = discovery.remaining.unwrap();
         assert_eq!(200, remaining.clone().count());
         assert_eq!(300..=499, remaining);
@@ -409,6 +627,7 @@ mod tests {
         assert_eq!(100, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_over_range() {
         let target_part_size = 100;
@@ -424,8 +643,6 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, &[&get_obj_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
@@ -433,7 +650,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         assert!(discovery.remaining.is_none());
 
         let initial_chunk = discovery
@@ -445,6 +664,7 @@ mod tests {
         assert_eq!(50, initial_chunk.remaining());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_empty_object() {
         let target_part_size = 500;
@@ -458,15 +678,15 @@ mod tests {
             .then_output(|| GetObjectOutput::builder().content_length(0).build());
         let client = mock_client!(aws_sdk_s3, &[&get_range_rule, &get_first_part_rule]);
 
-        let ctx = DownloadContext::new(test_handle(client, target_part_size), BucketType::Standard);
-
         let request = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .build()
             .unwrap();
 
-        let discovery = discover_obj(&ctx, &request).await.unwrap();
+        let transfer = test_transfer(test_handle(client, target_part_size), &request);
+
+        let discovery = discover_obj(&transfer, &request, false).await.unwrap();
         assert!(discovery.remaining.is_none());
         assert!(discovery.initial_chunk.is_none());
     }

@@ -5,7 +5,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::fmt::Formatter;
-use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
+use std::io::Error as StdIoError;
 use tokio::task::JoinError;
 
 #[derive(Debug)]
@@ -78,7 +78,7 @@ impl StdError for Error {
 }
 impl From<Error> for StdIoError {
     fn from(err: Error) -> Self {
-        StdIoError::new(StdIoErrorKind::Other, err)
+        StdIoError::other(err)
     }
 }
 

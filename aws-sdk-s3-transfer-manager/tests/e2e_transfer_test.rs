@@ -3,6 +3,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+// TODO(vnext): fold these tests into the integration-tests e2e harness (see integration-tests/src/harness.rs Target).
 // Tests here requires AWS account with pre-configured S3 bucket to run the tests.
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
@@ -11,7 +12,8 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::{DownloadFilter, PartSize};
+use aws_sdk_s3_transfer_manager::types::PartSize;
+use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
@@ -43,9 +45,10 @@ async fn test_tm() -> (aws_sdk_s3_transfer_manager::Client, aws_sdk_s3::Client) 
         .part_size(PartSize::Target(8 * ByteUnit::Mebibyte.as_bytes_u64()))
         .load()
         .await;
-    let client = tm_config.client().clone();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
-    (tm, client)
+    let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let s3_client = aws_sdk_s3::Client::new(&sdk_config);
+    (tm, s3_client)
 }
 
 fn create_input_stream(size: usize) -> InputStream {
@@ -97,6 +100,7 @@ async fn round_trip_helper(file_size: usize, bucket_name: &str, object_key: &str
 
 #[tokio::test]
 async fn test_single_part_file_round_trip() {
+    let _logs = show_test_logs();
     let file_size = 1024 * 1024; // 1MB
     let object_key = generate_key("1MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
@@ -106,6 +110,7 @@ async fn test_single_part_file_round_trip() {
 
 #[tokio::test]
 async fn test_multi_part_file_round_trip() {
+    let _logs = show_test_logs();
     let file_size = 20 * 1024 * 1024; // 20MB
     let object_key = generate_key("20MB");
     let (bucket_name, express_bucket_name) = get_bucket_names();
@@ -199,11 +204,13 @@ async fn checksum_test_helper(size_mb: usize, key_suffix: &str, is_multi_part: b
 
 #[tokio::test]
 async fn test_multi_part_file_checksum_upload() {
+    let _logs = show_test_logs();
     checksum_test_helper(20, "20MB-crc32", true).await;
 }
 
 #[tokio::test]
 async fn test_single_part_file_checksum_upload() {
+    let _logs = show_test_logs();
     checksum_test_helper(1, "1MB-crc32", false).await;
 }
 
@@ -277,6 +284,7 @@ impl PartStream for DelayStream {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn test_upload_with_long_running_stream() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let file_size = 10 * 1024 * 1024; // 10MB
     let num_uploads = 10;
@@ -306,6 +314,7 @@ async fn test_upload_with_long_running_stream() {
 
 #[tokio::test]
 async fn test_empty_object_download() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -352,6 +361,7 @@ async fn range_download_helper(
 
 #[tokio::test]
 async fn test_object_download_range() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -404,6 +414,7 @@ async fn test_object_download_range() {
 
 #[tokio::test]
 async fn test_object_download_range_failures() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -430,6 +441,7 @@ async fn test_object_download_range_failures() {
 
 #[tokio::test]
 async fn test_objects_transfer() {
+    let _logs = show_test_logs();
     let (tm, _) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
@@ -448,10 +460,14 @@ async fn test_objects_transfer() {
         .download_objects()
         .bucket(bucket_name.as_str())
         .key_prefix("pre-existing")
-        .set_filter(Some(DownloadFilter::from(sse_c_filter)))
+        .walker(
+            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+                .filter(sse_c_filter)
+                .prefix("pre-existing")
+                .build(),
+        )
         .destination(temp_dir.path())
-        .send()
-        .await
+        .initiate()
         .unwrap();
     download_handle.join().await.unwrap();
 
@@ -480,8 +496,7 @@ async fn test_objects_transfer() {
         .bucket(bucket_name.as_str())
         .set_key_prefix(Some(generate_key("test")))
         .source(temp_dir.path())
-        .send()
-        .await
+        .initiate()
         .unwrap();
     upload_handle.join().await.unwrap();
 }

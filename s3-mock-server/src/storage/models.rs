@@ -101,6 +101,31 @@ pub(crate) struct ObjectMetadata {
     pub crc64nvme: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
+
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_language: Option<String>,
+    pub content_disposition: Option<String>,
+
+    /// Part boundaries + per-part checksums for a completed multipart object,
+    /// in part order. Empty for single-PUT objects. Enables range-aware checksum
+    /// responses: a GET whose range exactly matches a part boundary returns that
+    /// part's checksum (matching real S3).
+    #[serde(default)]
+    pub parts: Vec<ObjectPart>,
+}
+
+/// A completed multipart object's part: its size and per-algorithm checksum.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ObjectPart {
+    pub size: u64,
+    pub crc32: Option<String>,
+    pub crc32c: Option<String>,
+    pub crc64nvme: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
 }
 
 impl ObjectMetadata {
@@ -111,6 +136,56 @@ impl ObjectMetadata {
         self.crc64nvme = None;
         self.sha1 = None;
         self.sha256 = None;
+    }
+
+    /// Resolve the checksum headers for a ranged GET, matching real S3:
+    /// a range covering the whole object keeps the object-level checksum; a range
+    /// matching one part boundary of a multipart object exposes that part's
+    /// individual checksum (no `-N` suffix); any other range has no checksum.
+    /// `end` is exclusive.
+    pub(crate) fn apply_range_checksums(&mut self, start: u64, end: u64) {
+        // A whole-object range keeps the object-level checksum. Covers single-PUT
+        // objects (no parts) and a multipart object's combined value. Verified
+        // against real S3: a ranged GET covering the whole object returns the
+        // full-object checksum.
+        if start == 0 && end == self.content_length {
+            return;
+        }
+        let mut offset = 0u64;
+        for part in &self.parts {
+            if start == offset && end == offset + part.size {
+                self.crc32 = part.crc32.clone();
+                self.crc32c = part.crc32c.clone();
+                self.crc64nvme = part.crc64nvme.clone();
+                self.sha1 = part.sha1.clone();
+                self.sha256 = part.sha256.clone();
+                return;
+            }
+            offset += part.size;
+        }
+        self.clear_checksums();
+    }
+
+    /// Byte range `[start, end)` of the 1-based `part_number` for a completed
+    /// multipart object, from the stored part boundaries. `None` if the object
+    /// has no parts (single-PUT) or the part number is out of range. Matches S3's
+    /// `partNumber` GET, which returns exactly that part's bytes.
+    pub(crate) fn part_range(&self, part_number: i32) -> Option<std::ops::Range<u64>> {
+        if part_number < 1 {
+            return None;
+        }
+        let idx = (part_number - 1) as usize;
+        if idx >= self.parts.len() {
+            return None;
+        }
+        let start: u64 = self.parts[..idx].iter().map(|p| p.size).sum();
+        let end = start + self.parts[idx].size;
+        Some(start..end)
+    }
+
+    /// Number of stored parts for a completed multipart object (0 for single-PUT).
+    pub(crate) fn parts_count(&self) -> usize {
+        self.parts.len()
     }
 }
 
@@ -128,6 +203,13 @@ impl Default for ObjectMetadata {
             crc64nvme: None,
             sha1: None,
             sha256: None,
+            storage_class: None,
+            server_side_encryption: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
+            parts: Vec::new(),
         }
     }
 }
@@ -152,6 +234,10 @@ pub(crate) struct PartMetadata {
 /// Metadata for a multipart upload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MultipartUploadMetadata {
+    /// Bucket the completed object belongs to.
+    #[serde(default)]
+    pub bucket: Option<String>,
+
     /// Key of the object being uploaded.
     pub key: String,
 

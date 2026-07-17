@@ -9,10 +9,8 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::pin::Pin;
 
-use aws_sdk_s3::primitives::ByteStream;
 use bytes::{Buf, Bytes};
 
-use crate::error;
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
@@ -93,16 +91,61 @@ impl InputStream {
         Self::read_from().path(path).build()
     }
 
-    /// Converts `InputStream` to ByteStream that can be used in PutObject.
-    pub(crate) async fn into_byte_stream(self) -> Result<ByteStream, error::Error> {
+    /// Returns `true` when this `InputStream` reads from a local file.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self.inner, RawInputStream::Fs(_))
+    }
+
+    /// Convert this input stream into an [`SdkBody`] suitable for a top-level
+    /// retryable SDK call (e.g. `PutObject`). The returned body is retryable at
+    /// the SDK layer:
+    ///
+    /// * In-memory (`Buf`) streams go through [`SdkBody::from`] whose rebuild
+    ///   path is a cheap `Bytes` clone. Keeping the native in-memory body (rather
+    ///   than a custom wrapper) is what lets the SDK take its inline-checksum
+    ///   path; wrapping would force aws-chunked trailer encoding.
+    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each retry
+    ///   constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`] with its
+    ///   own open file descriptor and read cursor.
+    ///
+    /// `direct_io` selects between the two file-body implementations: `true`
+    /// when the caller owns the polling thread (managed-thread direct I/O),
+    /// `false` when the body may be polled by the shared tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `Dyn` streams. Dyn sources cannot be rewound and must route
+    /// through the multipart upload path (see [`is_mpu_only`](Self::is_mpu_only)).
+    ///
+    /// [`SdkBody`]: aws_smithy_types::body::SdkBody
+    /// [`SdkBody::from`]: aws_smithy_types::body::SdkBody::from
+    /// [`SdkBody::retryable`]: aws_smithy_types::body::SdkBody::retryable
+    /// [`DirectFileBody`]: crate::operation::upload::file_body::DirectFileBody
+    /// [`OffloadedFileBody`]: crate::operation::upload::file_body::OffloadedFileBody
+    pub(crate) fn into_sdk_body(self, direct_io: bool) -> aws_smithy_types::body::SdkBody {
+        use crate::operation::upload::file_body::{DirectFileBody, OffloadedFileBody};
+        use aws_smithy_types::body::SdkBody;
         match self.inner {
-            RawInputStream::Fs(path_body) => ByteStream::from_path(path_body.path)
-                .await
-                .map_err(error::from_kind(error::ErrorKind::IOError)),
-            RawInputStream::Buf(bytes) => Ok(ByteStream::from(bytes)),
-            RawInputStream::Dyn(_) => {
-                unreachable!("dyn InputStream should not have into_byte_stream called on it!")
+            RawInputStream::Buf(bytes) => SdkBody::from(bytes),
+            RawInputStream::Fs(path_body) => {
+                let path = path_body.path;
+                let offset = path_body.offset;
+                let length = path_body.length;
+                if direct_io {
+                    SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(DirectFileBody::new(path.clone(), offset, length))
+                    })
+                } else {
+                    SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(OffloadedFileBody::new(path.clone(), offset, length))
+                    })
+                }
             }
+            RawInputStream::Dyn(_) => panic!(
+                "InputStream::into_sdk_body called on Dyn stream; \
+                 Dyn sources must route through the multipart upload path \
+                 (is_mpu_only() should have been checked upstream)"
+            ),
         }
     }
 
@@ -141,11 +184,27 @@ pub(super) enum RawInputStream {
 #[derive(Debug)]
 pub struct StreamContext {
     part_size: usize,
+    /// When true, file I/O runs directly on the calling thread.
+    direct_io: bool,
+    /// Per-transfer cumulative metrics.
+    metrics: std::sync::Arc<crate::transfer::MetricsState>,
+    /// Per-client telemetry (windowed throughput, latency tracking).
+    telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
 }
 
 impl StreamContext {
-    pub(super) fn new(part_size: usize) -> Self {
-        Self { part_size }
+    pub(super) fn new(
+        part_size: usize,
+        direct_io: bool,
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+        telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
+    ) -> Self {
+        Self {
+            part_size,
+            direct_io,
+            metrics,
+            telemetry,
+        }
     }
 
     /// The part size to use when yielding parts.
@@ -153,6 +212,17 @@ impl StreamContext {
     /// result in exceeding the maximum number of parts allowed).
     pub fn part_size(&self) -> usize {
         self.part_size
+    }
+
+    /// Whether file I/O should run directly on the calling thread.
+    pub(crate) fn direct_io(&self) -> bool {
+        self.direct_io
+    }
+
+    /// Record an IO sample to per-transfer metrics and per-client telemetry.
+    pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
+        self.metrics.record_io(sample);
+        self.telemetry.io_counters.record(sample);
     }
 
     // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.
@@ -166,7 +236,7 @@ impl StreamContext {
 /// Contents and (optional) metadata for a single part of a [multipart upload].
 ///
 /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
@@ -175,11 +245,23 @@ pub struct PartData {
     pub(crate) is_last: Option<bool>,
 }
 
+impl std::fmt::Debug for PartData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartData")
+            .field("part_number", &self.part_number)
+            .field("data_len", &self.data.len())
+            .field("checksum", &self.checksum)
+            .field("is_last", &self.is_last)
+            .finish()
+    }
+}
+
 impl PartData {
     // Check if this is the last part
     //
     // It is `Option` because it's not always possible to determine
     // whether the just-yielded part is the last one, e.g., streaming cases.
+    #[allow(dead_code)] // TODO: re-wire upload part validation
     pub(crate) fn is_last(&self) -> Option<bool> {
         self.is_last
     }

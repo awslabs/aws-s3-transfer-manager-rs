@@ -15,9 +15,88 @@ use base64::Engine;
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use s3s::dto::Timestamp;
-use s3s::dto::{HeadBucketInput, HeadBucketOutput, StreamingBlob};
+use s3s::dto::{ETag, HeadBucketInput, HeadBucketOutput, StreamingBlob};
 use s3s::{S3Request, S3Response, S3Result};
 use std::str::FromStr;
+
+/// Convert a quoted etag string (e.g. `"\"abc123\""`) to `ETag::Strong("abc123")`.
+fn etag_from_quoted(s: &str) -> ETag {
+    ETag::Strong(s.trim_matches('"').to_owned())
+}
+
+/// Convert a quoted etag string to `Option<ETag::Strong>`.
+fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
+    s.map(|v| etag_from_quoted(&v))
+}
+
+/// Apply defaults to a HeadObject response matching post-2023 prod S3
+/// behavior on a fresh bucket: SSE-S3 (AES256) default encryption, and
+/// `ChecksumType::FullObject` whenever any checksum is present.
+fn apply_response_defaults_head(output: &mut s3s::dto::HeadObjectOutput) {
+    if output.server_side_encryption.is_none() {
+        output.server_side_encryption = Some(s3s::dto::ServerSideEncryption::from_static(
+            s3s::dto::ServerSideEncryption::AES256,
+        ));
+    }
+    if output.checksum_type.is_none() && has_any_checksum_head(output) {
+        output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
+            s3s::dto::ChecksumType::FULL_OBJECT,
+        ));
+    }
+}
+
+fn apply_response_defaults_get(output: &mut s3s::dto::GetObjectOutput) {
+    if output.server_side_encryption.is_none() {
+        output.server_side_encryption = Some(s3s::dto::ServerSideEncryption::from_static(
+            s3s::dto::ServerSideEncryption::AES256,
+        ));
+    }
+    if output.checksum_type.is_none() && has_any_checksum_get(output) {
+        output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
+            s3s::dto::ChecksumType::FULL_OBJECT,
+        ));
+    }
+}
+
+fn has_any_checksum_head(o: &s3s::dto::HeadObjectOutput) -> bool {
+    o.checksum_crc32.is_some()
+        || o.checksum_crc32c.is_some()
+        || o.checksum_crc64nvme.is_some()
+        || o.checksum_sha1.is_some()
+        || o.checksum_sha256.is_some()
+}
+
+fn has_any_checksum_get(o: &s3s::dto::GetObjectOutput) -> bool {
+    o.checksum_crc32.is_some()
+        || o.checksum_crc32c.is_some()
+        || o.checksum_crc64nvme.is_some()
+        || o.checksum_sha1.is_some()
+        || o.checksum_sha256.is_some()
+}
+
+/// Deterministically corrupt the first checksum header present on a GET response:
+/// decode it, XOR its first byte with 0xFF, re-encode. The result is valid-format
+/// but guaranteed ≠ the real value, and is recomputable from the object.
+fn xor_first_byte_of_checksum(output: &mut s3s::dto::GetObjectOutput) {
+    for value in [
+        &mut output.checksum_crc32,
+        &mut output.checksum_crc32c,
+        &mut output.checksum_crc64nvme,
+        &mut output.checksum_sha1,
+        &mut output.checksum_sha256,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(mut raw) = base64::engine::general_purpose::STANDARD.decode(value.as_bytes()) {
+            if let Some(b) = raw.first_mut() {
+                *b ^= 0xFF;
+                *value = base64::engine::general_purpose::STANDARD.encode(&raw);
+                return;
+            }
+        }
+    }
+}
 
 /// Inner implementation of the s3s::S3 trait.
 ///
@@ -27,33 +106,271 @@ use std::str::FromStr;
 pub(crate) struct Inner<S: StorageBackend + 'static> {
     /// The storage backend.
     storage: S,
+    /// Key-scoped fault injection registry.
+    faults: std::sync::Arc<crate::faults::FaultRegistry>,
+    /// Server-wide load-driven throttle, shared with the owning server. `None`
+    /// until one is installed.
+    throttle:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>>,
 }
 
 impl<S: StorageBackend + 'static> Inner<S> {
-    /// Create a new Inner with the given storage backend.
+    /// Create a new Inner with the given storage backend (no faults, no throttle).
+    #[cfg(test)]
     pub(crate) fn new(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            faults: std::sync::Arc::new(crate::faults::FaultRegistry::default()),
+            throttle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Create a new Inner sharing an external fault registry and throttle.
+    pub(crate) fn with_faults_and_throttle(
+        storage: S,
+        faults: std::sync::Arc<crate::faults::FaultRegistry>,
+        throttle: std::sync::Arc<
+            std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
+        >,
+    ) -> Self {
+        Self {
+            storage,
+            faults,
+            throttle,
+        }
+    }
+
+    /// Decide whether to serve or shed this request under the installed throttle;
+    /// a shed request returns 503 `SlowDown`. Called first in every S3 handler so
+    /// the throttle applies to all operations uniformly. The throttle lock is
+    /// released before consulting the rate limiter, so it is never held across the
+    /// handler body.
+    fn check_throttle(&self) -> S3Result<()> {
+        let throttle = self.throttle.lock().unwrap().clone();
+        match throttle {
+            Some(rt) if !rt.try_take(std::time::Instant::now()) => {
+                Err(s3s::S3Error::new(s3s::S3ErrorCode::SlowDown))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Apply a registered fault to a GET response, if one fires for this request.
+    /// Effects are deterministic transforms (XOR) so a faulted value is derivable.
+    async fn apply_get_fault(
+        &self,
+        bucket: &str,
+        key: &str,
+        conn_fault: Option<&std::sync::Arc<crate::socket_fault::ConnectionFault>>,
+        output: &mut s3s::dto::GetObjectOutput,
+    ) -> S3Result<()> {
+        match self.faults.next_fault(bucket, key) {
+            Some(crate::faults::FaultType::WrongStoredChecksum) => {
+                xor_first_byte_of_checksum(output);
+            }
+            Some(crate::faults::FaultType::CorruptBody) => {
+                if let Some(body) = output.body.take() {
+                    let mut bytes = BytesMut::new();
+                    let mut stream = body;
+                    while let Some(chunk) = stream.next().await {
+                        let chunk =
+                            chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if let Some(b) = bytes.first_mut() {
+                        *b ^= 0xFF;
+                    }
+                    let bytes = bytes.freeze();
+                    output.body = Some(StreamingBlob::wrap(futures_util::stream::once(
+                        async move { Ok::<_, std::io::Error>(bytes) },
+                    )));
+                }
+            }
+            Some(crate::faults::FaultType::TruncateBody { after_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `after_bytes`, then error the stream.
+                    // hyper aborts the connection mid-response.
+                    //
+                    // State: (inner stream, remaining passthrough bytes, errored?).
+                    let faulted = futures_util::stream::unfold(
+                        (body, after_bytes, false),
+                        |(mut stream, remaining, errored)| async move {
+                            if errored {
+                                return None;
+                            }
+                            if remaining == 0 {
+                                // Already delivered the allotted bytes: error now.
+                                return Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionReset,
+                                        "injected mid-stream truncation",
+                                    )),
+                                    (stream, 0, true),
+                                ));
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem, false)))
+                                    } else {
+                                        // Emit the partial head; error on next poll.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0, false)))
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    Some((Err(std::io::Error::other(e)), (stream, 0, true)))
+                                }
+                                // Real EOF before the truncation point: nothing to fault.
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::PaceBody {
+                piece_bytes,
+                cadence,
+            }) => {
+                if let Some(body) = output.body.take() {
+                    // Re-chunk the body into `piece_bytes`-sized pieces delivered
+                    // on the given cadence.
+                    //
+                    // State: (inner stream, buffer of pending bytes from the
+                    // underlying stream, whether the first piece has been emitted,
+                    // bytes remaining in the current piece).
+                    let faulted = futures_util::stream::unfold(
+                        (body, bytes::BytesMut::new(), false, piece_bytes),
+                        move |(mut stream, mut buf, first_emitted, piece_size)| async move {
+                            // Fill the buffer until we have a full piece or EOF.
+                            while (buf.len() as u64) < piece_size {
+                                match stream.next().await {
+                                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                                    Some(Err(e)) => {
+                                        return Some((
+                                            Err(std::io::Error::other(e)),
+                                            (stream, buf, first_emitted, piece_size),
+                                        ));
+                                    }
+                                    None => break,
+                                }
+                            }
+
+                            if buf.is_empty() {
+                                // Underlying body exhausted and buffer drained: EOF.
+                                return None;
+                            }
+
+                            // Apply cadence before delivering subsequent pieces.
+                            if first_emitted {
+                                match cadence {
+                                    crate::faults::BodyCadence::Slow(delay) => {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                    crate::faults::BodyCadence::Stall => {
+                                        std::future::pending::<()>().await;
+                                        unreachable!("pending future never resolves");
+                                    }
+                                }
+                            }
+
+                            let take = std::cmp::min(buf.len() as u64, piece_size) as usize;
+                            let piece = buf.split_to(take).freeze();
+                            Some((Ok(piece), (stream, buf, true, piece_size)))
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::ShortBody { actual_bytes }) => {
+                if let Some(body) = output.body.take() {
+                    // Yield body bytes up to `actual_bytes`, then end the stream
+                    // cleanly. Content-Length still advertises the full size, so
+                    // the client sees a short read.
+                    //
+                    // State: (inner stream, remaining bytes to deliver).
+                    let faulted = futures_util::stream::unfold(
+                        (body, actual_bytes),
+                        |(mut stream, remaining)| async move {
+                            if remaining == 0 {
+                                return None;
+                            }
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    if (chunk.len() as u64) <= remaining {
+                                        let rem = remaining - chunk.len() as u64;
+                                        Some((Ok(chunk), (stream, rem)))
+                                    } else {
+                                        // Emit the partial head, then end.
+                                        let head = chunk.slice(0..remaining as usize);
+                                        Some((Ok(head), (stream, 0)))
+                                    }
+                                }
+                                Some(Err(e)) => Some((Err(std::io::Error::other(e)), (stream, 0))),
+                                None => None,
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::ConnectionReset { after_bytes }) => {
+                // Arm the per-connection fault; the socket wrapper aborts the
+                // connection (RST) after `after_bytes` further bytes are written.
+                if let Some(fault) = conn_fault {
+                    fault.arm(after_bytes);
+                }
+            }
+            Some(crate::faults::FaultType::ServiceError { status }) => {
+                // Send-time HTTP error: reaches the SDK retry/token-bucket layer
+                // (not the TM body-read loop). Map the status to an S3 error code.
+                let code = match status {
+                    500 => s3s::S3ErrorCode::InternalError,
+                    503 => s3s::S3ErrorCode::SlowDown,
+                    _ => s3s::S3ErrorCode::ServiceUnavailable,
+                };
+                return Err(s3s::S3Error::new(code));
+            }
+            // Upload-only faults are no-ops on the GET path.
+            Some(crate::faults::FaultType::StallRequestRead { .. }) => {}
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Consume the next fault for an upload request and return it. Both upload
+    /// handlers call this once so the queue advances deterministically.
+    fn next_upload_fault(&self, bucket: &str, key: &str) -> Option<crate::faults::FaultType> {
+        self.faults.next_fault(bucket, key)
     }
 }
 
 #[async_trait]
 impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
-    #[tracing::instrument(level = "debug")]
     async fn get_object(
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
+        self.check_throttle()?;
+        let conn_fault = req
+            .extensions
+            .get::<std::sync::Arc<crate::socket_fault::ConnectionFault>>()
+            .cloned();
         let input = req.input;
+        let bucket = &input.bucket;
         let key = &input.key;
+        tracing::trace!(%bucket, %key, "GetObject");
 
         // Get metadata first to validate range
-        let metadata = match self.storage.head_object(key).await? {
+        let metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
 
         // Convert s3s Range to std Range if present
-        let range = input
+        let mut range = input
             .range
             .as_ref()
             .map(|range_dto| {
@@ -63,8 +380,30 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             })
             .transpose()?;
 
+        // A partNumber GET returns exactly that stored part's bytes. Translate it
+        // to the part's byte range; the range path below then returns the part's
+        // data, Content-Range, and per-part checksum. parts_count is set on the
+        // response so callers learn the stored part count.
+        // For a non-multipart (single-PUT) object there are no stored parts:
+        // partNumber=1 returns the whole object, any higher number errors.
+        let parts_count = metadata.parts_count();
+        if let Some(pn) = input.part_number {
+            if parts_count == 0 {
+                if pn != 1 {
+                    return Err(Error::InvalidPart.into());
+                }
+                // pn == 1, single-PUT: leave range as-is (whole object).
+            } else {
+                match metadata.part_range(pn) {
+                    Some(r) => range = Some(r),
+                    None => return Err(Error::InvalidPart.into()),
+                }
+            }
+        }
+
         // Get object stream with validated range
         let request = crate::storage::GetObjectRequest {
+            bucket,
             key,
             range: range.clone(),
         };
@@ -97,15 +436,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Use the stream directly
         output.body = Some(StreamingBlob::wrap(stream));
 
-        output.e_tag = Some(stream_metadata.etag);
+        output.e_tag = Some(etag_from_quoted(&stream_metadata.etag));
 
         let timestamp = Timestamp::from(stream_metadata.last_modified);
         output.last_modified = Some(timestamp);
 
         if let Some(content_type) = stream_metadata.content_type {
-            if let Ok(mime) = content_type.parse() {
-                output.content_type = Some(mime);
-            }
+            let mime = content_type
+                .parse()
+                .expect("stored content_type should be valid");
+            output.content_type = Some(mime);
         }
 
         output.metadata = Some(stream_metadata.user_metadata);
@@ -117,19 +457,38 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_sha256 = stream_metadata.sha256;
         output.checksum_crc64nvme = stream_metadata.crc64nvme;
 
+        // A partNumber GET reports the object's stored part count.
+        if input.part_number.is_some() && parts_count > 1 {
+            output.parts_count = Some(parts_count as i32);
+        }
+
+        // Return stored HTTP headers
+        output.storage_class = stream_metadata.storage_class.map(|s| s.parse().unwrap());
+        output.cache_control = stream_metadata.cache_control.map(|s| s.parse().unwrap());
+        output.content_encoding = stream_metadata.content_encoding.map(|s| s.parse().unwrap());
+        output.content_disposition = stream_metadata
+            .content_disposition
+            .map(|s| s.parse().unwrap());
+        output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
+
+        apply_response_defaults_get(&mut output);
+        self.apply_get_fault(bucket, key, conn_fault.as_ref(), &mut output)
+            .await?;
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn head_object(
         &self,
         req: S3Request<s3s::dto::HeadObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::HeadObjectOutput>> {
+        self.check_throttle()?;
         let input = req.input;
+        let bucket = &input.bucket;
         let key = &input.key;
+        tracing::trace!(%bucket, %key, "HeadObject");
 
         // Get object metadata from storage
-        let metadata = match self.storage.head_object(key).await? {
+        let metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
@@ -138,7 +497,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let content_type = metadata.content_type.and_then(|ct| ct.parse().ok());
         let mut output = s3s::dto::HeadObjectOutput {
             content_length: Some(metadata.content_length as i64),
-            e_tag: Some(metadata.etag),
+            e_tag: Some(etag_from_quoted(&metadata.etag)),
             last_modified: Some(Timestamp::from(metadata.last_modified)),
             content_type,
             metadata: Some(metadata.user_metadata),
@@ -152,17 +511,38 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_sha256 = metadata.sha256;
         output.checksum_crc64nvme = metadata.crc64nvme;
 
+        // Return stored HTTP headers
+        output.storage_class = metadata.storage_class.map(|s| s.parse().unwrap());
+        output.cache_control = metadata.cache_control.map(|s| s.parse().unwrap());
+        output.content_encoding = metadata.content_encoding.map(|s| s.parse().unwrap());
+        output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
+        output.content_language = metadata.content_language.map(|s| s.parse().unwrap());
+
+        apply_response_defaults_head(&mut output);
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn put_object(
         &self,
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
+        self.check_throttle()?;
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
         if input.key.is_empty() {
             return Err(s3s::s3_error!(InvalidRequest));
+        }
+
+        let fault = self.next_upload_fault(&input.bucket, &input.key);
+
+        // ServiceError: return before consuming the body.
+        if let Some(crate::faults::FaultType::ServiceError { status }) = fault {
+            let code = match status {
+                500 => s3s::S3ErrorCode::InternalError,
+                503 => s3s::S3ErrorCode::SlowDown,
+                _ => s3s::S3ErrorCode::ServiceUnavailable,
+            };
+            return Err(s3s::S3Error::new(code));
         }
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
@@ -172,6 +552,35 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let mut request = crate::storage::StoreObjectRequest::from(input);
         request.integrity_checks = integrity_checks;
 
+        // StallRequestRead: wrap the body stream to stall after `after_bytes`.
+        if let Some(crate::faults::FaultType::StallRequestRead { after_bytes }) = fault {
+            let inner_body =
+                std::mem::replace(&mut request.body, Box::pin(futures_util::stream::empty()));
+            let stalled = futures_util::stream::unfold(
+                (inner_body, after_bytes),
+                |(mut stream, remaining)| async move {
+                    if remaining == 0 {
+                        std::future::pending::<()>().await;
+                        unreachable!("pending future never resolves");
+                    }
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            if (chunk.len() as u64) <= remaining {
+                                let rem = remaining - chunk.len() as u64;
+                                Some((Ok(chunk), (stream, rem)))
+                            } else {
+                                let head = chunk.slice(0..remaining as usize);
+                                Some((Ok(head), (stream, 0)))
+                            }
+                        }
+                        Some(Err(e)) => Some((Err(e), (stream, 0))),
+                        None => None,
+                    }
+                },
+            );
+            request.body = Box::pin(stalled);
+        }
+
         let stored_meta = self.storage.put_object(request).await?;
 
         // Validate client-provided checksums
@@ -180,7 +589,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         let output = s3s::dto::PutObjectOutput {
-            e_tag: stored_meta.object_integrity.etag(),
+            e_tag: opt_etag_from_quoted(stored_meta.object_integrity.etag()),
             checksum_crc32: stored_meta.object_integrity.crc32,
             checksum_crc32c: stored_meta.object_integrity.crc32c,
             checksum_sha1: stored_meta.object_integrity.sha1,
@@ -192,12 +601,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn create_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+        self.check_throttle()?;
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
         let key = &input.key;
 
         // Extract checksum algorithm if provided, default to CRC64NVME
@@ -254,6 +664,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             ..Default::default()
         };
         let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: &input.bucket,
             key,
             upload_id: &upload_id,
             metadata,
@@ -277,24 +688,60 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn upload_part(
         &self,
         req: S3Request<s3s::dto::UploadPartInput>,
     ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
+        self.check_throttle()?;
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
+        tracing::trace!(%upload_id, part_number, "UploadPart");
+
+        let fault = self.next_upload_fault(&input.bucket, &input.key);
+
+        // ServiceError: return before consuming the body.
+        if let Some(crate::faults::FaultType::ServiceError { status }) = fault {
+            let code = match status {
+                500 => s3s::S3ErrorCode::InternalError,
+                503 => s3s::S3ErrorCode::SlowDown,
+                _ => s3s::S3ErrorCode::ServiceUnavailable,
+            };
+            return Err(s3s::S3Error::new(code));
+        }
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
-        // Read the part content and calculate checksums
+        // Read the part content and calculate checksums.
+        // StallRequestRead: after consuming `after_bytes`, pend forever.
+        let stall_after = match fault {
+            Some(crate::faults::FaultType::StallRequestRead { after_bytes }) => Some(after_bytes),
+            _ => None,
+        };
+        let mut bytes_consumed: u64 = 0;
         let mut content = BytesMut::new();
         if let Some(mut body) = input.body {
             while let Some(chunk) = body.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        if let Some(limit) = stall_after {
+                            if bytes_consumed >= limit {
+                                // Stall: stop reading, pend forever.
+                                std::future::pending::<()>().await;
+                                unreachable!("pending future never resolves");
+                            }
+                            let new_total = bytes_consumed + chunk.len() as u64;
+                            if new_total > limit {
+                                // Consume up to the limit, then stall.
+                                let allowed = (limit - bytes_consumed) as usize;
+                                integrity_checks.update(&chunk[..allowed]);
+                                content.extend_from_slice(&chunk[..allowed]);
+                                std::future::pending::<()>().await;
+                                unreachable!("pending future never resolves");
+                            }
+                            bytes_consumed = new_total;
+                        }
                         integrity_checks.update(&chunk);
                         content.extend_from_slice(&chunk);
                     }
@@ -320,7 +767,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Build response with checksums
         let output = s3s::dto::UploadPartOutput {
-            e_tag: Some(response.etag),
+            e_tag: Some(etag_from_quoted(&response.etag)),
             checksum_crc32: calculated_integrity.crc32,
             checksum_crc32c: calculated_integrity.crc32c,
             checksum_sha1: calculated_integrity.sha1,
@@ -332,12 +779,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
+        self.check_throttle()?;
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "CompleteMultipartUpload");
         let bucket = input.bucket.clone();
         let upload_id = &input.upload_id;
 
@@ -352,7 +800,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                     .part_number
                     .ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
                 let etag = part.e_tag.ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
-                parts.push((part_number, etag));
+                parts.push((part_number, format!("\"{}\"", etag.value())));
             }
         }
 
@@ -368,6 +816,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Complete the multipart upload
         let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: &bucket,
             upload_id,
             parts,
             client_checksums: if client_checksums.has_any() {
@@ -380,7 +829,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         let output = s3s::dto::CompleteMultipartUploadOutput {
             key: Some(response.key),
-            e_tag: Some(response.etag),
+            e_tag: Some(etag_from_quoted(&response.etag)),
             bucket: Some(bucket),
             checksum_crc32: response.object_integrity.crc32,
             checksum_crc32c: response.object_integrity.crc32c,
@@ -393,12 +842,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<s3s::dto::AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
+        self.check_throttle()?;
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "AbortMultipartUpload");
         let upload_id = &input.upload_id;
 
         // Abort the multipart upload
@@ -409,12 +859,22 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         ))
     }
 
-    #[tracing::instrument(level = "debug")]
     async fn list_objects_v2(
         &self,
         req: S3Request<s3s::dto::ListObjectsV2Input>,
     ) -> S3Result<S3Response<s3s::dto::ListObjectsV2Output>> {
+        self.check_throttle()?;
         let input = req.input;
+        tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
+
+        // Real S3 returns NoSuchBucket if the bucket doesn't exist
+        if !self.storage.head_bucket(&input.bucket).await? {
+            return Err(s3s::s3_error!(
+                NoSuchBucket,
+                "The specified bucket does not exist"
+            ));
+        }
+
         let prefix = input.prefix.as_deref();
         let delimiter = input.delimiter.as_deref();
         let max_keys = input.max_keys.unwrap_or(1000).min(1000) as usize;
@@ -422,7 +882,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let continuation_token = input.continuation_token.as_deref();
 
         // List objects from storage
-        let request = crate::storage::ListObjectsRequest { prefix };
+        let request = crate::storage::ListObjectsRequest {
+            bucket: &input.bucket,
+            prefix,
+        };
         let mut response = self.storage.list_objects(request).await?;
 
         // Apply start_after or continuation token if specified
@@ -472,7 +935,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 let object = s3s::dto::Object {
                     key: Some(obj.key),
                     size: Some(obj.metadata.content_length as i64),
-                    e_tag: Some(obj.metadata.etag),
+                    e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
                     last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
                     ..Default::default()
                 };
@@ -485,7 +948,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 let object = s3s::dto::Object {
                     key: Some(obj.key),
                     size: Some(obj.metadata.content_length as i64),
-                    e_tag: Some(obj.metadata.etag),
+                    e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
                     last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
                     ..Default::default()
                 };
@@ -522,7 +985,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             max_keys: Some(max_keys as i32),
             prefix: prefix.map(|s| s.to_string()),
             delimiter: delimiter.map(|s| s.to_string()),
-            name: Some("mock-bucket".to_string()),
+            name: Some(input.bucket.to_string()),
             next_continuation_token,
             ..Default::default()
         };
@@ -532,9 +995,75 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
     async fn head_bucket(
         &self,
-        _req: S3Request<HeadBucketInput>,
+        req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        Ok(S3Response::new(HeadBucketOutput::default()))
+        let input = req.input;
+        tracing::trace!(bucket = %input.bucket, "HeadBucket");
+        if self.storage.head_bucket(&input.bucket).await? {
+            Ok(S3Response::new(HeadBucketOutput::default()))
+        } else {
+            Err(s3s::s3_error!(
+                NoSuchBucket,
+                "The specified bucket does not exist"
+            ))
+        }
+    }
+
+    async fn delete_object(
+        &self,
+        req: S3Request<s3s::dto::DeleteObjectInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteObjectOutput>> {
+        self.check_throttle()?;
+        let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
+        self.storage
+            .delete_object(&input.bucket, &input.key)
+            .await?;
+        Ok(S3Response::new(s3s::dto::DeleteObjectOutput::default()))
+    }
+
+    async fn create_bucket(
+        &self,
+        req: S3Request<s3s::dto::CreateBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
+        let input = req.input;
+        tracing::trace!(bucket = %input.bucket, "CreateBucket");
+        self.storage.create_bucket(&input.bucket).await?;
+        let output = s3s::dto::CreateBucketOutput {
+            location: Some(format!("/{}", input.bucket)),
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
+        let input = req.input;
+        tracing::trace!(bucket = %input.bucket, "DeleteBucket");
+        self.storage.delete_bucket(&input.bucket).await?;
+        Ok(S3Response::new(s3s::dto::DeleteBucketOutput::default()))
+    }
+
+    async fn list_buckets(
+        &self,
+        _req: S3Request<s3s::dto::ListBucketsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
+        tracing::trace!("ListBuckets");
+        let buckets = self.storage.list_buckets().await?;
+        let bucket_list: Vec<s3s::dto::Bucket> = buckets
+            .into_iter()
+            .map(|b| s3s::dto::Bucket {
+                name: Some(b.name),
+                creation_date: Some(Timestamp::from(b.creation_date)),
+                ..Default::default()
+            })
+            .collect();
+        let output = s3s::dto::ListBucketsOutput {
+            buckets: Some(bucket_list),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
 }
 
@@ -587,6 +1116,20 @@ mod tests {
     use futures::stream;
     use s3s::S3;
 
+    fn s3_request<T>(input: T) -> S3Request<T> {
+        S3Request {
+            input,
+            method: http::Method::GET,
+            uri: http::Uri::default(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
     fn create_get_object_input(bucket: &str, key: &str) -> s3s::dto::GetObjectInput {
         s3s::dto::GetObjectInput::builder()
             .bucket(s3s::dto::BucketName::from(bucket))
@@ -614,7 +1157,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         inner.put_object(req).await.expect("Failed to put object")
     }
 
@@ -629,7 +1172,7 @@ mod tests {
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=0-49").unwrap());
 
-        let req = S3Request::new(input);
+        let req = s3_request(input);
 
         // Call the method
         let result = inner.get_object(req).await.expect("Get object failed");
@@ -642,8 +1185,8 @@ mod tests {
         assert_eq!(output.content_range, Some("bytes 0-49/100".to_string()));
 
         // The etag should be the MD5 hash of the content (calculated during put_object)
-        let expected_etag = format!("\"{}\"", hex::encode(md5::compute(content).0));
-        assert_eq!(output.e_tag.unwrap().as_str(), &expected_etag);
+        let expected_etag = hex::encode(md5::compute(content).0);
+        assert_eq!(output.e_tag.unwrap().value(), &expected_etag);
 
         let mut body = output.body.unwrap();
 
@@ -670,7 +1213,7 @@ mod tests {
         // Test case 1: Range at the beginning
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=0-4").unwrap());
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         let result = inner.get_object(req).await.expect("Get object failed");
         let output = result.output;
 
@@ -680,7 +1223,7 @@ mod tests {
         // Test case 2: Range at the end
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=5-9").unwrap());
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         let result = inner.get_object(req).await.expect("Get object failed");
         let output = result.output;
 
@@ -690,7 +1233,7 @@ mod tests {
         // Test case 3: Single byte range
         let mut input = create_get_object_input("test-bucket", "test-key");
         input.range = Some(s3s::dto::Range::parse("bytes=3-3").unwrap());
-        let req = S3Request::new(input);
+        let req = s3_request(input);
         let result = inner.get_object(req).await.expect("Get object failed");
         let output = result.output;
 
@@ -725,7 +1268,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .put_object(S3Request::new(input))
+            .put_object(s3_request(input))
             .await
             .expect("Put should succeed");
         assert_eq!(result.output.checksum_crc32, Some(expected_crc32));
@@ -743,7 +1286,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result_wrong = inner.put_object(S3Request::new(input_wrong)).await;
+        let result_wrong = inner.put_object(s3_request(input_wrong)).await;
         assert!(result_wrong.is_err());
     }
 
@@ -767,7 +1310,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .put_object(S3Request::new(input))
+            .put_object(s3_request(input))
             .await
             .expect("Put should succeed");
 
@@ -791,7 +1334,7 @@ mod tests {
             .unwrap();
 
         let create_result = inner
-            .create_multipart_upload(S3Request::new(create_input))
+            .create_multipart_upload(s3_request(create_input))
             .await
             .expect("Create multipart upload failed");
         let upload_id = create_result.output.upload_id.unwrap();
@@ -820,7 +1363,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .upload_part(S3Request::new(input))
+            .upload_part(s3_request(input))
             .await
             .expect("Upload part should succeed");
         assert_eq!(result.output.checksum_crc32, Some(expected_crc32));
@@ -840,7 +1383,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result_wrong = inner.upload_part(S3Request::new(input_wrong)).await;
+        let result_wrong = inner.upload_part(s3_request(input_wrong)).await;
         assert!(result_wrong.is_err());
     }
 
@@ -857,7 +1400,7 @@ mod tests {
             .unwrap();
 
         let create_result = inner
-            .create_multipart_upload(S3Request::new(create_input))
+            .create_multipart_upload(s3_request(create_input))
             .await
             .expect("Create multipart upload failed");
         let upload_id = create_result.output.upload_id.unwrap();
@@ -880,7 +1423,7 @@ mod tests {
                 .unwrap();
 
             let result = inner
-                .upload_part(S3Request::new(input))
+                .upload_part(s3_request(input))
                 .await
                 .expect("Upload part failed");
             part_etags.push(result.output.e_tag.unwrap());
@@ -910,7 +1453,7 @@ mod tests {
             .unwrap();
 
         let valid_result = inner
-            .complete_multipart_upload(S3Request::new(valid_input))
+            .complete_multipart_upload(s3_request(valid_input))
             .await;
         assert!(valid_result.is_ok());
 
@@ -922,7 +1465,7 @@ mod tests {
             .unwrap();
 
         let create_result2 = inner
-            .create_multipart_upload(S3Request::new(create_input2))
+            .create_multipart_upload(s3_request(create_input2))
             .await
             .expect("Create multipart upload failed");
         let upload_id2 = create_result2.output.upload_id.unwrap();
@@ -931,12 +1474,12 @@ mod tests {
         let invalid_parts = vec![
             s3s::dto::CompletedPart {
                 part_number: Some(1),
-                e_tag: Some("etag1".to_string()),
+                e_tag: Some(ETag::Strong("etag1".to_string())),
                 ..Default::default()
             },
             s3s::dto::CompletedPart {
                 part_number: Some(3),
-                e_tag: Some("etag3".to_string()),
+                e_tag: Some(ETag::Strong("etag3".to_string())),
                 ..Default::default()
             },
         ];
@@ -951,7 +1494,7 @@ mod tests {
             .unwrap();
 
         let invalid_result = inner
-            .complete_multipart_upload(S3Request::new(invalid_input))
+            .complete_multipart_upload(s3_request(invalid_input))
             .await;
         assert!(invalid_result.is_err());
     }
@@ -968,7 +1511,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = inner.create_multipart_upload(S3Request::new(input)).await;
+        let result = inner.create_multipart_upload(s3_request(input)).await;
         assert!(result.is_ok());
 
         // The response should include the default CRC64NVME algorithm
@@ -1000,7 +1543,7 @@ mod tests {
             .unwrap();
 
         let result = inner
-            .create_multipart_upload(S3Request::new(invalid_input))
+            .create_multipart_upload(s3_request(invalid_input))
             .await;
         assert!(result.is_err());
 
@@ -1016,7 +1559,7 @@ mod tests {
             .unwrap();
 
         let result2 = inner
-            .create_multipart_upload(S3Request::new(invalid_input2))
+            .create_multipart_upload(s3_request(invalid_input2))
             .await;
         assert!(result2.is_err());
 
@@ -1029,9 +1572,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result3 = inner
-            .create_multipart_upload(S3Request::new(valid_input))
-            .await;
+        let result3 = inner.create_multipart_upload(s3_request(valid_input)).await;
         assert!(result3.is_ok());
         let output = result3.unwrap().output;
         assert_eq!(

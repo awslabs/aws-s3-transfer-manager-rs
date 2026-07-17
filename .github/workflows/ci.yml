@@ -14,10 +14,10 @@ env:
   RUST_BACKTRACE: 1
   # Change to specific Rust release to pin
   rust_stable: stable
-  rust_nightly: nightly-2025-08-06
-  rust_clippy: '1.86'
+  rust_nightly: nightly-2026-03-31
+  rust_clippy: '1.92.0'
   # When updating this, also update relevant docs
-  rust_min: '1.86'
+  rust_min: '1.92.0'
   CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
   AWS_REGION: us-west-2
 
@@ -35,6 +35,7 @@ jobs:
   ci-required-checks:
     name: Required checks pass
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs:
       - test-hll
       - fmt
@@ -45,6 +46,9 @@ jobs:
       - check-deny
       - sanitizers
       - features
+      - dial9-build
+      - miri
+      - loom
     steps:
       - run: exit 0
 
@@ -52,6 +56,7 @@ jobs:
   basics:
     name: basic checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs:
       - fmt
       - clippy
@@ -63,7 +68,9 @@ jobs:
   test-hll:
     name: Test S3 transfer manager HLL
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-24.04
@@ -90,16 +97,18 @@ jobs:
 
       - name: test s3-transfer-manager HLL
         run: |
-          cargo nextest run --workspace --all-features
-          cargo test --doc --workspace --all-features
+          cargo nextest run --workspace --no-fail-fast
+          cargo test --doc --workspace --no-fail-fast
 
       - name: test s3-transfer-manager e2e
         run: |
-          RUSTFLAGS="--cfg e2e_test" cargo test --all-features --test e2e_transfer_test
+          RUSTFLAGS="--cfg e2e_test" cargo test --test e2e_transfer_test
+          RUSTFLAGS="--cfg e2e_test" cargo test -p integration-tests
 
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -120,6 +129,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_clippy }}
@@ -129,11 +139,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --all-features --no-deps
+        run: cargo clippy --all --tests --no-deps
 
   docs:
     name: docs
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -141,16 +152,16 @@ jobs:
         with:
           toolchain: ${{ env.rust_nightly }}
       - uses: Swatinem/rust-cache@v2
-      - name: "doc --lib --all-features"
+      - name: "doc --lib"
         run: |
-          cargo doc --lib --no-deps --all-features --document-private-items
+          cargo doc --lib --no-deps --document-private-items
         env:
-          RUSTFLAGS: --cfg docsrs
           RUSTDOCFLAGS: --cfg docsrs
 
   minrust:
     name: minrust
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_min }}
@@ -158,8 +169,8 @@ jobs:
         with:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
-      - name: "check --workspace --all-features"
-        run: cargo check --workspace --all-features
+      - name: "check --workspace"
+        run: cargo check --workspace
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
@@ -167,6 +178,7 @@ jobs:
     name: check-external-types (${{ matrix.os }})
     needs: basics
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       matrix:
         os:
@@ -176,7 +188,8 @@ jobs:
         rust:
           # `check-external-types` requires a specific Rust nightly version. See
           # the README for details: https://github.com/awslabs/cargo-check-external-types
-          - nightly-2025-08-06
+          # v0.4.0 needs rustdoc JSON format v56 (rustdoc-types 0.56.0)
+          - nightly-2025-10-18
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -187,15 +200,16 @@ jobs:
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v2
         with:
-          tool: cargo-check-external-types@0.3.0
+          tool: cargo-check-external-types@0.4.0
       - name: check-external-types
-        run: cargo check-external-types --all-features --config external-types.toml
+        run: cargo check-external-types --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
 
   check-deny:
     name: check deps with cargo-deny
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -208,13 +222,33 @@ jobs:
         with:
           tool: cargo-deny
       - name: cargo-deny
-        run: cargo deny --all-features check --hide-inclusion-graph --config .cargo-deny-config.toml licenses bans sources
+        # --config is a global flag: it must precede the `check` subcommand.
+        # Newer cargo-deny rejects it after `check` (unexpected argument).
+        run: cargo deny --all-features --config .cargo-deny-config.toml check --hide-inclusion-graph licenses bans sources
 
   sanitizers:
-    name: saniters
+    name: saniters (${{ matrix.sanitizer }})
     needs: basics
     runs-on: ubuntu-24.04
-    # TODO - add additional sanitizers like leak via matrix or other jobs
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ASAN: leak detection + use-after-free + heap/stack buffer overflow.
+          # `--test-threads 1` keeps leak attribution readable when something
+          # panics mid-test and leaves Arc cycles behind.
+          - sanitizer: address
+            rustflags: -Z sanitizer=address --cfg s3_tm_asan
+            cargo_args: ""
+            test_args: --test-threads 1 --nocapture
+          # TSan is parked: requires `-Z build-std` for correct happens-before
+          # modeling against std synchronization (the alternative
+          # `-Cunsafe-allow-abi-mismatch=sanitizer` produces both false
+          # positives and missed races); build-std currently fails to
+          # compile transitive `tower 0.4` against `indexmap 1.9` due to
+          # feature-resolution differences. Re-evaluate when the dep
+          # graph picks up tower 0.5+.
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
@@ -225,10 +259,10 @@ jobs:
         with:
           toolchain: ${{ env.rust_nightly }}
       - uses: Swatinem/rust-cache@v2
-      - name: asan
-        run: cargo test --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- --test-threads 1 --nocapture
+      - name: ${{ matrix.sanitizer }}
+        run: cargo test ${{ matrix.cargo_args }} --workspace --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
         env:
-          RUSTFLAGS: -Z sanitizer=address
+          RUSTFLAGS: ${{ matrix.rustflags }}
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
@@ -249,6 +283,7 @@ jobs:
     name: features
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -259,7 +294,81 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
-        run: cargo hack check --all --feature-powerset
+        # Exclude dial9: it requires RUSTFLAGS=--cfg tokio_unstable (see the
+        # dial9-build job for dedicated coverage).
+        run: cargo hack check --all --feature-powerset --exclude-features dial9
+
+  dial9-build:
+    # Verifies the optional `dial9` feature compiles. dial9-tokio-telemetry
+    # uses tokio's unstable runtime metrics + task-lifecycle hooks, gated
+    # behind `--cfg tokio_unstable`. The `cp` example is the sole consumer
+    # of dial9 types in the workspace; building it transitively compiles
+    # the lib with `cfg(feature = "dial9")` paths active, which is enough
+    # to prove the wiring. Keeping it a dedicated job avoids leaking
+    # `tokio_unstable` into the rest of CI.
+    name: dial9 build
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build cp example with dial9
+        run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
+        env:
+          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+
+  miri:
+    name: miri
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Run miri on all lib tests. Tests that need tokio's I/O driver
+      # (epoll/kqueue FFI) are marked #[cfg_attr(miri, ignore)].
+      # Mutex/Condvar fall back to std::sync under miri (parking_lot uses
+      # integer-to-pointer casts incompatible with strict provenance).
+      - name: miri
+        run: |
+          cargo miri test -p aws-sdk-s3-transfer-manager --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+
+  loom:
+    name: loom
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: loom
+        run: |
+          RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
+            --lib --release -- loom_tests --nocapture
+        env:
+          # Three preemption points catches three-way interleaving bugs that
+          # two-preemption exploration misses. Branch budget raised to absorb
+          # the larger state space; if a specific test exhausts it, we calibrate
+          # that test rather than dropping back globally.
+          LOOM_MAX_PREEMPTIONS: 3
+          LOOM_MAX_BRANCHES: 50000
+          RUST_BACKTRACE: 1
 
   # TODO - get cross check working
   # cross-check:
