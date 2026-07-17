@@ -13,6 +13,19 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Body delivery cadence for [`FaultType::PaceBody`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyCadence {
+    /// Wait this long before each piece after the first, then deliver it; the
+    /// body runs to EOF. Throughput stays positive, so this models a healthy but
+    /// slow link — distinct from a stall.
+    Slow(std::time::Duration),
+    /// Deliver the first piece, then never yield again and never EOF (zero
+    /// throughput). Stalled-stream protection observes this as a stall.
+    Stall,
+}
+
 /// What a fault does to a matching request. One effect per request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,10 +40,13 @@ pub enum FaultType {
     /// aborts the connection. The client observes a connection reset / incomplete
     /// body mid-stream.
     TruncateBody { after_bytes: u64 },
-    /// GET yields `after_bytes` body bytes, then stalls the body stream (no further
-    /// byte, no EOF). A client with stalled-stream protection enabled aborts the
-    /// read with `ThroughputBelowMinimum`.
-    StallBody { after_bytes: u64 },
+    /// GET delivers the body in `piece_bytes`-sized pieces on a cadence, modeling a
+    /// slow or dead link rather than an errored stream. The cadence decides whether
+    /// the body eventually completes.
+    PaceBody {
+        piece_bytes: u64,
+        cadence: BodyCadence,
+    },
     /// GET ends the body stream cleanly after `actual_bytes`, fewer than the
     /// Content-Length header advertises. The client observes a length mismatch
     /// (body shorter than declared / unexpected EOF).
@@ -44,6 +60,10 @@ pub enum FaultType {
     /// token-bucket layer rather than the TM body-read loop. Retryable statuses
     /// (500/503) drive the SDK to spend retry tokens.
     ServiceError { status: u16 },
+    /// While reading the request (upload) body, consume up to `after_bytes` then
+    /// stall (stop reading, never complete). The client's request-body poll parks
+    /// indefinitely, which stalled-stream protection observes as a stall.
+    StallRequestRead { after_bytes: u64 },
 }
 
 /// How many times an eligible fault fires before it is consumed.

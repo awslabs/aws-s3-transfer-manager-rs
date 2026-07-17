@@ -564,6 +564,12 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
+                        // TODO: the triggering child's error is preserved in
+                        // `state.failed` (reachable via
+                        // `Error::failed_downloads`), but the root error's
+                        // `source()` is only this string. Connecting the root
+                        // `source()` to the failing child's error needs a
+                        // shareable error (`Arc`) since `Error` is not `Clone`.
                         self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),
@@ -818,6 +824,12 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
+                        // TODO: the triggering child's error is preserved in
+                        // `state.failed` (reachable via
+                        // `Error::failed_downloads`), but the root error's
+                        // `source()` is only this string. Connecting the root
+                        // `source()` to the failing child's error needs a
+                        // shareable error (`Arc`) since `Error` is not `Clone`.
                         self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
                             format!("download failed for key '{key}'"),

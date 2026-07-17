@@ -17,6 +17,39 @@
 use aws_sdk_s3_transfer_manager::Client as TmClient;
 use s3_mock_server::S3MockServer;
 
+/// Install a process-global tracing subscriber for e2e diagnosis, once.
+///
+/// A failing real-S3 test otherwise surfaces only a panic string; this makes the
+/// run debuggable from its own logs, no re-run needed. Honors `RUST_LOG`;
+/// defaults to a curated filter over the transfer manager's diagnostic targets —
+/// the adaptive concurrency target (is it ramping?), scheduler/memory-budget
+/// admission (is a reserve parking?), and transfer lifecycle. Deliberately omits
+/// the per-work-item `execution` target (768 GETs × chunks is a firehose); reach
+/// for it with `RUST_LOG` when a specific run needs it.
+///
+/// Global (not a thread-local `set_default`) so it captures events from the
+/// managed threads and tokio workers the transfer runs on, not just the test
+/// thread. Idempotent: the first call wins, later calls are no-ops.
+#[cfg(e2e_test)]
+pub(crate) fn init_e2e_logs() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        const DEFAULT_FILTER: &str = "info,\
+            aws_sdk_s3_transfer_manager::concurrency=debug,\
+            aws_sdk_s3_transfer_manager::scheduling=debug,\
+            aws_sdk_s3_transfer_manager::transfer=debug";
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
+        // try_init: another test (or the process) may have set a subscriber
+        // already; a lost race is fine, the winner honors the same env.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .try_init();
+    });
+}
+
 /// Which backend serves S3 requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Backend {
@@ -186,6 +219,7 @@ impl TmTestClient {
         kind: BucketKind,
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
     ) -> Self {
+        init_e2e_logs();
         let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")
             .unwrap_or("aws-s3-transfer-manager-rs-test-bucket")
             .to_owned();

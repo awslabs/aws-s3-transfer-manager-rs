@@ -46,6 +46,33 @@ async fn setup() -> (
     (server, handle, tm)
 }
 
+/// Setup with an explicit concurrency limit, bounding the sustained offered load
+/// an installed throttle sees (so a throttled object's re-issues are not drowned
+/// out by peers retrying into the same limit).
+async fn setup_with_concurrency(
+    concurrency: usize,
+) -> (
+    S3MockServer,
+    s3_mock_server::ServerHandle,
+    aws_sdk_s3_transfer_manager::Client,
+) {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+
+    let handle = server.start().await.expect("start mock server");
+    let s3_client = handle.client().await;
+
+    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(concurrency))
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+
+    (server, handle, tm)
+}
+
 /// Create a flat temp directory containing `count` files, each of the
 /// same `size` in bytes. Files are named `NNNN.bin` (4-digit zero-padded).
 fn make_flat_dataset(count: usize, size: usize) -> TempDir {
@@ -485,3 +512,219 @@ async fn test_upload_objects_abort_terminates() {
 /// Suppress unused warning on `Path` in case the test matrix rotates.
 #[allow(dead_code)]
 fn _touch(_: &Path) {}
+
+// throttle storm (token-bucket starvation) ------------------------------------
+
+/// Characterizes how `upload_objects` behaves when a concurrent fan-out of small
+/// PutObjects is throttled (503 `SlowDown`) across every key — the shape that
+/// fails the `256KiB x 10k` benchmark workload.
+///
+/// Mechanism: throttles ARE retried (throttle backoff + shared refilling bucket),
+/// but a PERMANENT storm (`Occurrence::Always`) never relents: the bounded outer
+/// retries (`MAX_ATTEMPTS`) exhaust, the child upload fails, and the default
+/// `FailedTransferPolicy::Abort` aborts the transfer. The `timeout` guards
+/// against a hang regression.
+#[tokio::test]
+async fn upload_objects_throttle_storm_aborts_transfer() {
+    timeout(TEST_TIMEOUT, async {
+        let (server, server_handle, tm) = setup().await;
+
+        let count = 200usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let dataset = make_flat_dataset(count, size);
+        let bucket = "test-bucket";
+        let key_prefix = "storm/";
+
+        // 503 on every object's PutObject, on every attempt: the SDK spends the
+        // shared bucket retrying the first objects, then the rest surface the 503
+        // un-retried once the bucket is drained.
+        for i in 0..count {
+            let key = format!("{key_prefix}{i:04}.bin");
+            server.insert_fault(
+                bucket,
+                &key,
+                s3_mock_server::FaultType::ServiceError { status: 503 },
+                0,
+                s3_mock_server::Occurrence::Always,
+            );
+        }
+
+        let handle = tm
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix(key_prefix)
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let result = handle.join().await;
+
+        // Current behavior: a persistent throttle storm aborts the whole transfer.
+        let err = result
+            .expect_err("a persistent 503 storm across the fan-out currently aborts the transfer");
+        assert_eq!(
+            *err.kind(),
+            aws_sdk_s3_transfer_manager::error::ErrorKind::ChildOperationFailed,
+            "a throttle storm aborts via a failed child operation, got {err:?}",
+        );
+        // The top-level Display names the first failing object (not a bare "child
+        // operation failed"), so the message points at what to inspect.
+        assert!(
+            err.to_string().starts_with("child operation failed: "),
+            "the abort message must name the failing object, got: {err}",
+        );
+        // The child's failure is reachable via `failed_uploads()` as a structured
+        // `ServiceError`, distinguishing a throttle storm from a transport/IO
+        // failure or a generic abort. The service code is `SlowDown` when the SDK
+        // surfaces the modeled throttle response, but a drained retry quota can
+        // instead surface the terminal 503 as a code-less `ServiceError`, so the
+        // reliable assertion is the error KIND. (The root `source()` is only a
+        // string today — see the TODO in upload_objects/transfer.rs `abort`.)
+        let failed = err
+            .failed_uploads()
+            .expect("abort under Abort policy attaches the per-object failures");
+        assert!(!failed.is_empty(), "at least one child failure recorded");
+        let service_failure = failed.iter().any(|f| {
+            *f.error().kind() == aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError
+        });
+        assert!(
+            service_failure,
+            "a failed_uploads entry must carry the structured ServiceError from the storm, got: {failed:?}",
+        );
+
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("upload_objects_throttle_storm_aborts_transfer timed out");
+}
+
+/// A load-driven throttle storm is recovered: the transfer completes despite the
+/// prefix shedding load under the initial fan-out, where the persistent-storm test
+/// above aborts. This exercises the throttle classifier (a throttle is retried,
+/// not terminal) and the outer throttle-backoff re-issue.
+///
+/// Uses the mock's load-driven rate throttle (a token bucket: sustained `rate`
+/// req/sec with a `burst` allowance, shedding the rest with 503), which models
+/// S3's per-prefix request-rate limit and relents *because the client backed off* —
+/// not because a fixed request count elapsed:
+///
+/// - The opening fan-out arrives faster than the bucket refills, so past the
+///   `burst` (15) the excess is shed. Across 200 objects that sheds far more than
+///   the 100 inner retries the SDK's shared retry bucket can absorb (capacity 500,
+///   throttling-retry cost 5), so 503s stop being absorbed by SDK inner retry and
+///   surface to the TM's outer loop. That is the machinery under test — with
+///   throttles classified `NoRetry` the shed children fail and the transfer aborts
+///   (mutation-verified).
+/// - The TM's throttle backoff paces re-issues back under `rate`, so the bucket
+///   keeps up and requests are served again. Recovery is caused by the backoff.
+///   (Rate — not in-flight concurrency — is what accumulates under a burst of
+///   near-instant in-memory requests, so it produces real backpressure a
+///   concurrency limit would not at this object size.)
+/// - Concurrency is fixed (16) so the sustained offered load stays bounded: a
+///   throttled object's re-issues are not drowned out by hundreds of peers
+///   retrying into the same rate limit, so each recovers within the retry budget.
+/// - Which request is shed varies with arrival timing; the behavior (over rate →
+///   shed, back off → recover → complete) is deterministic.
+///
+/// Recovery here is driven by the client's backoff under the rate limit, so it does
+/// not by itself depend on the per-bucket token bucket being shared across
+/// operations (that isolation + refill fix, and its reuse, is covered by
+/// `retry_partition_is_cached_per_bucket` in the transfer-manager crate).
+#[tokio::test]
+async fn upload_objects_transient_throttle_storm_recovers() {
+    timeout(TEST_TIMEOUT, async {
+        // Fixed concurrency bounds the sustained offered load so throttled objects'
+        // re-issues recover within the retry budget rather than being drowned out by
+        // peers retrying into the same rate limit.
+        let (server, server_handle, tm) = setup_with_concurrency(16).await;
+
+        let count = 200usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let dataset = make_flat_dataset(count, size);
+        let bucket = "test-bucket";
+
+        // Sustained 50 req/sec, burst 15: the fan-out overruns it and sheds well
+        // past the 100 inner retries the shared SDK bucket can absorb (draining it
+        // so 503s reach the TM loop); the TM's throttle backoff then paces re-issues
+        // under 50/sec to recover.
+        server.set_rate_throttle(50.0, 15.0);
+
+        let handle = tm
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix("recover/")
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a load-driven throttle storm must be recovered via backoff, not aborted");
+        assert_eq!(
+            output.objects_uploaded(),
+            count as u64,
+            "every object must land once backoff relieves the load"
+        );
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no object should be left failed after recovery"
+        );
+
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("upload_objects_transient_throttle_storm_recovers timed out");
+}
+
+/// Download counterpart to `upload_objects_transient_throttle_storm_recovers`.
+/// For a small single-part object, discovery is the sole request, so a
+/// throttle storm on discovery must recover via the TM retry loop — parity with
+/// the upload path. Drives the same load-driven storm the upload test survives.
+#[tokio::test]
+async fn download_objects_transient_throttle_storm_recovers() {
+    timeout(TEST_TIMEOUT, async {
+        let (server, server_handle, tm) = setup_with_concurrency(16).await;
+        let count = 200usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "recover-dl/";
+
+        // Seed the store with no throttle installed.
+        let dataset = make_flat_dataset(count, size);
+        tm.upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix(prefix)
+            .initiate()
+            .expect("initiate seed upload")
+            .join()
+            .await
+            .expect("seed upload must succeed");
+
+        // Install the load-driven storm: every request is rate-limited server-wide.
+        server.set_rate_throttle(50.0, 15.0);
+
+        let dest = TempDir::new().expect("dest tempdir");
+        let handle = tm
+            .download_objects()
+            .bucket(bucket)
+            .key_prefix(prefix)
+            .destination(dest.path())
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a load-driven throttle storm on download must recover (parity with upload)");
+        assert_eq!(output.objects_downloaded(), count as u64);
+        assert!(output.failed_transfers().is_empty());
+        server_handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("download_objects_transient_throttle_storm_recovers timed out");
+}

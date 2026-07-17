@@ -37,9 +37,9 @@ pub(crate) const TARGET_TRANSFER: &str = "aws_sdk_s3_transfer_manager::transfer"
 /// Groups latency tracking and throughput counters. Transfers record
 /// directly; the adaptive concurrency controller reads aggregated views.
 pub(crate) struct Telemetry {
-    /// Latency tracking for outbound data plane (upload part sends).
-    pub(crate) send_latencies: LatencyTracker,
-    /// Latency tracking for inbound data plane (download range receives).
+    /// Latency tracking for inbound data plane (download range receives); drives
+    /// the download time-to-first-byte deadline. There is no send-side tracker:
+    /// the upload path carries no adaptive latency deadline.
     pub(crate) recv_latencies: LatencyTracker,
     /// Throughput counters (network tx/rx, disk read/write).
     pub(crate) io_counters: Arc<IOCounters>,
@@ -49,7 +49,6 @@ impl Telemetry {
     /// Create telemetry with the given window duration for throughput counters.
     pub(crate) fn new(counter_window: Duration) -> Self {
         Self {
-            send_latencies: LatencyTracker::new(),
             recv_latencies: LatencyTracker::new(),
             io_counters: Arc::new(IOCounters::new(counter_window)),
         }
@@ -59,7 +58,6 @@ impl Telemetry {
 impl std::fmt::Debug for Telemetry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Telemetry")
-            .field("send_latencies", &self.send_latencies)
             .field("recv_latencies", &self.recv_latencies)
             .finish_non_exhaustive()
     }

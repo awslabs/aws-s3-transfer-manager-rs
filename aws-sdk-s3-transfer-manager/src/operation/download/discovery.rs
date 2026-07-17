@@ -160,16 +160,26 @@ async fn discover_obj_with_get_first_part(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::Error> {
-    let builder = copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
-    // S3 index starts with 1
-    let resp = builder
-        .set_range(None)
-        .set_part_number(Some(1))
-        .customize()
-        .config_override(crate::retry::bucket_partition_override(input.bucket()))
-        .send()
-        .await
-        .map_err(error::Error::from)?;
+    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let builder =
+            copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        let req = builder
+            .set_range(None)
+            .set_part_number(Some(1))
+            .customize()
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+        }
+    })
+    .await?;
     first_chunk_response_handler(resp, None)
 }
 
@@ -177,18 +187,28 @@ async fn discover_obj_with_head(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let resp = transfer
-        .ctx()
-        .s3_client()
-        .head_object()
-        .set_range(input.range.clone())
-        .set_bucket(input.bucket().map(str::to_string))
-        .set_key(input.key().map(str::to_string))
-        .customize()
-        .config_override(crate::retry::bucket_partition_override(input.bucket()))
-        .send()
-        .await
-        .map_err(error::Error::from)?;
+    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let req = transfer
+            .ctx()
+            .s3_client()
+            .head_object()
+            .set_range(input.range.clone())
+            .set_bucket(input.bucket().map(str::to_string))
+            .set_key(input.key().map(str::to_string))
+            .customize()
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+        }
+    })
+    .await?;
     let object_meta: ObjectMetadata = resp.into();
 
     Ok(ObjectDiscovery {
@@ -215,27 +235,32 @@ async fn discover_obj_with_get(
         ),
         None => ByteRange::Inclusive(0, target_part_size - 1),
     };
-    let builder = copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
-    let resp = builder
-        .range(header::Range::bytes(byte_range))
-        .customize()
-        .config_override(crate::retry::bucket_partition_override(input.bucket()))
-        .send()
-        .await;
-    match resp {
-        Err(error) => {
-            match error.as_service_error() {
-                Some(service_error)
-                    if service_error.meta().code() == Some("InvalidRange")
-                        && range_from_user.is_none() =>
-                {
-                    // Invalid Range Error found and no Range passed in it's an empty object.
-                    // discover the object with the first part instead for empty object.
-                    discover_obj_with_get_first_part(transfer, input).await
-                }
-                _ => Err(error::Error::from(error)),
-            }
+    let result = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let builder =
+            copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        let req = builder
+            .range(header::Range::bytes(byte_range.clone()))
+            .customize()
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
+    })
+    .await;
+    match result {
+        Err(error) if error.code() == Some("InvalidRange") && range_from_user.is_none() => {
+            // InvalidRange with no user-supplied range indicates an empty object.
+            // Discover via partNumber=1 instead.
+            discover_obj_with_get_first_part(transfer, input).await
+        }
+        Err(error) => Err(error),
         Ok(response) => first_chunk_response_handler(response, range_from_user),
     }
 }

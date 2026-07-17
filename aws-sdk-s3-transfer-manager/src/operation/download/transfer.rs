@@ -696,52 +696,77 @@ impl DownloadTransfer {
     ) -> WorkOutcome {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
-        // The discovery GET already fetched this chunk's bytes; the first read
-        // consumes that stream with no extra request (preserving time-to-first-
-        // byte). A retry has no stream to reuse, so it re-issues a ranged GET for
-        // exactly the bytes this chunk covers, taken from the discovery response's
-        // content-range. A partNumber=1 discovery maps to the same byte range, so
-        // the re-issued aligned range returns the same per-part checksum the SDK
-        // validates against.
+        // The discovery GET already received this chunk's response headers; the
+        // first read consumes its (lazy, not-yet-read) body stream with no extra
+        // request. A retry has no stream to reuse, so it re-issues a ranged GET
+        // for exactly the bytes this chunk covers, taken from the discovery
+        // response's content-range. A partNumber=1 discovery maps to the same
+        // byte range, so the re-issued aligned range returns the same per-part
+        // checksum the SDK validates against.
         let reissue_range = chunk_meta
             .content_range
             .as_deref()
             .and_then(crate::http::header::parse_content_range);
 
         let mut initial = Some(stream);
-        let result = crate::retry::retry_guarded(
-            &self.inner.ctx.handle.telemetry.recv_latencies,
-            crate::retry::classify_body_retry,
-            || {
-                let pre_issued = initial.take();
-                let etag = etag.clone();
-                let ctx = self.inner.ctx.clone();
-                let reissue_range = reissue_range.clone();
-                let mut builder =
-                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
-                if let Some(r) = reissue_range.as_ref() {
-                    builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
-                }
-                if let Some(etag) = etag.as_ref() {
-                    builder = builder.if_match(etag.as_ref());
-                }
-                let req = builder
-                    .customize()
-                    .config_override(crate::retry::bucket_partition_override(input.bucket()));
-                async move {
-                    let body = match pre_issued {
-                        // First attempt: the body discovery already fetched.
-                        Some(s) => s,
-                        // Retry: re-fetch the discovery chunk's range.
-                        None => {
-                            let resp = req.send().await.map_err(crate::error::Error::from)?;
-                            resp.body
+        let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        // The deadline guards only the GET response (TTFB); the body-read is
+        // untimed. The first attempt reuses the discovery body — no network send
+        // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
+        // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
+        // goes through `guarded`, which times and records its TTFB.
+        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
+            let pre_issued = initial.take();
+            let etag = etag.clone();
+            let ctx = self.inner.ctx.clone();
+            let reissue_range = reissue_range.clone();
+            let mut builder =
+                copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+            if let Some(r) = reissue_range.as_ref() {
+                builder = builder.set_range(Some(format!("bytes={}-{}", r.start(), r.end())));
+            }
+            if let Some(etag) = etag.as_ref() {
+                builder = builder.if_match(etag.as_ref());
+            }
+            let req = builder
+                .customize()
+                .config_override(ctx.handle.download_get_override(input.bucket()));
+            async move {
+                // Obtain the body stream. First attempt reuses the discovery body
+                // (no send, untimed); a re-issue is TTFB-guarded (times + records).
+                let body = match pre_issued {
+                    Some(s) => s,
+                    None => {
+                        // A re-issue without a byte range would fetch the whole
+                        // object into this chunk's slot. S3 always returns a
+                        // content-range for a ranged/partNumber GET, so a missing
+                        // range is a contract violation — fail the chunk rather
+                        // than issue an unbounded GET. Use a terminal kind
+                        // (`RuntimeError`, NoRetry in `classify_body_retry`): the
+                        // range cannot appear on a re-issue, so retrying would
+                        // deterministically fail again and waste a backoff.
+                        if reissue_range.is_none() {
+                            return Err(crate::retry::GuardError::Inner(crate::error::Error::new(
+                                crate::error::ErrorKind::RuntimeError,
+                                "cannot re-issue discovery chunk: response carried no content-range",
+                            )));
                         }
-                    };
-                    Self::read_body_stream(&ctx, body).await
-                }
-            },
-        )
+                        recv_latencies
+                            .guarded(allow_hedge, async {
+                                req.send()
+                                    .await
+                                    .map(|resp| resp.body)
+                                    .map_err(crate::error::Error::from)
+                            })
+                            .await?
+                    }
+                };
+                // Untimed: drain the body. Errors here are inner (retryable IO).
+                Self::read_body_stream(&ctx, body)
+                    .await
+                    .map_err(crate::retry::GuardError::Inner)
+            }
+        })
         .await;
 
         let (segmented, bytes_received) = match result {
@@ -821,6 +846,7 @@ impl DownloadTransfer {
         let mut segmented = SegmentedBuf::new();
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
+
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
@@ -832,6 +858,7 @@ impl DownloadTransfer {
                 ));
             }
         }
+
         Ok((segmented, bytes_received))
     }
 
@@ -845,36 +872,53 @@ impl DownloadTransfer {
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
 
-        let result = crate::retry::retry_guarded(
-            &self.inner.ctx.handle.telemetry.recv_latencies,
-            crate::retry::classify_body_retry,
-            || {
-                let rh = range_header.clone();
-                let etag = etag.clone();
-                let ctx = self.inner.ctx.clone();
-                // Every chunk GET must carry the same request fields as discovery
-                // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
-                // conversion, then pin this chunk's range and the discovered etag.
-                let mut builder =
-                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
-                builder = builder.set_range(Some(rh.clone()));
-                if let Some(etag) = etag.as_ref() {
-                    builder = builder.if_match(etag.as_ref());
-                }
-                let req = builder
-                    .customize()
-                    .config_override(crate::retry::bucket_partition_override(input.bucket()));
-
-                async move {
-                    let resp = req.send().await.map_err(crate::error::Error::from)?;
-                    validate_content_range(&rh, resp.content_range())?;
-                    let chunk_meta = ChunkMetadata::from(&resp);
-                    let (segmented, bytes_received) =
-                        Self::read_body_stream(&ctx, resp.body).await?;
-                    Ok::<_, crate::error::Error>((chunk_meta, segmented, bytes_received))
-                }
-            },
-        )
+        let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        // The deadline guards only the GET response (send → headers ≈ TTFB): the
+        // `recv_latencies.guarded(send)` wrapper times the send, then the body is
+        // read UNTIMED. A large part on a slow-but-healthy link takes a long time
+        // to drain and must not be cancelled as a straggler; a dead mid-body
+        // stream is caught by stalled-stream protection. A `GuardError`
+        // (deadline timeout OR inner error from either phase) is classified by
+        // the retry loop.
+        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
+            let rh = range_header.clone();
+            let etag = etag.clone();
+            let ctx = self.inner.ctx.clone();
+            // Every chunk GET must carry the same request fields as discovery
+            // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
+            // conversion, then pin this chunk's range and the discovered etag.
+            let mut builder =
+                copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+            builder = builder.set_range(Some(rh.clone()));
+            if let Some(etag) = etag.as_ref() {
+                builder = builder.if_match(etag.as_ref());
+            }
+            let req = builder
+                .customize()
+                .config_override(ctx.handle.download_get_override(input.bucket()));
+            async move {
+                // Timed (TTFB): obtain response headers. Validate the range here
+                // so a mismatch is classified before we commit to the body read.
+                let rh_validate = rh.clone();
+                let resp = recv_latencies
+                    .guarded(allow_hedge, async move {
+                        let resp = req.send().await.map_err(crate::error::Error::from)?;
+                        validate_content_range(&rh_validate, resp.content_range())?;
+                        Ok::<_, crate::error::Error>(resp)
+                    })
+                    .await?;
+                // Untimed: drain the body. Errors here are inner (retryable IO).
+                let chunk_meta = ChunkMetadata::from(&resp);
+                let (segmented, bytes_received) = Self::read_body_stream(&ctx, resp.body)
+                    .await
+                    .map_err(crate::retry::GuardError::Inner)?;
+                Ok::<_, crate::retry::GuardError<crate::error::Error>>((
+                    chunk_meta,
+                    segmented,
+                    bytes_received,
+                ))
+            }
+        })
         .await;
 
         let (chunk_meta, segmented, bytes_received) = match result {
@@ -1085,28 +1129,46 @@ impl Transfer for DownloadTransfer {
     }
 }
 
+/// Parse a byte range from either the request format (`bytes=START-END`) or the
+/// response format (`bytes START-END/TOTAL` or `bytes START-END/*`).
+///
+/// Strips a leading `bytes=` or `bytes ` prefix, discards a `/TOTAL` suffix if
+/// present, splits on `-`, and parses both halves as `u64`. Returns `Some((start, end))`
+/// only when both parse and `start <= end`; returns `None` for any malformed input.
+fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
+    let s = s
+        .strip_prefix("bytes=")
+        .or_else(|| s.strip_prefix("bytes "))
+        .unwrap_or(s);
+    // Strip "/TOTAL" or "/*" suffix (Content-Range format).
+    let range_part = s.split('/').next()?;
+    let (start_str, end_str) = range_part.split_once('-')?;
+    let start: u64 = start_str.trim().parse().ok()?;
+    let end: u64 = end_str.trim().parse().ok()?;
+    (start <= end).then_some((start, end))
+}
+
 /// Validate that the response Content-Range matches the requested range.
+///
+/// Both the requested range and the response are parsed to numeric `(start, end)` and
+/// compared for equality. Returns `Err` when either side is absent or unparseable, or
+/// when the parsed ranges differ.
 fn validate_content_range(
     requested_range: &str,
     response_content_range: Option<&str>,
 ) -> Result<(), Error> {
-    let normalized = requested_range
-        .strip_prefix("bytes=")
-        .unwrap_or(requested_range);
+    let requested = parse_byte_range(requested_range);
+    let response = response_content_range.and_then(parse_byte_range);
 
-    if response_content_range
-        .map(|range| range.contains(normalized))
-        .unwrap_or(false)
-    {
-        Ok(())
-    } else {
-        Err(error::Error::new(
+    match (requested, response) {
+        (Some(req), Some(resp)) if req == resp => Ok(()),
+        _ => Err(error::Error::new(
             error::ErrorKind::RuntimeError,
             format!(
                 "content range mismatch: requested {}, response {:?}",
                 requested_range, response_content_range
             ),
-        ))
+        )),
     }
 }
 
@@ -2258,5 +2320,58 @@ mod tests {
     #[test]
     fn test_validate_content_range_missing() {
         assert!(validate_content_range("bytes=1024-2047", None).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_substring_false_positive() {
+        // The substring "0-9" appears in "bytes 10-99/100", but the ranges differ.
+        // A naive `.contains()` match would wrongly pass this.
+        assert!(validate_content_range("bytes=0-9", Some("bytes 10-99/100")).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_exact_match_small_range() {
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/100")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_unsized_total() {
+        // RFC 7233 allows `bytes START-END/*` when the total is unknown.
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/*")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_large_range_match() {
+        assert!(validate_content_range("bytes=100-199", Some("bytes 100-199/500")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_range_response_none() {
+        assert!(validate_content_range("bytes=0-9", None).is_err());
+    }
+
+    #[test]
+    fn test_validate_content_range_garbage_response() {
+        assert!(validate_content_range("bytes=0-9", Some("bytes abc")).is_err());
+    }
+
+    #[test]
+    fn test_parse_byte_range_request_format() {
+        assert_eq!(parse_byte_range("bytes=0-9"), Some((0, 9)));
+        assert_eq!(parse_byte_range("bytes=100-199"), Some((100, 199)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_response_format() {
+        assert_eq!(parse_byte_range("bytes 0-9/100"), Some((0, 9)));
+        assert_eq!(parse_byte_range("bytes 100-199/500"), Some((100, 199)));
+        assert_eq!(parse_byte_range("bytes 0-9/*"), Some((0, 9)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_invalid() {
+        assert_eq!(parse_byte_range("bytes abc"), None);
+        assert_eq!(parse_byte_range(""), None);
+        assert_eq!(parse_byte_range("bytes 9-0"), None); // start > end
     }
 }

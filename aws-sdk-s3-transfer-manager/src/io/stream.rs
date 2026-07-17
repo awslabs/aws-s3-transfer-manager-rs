@@ -97,31 +97,31 @@ impl InputStream {
     }
 
     /// Convert this input stream into an [`SdkBody`] suitable for a top-level
-    /// retryable SDK call (e.g. `PutObject`). The returned body is retryable
-    /// at the SDK layer:
+    /// retryable SDK call (e.g. `PutObject`). The returned body is retryable at
+    /// the SDK layer:
     ///
-    /// * In-memory (`Buf`) streams go through [`SdkBody::from`] whose
-    ///   rebuild path is a cheap `Bytes` clone.
-    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each
-    ///   retry constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`]
-    ///   with its own open file descriptor and read cursor.
+    /// * In-memory (`Buf`) streams go through [`SdkBody::from`] whose rebuild
+    ///   path is a cheap `Bytes` clone. Keeping the native in-memory body (rather
+    ///   than a custom wrapper) is what lets the SDK take its inline-checksum
+    ///   path; wrapping would force aws-chunked trailer encoding.
+    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each retry
+    ///   constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`] with its
+    ///   own open file descriptor and read cursor.
     ///
-    /// `direct_io` selects between the two file-body implementations:
-    /// `true` when the caller owns the polling thread (managed-thread
-    /// direct I/O), `false` when the body may be polled by the shared
-    /// tokio runtime.
+    /// `direct_io` selects between the two file-body implementations: `true`
+    /// when the caller owns the polling thread (managed-thread direct I/O),
+    /// `false` when the body may be polled by the shared tokio runtime.
     ///
     /// # Panics
     ///
-    /// Panics on `Dyn` streams. Dyn sources cannot be rewound and must
-    /// route through the multipart upload path (see [`is_mpu_only`]).
+    /// Panics on `Dyn` streams. Dyn sources cannot be rewound and must route
+    /// through the multipart upload path (see [`is_mpu_only`](Self::is_mpu_only)).
     ///
     /// [`SdkBody`]: aws_smithy_types::body::SdkBody
     /// [`SdkBody::from`]: aws_smithy_types::body::SdkBody::from
     /// [`SdkBody::retryable`]: aws_smithy_types::body::SdkBody::retryable
     /// [`DirectFileBody`]: crate::operation::upload::file_body::DirectFileBody
     /// [`OffloadedFileBody`]: crate::operation::upload::file_body::OffloadedFileBody
-    /// [`is_mpu_only`]: Self::is_mpu_only
     pub(crate) fn into_sdk_body(self, direct_io: bool) -> aws_smithy_types::body::SdkBody {
         use crate::operation::upload::file_body::{DirectFileBody, OffloadedFileBody};
         use aws_smithy_types::body::SdkBody;

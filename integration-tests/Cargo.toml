@@ -19,6 +19,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 uuid = { version = "1.23.2", features = ["v4"] }
 aws-smithy-checksums = "0.64.6"
+aws-smithy-runtime-api = "1.11.6"
+aws-smithy-http-client = { version = "1.1.12", features = ["rustls-aws-lc"] }
+bytes = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)'] }

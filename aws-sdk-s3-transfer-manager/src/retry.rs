@@ -3,75 +3,192 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Retry loop layered over the latency deadline guard.
+//! Retry loop for transfer operations and its classifiers.
 //!
-//! [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded)
-//! runs one attempt under a deadline and reports its outcome. This module loops
-//! it: a caller-supplied classifier decides, per failed attempt, whether to
-//! retry. The guard holds no retry policy; the classifier holds the domain
-//! knowledge of which errors are transient.
+//! [`retry`] re-issues an operation up to [`MAX_ATTEMPTS`] times, deciding per
+//! failure via a caller-supplied classifier and backing off per [`Backoff`].
+//! The loop is deadline-agnostic: any latency deadline is composed by the caller
+//! inside the built future (see
+//! [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded)),
+//! surfacing a timeout as [`GuardError::DeadlineExceeded`].
 
 use std::future::Future;
 use std::time::Duration;
 
-use aws_sdk_s3::config::retry::RetryPartition;
+use aws_sdk_s3::config::retry::{RetryPartition, TokenBucket};
 
 use crate::error::{Error, ErrorKind};
-use crate::metrics::latency::{GuardError, LatencyTracker};
+pub(crate) use crate::metrics::latency::GuardError;
 
-/// Maximum attempts per operation before the last failure is returned. Counts
-/// every attempt, not just timeouts: a retryable failure of any kind re-issues
-/// until this budget is spent.
+/// Maximum attempts per operation before the last error is returned.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// A classifier's verdict for a failed attempt.
+/// Base of the full-jitter backoff: the first retry waits a random duration in
+/// `[0, INITIAL_BACKOFF]`, doubling the ceiling each attempt.
+///
+/// Larger than the SDK's own transient base because this is an *outer* retry
+/// that fires only after the SDK's inner retry exhausted; a re-issue should span
+/// the window in which in-flight work completes and refills the shared retry
+/// quota, rather than collide with the still-drained bucket.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Base of the full-jitter backoff for a throttle retry.
+///
+/// The SEP backs off a throttling error with a 1s base — 10× the transient base
+/// — so a service shedding load is given room to recover before a re-issue. A
+/// transient transport error (a body-part IO failure) is safe to re-issue fast;
+/// a throttle is not, so the two retry reasons carry distinct bases while
+/// sharing [`MAX_ATTEMPTS`].
+const THROTTLE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Ceiling for a single backoff delay, before jitter. Capped below the SDK SEP's
+/// 20s because a multi-second stall on one part of a larger transfer is
+/// pathological.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Full-jitter truncated-exponential backoff schedule: `delay = b · min(initial
+/// · 2^i, max)`, `b` uniform in `[0, 1)`.
+///
+/// Full jitter (the whole capped value scaled, not a band around the base)
+/// de-correlates a burst of simultaneous failures by spreading re-issues across
+/// the entire `[0, cap]` window.
+///
+/// Owns no RNG: the caller supplies the `[0, 1)` draw, so [`delay`](Self::delay)
+/// is a pure function of `(retry_index, rand_unit)`.
+#[derive(Clone, Copy)]
+pub(crate) struct Backoff {
+    initial: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    /// Backoff tuned for transient-transport retries (upload part-send and
+    /// download body-read paths).
+    pub(crate) const fn transient() -> Self {
+        Self {
+            initial: INITIAL_BACKOFF,
+            max: MAX_BACKOFF,
+        }
+    }
+
+    /// Backoff tuned for throttle retries.
+    ///
+    /// Uses the SEP's 1s throttling base (10× the transient base), giving a
+    /// service that is shedding load room to recover before a re-issue. The SDK
+    /// applies this base on its own inner retries, but when its retry quota is
+    /// drained it returns the throttle without retrying (and without backoff), so
+    /// the outer loop applies the hard base itself.
+    pub(crate) const fn throttle() -> Self {
+        Self {
+            initial: THROTTLE_INITIAL_BACKOFF,
+            max: MAX_BACKOFF,
+        }
+    }
+
+    /// Un-jittered ceiling for a 0-based retry index: `min(initial · 2^i, max)`.
+    fn ceiling(&self, retry_index: u32) -> Duration {
+        let factor = 2u32.saturating_pow(retry_index);
+        self.initial.saturating_mul(factor).min(self.max)
+    }
+
+    /// Full-jittered delay for a 0-based retry index (`0` = first retry).
+    /// `rand_unit` must be in `[0, 1)`; the result lands in `[0, ceiling(i)]`.
+    pub(crate) fn delay(&self, retry_index: u32, rand_unit: f64) -> Duration {
+        self.ceiling(retry_index).mul_f64(rand_unit)
+    }
+}
+
+/// A classifier's verdict for a failed attempt: whether to retry, never how
+/// long to wait. [`retry`] owns the schedule, so classifiers are pure functions
+/// of the error.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RetryDecision {
-    /// Re-issue the operation, optionally after a backoff delay.
-    Retry {
-        /// `None` retries immediately; `Some` sleeps first (used for throttling).
-        after: Option<Duration>,
-    },
+    /// Re-issue after a fast full-jittered backoff (transient transport or a
+    /// latency-deadline straggler).
+    Retry,
+    /// Re-issue after a hard full-jittered backoff appropriate for a service
+    /// shedding load (throttling).
+    RetryThrottle,
     /// Give up and return the last error.
     NoRetry,
 }
 
-/// Run `build` under the latency deadline, retrying per `classify` up to
-/// [`MAX_ATTEMPTS`] total attempts.
+/// Retry an operation up to [`MAX_ATTEMPTS`] times, deciding each failure via
+/// `classify` and backing off per `backoff`.
 ///
-/// Each iteration builds a fresh future via `build` and runs it through
-/// [`LatencyTracker::guarded`]. On a [`GuardError`], `classify` decides whether
-/// to retry; a retryable failure re-issues (after any backoff) until the budget
-/// is spent, then the last error is returned. `build` must produce an identical
-/// request each call (same range, etag, version) so a retry reads the same data.
+/// Each attempt calls `build(allow_hedge)` for a fresh future; `build` must
+/// produce an identical request each call so a retry re-sends/re-reads the same
+/// data. Any latency deadline is composed inside `build` (via
+/// [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded),
+/// which arms only when `allow_hedge` is set) and surfaces as
+/// [`GuardError::DeadlineExceeded`]; other errors surface as
+/// [`GuardError::Inner`]. `allow_hedge` is `false` after the first deadline
+/// exceedance (hedge-once), so a build with no deadline can ignore the flag.
 ///
-/// `classify` sees the [`GuardError`] directly, so a deadline timeout is a
-/// distinct arm from inner errors. [`into_error`] renders a terminal
-/// `DeadlineExceeded` into the returned `Error` only at the return path.
-pub(crate) async fn retry_guarded<T, F, Fut>(
-    tracker: &LatencyTracker,
+/// `classify` decides per failure; the loop owns the
+/// schedule, selecting the [`Backoff`] by decision — [`RetryDecision::Retry`]
+/// uses the fast transient base, [`RetryDecision::RetryThrottle`] the hard
+/// throttle base — and sleeps a full-jittered delay keyed on the 0-based retry
+/// index. Both retry decisions share [`MAX_ATTEMPTS`]; on [`RetryDecision::NoRetry`]
+/// or after the last attempt it returns the error via [`into_error`].
+///
+/// The one-time hedge (the first [`GuardError::DeadlineExceeded`]) does not
+/// consume an attempt: a genuine failure gets the full [`MAX_ATTEMPTS`] whether
+/// or not the operation also hedged, so a speculative cancel never steals a
+/// transport retry. The loop still terminates — at most one exceedance is free
+/// (hedge-once), bounding it to [`MAX_ATTEMPTS`] + 1 iterations.
+pub(crate) async fn retry<T, F, Fut>(
     classify: impl Fn(&GuardError<Error>) -> RetryDecision,
     mut build: F,
 ) -> Result<T, Error>
 where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, Error>>,
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<T, GuardError<Error>>>,
 {
-    let mut attempt = 1;
+    let transient = Backoff::transient();
+    let throttle = Backoff::throttle();
+    let mut attempt = 1u32;
+    // Hedge at most once per operation: the first deadline exceedance cancels and
+    // re-issues (the hedge), but a second would mean speculatively cancelling a
+    // path already shown to be slow — so once hedged, later attempts run untimed
+    // (via `allow_hedge = false`) and ride to completion. This bounds a single
+    // operation's deadline-driven cancels to one, so no operation can exhaust its
+    // attempt budget on the deadline; the budget bounds aggregate speculation.
+    let mut hedged = false;
     loop {
-        match tracker.guarded(build()).await {
+        match build(!hedged).await {
             Ok(val) => return Ok(val),
-            Err(ge) => match classify(&ge) {
-                RetryDecision::NoRetry => return Err(into_error(ge)),
-                RetryDecision::Retry { .. } if attempt >= MAX_ATTEMPTS => {
-                    return Err(into_error(ge));
+            Err(ge) => {
+                let is_hedge = matches!(ge, GuardError::DeadlineExceeded(_));
+                // The one-time hedge does not consume a retry attempt: a genuine
+                // failure still gets the full MAX_ATTEMPTS whether or not the
+                // operation also hedged. "Free" applies only to the first deadline
+                // exceedance (hedge-once); `guarded` runs untimed thereafter, so a
+                // further exceedance should not occur, but if one does it consumes
+                // an attempt so the loop is still bounded (at most MAX_ATTEMPTS + 1
+                // iterations).
+                let free_hedge = is_hedge && !hedged;
+                // Select the backoff by retry reason; both share MAX_ATTEMPTS.
+                let backoff = match classify(&ge) {
+                    RetryDecision::NoRetry => return Err(into_error(ge)),
+                    _ if !free_hedge && attempt >= MAX_ATTEMPTS => return Err(into_error(ge)),
+                    RetryDecision::Retry => &transient,
+                    RetryDecision::RetryThrottle => &throttle,
+                };
+                // `attempt - 1` is the 0-based retry index: 0 on the first
+                // failure, so the first backoff uses 2^0. A free hedge reissues at
+                // the current index without advancing it, so genuine retries keep
+                // their normal backoff progression.
+                // The backoff sleep binds to tokio directly rather than the
+                // runtime's `AsyncSleep`, so the loop requires a tokio reactor.
+                tokio::time::sleep(backoff.delay(attempt - 1, fastrand::f64())).await;
+                if is_hedge {
+                    hedged = true;
                 }
-                RetryDecision::Retry { after } => {
-                    if let Some(delay) = after {
-                        tokio::time::sleep(delay).await;
-                    }
+                if !free_hedge {
                     attempt += 1;
                 }
-            },
+            }
         }
     }
 }
@@ -94,67 +211,177 @@ fn into_error(ge: GuardError<Error>) -> Error {
     }
 }
 
-/// Classifier that retries only on a deadline timeout and never on an inner
-/// error.
+/// Classifier for the upload part-send path.
 ///
-/// Reproduces the pre-split behavior: stragglers retry on a fresh connection,
-/// a returned inner error is terminal. Used by the upload part-send path, where
-/// the SDK already retries the dispatch over a rewindable body.
-pub(crate) fn retry_deadline_only(ge: &GuardError<Error>) -> RetryDecision {
+/// Retries a **transient transport** inner error (connection IO error or
+/// client-side timeout). The SDK normally retries these over the rewindable
+/// in-memory part body, but its retry can be defeated by token-bucket exhaustion
+/// when many parts fail concurrently (an ENOBUFS-style burst); the outer
+/// re-issue (with the loop's jittered backoff) lands after in-flight parts
+/// complete and refill the quota, instead of re-colliding.
+///
+/// A throttle ([`is_throttle`]) is retried with the hard throttle backoff. Under
+/// high fan-out the SDK's shared retry token bucket drains, surfacing throttles
+/// un-retried; the tuned per-bucket partition ([`bucket_retry_partition`]) refills
+/// that budget over time while the outer re-issue — bounded by [`MAX_ATTEMPTS`]
+/// and paced by the 1s throttle base — gives the service room to recover.
+///
+/// Everything else is terminal: a non-throttle modeled service error and any
+/// non-transport inner error.
+///
+/// [`GuardError::DeadlineExceeded`]: uploads carry no latency deadline (no
+/// `guarded` composition), so this arm is unreachable in practice; retained for
+/// exhaustiveness over the shared [`GuardError`].
+pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecision {
     match ge {
-        GuardError::DeadlineExceeded(_) => RetryDecision::Retry { after: None },
+        GuardError::DeadlineExceeded(_) => RetryDecision::NoRetry,
+        GuardError::Inner(e) if e.is_transient_transport() => RetryDecision::Retry,
+        GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
+        GuardError::Inner(_) => RetryDecision::NoRetry,
+    }
+}
+
+/// Whether a transfer error is an S3 throttle (a service error whose code denotes
+/// throttling).
+///
+/// Matches on service error code only: the flattened [`Error`] carries the parsed
+/// code but not the raw HTTP status. A throttle that arrives as an HTTP status
+/// (429 or 503) without a recognized throttle code (e.g. some `HeadObject` 503
+/// responses) is not classified as a throttle here and falls through to the SDK's
+/// inner retry only. The set mirrors the scheduler's throttle classifier
+/// (`scheduler::concurrency`).
+fn is_throttle(e: &Error) -> bool {
+    matches!(
+        e.code(),
+        Some(
+            "SlowDown"
+                | "Throttling"
+                | "ThrottlingException"
+                | "RequestLimitExceeded"
+                | "BandwidthLimitExceeded"
+        )
+    )
+}
+
+/// Classifier for the download discovery send path.
+///
+/// Discovery is a single send (GetObject, HeadObject, or GetObject with
+/// partNumber) with no body read and no latency deadline. Retries a throttle
+/// with the hard throttle backoff and a transient transport error with the fast
+/// backoff. Everything else (including `InvalidRange`, `NotFound`, and other
+/// modeled service errors) is terminal.
+pub(crate) fn classify_discovery_retry(ge: &GuardError<Error>) -> RetryDecision {
+    match ge {
+        GuardError::DeadlineExceeded(_) => RetryDecision::NoRetry,
+        GuardError::Inner(e) if e.is_transient_transport() => RetryDecision::Retry,
+        GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
         GuardError::Inner(_) => RetryDecision::NoRetry,
     }
 }
 
 /// Classifier for download body reads.
 ///
-/// A chunk's body is consumed after the SDK's GetObject orchestration
-/// completes, so the SDK's own retry never covers a mid-stream failure. This
-/// loop exists to recover exactly that: a body-read failure (connection reset,
-/// truncated or short body) re-issues the ranged GET.
+/// A chunk's body is consumed after the SDK's GetObject orchestration completes,
+/// so the SDK's own retry never covers a mid-stream failure. This loop recovers
+/// exactly that, re-issuing the ranged GET, and it is the SOLE retrier for the
+/// body path. Retries (all with the loop's full-jittered backoff):
+///   - a **latency-deadline timeout** (a slow-TTFB straggler) → re-issue on a
+///     fresh connection.
+///   - a **transient transport** failure on the re-issue's send (connection IO
+///     error or client-side timeout) → these correlate under load (e.g. macOS
+///     mbuf/ENOBUFS fails many connections at once), so the jittered backoff
+///     spreads the retries instead of re-colliding on the same empty pool.
+///   - a **body-stream** failure ([`ErrorKind::IOError`]: reset, truncated, short
+///     body, SSP stall) → also clusters under a saturated link, same backoff.
+///   - a **throttle** ([`is_throttle`]) on the send → re-issue with the hard
+///     throttle backoff (see [`classify_upload_part_retry`] for the rationale).
 ///
-/// Within the body-read closure the error kind already separates the cases: a
-/// body-stream failure is an [`ErrorKind::IOError`], while a send-time failure
-/// arrives as an `SdkError`-derived kind that the SDK already retried before
-/// surfacing — re-issuing those is redundant, so they are terminal. A checksum
-/// mismatch arrives as [`ErrorKind::IntegrityError`] (classified at the body-read
-/// boundary) and is terminal: a corrupt body must never be re-fetched and masked.
+/// A checksum mismatch ([`ErrorKind::IntegrityError`], classified at the body-read
+/// boundary) is terminal: a corrupt body must never be re-fetched and masked.
+/// Everything else is terminal.
 pub(crate) fn classify_body_retry(ge: &GuardError<Error>) -> RetryDecision {
     let err = match ge {
-        GuardError::DeadlineExceeded(_) => return RetryDecision::Retry { after: None },
+        GuardError::DeadlineExceeded(_) => return RetryDecision::Retry,
         GuardError::Inner(e) => e,
     };
 
     match err.kind() {
         // A checksum mismatch must never be re-fetched and masked.
         ErrorKind::IntegrityError(_) => RetryDecision::NoRetry,
-        ErrorKind::IOError => RetryDecision::Retry { after: None },
+        // Throttle on the send: re-issue with the hard throttle backoff.
+        ErrorKind::ServiceError if is_throttle(err) => RetryDecision::RetryThrottle,
+        // Transient transport on the send (surfaced as ServiceError with the
+        // transient-transport flag).
+        ErrorKind::ServiceError if err.is_transient_transport() => RetryDecision::Retry,
+        // Mid-stream body-read failure (reset, truncation, SSP stall).
+        ErrorKind::IOError => RetryDecision::Retry,
         _ => RetryDecision::NoRetry,
     }
 }
 
-/// Retry partition for an S3 bucket.
+/// Per-bucket retry token bucket refill rate, tokens/second.
 ///
-/// The SDK shares one retry token bucket per [`RetryPartition`]; the default
-/// is region-wide (`s3-{region}`), so a throttle storm on one bucket drains the
+/// The SDK's default bucket has no time-based refill (`refill_rate = 0`): retry
+/// budget returns only as requests succeed. Under a high fan-out against one
+/// prefix a throttle storm drains it before any success lands, leaving no
+/// recovery path — the transfer aborts. A low refill restores a bounded retry
+/// budget over time so re-issues proceed once the throttle relents.
+///
+/// Cached per bucket on the Handle so the budget and its refill are shared
+/// across all operations and retries to that bucket; under a total outage the
+/// sustained retry rate to S3 is `REFILL_RATE / throttling_retry_cost` (the
+/// SDK's throttle cost is 5) ≈ 2 retries/sec per bucket, independent of
+/// concurrency. Kept low to trickle-probe recovery rather than re-flood a
+/// service that is shedding load; per-operation attempts remain bounded by
+/// [`MAX_ATTEMPTS`].
+const RETRY_BUCKET_REFILL_RATE: f32 = 10.0;
+
+/// Per-bucket retry token bucket capacity. Matches the SDK default; a larger
+/// pool would only absorb a larger initial retry burst (more amplification)
+/// without addressing recovery, which [`RETRY_BUCKET_REFILL_RATE`] owns.
+const RETRY_BUCKET_CAPACITY: usize = 500;
+
+/// Retry partition for an S3 bucket, carrying a TM-tuned token bucket.
+///
+/// The SDK shares one retry token bucket per [`RetryPartition`]; the default is
+/// region-wide (`s3-{region}`), so a throttle storm on one bucket drains the
 /// retry budget for every other bucket on the client. Keying the partition by
 /// bucket isolates them: each bucket gets its own token bucket, matching CRT,
-/// which partitions per S3 host. Applied per operation via `config_override`.
+/// which partitions per S3 host. The bucket is given a time-based refill
+/// ([`RETRY_BUCKET_REFILL_RATE`]) the SDK default lacks, so a drained bucket
+/// recovers a bounded retry budget over time.
+///
+/// Callers MUST NOT call this per-operation: the returned partition carries a
+/// freshly-allocated token bucket. Cache the partition on the Handle (via
+/// [`Handle::bucket_partition_override`](crate::client::Handle::bucket_partition_override))
+/// so all operations to a bucket share one live bucket instance.
 pub(crate) fn bucket_retry_partition(bucket: &str) -> RetryPartition {
-    RetryPartition::new(format!("s3-tm-{bucket}"))
+    RetryPartition::custom(format!("s3-tm-{bucket}"))
+        .token_bucket(
+            TokenBucket::builder()
+                .capacity(RETRY_BUCKET_CAPACITY)
+                .refill_rate(RETRY_BUCKET_REFILL_RATE)
+                .build(),
+        )
+        .build()
 }
 
-/// Per-operation config override that keys the retry token bucket by bucket.
+/// Stalled-stream grace period applied to transfer bodies.
 ///
-/// Returns an empty override when no bucket is set (a no-op merge), so call
-/// sites can attach it unconditionally via `.config_override(...)`.
-pub(crate) fn bucket_partition_override(bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
-    let builder = aws_sdk_s3::config::Builder::default();
-    match bucket {
-        Some(b) => builder.retry_partition(bucket_retry_partition(b)),
-        None => builder,
-    }
+/// Stalled-stream protection aborts a body whose *throughput* stays at zero for
+/// this long, re-issuing the operation on a fresh connection. It fires only on
+/// zero byte-progress, so a slow-but-progressing stream is never affected;
+/// tightening below the SDK's 5s default only shortens how long a genuinely dead
+/// gap wedges the transfer. Bounds a mid-download-body dead connection and a
+/// mid-upload-body stall (the transferring peer stops making progress); it does
+/// not bound a response that never arrives after the request body is fully sent.
+const STALL_GRACE: Duration = Duration::from_secs(2);
+
+/// Stalled-stream protection enabled with the tightened [`STALL_GRACE`].
+pub(crate) fn tightened_ssp() -> aws_sdk_s3::config::StalledStreamProtectionConfig {
+    aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+        .grace_period(STALL_GRACE)
+        .build()
 }
 
 #[cfg(test)]
@@ -162,67 +389,180 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Pre-warm a tracker so its deadline is `Some` (mirrors latency.rs helper).
-    fn warm_tracker(tracker: &LatencyTracker) {
-        for _ in 0..10 {
-            tracker.record(Duration::from_millis(100));
+    /// Classifier for the loop tests: retry a `DeadlineExceeded` or an `IOError`
+    /// inner; everything else terminal. Exercises both `GuardError` arms.
+    fn classify_test(ge: &GuardError<Error>) -> RetryDecision {
+        match ge {
+            GuardError::DeadlineExceeded(_) => RetryDecision::Retry,
+            GuardError::Inner(e) if *e.kind() == ErrorKind::IOError => RetryDecision::Retry,
+            GuardError::Inner(_) => RetryDecision::NoRetry,
         }
     }
 
+    // --- retry loop (pure; no deadline — timing is composed by callers) -----
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn deadline_only_retries_timeout_then_succeeds() {
-        let tracker = LatencyTracker::new();
-        warm_tracker(&tracker); // deadline ≈ 200ms
-
+    async fn retries_then_succeeds() {
+        // First attempt fails retryably (IOError), second succeeds.
         let attempts = AtomicUsize::new(0);
-        let result = retry_guarded(&tracker, retry_deadline_only, || {
+        let result = retry(classify_test, |_| {
             let n = attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 if n == 0 {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    return Err(GuardError::Inner(Error::new(ErrorKind::IOError, "reset")));
                 }
-                Ok::<_, Error>(42)
+                Ok::<_, GuardError<Error>>(42)
             }
         })
         .await;
 
         assert_eq!(result.unwrap(), 42);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
-        assert_eq!(tracker.timeout_count(), 1);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn deadline_only_exhausts_attempts_on_persistent_timeout() {
-        let tracker = LatencyTracker::new();
-        warm_tracker(&tracker);
-
+    async fn deadline_exceeded_is_retried() {
+        // A `DeadlineExceeded` (what a composed `guarded` produces on timeout) is
+        // a retryable arm; the terminal one renders to an IOError via `into_error`.
+        // The first exceedance is a free hedge (no attempt consumed), so a build
+        // that keeps tripping the deadline runs MAX_ATTEMPTS + 1 times before the
+        // last error surfaces. (A real `guarded` cannot exceed the deadline once
+        // `allow_hedge` is cleared; this build ignores the flag to drive the loop.)
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry_guarded(&tracker, retry_deadline_only, || {
+        let result: Result<(), _> = retry(classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
-            async {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                Ok::<_, Error>(())
-            }
+            async { Err::<(), _>(GuardError::DeadlineExceeded(Duration::from_millis(200))) }
         })
         .await;
 
         let err = result.unwrap_err();
         assert_eq!(err.kind(), &ErrorKind::IOError);
-        assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
-        assert_eq!(tracker.timeout_count(), MAX_ATTEMPTS as usize);
+        assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize + 1);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn deadline_only_does_not_retry_inner_error() {
-        let tracker = LatencyTracker::new();
-        let attempts = AtomicUsize::new(0);
+    async fn hedge_allowed_only_until_first_deadline_exceedance() {
+        // hedge-once: the loop passes `allow_hedge = true` until a
+        // `DeadlineExceeded` fires, then `false` for every later attempt — so a
+        // chunk is speculatively cancelled at most once and later attempts run
+        // untimed. Record the flag each attempt.
+        let flags = std::sync::Mutex::new(Vec::new());
+        let result: Result<(), _> = retry(classify_test, |allow_hedge| {
+            flags.lock().unwrap().push(allow_hedge);
+            // Every call trips the deadline, so after the first (free) hedge the
+            // loop must clear the flag. The free hedge does not consume an attempt,
+            // so the loop runs MAX_ATTEMPTS + 1 times: one hedge + MAX_ATTEMPTS
+            // untimed attempts.
+            async { Err::<(), _>(GuardError::DeadlineExceeded(Duration::from_millis(200))) }
+        })
+        .await;
 
-        let result: Result<(), _> = retry_guarded(&tracker, retry_deadline_only, || {
+        assert!(result.is_err());
+        assert_eq!(
+            *flags.lock().unwrap(),
+            vec![true, false, false, false],
+            "hedge allowed on the first call only, then cleared; the free hedge \
+             adds one iteration on top of MAX_ATTEMPTS"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn non_deadline_failures_do_not_clear_the_hedge_flag() {
+        // Only a `DeadlineExceeded` is a hedge; a transient inner error must not
+        // consume the once-per-operation hedge allowance.
+        let flags = std::sync::Mutex::new(Vec::new());
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry(classify_test, |allow_hedge| {
+            flags.lock().unwrap().push(allow_hedge);
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                // Two inner IO errors (not hedges), then succeed.
+                if n < 2 {
+                    return Err(GuardError::Inner(Error::new(ErrorKind::IOError, "reset")));
+                }
+                Ok::<(), GuardError<Error>>(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *flags.lock().unwrap(),
+            vec![true, true, true],
+            "inner errors are not hedges; the hedge allowance stays open"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn hedge_does_not_consume_a_transport_retry() {
+        // The seq-700 case: a chunk hedges once (deadline exceedance) and then
+        // hits genuine transient-transport failures. The hedge must not steal a
+        // transport attempt — the operation still gets the full MAX_ATTEMPTS
+        // genuine retries after the free hedge, succeeding on the last one.
+        let attempts = AtomicUsize::new(0);
+        let result = retry(classify_test, |allow_hedge| {
+            let n = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                // Call 0: the one-time hedge (deadline exceedance), free.
+                if n == 0 {
+                    assert!(allow_hedge, "hedge must be allowed on the first call");
+                    return Err(GuardError::DeadlineExceeded(Duration::from_millis(200)));
+                }
+                // Calls 1..MAX_ATTEMPTS: genuine transport failures (untimed).
+                assert!(!allow_hedge, "hedge cleared after the first exceedance");
+                if (n as u32) < MAX_ATTEMPTS {
+                    return Err(GuardError::Inner(Error::new(ErrorKind::IOError, "connect")));
+                }
+                // The MAX_ATTEMPTS-th genuine attempt succeeds.
+                Ok::<_, GuardError<Error>>(7)
+            }
+        })
+        .await;
+
+        assert_eq!(
+            result.unwrap(),
+            7,
+            "the full transport-retry budget survives a hedge"
+        );
+        // 1 free hedge + MAX_ATTEMPTS genuine attempts (last succeeds).
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            MAX_ATTEMPTS as usize + 1,
+            "hedge is free; genuine failures keep the full MAX_ATTEMPTS"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn exhausts_attempts_on_persistent_retryable_error() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry(classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
-            async { Err::<(), _>(Error::new(ErrorKind::RuntimeError, "simulated SDK error")) }
+            async { Err::<(), _>(GuardError::Inner(Error::new(ErrorKind::IOError, "reset"))) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn does_not_retry_terminal_inner_error() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry(classify_test, |_| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async {
+                Err::<(), _>(GuardError::Inner(Error::new(
+                    ErrorKind::RuntimeError,
+                    "simulated SDK error",
+                )))
+            }
         })
         .await;
 
@@ -230,37 +570,229 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
-    // classify_body_retry — arms that can be constructed directly. The SdkError
-    // (throttle/transient/permanent) and checksum-mismatch arms use real wire
-    // error shapes; those are covered by the mock-server fault integration tests
-    // (the non_exhaustive checksum error cannot be built outside its crate).
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn throttle_decision_retries_and_uses_the_throttle_backoff() {
+        // A `RetryThrottle` decision re-issues up to MAX_ATTEMPTS AND the loop
+        // paces it with the throttle base (1s), not the transient base (100ms).
+        // This times the REAL loop, so it fails if the loop selects the wrong
+        // backoff for a throttle decision.
+        //
+        // Full jitter makes an unseeded lower bound flaky, so seed `fastrand`:
+        // with seed 2 the two throttle draws (ceilings 1s, 2s) sum to ~2.03s of
+        // paused-time sleep. The transient base (ceilings 100ms, 200ms) can sleep
+        // at most 300ms total for ANY draw, so a `>= 1s` lower bound is reachable
+        // only by the throttle schedule and cannot false-pass under transient.
+        fn classify_throttle(ge: &GuardError<Error>) -> RetryDecision {
+            match ge {
+                GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
+                _ => RetryDecision::NoRetry,
+            }
+        }
+        fastrand::seed(2);
 
-    fn retry_after(decision: RetryDecision) -> Option<Option<Duration>> {
-        match decision {
-            RetryDecision::Retry { after } => Some(after),
-            RetryDecision::NoRetry => None,
+        let attempts = AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        let result: Result<(), _> = retry(classify_throttle, |_| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async { Err::<(), _>(GuardError::Inner(Error::test_service_error("SlowDown"))) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
+        let elapsed = start.elapsed();
+        // Lower bound only the throttle base can reach (transient tops out at 300ms
+        // across both retries): proves the loop selected the throttle backoff.
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "elapsed {elapsed:?} is below the throttle base; the loop must use the \
+             throttle backoff (1s), not the transient backoff (max 300ms total)"
+        );
+        // Upper bound: the two throttle ceilings (1s + 2s) cap total sleep at 3s.
+        assert!(
+            elapsed <= Duration::from_secs(3),
+            "elapsed {elapsed:?} exceeds the throttle backoff ceiling sum"
+        );
+    }
+
+    // --- Backoff schedule (pure; rand supplied) -----------------------------
+
+    #[test]
+    fn backoff_ceiling_progression_doubles_then_caps() {
+        // rand_unit = 1.0 yields the full ceiling, so the geometric progression
+        // for INITIAL_BACKOFF=100ms, factor 2, MAX_BACKOFF=5s is directly checked.
+        let b = Backoff::transient();
+        assert_eq!(b.delay(0, 1.0), Duration::from_millis(100));
+        assert_eq!(b.delay(1, 1.0), Duration::from_millis(200));
+        assert_eq!(b.delay(2, 1.0), Duration::from_millis(400));
+        assert_eq!(b.delay(3, 1.0), Duration::from_millis(800));
+        assert_eq!(b.delay(4, 1.0), Duration::from_millis(1600));
+        assert_eq!(b.delay(5, 1.0), Duration::from_millis(3200));
+        // 100ms * 2^6 = 6400ms, capped at MAX_BACKOFF = 5s.
+        assert_eq!(b.delay(6, 1.0), Duration::from_secs(5));
+        assert_eq!(b.delay(7, 1.0), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn backoff_large_index_saturates_without_overflow() {
+        // 2^u32::MAX must not panic; saturating_pow/mul keep it at the cap.
+        let b = Backoff::transient();
+        assert_eq!(b.delay(u32::MAX, 1.0), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn backoff_full_jitter_scales_linearly_within_ceiling() {
+        let b = Backoff::transient();
+        // index 2 -> 400ms ceiling. Full jitter spans [0, ceiling].
+        assert_eq!(b.delay(2, 0.0), Duration::ZERO);
+        assert_eq!(b.delay(2, 0.5), Duration::from_millis(200));
+        assert_eq!(b.delay(2, 0.25), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn backoff_real_draws_stay_within_ceiling() {
+        let b = Backoff::transient();
+        for _ in 0..10_000 {
+            let d = b.delay(2, fastrand::f64());
+            assert!(
+                d <= Duration::from_millis(400),
+                "delay {d:?} exceeded ceiling"
+            );
         }
     }
 
     #[test]
-    fn body_retry_deadline_exceeded_retries_immediately() {
-        let decision = classify_body_retry(&GuardError::DeadlineExceeded(Duration::from_secs(1)));
-        assert_eq!(retry_after(decision), Some(None));
+    fn throttle_backoff_uses_the_1s_base_and_shares_the_cap() {
+        // The throttle base is 1s (10× the transient base); the same 5s cap.
+        let b = Backoff::throttle();
+        assert_eq!(b.delay(0, 1.0), Duration::from_secs(1));
+        assert_eq!(b.delay(1, 1.0), Duration::from_secs(2));
+        assert_eq!(b.delay(2, 1.0), Duration::from_secs(4));
+        // 1s * 2^3 = 8s, capped at MAX_BACKOFF = 5s.
+        assert_eq!(b.delay(3, 1.0), Duration::from_secs(5));
+        // Full jitter still spans [0, ceiling].
+        assert_eq!(b.delay(0, 0.0), Duration::ZERO);
+    }
+
+    // --- classify_upload_part_retry -----------------------------------------
+
+    #[test]
+    fn upload_transient_transport_retries() {
+        // A transient-transport ServiceError (the ENOBUFS shape) is retried.
+        let d = classify_upload_part_retry(&GuardError::Inner(Error::test_transient_transport()));
+        assert_eq!(d, RetryDecision::Retry);
+    }
+
+    #[test]
+    fn upload_non_throttle_service_error_is_terminal() {
+        // A modeled service error with no throttle code (e.g. AccessDenied) is
+        // terminal: not transient transport, not a throttle.
+        let err = Error::test_service_error("AccessDenied");
+        assert_eq!(
+            classify_upload_part_retry(&GuardError::Inner(err)),
+            RetryDecision::NoRetry
+        );
+    }
+
+    #[test]
+    fn upload_throttle_retries_with_throttle_decision() {
+        // A throttle (SlowDown) is retried with the hard throttle backoff.
+        let err = Error::test_service_error("SlowDown");
+        assert_eq!(
+            classify_upload_part_retry(&GuardError::Inner(err)),
+            RetryDecision::RetryThrottle
+        );
+    }
+
+    #[test]
+    fn upload_other_inner_error_is_terminal() {
+        let err = Error::new(ErrorKind::RuntimeError, "not a transport error");
+        assert_eq!(
+            classify_upload_part_retry(&GuardError::Inner(err)),
+            RetryDecision::NoRetry
+        );
+    }
+
+    // --- classify_body_retry ------------------------------------------------
+
+    #[test]
+    fn body_retry_deadline_exceeded_retries() {
+        let d = classify_body_retry(&GuardError::DeadlineExceeded(Duration::from_secs(1)));
+        assert_eq!(d, RetryDecision::Retry);
     }
 
     #[test]
     fn body_retry_cancellation_does_not_retry() {
         let err = Error::new(ErrorKind::OperationCancelled, "cancelled mid body");
-        let decision = classify_body_retry(&GuardError::Inner(err));
-        assert!(matches!(decision, RetryDecision::NoRetry));
+        assert_eq!(
+            classify_body_retry(&GuardError::Inner(err)),
+            RetryDecision::NoRetry
+        );
     }
 
     #[test]
-    fn body_retry_unrecognized_io_error_retries() {
-        // A transport/byte-stream error that isn't an SdkError or checksum
-        // mismatch falls through to retry-by-default.
+    fn body_retry_io_error_retries() {
+        // A body-stream failure (reset, truncation, SSP stall) is retried.
         let err = Error::new(ErrorKind::IOError, "connection reset by peer");
-        let decision = classify_body_retry(&GuardError::Inner(err));
-        assert_eq!(retry_after(decision), Some(None));
+        assert_eq!(
+            classify_body_retry(&GuardError::Inner(err)),
+            RetryDecision::Retry
+        );
     }
+
+    #[test]
+    fn body_retry_transient_transport_retries() {
+        // A transient-transport send failure (ENOBUFS/connect/timeout class).
+        let d = classify_body_retry(&GuardError::Inner(Error::test_transient_transport()));
+        assert_eq!(d, RetryDecision::Retry);
+    }
+
+    #[test]
+    fn body_retry_throttle_retries_with_throttle_decision() {
+        let err = Error::test_service_error("SlowDown");
+        assert_eq!(
+            classify_body_retry(&GuardError::Inner(err)),
+            RetryDecision::RetryThrottle
+        );
+    }
+
+    #[test]
+    fn body_retry_non_throttle_service_error_is_terminal() {
+        let err = Error::test_service_error("AccessDenied");
+        assert_eq!(
+            classify_body_retry(&GuardError::Inner(err)),
+            RetryDecision::NoRetry
+        );
+    }
+
+    // --- throttle detection -------------------------------------------------
+
+    #[test]
+    fn is_throttle_matches_the_known_codes() {
+        for code in [
+            "SlowDown",
+            "Throttling",
+            "ThrottlingException",
+            "RequestLimitExceeded",
+            "BandwidthLimitExceeded",
+        ] {
+            assert!(
+                is_throttle(&Error::test_service_error(code)),
+                "{code} must be detected as a throttle"
+            );
+        }
+    }
+
+    #[test]
+    fn is_throttle_rejects_non_throttle_and_codeless() {
+        assert!(!is_throttle(&Error::test_service_error("AccessDenied")));
+        // No service code at all (e.g. a non-service error) is not a throttle.
+        assert!(!is_throttle(&Error::new(ErrorKind::IOError, "reset")));
+    }
+
+    // The integrity-error-is-terminal contract is covered end-to-end by the
+    // `corrupt_body_once_is_not_retried` integration test (a real checksum
+    // mismatch through the full stack), which is stronger than a unit assertion
+    // over a hand-built error.
 }

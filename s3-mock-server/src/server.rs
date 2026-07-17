@@ -18,7 +18,7 @@ use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -152,6 +152,7 @@ impl S3MockServerBuilder {
             storage,
             faults: Arc::new(crate::faults::FaultRegistry::default()),
             connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            throttle: Arc::new(Mutex::new(None)),
             config: self.config,
         })
     }
@@ -232,6 +233,10 @@ pub struct S3MockServer {
     /// exists at connect time; decremented per reset. Shared with the serving task.
     connect_reset: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Server-wide load-driven throttle. Shared with the serving task; `None`
+    /// until one is installed via [`set_rate_throttle`](Self::set_rate_throttle).
+    throttle: Arc<Mutex<Option<Arc<crate::throttle::RateThrottle>>>>,
+
     /// Server configuration.
     config: ServerConfig,
 }
@@ -309,6 +314,15 @@ impl S3MockServer {
     /// Drop the entire fault queue for `(bucket, key)`.
     pub fn clear_fault(&self, bucket: &str, key: &str) {
         self.faults.clear(bucket, key);
+    }
+
+    /// Install a server-wide load-driven throttle admitting a sustained `rate`
+    /// requests/sec with a `burst` allowance; a shed request returns 503
+    /// `SlowDown`. Checked on every S3 operation before touching storage, and
+    /// replaces any previously installed throttle.
+    pub fn set_rate_throttle(&self, rate: f64, burst: f64) {
+        *self.throttle.lock().unwrap() =
+            Some(Arc::new(crate::throttle::RateThrottle::new(rate, burst)));
     }
 
     /// Abort (RST) the next `count` freshly accepted connections immediately,
@@ -409,11 +423,12 @@ impl S3MockServer {
         let storage = self.storage.clone();
         let faults = self.faults.clone();
         let connect_reset = self.connect_reset.clone();
+        let throttle = self.throttle.clone();
         let server_task = tokio::spawn(async move {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-            let inner = Inner::with_faults(storage, faults);
+            let inner = Inner::with_faults_and_throttle(storage, faults, throttle);
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));

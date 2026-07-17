@@ -796,9 +796,23 @@ async fn tampered_many_part_file_cleans_up_mock_gp() {
 // Source and dest are files; verification re-derives a CRC64NVME over the
 // downloaded file independently of S3.
 
+/// Serializes the large-object download tests against each other.
+///
+/// Each large-object test holds a 6 GiB source and a 6 GiB (preallocated)
+/// destination on the runner's temp volume. Two such tests running concurrently
+/// exceed the ~14 GiB free on a hosted CI runner and fail with ENOSPC. Every
+/// large-object test acquires this gate for its duration so at most one runs at
+/// a time, bounding peak temp usage to a single test's footprint.
+#[cfg(e2e_test)]
+static SERIAL_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(e2e_test)]
 async fn large_object_file_download_validates(target: Target) {
     use aws_sdk_s3_transfer_manager::types::PartSize;
+
+    // Hold the gate for the whole test so peak temp-disk usage stays within one
+    // test's footprint (see SERIAL_TEST_GATE).
+    let _serial = SERIAL_TEST_GATE.lock().await;
 
     // 6 GiB at an 8 MiB part size = ~768 ranged GETs, past the 512-slot window.
     let part = 8 * ByteUnit::Mebibyte.as_bytes_u64();
@@ -816,6 +830,10 @@ async fn large_object_file_download_validates(target: Target) {
         ChecksumStrategy::with_calculated_crc64_nvme(),
     )
     .await;
+    // The source is not needed past upload; remove it before the download
+    // preallocates an equal-sized destination, halving peak temp-disk usage.
+    std::fs::remove_file(&src).expect("remove source after upload");
+
     t.download_to_path("large-obj", &dest, Some(ChecksumMode::Enabled))
         .await
         .expect("large file download");

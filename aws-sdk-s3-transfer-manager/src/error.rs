@@ -17,6 +17,8 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartError;
 use aws_sdk_s3::operation::RequestIdExt;
 use aws_sdk_s3::types::ChecksumAlgorithm;
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_types::retry::ErrorKind as RetryErrorKind;
 use aws_types::request_id::RequestId;
 
 use crate::types::{FailedDownload, FailedUpload};
@@ -48,6 +50,14 @@ struct ErrorExtra {
     failed_uploads: Option<Vec<FailedUpload>>,
     /// Per-object download failures when this error aggregates a bulk download.
     failed_downloads: Option<Vec<FailedDownload>>,
+    /// `true` when the underlying `SdkError` was a transient transport failure
+    /// (a connect/read/write IO error or a client-side timeout) rather than a
+    /// service response — a re-issuable failure the SDK's own retry may not have
+    /// recovered (e.g. its shared retry token bucket was exhausted under a
+    /// concurrent burst). Set at conversion from the typed `SdkError`, where the
+    /// distinction is still available before type erasure. Never set for
+    /// throttling/service errors — see `retry::classify_upload_part_retry`.
+    transient_transport: bool,
 }
 
 /// General categories of transfer errors.
@@ -170,6 +180,43 @@ impl Error {
         &self.kind
     }
 
+    /// Test-only: a `ServiceError` flagged as transient transport, mirroring what
+    /// `service_error` produces for an IO `DispatchFailure` (which cannot be
+    /// constructed directly in a unit test).
+    #[cfg(test)]
+    pub(crate) fn test_transient_transport() -> Error {
+        Error {
+            kind: ErrorKind::ServiceError,
+            source: "injected transient transport".into(),
+            extra: Some(Box::new(ErrorExtra {
+                transient_transport: true,
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Test-only: a `ServiceError` carrying the given service error code,
+    /// mirroring what `service_error` produces from an `SdkError` (which cannot
+    /// be constructed directly in a unit test). Lets retry classifiers be tested
+    /// against a code (e.g. throttle detection) without a live wire error.
+    #[cfg(test)]
+    pub(crate) fn test_service_error(code: &str) -> Error {
+        Error {
+            kind: ErrorKind::ServiceError,
+            source: "injected service error".into(),
+            extra: Some(Box::new(ErrorExtra {
+                service: Some(ServiceMetadata {
+                    operation: "TestOperation",
+                    code: Some(code.to_owned()),
+                    message: None,
+                    request_id: None,
+                    extended_request_id: None,
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
     fn service(&self) -> Option<&ServiceMetadata> {
         self.extra.as_ref().and_then(|e| e.service.as_ref())
     }
@@ -214,6 +261,15 @@ impl Error {
             self.code(),
             Some("NotFound" | "NoSuchKey" | "NoSuchUpload" | "NoSuchBucket")
         )
+    }
+
+    /// Whether this error was a transient transport failure (connection IO error
+    /// or client-side timeout) as opposed to a service response. Such failures
+    /// are safe to re-issue and may not have been recovered by the SDK's own
+    /// retry (e.g. its shared retry token bucket was exhausted under a concurrent
+    /// burst). Always `false` for throttling and modeled service errors.
+    pub(crate) fn is_transient_transport(&self) -> bool {
+        self.extra.as_ref().is_some_and(|e| e.transient_transport)
     }
 
     /// The chunk this failure is attributable to, if known.
@@ -264,7 +320,37 @@ impl fmt::Display for Error {
             ErrorKind::IOError => write!(f, "I/O error")?,
             ErrorKind::RuntimeError => write!(f, "runtime error")?,
             ErrorKind::ObjectNotDiscoverable => write!(f, "object discovery failed")?,
-            ErrorKind::ChildOperationFailed => write!(f, "child operation failed")?,
+            ErrorKind::ChildOperationFailed => {
+                write!(f, "child operation failed")?;
+                // A bulk transfer failed on one or more objects. Name the first
+                // failure and the total so the top-level message is actionable;
+                // the full per-object detail (including each object's own error)
+                // is reached via `failed_uploads` / `failed_downloads`.
+                let first_and_count = self
+                    .failed_uploads()
+                    .map(|f| {
+                        let id = f
+                            .first()
+                            .and_then(|u| u.source_path())
+                            .map(|p| p.display().to_string());
+                        (id, f.len())
+                    })
+                    .or_else(|| {
+                        self.failed_downloads().map(|f| {
+                            let id = f.first().and_then(|d| d.input().key()).map(str::to_owned);
+                            (id, f.len())
+                        })
+                    });
+                if let Some((id, n)) = first_and_count {
+                    match id {
+                        Some(id) => write!(f, ": {id}")?,
+                        None => write!(f, ": 1 object")?,
+                    }
+                    if n > 1 {
+                        write!(f, " (and {} more)", n - 1)?;
+                    }
+                }
+            }
             ErrorKind::OperationCancelled => write!(f, "operation cancelled")?,
             ErrorKind::ServiceError => {
                 write!(f, "service error")?;
@@ -434,8 +520,60 @@ where
     }
 }
 
+/// Whether a single [`ConnectorError`] frame denotes a transient transport
+/// failure: an IO error, a client-side timeout, or one the http client tagged
+/// [`RetryErrorKind::TransientError`] (an incomplete/truncated response, TLS
+/// negotiation timeout, and similar). A bare `Other(None)` connector error
+/// carries no marker and is not transient on its own.
+fn connector_error_is_transient(conn: &ConnectorError) -> bool {
+    conn.is_io() || conn.is_timeout() || conn.as_other() == Some(RetryErrorKind::TransientError)
+}
+
+/// Whether an `SdkError` is a transient transport failure — a connection-level
+/// IO error, a client-side timeout, or a connector error the http client tagged
+/// [`RetryErrorKind::TransientError`] (e.g. an incomplete/truncated HTTP
+/// response) — rather than a service response. Captured here because the
+/// flattening into [`ErrorKind::ServiceError`] erases the `SdkError` variant.
+///
+/// Walks the error source chain rather than inspecting only the outermost
+/// [`ConnectorError`]. A nested dispatch can re-wrap a fully-classified inner
+/// connector error inside an outer `ConnectorError::Other(None)`, which carries
+/// no transient marker; the SDK's own `TransientErrorClassifier` inspects only
+/// that outer frame and misclassifies the error as non-retryable. Scanning every
+/// `ConnectorError` in the chain recovers the inner classification.
+///
+/// Deliberately excludes service responses: a 503 `SlowDown` arrives as a
+/// `ServiceError`, not a `DispatchFailure`, so throttling is never classified
+/// transient here (see `retry::classify_upload_part_retry` for why that matters).
+fn is_sdk_transient_transport<E, R>(e: &SdkError<E, R>) -> bool {
+    if let SdkError::TimeoutError(_) = e {
+        return true;
+    }
+    // A DispatchFailure carries a ConnectorError; scan it and every nested
+    // ConnectorError in the source chain for a transient classification.
+    let conn = match e {
+        SdkError::DispatchFailure(df) => df.as_connector_error(),
+        _ => return false,
+    };
+    let Some(conn) = conn else { return false };
+    if connector_error_is_transient(conn) {
+        return true;
+    }
+    let mut source = std::error::Error::source(conn);
+    while let Some(err) = source {
+        if let Some(conn) = err.downcast_ref::<ConnectorError>() {
+            if connector_error_is_transient(conn) {
+                return true;
+            }
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// Converts an `SdkError` into a [`ErrorKind::ServiceError`], capturing the
-/// operation name and service metadata.
+/// operation name, service metadata, and whether it was a transient transport
+/// failure.
 fn service_error<E>(
     operation: &'static str,
     e: SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
@@ -444,11 +582,13 @@ where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     let service = service_metadata(operation, &e);
+    let transient_transport = is_sdk_transient_transport(&e);
     Error {
         kind: ErrorKind::ServiceError,
         source: Box::new(e),
         extra: Some(Box::new(ErrorExtra {
             service: Some(service),
+            transient_transport,
             ..Default::default()
         })),
     }
@@ -611,5 +751,105 @@ mod tests {
     fn is_not_found_matches_codes() {
         assert!(service("GetObject", Some("NoSuchKey"), None, None).is_not_found());
         assert!(!service("GetObject", Some("AccessDenied"), None, None).is_not_found());
+    }
+
+    #[test]
+    fn display_child_operation_failed_bare() {
+        // No attached failure list: the bare kind message, no trailing detail.
+        let e = Error::new(ErrorKind::ChildOperationFailed, "x");
+        assert_eq!(e.to_string(), "child operation failed");
+    }
+
+    #[test]
+    fn display_child_operation_failed_names_first_and_count() {
+        let failed = vec![
+            FailedUpload {
+                input: None,
+                error: Error::new(ErrorKind::ServiceError, "boom"),
+                source_path: Some(std::path::PathBuf::from("/data/a.bin")),
+            },
+            FailedUpload {
+                input: None,
+                error: Error::new(ErrorKind::ServiceError, "boom"),
+                source_path: Some(std::path::PathBuf::from("/data/b.bin")),
+            },
+        ];
+        let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
+        assert_eq!(
+            e.to_string(),
+            "child operation failed: /data/a.bin (and 1 more)"
+        );
+    }
+
+    #[test]
+    fn display_child_operation_failed_single_no_path() {
+        // A failure list carrying no source path still reports a count.
+        let failed = vec![FailedUpload {
+            input: None,
+            error: Error::new(ErrorKind::ServiceError, "boom"),
+            source_path: None,
+        }];
+        let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
+        assert_eq!(e.to_string(), "child operation failed: 1 object");
+    }
+
+    // --- transient-transport classification -----------------------------------
+
+    use aws_sdk_s3::operation::get_object::GetObjectError;
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+
+    fn dispatch(conn: ConnectorError) -> SdkError<GetObjectError, HttpResponse> {
+        SdkError::dispatch_failure(conn)
+    }
+
+    #[test]
+    fn transient_nested_transient_marker_under_other_none_is_transient() {
+        // The Windows failure shape: the http client classified an incomplete
+        // response as ConnectorError::Other(TransientError), but a nested dispatch
+        // re-wrapped it inside an outer ConnectorError::Other(None). The outer
+        // frame carries no marker; the classifier must walk the chain to the inner
+        // marker. Inspecting only the outer frame (the previous behavior) would
+        // classify this non-transient and abort a retryable error.
+        let inner = ConnectorError::other(
+            "incomplete message".into(),
+            Some(RetryErrorKind::TransientError),
+        );
+        let inner_sdk: SdkError<GetObjectError, HttpResponse> = SdkError::dispatch_failure(inner);
+        let outer = ConnectorError::other(Box::new(inner_sdk), None);
+        assert!(
+            is_sdk_transient_transport(&dispatch(outer)),
+            "a TransientError marker nested under an outer Other(None) must classify transient"
+        );
+    }
+
+    #[test]
+    fn transient_outer_io_is_transient() {
+        assert!(is_sdk_transient_transport(&dispatch(ConnectorError::io(
+            "reset".into()
+        ))));
+    }
+
+    #[test]
+    fn transient_outer_timeout_is_transient() {
+        assert!(is_sdk_transient_transport(&dispatch(
+            ConnectorError::timeout("connect".into())
+        )));
+    }
+
+    #[test]
+    fn transient_bare_other_none_is_not_transient() {
+        // A connector Other(None) with no transient marker anywhere in the chain
+        // is not transient — the fix must not blanket-retry every Other error.
+        assert!(!is_sdk_transient_transport(&dispatch(
+            ConnectorError::other("unclassified".into(), None)
+        )));
+    }
+
+    #[test]
+    fn transient_user_error_is_not_transient() {
+        // A user error (e.g. malformed request) must never be treated transient.
+        assert!(!is_sdk_transient_transport(&dispatch(
+            ConnectorError::user("bad request".into())
+        )));
     }
 }

@@ -12,9 +12,10 @@
 
 mod assertions;
 mod download;
+mod download_retry;
 mod harness;
 mod integrity;
 mod metrics;
-mod retry;
 mod upload;
 mod upload_objects;
+mod upload_retry;
