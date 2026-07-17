@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3-transfer-manager"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "aws-config",
  "aws-runtime",
