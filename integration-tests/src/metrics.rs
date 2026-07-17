@@ -180,7 +180,7 @@ async fn test_download_to_file_metrics_mock_gp() {
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_to_file_metrics_tokio_mt() {
-    test_download_to_file_metrics(RuntimeMode::CurrentTokio).await;
+    test_download_to_file_metrics(RuntimeMode::MultiThreadTokio).await;
 }
 
 #[tokio::test]

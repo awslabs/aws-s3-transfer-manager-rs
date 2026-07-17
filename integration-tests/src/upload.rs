@@ -96,7 +96,7 @@ async fn test_mpu_upload_concurrent_mock_gp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpu_upload_concurrent_tokio_mt() {
-    test_mpu_upload_concurrent(RuntimeMode::CurrentTokio).await;
+    test_mpu_upload_concurrent(RuntimeMode::MultiThreadTokio).await;
 }
 
 #[tokio::test]

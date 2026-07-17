@@ -890,13 +890,17 @@ mod tests {
     fn test_handle_managed(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
-        Handle::new_for_test_with_runtime(config, concurrency, |weak| {
-            Arc::new(
-                crate::runtime::ManagedThreadRuntime::builder(weak)
-                    .topology(crate::runtime::Topology::uniform(4))
-                    .build(),
-            )
-        })
+        Handle::new_for_test_with_runtime(
+            config,
+            Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
+            |weak| {
+                Arc::new(
+                    crate::runtime::ManagedThreadRuntime::builder(weak)
+                        .topology(crate::runtime::Topology::uniform(4))
+                        .build(),
+                )
+            },
+        )
     }
 
     #[cfg_attr(miri, ignore)]

@@ -230,7 +230,7 @@ async fn test_download_concurrent_mock_gp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_concurrent_tokio_mt() {
-    test_download_concurrent(RuntimeMode::CurrentTokio).await;
+    test_download_concurrent(RuntimeMode::MultiThreadTokio).await;
 }
 
 /// Generate deterministic data using prime 251 to avoid alignment patterns.
@@ -746,5 +746,6 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_mock_gp(
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_tokio_mt() {
-    test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::CurrentTokio).await;
+    test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::MultiThreadTokio)
+        .await;
 }

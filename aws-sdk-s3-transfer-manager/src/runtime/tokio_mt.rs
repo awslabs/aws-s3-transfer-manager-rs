@@ -260,34 +260,13 @@ mod tests {
         Arc<AdjustableConcurrency>,
     ) {
         let controller = Arc::new(AdjustableConcurrency::new(initial_target));
-        let controller_clone = controller.clone();
         let slot: Arc<OnceLock<Arc<TokioMultiThreadRuntime>>> = Arc::new(OnceLock::new());
         let slot_clone = slot.clone();
 
-        let mut config = test_config();
-        let handle = Arc::new_cyclic(|weak| {
-            let scheduler = crate::scheduler::Scheduler::new(weak.clone());
-            let rt = Arc::new(TokioMultiThreadRuntime::new(weak.clone()));
+        let handle = Handle::new_for_test_with_runtime(test_config(), controller.clone(), |weak| {
+            let rt = Arc::new(TokioMultiThreadRuntime::new(weak));
             slot_clone.set(rt.clone()).ok();
-            let runtime: Arc<dyn crate::runtime::ExecutionRuntime> = rt;
-            let s3_client = match config.take_s3_client_source() {
-                crate::config::S3ClientSource::Provided(client) => client,
-                crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    aws_sdk_s3::Client::from_conf(s3_config.builder.build())
-                }
-            };
-            Handle {
-                config,
-                s3_client,
-                scheduler,
-                runtime,
-                controller: controller_clone.clone(),
-                telemetry: Arc::new(crate::telemetry::Telemetry::new(Duration::from_millis(500))),
-                memory_budget: crate::runtime::memory::MemoryBudget::new(
-                    1024 * 1024 * 1024,
-                    8 * 1024 * 1024,
-                ),
-            }
+            rt
         });
         let runtime = slot.get().unwrap().clone();
         (handle, runtime, controller)

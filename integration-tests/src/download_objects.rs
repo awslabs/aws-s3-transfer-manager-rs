@@ -160,7 +160,7 @@ async fn test_download_objects_many_small_files_mock_gp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_many_small_files_tokio_mt() {
-    test_download_objects_many_small_files(RuntimeMode::CurrentTokio).await;
+    test_download_objects_many_small_files(RuntimeMode::MultiThreadTokio).await;
 }
 
 /// Per-file byte-content integrity after download.
@@ -332,7 +332,7 @@ async fn test_download_objects_multipart_children_mock_gp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_multipart_children_tokio_mt() {
-    test_download_objects_multipart_children(RuntimeMode::CurrentTokio).await;
+    test_download_objects_multipart_children(RuntimeMode::MultiThreadTokio).await;
 }
 
 /// Empty prefix yields zero downloads with no error.
@@ -535,7 +535,7 @@ async fn test_download_objects_listing_pagination_mock_gp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_listing_pagination_tokio_mt() {
-    test_download_objects_listing_pagination(RuntimeMode::CurrentTokio).await;
+    test_download_objects_listing_pagination(RuntimeMode::MultiThreadTokio).await;
 }
 
 /// FailedTransferPolicy::Continue with one faulted key: the other objects
@@ -762,5 +762,5 @@ async fn test_upload_then_download_objects_roundtrip_mock_gp() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
-    test_upload_then_download_objects_roundtrip(RuntimeMode::CurrentTokio).await;
+    test_upload_then_download_objects_roundtrip(RuntimeMode::MultiThreadTokio).await;
 }

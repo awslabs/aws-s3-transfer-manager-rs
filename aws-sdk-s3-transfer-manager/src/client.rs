@@ -138,30 +138,17 @@ impl Handle {
         self.transfer_override(bucket)
     }
 
-    /// Create a Handle for testing with a custom scheduler factory.
+    /// Create a Handle for testing on the ambient tokio runtime with a fixed
+    /// concurrency target. The ergonomic common case; tests that need a custom
+    /// runtime or a controller they drive directly use
+    /// [`new_for_test_with_runtime`](Self::new_for_test_with_runtime).
     #[cfg(test)]
-    pub(crate) fn new_for_test(mut config: crate::Config, concurrency: usize) -> Arc<Self> {
-        Arc::new_cyclic(|weak| {
-            let scheduler = Scheduler::new(weak.clone());
-            let runtime: Arc<dyn ExecutionRuntime> =
-                Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak.clone()));
-            let s3_client = match config.take_s3_client_source() {
-                crate::config::S3ClientSource::Provided(client) => client,
-                crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    aws_sdk_s3::Client::from_conf(s3_config.builder.build())
-                }
-            };
-            Self {
-                config,
-                s3_client,
-                scheduler,
-                runtime,
-                controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-                telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
-                memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
-                retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            }
-        })
+    pub(crate) fn new_for_test(config: crate::Config, concurrency: usize) -> Arc<Self> {
+        Self::new_for_test_with_runtime(
+            config,
+            Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
+            |weak| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak)),
+        )
     }
 
     /// Test handle using the ambient tokio runtime (no OS threads spawned).
@@ -186,20 +173,27 @@ impl Handle {
     /// threads own their own runtimes independently.
     #[cfg(test)]
     pub(crate) fn test_handle_managed(config: crate::Config) -> Arc<Self> {
-        Self::new_for_test_with_runtime(config, 128, |weak| {
-            Arc::new(
-                crate::runtime::ManagedThreadRuntime::builder(weak)
-                    .topology(crate::runtime::Topology::uniform(4))
-                    .build(),
-            )
-        })
+        Self::new_for_test_with_runtime(
+            config,
+            Arc::new(crate::scheduler::FixedConcurrency::new(128)),
+            |weak| {
+                Arc::new(
+                    crate::runtime::ManagedThreadRuntime::builder(weak)
+                        .topology(crate::runtime::Topology::uniform(4))
+                        .build(),
+                )
+            },
+        )
     }
 
-    /// Create a Handle for testing with a custom runtime factory.
+    /// Create a Handle for testing with a custom concurrency controller and
+    /// runtime factory. The controller is an axis because some tests drive its
+    /// target directly (e.g. an adjustable controller); most pass a
+    /// [`FixedConcurrency`](crate::scheduler::FixedConcurrency).
     #[cfg(test)]
     pub(crate) fn new_for_test_with_runtime(
         mut config: crate::Config,
-        concurrency: usize,
+        controller: Arc<dyn ConcurrencyController>,
         runtime_factory: impl FnOnce(std::sync::Weak<Handle>) -> Arc<dyn ExecutionRuntime>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
@@ -216,7 +210,7 @@ impl Handle {
                 s3_client,
                 scheduler,
                 runtime,
-                controller: Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
+                controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
