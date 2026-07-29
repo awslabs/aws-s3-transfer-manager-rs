@@ -412,15 +412,22 @@ fn make_file_sink(file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
         // fallback file is consumed by the direct sink for unaligned writes.
         match crate::io::uring::UringDirectSink::new(file, owns_file) {
             Ok(sink) => {
-                tracing::debug!("using O_DIRECT + io_uring file sink");
+                println!("[TM] write path: O_DIRECT + io_uring (page cache BYPASSED)");
                 return Box::new(sink);
             }
             Err((e, file)) => {
-                tracing::debug!(error = %e, "direct I/O unavailable; using buffered file sink");
+                println!(
+                    "[TM] write path: buffered (page cache IN USE) \
+                     -- S3_TM_DIRECT_IO=1 was set but direct I/O is unavailable: {e}"
+                );
                 return Box::new(FileSink { file, owns_file });
             }
         }
     }
+    println!(
+        "[TM] write path: buffered (page cache IN USE) \
+         -- set S3_TM_DIRECT_IO=1 to enable direct I/O"
+    );
     Box::new(FileSink { file, owns_file })
 }
 

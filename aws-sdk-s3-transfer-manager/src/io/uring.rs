@@ -101,6 +101,38 @@ pub(crate) struct UringDirectSink {
     /// Whether the transfer manager created this file (vs caller-provided).
     /// Only an owned file is preallocated, matching the buffered sink.
     owns_file: bool,
+    /// Diagnostic counters: how many write calls (and bytes) took the O_DIRECT
+    /// path vs the buffered fallback. Reported on drop so a benchmark run can
+    /// confirm the direct path was actually exercised.
+    direct_writes: std::sync::atomic::AtomicU64,
+    direct_bytes: std::sync::atomic::AtomicU64,
+    fallback_writes: std::sync::atomic::AtomicU64,
+    fallback_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Drop for UringDirectSink {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dw = self.direct_writes.load(Relaxed);
+        let db = self.direct_bytes.load(Relaxed);
+        let fw = self.fallback_writes.load(Relaxed);
+        let fb = self.fallback_bytes.load(Relaxed);
+        let total = db + fb;
+        tracing::info!(
+            direct_writes = dw,
+            direct_bytes = db,
+            direct_mib = db as f64 / (1024.0 * 1024.0),
+            fallback_writes = fw,
+            fallback_bytes = fb,
+            fallback_mib = fb as f64 / (1024.0 * 1024.0),
+            direct_pct = if total > 0 {
+                db as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
+            "direct I/O sink write summary"
+        );
+    }
 }
 
 impl std::fmt::Debug for UringDirectSink {
@@ -146,6 +178,10 @@ impl UringDirectSink {
             direct_file,
             fallback_file,
             owns_file,
+            direct_writes: std::sync::atomic::AtomicU64::new(0),
+            direct_bytes: std::sync::atomic::AtomicU64::new(0),
+            fallback_writes: std::sync::atomic::AtomicU64::new(0),
+            fallback_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -154,6 +190,20 @@ impl UringDirectSink {
     /// so only position and length matter here.
     fn is_aligned(pos: u64, len: u64) -> bool {
         pos % DIRECT_IO_ALIGN == 0 && len % DIRECT_IO_ALIGN == 0 && len > 0
+    }
+
+    /// Direct vs buffered-fallback write totals: `(direct_writes,
+    /// direct_bytes, fallback_writes, fallback_bytes)`. Lets a caller report
+    /// the split at a deterministic point instead of relying on `Drop`.
+    #[allow(dead_code)]
+    pub(crate) fn write_stats(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.direct_writes.load(Relaxed),
+            self.direct_bytes.load(Relaxed),
+            self.fallback_writes.load(Relaxed),
+            self.fallback_bytes.load(Relaxed),
+        )
     }
 
     /// Copy `buf` into the staging buffer slice-by-slice and submit each slice
@@ -234,12 +284,39 @@ impl crate::operation::download::body::SinkWrite for UringDirectSink {
         buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
         pos: u64,
     ) -> io::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         let len = buf.remaining() as u64;
         // Alignment decided upfront: unaligned writes (the tail run, and
         // range-GETs starting mid-block) never attempt O_DIRECT.
         if Self::is_aligned(pos, len) {
+            let n = self.direct_writes.fetch_add(1, Relaxed);
+            let total = self.direct_bytes.fetch_add(len, Relaxed) + len;
+            if n == 0 {
+                // Deterministic proof the direct path is live. Drop-based
+                // reporting is unreliable: the sink can outlive the process's
+                // output machinery at exit.
+                println!("[TM] first O_DIRECT write issued: pos={pos} len={len}");
+            }
+            tracing::trace!(pos, len, direct_writes = n + 1, direct_bytes = total, "O_DIRECT write");
             self.write_direct(buf, pos)
         } else {
+            let n = self.fallback_writes.fetch_add(1, Relaxed);
+            let total = self.fallback_bytes.fetch_add(len, Relaxed) + len;
+            if n == 0 {
+                println!(
+                    "[TM] first buffered-fallback write: pos={pos} len={len} \
+                     (pos_aligned={} len_aligned={}) -- this data goes through the page cache",
+                    pos % DIRECT_IO_ALIGN == 0,
+                    len % DIRECT_IO_ALIGN == 0,
+                );
+            }
+            tracing::debug!(
+                pos,
+                len,
+                fallback_writes = n + 1,
+                fallback_bytes = total,
+                "unaligned write takes buffered fallback"
+            );
             crate::io::fs::write_all_at(&self.fallback_file, buf, pos)
         }
     }

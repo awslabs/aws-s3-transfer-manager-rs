@@ -259,6 +259,20 @@ impl Client {
         // Handle's MemoryBudget.
         let budget_capacity = config.memory_budget().resolve(profile.ram_bytes);
 
+        println!(
+            "[TM] memory budget: {:.2} GiB ({} bytes, {} chunks of {} MiB) \
+             | policy={:?} | detected RAM: {}",
+            budget_capacity as f64 / (1024.0 * 1024.0 * 1024.0),
+            budget_capacity,
+            budget_capacity / BUDGET_CHUNK_BYTES,
+            BUDGET_CHUNK_BYTES / (1024 * 1024),
+            config.memory_budget(),
+            match profile.ram_bytes {
+                Some(b) => format!("{:.2} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
+                None => "undetected".to_string(),
+            },
+        );
+
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
