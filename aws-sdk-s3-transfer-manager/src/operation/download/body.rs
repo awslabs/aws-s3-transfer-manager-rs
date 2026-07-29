@@ -81,9 +81,18 @@ impl SinkWrite for FileSink {
 
     fn preallocate(&self, len: u64) {
         if self.owns_file {
-            if let Err(e) = crate::io::fs::preallocate(&self.file, len) {
-                tracing::warn!(error = %e, "failed to preallocate file space");
+            match crate::io::fs::preallocate(&self.file, len) {
+                Ok(()) => println!(
+                    "[TM] preallocated {len} bytes ({:.2} GiB)",
+                    len as f64 / (1024.0 * 1024.0 * 1024.0)
+                ),
+                Err(e) => {
+                    println!("[TM] preallocate FAILED ({e})");
+                    tracing::warn!(error = %e, "failed to preallocate file space");
+                }
             }
+        } else {
+            println!("[TM] preallocate SKIPPED (caller-owned file)");
         }
     }
 }
