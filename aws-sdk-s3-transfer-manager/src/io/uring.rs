@@ -33,14 +33,31 @@ use io_uring::{opcode, types, IoUring};
 /// platforms, so it is used as a safe static bound.
 pub(crate) const DIRECT_IO_ALIGN: u64 = 4096;
 
-/// Size of the reusable staging buffer. One drain run is at most one part
-/// (runs are coalesced up to the segment size in the recv buffer), and parts
-/// default to 8 MiB; larger runs are written in staging-buffer-sized slices.
+/// Size of each staging buffer. One drain run is often many parts coalesced, and
+/// runs larger than a buffer are written in buffer-sized slices.
 const STAGING_BUF_SIZE: usize = 8 * 1024 * 1024;
 
-/// io_uring submission queue depth. Writes are submitted synchronously one
-/// slice at a time from the drain task, so a small ring suffices.
-const RING_ENTRIES: u32 = 8;
+/// Number of O_DIRECT writes kept in flight per sink, and therefore the number
+/// of staging buffers allocated.
+///
+/// Depth matters because a single write's completion latency bounds throughput
+/// when writes are issued one at a time: an 8 MiB write completing in ~0.8 ms
+/// caps a serial issuer near 10 GiB/s, and far lower when latency is higher.
+/// Keeping several writes outstanding lets the device overlap them.
+///
+/// The cost is memory: `depth * STAGING_BUF_SIZE` per output file, charged
+/// outside the transfer manager's memory budget. The default is deliberately
+/// modest; override with `S3_TM_DIRECT_IO_QUEUE_DEPTH`.
+const DEFAULT_QUEUE_DEPTH: usize = 16;
+
+/// Resolve the per-sink queue depth, clamped to a sane range.
+fn queue_depth() -> usize {
+    std::env::var("S3_TM_DIRECT_IO_QUEUE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|d| d.clamp(1, 64))
+        .unwrap_or(DEFAULT_QUEUE_DEPTH)
+}
 
 /// Page-aligned heap buffer for staging unaligned network segments before an
 /// O_DIRECT write.
@@ -80,11 +97,17 @@ impl Drop for AlignedBuf {
     }
 }
 
-/// State serialized behind a mutex: the ring and the staging buffer are both
+/// State serialized behind a mutex: the ring and the staging buffers are both
 /// single-user resources, and `SinkWrite` is `&self` + `Sync`.
+///
+/// `staging` holds one buffer per in-flight slot. A slot's buffer is owned by
+/// the kernel from the moment its write is submitted until its completion is
+/// reaped, so slots cannot share a buffer.
 struct Inner {
     ring: IoUring,
-    staging: AlignedBuf,
+    staging: Vec<AlignedBuf>,
+    /// Byte count submitted for each slot, to validate the completion result.
+    expected: Vec<usize>,
 }
 
 /// O_DIRECT + io_uring write target for a single output file.
@@ -164,17 +187,29 @@ impl UringDirectSink {
             Err(e) => return Err((e, fallback_file)),
         };
 
-        let ring = match IoUring::new(RING_ENTRIES) {
+        let depth = queue_depth();
+        // The ring must hold every outstanding submission; io_uring rounds the
+        // entry count up to a power of two. Sizing it at least `depth` makes a
+        // submission-queue-full push impossible while at most `depth` writes are
+        // in flight, which the write loop relies on.
+        let ring = match IoUring::new(depth.next_power_of_two().max(2) as u32) {
             Ok(r) => r,
             Err(e) => return Err((e, fallback_file)),
         };
-        let staging = match AlignedBuf::new(STAGING_BUF_SIZE, DIRECT_IO_ALIGN as usize) {
-            Ok(b) => b,
-            Err(e) => return Err((e, fallback_file)),
-        };
+        let mut staging = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            match AlignedBuf::new(STAGING_BUF_SIZE, DIRECT_IO_ALIGN as usize) {
+                Ok(b) => staging.push(b),
+                Err(e) => return Err((e, fallback_file)),
+            }
+        }
 
         Ok(Self {
-            inner: Mutex::new(Inner { ring, staging }),
+            inner: Mutex::new(Inner {
+                ring,
+                staging,
+                expected: vec![0; depth],
+            }),
             direct_file,
             fallback_file,
             owns_file,
@@ -206,73 +241,109 @@ impl UringDirectSink {
         )
     }
 
-    /// Copy `buf` into the staging buffer slice-by-slice and submit each slice
-    /// as an io_uring `Write` op against the O_DIRECT descriptor.
+    /// Copy `buf` into staging buffers and write it out via io_uring, keeping up
+    /// to `queue_depth()` writes in flight.
+    ///
+    /// A run is often many coalesced parts — a 100 MiB run becomes 13 slices of
+    /// 8 MiB — so issuing slices one at a time and waiting for each would cap
+    /// throughput at one write's latency regardless of how much data is ready.
+    /// Slices are instead submitted from a pool of free buffers and completions
+    /// reaped as they land, returning each buffer to the pool.
+    ///
+    /// Completions can arrive out of order, so a buffer is reusable only once its
+    /// own completion has been seen. Each submission tags its slot in
+    /// `user_data`; that slot returns to the free list when the matching CQE is
+    /// reaped. The kernel owns a buffer for exactly the interval between its
+    /// submission and its completion.
     fn write_direct(
         &self,
         buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
         mut pos: u64,
     ) -> io::Result<()> {
         let inner = &mut *self.inner.lock().unwrap();
+        // Split the borrow so the ring and the buffer pool can be used together.
+        let Inner {
+            ring,
+            staging,
+            expected,
+        } = inner;
         let fd = types::Fd(self.direct_file.as_raw_fd());
 
-        while buf.has_remaining() {
-            // Gather up to a staging buffer's worth of segments.
-            let staging = inner.staging.as_mut_slice();
-            let mut filled = 0usize;
-            while buf.has_remaining() && filled < staging.len() {
-                let chunk = buf.chunk();
-                let n = chunk.len().min(staging.len() - filled);
-                staging[filled..filled + n].copy_from_slice(&chunk[..n]);
-                filled += n;
-                buf.advance(n);
-            }
-            debug_assert_eq!(
-                filled as u64 % DIRECT_IO_ALIGN,
-                0,
-                "callers only route fully-aligned writes here and the staging \
-                 buffer size is a multiple of the alignment"
-            );
+        let depth = staging.len();
+        let mut free: Vec<usize> = (0..depth).rev().collect();
 
-            // Submit one write and wait for its completion. The drain task is
-            // synchronous, so submit-and-wait per slice keeps the ownership
-            // model trivial: the staging buffer is never touched while the
-            // kernel owns it.
-            let ptr = inner.staging.ptr;
-            let sqe = opcode::Write::new(fd, ptr, filled as u32)
-                .offset(pos)
-                .build();
-            // SAFETY: the buffer outlives the submission — we block on the
-            // CQE below before reusing or dropping it.
-            unsafe {
-                inner
-                    .ring
-                    .submission()
-                    .push(&sqe)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            }
-            inner.ring.submit_and_wait(1)?;
+        loop {
+            // Fill and submit while data remains and a buffer is available.
+            while buf.has_remaining() && !free.is_empty() {
+                let slot = *free.last().expect("free is non-empty");
 
-            let cqe = inner
-                .ring
+                let dst = staging[slot].as_mut_slice();
+                let mut filled = 0usize;
+                while buf.has_remaining() && filled < dst.len() {
+                    let chunk = buf.chunk();
+                    let n = chunk.len().min(dst.len() - filled);
+                    dst[filled..filled + n].copy_from_slice(&chunk[..n]);
+                    filled += n;
+                    buf.advance(n);
+                }
+                debug_assert_eq!(
+                    filled as u64 % DIRECT_IO_ALIGN,
+                    0,
+                    "callers only route fully-aligned writes here and the staging \
+                     buffer size is a multiple of the alignment"
+                );
+
+                expected[slot] = filled;
+                let ptr = staging[slot].ptr;
+                let sqe = opcode::Write::new(fd, ptr, filled as u32)
+                    .offset(pos)
+                    .build()
+                    .user_data(slot as u64);
+                // SAFETY: `slot` was on the free list, so the kernel does not
+                // already own this buffer; the buffer lives in `staging` for the
+                // duration of this call and the slot is not reused until its
+                // completion is reaped below.
+                unsafe {
+                    ring.submission().push(&sqe).expect(
+                        "ring is sized at >= depth entries and at most depth \
+                         writes are in flight, so the submission queue cannot be full",
+                    );
+                }
+                free.pop();
+                pos += filled as u64;
+            }
+
+            if free.len() == depth {
+                break; // nothing in flight and nothing left to submit
+            }
+
+            ring.submit_and_wait(1)?;
+
+            // Reap everything available, returning each slot to the pool.
+            let completions: Vec<(u64, i32)> = ring
                 .completion()
-                .next()
-                .expect("submit_and_wait(1) guarantees one completion");
-            let res = cqe.result();
-            if res < 0 {
-                return Err(io::Error::from_raw_os_error(-res));
+                .map(|cqe| (cqe.user_data(), cqe.result()))
+                .collect();
+            for (slot, res) in completions {
+                let slot = slot as usize;
+                if res < 0 {
+                    return Err(io::Error::from_raw_os_error(-res));
+                }
+                if res as usize != expected[slot] {
+                    // Short direct write: extremely rare (device error boundary).
+                    // The bytes were already consumed from `buf` into staging, so
+                    // surface an error rather than complicating the resubmit path
+                    // for a case that indicates device trouble.
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!(
+                            "short O_DIRECT write: {} of {} bytes",
+                            res, expected[slot]
+                        ),
+                    ));
+                }
+                free.push(slot);
             }
-            if res as usize != filled {
-                // Short direct write: extremely rare (device error boundary).
-                // The remaining bytes were already consumed from `buf` into
-                // staging; surface an error rather than complicating the
-                // resubmit path for a case that indicates device trouble.
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("short O_DIRECT write: {} of {} bytes", res, filled),
-                ));
-            }
-            pos += filled as u64;
         }
         Ok(())
     }
