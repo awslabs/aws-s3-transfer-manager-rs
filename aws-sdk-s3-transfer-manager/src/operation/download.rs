@@ -12,7 +12,7 @@ pub use input::{DownloadInput, DownloadInputBuilder};
 pub mod builders;
 
 /// Abstractions for responses and consuming data streams.
-mod body;
+pub(crate) mod body;
 pub use body::{Body, ChunkOutput};
 
 /// In-order delivery buffer (out-of-order arrival → in-order stream).

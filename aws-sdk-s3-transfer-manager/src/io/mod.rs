@@ -16,6 +16,9 @@ mod stream;
 pub mod error;
 pub(crate) mod fs;
 mod size_hint;
+/// O_DIRECT + io_uring positioned-write sink (Linux only).
+#[cfg(target_os = "linux")]
+pub(crate) mod uring;
 /// Walker types for traversing filesystems and S3 buckets.
 pub mod walk;
 

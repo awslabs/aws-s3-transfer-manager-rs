@@ -391,12 +391,37 @@ fn new_recv_body_with_disk_mode(
 }
 
 /// Create a producer/consumer pair with a file sink for download-to-file.
+///
+/// On Linux, when `S3_TM_DIRECT_IO=1` is set, the file write path uses
+/// O_DIRECT + io_uring ([`crate::io::uring::UringDirectSink`]); if the sink
+/// cannot be constructed (filesystem rejects O_DIRECT, io_uring unavailable)
+/// the buffered `pwritev` sink is used instead.
 pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
     object_range_start: u64,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }), object_range_start)
+    new_recv_body_with_disk_mode(make_file_sink(file, owns_file), object_range_start)
+}
+
+/// Select the concrete [`SinkWrite`] for a file target.
+fn make_file_sink(file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("S3_TM_DIRECT_IO").is_some_and(|v| v == "1") {
+        // Try to reopen with O_DIRECT; fall back to buffered on failure. The
+        // fallback file is consumed by the direct sink for unaligned writes.
+        match crate::io::uring::UringDirectSink::new(file, owns_file) {
+            Ok(sink) => {
+                tracing::debug!("using O_DIRECT + io_uring file sink");
+                return Box::new(sink);
+            }
+            Err((e, file)) => {
+                tracing::debug!(error = %e, "direct I/O unavailable; using buffered file sink");
+                return Box::new(FileSink { file, owns_file });
+            }
+        }
+    }
+    Box::new(FileSink { file, owns_file })
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -1197,5 +1222,35 @@ mod tests {
             "disk drain copies out and frees the bytes; the reservation releases at drain"
         );
         assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");
+    }
+
+    /// `S3_TM_DIRECT_IO=1` selects the O_DIRECT + io_uring sink when the
+    /// filesystem supports it, and falls back to the buffered sink otherwise.
+    /// Run against a file on the source tree's filesystem (not tmpfs) so the
+    /// direct sink can construct.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_io_env_var_selects_uring_sink() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/direct-io-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        let mk_file = || std::fs::File::create(dir.path().join("out.bin")).unwrap();
+
+        // Without the env var: buffered sink.
+        std::env::remove_var("S3_TM_DIRECT_IO");
+        let sink = super::make_file_sink(mk_file(), true);
+        assert!(format!("{sink:?}").contains("FileSink"));
+
+        // With the env var: direct sink (or buffered fallback if this
+        // filesystem rejects O_DIRECT — assert only on supported fs).
+        std::env::set_var("S3_TM_DIRECT_IO", "1");
+        let sink = super::make_file_sink(mk_file(), true);
+        std::env::remove_var("S3_TM_DIRECT_IO");
+        let repr = format!("{sink:?}");
+        if crate::io::uring::UringDirectSink::new(mk_file(), true).is_ok() {
+            assert!(repr.contains("UringDirectSink"), "expected direct sink, got {repr}");
+        } else {
+            assert!(repr.contains("FileSink"), "expected buffered fallback, got {repr}");
+        }
     }
 }
