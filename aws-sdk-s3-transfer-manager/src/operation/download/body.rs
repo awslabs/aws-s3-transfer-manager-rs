@@ -46,11 +46,27 @@ impl WakeNotify {
 /// drain task, hence `Send + Sync`.
 pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
     /// Write the entire buffer at `pos` bytes into the target.
+    ///
+    /// A write is durable-as-far-as-the-OS-is-concerned once this returns *unless*
+    /// the implementation reports otherwise by overriding [`flush`](Self::flush).
+    /// An implementation that keeps writes in flight past return must surface any
+    /// deferred error from a later `write_all_at` or from `flush`.
     fn write_all_at(
         &self,
         buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
         pos: u64,
     ) -> std::io::Result<()>;
+
+    /// Wait for every write issued so far to complete and report the first error
+    /// observed, if any. Default no-op for implementations that complete writes
+    /// inline.
+    ///
+    /// Callers MUST invoke this before treating the file as complete — the
+    /// download layer does so in `finalize()`, which runs before the temporary
+    /// file is renamed to its destination.
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Best-effort preallocation of `len` bytes. Default no-op.
     fn preallocate(&self, _len: u64) {}
@@ -230,10 +246,14 @@ impl BodyWriter {
     /// Returns the parts freed by this terminal pass (the tail left resident below the
     /// drain batch) so the caller can release the last of the read-ahead occupancy.
     pub(crate) fn finalize(&self) -> Result<u64, std::io::Error> {
-        if !matches!(&*self.mode, Mode::Disk { .. }) {
+        let Mode::Disk { sink, .. } = &*self.mode else {
             return Ok(0);
-        }
+        };
         let terminal_parts = self.drain(DrainMode::Eager)?;
+        // The sink may keep writes in flight past `write_all_at` returning, so the
+        // file is not complete until it has been flushed. This must happen before
+        // the caller renames the temporary file into place.
+        sink.flush()?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             terminal_parts,

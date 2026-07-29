@@ -100,14 +100,88 @@ impl Drop for AlignedBuf {
 /// State serialized behind a mutex: the ring and the staging buffers are both
 /// single-user resources, and `SinkWrite` is `&self` + `Sync`.
 ///
-/// `staging` holds one buffer per in-flight slot. A slot's buffer is owned by
-/// the kernel from the moment its write is submitted until its completion is
-/// reaped, so slots cannot share a buffer.
+/// The pool state persists across `write_all_at` calls so writes stay in flight
+/// between runs: a run that only fills a few slices does not have to drain before
+/// returning, and the next run reuses whatever slots have since completed. This is
+/// what keeps the device busy when runs are smaller than the queue depth.
+///
+/// A slot's buffer is owned by the kernel from the moment its write is submitted
+/// until its completion is reaped, so a slot must not be refilled while in flight.
 struct Inner {
     ring: IoUring,
     staging: Vec<AlignedBuf>,
     /// Byte count submitted for each slot, to validate the completion result.
     expected: Vec<usize>,
+    /// Slots not currently owned by the kernel.
+    free: Vec<usize>,
+    /// Submitted writes whose completions have not been reaped.
+    in_flight: usize,
+    /// First error seen while reaping. Surfaced from a later `write_all_at` or
+    /// from `flush`, since the write that failed had already returned.
+    deferred_error: Option<io::Error>,
+    /// Whether any SQE has been pushed but not yet handed to the kernel.
+    unsubmitted: bool,
+}
+
+impl Inner {
+    /// Reap every completion currently available, returning slots to the pool.
+    /// Errors are recorded rather than returned: the originating `write_all_at`
+    /// has already returned to its caller.
+    fn reap_available(&mut self) {
+        let completions: Vec<(u64, i32)> = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
+            .collect();
+        for (slot, res) in completions {
+            let slot = slot as usize;
+            if res < 0 {
+                self.record_error(io::Error::from_raw_os_error(-res));
+            } else if res as usize != self.expected[slot] {
+                self.record_error(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "short O_DIRECT write: {} of {} bytes",
+                        res, self.expected[slot]
+                    ),
+                ));
+            }
+            self.free.push(slot);
+            self.in_flight -= 1;
+        }
+    }
+
+    fn record_error(&mut self, e: io::Error) {
+        if self.deferred_error.is_none() {
+            self.deferred_error = Some(e);
+        }
+    }
+
+    /// Hand any queued submissions to the kernel without blocking.
+    fn submit_pending(&mut self) -> io::Result<()> {
+        if self.unsubmitted {
+            self.ring.submit()?;
+            self.unsubmitted = false;
+        }
+        Ok(())
+    }
+
+    /// Block until at least one completion is available, then reap.
+    fn wait_and_reap(&mut self) -> io::Result<()> {
+        self.ring.submit_and_wait(1)?;
+        self.unsubmitted = false;
+        self.reap_available();
+        Ok(())
+    }
+
+    /// Wait for every outstanding write to complete.
+    fn drain_in_flight(&mut self) -> io::Result<()> {
+        self.submit_pending()?;
+        while self.in_flight > 0 {
+            self.wait_and_reap()?;
+        }
+        Ok(())
+    }
 }
 
 /// O_DIRECT + io_uring write target for a single output file.
@@ -136,6 +210,28 @@ pub(crate) struct UringDirectSink {
 impl Drop for UringDirectSink {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+
+        // Soundness: the kernel may still own staging buffers via submitted writes,
+        // and those buffers are freed when `inner` drops immediately after this.
+        // Draining here is the last line of defense if `flush` was never called
+        // (an aborted or panicking transfer). Without it the kernel could write
+        // into freed memory.
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Err(e) = inner.drain_in_flight() {
+                tracing::warn!(
+                    error = %e,
+                    "failed to drain in-flight O_DIRECT writes on sink drop"
+                );
+            }
+            if let Some(e) = inner.deferred_error.take() {
+                tracing::warn!(
+                    error = %e,
+                    "O_DIRECT write error discovered during drop; the transfer \
+                     should already have failed via flush"
+                );
+            }
+        }
+
         let dw = self.direct_writes.load(Relaxed);
         let db = self.direct_bytes.load(Relaxed);
         let fw = self.fallback_writes.load(Relaxed);
@@ -209,6 +305,10 @@ impl UringDirectSink {
                 ring,
                 staging,
                 expected: vec![0; depth],
+                free: (0..depth).rev().collect(),
+                in_flight: 0,
+                deferred_error: None,
+                unsubmitted: false,
             }),
             direct_file,
             fallback_file,
@@ -241,110 +341,97 @@ impl UringDirectSink {
         )
     }
 
-    /// Copy `buf` into staging buffers and write it out via io_uring, keeping up
-    /// to `queue_depth()` writes in flight.
+    /// Copy `buf` into staging buffers and submit it via io_uring, returning as soon
+    /// as the last slice is queued — **without** waiting for completions.
     ///
-    /// A run is often many coalesced parts — a 100 MiB run becomes 13 slices of
-    /// 8 MiB — so issuing slices one at a time and waiting for each would cap
-    /// throughput at one write's latency regardless of how much data is ready.
-    /// Slices are instead submitted from a pool of free buffers and completions
-    /// reaped as they land, returning each buffer to the pool.
+    /// Writes stay in flight across calls. Only when every slot is busy does this
+    /// block, and then just long enough for one to free. That keeps the device busy
+    /// even when a single run is smaller than the queue depth, which per-call
+    /// pipelining could not do: a one-part run has one slice and would otherwise
+    /// issue one write and wait for it.
     ///
-    /// Completions can arrive out of order, so a buffer is reusable only once its
-    /// own completion has been seen. Each submission tags its slot in
-    /// `user_data`; that slot returns to the free list when the matching CQE is
-    /// reaped. The kernel owns a buffer for exactly the interval between its
-    /// submission and its completion.
+    /// Safe to return early because the payload is *copied* into the staging buffer,
+    /// so the caller may free the source `Bytes` immediately. What must not happen is
+    /// refilling a slot the kernel still owns, which the free list prevents.
+    ///
+    /// Completions are reaped opportunistically, so an error may be observed after
+    /// the write that caused it has returned. Such errors are recorded and surfaced
+    /// from a later call or from [`flush`](Self::flush).
     fn write_direct(
         &self,
         buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
         mut pos: u64,
     ) -> io::Result<()> {
         let inner = &mut *self.inner.lock().unwrap();
-        // Split the borrow so the ring and the buffer pool can be used together.
-        let Inner {
-            ring,
-            staging,
-            expected,
-        } = inner;
+
+        // Surface a failure from an earlier, already-returned write before doing
+        // more work: the transfer should fail rather than keep writing.
+        if let Some(e) = inner.deferred_error.take() {
+            return Err(e);
+        }
+
         let fd = types::Fd(self.direct_file.as_raw_fd());
 
-        let depth = staging.len();
-        let mut free: Vec<usize> = (0..depth).rev().collect();
+        while buf.has_remaining() {
+            // Acquire a slot, waiting only if every buffer is with the kernel.
+            while inner.free.is_empty() {
+                inner.wait_and_reap()?;
+            }
+            let slot = *inner.free.last().expect("free is non-empty");
 
-        loop {
-            // Fill and submit while data remains and a buffer is available.
-            while buf.has_remaining() && !free.is_empty() {
-                let slot = *free.last().expect("free is non-empty");
+            // Split the borrow so the buffer pool and the ring can be used together.
+            let Inner {
+                ring,
+                staging,
+                expected,
+                free,
+                in_flight,
+                unsubmitted,
+                ..
+            } = inner;
 
-                let dst = staging[slot].as_mut_slice();
-                let mut filled = 0usize;
-                while buf.has_remaining() && filled < dst.len() {
-                    let chunk = buf.chunk();
-                    let n = chunk.len().min(dst.len() - filled);
-                    dst[filled..filled + n].copy_from_slice(&chunk[..n]);
-                    filled += n;
-                    buf.advance(n);
-                }
-                debug_assert_eq!(
-                    filled as u64 % DIRECT_IO_ALIGN,
-                    0,
-                    "callers only route fully-aligned writes here and the staging \
-                     buffer size is a multiple of the alignment"
+            let dst = staging[slot].as_mut_slice();
+            let mut filled = 0usize;
+            while buf.has_remaining() && filled < dst.len() {
+                let chunk = buf.chunk();
+                let n = chunk.len().min(dst.len() - filled);
+                dst[filled..filled + n].copy_from_slice(&chunk[..n]);
+                filled += n;
+                buf.advance(n);
+            }
+            debug_assert_eq!(
+                filled as u64 % DIRECT_IO_ALIGN,
+                0,
+                "callers only route fully-aligned writes here and the staging \
+                 buffer size is a multiple of the alignment"
+            );
+
+            expected[slot] = filled;
+            let ptr = staging[slot].ptr;
+            let sqe = opcode::Write::new(fd, ptr, filled as u32)
+                .offset(pos)
+                .build()
+                .user_data(slot as u64);
+            // SAFETY: `slot` came off the free list, so the kernel does not already
+            // own this buffer. The buffer lives in `staging` until the sink is
+            // dropped, and `Drop` drains in-flight writes before that happens, so
+            // the kernel never holds a dangling pointer. The slot is not refilled
+            // until its completion is reaped.
+            unsafe {
+                ring.submission().push(&sqe).expect(
+                    "ring is sized at >= depth entries and at most depth writes \
+                     are in flight, so the submission queue cannot be full",
                 );
-
-                expected[slot] = filled;
-                let ptr = staging[slot].ptr;
-                let sqe = opcode::Write::new(fd, ptr, filled as u32)
-                    .offset(pos)
-                    .build()
-                    .user_data(slot as u64);
-                // SAFETY: `slot` was on the free list, so the kernel does not
-                // already own this buffer; the buffer lives in `staging` for the
-                // duration of this call and the slot is not reused until its
-                // completion is reaped below.
-                unsafe {
-                    ring.submission().push(&sqe).expect(
-                        "ring is sized at >= depth entries and at most depth \
-                         writes are in flight, so the submission queue cannot be full",
-                    );
-                }
-                free.pop();
-                pos += filled as u64;
             }
-
-            if free.len() == depth {
-                break; // nothing in flight and nothing left to submit
-            }
-
-            ring.submit_and_wait(1)?;
-
-            // Reap everything available, returning each slot to the pool.
-            let completions: Vec<(u64, i32)> = ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result()))
-                .collect();
-            for (slot, res) in completions {
-                let slot = slot as usize;
-                if res < 0 {
-                    return Err(io::Error::from_raw_os_error(-res));
-                }
-                if res as usize != expected[slot] {
-                    // Short direct write: extremely rare (device error boundary).
-                    // The bytes were already consumed from `buf` into staging, so
-                    // surface an error rather than complicating the resubmit path
-                    // for a case that indicates device trouble.
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        format!(
-                            "short O_DIRECT write: {} of {} bytes",
-                            res, expected[slot]
-                        ),
-                    ));
-                }
-                free.push(slot);
-            }
+            free.pop();
+            *in_flight += 1;
+            *unsubmitted = true;
+            pos += filled as u64;
         }
+
+        // Hand the batch to the kernel so it starts now rather than at the next
+        // blocking wait — without this the writes would not actually be in flight.
+        inner.submit_pending()?;
         Ok(())
     }
 }
@@ -389,6 +476,15 @@ impl crate::operation::download::body::SinkWrite for UringDirectSink {
                 "unaligned write takes buffered fallback"
             );
             crate::io::fs::write_all_at(&self.fallback_file, buf, pos)
+        }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        let inner = &mut *self.inner.lock().unwrap();
+        inner.drain_in_flight()?;
+        match inner.deferred_error.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -467,6 +563,8 @@ mod tests {
         let mut buf = seg(&[&data]);
         sink.write_all_at(&mut buf, 0).unwrap();
 
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents, data);
     }
@@ -483,6 +581,8 @@ mod tests {
         sink.write_all_at(&mut seg(&[&block1]), ALIGN as u64).unwrap();
         sink.write_all_at(&mut seg(&[&block0]), 0).unwrap();
 
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(&contents[..ALIGN], &block0[..]);
         assert_eq!(&contents[ALIGN..], &block1[..]);
@@ -507,6 +607,8 @@ mod tests {
         }
 
         sink.write_all_at(&mut buf, 0).unwrap();
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -529,6 +631,8 @@ mod tests {
         }
 
         sink.write_all_at(&mut buf, 0).unwrap();
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -545,6 +649,8 @@ mod tests {
         sink.write_all_at(&mut seg(&[&tail]), body.len() as u64)
             .unwrap();
 
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents.len(), body.len() + tail.len());
         assert_eq!(&contents[..body.len()], &body[..]);
@@ -561,6 +667,8 @@ mod tests {
         let data = vec![0x33u8; ALIGN];
         sink.write_all_at(&mut seg(&[&data]), 100).unwrap();
 
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents.len(), 100 + ALIGN);
         assert_eq!(&contents[100..], &data[..]);
@@ -574,6 +682,8 @@ mod tests {
 
         let mut buf = SegmentedBuf::<Bytes>::new();
         sink.write_all_at(&mut buf, 0).unwrap();
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
@@ -604,6 +714,8 @@ mod tests {
         sink.write_all_at(&mut seg(&[&tail]), (num_parts * part) as u64)
             .unwrap();
 
+        // Writes stay in flight past `write_all_at`; flush before reading back.
+        SinkWrite::flush(&sink).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
