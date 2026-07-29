@@ -16,7 +16,13 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::Topology;
 
+#[cfg(test)]
+mod buffer_pool_model;
+#[cfg(test)]
+mod elastic_buffer_pool_model;
 pub(crate) mod memory;
+#[cfg(test)]
+mod operation_memory_model;
 pub(crate) mod platform;
 pub(crate) mod sync;
 
