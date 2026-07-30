@@ -8,6 +8,10 @@
 //! This is intentionally test-only. It separates planned-demand admission from
 //! physical carrier ownership before production concurrency obscures the state
 //! transitions.
+//!
+//! Admission usage is reserved demand plus sticky unreserved debt. New
+//! reservations provide coverage only for future unreserved acquisitions; they
+//! cannot retroactively absorb already-live debt.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -133,34 +137,38 @@ struct CarrierId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReservationPlan {
-    admitted: usize,
-    ticketed_max_live: usize,
+    reservation_size: usize,
+    direct_acquire_limit: usize,
     capability: CapabilityRequirement,
     affinity: DispatchAffinity,
 }
 
 impl ReservationPlan {
     fn new(
-        admitted: usize,
-        ticketed_max_live: usize,
+        reservation_size: usize,
+        direct_acquire_limit: usize,
         capability: CapabilityRequirement,
         affinity: DispatchAffinity,
     ) -> Self {
-        assert!(admitted > 0);
-        assert!(ticketed_max_live <= admitted);
+        assert!(reservation_size > 0);
+        assert!(direct_acquire_limit <= reservation_size);
         Self {
-            admitted,
-            ticketed_max_live,
+            reservation_size,
+            direct_acquire_limit,
             capability,
             affinity,
         }
+    }
+
+    fn unreserved_coverage(self) -> usize {
+        self.reservation_size - self.direct_acquire_limit
     }
 }
 
 #[derive(Debug)]
 struct ReservationState {
     plan: ReservationPlan,
-    ticketed_live: usize,
+    direct_live: usize,
     closing: bool,
 }
 
@@ -185,7 +193,7 @@ struct GrantedWaiter {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClaimOwner {
-    Ticketed(ReservationId),
+    Reserved(ReservationId),
     Unreserved,
 }
 
@@ -235,7 +243,7 @@ enum ModelError {
     UnknownReservation,
     UnknownWaiter,
     ReservationClosing,
-    TicketEnvelopeExceeded,
+    ReservationEnvelopeExceeded,
     RequirementMismatch,
     UnsupportedLayout,
     AllocationFailed,
@@ -246,12 +254,15 @@ enum ModelError {
 struct ElasticPoolModel {
     carrier_size: usize,
 
-    admission_limit: usize,
-    admitted: usize,
+    configured_capacity: usize,
+    reserved_demand: usize,
+    live: usize,
+    unreserved_live: usize,
+    unreserved_debt: usize,
     reservations: HashMap<ReservationId, ReservationState>,
     waiters: VecDeque<AdmissionWaiter>,
 
-    retained_capacity_limit: usize,
+    reusable_capacity_target: usize,
     retained: Vec<ReusableCarrier>,
     overflow: HashMap<CarrierId, OverflowCarrier>,
 
@@ -263,16 +274,19 @@ struct ElasticPoolModel {
 }
 
 impl ElasticPoolModel {
-    fn new(carrier_size: usize, admission_limit: usize, retained_capacity_limit: usize) -> Self {
+    fn new(carrier_size: usize, configured_capacity: usize) -> Self {
         assert!(carrier_size > 0);
-        assert!(admission_limit > 0);
+        assert!(configured_capacity > 0);
         Self {
             carrier_size,
-            admission_limit,
-            admitted: 0,
+            configured_capacity,
+            reserved_demand: 0,
+            live: 0,
+            unreserved_live: 0,
+            unreserved_debt: 0,
             reservations: HashMap::new(),
             waiters: VecDeque::new(),
-            retained_capacity_limit,
+            reusable_capacity_target: configured_capacity,
             retained: Vec::new(),
             overflow: HashMap::new(),
             next_reservation: 0,
@@ -284,12 +298,10 @@ impl ElasticPoolModel {
     }
 
     fn reserve(&mut self, plan: ReservationPlan) -> ReserveOutcome {
-        if plan.admitted > self.admission_limit {
+        if plan.reservation_size > self.configured_capacity {
             return ReserveOutcome::Rejected;
         }
-        if self.waiters.is_empty()
-            && plan.admitted <= self.admission_limit.saturating_sub(self.admitted)
-        {
+        if self.waiters.is_empty() && self.can_reserve(plan.reservation_size) {
             let reservation = self.grant(plan);
             self.assert_invariants();
             return ReserveOutcome::Ready(reservation);
@@ -303,15 +315,15 @@ impl ElasticPoolModel {
     }
 
     fn grant(&mut self, plan: ReservationPlan) -> ReservationId {
-        assert!(plan.admitted <= self.admission_limit - self.admitted);
+        assert!(self.can_reserve(plan.reservation_size));
         let reservation = ReservationId(self.next_reservation);
         self.next_reservation += 1;
-        self.admitted += plan.admitted;
+        self.reserved_demand += plan.reservation_size;
         let previous = self.reservations.insert(
             reservation,
             ReservationState {
                 plan,
-                ticketed_live: 0,
+                direct_live: 0,
                 closing: false,
             },
         );
@@ -326,33 +338,39 @@ impl ElasticPoolModel {
                 .get_mut(&reservation)
                 .ok_or(ModelError::UnknownReservation)?;
             state.closing = true;
-            state.ticketed_live == 0
+            state.direct_live == 0
         };
 
-        let grants = if release_now {
-            self.release_admission(reservation)
-        } else {
-            Vec::new()
-        };
+        if release_now {
+            self.remove_reservation(reservation);
+        }
+        let grants = self.drain_waiters();
         self.assert_invariants();
         Ok(grants)
     }
 
-    fn release_admission(&mut self, reservation: ReservationId) -> Vec<GrantedWaiter> {
+    fn remove_reservation(&mut self, reservation: ReservationId) {
         let state = self
             .reservations
             .remove(&reservation)
             .expect("reservation must exist while releasing admission");
         assert!(state.closing);
-        assert_eq!(state.ticketed_live, 0);
-        self.admitted -= state.plan.admitted;
-        self.drain_waiters()
+        assert_eq!(state.direct_live, 0);
+        self.reserved_demand -= state.plan.reservation_size;
+
+        // Unreserved owners cannot be attributed to the reservation whose
+        // coverage disappeared. Preserve them as sticky debt instead of
+        // allowing a later reservation to absorb their existing demand.
+        let minimum_debt = self
+            .unreserved_live
+            .saturating_sub(self.unreserved_coverage());
+        self.unreserved_debt = self.unreserved_debt.max(minimum_debt);
     }
 
     fn drain_waiters(&mut self) -> Vec<GrantedWaiter> {
         let mut granted = Vec::new();
         while let Some(waiter) = self.waiters.front() {
-            if waiter.plan.admitted > self.admission_limit.saturating_sub(self.admitted) {
+            if !self.can_reserve(waiter.plan.reservation_size) {
                 break;
             }
             let waiter = self.waiters.pop_front().unwrap();
@@ -376,7 +394,7 @@ impl ElasticPoolModel {
         Ok(grants)
     }
 
-    fn acquire_ticketed(
+    fn acquire(
         &mut self,
         reservation: ReservationId,
         request: AcquireRequest,
@@ -389,8 +407,8 @@ impl ElasticPoolModel {
             if state.closing {
                 return Err(ModelError::ReservationClosing);
             }
-            if state.ticketed_live == state.plan.ticketed_max_live {
-                return Err(ModelError::TicketEnvelopeExceeded);
+            if state.direct_live == state.plan.direct_acquire_limit {
+                return Err(ModelError::ReservationEnvelopeExceeded);
             }
             if request.capability != state.plan.capability
                 || !request
@@ -400,11 +418,12 @@ impl ElasticPoolModel {
             {
                 return Err(ModelError::RequirementMismatch);
             }
-            state.ticketed_live += 1;
+            state.direct_live += 1;
         }
 
-        match self.acquire_physical(ClaimOwner::Ticketed(reservation), request) {
+        match self.acquire_physical(ClaimOwner::Reserved(reservation), request) {
             Ok(claim) => {
+                self.live += 1;
                 self.assert_invariants();
                 Ok(claim)
             }
@@ -412,7 +431,7 @@ impl ElasticPoolModel {
                 self.reservations
                     .get_mut(&reservation)
                     .expect("reservation remains live during acquisition")
-                    .ticketed_live -= 1;
+                    .direct_live -= 1;
                 self.assert_invariants();
                 Err(error)
             }
@@ -424,6 +443,12 @@ impl ElasticPoolModel {
         request: AcquireRequest,
     ) -> Result<ClaimedCarrier, ModelError> {
         let claim = self.acquire_physical(ClaimOwner::Unreserved, request)?;
+        let covered_live = self.unreserved_live - self.unreserved_debt;
+        if covered_live == self.unreserved_coverage() {
+            self.unreserved_debt += 1;
+        }
+        self.unreserved_live += 1;
+        self.live += 1;
         self.assert_invariants();
         Ok(claim)
     }
@@ -457,7 +482,7 @@ impl ElasticPoolModel {
             .expect("AcquireRequest affinity is validated at construction");
         let capability = request.capability.materialized();
 
-        if self.retained.len() < self.retained_capacity_limit {
+        if self.retained.len() < self.reusable_capacity_target {
             self.allocate()?;
             let id = self.next_carrier_id();
             self.retained.push(ReusableCarrier {
@@ -521,7 +546,7 @@ impl ElasticPoolModel {
                 && request.affinity.eligible.contains(carrier.home)
                 && request.capability.accepts(carrier.capability)
                 && carrier.alignment >= request.alignment
-                && carrier.alignment % request.alignment == 0
+                && carrier.alignment.is_multiple_of(request.alignment)
         };
 
         self.retained
@@ -571,9 +596,9 @@ impl ElasticPoolModel {
                 }
                 self.retained[index].owner = None;
 
-                // Lowering the retention policy turns returned excess carriers
+                // Lowering the reuse policy turns returned excess carriers
                 // into trim-on-return storage.
-                if self.retained.len() > self.retained_capacity_limit {
+                if self.retained.len() > self.reusable_capacity_target {
                     self.retained.remove(index);
                 }
             }
@@ -593,32 +618,36 @@ impl ElasticPoolModel {
             }
         }
 
-        let grants = match claim.owner {
-            ClaimOwner::Unreserved => Vec::new(),
-            ClaimOwner::Ticketed(reservation) => {
+        self.live -= 1;
+        match claim.owner {
+            ClaimOwner::Unreserved => {
+                self.unreserved_live -= 1;
+                self.unreserved_debt = self.unreserved_debt.saturating_sub(1);
+            }
+            ClaimOwner::Reserved(reservation) => {
                 let release_admission = {
                     let state = self
                         .reservations
                         .get_mut(&reservation)
                         .ok_or(ModelError::UnknownReservation)?;
-                    assert!(state.ticketed_live > 0);
-                    state.ticketed_live -= 1;
-                    state.closing && state.ticketed_live == 0
+                    assert!(state.direct_live > 0);
+                    state.direct_live -= 1;
+                    state.closing && state.direct_live == 0
                 };
                 if release_admission {
-                    self.release_admission(reservation)
-                } else {
-                    Vec::new()
+                    self.remove_reservation(reservation);
                 }
             }
-        };
+        }
+        let grants = self.drain_waiters();
         self.assert_invariants();
         Ok(grants)
     }
 
-    fn set_retained_capacity_limit(&mut self, limit: usize) {
-        self.retained_capacity_limit = limit;
-        while self.retained.len() > limit {
+    fn set_reusable_capacity_target(&mut self, target: usize) {
+        assert!(target <= self.configured_capacity);
+        self.reusable_capacity_target = target;
+        while self.retained.len() > target {
             let Some(index) = self
                 .retained
                 .iter()
@@ -635,15 +664,37 @@ impl ElasticPoolModel {
         self.fail_next_allocation = true;
     }
 
-    fn admitted(&self) -> usize {
-        self.admitted
+    fn can_reserve(&self, amount: usize) -> bool {
+        amount
+            <= self
+                .configured_capacity
+                .saturating_sub(self.admission_used())
     }
 
-    fn retained_capacity(&self) -> usize {
+    fn admission_used(&self) -> usize {
+        self.reserved_demand.saturating_add(self.unreserved_debt)
+    }
+
+    fn unreserved_coverage(&self) -> usize {
+        self.reservations
+            .values()
+            .map(|reservation| reservation.plan.unreserved_coverage())
+            .sum()
+    }
+
+    fn reserved_demand(&self) -> usize {
+        self.reserved_demand
+    }
+
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    fn reusable_capacity(&self) -> usize {
         self.retained.len()
     }
 
-    fn retained_live(&self) -> usize {
+    fn reusable_live(&self) -> usize {
         self.retained
             .iter()
             .filter(|carrier| carrier.owner.is_some())
@@ -654,8 +705,23 @@ impl ElasticPoolModel {
         self.overflow.len()
     }
 
-    fn ticketed_live(&self, reservation: ReservationId) -> usize {
-        self.reservations[&reservation].ticketed_live
+    fn free_reusable(&self) -> usize {
+        self.retained
+            .iter()
+            .filter(|carrier| carrier.owner.is_none())
+            .count()
+    }
+
+    fn mapped(&self) -> usize {
+        self.retained.len() + self.overflow.len()
+    }
+
+    fn unreserved_debt(&self) -> usize {
+        self.unreserved_debt
+    }
+
+    fn reservation_live(&self, reservation: ReservationId) -> usize {
+        self.reservations[&reservation].direct_live
     }
 
     fn stats(&self) -> AcquisitionStats {
@@ -663,28 +729,54 @@ impl ElasticPoolModel {
     }
 
     fn assert_invariants(&self) {
-        let admitted_from_reservations: usize = self
+        let reserved_from_reservations: usize = self
             .reservations
             .values()
-            .map(|reservation| reservation.plan.admitted)
+            .map(|reservation| reservation.plan.reservation_size)
             .sum();
-        assert_eq!(self.admitted, admitted_from_reservations);
-        assert!(self.admitted <= self.admission_limit);
+        assert_eq!(self.reserved_demand, reserved_from_reservations);
+        assert!(self.reserved_demand <= self.configured_capacity);
+        assert!(self.reusable_capacity_target <= self.configured_capacity);
 
         for (reservation_id, reservation) in &self.reservations {
-            assert!(reservation.ticketed_live <= reservation.plan.ticketed_max_live);
+            assert!(reservation.direct_live <= reservation.plan.direct_acquire_limit);
             let physical_live = self
                 .retained
                 .iter()
-                .filter(|carrier| carrier.owner == Some(ClaimOwner::Ticketed(*reservation_id)))
+                .filter(|carrier| carrier.owner == Some(ClaimOwner::Reserved(*reservation_id)))
                 .count()
                 + self
                     .overflow
                     .values()
-                    .filter(|carrier| carrier.owner == ClaimOwner::Ticketed(*reservation_id))
+                    .filter(|carrier| carrier.owner == ClaimOwner::Reserved(*reservation_id))
                     .count();
-            assert_eq!(reservation.ticketed_live, physical_live);
+            assert_eq!(reservation.direct_live, physical_live);
         }
+
+        let physical_unreserved_live = self
+            .retained
+            .iter()
+            .filter(|carrier| carrier.owner == Some(ClaimOwner::Unreserved))
+            .count()
+            + self
+                .overflow
+                .values()
+                .filter(|carrier| carrier.owner == ClaimOwner::Unreserved)
+                .count();
+        assert_eq!(self.unreserved_live, physical_unreserved_live);
+        assert!(self.unreserved_debt <= self.unreserved_live);
+        assert!(
+            self.unreserved_live - self.unreserved_debt <= self.unreserved_coverage(),
+            "covered unreserved owners must fit active reservation coverage"
+        );
+
+        let physical_live = self.reusable_live() + self.overflow.len();
+        assert_eq!(self.live, physical_live);
+        assert!(
+            self.live <= self.admission_used(),
+            "reservation plus sticky debt must cover all live carriers"
+        );
+        assert_eq!(self.free_reusable() + self.live, self.mapped());
 
         let mut ids: Vec<_> = self.retained.iter().map(|carrier| carrier.id).collect();
         ids.extend(self.overflow.keys().copied());
@@ -738,9 +830,15 @@ mod tests {
         )
     }
 
+    fn model(configured_capacity: usize, reusable_capacity_target: usize) -> ElasticPoolModel {
+        let mut pool = ElasticPoolModel::new(MIB, configured_capacity);
+        pool.set_reusable_capacity_target(reusable_capacity_target);
+        pool
+    }
+
     #[test]
-    fn admission_limit_and_retained_limit_are_independent() {
-        let mut pool = ElasticPoolModel::new(MIB, 8, 2);
+    fn reusable_target_does_not_cap_live_acquisition() {
+        let mut pool = model(8, 2);
         let ReserveOutcome::Ready(download) = pool.reserve(download_plan(8)) else {
             panic!("download should be admitted");
         };
@@ -749,8 +847,8 @@ mod tests {
         let second = pool.acquire_unreserved(ordinary_request()).unwrap();
         let third = pool.acquire_unreserved(ordinary_request()).unwrap();
 
-        assert_eq!(pool.admitted(), 8);
-        assert_eq!(pool.retained_capacity(), 2);
+        assert_eq!(pool.reserved_demand(), 8);
+        assert_eq!(pool.reusable_capacity(), 2);
         assert_eq!(pool.overflow_live(), 1);
         assert_eq!(third.source, AcquisitionSource::Overflow);
 
@@ -762,16 +860,62 @@ mod tests {
 
     #[test]
     fn unreserved_acquisition_requires_no_active_reservation() {
-        let mut pool = ElasticPoolModel::new(MIB, 8, 1);
+        let mut pool = model(8, 1);
         let claim = pool.acquire_unreserved(ordinary_request()).unwrap();
         assert_eq!(claim.source, AcquisitionSource::RetainedGrowth);
-        assert_eq!(pool.admitted(), 0);
+        assert_eq!(pool.reserved_demand(), 0);
+        assert_eq!(pool.unreserved_debt(), 1);
         pool.release(claim).unwrap();
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.unreserved_debt(), 0);
+        assert_eq!(pool.free_reusable(), 1);
+        assert_eq!(pool.mapped(), 1);
+    }
+
+    #[test]
+    fn new_reservations_do_not_absorb_existing_unreserved_debt() {
+        let mut pool = model(3, 3);
+        let ReserveOutcome::Ready(active) = pool.reserve(download_plan(1)) else {
+            panic!("first download should be admitted");
+        };
+        let first = pool.acquire_unreserved(ordinary_request()).unwrap();
+        let second = pool.acquire_unreserved(ordinary_request()).unwrap();
+
+        assert_eq!(pool.reserved_demand(), 1);
+        assert_eq!(pool.live(), 2);
+        assert_eq!(pool.unreserved_debt(), 1);
+        assert_eq!(pool.admission_used(), 2);
+
+        let ReserveOutcome::Ready(second_reservation) = pool.reserve(download_plan(1)) else {
+            panic!("one unit of admission headroom should remain");
+        };
+        assert_eq!(pool.reserved_demand(), 2);
+        assert_eq!(pool.unreserved_debt(), 1);
+        assert_eq!(pool.admission_used(), 3);
+
+        // The new reservation covers future unreserved demand without erasing
+        // the debt that was already live when it was granted.
+        let future = pool.acquire_unreserved(ordinary_request()).unwrap();
+        assert_eq!(pool.live(), 3);
+        assert_eq!(pool.unreserved_debt(), 1);
+
+        let ReserveOutcome::Pending(waiter) = pool.reserve(download_plan(1)) else {
+            panic!("sticky debt must prevent another reservation");
+        };
+
+        let grants = pool.release(first).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].waiter, waiter);
+        pool.release(second).unwrap();
+        pool.release(future).unwrap();
+        pool.close(active).unwrap();
+        pool.close(second_reservation).unwrap();
+        pool.close(grants[0].reservation).unwrap();
     }
 
     #[test]
     fn reusable_capacity_is_preferred_before_growth_or_overflow() {
-        let mut pool = ElasticPoolModel::new(MIB, 8, 2);
+        let mut pool = model(8, 2);
         let first = pool.acquire_unreserved(ordinary_request()).unwrap();
         assert_eq!(first.source, AcquisitionSource::RetainedGrowth);
         pool.release(first).unwrap();
@@ -791,7 +935,7 @@ mod tests {
 
     #[test]
     fn overflow_is_destroyed_on_return() {
-        let mut pool = ElasticPoolModel::new(MIB, 8, 1);
+        let mut pool = model(8, 1);
         let retained = pool.acquire_unreserved(ordinary_request()).unwrap();
         let overflow = pool.acquire_unreserved(ordinary_request()).unwrap();
         assert_eq!(overflow.source, AcquisitionSource::Overflow);
@@ -799,122 +943,152 @@ mod tests {
 
         pool.release(overflow).unwrap();
         assert_eq!(pool.overflow_live(), 0);
-        assert_eq!(pool.retained_capacity(), 1);
+        assert_eq!(pool.reusable_capacity(), 1);
         pool.release(retained).unwrap();
     }
 
     #[test]
-    fn anonymous_use_of_free_capacity_does_not_block_ticket_growth() {
-        let mut pool = ElasticPoolModel::new(MIB, 2, 1);
+    fn unreserved_use_of_free_capacity_does_not_block_reserved_growth() {
+        let mut pool = model(2, 1);
         let ReserveOutcome::Ready(upload) = pool.reserve(upload_plan(1)) else {
             panic!("upload should be admitted");
         };
-        let anonymous = pool.acquire_unreserved(ordinary_request()).unwrap();
-        let ticketed = pool.acquire_ticketed(upload, ordinary_request()).unwrap();
+        let unreserved = pool.acquire_unreserved(ordinary_request()).unwrap();
+        let reserved = pool.acquire(upload, ordinary_request()).unwrap();
 
-        assert_eq!(anonymous.source, AcquisitionSource::RetainedGrowth);
-        assert_eq!(ticketed.source, AcquisitionSource::Overflow);
-        assert_eq!(pool.ticketed_live(upload), 1);
+        assert_eq!(unreserved.source, AcquisitionSource::RetainedGrowth);
+        assert_eq!(reserved.source, AcquisitionSource::Overflow);
+        assert_eq!(pool.reservation_live(upload), 1);
 
-        pool.release(anonymous).unwrap();
+        pool.release(unreserved).unwrap();
         pool.close(upload).unwrap();
-        pool.release(ticketed).unwrap();
+        pool.release(reserved).unwrap();
     }
 
     #[test]
     fn admission_being_full_does_not_reject_unreserved_acquisition() {
-        let mut pool = ElasticPoolModel::new(MIB, 1, 0);
+        let mut pool = model(1, 0);
         let ReserveOutcome::Ready(reservation) = pool.reserve(download_plan(1)) else {
             panic!("download should be admitted");
         };
 
         let claim = pool.acquire_unreserved(ordinary_request()).unwrap();
         assert_eq!(claim.source, AcquisitionSource::Overflow);
-        assert_eq!(pool.admitted(), 1);
+        assert_eq!(pool.reserved_demand(), 1);
 
         pool.release(claim).unwrap();
         pool.close(reservation).unwrap();
     }
 
     #[test]
-    fn ticket_envelope_limits_direct_live_ownership_only() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 4);
+    fn reservation_envelope_limits_direct_live_ownership_only() {
+        let mut pool = model(4, 4);
         let ReserveOutcome::Ready(upload) = pool.reserve(upload_plan(1)) else {
             panic!("upload should be admitted");
         };
 
-        let ticketed = pool.acquire_ticketed(upload, ordinary_request()).unwrap();
+        let reserved = pool.acquire(upload, ordinary_request()).unwrap();
         assert_eq!(
-            pool.acquire_ticketed(upload, ordinary_request()),
-            Err(ModelError::TicketEnvelopeExceeded)
+            pool.acquire(upload, ordinary_request()),
+            Err(ModelError::ReservationEnvelopeExceeded)
         );
 
-        let anonymous = pool.acquire_unreserved(ordinary_request()).unwrap();
-        pool.release(anonymous).unwrap();
-        pool.release(ticketed).unwrap();
+        let unreserved = pool.acquire_unreserved(ordinary_request()).unwrap();
+        pool.release(unreserved).unwrap();
+        pool.release(reserved).unwrap();
         pool.close(upload).unwrap();
     }
 
     #[test]
-    fn allocation_failure_rolls_back_ticket_live_count() {
-        let mut pool = ElasticPoolModel::new(MIB, 2, 1);
+    fn allocation_failure_rolls_back_reservation_live_count() {
+        let mut pool = model(2, 1);
         let ReserveOutcome::Ready(upload) = pool.reserve(upload_plan(1)) else {
             panic!("upload should be admitted");
         };
         pool.fail_next_allocation();
 
         assert_eq!(
-            pool.acquire_ticketed(upload, ordinary_request()),
+            pool.acquire(upload, ordinary_request()),
             Err(ModelError::AllocationFailed)
         );
-        assert_eq!(pool.ticketed_live(upload), 0);
+        assert_eq!(pool.reservation_live(upload), 0);
 
-        let retry = pool.acquire_ticketed(upload, ordinary_request()).unwrap();
+        let retry = pool.acquire(upload, ordinary_request()).unwrap();
         pool.release(retry).unwrap();
         pool.close(upload).unwrap();
     }
 
     #[test]
-    fn closing_ticketed_reservation_waits_for_final_owner() {
-        let mut pool = ElasticPoolModel::new(MIB, 1, 1);
+    fn closing_reserved_reservation_waits_for_final_owner() {
+        let mut pool = model(1, 1);
         let ReserveOutcome::Ready(first) = pool.reserve(upload_plan(1)) else {
             panic!("first upload should be admitted");
         };
-        let owner = pool.acquire_ticketed(first, ordinary_request()).unwrap();
+        let owner = pool.acquire(first, ordinary_request()).unwrap();
         let ReserveOutcome::Pending(waiter) = pool.reserve(upload_plan(1)) else {
             panic!("second upload should wait");
         };
 
         assert!(pool.close(first).unwrap().is_empty());
-        assert_eq!(pool.admitted(), 1);
+        assert_eq!(pool.reserved_demand(), 1);
 
         let grants = pool.release(owner).unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].waiter, waiter);
-        assert_eq!(pool.admitted(), 1);
+        assert_eq!(pool.reserved_demand(), 1);
         pool.close(grants[0].reservation).unwrap();
     }
 
     #[test]
-    fn download_admission_lifetime_is_not_inferred_from_anonymous_owner() {
-        let mut pool = ElasticPoolModel::new(MIB, 1, 1);
+    fn closing_download_converts_live_unreserved_owners_to_debt() {
+        let mut pool = model(1, 1);
         let ReserveOutcome::Ready(download) = pool.reserve(download_plan(1)) else {
             panic!("download should be admitted");
         };
         let owner = pool.acquire_unreserved(ordinary_request()).unwrap();
+        let ReserveOutcome::Pending(waiter) = pool.reserve(download_plan(1)) else {
+            panic!("next download should wait");
+        };
 
-        // The caller must carry the admission guard into output. The request-
-        // blind pool cannot infer this relationship.
-        pool.close(download).unwrap();
-        assert_eq!(pool.admitted(), 0);
-        assert_eq!(pool.retained_live(), 1);
+        assert!(pool.close(download).unwrap().is_empty());
+        assert_eq!(pool.reserved_demand(), 0);
+        assert_eq!(pool.reusable_live(), 1);
+        assert_eq!(pool.unreserved_debt(), 1);
+        assert_eq!(pool.admission_used(), 1);
 
-        pool.release(owner).unwrap();
+        let grants = pool.release(owner).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].waiter, waiter);
+        pool.close(grants[0].reservation).unwrap();
+    }
+
+    #[test]
+    fn reserved_carrier_return_does_not_repay_unreserved_debt() {
+        let mut pool = model(2, 2);
+        let ReserveOutcome::Ready(upload) = pool.reserve(upload_plan(1)) else {
+            panic!("upload should be admitted");
+        };
+        let reserved = pool.acquire(upload, ordinary_request()).unwrap();
+        let unreserved = pool.acquire_unreserved(ordinary_request()).unwrap();
+        let ReserveOutcome::Pending(waiter) = pool.reserve(download_plan(1)) else {
+            panic!("download should wait for admission headroom");
+        };
+
+        assert!(pool.release(reserved).unwrap().is_empty());
+        assert_eq!(pool.unreserved_debt(), 1);
+        assert_eq!(pool.admission_used(), 2);
+
+        let grants = pool.close(upload).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].waiter, waiter);
+
+        pool.release(unreserved).unwrap();
+        pool.close(grants[0].reservation).unwrap();
     }
 
     #[test]
     fn strict_fifo_prevents_small_work_bypassing_large_waiter() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 1);
+        let mut pool = model(4, 1);
         let ReserveOutcome::Ready(active) = pool.reserve(download_plan(3)) else {
             panic!("first work should be admitted");
         };
@@ -936,7 +1110,7 @@ mod tests {
 
     #[test]
     fn cancelling_head_waiter_allows_smaller_work_to_run() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 1);
+        let mut pool = model(4, 1);
         let ReserveOutcome::Ready(active) = pool.reserve(download_plan(3)) else {
             panic!("first work should be admitted");
         };
@@ -956,7 +1130,7 @@ mod tests {
 
     #[test]
     fn preferred_domain_wins_but_other_eligible_capacity_is_reusable() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 2);
+        let mut pool = model(4, 2);
         let on_one = AcquireRequest::new(
             MIB,
             4096,
@@ -976,7 +1150,7 @@ mod tests {
 
     #[test]
     fn ordinary_use_can_borrow_fixed_capacity_and_fixed_demand_can_overflow() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 1);
+        let mut pool = model(4, 1);
         let fixed_request = AcquireRequest::new(
             MIB,
             4096,
@@ -998,8 +1172,8 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_retained_capacity_does_not_prevent_progress() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 1);
+    fn incompatible_reusable_capacity_does_not_prevent_progress() {
+        let mut pool = model(4, 1);
         let fixed_request = AcquireRequest::new(
             MIB,
             4096,
@@ -1021,18 +1195,18 @@ mod tests {
     }
 
     #[test]
-    fn lowering_retention_limit_trims_free_then_live_on_return() {
-        let mut pool = ElasticPoolModel::new(MIB, 4, 2);
+    fn lowering_reusable_target_trims_free_then_live_on_return() {
+        let mut pool = model(4, 2);
         let first = pool.acquire_unreserved(ordinary_request()).unwrap();
         let second = pool.acquire_unreserved(ordinary_request()).unwrap();
         pool.release(first).unwrap();
-        assert_eq!(pool.retained_capacity(), 2);
+        assert_eq!(pool.reusable_capacity(), 2);
 
-        pool.set_retained_capacity_limit(0);
-        assert_eq!(pool.retained_capacity(), 1);
-        assert_eq!(pool.retained_live(), 1);
+        pool.set_reusable_capacity_target(0);
+        assert_eq!(pool.reusable_capacity(), 1);
+        assert_eq!(pool.reusable_live(), 1);
 
         pool.release(second).unwrap();
-        assert_eq!(pool.retained_capacity(), 0);
+        assert_eq!(pool.reusable_capacity(), 0);
     }
 }

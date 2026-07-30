@@ -6,7 +6,7 @@
 //! Executable model for deriving planned per-work memory demand.
 //!
 //! This is intentionally test-only. Admission limits scheduled demand; it does
-//! not escrow physical carriers. Ticketed and shared Hyper acquisitions both
+//! not escrow physical carriers. Reserved and shared Hyper acquisitions both
 //! use the pool's elastic acquisition path.
 
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -34,25 +34,25 @@ impl CarrierGeometry {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WorkMemoryRequirement {
     /// Expected maximum simultaneously live pool-sized carriers.
-    admitted_carriers: usize,
+    reservation_size: usize,
     /// Subset acquired directly by TM through the reservation.
     ///
     /// Shared Hyper acquisitions are not attributed to this field.
-    ticketed_carriers: usize,
+    direct_acquire_limit: usize,
 }
 
 impl WorkMemoryRequirement {
-    fn planned_anonymous(admitted_carriers: usize) -> Self {
+    fn planned_unreserved(reservation_size: usize) -> Self {
         Self {
-            admitted_carriers,
-            ticketed_carriers: 0,
+            reservation_size,
+            direct_acquire_limit: 0,
         }
     }
 
-    fn ticketed(ticketed_carriers: usize) -> Self {
+    fn direct(reservation_size: usize) -> Self {
         Self {
-            admitted_carriers: ticketed_carriers,
-            ticketed_carriers,
+            reservation_size,
+            direct_acquire_limit: reservation_size,
         }
     }
 }
@@ -115,7 +115,7 @@ fn request_body_requirement(
         RequestStorage::PooledRetained { max_bytes } => geometry.carriers_for(max_bytes)?,
         RequestStorage::PooledStreaming { max_live_carriers } => max_live_carriers.get(),
     };
-    Ok(WorkMemoryRequirement::ticketed(carriers))
+    Ok(WorkMemoryRequirement::direct(carriers))
 }
 
 /// The exact successful range is planned scheduler demand. Hyper acquires its
@@ -124,7 +124,7 @@ fn ranged_get(
     geometry: CarrierGeometry,
     range_length: u64,
 ) -> Result<WorkMemoryRequirement, ModelError> {
-    Ok(WorkMemoryRequirement::planned_anonymous(
+    Ok(WorkMemoryRequirement::planned_unreserved(
         geometry.carriers_for(range_length)?,
     ))
 }
@@ -174,8 +174,8 @@ mod tests {
         assert_eq!(
             ranged_get(geometry(), 8 * MIB).unwrap(),
             WorkMemoryRequirement {
-                admitted_carriers: 8,
-                ticketed_carriers: 0,
+                reservation_size: 8,
+                direct_acquire_limit: 0,
             }
         );
     }
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn pooled_upload_body_is_both_admitted_and_ticketed() {
+    fn pooled_upload_body_reserves_its_direct_acquire_limit() {
         assert_eq!(
             upload(
                 geometry(),
@@ -194,8 +194,8 @@ mod tests {
             )
             .unwrap(),
             WorkMemoryRequirement {
-                admitted_carriers: 8,
-                ticketed_carriers: 8,
+                reservation_size: 8,
+                direct_acquire_limit: 8,
             }
         );
     }
@@ -219,8 +219,8 @@ mod tests {
             )
             .unwrap(),
             WorkMemoryRequirement {
-                admitted_carriers: 4,
-                ticketed_carriers: 4,
+                reservation_size: 4,
+                direct_acquire_limit: 4,
             }
         );
     }

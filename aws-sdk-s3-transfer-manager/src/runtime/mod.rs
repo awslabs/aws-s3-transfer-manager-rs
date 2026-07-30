@@ -19,6 +19,8 @@ pub(crate) use topology::Topology;
 #[cfg(test)]
 mod buffer_pool_model;
 #[cfg(test)]
+mod carrier_ownership_model;
+#[cfg(test)]
 mod elastic_buffer_pool_model;
 pub(crate) mod memory;
 #[cfg(test)]
