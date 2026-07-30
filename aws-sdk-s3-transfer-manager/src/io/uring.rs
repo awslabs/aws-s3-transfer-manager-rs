@@ -33,9 +33,34 @@ use io_uring::{opcode, types, IoUring};
 /// platforms, so it is used as a safe static bound.
 pub(crate) const DIRECT_IO_ALIGN: u64 = 4096;
 
-/// Size of each staging buffer. One drain run is often many parts coalesced, and
-/// runs larger than a buffer are written in buffer-sized slices.
-const STAGING_BUF_SIZE: usize = 8 * 1024 * 1024;
+/// Default size of each staging buffer, and therefore the size of each write the
+/// device actually sees.
+///
+/// This is *not* the part size. A run larger than one buffer is issued as several
+/// buffer-sized writes, so this constant — not the transfer's part size — bounds
+/// the write size reaching the disk.
+///
+/// Write size dominates throughput on a striped array: on a nine-volume gp3 RAID0,
+/// a single outstanding 8 MiB write sustains ~1.4 GiB/s while a single 128 MiB
+/// write sustains ~15 GiB/s. Override with `S3_TM_DIRECT_IO_BLOCK_MIB`.
+const DEFAULT_STAGING_BUF_MIB: usize = 8;
+
+/// Resolve the staging buffer size in bytes, clamped to a sane range.
+///
+/// Configured in whole MiB rather than bytes so the result is always a multiple of
+/// the direct-I/O alignment and cannot be set to a value `O_DIRECT` would reject.
+fn staging_buf_size() -> usize {
+    let mib = std::env::var("S3_TM_DIRECT_IO_BLOCK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|m| m.clamp(1, 1024))
+        .unwrap_or(DEFAULT_STAGING_BUF_MIB);
+    mib * 1024 * 1024
+}
+
+/// Guards the one-time write-size printout. Process-wide rather than per-sink so
+/// a multi-file transfer reports it once instead of once per output file.
+static S_WRITE_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// Number of O_DIRECT writes kept in flight per sink, and therefore the number
 /// of staging buffers allocated.
@@ -45,7 +70,7 @@ const STAGING_BUF_SIZE: usize = 8 * 1024 * 1024;
 /// caps a serial issuer near 10 GiB/s, and far lower when latency is higher.
 /// Keeping several writes outstanding lets the device overlap them.
 ///
-/// The cost is memory: `depth * STAGING_BUF_SIZE` per output file, charged
+/// The cost is memory: `depth * staging_buf_size()` per output file, charged
 /// outside the transfer manager's memory budget. The default is deliberately
 /// modest; override with `S3_TM_DIRECT_IO_QUEUE_DEPTH`.
 const DEFAULT_QUEUE_DEPTH: usize = 16;
@@ -292,9 +317,10 @@ impl UringDirectSink {
             Ok(r) => r,
             Err(e) => return Err((e, fallback_file)),
         };
+        let buf_size = staging_buf_size();
         let mut staging = Vec::with_capacity(depth);
         for _ in 0..depth {
-            match AlignedBuf::new(STAGING_BUF_SIZE, DIRECT_IO_ALIGN as usize) {
+            match AlignedBuf::new(buf_size, DIRECT_IO_ALIGN as usize) {
                 Ok(b) => staging.push(b),
                 Err(e) => return Err((e, fallback_file)),
             }
@@ -408,6 +434,29 @@ impl UringDirectSink {
 
             expected[slot] = filled;
             let ptr = staging[slot].ptr;
+
+            // Print the real per-write size exactly once for the process. This is
+            // not the part size: a run larger than one staging buffer is issued as
+            // several buffer-sized writes, so the part size does not determine the
+            // size the device actually sees.
+            S_WRITE_SIZE_ONCE.call_once(|| {
+                // Re-read config rather than plumb the values down: this runs once,
+                // and it reads the same source the sink was constructed from.
+                let cap = staging_buf_size();
+                let d = queue_depth();
+                println!(
+                    "[TM] O_DIRECT write size: {} bytes ({:.2} MiB) per write \
+                     -- staging buffer is {:.2} MiB (S3_TM_DIRECT_IO_BLOCK_MIB), \
+                     depth {} (S3_TM_DIRECT_IO_QUEUE_DEPTH), \
+                     {:.2} MiB of staging per file",
+                    filled,
+                    filled as f64 / (1024.0 * 1024.0),
+                    cap as f64 / (1024.0 * 1024.0),
+                    d,
+                    (cap * d) as f64 / (1024.0 * 1024.0),
+                );
+            });
+
             let sqe = opcode::Write::new(fd, ptr, filled as u32)
                 .offset(pos)
                 .build()
@@ -619,7 +668,8 @@ mod tests {
         let Some(sink) = new_sink(&path) else { return };
 
         // 1.5x the staging buffer forces the slice loop to run twice.
-        let total = STAGING_BUF_SIZE + STAGING_BUF_SIZE / 2;
+        let buf_size = super::staging_buf_size();
+        let total = buf_size + buf_size / 2;
         assert_eq!(total % ALIGN, 0);
         let mut expected = Vec::with_capacity(total);
         let mut buf = SegmentedBuf::new();
