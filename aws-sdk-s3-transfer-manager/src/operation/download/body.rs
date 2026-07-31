@@ -416,7 +416,7 @@ pub(crate) fn new_recv_body_with_sink(
 /// Select the concrete [`SinkWrite`] for a file target.
 fn make_file_sink(file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
     #[cfg(target_os = "linux")]
-    if std::env::var_os("S3_TM_DIRECT_IO").is_some_and(|v| v == "1") {
+    if crate::io::uring::direct_io_enabled() {
         // Try to reopen with O_DIRECT; fall back to buffered on failure. The
         // fallback file is consumed by the direct sink for unaligned writes.
         match crate::io::uring::UringDirectSink::new(file, owns_file) {

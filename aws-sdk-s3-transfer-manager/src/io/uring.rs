@@ -7,9 +7,10 @@
 //!
 //! Bypasses the page cache (`O_DIRECT`) using positioned writes against a
 //! descriptor opened with `O_DIRECT`. Network `Bytes` segments are aligned at
-//! receive time via [`align_bytes()`], so by the time data reaches the write
-//! path, every segment is already page-aligned and can be passed directly to
-//! the kernel — no staging-buffer copy, no io_uring.
+//! receive time: the body reader accumulates each part into one page-aligned
+//! [`AlignedBuf`], so a part reaches the write path as a single segment whose
+//! address AND length are page multiples and can be passed directly to the
+//! kernel — no staging-buffer copy, no io_uring.
 //!
 //! Alignment is checked upfront: a write whose file position or length is not a
 //! multiple of the direct-I/O alignment falls back to the buffered `pwritev`
@@ -30,83 +31,117 @@ use std::os::fd::AsRawFd;
 /// platforms, so it is used as a safe static bound.
 pub(crate) const DIRECT_IO_ALIGN: u64 = 4096;
 
-/// A heap buffer with guaranteed page alignment, usable as a `Bytes` owner.
-struct AlignedVec {
-    ptr: *mut u8,
-    len: usize,
-    layout: std::alloc::Layout,
+/// Whether the O_DIRECT download write path is requested.
+///
+/// Single source of truth: both the sink selection (`make_file_sink`) and the
+/// receive-time alignment in the body reader gate on this, so the two can never
+/// disagree. Disagreement would hand unaligned buffers to an O_DIRECT sink.
+pub(crate) fn direct_io_enabled() -> bool {
+    std::env::var_os("S3_TM_DIRECT_IO").is_some_and(|v| v == "1")
 }
 
-// Owned exclusively — safe to send across threads.
-unsafe impl Send for AlignedVec {}
-unsafe impl Sync for AlignedVec {}
+/// A growable heap buffer whose base address is always page-aligned.
+///
+/// Used to accumulate a whole part's worth of network segments into one
+/// contiguous, page-aligned allocation. O_DIRECT constrains the buffer address,
+/// the file offset, AND the length — so a part must arrive at the write path as
+/// a single segment of page-multiple length, not as a chain of arbitrarily sized
+/// network chunks.
+pub(crate) struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
 
-impl AlignedVec {
-    /// Allocate `len` bytes at page alignment and copy `src` into it.
-    fn copy_from(src: &[u8]) -> io::Result<Self> {
-        let len = src.len();
-        if len == 0 {
-            return Ok(Self {
-                ptr: std::ptr::NonNull::dangling().as_ptr(),
-                len: 0,
-                layout: std::alloc::Layout::from_size_align(0, DIRECT_IO_ALIGN as usize).unwrap(),
-            });
-        }
-        let layout = std::alloc::Layout::from_size_align(len, DIRECT_IO_ALIGN as usize)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+// The allocation is owned exclusively by this struct (no aliasing).
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+
+impl AlignedBuf {
+    fn layout_for(cap: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(cap, DIRECT_IO_ALIGN as usize)
+            .expect("capacity within isize::MAX with page alignment")
+    }
+
+    /// Allocate with room for `cap` bytes (rounded up to a page multiple).
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        let cap = cap.next_multiple_of(DIRECT_IO_ALIGN as usize).max(DIRECT_IO_ALIGN as usize);
+        let layout = Self::layout_for(cap);
         // SAFETY: layout has non-zero size.
         let ptr = unsafe { std::alloc::alloc(layout) };
         if ptr.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "aligned buffer allocation failed",
-            ));
+            std::alloc::handle_alloc_error(layout);
         }
-        // SAFETY: ptr is valid for len bytes.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, len) };
-        Ok(Self { ptr, len, layout })
+        Self { ptr, len: 0, cap }
+    }
+
+    /// Grow to hold at least `needed` total bytes, preserving contents.
+    fn reserve(&mut self, needed: usize) {
+        if needed <= self.cap {
+            return;
+        }
+        let new_cap = needed
+            .max(self.cap * 2)
+            .next_multiple_of(DIRECT_IO_ALIGN as usize);
+        let new_layout = Self::layout_for(new_cap);
+        // SAFETY: new_layout has non-zero size.
+        let new_ptr = unsafe { std::alloc::alloc(new_layout) };
+        if new_ptr.is_null() {
+            std::alloc::handle_alloc_error(new_layout);
+        }
+        // SAFETY: both allocations are valid for self.len bytes and disjoint.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
+            std::alloc::dealloc(self.ptr, Self::layout_for(self.cap));
+        }
+        self.ptr = new_ptr;
+        self.cap = new_cap;
+    }
+
+    /// Append `src`, growing the allocation if needed.
+    pub(crate) fn extend_from_slice(&mut self, src: &[u8]) {
+        if src.is_empty() {
+            return;
+        }
+        self.reserve(self.len + src.len());
+        // SAFETY: reserve() guarantees capacity for len + src.len() bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(self.len), src.len()) };
+        self.len += src.len();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Freeze into a `Bytes` that keeps the page-aligned allocation alive.
+    ///
+    /// The resulting `Bytes` has a page-aligned address; its length is whatever
+    /// was accumulated. A page-multiple length means the write path can hand it
+    /// straight to an O_DIRECT `write()`; otherwise (the object's tail part) the
+    /// sink's upfront alignment check routes the run to the buffered fallback.
+    pub(crate) fn into_bytes(self) -> bytes::Bytes {
+        if self.len == 0 {
+            return bytes::Bytes::new();
+        }
+        bytes::Bytes::from_owner(self)
     }
 }
 
-impl AsRef<[u8]> for AlignedVec {
+impl AsRef<[u8]> for AlignedBuf {
     fn as_ref(&self) -> &[u8] {
         if self.len == 0 {
             return &[];
         }
-        // SAFETY: ptr is valid for len bytes and exclusively owned.
+        // SAFETY: ptr is valid for len initialized bytes and exclusively owned.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-impl Drop for AlignedVec {
+impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        if self.len > 0 {
-            // SAFETY: allocated with the same layout.
-            unsafe { std::alloc::dealloc(self.ptr, self.layout) };
-        }
+        // SAFETY: allocated with this layout in with_capacity()/reserve().
+        unsafe { std::alloc::dealloc(self.ptr, Self::layout_for(self.cap)) };
     }
-}
-
-/// Copy `data` into a page-aligned `Bytes`.
-///
-/// Call this in the network receive loop so that by the time data reaches the
-/// O_DIRECT write path, every segment is already aligned and can be passed
-/// directly to the kernel — no staging-buffer gather copy needed.
-///
-/// Fast path: if the buffer is already page-aligned, returns it unchanged
-/// (zero-copy, just a pointer check).
-pub(crate) fn align_bytes(data: bytes::Bytes) -> bytes::Bytes {
-    if data.is_empty() {
-        return data;
-    }
-    // Fast path: already aligned — just return it.
-    if data.as_ptr() as usize % DIRECT_IO_ALIGN as usize == 0 {
-        return data;
-    }
-    // Copy into a page-aligned allocation.
-    let aligned = AlignedVec::copy_from(&data)
-        .expect("page-aligned allocation for O_DIRECT receive buffer");
-    bytes::Bytes::from_owner(aligned)
 }
 
 /// O_DIRECT write target for a single output file.
@@ -197,8 +232,9 @@ impl UringDirectSink {
     }
 
     /// Whether a positioned write of `len` bytes at `pos` satisfies the
-    /// O_DIRECT constraints (position, length, and — via `align_bytes()` at
-    /// receive time — buffer address are all multiples of `DIRECT_IO_ALIGN`).
+    /// O_DIRECT constraints. Buffer address alignment is supplied by the
+    /// receive-time [`AlignedBuf`] accumulation; only position and length are
+    /// checked here.
     fn is_aligned(pos: u64, len: u64) -> bool {
         pos % DIRECT_IO_ALIGN == 0 && len % DIRECT_IO_ALIGN == 0 && len > 0
     }
@@ -218,9 +254,15 @@ impl UringDirectSink {
     }
     /// Write aligned segments directly to the O_DIRECT descriptor.
     ///
-    /// Precondition: every segment in `buf` is page-aligned (guaranteed when
-    /// `align_bytes()` was applied at receive time). The staging buffer is not
-    /// used — each segment is passed directly to the kernel.
+    /// Precondition: every segment in `buf` is page-aligned in BOTH address and
+    /// length. The body reader guarantees this by accumulating each part into a
+    /// single [`AlignedBuf`]; a part whose length is not a page multiple (the
+    /// object's tail) is rejected by [`Self::is_aligned`] before reaching here
+    /// and takes the buffered fallback instead.
+    ///
+    /// The checks are real returns, not `debug_assert`s: a violation in a release
+    /// build would otherwise surface as a bare `EINVAL` from the kernel with no
+    /// indication of which constraint was broken.
     fn write_direct(
         &self,
         buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
@@ -233,17 +275,20 @@ impl UringDirectSink {
         while buf.has_remaining() {
             let chunk = buf.chunk();
             let len = chunk.len();
+            let addr = chunk.as_ptr() as u64;
 
-            debug_assert_eq!(
-                chunk.as_ptr() as u64 % DIRECT_IO_ALIGN,
-                0,
-                "segment buffer address must be page-aligned (use align_bytes at receive time)"
-            );
-            debug_assert_eq!(
-                len as u64 % DIRECT_IO_ALIGN,
-                0,
-                "callers only route fully-aligned writes here"
-            );
+            if addr % DIRECT_IO_ALIGN != 0 || len as u64 % DIRECT_IO_ALIGN != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "O_DIRECT requires page-aligned address and length, got \
+                         addr%{align}={addr_rem} len={len} (len%{align}={len_rem}) at pos={pos}",
+                        align = DIRECT_IO_ALIGN,
+                        addr_rem = addr % DIRECT_IO_ALIGN,
+                        len_rem = len as u64 % DIRECT_IO_ALIGN,
+                    ),
+                ));
+            }
 
             f.seek(SeekFrom::Start(pos))?;
             f.write_all(chunk)?;
@@ -361,10 +406,17 @@ mod tests {
         }
     }
 
+    /// Build a page-aligned `Bytes` the way the body reader does.
+    fn aligned(src: &[u8]) -> Bytes {
+        let mut b = AlignedBuf::with_capacity(src.len());
+        b.extend_from_slice(src);
+        b.into_bytes()
+    }
+
     fn seg(chunks: &[&[u8]]) -> SegmentedBuf<Bytes> {
         let mut s = SegmentedBuf::new();
         for c in chunks {
-            s.push(super::align_bytes(Bytes::copy_from_slice(c)));
+            s.push(aligned(c));
         }
         s
     }
@@ -402,23 +454,43 @@ mod tests {
     }
 
     #[test]
-    fn align_bytes_produces_page_aligned_buffer() {
-        // Verify that align_bytes produces a page-aligned Bytes from unaligned input.
+    fn aligned_buf_is_page_aligned_and_preserves_content() {
         let data = vec![0xABu8; 8192];
-        let unaligned = Bytes::copy_from_slice(&data);
-        let aligned = super::align_bytes(unaligned);
-        assert_eq!(aligned.as_ptr() as usize % ALIGN, 0);
-        assert_eq!(&aligned[..], &data[..]);
+        let b = aligned(&data);
+        assert_eq!(b.as_ptr() as usize % ALIGN, 0);
+        assert_eq!(&b[..], &data[..]);
     }
 
     #[test]
-    fn align_bytes_passthrough_when_already_aligned() {
-        // If the input happens to be aligned, align_bytes returns it unchanged.
-        let aligned_vec = super::AlignedVec::copy_from(&[0x42u8; 4096]).unwrap();
-        let original_ptr = aligned_vec.ptr;
-        let b = bytes::Bytes::from_owner(aligned_vec);
-        let result = super::align_bytes(b);
-        assert_eq!(result.as_ptr(), original_ptr);
+    fn aligned_buf_stays_aligned_across_growth() {
+        // Accumulate many arbitrarily-sized network-like chunks; the frozen
+        // buffer must be one contiguous page-aligned segment.
+        let mut b = AlignedBuf::with_capacity(0);
+        let mut expected = Vec::new();
+        for i in 0..200u32 {
+            let chunk = vec![(i % 251) as u8; 1000 + (i as usize % 7)];
+            expected.extend_from_slice(&chunk);
+            b.extend_from_slice(&chunk);
+        }
+        assert_eq!(b.len(), expected.len());
+        let frozen = b.into_bytes();
+        assert_eq!(frozen.as_ptr() as usize % ALIGN, 0);
+        assert_eq!(&frozen[..], &expected[..]);
+    }
+
+    #[test]
+    fn unaligned_length_is_rejected_not_einval() {
+        // A page-aligned address with a non-page-multiple length must produce a
+        // descriptive error from write_direct rather than a bare EINVAL.
+        let dir = test_dir();
+        let path = dir.path().join("badlen.bin");
+        let Some(sink) = new_sink(&path) else { return };
+
+        let mut buf = SegmentedBuf::new();
+        buf.push(aligned(&vec![0u8; ALIGN + 7]));
+        let err = sink.write_direct(&mut buf, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("page-aligned"), "{err}");
     }
 
     #[test]
@@ -433,7 +505,7 @@ mod tests {
         for i in 0..4u8 {
             let chunk = vec![i; ALIGN];
             expected.extend_from_slice(&chunk);
-            buf.push(super::align_bytes(Bytes::from(chunk)));
+            buf.push(aligned(&chunk));
         }
 
         sink.write_all_at(&mut buf, 0).unwrap();
@@ -455,7 +527,7 @@ mod tests {
         for i in 0..(total / seg_size) {
             let chunk = vec![(i % 251) as u8; seg_size];
             expected.extend_from_slice(&chunk);
-            buf.push(super::align_bytes(Bytes::from(chunk)));
+            buf.push(aligned(&chunk));
         }
 
         sink.write_all_at(&mut buf, 0).unwrap();

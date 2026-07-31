@@ -710,6 +710,7 @@ impl DownloadTransfer {
             .and_then(crate::http::header::parse_content_range);
 
         let mut initial = Some(stream);
+        let body_len_hint = chunk_meta.content_length.and_then(|n| u64::try_from(n).ok());
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
@@ -763,7 +764,7 @@ impl DownloadTransfer {
                     }
                 };
                 // Untimed: drain the body. Errors here are inner (retryable IO).
-                Self::read_body_stream(&ctx, body)
+                Self::read_body_stream(&ctx, body, body_len_hint)
                     .await
                     .map_err(crate::retry::GuardError::Inner)
             }
@@ -845,34 +846,54 @@ impl DownloadTransfer {
     /// to avoid masking corruption), any other stream failure becomes
     /// [`ErrorKind::IOError`] (the body-read class the classifier re-issues). A
     /// cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`].
+    /// `expected_len` is a capacity hint for the O_DIRECT accumulation path (the
+    /// requested range length); it only avoids a realloc and does not need to be
+    /// exact.
     async fn read_body_stream(
         ctx: &TransferContext,
         body: aws_sdk_s3::primitives::ByteStream,
+        expected_len: Option<u64>,
     ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
         let mut segmented = SegmentedBuf::new();
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
-        let align = ctx.handle.runtime.components().direct_io();
+
+        // O_DIRECT constrains buffer address, file offset, AND length. Network
+        // chunks satisfy none of these, so when the direct sink is in use each
+        // part is accumulated into ONE page-aligned buffer here — overlapping
+        // the copy with network I/O — and reaches the write path as a single
+        // aligned segment. Pushing chunks individually cannot work: their
+        // lengths are arbitrary, so the kernel rejects the write (EINVAL) and
+        // the running file offset loses alignment.
+        #[cfg(target_os = "linux")]
+        let mut aligned = crate::io::uring::direct_io_enabled().then(|| {
+            crate::io::uring::AlignedBuf::with_capacity(expected_len.unwrap_or(0) as usize)
+        });
 
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
-            // When O_DIRECT is enabled, copy each network chunk into a
-            // page-aligned buffer here (overlapping with network I/O) so the
-            // write path can hand it directly to the kernel without a staging
-            // buffer copy.
+
             #[cfg(target_os = "linux")]
-            let data = if align {
-                crate::io::uring::align_bytes(data)
-            } else {
-                data
-            };
+            match aligned.as_mut() {
+                Some(buf) => buf.extend_from_slice(&data),
+                None => segmented.push(data),
+            }
+            #[cfg(not(target_os = "linux"))]
             segmented.push(data);
+
             if !ctx.is_active() {
                 return Err(crate::error::Error::new(
                     crate::error::ErrorKind::OperationCancelled,
                     "transfer cancelled during body read",
                 ));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(buf) = aligned {
+            if buf.len() > 0 {
+                segmented.push(buf.into_bytes());
             }
         }
 
@@ -888,6 +909,7 @@ impl DownloadTransfer {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
+        let range_len = range.end() - range.start() + 1;
 
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (send → headers ≈ TTFB): the
@@ -926,7 +948,7 @@ impl DownloadTransfer {
                     .await?;
                 // Untimed: drain the body. Errors here are inner (retryable IO).
                 let chunk_meta = ChunkMetadata::from(&resp);
-                let (segmented, bytes_received) = Self::read_body_stream(&ctx, resp.body)
+                let (segmented, bytes_received) = Self::read_body_stream(&ctx, resp.body, Some(range_len))
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
                 Ok::<_, crate::retry::GuardError<crate::error::Error>>((
