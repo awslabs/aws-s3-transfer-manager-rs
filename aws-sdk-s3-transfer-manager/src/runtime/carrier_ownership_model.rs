@@ -23,7 +23,19 @@ use bytes::Bytes;
 /// must be limited to an initialized `PooledWindow`.
 struct CarrierBacking {
     data: Box<[UnsafeCell<MaybeUninit<u8>>]>,
-    returns: Arc<AtomicUsize>,
+    _return_token: ReturnToken,
+}
+
+/// Returns one physical charge when the final backing owner disappears.
+struct ReturnToken {
+    returned_units: Arc<AtomicUsize>,
+    units: usize,
+}
+
+impl Drop for ReturnToken {
+    fn drop(&mut self) {
+        self.returned_units.fetch_add(self.units, Ordering::Relaxed);
+    }
 }
 
 // Access is safe only through `ExclusiveRange` and `PooledWindow`.
@@ -32,19 +44,19 @@ unsafe impl Send for CarrierBacking {}
 unsafe impl Sync for CarrierBacking {}
 
 impl CarrierBacking {
-    fn heap(capacity: usize, returns: Arc<AtomicUsize>) -> Arc<Self> {
+    fn heap(capacity: usize, returned_units: Arc<AtomicUsize>) -> Arc<Self> {
         assert!(capacity > 0, "a carrier must have nonzero capacity");
         let data = std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::uninit()))
             .take(capacity)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Arc::new(Self { data, returns })
-    }
-}
-
-impl Drop for CarrierBacking {
-    fn drop(&mut self) {
-        self.returns.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Self {
+            data,
+            _return_token: ReturnToken {
+                returned_units,
+                units: 1,
+            },
+        })
     }
 }
 
@@ -271,6 +283,26 @@ mod tests {
         drop(tail);
         drop(first);
         drop(second);
+        assert_eq!(returns.load(Ordering::Relaxed), 0);
+        drop(third);
+        assert_eq!(returns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn short_windows_and_writable_tail_share_one_physical_return() {
+        let returns = Arc::new(AtomicUsize::new(0));
+        let mut tail = WritableTail::heap(64, Arc::clone(&returns));
+
+        write(&mut tail, &[1; 5]);
+        let first = tail.publish_prefix(5);
+        write(&mut tail, &[2; 7]);
+        let second = tail.publish_prefix(7);
+        write(&mut tail, &[3; 9]);
+        let third = tail.publish_prefix(9);
+
+        drop(second);
+        drop(tail);
+        drop(first);
         assert_eq!(returns.load(Ordering::Relaxed), 0);
         drop(third);
         assert_eq!(returns.load(Ordering::Relaxed), 1);

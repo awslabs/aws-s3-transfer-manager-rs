@@ -9,7 +9,9 @@
 //! physical carrier ownership before production concurrency obscures the state
 //! transitions.
 //!
-//! Admission usage is reserved demand plus sticky unreserved debt. New
+//! Admission usage is active planned demand plus retiring direct owners plus
+//! sticky unreserved debt. Closing a reservation releases unused planned
+//! demand immediately, while physical owners remain charged until return. New
 //! reservations provide coverage only for future unreserved acquisitions; they
 //! cannot retroactively absorb already-live debt.
 
@@ -255,7 +257,8 @@ struct ElasticPoolModel {
     carrier_size: usize,
 
     configured_capacity: usize,
-    reserved_demand: usize,
+    active_planned_demand: usize,
+    retiring_direct_live: usize,
     live: usize,
     unreserved_live: usize,
     unreserved_debt: usize,
@@ -280,7 +283,8 @@ impl ElasticPoolModel {
         Self {
             carrier_size,
             configured_capacity,
-            reserved_demand: 0,
+            active_planned_demand: 0,
+            retiring_direct_live: 0,
             live: 0,
             unreserved_live: 0,
             unreserved_debt: 0,
@@ -318,7 +322,7 @@ impl ElasticPoolModel {
         assert!(self.can_reserve(plan.reservation_size));
         let reservation = ReservationId(self.next_reservation);
         self.next_reservation += 1;
-        self.reserved_demand += plan.reservation_size;
+        self.active_planned_demand += plan.reservation_size;
         let previous = self.reservations.insert(
             reservation,
             ReservationState {
@@ -332,39 +336,42 @@ impl ElasticPoolModel {
     }
 
     fn close(&mut self, reservation: ReservationId) -> Result<Vec<GrantedWaiter>, ModelError> {
-        let release_now = {
+        let direct_live = {
             let state = self
                 .reservations
                 .get_mut(&reservation)
                 .ok_or(ModelError::UnknownReservation)?;
+            if state.closing {
+                return Err(ModelError::ReservationClosing);
+            }
             state.closing = true;
-            state.direct_live == 0
+            self.active_planned_demand -= state.plan.reservation_size;
+            state.direct_live
         };
+        self.retiring_direct_live += direct_live;
 
-        if release_now {
-            self.remove_reservation(reservation);
+        // Coverage belongs only to active plans. Any live unreserved owners
+        // exposed by closing this plan become sticky debt.
+        let minimum_debt = self
+            .unreserved_live
+            .saturating_sub(self.unreserved_coverage());
+        self.unreserved_debt = self.unreserved_debt.max(minimum_debt);
+
+        if direct_live == 0 {
+            self.remove_drained_reservation(reservation);
         }
         let grants = self.drain_waiters();
         self.assert_invariants();
         Ok(grants)
     }
 
-    fn remove_reservation(&mut self, reservation: ReservationId) {
+    fn remove_drained_reservation(&mut self, reservation: ReservationId) {
         let state = self
             .reservations
             .remove(&reservation)
-            .expect("reservation must exist while releasing admission");
+            .expect("draining reservation must remain registered");
         assert!(state.closing);
         assert_eq!(state.direct_live, 0);
-        self.reserved_demand -= state.plan.reservation_size;
-
-        // Unreserved owners cannot be attributed to the reservation whose
-        // coverage disappeared. Preserve them as sticky debt instead of
-        // allowing a later reservation to absorb their existing demand.
-        let minimum_debt = self
-            .unreserved_live
-            .saturating_sub(self.unreserved_coverage());
-        self.unreserved_debt = self.unreserved_debt.max(minimum_debt);
     }
 
     fn drain_waiters(&mut self) -> Vec<GrantedWaiter> {
@@ -625,17 +632,20 @@ impl ElasticPoolModel {
                 self.unreserved_debt = self.unreserved_debt.saturating_sub(1);
             }
             ClaimOwner::Reserved(reservation) => {
-                let release_admission = {
+                let remove_drained = {
                     let state = self
                         .reservations
                         .get_mut(&reservation)
                         .ok_or(ModelError::UnknownReservation)?;
                     assert!(state.direct_live > 0);
                     state.direct_live -= 1;
+                    if state.closing {
+                        self.retiring_direct_live -= 1;
+                    }
                     state.closing && state.direct_live == 0
                 };
-                if release_admission {
-                    self.remove_reservation(reservation);
+                if remove_drained {
+                    self.remove_drained_reservation(reservation);
                 }
             }
         }
@@ -672,18 +682,25 @@ impl ElasticPoolModel {
     }
 
     fn admission_used(&self) -> usize {
-        self.reserved_demand.saturating_add(self.unreserved_debt)
+        self.active_planned_demand
+            .saturating_add(self.retiring_direct_live)
+            .saturating_add(self.unreserved_debt)
     }
 
     fn unreserved_coverage(&self) -> usize {
         self.reservations
             .values()
+            .filter(|reservation| !reservation.closing)
             .map(|reservation| reservation.plan.unreserved_coverage())
             .sum()
     }
 
-    fn reserved_demand(&self) -> usize {
-        self.reserved_demand
+    fn active_planned_demand(&self) -> usize {
+        self.active_planned_demand
+    }
+
+    fn retiring_direct_live(&self) -> usize {
+        self.retiring_direct_live
     }
 
     fn live(&self) -> usize {
@@ -729,14 +746,23 @@ impl ElasticPoolModel {
     }
 
     fn assert_invariants(&self) {
-        let reserved_from_reservations: usize = self
+        let active_planned_from_reservations: usize = self
             .reservations
             .values()
+            .filter(|reservation| !reservation.closing)
             .map(|reservation| reservation.plan.reservation_size)
             .sum();
-        assert_eq!(self.reserved_demand, reserved_from_reservations);
-        assert!(self.reserved_demand <= self.configured_capacity);
+        assert_eq!(self.active_planned_demand, active_planned_from_reservations);
+        assert!(self.active_planned_demand <= self.configured_capacity);
         assert!(self.reusable_capacity_target <= self.configured_capacity);
+
+        let retiring_direct_from_reservations: usize = self
+            .reservations
+            .values()
+            .filter(|reservation| reservation.closing)
+            .map(|reservation| reservation.direct_live)
+            .sum();
+        assert_eq!(self.retiring_direct_live, retiring_direct_from_reservations);
 
         for (reservation_id, reservation) in &self.reservations {
             assert!(reservation.direct_live <= reservation.plan.direct_acquire_limit);
@@ -774,7 +800,7 @@ impl ElasticPoolModel {
         assert_eq!(self.live, physical_live);
         assert!(
             self.live <= self.admission_used(),
-            "reservation plus sticky debt must cover all live carriers"
+            "active plans, retiring owners, and sticky debt must cover all live carriers"
         );
         assert_eq!(self.free_reusable() + self.live, self.mapped());
 
@@ -847,7 +873,7 @@ mod tests {
         let second = pool.acquire_unreserved(ordinary_request()).unwrap();
         let third = pool.acquire_unreserved(ordinary_request()).unwrap();
 
-        assert_eq!(pool.reserved_demand(), 8);
+        assert_eq!(pool.active_planned_demand(), 8);
         assert_eq!(pool.reusable_capacity(), 2);
         assert_eq!(pool.overflow_live(), 1);
         assert_eq!(third.source, AcquisitionSource::Overflow);
@@ -863,7 +889,7 @@ mod tests {
         let mut pool = model(8, 1);
         let claim = pool.acquire_unreserved(ordinary_request()).unwrap();
         assert_eq!(claim.source, AcquisitionSource::RetainedGrowth);
-        assert_eq!(pool.reserved_demand(), 0);
+        assert_eq!(pool.active_planned_demand(), 0);
         assert_eq!(pool.unreserved_debt(), 1);
         pool.release(claim).unwrap();
         assert_eq!(pool.live(), 0);
@@ -881,7 +907,7 @@ mod tests {
         let first = pool.acquire_unreserved(ordinary_request()).unwrap();
         let second = pool.acquire_unreserved(ordinary_request()).unwrap();
 
-        assert_eq!(pool.reserved_demand(), 1);
+        assert_eq!(pool.active_planned_demand(), 1);
         assert_eq!(pool.live(), 2);
         assert_eq!(pool.unreserved_debt(), 1);
         assert_eq!(pool.admission_used(), 2);
@@ -889,7 +915,7 @@ mod tests {
         let ReserveOutcome::Ready(second_reservation) = pool.reserve(download_plan(1)) else {
             panic!("one unit of admission headroom should remain");
         };
-        assert_eq!(pool.reserved_demand(), 2);
+        assert_eq!(pool.active_planned_demand(), 2);
         assert_eq!(pool.unreserved_debt(), 1);
         assert_eq!(pool.admission_used(), 3);
 
@@ -974,7 +1000,7 @@ mod tests {
 
         let claim = pool.acquire_unreserved(ordinary_request()).unwrap();
         assert_eq!(claim.source, AcquisitionSource::Overflow);
-        assert_eq!(pool.reserved_demand(), 1);
+        assert_eq!(pool.active_planned_demand(), 1);
 
         pool.release(claim).unwrap();
         pool.close(reservation).unwrap();
@@ -1019,24 +1045,103 @@ mod tests {
     }
 
     #[test]
-    fn closing_reserved_reservation_waits_for_final_owner() {
-        let mut pool = model(1, 1);
-        let ReserveOutcome::Ready(first) = pool.reserve(upload_plan(1)) else {
+    fn close_replaces_full_plan_with_exact_retiring_direct_charge() {
+        let mut pool = model(4, 4);
+        let ReserveOutcome::Ready(first) = pool.reserve(upload_plan(4)) else {
             panic!("first upload should be admitted");
         };
         let owner = pool.acquire(first, ordinary_request()).unwrap();
-        let ReserveOutcome::Pending(waiter) = pool.reserve(upload_plan(1)) else {
-            panic!("second upload should wait");
+        let ReserveOutcome::Pending(waiter) = pool.reserve(download_plan(3)) else {
+            panic!("second operation should wait");
         };
 
-        assert!(pool.close(first).unwrap().is_empty());
-        assert_eq!(pool.reserved_demand(), 1);
-
-        let grants = pool.release(owner).unwrap();
+        let grants = pool.close(first).unwrap();
+        assert_eq!(pool.active_planned_demand(), 3);
+        assert_eq!(pool.retiring_direct_live(), 1);
+        assert_eq!(pool.admission_used(), 4);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].waiter, waiter);
-        assert_eq!(pool.reserved_demand(), 1);
+
+        assert!(pool.release(owner).unwrap().is_empty());
+        assert_eq!(pool.retiring_direct_live(), 0);
+        assert_eq!(pool.active_planned_demand(), 3);
         pool.close(grants[0].reservation).unwrap();
+    }
+
+    #[test]
+    fn retiring_direct_returns_wake_fifo_incrementally() {
+        let mut pool = model(4, 4);
+        let ReserveOutcome::Ready(active) = pool.reserve(upload_plan(4)) else {
+            panic!("active upload should be admitted");
+        };
+        let first_owner = pool.acquire(active, ordinary_request()).unwrap();
+        let second_owner = pool.acquire(active, ordinary_request()).unwrap();
+        let ReserveOutcome::Pending(large) = pool.reserve(download_plan(3)) else {
+            panic!("large operation should wait");
+        };
+        let ReserveOutcome::Pending(small) = pool.reserve(download_plan(1)) else {
+            panic!("small operation should queue behind large operation");
+        };
+
+        assert!(pool.close(active).unwrap().is_empty());
+        assert_eq!(pool.active_planned_demand(), 0);
+        assert_eq!(pool.retiring_direct_live(), 2);
+        assert_eq!(pool.admission_used(), 2);
+
+        let grants = pool.release(first_owner).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].waiter, large);
+        assert_eq!(pool.active_planned_demand(), 3);
+        assert_eq!(pool.retiring_direct_live(), 1);
+
+        let final_grants = pool.release(second_owner).unwrap();
+        assert_eq!(final_grants.len(), 1);
+        assert_eq!(final_grants[0].waiter, small);
+        assert_eq!(pool.active_planned_demand(), 4);
+        assert_eq!(pool.retiring_direct_live(), 0);
+
+        pool.close(grants[0].reservation).unwrap();
+        pool.close(final_grants[0].reservation).unwrap();
+    }
+
+    #[test]
+    fn closing_mixed_plan_converts_direct_owners_and_lost_coverage_separately() {
+        let mut pool = model(4, 4);
+        let mixed_plan = ReservationPlan::new(
+            4,
+            2,
+            CapabilityRequirement::Ordinary,
+            affinity(&[0, 1], &[0]),
+        );
+        let ReserveOutcome::Ready(mixed) = pool.reserve(mixed_plan) else {
+            panic!("mixed operation should be admitted");
+        };
+        let direct = pool.acquire(mixed, ordinary_request()).unwrap();
+        let first_unreserved = pool.acquire_unreserved(ordinary_request()).unwrap();
+        let second_unreserved = pool.acquire_unreserved(ordinary_request()).unwrap();
+
+        assert!(pool.close(mixed).unwrap().is_empty());
+        assert_eq!(pool.active_planned_demand(), 0);
+        assert_eq!(pool.retiring_direct_live(), 1);
+        assert_eq!(pool.unreserved_debt(), 2);
+        assert_eq!(pool.admission_used(), 3);
+
+        pool.release(direct).unwrap();
+        pool.release(first_unreserved).unwrap();
+        pool.release(second_unreserved).unwrap();
+    }
+
+    #[test]
+    fn closing_reservation_twice_is_rejected_while_direct_owner_retires() {
+        let mut pool = model(1, 1);
+        let ReserveOutcome::Ready(reservation) = pool.reserve(upload_plan(1)) else {
+            panic!("upload should be admitted");
+        };
+        let owner = pool.acquire(reservation, ordinary_request()).unwrap();
+
+        assert!(pool.close(reservation).unwrap().is_empty());
+        assert_eq!(pool.close(reservation), Err(ModelError::ReservationClosing));
+        pool.release(owner).unwrap();
     }
 
     #[test]
@@ -1051,7 +1156,7 @@ mod tests {
         };
 
         assert!(pool.close(download).unwrap().is_empty());
-        assert_eq!(pool.reserved_demand(), 0);
+        assert_eq!(pool.active_planned_demand(), 0);
         assert_eq!(pool.reusable_live(), 1);
         assert_eq!(pool.unreserved_debt(), 1);
         assert_eq!(pool.admission_used(), 1);
