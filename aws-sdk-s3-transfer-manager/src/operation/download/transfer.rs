@@ -852,10 +852,21 @@ impl DownloadTransfer {
         let mut segmented = SegmentedBuf::new();
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
+        let align = ctx.handle.runtime.components().direct_io();
 
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
+            // When O_DIRECT is enabled, copy each network chunk into a
+            // page-aligned buffer here (overlapping with network I/O) so the
+            // write path can hand it directly to the kernel without a staging
+            // buffer copy.
+            #[cfg(target_os = "linux")]
+            let data = if align {
+                crate::io::uring::align_bytes(data)
+            } else {
+                data
+            };
             segmented.push(data);
             if !ctx.is_active() {
                 return Err(crate::error::Error::new(

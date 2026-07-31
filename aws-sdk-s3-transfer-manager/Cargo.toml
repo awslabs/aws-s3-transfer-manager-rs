@@ -47,9 +47,8 @@ dial9 = ["dep:dial9-tokio-telemetry"]
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }
 
-# O_DIRECT + io_uring write sink for download-to-file.
+# O_DIRECT write sink for download-to-file.
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
 libc = "0.2"
 
 # Total physical RAM via sysctl(hw.memsize).

@@ -298,7 +298,6 @@ dependencies = [
  "hdrhistogram",
  "http 1.4.0",
  "http-body 1.0.1",
- "io-uring",
  "jemallocator",
  "libc",
  "loom",
@@ -2429,17 +2428,6 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "io-uring"
-version = "0.7.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
 ]
 
 [[package]]
