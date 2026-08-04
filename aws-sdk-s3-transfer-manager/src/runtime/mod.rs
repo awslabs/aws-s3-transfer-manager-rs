@@ -17,11 +17,7 @@ mod topology;
 pub(crate) use topology::Topology;
 
 #[cfg(test)]
-mod buffer_pool_model;
-#[cfg(test)]
-mod carrier_ownership_model;
-#[cfg(test)]
-mod elastic_buffer_pool_model;
+mod buffer_pool;
 pub(crate) mod memory;
 #[cfg(test)]
 mod operation_memory_model;
