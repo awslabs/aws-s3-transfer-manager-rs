@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 
-use super::arena::CarrierAllocation;
+use super::arena::AcquisitionSource;
 use super::CarrierGuard;
 
 /// Exclusive mutable authority over one range in a carrier.
@@ -142,11 +142,16 @@ impl ExclusiveRange {
 }
 
 impl WritableCarrier {
-    pub(super) fn new(allocation: CarrierAllocation, guard: Arc<CarrierGuard>) -> Self {
-        let _ = allocation.source;
+    pub(super) fn new(
+        ptr: NonNull<MaybeUninit<u8>>,
+        capacity: usize,
+        source: AcquisitionSource,
+        guard: Arc<CarrierGuard>,
+    ) -> Self {
+        let _ = source;
         Self {
             guard,
-            writable: Some(ExclusiveRange::whole(allocation.ptr, allocation.capacity)),
+            writable: Some(ExclusiveRange::whole(ptr, capacity)),
             initialized: 0,
         }
     }

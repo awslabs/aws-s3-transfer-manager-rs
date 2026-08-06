@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#![cfg_attr(all(test, s3_tm_loom), allow(dead_code))]
+
 //! Elastic pooled storage for transfer payloads.
 //!
 //! Admission and physical acquisition are separate operations. A reservation
@@ -34,20 +36,22 @@
 //!
 //! [`BufferPool::try_reserve`] performs immediate admission and never parks.
 //! This implementation does not provide FIFO parking, forced oversized
-//! admission, topology, or block lifecycle.
+//! admission, topology, or a real mmap backend.
 
 use std::sync::{Arc, Mutex};
 
 mod admission;
-use admission::{AdmissionState, Charge, DirectDebit, Reservation, ReservationPlan};
+use admission::{
+    AdmissionState, Charge, DirectDebit, Reservation, ReservationPlan, UnreservedDebit,
+};
 
 mod arena;
-use arena::{Arena, CarrierAllocation, CarrierId};
+use arena::{Arena, CarrierAllocation};
 
 mod buffer;
 use buffer::{PooledBufMut, WritableCarrier};
 
-#[cfg(test)]
+#[cfg(all(test, not(s3_tm_loom)))]
 mod tests;
 
 /// Cloneable handle to the pool's admission and physical storage state.
@@ -65,7 +69,7 @@ struct PoolInner {
 /// Final-return token shared by every view over one carrier checkout.
 struct CarrierGuard {
     pool: Arc<PoolInner>,
-    id: CarrierId,
+    allocation: Option<CarrierAllocation>,
     charge: Charge,
 }
 
@@ -91,6 +95,7 @@ impl AcquireRequest {
 enum ReserveError {
     Closed,
     AtCapacity,
+    PhysicalPreparationFailed,
 }
 
 /// Failure to acquire physical carriers.
@@ -109,6 +114,7 @@ enum AllocError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PoolSnapshot {
     configured: usize,
+    prepared: usize,
     active_planned_demand: usize,
     retiring_direct_live: usize,
     unreserved_coverage: usize,
@@ -118,6 +124,7 @@ struct PoolSnapshot {
     retained: usize,
     free_retained: usize,
     overflow: usize,
+    quarantined: usize,
     physical_live: usize,
 }
 
@@ -148,6 +155,16 @@ impl BufferPool {
     /// park.
     fn try_reserve(&self, plan: ReservationPlan) -> Result<Reservation, ReserveError> {
         let mut admission = self.inner.admission.lock().unwrap();
+        admission.check_admit(plan)?;
+        let target = admission
+            .ledger
+            .admission_used()
+            .checked_add(plan.envelope)
+            .ok_or(ReserveError::PhysicalPreparationFailed)?;
+        self.inner
+            .arena
+            .prepare_to(target, &mut admission.ledger.prepared)
+            .map_err(|_| ReserveError::PhysicalPreparationFailed)?;
         admission.try_admit(plan)?;
         drop(admission);
         Ok(Reservation::new(Arc::clone(&self.inner), plan))
@@ -167,7 +184,7 @@ impl BufferPool {
         let mut carriers = Vec::with_capacity(carrier_count);
 
         for _ in 0..carrier_count {
-            let allocation = match self.inner.arena.acquire_one() {
+            let allocation = match self.inner.acquire_one() {
                 Ok(allocation) => allocation,
                 Err(error) => {
                     drop(carriers);
@@ -188,26 +205,18 @@ impl BufferPool {
     /// grants until an unreserved carrier returns.
     fn acquire_unreserved(&self, request: AcquireRequest) -> Result<PooledBufMut, AllocError> {
         let carrier_count = self.carriers_for(request.minimum_capacity)?;
+        let mut debit = self.inner.debit_unreserved(carrier_count)?;
         let mut carriers = Vec::with_capacity(carrier_count);
 
         for _ in 0..carrier_count {
-            let allocation = match self.inner.arena.acquire_one() {
+            let allocation = match self.inner.acquire_one() {
                 Ok(allocation) => allocation,
                 Err(error) => {
                     drop(carriers);
                     return Err(error);
                 }
             };
-            let id = allocation.id;
-            self.inner.record_unreserved_acquire();
-            carriers.push(WritableCarrier::new(
-                allocation,
-                Arc::new(CarrierGuard {
-                    pool: Arc::clone(&self.inner),
-                    id,
-                    charge: Charge::Unreserved,
-                }),
-            ));
+            carriers.push(debit.commit(allocation));
         }
 
         Ok(PooledBufMut::new(carriers))
@@ -231,6 +240,7 @@ impl BufferPool {
         let arena = self.inner.arena.snapshot();
         PoolSnapshot {
             configured: admission.ledger.configured,
+            prepared: admission.ledger.prepared,
             active_planned_demand: admission.ledger.active_planned_demand,
             retiring_direct_live: admission.ledger.retiring_direct_live,
             unreserved_coverage: admission.ledger.unreserved_coverage,
@@ -240,6 +250,7 @@ impl BufferPool {
             retained: arena.retained,
             free_retained: arena.free_retained,
             overflow: arena.overflow,
+            quarantined: arena.quarantined,
             physical_live: arena.physical_live,
         }
     }
@@ -248,6 +259,11 @@ impl BufferPool {
     fn fail_after_successes(&self, successes: usize) {
         self.inner.arena.fail_after_successes(successes);
     }
+
+    /// Trim free overflow while retaining configured reusable capacity.
+    fn trim_excess(&self) -> usize {
+        self.inner.trim_excess()
+    }
 }
 
 impl DirectDebit {
@@ -255,12 +271,32 @@ impl DirectDebit {
     fn commit(&mut self, allocation: CarrierAllocation) -> WritableCarrier {
         assert!(self.uncommitted > 0, "direct debit is exhausted");
         self.uncommitted -= 1;
+        let ptr = allocation.ptr();
+        let capacity = allocation.capacity();
+        let source = allocation.source;
         let guard = Arc::new(CarrierGuard {
             pool: Arc::clone(&self.reservation.pool),
-            id: allocation.id,
+            allocation: Some(allocation),
             charge: Charge::Direct(Arc::clone(&self.reservation)),
         });
-        WritableCarrier::new(allocation, guard)
+        WritableCarrier::new(ptr, capacity, source, guard)
+    }
+}
+
+impl UnreservedDebit {
+    /// Transfer one installed charge into a carrier's final-return guard.
+    fn commit(&mut self, allocation: CarrierAllocation) -> WritableCarrier {
+        assert!(self.uncommitted > 0, "unreserved debit is exhausted");
+        self.uncommitted -= 1;
+        let ptr = allocation.ptr();
+        let capacity = allocation.capacity();
+        let source = allocation.source;
+        let guard = Arc::new(CarrierGuard {
+            pool: Arc::clone(&self.pool),
+            allocation: Some(allocation),
+            charge: Charge::Unreserved,
+        });
+        WritableCarrier::new(ptr, capacity, source, guard)
     }
 }
 
@@ -268,10 +304,47 @@ impl Drop for CarrierGuard {
     fn drop(&mut self) {
         // Publish physical availability before reducing admission pressure.
         // A newly admitted operation may acquire this carrier immediately.
-        self.pool.arena.return_carrier(self.id);
+        drop(self.allocation.take());
         match &self.charge {
             Charge::Direct(reservation) => reservation.release_direct(1),
-            Charge::Unreserved => self.pool.release_unreserved(),
+            Charge::Unreserved => self.pool.release_unreserved(1),
+        }
+    }
+}
+
+impl PoolInner {
+    /// Acquire from prepared capacity, then serialize an exhaustive recheck and
+    /// compatible growth on miss.
+    fn acquire_one(&self) -> Result<CarrierAllocation, AllocError> {
+        if let Some(allocation) = self.arena.try_acquire_one()? {
+            return Ok(allocation);
+        }
+
+        let mut admission = self.admission.lock().unwrap();
+        self.arena
+            .acquire_or_grow_one(&mut admission.ledger.prepared)
+    }
+
+    /// Remove free overflow without crossing admission's prepared floor.
+    fn trim_excess(&self) -> usize {
+        let mut trimmed = 0;
+        loop {
+            let cleanup = {
+                let mut admission = self.admission.lock().unwrap();
+                let floor = admission
+                    .ledger
+                    .configured
+                    .max(admission.ledger.admission_used());
+                self.arena
+                    .start_trim_excess(&mut admission.ledger.prepared, floor)
+            };
+            let Some(cleanup) = cleanup else {
+                return trimmed;
+            };
+            let carrier_count = cleanup.carrier_count();
+            if cleanup.finish() {
+                trimmed += carrier_count;
+            }
         }
     }
 }

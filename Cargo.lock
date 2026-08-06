@@ -274,6 +274,7 @@ dependencies = [
 name = "aws-sdk-s3-transfer-manager"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "aws-config",
  "aws-runtime",
  "aws-sdk-s3",

@@ -136,6 +136,25 @@ fn partial_physical_failure_rolls_back_direct_debits_and_carriers() {
 }
 
 #[test]
+fn partial_physical_failure_rolls_back_unreserved_charges_and_carriers() {
+    let pool = BufferPool::new(4, 2);
+    pool.fail_after_successes(1);
+
+    assert!(matches!(
+        pool.acquire_unreserved(AcquireRequest::new(8)),
+        Err(AllocError::PhysicalAllocationFailed)
+    ));
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.unreserved_live, 0);
+    assert_eq!(snapshot.unreserved_debt, 0);
+    assert_eq!(snapshot.physical_live, 0);
+
+    let retry = pool.acquire_unreserved(AcquireRequest::new(8)).unwrap();
+    drop(retry);
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
 fn reservation_cannot_acquire_from_another_pool() {
     let first = BufferPool::new(4, 1);
     let second = BufferPool::new(4, 1);
@@ -167,6 +186,8 @@ fn reserved_acquisition_grows_when_unreserved_ownership_uses_retained_capacity()
     drop(reserved);
     drop(unreserved);
     assert_eq!(pool.snapshot().admission_used, 0);
+    assert_eq!(pool.snapshot().overflow, 1);
+    assert_eq!(pool.trim_excess(), 1);
     assert_eq!(pool.snapshot().overflow, 0);
 }
 
@@ -274,6 +295,7 @@ fn snapshots_distinguish_free_retained_memory_from_admission_usage() {
 
     let snapshot = pool.snapshot();
     assert_eq!(snapshot.configured, 1);
+    assert_eq!(snapshot.prepared, 1);
     assert_eq!(snapshot.active_planned_demand, 1);
     assert_eq!(snapshot.retained, 1);
     assert_eq!(snapshot.free_retained, 1);

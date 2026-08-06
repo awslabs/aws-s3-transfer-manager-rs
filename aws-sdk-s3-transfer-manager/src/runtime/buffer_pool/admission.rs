@@ -33,6 +33,7 @@ pub(super) struct AdmissionState {
 /// unreserved_debt`.
 pub(super) struct AdmissionLedger {
     pub(super) configured: usize,
+    pub(super) prepared: usize,
     pub(super) active_planned_demand: usize,
     pub(super) retiring_direct_live: usize,
     pub(super) unreserved_coverage: usize,
@@ -74,6 +75,12 @@ pub(super) struct DirectDebit {
     pub(super) uncommitted: usize,
 }
 
+/// RAII rollback for unreserved charges installed before physical acquisition.
+pub(super) struct UnreservedDebit {
+    pub(super) pool: Arc<PoolInner>,
+    pub(super) uncommitted: usize,
+}
+
 /// Accounting inverse performed by a carrier's final owner.
 pub(super) enum Charge {
     Direct(Arc<ReservationState>),
@@ -86,6 +93,7 @@ impl AdmissionState {
         Self {
             ledger: AdmissionLedger {
                 configured,
+                prepared: 0,
                 active_planned_demand: 0,
                 retiring_direct_live: 0,
                 unreserved_coverage: 0,
@@ -98,6 +106,16 @@ impl AdmissionState {
 
     /// Charge one plan or reject it under current pressure.
     pub(super) fn try_admit(&mut self, plan: ReservationPlan) -> Result<(), ReserveError> {
+        self.check_admit(plan)?;
+
+        self.ledger.active_planned_demand += plan.envelope;
+        self.ledger.unreserved_coverage += plan.unreserved_coverage();
+        self.ledger.assert_invariants();
+        Ok(())
+    }
+
+    /// Check whether one plan may be charged without changing the ledger.
+    pub(super) fn check_admit(&self, plan: ReservationPlan) -> Result<(), ReserveError> {
         if self.closed {
             return Err(ReserveError::Closed);
         }
@@ -111,9 +129,6 @@ impl AdmissionState {
             return Err(ReserveError::AtCapacity);
         }
 
-        self.ledger.active_planned_demand += plan.envelope;
-        self.ledger.unreserved_coverage += plan.unreserved_coverage();
-        self.ledger.assert_invariants();
         Ok(())
     }
 }
@@ -128,6 +143,10 @@ impl AdmissionLedger {
 
     /// Check identities that must hold after every ledger transition.
     fn assert_invariants(&self) {
+        assert!(
+            self.prepared >= self.admission_used(),
+            "prepared capacity must cover admitted work and debt"
+        );
         assert!(self.unreserved_debt <= self.unreserved_live);
         assert!(
             self.unreserved_live - self.unreserved_debt <= self.unreserved_coverage,
@@ -299,27 +318,67 @@ impl Drop for DirectDebit {
     }
 }
 
+impl Drop for UnreservedDebit {
+    fn drop(&mut self) {
+        if self.uncommitted > 0 {
+            self.pool.release_unreserved(self.uncommitted);
+        }
+    }
+}
+
 impl PoolInner {
-    /// Record one unreserved checkout and create debt when coverage is full.
-    pub(super) fn record_unreserved_acquire(&self) {
+    /// Charge an unreserved acquisition and prepare any newly exposed debt.
+    ///
+    /// Charging precedes physical claim so unreserved traffic cannot consume
+    /// the only carrier backing an existing reservation without first growing
+    /// replacement capacity.
+    pub(super) fn debit_unreserved(
+        self: &Arc<Self>,
+        count: usize,
+    ) -> Result<UnreservedDebit, AllocError> {
         let mut admission = self.admission.lock().unwrap();
         let covered_live = admission.ledger.unreserved_live - admission.ledger.unreserved_debt;
-        if covered_live == admission.ledger.unreserved_coverage {
-            admission.ledger.unreserved_debt += 1;
+        let available_coverage = admission
+            .ledger
+            .unreserved_coverage
+            .saturating_sub(covered_live);
+        let new_debt = count.saturating_sub(available_coverage);
+        let previous_live = admission.ledger.unreserved_live;
+        let previous_debt = admission.ledger.unreserved_debt;
+        let next_live = previous_live
+            .checked_add(count)
+            .ok_or(AllocError::CapacityOverflow)?;
+        let next_debt = previous_debt
+            .checked_add(new_debt)
+            .ok_or(AllocError::CapacityOverflow)?;
+        admission.ledger.unreserved_live = next_live;
+        admission.ledger.unreserved_debt = next_debt;
+
+        let target = admission.ledger.admission_used();
+        if let Err(error) = self
+            .arena
+            .prepare_to(target, &mut admission.ledger.prepared)
+        {
+            admission.ledger.unreserved_live = previous_live;
+            admission.ledger.unreserved_debt = previous_debt;
+            return Err(error);
         }
-        admission.ledger.unreserved_live += 1;
         admission.ledger.assert_invariants();
+        Ok(UnreservedDebit {
+            pool: Arc::clone(self),
+            uncommitted: count,
+        })
     }
 
-    /// Retire one unreserved checkout, repaying sticky debt first.
-    pub(super) fn release_unreserved(&self) {
+    /// Retire unreserved charges, repaying sticky debt first.
+    pub(super) fn release_unreserved(&self, count: usize) {
         let mut admission = self.admission.lock().unwrap();
         assert!(
-            admission.ledger.unreserved_live > 0,
-            "unreserved return requires a live charge"
+            admission.ledger.unreserved_live >= count,
+            "unreserved return exceeds live charges"
         );
-        admission.ledger.unreserved_live -= 1;
-        admission.ledger.unreserved_debt = admission.ledger.unreserved_debt.saturating_sub(1);
+        admission.ledger.unreserved_live -= count;
+        admission.ledger.unreserved_debt = admission.ledger.unreserved_debt.saturating_sub(count);
         admission.ledger.assert_invariants();
     }
 }
