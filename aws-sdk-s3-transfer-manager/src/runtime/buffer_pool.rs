@@ -28,21 +28,31 @@
 //!
 //! # Synchronization
 //!
-//! [`PoolInner::admission`] serializes global ledger transitions. Reservation
-//! acquisition counts use a packed atomic so direct return before close avoids
-//! that lock. Close holds the admission lock while publishing the closed bit
-//! and installing the retiring count. Final carrier return makes the carrier
-//! reusable before lowering admission pressure.
+//! [`PoolInner::admission`] serializes planned-demand, FIFO, and debt-producing
+//! transitions. A packed unreserved state lets covered transport acquisition
+//! and debt-free return avoid that lock while remaining atomic with coverage
+//! grant and withdrawal. Reservation acquisition counts use a second packed
+//! atomic so direct return before close also avoids the lock. Close holds the
+//! admission lock while publishing the closed bit and installing exact
+//! retiring charges. Final carrier return makes the carrier reusable before
+//! lowering admission pressure.
 //!
-//! [`BufferPool::try_reserve`] performs immediate admission and never parks.
-//! This implementation does not provide FIFO parking, forced oversized
-//! admission, topology, or a real mmap backend.
+//! Reservation admission is strict FIFO. A grant is physically prepared and
+//! transferred to its waiter before notification. Notifications run after the
+//! admission lock is released.
+//!
+//! Queue operations may take the admission lock and then a waiter-slot lock.
+//! Ticket drop extracts its slot state and releases that lock before taking the
+//! admission lock. This ordering must not be reversed or nested.
+//!
+//! This implementation does not provide topology or a real mmap backend.
 
-use std::sync::{Arc, Mutex};
+use crate::runtime::sync::sync::{Arc, Mutex};
 
 mod admission;
 use admission::{
-    AdmissionState, Charge, DirectDebit, Reservation, ReservationPlan, UnreservedDebit,
+    AdmissionState, Charge, DirectDebit, NotifyFn, Reservation, ReservationPlan, Reserve,
+    UnreservedDebit, UnreservedState,
 };
 
 mod arena;
@@ -63,6 +73,8 @@ struct BufferPool {
 /// Shared lifetime retained by reservations and checked-out carriers.
 struct PoolInner {
     admission: Mutex<AdmissionState>,
+    /// Aggregate counters changed at transport acquisition frequency.
+    unreserved: UnreservedState,
     arena: Arena,
 }
 
@@ -96,6 +108,7 @@ enum ReserveError {
     Closed,
     AtCapacity,
     PhysicalPreparationFailed,
+    CapacityOverflow,
 }
 
 /// Failure to acquire physical carriers.
@@ -113,19 +126,36 @@ enum AllocError {
 /// not in one atomic transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PoolSnapshot {
+    /// Soft admission and retained-capacity target.
     configured: usize,
+    /// Capacity whose current preparation steps have completed.
     prepared: usize,
+    /// Full envelopes with direct acquisition still open.
     active_planned_demand: usize,
+    /// Direct owners surviving after reservation close.
     retiring_direct_live: usize,
+    /// Active-plan capacity available to unreserved acquisition.
     unreserved_coverage: usize,
+    /// Live ownership acquired without reservation authority.
     unreserved_live: usize,
+    /// Unreserved ownership not covered by active plans.
     unreserved_debt: usize,
+    /// Planned, retiring, and sticky-debt pressure on admission.
     admission_used: usize,
+    /// Prepared carriers retained within the configured target.
     retained: usize,
+    /// Retained carriers currently available for acquisition.
     free_retained: usize,
+    /// Prepared carriers above the configured target.
     overflow: usize,
+    /// Mapped carriers excluded from acquisition after cleanup failure.
     quarantined: usize,
+    /// Carriers currently held by mutable or immutable owners.
     physical_live: usize,
+    /// Reservation requests still held in FIFO order.
+    waiters: usize,
+    /// Whether new reservations and queued grants are closed.
+    admission_closed: bool,
 }
 
 impl BufferPool {
@@ -144,6 +174,7 @@ impl BufferPool {
         Self {
             inner: Arc::new(PoolInner {
                 admission: Mutex::new(AdmissionState::new(configured_carriers)),
+                unreserved: UnreservedState::new(),
                 arena: Arena::new(carrier_size, configured_carriers),
             }),
         }
@@ -154,20 +185,24 @@ impl BufferPool {
     /// A successful call charges the complete envelope. This method does not
     /// park.
     fn try_reserve(&self, plan: ReservationPlan) -> Result<Reservation, ReserveError> {
-        let mut admission = self.inner.admission.lock().unwrap();
-        admission.check_admit(plan)?;
-        let target = admission
-            .ledger
-            .admission_used()
-            .checked_add(plan.envelope)
-            .ok_or(ReserveError::PhysicalPreparationFailed)?;
-        self.inner
-            .arena
-            .prepare_to(target, &mut admission.ledger.prepared)
-            .map_err(|_| ReserveError::PhysicalPreparationFailed)?;
-        admission.try_admit(plan)?;
-        drop(admission);
-        Ok(Reservation::new(Arc::clone(&self.inner), plan))
+        PoolInner::try_reserve(&self.inner, plan)
+    }
+
+    /// Reserve `plan` immediately or enqueue it in strict arrival order.
+    ///
+    /// A pending waiter receives an already-charged reservation before its
+    /// notification runs. Preparation and shutdown failure are delivered
+    /// through the same waiter.
+    fn reserve(&self, plan: ReservationPlan, notify: NotifyFn) -> Result<Reserve, ReserveError> {
+        PoolInner::reserve(&self.inner, plan, notify)
+    }
+
+    /// Close admission and fail every queued waiter.
+    ///
+    /// Existing reservations, unreserved acquisition, and carrier return
+    /// remain valid until their owners drain.
+    fn close_admission(&self) {
+        PoolInner::close_admission(&self.inner);
     }
 
     /// Acquire writable storage against direct reservation authority.
@@ -205,7 +240,7 @@ impl BufferPool {
     /// grants until an unreserved carrier returns.
     fn acquire_unreserved(&self, request: AcquireRequest) -> Result<PooledBufMut, AllocError> {
         let carrier_count = self.carriers_for(request.minimum_capacity)?;
-        let mut debit = self.inner.debit_unreserved(carrier_count)?;
+        let mut debit = PoolInner::debit_unreserved(&self.inner, carrier_count)?;
         let mut carriers = Vec::with_capacity(carrier_count);
 
         for _ in 0..carrier_count {
@@ -236,7 +271,8 @@ impl BufferPool {
     /// The two stores are sampled in lock order, but ownership may transition
     /// between samples.
     fn snapshot(&self) -> PoolSnapshot {
-        let admission = self.inner.admission.lock().unwrap();
+        let admission = self.inner.admission.lock();
+        let unreserved = self.inner.unreserved.snapshot();
         let arena = self.inner.arena.snapshot();
         PoolSnapshot {
             configured: admission.ledger.configured,
@@ -244,20 +280,27 @@ impl BufferPool {
             active_planned_demand: admission.ledger.active_planned_demand,
             retiring_direct_live: admission.ledger.retiring_direct_live,
             unreserved_coverage: admission.ledger.unreserved_coverage,
-            unreserved_live: admission.ledger.unreserved_live,
-            unreserved_debt: admission.ledger.unreserved_debt,
-            admission_used: admission.ledger.admission_used(),
+            unreserved_live: admission.ledger.unreserved_live(unreserved),
+            unreserved_debt: unreserved.debt,
+            admission_used: admission.ledger.admission_used(unreserved.debt),
             retained: arena.retained,
             free_retained: arena.free_retained,
             overflow: arena.overflow,
             quarantined: arena.quarantined,
             physical_live: arena.physical_live,
+            waiters: admission.waiter_count(),
+            admission_closed: admission.is_closed(),
         }
     }
 
     /// Inject a physical acquisition failure after `successes` allocations.
     fn fail_after_successes(&self, successes: usize) {
         self.inner.arena.fail_after_successes(successes);
+    }
+
+    /// Fail the next operation that must prepare additional capacity.
+    fn fail_next_preparation(&self) {
+        self.inner.arena.fail_next_preparation();
     }
 
     /// Trim free overflow while retaining configured reusable capacity.
@@ -307,7 +350,7 @@ impl Drop for CarrierGuard {
         drop(self.allocation.take());
         match &self.charge {
             Charge::Direct(reservation) => reservation.release_direct(1),
-            Charge::Unreserved => self.pool.release_unreserved(1),
+            Charge::Unreserved => PoolInner::release_unreserved(&self.pool, 1),
         }
     }
 }
@@ -320,7 +363,7 @@ impl PoolInner {
             return Ok(allocation);
         }
 
-        let mut admission = self.admission.lock().unwrap();
+        let mut admission = self.admission.lock();
         self.arena
             .acquire_or_grow_one(&mut admission.ledger.prepared)
     }
@@ -330,11 +373,12 @@ impl PoolInner {
         let mut trimmed = 0;
         loop {
             let cleanup = {
-                let mut admission = self.admission.lock().unwrap();
-                let floor = admission
-                    .ledger
-                    .configured
-                    .max(admission.ledger.admission_used());
+                let mut admission = self.admission.lock();
+                let floor = admission.ledger.configured.max(
+                    admission
+                        .ledger
+                        .admission_used(self.unreserved.snapshot().debt),
+                );
                 self.arena
                     .start_trim_excess(&mut admission.ledger.prepared, floor)
             };

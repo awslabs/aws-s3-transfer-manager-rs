@@ -3,11 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
+use std::task::Poll;
 use std::thread;
 
 use bytes::Buf;
 
+use super::admission::WaitTicket;
 use super::*;
 
 fn write_all(buffer: &mut PooledBufMut, mut bytes: &[u8]) {
@@ -20,6 +23,31 @@ fn write_all(buffer: &mut PooledBufMut, mut bytes: &[u8]) {
         // SAFETY: the loop initialized exactly `count` leading bytes.
         unsafe { buffer.advance_mut(count) };
         bytes = &bytes[count..];
+    }
+}
+
+fn notify_counter() -> (NotifyFn, Arc<AtomicUsize>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let notified = Arc::clone(&count);
+    (
+        Arc::new(move || {
+            notified.fetch_add(1, Ordering::Release);
+        }),
+        count,
+    )
+}
+
+fn pending_reservation(pool: &BufferPool, plan: ReservationPlan, notify: NotifyFn) -> WaitTicket {
+    match pool.reserve(plan, notify).unwrap() {
+        Reserve::Ready(_) => panic!("reservation unexpectedly granted"),
+        Reserve::Pending(ticket) => ticket,
+    }
+}
+
+fn take_ready(ticket: &mut WaitTicket) -> Result<Reservation, ReserveError> {
+    match ticket.take() {
+        Poll::Ready(result) => result,
+        Poll::Pending => panic!("reservation is still pending"),
     }
 }
 
@@ -172,11 +200,13 @@ fn reservation_cannot_acquire_from_another_pool() {
 }
 
 #[test]
-fn reserved_acquisition_grows_when_unreserved_ownership_uses_retained_capacity() {
+fn unreserved_debt_prepares_replacement_before_consuming_retained_capacity() {
     let pool = BufferPool::new(4, 1);
     let reservation = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
     let unreserved = pool.acquire_unreserved(AcquireRequest::new(4)).unwrap();
+    assert_eq!(pool.snapshot().prepared, 2);
     assert_eq!(pool.snapshot().retained, 1);
+    assert_eq!(pool.snapshot().overflow, 1);
 
     let reserved = pool.acquire(&reservation, AcquireRequest::new(4)).unwrap();
     assert_eq!(pool.snapshot().overflow, 1);
@@ -302,5 +332,269 @@ fn snapshots_distinguish_free_retained_memory_from_admission_usage() {
     assert_eq!(snapshot.physical_live, 0);
 
     reservation.close_acquisition();
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn fifo_transfers_grants_in_arrival_order() {
+    let pool = BufferPool::new(4, 2);
+    let holder = pool.try_reserve(ReservationPlan::new(2, 2)).unwrap();
+    let (notify_first, first_count) = notify_counter();
+    let (notify_second, second_count) = notify_counter();
+    let mut first = pending_reservation(&pool, ReservationPlan::new(2, 2), notify_first);
+    let mut second = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_second);
+
+    drop(holder);
+    assert_eq!(first_count.load(Ordering::Acquire), 1);
+    assert_eq!(second_count.load(Ordering::Acquire), 0);
+    assert_eq!(pool.snapshot().active_planned_demand, 2);
+    assert_eq!(pool.snapshot().waiters, 1);
+
+    let first_reservation = take_ready(&mut first).unwrap();
+    drop(first_reservation);
+    assert_eq!(second_count.load(Ordering::Acquire), 1);
+    assert_eq!(pool.snapshot().active_planned_demand, 1);
+    assert_eq!(pool.snapshot().waiters, 0);
+
+    drop(take_ready(&mut second).unwrap());
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn reserve_returns_an_immediate_prepared_grant() {
+    let pool = BufferPool::new(4, 1);
+    let (notify, notify_count) = notify_counter();
+
+    let reservation = match pool.reserve(ReservationPlan::new(1, 1), notify).unwrap() {
+        Reserve::Ready(reservation) => reservation,
+        Reserve::Pending(_) => panic!("reservation unexpectedly parked"),
+    };
+
+    assert_eq!(notify_count.load(Ordering::Acquire), 0);
+    assert_eq!(pool.snapshot().prepared, 1);
+    assert_eq!(pool.snapshot().active_planned_demand, 1);
+    drop(reservation);
+}
+
+#[test]
+fn fresh_reservation_does_not_bypass_fifo_head() {
+    let pool = BufferPool::new(4, 2);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let (notify, _) = notify_counter();
+    let _front = pending_reservation(&pool, ReservationPlan::new(2, 2), notify);
+
+    assert!(matches!(
+        pool.try_reserve(ReservationPlan::new(1, 1)),
+        Err(ReserveError::AtCapacity)
+    ));
+
+    drop(holder);
+}
+
+#[test]
+fn cancelling_fifo_head_grants_next_waiter_that_fits() {
+    let pool = BufferPool::new(4, 4);
+    let holder = pool.try_reserve(ReservationPlan::new(3, 3)).unwrap();
+    let (notify_front, front_count) = notify_counter();
+    let (notify_next, next_count) = notify_counter();
+    let front = pending_reservation(&pool, ReservationPlan::new(2, 2), notify_front);
+    let mut next = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_next);
+
+    drop(front);
+    assert_eq!(front_count.load(Ordering::Acquire), 0);
+    assert_eq!(next_count.load(Ordering::Acquire), 1);
+    assert_eq!(pool.snapshot().waiters, 0);
+
+    drop(take_ready(&mut next).unwrap());
+    drop(holder);
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn cancelling_middle_waiter_preserves_neighbor_order() {
+    let pool = BufferPool::new(4, 1);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let (notify_first, first_count) = notify_counter();
+    let (notify_middle, middle_count) = notify_counter();
+    let (notify_last, last_count) = notify_counter();
+    let mut first = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_first);
+    let middle = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_middle);
+    let mut last = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_last);
+
+    drop(middle);
+    drop(holder);
+    assert_eq!(first_count.load(Ordering::Acquire), 1);
+    assert_eq!(middle_count.load(Ordering::Acquire), 0);
+    assert_eq!(last_count.load(Ordering::Acquire), 0);
+
+    drop(take_ready(&mut first).unwrap());
+    assert_eq!(last_count.load(Ordering::Acquire), 1);
+    drop(take_ready(&mut last).unwrap());
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn oversized_fifo_head_waits_for_idle_then_precedes_smaller_waiter() {
+    let pool = BufferPool::new(4, 1);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let (notify_large, large_count) = notify_counter();
+    let (notify_small, small_count) = notify_counter();
+    let mut large = pending_reservation(&pool, ReservationPlan::new(2, 2), notify_large);
+    let mut small = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_small);
+
+    assert_eq!(large_count.load(Ordering::Acquire), 0);
+    drop(holder);
+
+    assert_eq!(large_count.load(Ordering::Acquire), 1);
+    assert_eq!(small_count.load(Ordering::Acquire), 0);
+    assert_eq!(pool.snapshot().active_planned_demand, 2);
+    assert_eq!(pool.snapshot().prepared, 2);
+
+    drop(take_ready(&mut large).unwrap());
+    assert_eq!(small_count.load(Ordering::Acquire), 1);
+    drop(take_ready(&mut small).unwrap());
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn dropping_untaken_grant_returns_it_to_fifo() {
+    let pool = BufferPool::new(4, 1);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let (notify_first, first_count) = notify_counter();
+    let (notify_second, second_count) = notify_counter();
+    let first = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_first);
+    let mut second = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_second);
+
+    drop(holder);
+    assert_eq!(first_count.load(Ordering::Acquire), 1);
+    drop(first);
+    assert_eq!(second_count.load(Ordering::Acquire), 1);
+
+    drop(take_ready(&mut second).unwrap());
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn queued_preparation_failure_fails_head_and_grants_next() {
+    let pool = BufferPool::new(4, 1);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let (notify_front, front_count) = notify_counter();
+    let (notify_next, next_count) = notify_counter();
+    let mut front = pending_reservation(&pool, ReservationPlan::new(2, 2), notify_front);
+    let mut next = pending_reservation(&pool, ReservationPlan::new(1, 1), notify_next);
+
+    pool.fail_next_preparation();
+    drop(holder);
+
+    assert_eq!(front_count.load(Ordering::Acquire), 1);
+    assert_eq!(next_count.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        take_ready(&mut front),
+        Err(ReserveError::PhysicalPreparationFailed)
+    ));
+    assert_eq!(pool.snapshot().active_planned_demand, 1);
+    assert_eq!(pool.snapshot().waiters, 0);
+
+    drop(take_ready(&mut next).unwrap());
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn immediate_preparation_failure_does_not_charge_admission() {
+    let pool = BufferPool::new(4, 1);
+    pool.fail_next_preparation();
+
+    assert!(matches!(
+        pool.try_reserve(ReservationPlan::new(1, 1)),
+        Err(ReserveError::PhysicalPreparationFailed)
+    ));
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.prepared, 0);
+    assert_eq!(snapshot.admission_used, 0);
+}
+
+#[test]
+fn admission_shutdown_fails_waiters_but_preserves_active_acquisition() {
+    let pool = BufferPool::new(4, 1);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let (notify, notify_count) = notify_counter();
+    let mut waiter = pending_reservation(&pool, ReservationPlan::new(1, 1), notify);
+
+    pool.close_admission();
+
+    assert_eq!(notify_count.load(Ordering::Acquire), 1);
+    assert!(matches!(take_ready(&mut waiter), Err(ReserveError::Closed)));
+    assert!(matches!(
+        pool.try_reserve(ReservationPlan::new(1, 1)),
+        Err(ReserveError::Closed)
+    ));
+    assert!(pool.snapshot().admission_closed);
+
+    let buffer = pool.acquire(&holder, AcquireRequest::new(4)).unwrap();
+    let unreserved = pool.acquire_unreserved(AcquireRequest::new(4)).unwrap();
+    drop(buffer);
+    drop(unreserved);
+    drop(holder);
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn idle_escape_ignores_unreserved_debt_and_allows_one_plan() {
+    let pool = BufferPool::new(4, 1);
+    let unreserved = pool.acquire_unreserved(AcquireRequest::new(4)).unwrap();
+    let reservation = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.configured, 1);
+    assert_eq!(snapshot.admission_used, 2);
+    assert_eq!(snapshot.prepared, 2);
+    assert_eq!(snapshot.unreserved_debt, 1);
+    assert!(matches!(
+        pool.try_reserve(ReservationPlan::new(1, 1)),
+        Err(ReserveError::AtCapacity)
+    ));
+
+    drop(reservation);
+    drop(unreserved);
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn retiring_direct_owner_blocks_idle_escape_until_final_return() {
+    let pool = BufferPool::new(4, 1);
+    let reservation = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let buffer = pool.acquire(&reservation, AcquireRequest::new(4)).unwrap();
+    let (notify, notify_count) = notify_counter();
+    let mut waiter = pending_reservation(&pool, ReservationPlan::new(1, 1), notify);
+
+    reservation.close_acquisition();
+    assert_eq!(pool.snapshot().retiring_direct_live, 1);
+    assert_eq!(notify_count.load(Ordering::Acquire), 0);
+    assert!(matches!(waiter.take(), Poll::Pending));
+
+    drop(buffer);
+    assert_eq!(notify_count.load(Ordering::Acquire), 1);
+    drop(take_ready(&mut waiter).unwrap());
+    assert_eq!(pool.snapshot().admission_used, 0);
+}
+
+#[test]
+fn unreserved_debt_repayment_drains_fifo() {
+    let pool = BufferPool::new(4, 2);
+    let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+    let first = pool.acquire_unreserved(AcquireRequest::new(4)).unwrap();
+    let second = pool.acquire_unreserved(AcquireRequest::new(4)).unwrap();
+    assert_eq!(pool.snapshot().unreserved_debt, 2);
+
+    let (notify, notify_count) = notify_counter();
+    let mut waiter = pending_reservation(&pool, ReservationPlan::new(1, 1), notify);
+    drop(first);
+    assert_eq!(notify_count.load(Ordering::Acquire), 0);
+    assert!(matches!(waiter.take(), Poll::Pending));
+
+    drop(second);
+    assert_eq!(notify_count.load(Ordering::Acquire), 1);
+    drop(take_ready(&mut waiter).unwrap());
+    drop(holder);
     assert_eq!(pool.snapshot().admission_used, 0);
 }

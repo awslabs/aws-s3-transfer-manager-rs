@@ -11,14 +11,14 @@
 //! Both ranges retain the same carrier guard, so the carrier returns only after
 //! the final mutable or immutable owner drops.
 
+use bytes::{Buf, Bytes};
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
+use crate::runtime::sync::sync::Arc;
 
 use super::arena::AcquisitionSource;
 use super::CarrierGuard;

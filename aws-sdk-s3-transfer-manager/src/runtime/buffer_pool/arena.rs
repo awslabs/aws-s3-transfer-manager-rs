@@ -57,6 +57,8 @@ struct ArenaState {
     next_slot: u32,
     #[cfg(test)]
     fail_after_successes: Option<usize>,
+    #[cfg(test)]
+    fail_next_preparation: bool,
 }
 
 #[derive(Clone)]
@@ -168,6 +170,8 @@ impl Arena {
                 next_slot: 0,
                 #[cfg(test)]
                 fail_after_successes: None,
+                #[cfg(test)]
+                fail_next_preparation: false,
             }),
         }
     }
@@ -183,6 +187,11 @@ impl Arena {
     pub(super) fn prepare_to(&self, target: usize, prepared: &mut usize) -> Result<(), AllocError> {
         let mut state = self.state.lock();
         while *prepared < target {
+            #[cfg(test)]
+            if std::mem::take(&mut state.fail_next_preparation) {
+                return Err(AllocError::PhysicalAllocationFailed);
+            }
+
             if let Some(block) = state
                 .blocks
                 .iter()
@@ -279,6 +288,14 @@ impl Arena {
         #[cfg(not(test))]
         {
             let _ = successes;
+        }
+    }
+
+    /// Inject one failure before the next capacity-preparation step.
+    pub(super) fn fail_next_preparation(&self) {
+        #[cfg(test)]
+        {
+            self.state.lock().fail_next_preparation = true;
         }
     }
 
