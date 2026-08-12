@@ -210,15 +210,16 @@ was minted, so a name that outlives its block's mapping is detected rather than 
 [unmapping a block safely](#unmapping-a-block-safely)):
 
 ```rust
-// Illustrative, not the committed API.
-struct CarrierId { block: u32, index: u32, generation: u32 }
+struct CarrierId { block: u32, index: u32, generation: u64 }
 
 struct Block {
     base: AtomicPtr<u8>,      // page-aligned mapping; null when the block is empty
     carrier_size: usize,      // uniform within the arena
     inuse: Box<[AtomicU64]>,  // one bit per carrier, 1 = in use; the single source of truth
-    state: AtomicU8,          // Empty | Active | Draining (see block lifetime)
-    generation: AtomicU32,    // bumped on unmap; guards stale CarrierIds
+    status: AtomicU64,        // low bits: Empty | Active | Draining; rest: generation.
+                              // generation occupies the high bits so its carry cannot
+                              // reach the state bits. One word, so a claim reads the
+                              // pair in one load (see unmapping a block safely)
     // ... NUMA node
 }
 
@@ -432,9 +433,9 @@ in-use, "all carriers free" is the whole word reading zero, which is the test tr
 
 Each worker thread keeps a **shard**: a small thread-local list of recently-seen free carrier IDs, used
 only to *start* a claim's search near carriers likely still free, never as owned capacity. A claim
-consults its shard first and takes a hinted carrier by the same atomic OR; if the hint is stale (the
-carrier was taken since, or its block was reclaimed and remapped), the claim discards it and scans the
-bitmap. The shard is written only by the scan: on a miss, the claim scans a word, takes one free bit, and
+consults its shard first and takes a hinted carrier by the same atomic OR; if the hint is stale — the
+carrier was taken since, or its block was reclaimed, or reclaimed and since revived — the claim discards it
+and scans the bitmap. The shard is written only by the scan: on a miss, the claim scans a word, takes one free bit, and
 stashes the word's other free bits as hints for its next claims. Because the shard holds only hints and
 the bitmap records every free carrier, a carrier freed anywhere is discoverable by a scan regardless of
 which thread last touched it — shard contents are never capacity the cap cannot see. Returns go straight
@@ -458,6 +459,121 @@ claim.
     bounded misses → serialized claim (below)
 ```
 
+The ordering each atomic requires is stated at the site that issues it; Appendix A collects them.
+
+```rust
+impl Arena {
+    /// Claims one carrier. The `Err` case is an `mmap` the operating system
+    /// declined; the subsystem itself never refuses a claim and never waits on
+    /// admission (see "reserved implies claimable").
+    fn claim(&self, shard: &mut Shard) -> Result<Carrier, AllocError> {
+        for _ in 0..CLAIM_ATTEMPTS {
+            // Start near a carrier recently seen free. A hint names a block, an
+            // index, and the generation that block held when the hint was minted.
+            // It is a starting point, never owned capacity.
+            while let Some(id) = shard.pop_hint() {
+                if let Some(c) = self.try_take(id) {
+                    return Ok(c);
+                }
+                // Stale: the carrier was taken since, or its block was reclaimed,
+                // or reclaimed and since revived. `try_take` left the bitmap as it
+                // found it, so there is nothing to undo here.
+            }
+
+            // No usable hint: scan the bitmap, the single source of truth for what
+            // is free, stashing the scanned word's other free bits as hints.
+            match self.scan_and_take(shard) {
+                Scan::Took(c) => return Ok(c),
+                // Free bits were found but every take lost its race. A free carrier
+                // still exists by the accounting, so scan again.
+                Scan::LostRace => continue,
+                // Nothing free anywhere: consumption that could not be refused has
+                // overtaken `prepared`. Map a block to back what is already owed,
+                // rather than failing or waiting on admission.
+                Scan::NoneFree => return self.grow_and_take(),
+            }
+        }
+
+        // Bounded losses: serialize under the per-node lock, where no take is lost.
+        // This resolves contention for capacity already guaranteed to exist; it
+        // never maps memory and never waits for any.
+        self.claim_serialized(shard)
+    }
+
+    /// The gate against trim. Sets the carrier's bit, then reads the block's status,
+    /// and keeps the carrier only on `active` with a matching generation (see
+    /// "unmapping a block safely" for why no weaker pair of orderings works).
+    fn try_take(&self, id: CarrierId) -> Option<Carrier> {
+        // The block record is never freed and never moves, so indexing it is always
+        // safe; only the region its `base` points at comes and goes.
+        let block = &self.blocks[id.block as usize];
+        let (word, bit) = (id.index as usize / 64, 1u64 << (id.index % 64));
+
+        // Take the bit. SeqCst: this store is the first half of the gate, and the
+        // load below must not be reordered before it. The returned prior word is
+        // what says the carrier was ours to take -- no remembered value is compared,
+        // so there is no ABA hazard on the bit.
+        if block.inuse[word].fetch_or(bit, Ordering::SeqCst) & bit != 0 {
+            return None; // another thread holds it; the bitmap is unchanged by us
+        }
+
+        // The second half of the gate. One load reads state and generation together,
+        // so the pair cannot be observed inconsistently. SeqCst for the same reason.
+        //
+        // The test is affirmative -- in service AND the same incarnation this name
+        // refers to. Rejecting only `draining` would let `empty` through, since a
+        // block has three states and a name can outlive a mapping entirely.
+        if block.status.load(Ordering::SeqCst) != Status::active(id.generation) {
+            block.inuse[word].fetch_and(!bit, Ordering::SeqCst); // only our own bit
+            return None;
+        }
+
+        // Only now is an address formed. The set bit forbids unmap, so `base` cannot
+        // be cleared while this carrier is held, and a claim that backed out above
+        // never reached this line. Relaxed suffices: the mapping was published
+        // before the status that admitted us, and the acquire half of that SeqCst
+        // load orders this read after it.
+        let base = block.base.load(Ordering::Relaxed);
+        Some(Carrier { id, ptr: unsafe { base.add(id.index as usize * block.carrier_size) } })
+    }
+
+    /// The batch form: an upload claims a whole part at once. One OR sets every free
+    /// bit it wants in a word and it keeps whichever it won -- not an all-or-nothing
+    /// compare-and-swap, which a concurrent return to the same word would livelock.
+    fn try_take_word(&self, id: CarrierId, word: usize, want: u32) -> Option<u64> {
+        let block = &self.blocks[id.block as usize];
+
+        let mask = lowest_set_bits(!block.inuse[word].load(Ordering::Relaxed), want);
+        if mask == 0 {
+            return None;
+        }
+
+        let won = mask & !block.inuse[word].fetch_or(mask, Ordering::SeqCst);
+        if won == 0 {
+            return None;
+        }
+
+        if block.status.load(Ordering::SeqCst) != Status::active(id.generation) {
+            block.inuse[word].fetch_and(!won, Ordering::SeqCst); // only the bits we won
+            return None;
+        }
+        Some(won)
+    }
+}
+
+impl Status {
+    /// `status` packs generation and state in one word; `active(g)` is the only
+    /// value a claim accepts. Generation occupies the high bits, so its carry
+    /// cannot reach the state bits.
+    fn active(generation: u64) -> u64 {
+        generation << STATE_BITS | ACTIVE
+    }
+}
+```
+
+A batch claim backs out by clearing the bits it won, not the mask it attempted. Bits the OR found already
+set belong to another claim, and clearing them would free a carrier that thread is about to fill.
+
 A claim succeeds on two separate conditions. Whether a free carrier *exists* is accounting: a claim
 happens only within a granted envelope the claimant has not spent, and the arena holds `prepared >=
 reserved + debt` (the counters are defined under [preparing and reclaiming
@@ -475,6 +591,17 @@ of attempts takes a serialized path, claiming under a per-node lock where no ato
 a fairness backstop, not a capacity wait: the carrier it claims was already guaranteed to exist, so the
 lock removes contention rather than waiting for memory to appear. The serialized path never maps memory
 or grows the arena, which is admission's concern settled at reserve.
+
+**Obligations** (discharged in [Appendix C](#appendix-c-verification)).
+- A claim keeps a carrier only when its bit was clear before the take and its block reads `active` with a
+  matching generation.
+- A rejected take leaves the bitmap exactly as it found it, and a batch rejection clears only the bits it
+  won.
+- An address is formed only after the gate passes — the pointer is computed in one place, after the status
+  check.
+- The scan finds any free carrier regardless of which thread returned it, so a claim within a granted
+  envelope never fails for lack of a carrier that exists.
+- A claim terminates: bounded losses fall through to the serialized path, which cannot lose a take.
 
 **Alternative: a per-thread cache that owns its carriers.** A thread cache that takes ownership of a
 batch of carriers — marking them in use until the local cache drains, as a general-purpose allocator's
@@ -503,18 +630,77 @@ Release is the drop, and the drop happens when the data the reservation accounts
 reservation is held for exactly as long as the memory it covers is resident.
 
 ```rust
-// Illustrative, not the committed API.
 struct Reservation {
-    cap: Arc<Cap>,   // the shared admission counter + wait queue
-    carriers: u32,   // the granted envelope
+    budget: Arc<MemoryBudget>, // the shared admission quantities + wait queue
+    carriers: u32,             // the granted envelope
+    coverage: u32,             // the part of it set aside for unreserved claims
+    live_here: AtomicU32,      // carriers claimed in this reservation's own name
+}
+
+impl Reservation {
+    /// How many more carriers the holder may claim itself. Coverage is carved
+    /// OUT of the envelope, so it is subtracted here: a download that declared
+    /// its whole envelope as coverage claims nothing directly, and an upload
+    /// that declared none claims all of it. Without the subtraction a download
+    /// could claim its full envelope while the transport spends its coverage as
+    /// well, holding twice what admission counted once.
+    fn remaining(&self) -> u32 {
+        self.carriers - self.coverage - self.live_here.load(Ordering::Relaxed)
+    }
+
+    /// The explicit path: the envelope is enforced here, at the claim, because
+    /// the caller has the reservation in hand. Exceeding it is a caller bug, not
+    /// a capacity condition -- admission already granted this memory.
+    fn claim(&self, arena: &Arena, n: u32) -> Result<SegmentBuffer, AllocError> {
+        assert!(n <= self.remaining(), "claim exceeds the granted envelope");
+        let buf = arena.claim_n(n)?;
+        self.live_here.fetch_add(n, Ordering::Relaxed);
+        Ok(buf)
+    }
+}
+
+impl Arena {
+    /// The unreserved path has no reservation to present and so no envelope to
+    /// check against (see "what the buffer source can carry"). It is served first
+    /// and reconciled afterward: draw the carrier, charge it against outstanding
+    /// coverage, and record whatever coverage cannot absorb as debt.
+    fn claim_unreserved(&self) -> Result<Carrier, AllocError> { /* ... */ }
 }
 
 impl Drop for Reservation {
+    /// The sole release path. Runs on whatever thread drops the last delivered
+    /// frame, so it must not depend on a work-generation turn.
     fn drop(&mut self) {
-        // returns `carriers` to the cap and drains the wait queue; the sole release path.
+        let mut ledger = self.budget.lock();
+
+        // Withdraw this reservation's coverage, and convert what that leaves
+        // uncovered into debt: the part of `coverage` that `avail` cannot
+        // absorb is consumption that is still live and has just lost its cover.
+        let uncovered = self.coverage.saturating_sub(ledger.avail);
+        ledger.debt += uncovered;
+        ledger.avail = ledger.avail.saturating_sub(self.coverage);
+        ledger.declared -= self.coverage;
+
+        // Return the envelope.
+        ledger.reserved -= self.carriers;
+
+        // Hand the freed capacity to waiters that fit, front to back, stopping
+        // at the first that does not. The grant is recorded here, under the
+        // lock; the wakes fire after it is released, so a wake is never lost and
+        // the wake path never nests locks.
+        let wakes = ledger.drain_queue();
+        drop(ledger);
+        for w in wakes {
+            w.wake();
+        }
     }
 }
 ```
+
+Debt only ever rises here. A grant adds coverage for claims that follow it and cannot retroactively cover
+consumption that is already live, which is why the conversion is additive rather than a recomputation
+against the current coverage (see [unreserved claims and debt](#unreserved-claims-and-debt)). The full set
+of quantities and every transition among them is in [Appendix D](#appendix-d-the-admission-ledger).
 
 The reservation covers a whole unit of work, a download range or an upload part, not an individual
 carrier. It is acquired at `poll_work`, carried on the work item into `execute`, and moved onto the
@@ -556,6 +742,14 @@ release: there is one reservation, released once, when the last byte it accounts
 individual carriers, by contrast, return to the arena eagerly as each frame drops (see
 [the segment buffer](#the-segment-buffer)), so physical memory frees ahead of the admission envelope.
 
+**Obligations** (discharged in [Appendix C](#appendix-c-verification)).
+- The holder's own claims are capped at `envelope − coverage`, which is what makes `live_reserved <=
+  reserved` hold and therefore what makes the cap bound real footprint. No mechanism enforces it other than
+  this subtraction.
+- A reservation's drop returns the envelope exactly once, and debt only rises at a close.
+- A grant never reduces standing debt.
+- The wake fires after the budget's lock is released, and the grant is recorded before the wake.
+
 Retry does not re-reserve. A range-GET that fails mid-body and retries re-reads the body into fresh
 carriers, but the reservation is held across attempts, on the work item, not dropped and re-taken. Only
 the partial data of the failed attempt is discarded; its carriers return to the arena and the
@@ -583,6 +777,15 @@ The immutable form is a sequence of segments delivered downstream. What that seq
 fixed by the consumers it must satisfy without a copy — the SDK body type carrying `Bytes`, and disk
 writes and generic byte sinks taking `bytes::Buf` — and getting arena memory into those shapes is the
 subject of [Ecosystem](#ecosystem).
+
+Two properties of the immutable form hold whatever the caller-facing type turns out to be. No route out of
+it loses track of a carrier: every route either clones a `Bytes`, extending the carrier's life while keeping
+it counted, or copies out of it, ending that life at a point the arena observes. None yields a bare pointer,
+so a consumer cannot escape the accounting. And capacity is held from claim until the last delivered view
+drops, so a slow consumer converts throughput into resident memory — which is why retention appears in the
+requirements as something the cap must tolerate rather than something the arena can prevent. The shape of
+the type the caller actually receives is open (see [the shape of the delivery
+type](#the-shape-of-the-delivery-type)).
 
 ### Preparing and reclaiming capacity
 
@@ -824,11 +1027,16 @@ changes. A claim never withholds count to hold out for contiguity: a short-but-c
 weaken the count guarantee exactly when the arena is fragmented, and vectored I/O handles several
 segments anyway.
 
-On the download side, where carriers are drawn one per socket read and interleave across many concurrent
-transfers, runs will rarely form, and that is fine: the scattered result is delivered and written by one
-vectored call. On the upload side, where a whole part is claimed at once, a run is often available and
-the claim captures it. So contiguity is an optimization the arena produces when it can and never depends
-on.
+On the upload side, where a whole part is claimed at once, a run is often available and the claim captures
+it. On the download side runs form differently, at delivery rather than claim: as frames are pushed into
+the buffer, a frame that abuts the back segment — same block, and its pointer meeting the segment's end —
+extends that segment instead of starting a new one, so consecutive carriers coalesce into one segment even
+though they were claimed one socket read at a time. The merge tests only block identity and pointer
+adjacency, never a carrier index, so it applies to arena-claimed carriers and to transport-published views
+alike; foreign memory (`block: None`) never abuts and stays its own segment. How many segments a delivered
+part carries then tracks the run length the arena handed out, not the frame count, which is what makes the
+`pwritev` descriptor count track carriers rather than framing. So contiguity is an optimization the arena
+produces when it can — at claim on upload, at delivery on download — and never depends on.
 
 The tail of a file is the one place `O_DIRECT` alignment is not free. A read whose length is rounded up
 past end-of-file is legal — the kernel returns a short count and the carrier's valid prefix is used — so
@@ -992,17 +1200,44 @@ base pointer, bitmap, state, and generation — is a small control structure. Se
 makes the concurrency tractable.
 
 The block record is never freed. A block occupies a stable position in the arena's block collection for
-the arena's life, and its record and bitmap outlive any single mapping. Trim unmaps the *region* and
-returns the block to an **empty** state; growth later revives an empty block by mapping a fresh region
-into it. A block is therefore always in one of three states: **empty** (no mapping, not eligible for
-claims), **active** (mapped, carriers claimable), or **draining** (mapped, but being taken out of
-service, no new claims). Because the record never moves or frees, a thread that holds a reference to a
-block — or resolves one from a carrier's block index — can always read its state and bitmap safely; only
-the *region* it points at may come and go, and that is what the gate below protects.
+the arena's life, and its record and bitmap outlive any single mapping. Because the record never moves or
+frees, a thread that holds a reference to a block — or resolves one from a carrier's block index — can
+always read its status and bitmap safely; only the *region* it points at may come and go, and that is what
+the gate below protects.
 
-A block is revived by mapping a region, initializing its bitmap all-free, and bumping its generation,
-*then* publishing the active state with a release store — so a claim that reads the active state with an
-acquire load sees a fully initialized block, never a half-mapped one.
+```text
+   ┌─────────┐
+   │  empty  │  no mapping, no claims; the record and bitmap still exist
+   └────┬────┘
+        │  revive: map a region, initialize the bitmap all-free,
+        │          then publish (active, generation + 1) in one store
+        ▼
+   ┌─────────┐
+   │ active  │  mapped, carriers claimable
+   └────┬────┘
+        │  drain: publish (draining, same generation)
+        │         only for a block already observed idle and all-free
+        ▼
+   ┌──────────┐
+   │ draining │  mapped, no new claims
+   └────┬─────┘
+        │
+        ├── confirming read: all carriers still free
+        │      └─► munmap the region, publish empty ─────────────► empty
+        │
+        └── confirming read: a carrier was taken
+               └─► abandon: revert to active, restore `prepared`,
+                   reclaim a different block later ──────────────► active
+```
+
+Trim unmaps the *region* and returns the block to **empty**; growth later revives an empty block by
+mapping a fresh region into it. Revival initializes the region and bitmap *before* publishing `active`, so
+a claim that sees `active` sees a fully initialized block, never a half-mapped one.
+
+A block's state and its generation live in one word. A claim needs both — the state to know the block is in
+service, the generation to know it is the same incarnation the claim's name refers to — and reading them
+as one load makes the pair consistent by construction rather than by argument. Revival advances the
+generation and sets the state in the same store.
 
 The dangerous interval between trim and a claim is narrow. Once a claim has flipped a carrier's bit to
 in-use, the block has a live carrier, and trim's all-free requirement forbids unmapping it — so the
@@ -1011,28 +1246,58 @@ only race is the instant *before* the bit is taken: a claim has selected a still
 that trim is simultaneously deciding is all-free and about to unmap. Closing that window is a mutual
 signal between the two:
 
-- Trim marks the block **draining**, then reads the bitmap to confirm all carriers free.
-- A claim sets its carrier's bit, then reads the block's state *and* generation; if the block is draining,
-  or its generation no longer matches the one the claim expected, it clears the bit and claims elsewhere.
+- Trim publishes **draining**, then reads the bitmap to confirm all carriers free.
+- A claim sets its carrier's bit, then reads the block's status; it keeps the carrier only if the state is
+  **active** *and* the generation matches the one its name refers to. Anything else — draining, empty, or a
+  generation that moved — and it clears the bit and claims elsewhere.
 
-Each side writes its flag and then reads the other's. The bad outcome — trim sees all-free while a claim
-believes it took a carrier from an active block — cannot occur, because the claim reads the state *after*
-setting the bit: if the claim saw active, its bit-set preceded trim's all-free read, so trim sees the bit
-taken and does not unmap. This is a store-then-load ordering on both sides, and it is correct only under
-sequential consistency (or an explicit full fence); acquire/release is insufficient, because the hazard
-is exactly the store-load reordering those orderings permit.
+Each side writes its flag and then reads the other's, so neither can complete while blind to the other:
 
-The generation is read in the same step for a second reason, not only to validate a shard hint. Between a
-claim reading a block's generation and setting its bit, the block could in principle be drained, unmapped,
-and revived — a new mapping in the same record — and its state would then read active again, passing a
-state-only check while the claim is about to write into the wrong incarnation. Rechecking the generation
-after the bit-set closes this: revival always bumps it, so a mismatch means "different incarnation" and
-the claim backs out. State and generation are therefore checked together, after the set, on every claim
-path including the shard-hint fast path — the generation is not a hint-only concern.
+```text
+     trim                                    claim
+     ────                                    ─────
+  T1 publish draining                     C1 set the carrier's bit
+        │                                       │
+  T2 read the bitmap                      C2 read the block's status
+        │                                       │
+        ├─ all free   → unmap                   ├─ active & generation matches → keep
+        └─ bit taken  → abandon                 └─ anything else → clear the bit, retry
+
+  Both sides completing wrongly requires each load to miss the other's store:
+
+      T2 missed C1  ⇒  T2 before C1
+      C2 missed T1  ⇒  C2 before T1
+
+  with T1 before T2 and C1 before C2 fixed by program order, this closes a cycle —
+  T1 → T2 → C1 → C2 → T1 — and no single total order over the four accesses admits it.
+```
+
+The requirement is therefore a total order over those four accesses: sequential consistency on them, or an
+explicit full fence between each side's store and its load. Acquire/release is insufficient, because the
+hazard is precisely the store-load reordering it permits — with it, both loads may miss both stores, the
+cycle opens, and trim unmaps a region a claim is about to write into. This is the interleaving the design
+is most likely to lose in review, since the orderings look stronger than the surrounding code needs.
+
+The generation is checked here for a reason beyond validating a shard hint. Between a claim reading a
+block's status and setting its bit, the block could be drained, unmapped, and revived — a new mapping in
+the same record, reading `active` again. The claim's bit would have landed on the previous incarnation's
+bitmap, which revival zeroed, so the claim would hold nothing while believing it holds a carrier, and a
+later claim could hand out the same carrier. Revival advances the generation, so a mismatch means
+"different incarnation" and the claim backs out. State and generation are read together, after the set, on
+every claim path including the shard-hint fast path: state answers whether the block is in service, and
+generation answers whether it is the same block the name meant. Neither question subsumes the other.
 
 This is the subsystem's sharpest ordering argument and is stated as a [correctness
-invariant](#unmapping-never-races-a-live-carrier) with a standing obligation to be model-checked,
-including a check that weakening the fence to acquire/release is caught.
+invariant](#unmapping-never-races-a-live-carrier).
+
+A carrier's address is its block's base plus an index times the carrier size, so resolving a name to an
+address reads the block's base pointer — which trim clears at unmap. That read belongs *after* the gate, not
+before. A claim that passes the gate holds a set bit, and a set bit forbids unmap, so the base it then reads
+cannot be cleared while it holds that carrier. A claim that backs out never resolves an address at all, so
+the pointer it would have computed is never formed. The base pointer therefore needs no ordering of its own;
+it inherits the gate's. This is also why a shard hint carries a block index, a carrier index, and a
+generation, but never an address: an address cached beside a hint would have been resolved before the gate,
+and a hint outlives the incarnation it names.
 
 A claim that loses this race — sets a bit, finds the block draining, and backs out — is guaranteed to find
 capacity elsewhere, because trim only began draining after the [floor
@@ -1043,13 +1308,23 @@ service — and reclaims a different one later. A block that reached draining wa
 arriving mid-drain is rare; abandoning is simpler than holding a wait, and it needs no in-flight-claim
 counter.
 
-Because a block only unmaps when all carriers are free, there is never a *live* carrier ID to invalidate
-at unmap; the generation's other role is guarding stale shard hints, which name a since-revived block and
-are discarded on the mismatch exactly as a stale-but-taken hint is.
+Because a block only unmaps when all carriers are free, there is never a *live* carrier name to invalidate
+at unmap; the names the generation guards are stale shard hints, discarded on the mismatch exactly as a
+stale-but-taken hint is.
 
-Trim touches the hot path only through flags a claim already reads — the block state on selection, the
-generation on hint validation — and the `munmap` itself runs off the hot path, on whatever actor the
-trigger drives.
+Trim touches the hot path only through the one word a claim already reads, and the `munmap` itself runs off
+the hot path, on whatever actor the trigger drives.
+
+**Obligations** (discharged in [Appendix C](#appendix-c-verification)).
+- The gate admits no cycle over its four accesses, so a total order over them is required.
+- Revival publishes `active` only after its region is mapped and its bitmap initialized.
+- A carrier's address is resolved only after the gate passes, and a claim that backs out resolves none.
+- A claim keeps a carrier only on `active` and a matching generation. Draining and empty are distinct
+  rejections, and neither relies on the generation check to catch it.
+- The generation is assumed not to wrap within a hint's lifetime. A false match requires the number of
+  revivals between stashing a hint and checking it to be exactly a multiple of the generation field's range;
+  every other value mismatches. The consequence if it did occur is aliased writes into one carrier, so the
+  field is sized to make the assumption hold by margin rather than by argument.
 
 ### Sizing the cap
 
@@ -1076,31 +1351,122 @@ at both ends, and bandwidth-aware sizing is a later refinement (see
 hosts the client runs on: safe on a large host starves a small one, and safe on a small host under-uses
 a large one. Sizing from detected memory adapts the default; the clamp bounds the adaptation.
 
+### Observability
+
+Two surfaces: a pull-only snapshot for programmatic use, and `tracing` at a named target for diagnosis.
+Neither is a metrics facade and neither runs a reporting task — the snapshot is computed when asked, and
+log records are emitted by the paths that already run.
+
+**The snapshot.** One method, taking the budget's lock once, converting the ledger's carrier counts to
+bytes. The four fields the shipped type already has keep their meaning, so this extends rather than
+replaces it; `#[non_exhaustive]` is what makes the extension additive.
+
+```rust
+/// Snapshot of the memory subsystem's admission and capacity state.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct MemoryBudgetSnapshot {
+    /// The resolved ceiling — what the configured policy produced on this machine.
+    pub capacity_bytes: u64,
+    /// Capacity mapped and ready to serve claims. Rises with growth, falls with trim,
+    /// bounded by `capacity_bytes`.
+    pub prepared_bytes: u64,
+    /// Bytes granted to live reservations. An admission level, not a residency figure: a
+    /// reservation is charged its whole envelope from grant, before any of it is claimed.
+    pub reserved_bytes: u64,
+    /// Bytes in claimed carriers. The subsystem's actual footprint, and the only field here
+    /// that tracks residency.
+    pub live_bytes: u64,
+    /// Live consumption drawn without a reservation — what a buffer source spent. Covered by
+    /// declared coverage where a transfer declared any, and by `debt_bytes` where it did not.
+    pub unreserved_bytes: u64,
+    /// The part of unreserved consumption no coverage absorbed. Repaid by returns.
+    pub debt_bytes: u64,
+    /// Reservations parked waiting for a grant. Zero means admission is not binding now.
+    pub waiters: usize,
+    /// Cumulative parks, maps, unmaps, and entries to the serialized claim path. Monotonic;
+    /// callers difference them to get rates.
+    pub counters: MemoryBudgetCounters,
+}
+```
+
+`capacity_bytes`, `prepared_bytes`, `reserved_bytes`, `debt_bytes`, and `waiters` are ledger quantities read
+as they stand (see [Appendix D](#appendix-d-the-admission-ledger)); `unreserved_bytes` is the derived
+`(declared − avail) + debt`. `live_bytes` is not a ledger field and is deliberately not maintained as one: a
+global live counter would add a second contended atomic to a claim path built to touch one word (see
+[claiming and returning a carrier](#claiming-and-returning-a-carrier)). It is computed on demand instead, by
+population count over the in-use bitmaps — one pass over `carriers / 64` words, on a cold path, against a
+hot path that stays at one atomic.
+
+`reserved_bytes` and `live_bytes` differ by granted-but-unclaimed envelope, which is normal and large on the
+download path because coverage is envelope a transfer never claims itself. Neither bounds the process's
+resident set: the cap bounds admitted work and prepared capacity, and a flattening copy taken by a consumer
+is memory the ledger has no term for (see [the shape of the delivery
+type](#the-shape-of-the-delivery-type)).
+
+Monotonic counters rather than rates or windows, because a caller sampling twice derives the rate and the
+subsystem then keeps no window state: `parks`, `blocks_mapped`, `blocks_unmapped`, `serialized_claims`. A
+map count that climbs alongside an unmap count is growth and trim thrashing the same capacity; a
+`serialized_claims` count that climbs is the fairness backstop firing under real contention rather than
+sitting idle.
+
+**Two derived quantities that the ledger cannot yield.** Park duration and retention age are durations, not
+levels, so each needs state added deliberately.
+
+Park duration is recorded where the grant already happens: the waiter carries its enqueue instant, and the
+grant computes the elapsed time under the lock it is already holding. It feeds an exponentially weighted
+mean and a high-water mark, not a histogram — it is a diagnostic, never a control input, and the crate's
+existing latency machinery is the precedent for an EWMA over an accumulated distribution.
+
+Retention age is the age of the oldest live *reservation*, not of the oldest carrier. A per-carrier
+timestamp would cost a second cache line written on every claim and megabytes of metadata at cap scale, to
+answer a question the reservation already answers: a consumer holding delivered data holds the reservation
+that accounts for it, so the reservation's grant instant is the retention clock. Consumption with no
+reservation behind it has no such clock, and standing debt is its signal instead.
+
+**What is logged, and at which level.** Every record sets the scheduling target explicitly, so admission and
+capacity events filter with the scheduler's, which is the concern they share. The level rule is the one the
+shipped budget already applies: steady-state per-item events are `trace`, edges a human cares about are
+`debug`.
+
+| event | level | why |
+|---|---|---|
+| reserve granted on the fast path; grant to a parked waiter; reservation released | `trace` | per unit of work, and unremarkable |
+| a reserve parks | `debug` | a park is a backpressure event, not steady state — with `need`, `reserved`, `configured`, and queue depth |
+| a block is mapped or unmapped | `debug` | capacity changed; once per block, and the pair is what shows thrashing |
+| an unreserved claim raises debt | `trace` | routine on the transport path; standing debt is the gauge that matters, not the event |
+| a claim falls through to the serialized path | `trace` | correct behaviour under contention; the counter is the signal |
+| a map the operating system declines | `warn` | the residual failure, returned to the caller |
+| the resolved cap, and a cap raised to the one-block floor | `debug` | emitted once, so the effective configuration is reconstructable from logs |
+
+Standing `debt_bytes` and the oldest reservation age are the two figures that carry information no single
+level does. Debt is the only place unreserved consumption becomes visible, so a debt that does not fall is
+retention the arena cannot attribute — including retention inside a buffer source shared with code outside
+this client. Oldest-reservation age separates a slow consumer from a leaked one: a bounded and an unbounded
+working set are indistinguishable at any single instant, and differ only in whether the oldest age stops
+growing.
+
 ---
 
 ## Ecosystem
 
-Everything above concerns memory the subsystem owns. This section concerns the boundary where that memory
-leaves it: arena carriers have to arrive at consumers as `bytes::Bytes` and `bytes::Buf`, because that is
-what the SDK body type and every byte sink in the ecosystem accept. The arena is not free to choose its
-delivery representation, and the constraints that representation imposes reach back into the design — they
-decide the granularity at which carriers return, and they set a floor on the allocations delivery costs.
-
-### `Bytes` is not a choice
-
-The requirement to deliver as `Bytes` is imposed by the SDK. The `http_body::Body` trait is generic in what
-a body yields: `type Data: Buf` admits any buffer type ([`http-body` `lib.rs:38`][http-body-trait]). The
-SDK closes that generic. `impl Body for SdkBody` fixes `type Data = Bytes`
-([`http_body_1_x.rs:49`][sdk-body-impl]), and every constructor accepting a caller-supplied body requires
-`Body<Data = Bytes>` as a compile-time bound ([`:19`][sdk-body-impl]). There is no variant, feature flag,
-or escape hatch admitting another buffer type.
-
-So payload must be expressible as `Bytes` at the point it crosses into the SDK, whatever representation
-the subsystem uses internally. `Bytes::from_owner` is the only public construction that does this without
-copying, which makes its per-owner allocation a floor on delivery cost rather than an implementation
-detail that could be optimized away.
+Everything above concerns memory the subsystem owns; what follows is the boundary where that memory leaves
+it. Arena carriers have to arrive at consumers as `bytes::Bytes` and `bytes::Buf`, because that is what the
+SDK body type and every byte sink in the ecosystem accept. The arena is not free to choose its delivery
+representation, and the constraints that representation imposes reach back into the design: they decide the
+granularity at which carriers return, and they set a floor on what delivery costs in allocations.
 
 ### Delivering arena memory as `Bytes`
+
+`Bytes` is not a choice. The `http_body::Body` trait is generic in what a body yields: `type Data: Buf`
+admits any buffer type ([`http-body` `lib.rs:38`][http-body-trait]). The SDK closes that generic. `impl Body
+for SdkBody` fixes `type Data = Bytes` ([`http_body_1_x.rs:49`][sdk-body-impl]), and every constructor
+accepting a caller-supplied body requires `Body<Data = Bytes>` as a compile-time bound
+([`:19`][sdk-body-impl]). There is no variant, feature flag, or escape hatch admitting another buffer type.
+So payload must be expressible as `Bytes` where it crosses into the SDK, whatever representation the
+subsystem uses internally, and `Bytes::from_owner` is the only public construction that does it without
+copying — which makes its per-owner allocation a floor on delivery cost rather than an implementation detail
+that could be optimized away.
 
 A `Bytes` is a pointer, a length, a data pointer, and a vtable ([`bytes.rs:279`][bytes-from-owner]). The
 vtable is what makes it possible to hand out arena memory at all: a `Bytes` need not own a heap
@@ -1116,17 +1482,19 @@ is the arena reference the handle holds: while the handle lives the block stays 
 carrier's bit forbids unmap (see [unmapping never races a live
 carrier](#unmapping-never-races-a-live-carrier)), and the handle lives as long as the `Bytes` does.
 
-Return is the owner's `Drop`. The boxed owner carries its own refcount; `clone` increments it and drop
-decrements, freeing the box — and running the handle's `Drop` — only on the last reference
-([`bytes.rs:1114`, `:1144`][bytes-from-owner]). The carrier returns to the arena when the last clone of the
-last slice of that `Bytes` is gone, and not before. No notification protocol between the arena and its
-consumers is required, because the refcount the ecosystem already maintains carries the signal.
+Return is the owner's `Drop`, but the carrier is not the owner. A single carrier is published as several
+independent `Bytes` — a transport reads three short frames into one carrier and hands each up as its own
+view — and each of those is a distinct `from_owner` with its own boxed refcount, because the transport
+mints them as it reads, not by slicing one owner it holds over the whole carrier. Nothing may hold a `Bytes`
+over a carrier while later frames are still being written into its tail: `from_owner` calls `as_ref()` once
+and captures a slice over the *whole* owner, so a live view over the unwritten tail would alias the writer's
+`&mut`. The owner is therefore per view, and the carrier it names must return exactly once no matter how
+many owners name it.
 
-One carrier can back several `Bytes`, which sets the granularity at which carriers return. Slicing a
-`Bytes` — `slice`, `split_to`, `split_off` — does not copy and does not create a second owner. Each calls
-`clone()` on the same owner and then narrows the pointer and length, so every slice of every clone shares
-one refcount. A transport reading three short frames into one carrier, publishing each as a separate view,
-produces three `Bytes` over one handle:
+A shared **carrier guard** supplies that. The owner each view carries holds an `Arc<CarrierGuard>`; the
+guard's `Drop` returns the one carrier to the arena, and an `Arc` runs it only when its last clone drops.
+Every view over a carrier holds a clone of the same guard, so the carrier returns when the last view over
+it drops — and not before — regardless of how many `from_owner` boxes exist:
 
 ```text
   one 64 KiB carrier, three published frames
@@ -1135,10 +1503,12 @@ produces three `Bytes` over one handle:
   │  5 KiB   │  7 KiB   │  9 KiB   │   43 KiB unwritten     │
   └────┬─────┴────┬─────┴────┬─────┴────────────────────────┘
        │          │          │
-    Bytes A    Bytes B    Bytes C        each a slice, ptr/len narrowed
+    Bytes A    Bytes B    Bytes C     each its own from_owner, ptr/len over its frame
+       │          │          │
+     guard      guard      guard      an Arc<CarrierGuard> clone apiece
        └──────────┴──────────┘
                   │
-          one carrier handle  ──  one refcount  ──  one arena carrier
+          one CarrierGuard  ──  its Drop returns  ──  one arena carrier
 
   the carrier returns when A, B, and C are all dropped;
   a surviving 5 KiB view pins the whole 64 KiB carrier.
@@ -1148,19 +1518,42 @@ The carrier, not the view, is therefore the unit of return, and a single survivi
 carrier. The slack one live carrier can pin is strictly less than the carrier size, which bounds the
 fragmentation but also ties it to the carrier size: a larger carrier strands more behind a short retained
 view, which is why the size is chosen by measurement against the observed distribution of delivered chunk
-sizes (see [open questions](#carrier-size)). The same relation scales up. If one owner covers a contiguous
-run of carriers, the run becomes the return unit, so fewer owner records trade against coarser return and
-more stranding.
+sizes (see [open questions](#carrier-size)). The guard is per carrier, never per run: an `Arc` over a run of
+carriers would pin every carrier in the run until the last byte of it cleared, so a guard covering more than
+one carrier would trade the arena's carrier-exact return for the same coarse stranding a large carrier
+causes.
 
-Delivery costs one heap allocation per owner record, and the design pays it **per segment rather than per
-carrier** — a contiguous claim of many carriers is one segment and one record. There is no public way to
-construct a `Bytes` with a custom vtable, so `from_owner` is the only route and it always boxes. The
-allocation is small and of the same order as the per-request allocations any HTTP transfer already makes,
-which is what makes it acceptable against the per-part buffer allocation and first-touch it replaces. A
-zero-allocation delivery — where the carrier handle *is* the `Bytes` backing, with its refcount in the
-arena — needs a public custom-vtable constructor ([tokio-rs/bytes#437][bytes437]). This is a constraint
-on how well the boundary can be made to perform, not a dependency: the design works today, and the
-allocation is the price.
+Placing the count in the guard rather than beside the bitmap is deliberate. The alternative — a per-carrier
+holder count in the block record, incremented on publish and decremented on return — would make carrier
+liveness two facts that must agree: the bit the [claim path](#claiming-and-returning-a-carrier) and the
+[unmap gate](#unmapping-never-races-a-live-carrier) both run on, and a count beside it. The guard keeps
+liveness a property of the views themselves, so the bitmap stays the single source of truth and the return
+path stays one atomic on it (see [Appendix A](#appendix-a-memory-ordering)).
+
+**Alternative: a per-carrier holder count in the block record.** Give each carrier a `u32` count next to its
+bit, so `Clone` and multi-view return read the count rather than an `Arc`. Rejected on two grounds. It is
+purely additive — the gate and trim still decide on the bit, so the count replaces nothing and only adds a
+second liveness fact to keep consistent, falsifying "the bitmap is the single source of truth" wherever that
+claim is load-bearing. And it is not free: a `u32` per carrier is thirty-two times the bitmap's own
+footprint and scales inversely with a carrier size that is itself a [measurement output](#carrier-size),
+block revival must initialize it, and the return path grows from one atomic to a decrement, a fence, and the
+bit clear. The guard pays one small allocation per carrier that is *in flight* instead of a standing cost
+across *every* carrier the arena can hold.
+
+Delivery costs one heap allocation per published view — the `from_owner` box — plus one `CarrierGuard`
+allocation per carrier and a refcount bump per view sharing it. On the fill path a view is published per
+read, which is the granularity at which the transport already allocates, so the boxes replace allocations
+rather than adding them. There is no public way to construct a `Bytes` with a custom vtable, so `from_owner`
+is the only route and it always boxes. A zero-allocation delivery — where the carrier handle *is* the
+`Bytes` backing, with its refcount in the arena — needs a public custom-vtable constructor
+([tokio-rs/bytes#437][bytes437]). This is a constraint on how well the boundary can be made to perform, not
+a dependency: the design works today, and the allocation is the price.
+
+The design leans on the `bytes` crate for exactly one guarantee: that the owner's `Drop` runs when the last
+clone of a `Bytes` drops, which is documented behavior of `from_owner` ([`bytes.rs:248`][bytes-from-owner]),
+not an internal detail. The carrier count is the arena's own — the guard's `Arc` — so nothing about carrier
+return depends on how `bytes` implements its refcount. What `bytes` decides is only when one view's owner
+drops; the guard decides when the carrier returns.
 
 The vtable also fixes what a consumer can do with delivered memory. An arena-backed `Bytes` reports itself
 as never uniquely owned ([`bytes.rs:1140`][bytes-from-owner]), so `try_into_mut` deep-copies instead of
@@ -1178,8 +1571,8 @@ transport, and the upload path, where the transfer reads its own data, depends o
 
 The contract below is therefore stated in terms of what the arena requires from a buffer source, not as an
 API. Which protocol states may read into a provided buffer, how a session attaches to a request, and what
-h2 requires beyond `hyper` are transport-side questions specified separately. Four properties are what
-this subsystem depends on:
+h2 requires beyond `hyper` are transport-side questions specified separately. This subsystem depends on four
+properties:
 
 - **The transport writes into memory it did not allocate.** It is handed a buffer with writable capacity
   and reads socket bytes into it directly. A copy at this boundary would defeat the purpose: the
@@ -1206,62 +1599,54 @@ a buffer source may be unable to satisfy fully, which is why the disk sink does 
 Neither trait requires contiguous storage, which is what lets a multi-segment buffer be delivered without
 gathering it. `Buf` is a cursor: `remaining`, `chunk` returning the contiguous run at the current
 position, `advance` moving the cursor, and `chunks_vectored` filling one `IoSlice` per disjoint region
-([`buf_impl.rs:148`, `:181`, `:212`, `:255`][bytes-buf]). A segment buffer implements it by tracking a
-current segment index and an offset within it.
+([`buf_impl.rs:148`, `:181`, `:212`, `:255`][bytes-buf]). The immutable form is a queue of segments and a
+front cursor; each segment holds its bytes' backing in one of two forms, split by who owns the memory:
 
 ```rust
-// Illustrative, not the committed API.
-impl Buf for SegmentBuffer {
-    fn remaining(&self) -> usize {
-        self.remaining
-    }
+struct Segment {
+    ptr: *const u8,
+    len: usize,
+    hold: Hold,
+}
 
-    // The contiguous run at the cursor: the tail of the current segment,
-    // never spanning a segment boundary.
-    fn chunk(&self) -> &[u8] {
-        match self.segments.get(self.idx) {
-            Some(seg) => &seg.as_slice()[self.offset..],
-            None => &[],
-        }
-    }
-
-    // Walks segment boundaries; a single advance may cross several.
-    fn advance(&mut self, mut cnt: usize) {
-        assert!(cnt <= self.remaining, "advance past end of buffer");
-        self.remaining -= cnt;
-        while cnt > 0 {
-            let seg_len = self.segments[self.idx].len();
-            let step = cmp::min(seg_len - self.offset, cnt);
-            self.offset += step;
-            cnt -= step;
-            if self.offset == seg_len {
-                self.idx += 1;
-                self.offset = 0;
-            }
-        }
-    }
-
-    // The whole point: every remaining segment in one call, one syscall downstream.
-    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
-        let mut n = 0;
-        let mut off = self.offset;
-        for seg in self.segments[self.idx..].iter().take(dst.len()) {
-            dst[n] = IoSlice::new(&seg.as_slice()[off..]);
-            off = 0;
-            n += 1;
-        }
-        n
-    }
+enum Hold {
+    // Carriers this buffer claimed and fills or writes itself. One guard per
+    // carrier, so return is carrier-exact and a clone is one Arc bump per carrier.
+    Carriers { block: u32, guards: VecDeque<Arc<CarrierGuard>> },
+    // Views a producer published over memory the arena did not claim — the SDK-fed
+    // download path, where the transport allocated. Their own refcounts hold the
+    // memory. `block: None` marks foreign memory, which is what makes it unmergeable.
+    Views { views: VecDeque<Bytes>, block: Option<u32> },
 }
 ```
 
-Two details in this are imposed by the trait's contract. `chunk` must return an empty slice if and only if
-`remaining` is zero ([`buf_impl.rs:173`][bytes-buf]), so the cursor must skip a segment the instant it is
-exhausted rather than leaving `offset` at the segment length: a cursor resting exactly on a boundary
-returns an empty `chunk` with bytes still remaining, and a generic consumer reads that as end-of-buffer and
-truncates. And `advance` is a loop rather than an addition because one call may cross several segments. The
-`chunk`-then-`advance` idiom generic code uses then moves segment by segment, so a discontiguous buffer is
-consumed correctly by code that has no idea it is discontiguous.
+`chunk`, `advance`, and `chunks_vectored` walk the segment queue and the front offset; a single `advance`
+may cross several segments, and it releases each backing the cursor moves past — a guard from the
+`Carriers` arm, a `Bytes` from the `Views` arm — so a slow consumer's resident memory falls as it reads
+rather than all at once when the buffer drops. Release granularity is the carrier on both arms: a guard
+returns its one carrier when it is popped and its last clone is gone, and a `Bytes` frees whatever is
+beneath it when the last view over that carrier drops. The `chunk` contract forces one detail — it must
+return an empty slice if and only if `remaining` is zero ([`buf_impl.rs:173`][bytes-buf]) — so the cursor
+skips a segment the instant it is exhausted rather than resting at its length, where a generic consumer
+would read the empty `chunk` as end-of-buffer and truncate with bytes still queued. `chunks_vectored` fills
+one `IoSlice` per remaining segment, so the whole buffer feeds one `pwritev`; the `chunk`-then-`advance`
+idiom then moves segment by segment, and a discontiguous buffer is consumed correctly by code that has no
+idea it is discontiguous.
+
+The two arms are the concrete form of the [buffer-source](#the-transport-as-a-buffer-source) distinction.
+When the arena supplies the buffer — upload reads, the aws-chunked copy path, and download once the
+transport exposes a receive-buffer seam — the filler writes into claimed carriers and the segment holds
+their guards. When the transport supplies it — today's default download over `hyper`/`h2`, which allocates
+its own receive buffers — the frames arrive as `Bytes` the arena never claimed, held as `Views` with no
+guard and `block: None`. A single delivered buffer can hold both kinds of segment, so the cursor and its
+release path are written against `Hold`, not against a single provenance.
+
+`Clone` on the delivery type falls out of the two arms without a holder count. A `Views` segment clones by
+cloning its `Bytes`, which bump the same per-carrier refcounts; a `Carriers` segment clones its
+`Arc<CarrierGuard>`s, one bump per carrier. A carrier returns when every clone's cursor has passed it and
+every clone is dropped — the guard's last `Arc` reference — so incremental release survives cloning rather
+than being defeated by it. This is what lets the delivered type stay `Clone`, matching what the SDK body
+types already offer, at the cost of one `Arc` bump per carrier per clone.
 
 `chunks_vectored` is what keeps discontiguity cheap rather than merely tolerable: a multi-segment part
 feeds one `pwritev` over the whole set, so a scattered claim costs the same syscall count as a contiguous
@@ -1281,59 +1666,8 @@ boundary — the frozen buffer's length is what was advanced, never what was cla
 a single allocation before handing it downstream would let every consumer treat it as one slice and remove
 the cursor logic entirely. Rejected: the copy is exactly the per-part cost the arena exists to remove, and
 it would be paid on every delivery rather than saved once. The traits already express discontiguity, the
-kernel already accepts vectored I/O over it, and a consumer that genuinely needs contiguity can ask for it
+kernel already accepts vectored I/O over it, and a consumer that requires contiguity can ask for it
 explicitly.
-
-### The consumer-facing delivery contract
-
-Delivered data reaches the caller as `AggregatedBytes`, which wraps a `SegmentedBuf<Bytes>` and implements
-`Buf` over the sequence of frames. Arena delivery fits the type as it stands: the frames become
-arena-backed `Bytes` rather than transport-allocated ones, and the `Buf` implementation above is what makes
-them interchangeable at that boundary.
-
-That it fits is not evidence that it is right. This type originates in the SDK's own runtime, and the copy
-that lives here exists so this crate owns the wrapping code and can reach the `SegmentedBuf` directly.
-Neither decision anticipated the arena. The type was shaped when delivered buffers were transport
-allocations that the client had no stake in after handing them over, and every question the arena raises at
-this boundary — whether a caller can tell that holding a segment holds capped capacity, whether it can
-release part of what it was given, whether it should be handed segments at all rather than something that
-knows how to return them — is a question the type was never designed to answer. Its shape under arena
-ownership is open (see [open questions](#the-shape-of-the-delivery-type)).
-
-What is settled is that no route out of it can lose track of a carrier. Every route either clones a
-`Bytes`, extending the carrier's life while keeping it counted, or copies out of it, ending the carrier's
-life at a point the arena observes. None yields a bare pointer, so the accounting cannot be escaped by a
-consumer, whatever the type's eventual shape.
-
-One route changes where retained memory is charged. `into_bytes` flattens
-the sequence into a single contiguous `Bytes`, copying whenever there is more than one segment — the
-underlying `copy_to_bytes` slices without copying only when the whole request is satisfied from the front
-segment ([`segmented.rs:117`][segmented-buf]). The copy lands in an ordinary heap allocation, and the
-carriers it read from are released as it consumes them. So the choice between holding the delivered
-segments and flattening them is a choice about *which* memory the caller retains:
-
-```text
-  a caller holds 8 MiB of delivered data for a long time
-
-  hold the segments                     flatten with into_bytes
-  ─────────────────                     ───────────────────────
-  8 MiB of arena carriers pinned        one 8 MiB copy, then carriers returned
-  counted in the cap                    heap memory, outside the cap
-  suppresses admission of new work      admission unaffected
-  no copy                               one copy of the whole part
-```
-
-Neither is free, and the trade is not the usual one. Flattening costs a copy but converts capped capacity
-into uncapped heap, so it relieves admission pressure without reducing the process's resident set — a
-caller archiving many parts in memory keeps the pipeline moving by paying for copies, while one that
-consumes and drops promptly should hold the segments and copy nothing. The arena cannot make this choice on
-the caller's behalf, and a caller cannot make it well without knowing that segments are capped and copies
-are not, which is part of what makes the delivery type's shape an open question rather than a settled one.
-
-Retention is what makes the cap bind in the first place: capacity is held from claim until the last
-delivered view drops, so a slow consumer converts throughput into resident memory. That is a property of
-the delivery contract rather than of the arena, and it is why retention appears in the requirements as
-something the cap must tolerate rather than something the arena can prevent.
 
 [bytes-from-owner]: https://github.com/tokio-rs/bytes/blob/v1.12.1/src/bytes.rs#L254
 [bytes-buf]: https://github.com/tokio-rs/bytes/blob/v1.12.1/src/buf/buf_impl.rs#L148
@@ -1409,7 +1743,7 @@ debt`. `debt` is the exception that proves the rule: it moves on an unreserved c
 that repays it, because that consumption is not covered by any envelope and admission has no other point
 at which to learn of it.
 
-### Release does not depend on scheduling
+### Release does not require a scheduling turn
 
 **Invariant.** A transfer can release the memory it holds without first obtaining a work-generation
 turn.
@@ -1478,17 +1812,18 @@ capacity already guaranteed; it never maps or grows the arena.
 **Invariant.** A block's region is never unmapped while a carrier in it is live or a claim into it is in
 flight, and a stale carrier ID naming an unmapped-and-revived block never reads the wrong memory.
 
-**Mechanism.** The block record is never freed, so its state and bitmap are always safe to read; only its
-mapped region comes and goes. Trim marks a block draining, then reads all-free; a claim sets a bit, then
-reads state *and* generation, backing out if draining or if the generation moved. The two are a
-store-then-load on each side, requiring sequential consistency (or a full fence) — acquire/release is
-insufficient, since the hazard is precisely the store-load reordering they permit. The all-free
-requirement means a live carrier's bit forbids unmap, so a handed-out address is valid for its buffer's
-life. Rechecking the generation after the bit-set (not only when validating a shard hint) closes the
-drain-unmap-revive-between-genread-and-set window: revival bumps the generation, so a claim into a revived
-incarnation is caught. On a lost race trim **abandons** the block (reverts the draining mark) rather than
-waiting for the claim, so no in-flight-claim counter is needed. This gate must be model-checked, including
-a check that weakening the fence to acquire/release is caught.
+**Mechanism.** The block record is never freed, so its status and bitmap are always safe to read; only its
+mapped region comes and goes. Trim publishes draining, then reads all-free; a claim sets a bit, then reads
+the block's status, keeping the carrier only if the state is active and the generation matches. The two are
+a store-then-load on each side, requiring sequential consistency (or a full fence) — acquire/release is
+insufficient, since the hazard is precisely the store-load reordering it permits. The all-free requirement
+means a live carrier's bit forbids unmap, so a handed-out address is valid for its buffer's life, and
+resolving that address after the gate is what ties it to the bit. Requiring `active` rather than rejecting
+only draining is what catches a name into an already-unmapped block; the generation additionally catches a
+name into a *revived* one, whose state reads active again. On a lost race trim **abandons** the block
+(reverts the draining mark) rather than waiting for the claim, so no in-flight-claim counter is needed. See
+the [obligations](#unmapping-a-block-safely) on that section for what must be model-checked, including the
+negative check that weakening the orderings is caught.
 
 ### The subsystem functions without a pinned runtime
 
@@ -1523,26 +1858,53 @@ question only a very large part with a slow consumer raises; it is left for meas
 
 ### The shape of the delivery type
 
-`AggregatedBytes` reached this crate by being copied from the SDK runtime, to own the wrapping code and to
-reach the underlying `SegmentedBuf` directly. It has not been reconsidered since, and the arena changes
-what it is for: delivered segments are now capped capacity rather than allocations the client is finished
-with, and holding them suppresses admission. Several things follow that the current shape does not express
-— that a caller holding a segment is holding budget, that it might release part of what it was given
-rather than all or nothing, that flattening trades capped memory for uncapped memory rather than merely
-trading copies for convenience. Whether the answer is documentation, a different type, or a delivery
-handle that returns capacity as it is consumed is open, and it is bounded by what the SDK body types
-accept at the boundary (see [the consumer-facing delivery
-contract](#the-consumer-facing-delivery-contract)).
+The delivery mechanism is settled — a queue of segments over the two `Hold` arms, releasing carriers at the
+consumer's cursor and cloning without a holder count (see [`Buf` and `BufMut` over a discontiguous
+buffer](#buf-and-bufmut-over-a-discontiguous-buffer)). What remains open is the caller-facing surface: which
+type carries it, and how one caller-facing hazard is handled.
+
+Delivered data currently reaches the caller as `AggregatedBytes`, which wraps a `SegmentedBuf<Bytes>` and
+implements `Buf` over the sequence of frames. The mechanism above fits either behind it — reshaping
+`AggregatedBytes` around the segment queue — or behind a new type; that is a public-API question, not a
+mechanism one, and it turns on how much of the existing surface must be preserved. `AggregatedBytes` is
+`Clone`, which the two-arm design supports, so cloning is not the deciding factor. The type reached this
+crate by being copied from the SDK runtime, and it was shaped when delivered buffers were transport
+allocations the client had no stake in after handing them over. The arena changes what it is for: delivered
+segments are now capped capacity, and holding them suppresses admission — which the current shape does not
+express.
+
+The sharpest expression of that is `into_bytes`, which the type offers as a convenience. It flattens the
+sequence into one contiguous `Bytes`, copying whenever there is more than one segment — the underlying
+`copy_to_bytes` slices without copying only when the whole request is satisfied from the front segment
+([`segmented.rs:117`][segmented-buf]) — and the carriers it reads from are released as it consumes them:
+
+```text
+  a caller holds 8 MiB of delivered data for a long time
+
+  hold the segments                     flatten with into_bytes
+  ─────────────────                     ───────────────────────
+  8 MiB of arena carriers pinned        one 8 MiB copy, then carriers returned
+  counted in the cap                    heap memory, outside the cap
+  suppresses admission of new work      admission unaffected
+  no copy                               one copy of the whole part
+```
+
+Flattening converts capped capacity into uncapped heap, so it relieves admission pressure without reducing
+the process's resident set. A caller archiving many parts in memory keeps the pipeline moving by paying for
+copies; one that consumes and drops promptly should hold the segments and copy nothing. The arena cannot
+make that choice for the caller, and the caller cannot make it well without knowing that segments are capped
+and copies are not — so whether the answer is documentation, a distinct method, or a type that names the
+tradeoff is the remaining open question. It is bounded by what the SDK body types accept at the boundary
+(see [delivering arena memory as `Bytes`](#delivering-arena-memory-as-bytes)).
 
 ### Which alignment route wins, and what protocol scratch costs
 
 Both routes in [payload alignment within a carrier](#payload-alignment-within-a-carrier) reach an aligned
-write, and the choice between them is a measurement this design does not have. The zero-copy route removes a
-copy of every byte but is available only for framing that can start payload at offset zero, and only once a
-transport can. The copy route is universal and costs one copy per body chunk, against a synchronous copy whose
-source buffer returns immediately. Whether that copy is measurable next to the direct write it enables, and
-whether the eliminated copy is measurable at all against a saturated link, decides how much the harder route
-is worth.
+write, and which one to prefer is unmeasured. The zero-copy route removes a copy of every byte but is
+available only for framing that can start payload at offset zero, and only once a transport can. The copy
+route is universal and costs one copy per body chunk, against a synchronous copy whose source buffer returns
+immediately. Deciding it needs measurements of both copies: the one the copy route adds, next to the direct
+write it enables, and the one the zero-copy route removes, against a saturated link.
 
 The related quantity is what protocol scratch costs when the transport reads into carriers. Framing buffers
 are small and churn per read; part-sized carriers are long-lived and retained until a write completes. Serving
@@ -1593,11 +1955,13 @@ its completion-ownership model are deferred.
 ### Threading a reservation to the injected buffer source
 
 The injected buffer source draws carriers without presenting a reservation because its interface cannot
-carry one. If that interface can be extended to carry a reservation through to the draw, the injected
-path enforces the envelope at the claim like the explicit path, converging the two. Whether a source can
-carry it, and what capacity a source needs for its own protocol handling (headers and framing, and
-potentially the TLS layer beneath), is an integration question bound up with the transport's protocol
-memory, above.
+carry one. If that interface can be extended to carry a reservation through to the draw, the draws a
+transfer makes for its own payload are enforced at the claim rather than reconciled afterward, which
+narrows what coverage and debt have to absorb. It does not remove them. A reservation can only be sized to
+payload, since that is the only quantity the transfer knows at admission; the source's own protocol memory
+— headers and framing, and the TLS layer beneath if it draws from the arena at all — is not attributable
+to any one transfer's envelope and stays outside it. Whether a source can carry a reservation at all is an
+integration question bound up with the transport's protocol memory, above.
 
 ### Sharing one arena across consumers
 
@@ -1611,3 +1975,247 @@ NUMA-local placement pays off only once the runtime pins threads or binds block 
 it does not do today. The arena is structured to place per node so the locality is available once pinning
 lands; the placement machinery and its interaction with the kernel's automatic NUMA balancing are future
 work.
+
+---
+
+## Appendix A: Memory ordering
+
+Every shared field and the ordering each of its operations requires. This is the complete set: `SeqCst`
+appears in exactly the four places below and nowhere else in the subsystem.
+
+**The unmap gate.** Four accesses on two fields, two per side, argued in full under [unmapping a block
+safely](#unmapping-a-block-safely). Each side stores then loads, and neither store may sink below its load;
+`SeqCst` on all four is what forbids the interleaving in which both sides proceed.
+
+| side | store | load |
+|---|---|---|
+| claim | `inuse` `fetch_or` of the carrier's bit — `SeqCst` | `status` — `SeqCst`, one load reading state and generation together |
+| trim | `status` ← `draining` — `SeqCst` | `inuse` read confirming all-free — `SeqCst` |
+
+Release/acquire is insufficient on either side: the hazard *is* the store-load reordering that release
+permits. A `fence(SeqCst)` between each side's store and its load is equivalent and equally correct — what
+the argument needs is a single total order over these four accesses, which either form supplies. The
+accesses carry the ordering rather than a free-standing fence so it travels with the operation. A mix that
+fences one side and relaxes the other is not correct.
+
+**Everything else.** Weak by intent — the claim path is cheap because the gate is the only fenced traffic on
+it.
+
+| field | operation | ordering | why not weaker |
+|---|---|---|---|
+| `inuse` word | claim backing out: `fetch_and` of its own bits | `SeqCst` | Trim's confirming read must not observe the block as all-free while this claim still believes it holds the bit. Part of the gate's argument, on the path a rejected claim takes. |
+| `inuse` word | return: `fetch_and` of the carrier's bit | `Release` | The carrier's contents were written before the return; a later claimant of the same bit must see them. Nothing on the return path reads a second location, so there is no store-load pair to fence. |
+| `inuse` word | claim: read while scanning for a free bit | `Relaxed` | A scan is a hint. A stale word costs an attempt; the `fetch_or` is what decides, and it carries the ordering. |
+| `status` | revival: store `(active, generation + 1)` | `Release` | Publishes the mapped region and the initialized bitmap. A claim that observes `active` through the gate's acquiring load therefore sees a fully initialized block. |
+| `status` | trim: store `empty` after `munmap` | `Release` | Ordered after the unmap; a subsequent revival of the same record must not appear to precede it. |
+| `base` | claim: read to resolve an address | `Relaxed` | Read only after the gate passes, and the set bit forbids unmap, so it cannot be cleared while the carrier is held. It inherits the gate's ordering; a claim that backs out never reads it. |
+| `base` | revival: publish, and trim: clear | `Relaxed` | Both are ordered by the `status` store that follows them, which is the only thing a claim consults before reading `base`. |
+| `live_here` | claim and return within a reservation | `Relaxed` | Single reservation, and its value gates only the holder's own claims against an envelope admission already granted. Nothing else reads it. |
+| `configured`, `prepared`, `reserved`, `declared`, `avail`, `debt`, the wait queue | every operation | not atomic; the budget's lock | These quantities are only meaningful as a set. Making each atomic would let a reserve read a torn combination and grant against a sum that never existed. The lock is affordable because admission moves once per unit of work, not once per carrier. |
+
+---
+
+## Appendix B: Safety and soundness
+
+The subsystem hands raw pointers into an `mmap`'d region to consumers it never sees again, freezes writable
+memory into immutable buffers without copying, and unmaps regions while other threads claim from the same
+block.
+
+**The `unsafe` surface, in full.** Seven sites. Everything else in the subsystem is safe code: the bitmap, the
+budget's quantities, the wait queue, and the shard are atomics and a lock, not unchecked memory access.
+
+| `unsafe` site | obligation | what upholds it |
+|---|---|---|
+| forming a carrier's address as `base + index * carrier_size` | the mapping is live and the arithmetic stays within it | The address is formed only after the gate passes, and the set bit forbids unmap. The index is bounded by the bitmap's length, derived from the block's carrier count at revival. |
+| `Bytes::from_owner` over a carrier | the pointer stays valid for the whole life of that `Bytes`, including clones on threads the arena never sees | The owner is boxed and therefore moved, but `as_ref()` builds its slice from the pointer *inside* the box, which addresses the mapping — so where the handle lives is irrelevant. Validity is held by the `Arc<CarrierGuard>` the owner carries: the carrier's bit stays set until the last guard clone drops, and a set bit forbids unmap. Several views over one carrier hold clones of one guard, so the bit clears exactly once, when the last of them is gone. |
+| publishing a view's slice from within a filling carrier | the published range is initialized and disjoint from the writer's `&mut` tail | A view is published only over bytes the filler has already written, and the writer holds `&mut` only over the unwritten suffix; the two ranges never overlap, and no view is taken over the whole carrier while the tail is still being written. |
+| `advance_mut` on the writable form | the bytes skipped have been initialized | The arena hands out uninitialized capacity, and the filler's `advance_mut` is the assertion that a prefix became data. The frozen length is what was advanced, never what was claimed, so no uninitialized byte is delivered. |
+| `Send` on a carrier handle and on the segment buffer | ownership can move between threads | A carrier handle owns a disjoint window and a reference to a record that never moves or frees. Moving it moves the right to write those bytes; no thread-local state is involved. A shard, which *is* thread-local, is never part of a handle. |
+| `Sync` on a block record | concurrent access from many threads is defined | Every field a thread other than the arena's grower touches is atomic, and the non-atomic fields (`carrier_size`, the bitmap's length) are written once at revival and published by the `status` store. |
+| `munmap` of a block's region | no live carrier and no in-flight claim into it | The all-free requirement, the gate, and trim's abandon-on-lost-race. This is the subsystem's sharpest obligation, argued in full under [unmapping a block safely](#unmapping-a-block-safely). |
+
+**Safety properties that hold without `unsafe`.** These are load-bearing but enforced by the type system, the
+ecosystem, or the structure — not asserted by the author.
+
+| property | what upholds it |
+|---|---|
+| two threads writing different carriers in one block do not race | Carriers are disjoint, non-overlapping windows, and a claimed bit is held by exactly one claimant. The mapping itself is written by no one. |
+| the freeze does not alias the writable form | The freeze consumes it. The `&mut [u8]` it exposed cannot outlive it, so no mutable reference exists once the immutable form is constructed. |
+| a consumer cannot regain write access to a carrier the arena still accounts for | Enforced by the ecosystem rather than by convention: `owned_is_unique` returns false for a custom owner, so `try_into_mut` on an arena-backed `Bytes` deep-copies rather than yielding the carrier ([`bytes.rs:1140`][bytes-owned-unique]). A consumer that wants a mutable buffer gets its own allocation. |
+| a stale carrier name is never followed into freed control state | The block record is never freed and never moves. A stale name is detected by the generation, checked in the same load as the state. |
+
+[bytes-owned-unique]: https://github.com/tokio-rs/bytes/blob/v1.12.1/src/bytes.rs#L1140
+
+---
+
+## Appendix C: Verification
+
+An index over the obligations stated beside each mechanism, grouped by the mechanism that incurs them. Each
+carries what discharges it and the negative check that must fail if the mechanism is weakened — the negative
+checks are the operative half, since each names an ordering or a term that looks removable and is not.
+
+Two obligations are not reachable by a model checker and say so in place: return-on-last-drop depends on
+refcount state internal to the `bytes` crate, and the freeze wants Miri rather than a state-space search.
+Only the gate and the ledger justify exhaustive checking at all; both are small state machines over a handful
+of quantities. Everything else is a property test, an assertion, or inspection.
+
+**[Unmapping a block safely](#unmapping-a-block-safely)** — one claim against one trim, all interleavings.
+
+| obligation | discharged by | negative check |
+|---|---|---|
+| the gate admits no cycle over its four accesses | exhaustive model check | weakening either gate access to acquire/release must be caught |
+| a claim keeps a carrier only on `active` and a matching generation, with draining and empty rejected independently | model check with a stale name into each of the three states | rejecting only `draining` must fail on the `empty` case |
+| revival publishes `active` only over an initialized bitmap | model check: no claim observes `active` over an uninitialized block | publishing `active` before initialization must be caught |
+| an address is formed only after the gate passes | inspection of the single site that computes it | resolving `base` before the status load must be caught by a trim that clears it mid-claim |
+| the generation does not wrap within a hint's lifetime | inspection; the field is sized so the assumption holds by margin | a narrowed generation field must produce a false match under a revival-heavy trace |
+
+**[Claiming and returning a carrier](#claiming-and-returning-a-carrier)**
+
+| obligation | discharged by | negative check |
+|---|---|---|
+| a rejected take leaves the bitmap as it found it; a batch rejection clears only bits it won | model check: no thread's bit is cleared by another thread's claim | clearing the attempted mask rather than the won bits must be caught |
+| a claim within a granted envelope always finds a carrier | property test over interleaved claims, returns, growth, and trim | a shard that retains carriers instead of hinting must strand capacity and fail it |
+| a claim terminates under contention | model check for the absence of a livelock cycle; the serialized path cannot lose a take | an all-or-nothing compare-and-swap in the batch claim must livelock against a concurrent return |
+
+**[The reservation and its lifetime](#the-reservation-and-its-lifetime)**
+
+| obligation | discharged by | negative check |
+|---|---|---|
+| the holder's own claims are capped at `envelope − coverage` | direct check: a download declaring its whole envelope as coverage has a remaining budget of zero | dropping the `coverage` term must let an all-coverage download claim its full envelope and break the bound |
+| a reservation's drop returns its envelope exactly once; the wake follows the unlock | model check for a lost wake and for lock nesting | waking under the lock must be caught by the nesting check |
+
+**[The admission ledger](#appendix-d-the-admission-ledger)** — all four over the same randomized
+grant/claim/return/close traces.
+
+| obligation | discharged by | negative check |
+|---|---|---|
+| `live_unreserved = (declared − avail) + debt` holds through every transition | property test over the traces | any transition that moves one term without the other must be caught |
+| `footprint <= reserved + debt <= configured` at every step | the same traces | a coverage term added beside the envelope rather than carved out of it must break the first inequality |
+| a grant never reduces standing debt | trace: close a reservation with consumption still live, then grant another | recomputing debt against current coverage at close must admit work against memory a previous transfer still holds |
+| the `avail` credit never exceeds `declared` | assertion in the return path, not a clamp | the assertion firing means the ledger arithmetic is wrong, not that a clamp is needed |
+
+**Delivery** — [as `Bytes`](#delivering-arena-memory-as-bytes) and [as
+`Buf`/`BufMut`](#buf-and-bufmut-over-a-discontiguous-buffer).
+
+| obligation | discharged by | negative check |
+|---|---|---|
+| a carrier returns exactly once, when the last view over it drops | model check over the guard's `Arc` and its `Drop` — the count is the arena's own state, unlike the per-view `bytes` refcount, which only governs when one owner drops and is **not model-checkable** | a second guard over the same carrier, or a guard covering a run, must return early and be caught |
+| the cursor releases each backing as it passes, not all at buffer drop | property test over partial consumption: resident carriers fall as the consumer advances | holding all guards until drop must be caught by a resident-set assertion mid-consumption |
+| the merge extends a segment only on block identity and pointer adjacency | property test: a foreign view (`block: None`) or a non-abutting frame starts a new segment | merging across a block boundary or a gap must produce an `IoSlice` spanning unowned memory and be caught |
+| the `Buf` cursor never reports end-of-buffer with bytes remaining | property test: a generic consumer reading through `chunk`/`advance` receives every byte | leaving the cursor resting on a segment boundary must truncate and be caught |
+| the frozen length is what was advanced, not what was claimed | property test over partial fills; **Miri** over the freeze path | freezing the claimed length must expose uninitialized bytes under Miri |
+
+---
+
+## Appendix D: The admission ledger
+
+Admission is a small state machine over six quantities, all moved under one lock. The body sections argue what
+each is for; this states the exact transitions.
+
+```rust
+struct MemoryBudget {
+    ledger: Mutex<Ledger>,
+    waiters: Mutex<VecDeque<Waiter>>, // arrival order; see "parking and granting"
+}
+
+/// The six quantities, meaningful only as a set — hence one lock, not six atomics.
+struct Ledger {
+    configured: u32, // the cap
+    prepared: u32,   // carriers backed by mapped arena
+    reserved: u32,   // carriers granted to live reservations
+    declared: u32,   // total coverage declared by live reservations
+    avail: u32,      // declared coverage still unconsumed
+    debt: u32,       // live unreserved consumption no reservation covers
+}
+```
+
+`live_unreserved` is deliberately not a field. It is `(declared − avail) + debt`, and that identity is the
+ledger's central invariant: every transition below moves terms so as to preserve it, and a transition that
+moved one term without the other would be a bug the identity catches.
+
+**Grant.** A reserve for an envelope of `e` carriers, declaring coverage `d <= e`, is admitted when
+
+```text
+  reserved + debt + e <= configured
+```
+
+and otherwise parks in arrival order. On admission:
+
+```text
+  reserved += e
+  declared += d
+  avail    += d
+```
+
+Coverage is declared, not escrowed: no carrier is set aside and nothing is handed to the transport. Adding
+`d` to both `declared` and `avail` leaves `declared − avail` unchanged, so the grant does not alter live
+unreserved consumption — correctly, since nothing has been claimed yet.
+
+**Unreserved claim** of `n` carriers, which cannot be refused:
+
+```text
+  covered = min(n, avail)
+  avail  -= covered
+  debt   += n - covered
+```
+
+The claim draws on outstanding coverage first, because coverage is memory a grant already paid for; only
+what exceeds it is new consumption the admission sum has not seen. The claim is served either way.
+
+**Return** of `n` carriers:
+
+```text
+  repay  = min(n, debt)
+  debt  -= repay
+  avail += n - repay        // and `avail <= declared` must hold
+```
+
+Debt is repaid before coverage is credited. The subsystem cannot attribute a return any more than it can
+attribute a claim, and among the orderings available to something that cannot tell a covered return from an
+uncovered one, this is the one under which debt falls as carriers come back. Crediting coverage first would
+leave debt standing while a steady working set recycled through the same carriers, with nothing to release
+admission.
+
+`avail <= declared` after the credit is an assertion rather than a clamp, and it holds by arithmetic: a
+return cannot exceed live consumption, so `n <= (declared − avail) + debt`, and after repaying the credit is
+`n − debt <= declared − avail`. A `min` here would silently absorb a real accounting bug.
+
+**Close**, when a reservation for `e` with coverage `d` drops:
+
+```text
+  debt     += d.saturating_sub(avail)   // coverage that is spent and still live
+  avail     = avail.saturating_sub(d)
+  declared -= d
+  reserved -= e
+```
+
+Withdrawing `d` from `declared` removes cover from consumption that is still live, and what just lost its
+cover is exactly the part of `d` that `avail` cannot absorb. This is the one transition that must be
+additive rather than a recomputation. A derived form — `debt = max(0, live_unreserved − declared)` — settles
+at nothing under repeated grants: close a reservation with eight carriers live and uncovered, admit a second
+transfer of the same shape, and its fresh coverage of eight cancels the debt before it has claimed anything,
+so the client admits work against memory the first transfer's consumer still holds. Debt has to be real
+state that only a return lowers.
+
+Every quantity moves only at these four transitions, all under the same lock. Claims and returns of carriers
+move the bitmap and nothing here, except for the two above that involve unreserved consumption, which
+admission has no other point at which to learn of. Each preserves `live_unreserved = (declared − avail) +
+debt`: a grant adds `d` to both terms of the difference, an unreserved claim splits `n` between `avail` and
+`debt` at the coverage boundary, a return moves `n` back the other way, and a close moves out of `declared`
+exactly what `avail` cannot absorb.
+
+The footprint bound follows:
+
+```text
+  footprint = live_reserved + covered_live + debt
+            <= reserved + debt          coverage is carved out of the envelope
+            <= configured               the grant condition gates this sum
+```
+
+The first inequality is the one everything else rests on, and it holds only because a reservation's own
+claims are capped at `envelope − coverage` rather than at `envelope` (see [the reservation and its
+lifetime](#the-reservation-and-its-lifetime)). Nothing else in the ledger enforces it.
+
+The second inequality is what the two documented overage paths cross, deliberately: an unreserved claim that
+finds nothing free, and the forced grant for a request larger than the whole cap. Both raise `prepared` above
+`configured`, both are accounted, and both retire through the ordinary trim floor as `reserved + debt` falls.

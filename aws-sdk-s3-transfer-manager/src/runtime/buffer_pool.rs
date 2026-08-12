@@ -64,6 +64,9 @@ use buffer::{PooledBufMut, WritableCarrier};
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests;
 
+#[cfg(all(test, s3_tm_loom))]
+mod loom_tests;
+
 /// Cloneable handle to the pool's admission and physical storage state.
 #[derive(Clone)]
 struct BufferPool {
