@@ -7,8 +7,8 @@
 //!
 //! A grant prepares fungible capacity before charging its complete envelope.
 //! Waiters receive the charged reservation before notification and never
-//! re-contend for released capacity. Closing replaces the envelope with exact
-//! surviving direct ownership and newly uncovered unreserved debt.
+//! re-contend for released capacity. Closing withdraws the envelope from
+//! aggregate coverage; occupied coverage becomes debt until its owner returns.
 
 use std::collections::VecDeque;
 use std::sync::Arc as StdArc;
@@ -19,16 +19,16 @@ use crate::runtime::sync::sync::{Arc, Mutex};
 
 use super::{AllocError, PoolInner, ReserveError};
 
-mod unreserved;
-pub(super) use unreserved::UnreservedState;
-use unreserved::{UnreservedSnapshot, MAX_CARRIERS};
+mod coverage;
+pub(super) use coverage::CoverageState;
+use coverage::{CoverageSnapshot, MAX_CARRIERS};
 
 /// Callback invoked after a pending reservation reaches a terminal state.
 pub(super) type NotifyFn = StdArc<dyn Fn() + Send + Sync>;
 
 /// Phase bit in [`ReservationState::owner_state`].
 const RESERVATION_CLOSED: u64 = 1 << 63;
-/// Direct owner/debit bits in [`ReservationState::owner_state`].
+/// Direct owner and debit bits in [`ReservationState::owner_state`].
 const RESERVATION_COUNT_MASK: u64 = !RESERVATION_CLOSED;
 
 /// Global admission state protected by `PoolInner::admission`.
@@ -41,32 +41,16 @@ pub(super) struct AdmissionState {
 
 /// Carrier-granular quantities used to decide and back new admission.
 ///
-/// Admission pressure is `active_planned_demand + retiring_direct_live` plus
-/// debt sampled from [`UnreservedState`]. `prepared` covers that pressure
-/// after every completed transition.
+/// Admission pressure is active planned demand plus debt sampled from
+/// [`CoverageState`]. `prepared` covers that pressure after every completed
+/// transition.
 pub(super) struct AdmissionLedger {
     /// Soft admission and retained-capacity target.
     pub(super) configured: usize,
     /// Capacity whose mapping and current preparation steps are complete.
     pub(super) prepared: usize,
-    /// Full envelopes whose direct acquisition remains open.
+    /// Full envelopes whose acquisition authority remains open.
     pub(super) active_planned_demand: usize,
-    /// Direct owners surviving after their reservation closed.
-    pub(super) retiring_direct_live: usize,
-    /// Active-plan capacity available to future unreserved ownership.
-    pub(super) unreserved_coverage: usize,
-}
-
-/// Planned demand and direct-acquisition authority for one work item.
-///
-/// The difference between `envelope` and `direct_limit` is aggregate coverage
-/// for future unreserved acquisition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ReservationPlan {
-    /// Complete planned demand charged while direct acquisition remains open.
-    pub(super) envelope: usize,
-    /// Subset of the envelope available through reserved acquisition.
-    pub(super) direct_limit: usize,
 }
 
 /// Result of a reservation request that may enter the FIFO.
@@ -77,7 +61,7 @@ pub(super) enum Reserve {
 
 /// A reservation request held in arrival order.
 struct Waiter {
-    plan: ReservationPlan,
+    envelope: usize,
     slot: Arc<WaitSlot>,
     notify: NotifyFn,
 }
@@ -115,29 +99,18 @@ pub(super) struct Reservation {
 /// State retained by direct carrier guards after the public reservation closes.
 pub(super) struct ReservationState {
     pub(super) pool: Arc<PoolInner>,
-    plan: ReservationPlan,
+    envelope: usize,
 
     /// The high bit closes acquisition. Remaining bits count direct carrier
     /// guards and in-flight debits that have not become guards.
     owner_state: AtomicU64,
 }
 
-/// RAII rollback for direct authority debited before physical acquisition.
-pub(super) struct DirectDebit {
-    pub(super) reservation: Arc<ReservationState>,
-    pub(super) uncommitted: usize,
-}
-
-/// RAII rollback for unreserved charges installed before physical acquisition.
-pub(super) struct UnreservedDebit {
+/// RAII rollback for accounting debited before physical acquisition.
+pub(super) struct AcquisitionDebit {
     pub(super) pool: Arc<PoolInner>,
+    pub(super) direct: Option<Arc<ReservationState>>,
     pub(super) uncommitted: usize,
-}
-
-/// Accounting inverse performed by a carrier's final owner.
-pub(super) enum Charge {
-    Direct(Arc<ReservationState>),
-    Unreserved,
 }
 
 impl std::fmt::Debug for WaitTicket {
@@ -154,8 +127,6 @@ impl AdmissionState {
                 configured,
                 prepared: 0,
                 active_planned_demand: 0,
-                retiring_direct_live: 0,
-                unreserved_coverage: 0,
             },
             waiters: VecDeque::new(),
             closed: false,
@@ -172,123 +143,85 @@ impl AdmissionState {
         self.closed
     }
 
-    /// Whether `plan` can be granted under the normal bound or idle escape.
-    fn can_grant(&self, plan: ReservationPlan, unreserved_debt: usize) -> bool {
-        let admission_used = self.ledger.admission_used(unreserved_debt);
-        let normal = plan.envelope <= self.ledger.configured.saturating_sub(admission_used);
-        let managed_demand = self
-            .ledger
-            .active_planned_demand
-            .checked_add(self.ledger.retiring_direct_live)
-            .expect("managed admission demand overflowed");
+    /// Whether `envelope` can be granted under the normal bound or idle escape.
+    fn can_grant(&self, envelope: usize, debt: usize) -> bool {
+        let admission_used = self.ledger.admission_used(debt);
+        let normal = envelope <= self.ledger.configured.saturating_sub(admission_used);
 
-        normal || managed_demand == 0
+        normal || self.ledger.active_planned_demand == 0
     }
 }
 
 impl AdmissionLedger {
     /// Pressure charged against new planned demand.
-    pub(super) fn admission_used(&self, unreserved_debt: usize) -> usize {
+    pub(super) fn admission_used(&self, debt: usize) -> usize {
         self.active_planned_demand
-            .checked_add(self.retiring_direct_live)
-            .and_then(|used| used.checked_add(unreserved_debt))
+            .checked_add(debt)
             .expect("admission pressure overflowed")
     }
 
-    /// Charge one plan after its capacity has been prepared.
-    fn admit(
-        &mut self,
-        unreserved: &UnreservedState,
-        plan: ReservationPlan,
-    ) -> Result<(), ReserveError> {
-        self.validate_admit(unreserved.snapshot(), plan)?;
+    /// Charge one envelope after its capacity has been prepared.
+    fn admit(&mut self, coverage: &CoverageState, envelope: usize) -> Result<(), ReserveError> {
+        self.validate_admit(coverage.snapshot(), envelope)?;
         let active_planned_demand = self
             .active_planned_demand
-            .checked_add(plan.envelope)
+            .checked_add(envelope)
             .expect("validated active planned demand overflowed");
-        let unreserved_coverage = self
-            .unreserved_coverage
-            .checked_add(plan.unreserved_coverage())
-            .expect("validated unreserved coverage overflowed");
 
-        unreserved
-            .add_coverage(plan.unreserved_coverage())
+        coverage
+            .add_coverage(envelope)
             .expect("validated coverage must fit packed state");
         self.active_planned_demand = active_planned_demand;
-        self.unreserved_coverage = unreserved_coverage;
-        self.assert_invariants(unreserved.snapshot());
+        self.assert_invariants(coverage.snapshot());
         Ok(())
     }
 
     /// Validate all fallible counters before physical preparation starts.
     fn validate_admit(
         &self,
-        unreserved: UnreservedSnapshot,
-        plan: ReservationPlan,
+        coverage: CoverageSnapshot,
+        envelope: usize,
     ) -> Result<(), ReserveError> {
         self.active_planned_demand
-            .checked_add(plan.envelope)
-            .ok_or(ReserveError::CapacityOverflow)?;
-        self.unreserved_coverage
-            .checked_add(plan.unreserved_coverage())
-            .and_then(|coverage| coverage.checked_add(unreserved.debt))
+            .checked_add(envelope)
+            .and_then(|active| active.checked_add(coverage.debt))
             .filter(|total| *total <= MAX_CARRIERS)
             .ok_or(ReserveError::CapacityOverflow)?;
         Ok(())
     }
 
     /// Check identities that must hold after every completed transition.
-    fn assert_invariants(&self, unreserved: UnreservedSnapshot) {
+    fn assert_invariants(&self, coverage: CoverageSnapshot) {
         assert!(
-            self.prepared >= self.admission_used(unreserved.debt),
+            self.prepared >= self.admission_used(coverage.debt),
             "prepared capacity must cover admitted work and debt"
         );
         assert!(
-            unreserved.available_coverage <= self.unreserved_coverage,
+            coverage.available_coverage <= self.active_planned_demand,
             "available coverage exceeds active coverage"
         );
         assert!(
-            self.unreserved_coverage + unreserved.debt <= MAX_CARRIERS,
-            "unreserved live bound exceeds packed state"
+            self.active_planned_demand + coverage.debt <= MAX_CARRIERS,
+            "admission pressure exceeds packed state"
         );
     }
 
-    /// Derive live unreserved owners from one coherent packed sample.
-    pub(super) fn unreserved_live(&self, unreserved: UnreservedSnapshot) -> usize {
-        self.unreserved_coverage
-            .checked_add(unreserved.debt)
-            .and_then(|total| total.checked_sub(unreserved.available_coverage))
-            .expect("unreserved state violates coverage identity")
-    }
-}
-
-impl ReservationPlan {
-    /// Construct an admitted envelope and its direct-acquisition subset.
-    pub(super) fn new(envelope: usize, direct_limit: usize) -> Self {
-        assert!(envelope > 0, "a reservation must have a nonzero envelope");
-        assert!(
-            direct_limit <= envelope,
-            "direct authority must fit the reservation envelope"
-        );
-        Self {
-            envelope,
-            direct_limit,
-        }
-    }
-
-    /// Capacity available to aggregate unreserved acquisition.
-    fn unreserved_coverage(self) -> usize {
-        self.envelope - self.direct_limit
+    /// Derive charged acquisitions from one coherent packed sample.
+    pub(super) fn charged_live(&self, coverage: CoverageSnapshot) -> usize {
+        self.active_planned_demand
+            .checked_add(coverage.debt)
+            .and_then(|total| total.checked_sub(coverage.available_coverage))
+            .expect("aggregate state violates coverage identity")
     }
 }
 
 impl Reservation {
-    /// Create direct acquisition authority for an already-admitted plan.
-    fn new(pool: Arc<PoolInner>, plan: ReservationPlan) -> Self {
+    /// Create direct acquisition authority for an admitted envelope.
+    fn new(pool: Arc<PoolInner>, envelope: usize) -> Self {
         Self {
             state: Some(Arc::new(ReservationState {
                 pool,
-                plan,
+                envelope,
                 owner_state: AtomicU64::new(0),
             })),
         }
@@ -299,7 +232,7 @@ impl Reservation {
         &self,
         pool: &Arc<PoolInner>,
         count: usize,
-    ) -> Result<DirectDebit, AllocError> {
+    ) -> Result<AcquisitionDebit, AllocError> {
         let state = self
             .state
             .as_ref()
@@ -307,7 +240,17 @@ impl Reservation {
         if !Arc::ptr_eq(&state.pool, pool) {
             return Err(AllocError::ForeignReservation);
         }
-        ReservationState::try_debit(state, count)
+        ReservationState::try_debit(state, count)?;
+        match PoolInner::debit_coverage(pool, count) {
+            Ok(mut debit) => {
+                debit.direct = Some(Arc::clone(state));
+                Ok(debit)
+            }
+            Err(error) => {
+                state.release_direct(count);
+                Err(error)
+            }
+        }
     }
 
     /// Consume all future direct-acquisition authority.
@@ -375,10 +318,9 @@ impl ReservationState {
     /// The returned guard owns rollback until each unit is transferred to a
     /// carrier guard. Acquire ordering publishes the updated count before a
     /// concurrent carrier return or close observes it.
-    fn try_debit(state: &Arc<Self>, count: usize) -> Result<DirectDebit, AllocError> {
+    fn try_debit(state: &Arc<Self>, count: usize) -> Result<(), AllocError> {
         let count = u64::try_from(count).map_err(|_| AllocError::CapacityOverflow)?;
-        let direct_limit =
-            u64::try_from(state.plan.direct_limit).map_err(|_| AllocError::CapacityOverflow)?;
+        let envelope = u64::try_from(state.envelope).map_err(|_| AllocError::CapacityOverflow)?;
 
         let result =
             state
@@ -390,14 +332,11 @@ impl ReservationState {
                     let outstanding = current & RESERVATION_COUNT_MASK;
                     outstanding
                         .checked_add(count)
-                        .filter(|next| *next <= direct_limit)
+                        .filter(|next| *next <= envelope)
                 });
 
         match result {
-            Ok(_) => Ok(DirectDebit {
-                reservation: Arc::clone(state),
-                uncommitted: usize::try_from(count).unwrap(),
-            }),
+            Ok(_) => Ok(()),
             Err(current) => {
                 assert_eq!(
                     current & RESERVATION_CLOSED,
@@ -409,11 +348,7 @@ impl ReservationState {
         }
     }
 
-    /// Replace the active envelope with exact surviving ownership.
-    ///
-    /// The admission lock is held across the phase-bit update and ledger
-    /// conversion. A return before the atomic observes an open reservation; a
-    /// return after it waits for the lock before retiring its installed charge.
+    /// Withdraw the active envelope and convert occupied coverage to debt.
     fn close_acquisition(&self) {
         let notifications = {
             let mut admission = self.pool.admission.lock();
@@ -424,38 +359,22 @@ impl ReservationState {
                 return;
             }
 
-            let direct_live = usize::try_from(previous & RESERVATION_COUNT_MASK).unwrap();
             admission.ledger.active_planned_demand = admission
                 .ledger
                 .active_planned_demand
-                .checked_sub(self.plan.envelope)
+                .checked_sub(self.envelope)
                 .expect("reservation close exceeded active planned demand");
-            admission.ledger.retiring_direct_live = admission
-                .ledger
-                .retiring_direct_live
-                .checked_add(direct_live)
-                .expect("retiring direct ownership overflowed");
-            self.pool
-                .unreserved
-                .remove_coverage(self.plan.unreserved_coverage());
-            admission.ledger.unreserved_coverage = admission
-                .ledger
-                .unreserved_coverage
-                .checked_sub(self.plan.unreserved_coverage())
-                .expect("reservation close exceeded unreserved coverage");
+            self.pool.coverage.remove_coverage(self.envelope);
 
             admission
                 .ledger
-                .assert_invariants(self.pool.unreserved.snapshot());
+                .assert_invariants(self.pool.coverage.snapshot());
             PoolInner::drain_fifo_locked(&self.pool, &mut admission)
         };
         notify_all(notifications);
     }
 
-    /// Release direct owners or uncommitted debits.
-    ///
-    /// Returns before close restore reservation authority. Returns after close
-    /// also remove the corresponding global retiring charge.
+    /// Restore reservation-local authority.
     pub(super) fn release_direct(&self, count: usize) {
         let count = u64::try_from(count).expect("direct release count fits owner state");
         let previous = self.owner_state.fetch_sub(count, Ordering::AcqRel);
@@ -463,71 +382,50 @@ impl ReservationState {
             previous & RESERVATION_COUNT_MASK >= count,
             "direct return exceeds outstanding ownership"
         );
-
-        if previous & RESERVATION_CLOSED != 0 {
-            let notifications = {
-                let mut admission = self.pool.admission.lock();
-                admission.ledger.retiring_direct_live = admission
-                    .ledger
-                    .retiring_direct_live
-                    .checked_sub(usize::try_from(count).unwrap())
-                    .expect("direct return exceeded retiring ownership");
-                admission
-                    .ledger
-                    .assert_invariants(self.pool.unreserved.snapshot());
-                PoolInner::drain_fifo_locked(&self.pool, &mut admission)
-            };
-            notify_all(notifications);
-        }
     }
 }
 
-impl Drop for DirectDebit {
+impl Drop for AcquisitionDebit {
     fn drop(&mut self) {
         if self.uncommitted > 0 {
-            self.reservation.release_direct(self.uncommitted);
-        }
-    }
-}
-
-impl Drop for UnreservedDebit {
-    fn drop(&mut self) {
-        if self.uncommitted > 0 {
-            PoolInner::release_unreserved(&self.pool, self.uncommitted);
+            if let Some(reservation) = &self.direct {
+                reservation.release_direct(self.uncommitted);
+            }
+            PoolInner::release_coverage(&self.pool, self.uncommitted);
         }
     }
 }
 
 impl PoolInner {
-    /// Grant `plan` immediately without bypassing an existing waiter.
+    /// Grant `envelope` immediately without bypassing an existing waiter.
     pub(super) fn try_reserve(
         pool: &Arc<Self>,
-        plan: ReservationPlan,
+        envelope: usize,
     ) -> Result<Reservation, ReserveError> {
         let mut admission = pool.admission.lock();
         if admission.closed {
             return Err(ReserveError::Closed);
         }
-        let unreserved_debt = pool.unreserved.snapshot().debt;
-        if !admission.waiters.is_empty() || !admission.can_grant(plan, unreserved_debt) {
+        let debt = pool.coverage.snapshot().debt;
+        if !admission.waiters.is_empty() || !admission.can_grant(envelope, debt) {
             return Err(ReserveError::AtCapacity);
         }
-        PoolInner::prepare_and_grant_locked(pool, &mut admission, plan)
+        PoolInner::prepare_and_grant_locked(pool, &mut admission, envelope)
     }
 
-    /// Grant `plan` immediately or append it to the reservation FIFO.
+    /// Grant `envelope` immediately or append it to the reservation FIFO.
     pub(super) fn reserve(
         pool: &Arc<Self>,
-        plan: ReservationPlan,
+        envelope: usize,
         notify: NotifyFn,
     ) -> Result<Reserve, ReserveError> {
         let mut admission = pool.admission.lock();
         if admission.closed {
             return Err(ReserveError::Closed);
         }
-        let unreserved_debt = pool.unreserved.snapshot().debt;
-        if admission.waiters.is_empty() && admission.can_grant(plan, unreserved_debt) {
-            let reservation = PoolInner::prepare_and_grant_locked(pool, &mut admission, plan)?;
+        let debt = pool.coverage.snapshot().debt;
+        if admission.waiters.is_empty() && admission.can_grant(envelope, debt) {
+            let reservation = PoolInner::prepare_and_grant_locked(pool, &mut admission, envelope)?;
             return Ok(Reserve::Ready(reservation));
         }
 
@@ -535,7 +433,7 @@ impl PoolInner {
             state: Mutex::new(WaitState::Queued),
         });
         admission.waiters.push_back(Waiter {
-            plan,
+            envelope,
             slot: Arc::clone(&slot),
             notify,
         });
@@ -567,70 +465,66 @@ impl PoolInner {
         notify_all(notifications);
     }
 
-    /// Charge an unreserved acquisition and prepare any newly exposed debt.
+    /// Charge an acquisition and prepare any newly exposed debt.
     ///
     /// Charging precedes physical claim so unreserved traffic cannot consume
     /// the only carrier backing an existing reservation without first growing
     /// replacement capacity.
-    pub(super) fn debit_unreserved(
+    pub(super) fn debit_coverage(
         pool: &Arc<Self>,
         count: usize,
-    ) -> Result<UnreservedDebit, AllocError> {
+    ) -> Result<AcquisitionDebit, AllocError> {
         if pool
-            .unreserved
+            .coverage
             .try_debit_covered(count)
             .map_err(|_| AllocError::CapacityOverflow)?
         {
-            return Ok(UnreservedDebit {
+            return Ok(AcquisitionDebit {
                 pool: Arc::clone(pool),
+                direct: None,
                 uncommitted: count,
             });
         }
 
         let mut admission = pool.admission.lock();
         let maximum_debt = MAX_CARRIERS
-            .checked_sub(admission.ledger.unreserved_coverage)
+            .checked_sub(admission.ledger.active_planned_demand)
             .ok_or(AllocError::CapacityOverflow)?;
         let debit = pool
-            .unreserved
+            .coverage
             .debit(count, maximum_debt)
             .map_err(|_| AllocError::CapacityOverflow)?;
 
         if debit.new_debt > 0 {
-            let unreserved = pool.unreserved.snapshot();
-            let target = admission.ledger.admission_used(unreserved.debt);
+            let coverage = pool.coverage.snapshot();
+            let target = admission.ledger.admission_used(coverage.debt);
             if let Err(error) = pool
                 .arena
                 .prepare_to(target, &mut admission.ledger.prepared)
             {
-                pool.unreserved.release(count);
-                admission
-                    .ledger
-                    .assert_invariants(pool.unreserved.snapshot());
+                pool.coverage.release(count);
+                admission.ledger.assert_invariants(pool.coverage.snapshot());
                 return Err(error);
             }
         }
-        admission
-            .ledger
-            .assert_invariants(pool.unreserved.snapshot());
-        Ok(UnreservedDebit {
+        admission.ledger.assert_invariants(pool.coverage.snapshot());
+        Ok(AcquisitionDebit {
             pool: Arc::clone(pool),
+            direct: None,
             uncommitted: count,
         })
     }
 
-    /// Retire unreserved charges, repaying sticky debt first.
-    pub(super) fn release_unreserved(pool: &Arc<Self>, count: usize) {
-        let release = pool.unreserved.release(count);
+    /// Retire aggregate charges, repaying sticky debt first.
+    pub(super) fn release_coverage(pool: &Arc<Self>, count: usize) {
+        let release = pool.coverage.release(count);
         if release.repaid_debt == 0 {
             return;
         }
 
         let notifications = {
             let mut admission = pool.admission.lock();
-            admission
-                .ledger
-                .assert_invariants(pool.unreserved.snapshot());
+            admission.ledger.assert_invariants(pool.coverage.snapshot());
             PoolInner::drain_fifo_locked(pool, &mut admission)
         };
         notify_all(notifications);
@@ -645,30 +539,30 @@ impl PoolInner {
         PoolInner::drain_fifo_locked(pool, &mut admission)
     }
 
-    /// Prepare and charge one plan while admission is serialized.
+    /// Prepare and charge one envelope while admission is serialized.
     fn prepare_and_grant_locked(
         pool: &Arc<Self>,
         admission: &mut AdmissionState,
-        plan: ReservationPlan,
+        envelope: usize,
     ) -> Result<Reservation, ReserveError> {
         admission
             .ledger
-            .validate_admit(pool.unreserved.snapshot(), plan)?;
-        PoolInner::prepare_plan_locked(pool, admission, plan)?;
-        admission.ledger.admit(&pool.unreserved, plan)?;
-        Ok(Reservation::new(Arc::clone(pool), plan))
+            .validate_admit(pool.coverage.snapshot(), envelope)?;
+        PoolInner::prepare_envelope_locked(pool, admission, envelope)?;
+        admission.ledger.admit(&pool.coverage, envelope)?;
+        Ok(Reservation::new(Arc::clone(pool), envelope))
     }
 
-    /// Prepare capacity for `plan` without changing admission pressure.
-    fn prepare_plan_locked(
+    /// Prepare capacity for `envelope` without changing admission pressure.
+    fn prepare_envelope_locked(
         pool: &Arc<Self>,
         admission: &mut AdmissionState,
-        plan: ReservationPlan,
+        envelope: usize,
     ) -> Result<(), ReserveError> {
         let target = admission
             .ledger
-            .admission_used(pool.unreserved.snapshot().debt)
-            .checked_add(plan.envelope)
+            .admission_used(pool.coverage.snapshot().debt)
+            .checked_add(envelope)
             .ok_or(ReserveError::CapacityOverflow)?;
         pool.arena
             .prepare_to(target, &mut admission.ledger.prepared)
@@ -683,7 +577,7 @@ impl PoolInner {
 
         let mut notifications = Vec::new();
         while let Some(front) = admission.waiters.front() {
-            let plan = front.plan;
+            let envelope = front.envelope;
             let slot = Arc::clone(&front.slot);
             let notify = StdArc::clone(&front.notify);
 
@@ -691,13 +585,13 @@ impl PoolInner {
                 admission.waiters.pop_front();
                 continue;
             }
-            if !admission.can_grant(plan, pool.unreserved.snapshot().debt) {
+            if !admission.can_grant(envelope, pool.coverage.snapshot().debt) {
                 break;
             }
 
             if let Err(error) = admission
                 .ledger
-                .validate_admit(pool.unreserved.snapshot(), plan)
+                .validate_admit(pool.coverage.snapshot(), envelope)
             {
                 admission.waiters.pop_front();
                 let mut state = slot.state.lock();
@@ -708,7 +602,7 @@ impl PoolInner {
                 continue;
             }
 
-            if let Err(error) = PoolInner::prepare_plan_locked(pool, admission, plan) {
+            if let Err(error) = PoolInner::prepare_envelope_locked(pool, admission, envelope) {
                 admission.waiters.pop_front();
                 let mut state = slot.state.lock();
                 if matches!(*state, WaitState::Queued) {
@@ -721,9 +615,9 @@ impl PoolInner {
             admission.waiters.pop_front();
             let mut state = slot.state.lock();
             if matches!(*state, WaitState::Queued) {
-                match admission.ledger.admit(&pool.unreserved, plan) {
+                match admission.ledger.admit(&pool.coverage, envelope) {
                     Ok(()) => {
-                        *state = WaitState::Granted(Reservation::new(Arc::clone(pool), plan));
+                        *state = WaitState::Granted(Reservation::new(Arc::clone(pool), envelope));
                         notifications.push(notify);
                     }
                     Err(error) => {
@@ -770,8 +664,8 @@ mod loom_tests {
         )
     }
 
-    fn pending(pool: &BufferPool, plan: ReservationPlan, notify: NotifyFn) -> WaitTicket {
-        match pool.reserve(plan, notify).unwrap() {
+    fn pending(pool: &BufferPool, envelope: usize, notify: NotifyFn) -> WaitTicket {
+        match pool.reserve(envelope, notify).unwrap() {
             Reserve::Ready(reservation) => {
                 drop(reservation);
                 panic!("reservation unexpectedly granted");
@@ -784,9 +678,9 @@ mod loom_tests {
     fn grant_racing_cancellation_never_leaks_admission() {
         loom::model(|| {
             let pool = BufferPool::new(4, 1);
-            let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+            let holder = pool.try_reserve(1).unwrap();
             let (notify, _) = notify_flag();
-            let ticket = pending(&pool, ReservationPlan::new(1, 1), notify);
+            let ticket = pending(&pool, 1, notify);
 
             let releasing = thread::spawn(move || drop(holder));
             let cancelling = thread::spawn(move || drop(ticket));
@@ -803,9 +697,9 @@ mod loom_tests {
     fn grant_is_visible_before_notification_and_take() {
         loom::model(|| {
             let pool = BufferPool::new(4, 1);
-            let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+            let holder = pool.try_reserve(1).unwrap();
             let (notify, notified) = notify_flag();
-            let mut ticket = pending(&pool, ReservationPlan::new(1, 1), notify);
+            let mut ticket = pending(&pool, 1, notify);
 
             let releasing = thread::spawn(move || drop(holder));
             let taking = thread::spawn(move || {
@@ -836,7 +730,7 @@ mod loom_tests {
     fn notification_observes_grant_without_admission_lock() {
         loom::model(|| {
             let pool = BufferPool::new(4, 1);
-            let holder = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+            let holder = pool.try_reserve(1).unwrap();
             let ticket_slot: Arc<Mutex<Option<WaitTicket>>> = Arc::new(Mutex::new(None));
             let notified_ticket = Arc::clone(&ticket_slot);
             let notify: NotifyFn = StdArc::new(move || {
@@ -853,7 +747,7 @@ mod loom_tests {
                 // Re-enters admission. This deadlocks if notification runs under its lock.
                 drop(reservation);
             });
-            let ticket = pending(&pool, ReservationPlan::new(1, 1), notify);
+            let ticket = pending(&pool, 1, notify);
             *ticket_slot.lock() = Some(ticket);
 
             drop(holder);
@@ -866,11 +760,13 @@ mod loom_tests {
     #[test]
     fn close_and_final_direct_return_wake_waiter_once() {
         loom::model(|| {
-            let pool = BufferPool::new(4, 1);
-            let reservation = pool.try_reserve(ReservationPlan::new(1, 1)).unwrap();
+            let pool = BufferPool::new(4, 2);
+            let anchor = pool.try_reserve(1).unwrap();
+            let reservation = pool.try_reserve(1).unwrap();
+            let unreserved = PoolInner::debit_coverage(&pool.inner, 1).unwrap();
             let debit = reservation.try_debit(&pool.inner, 1).unwrap();
             let (notify, notified) = notify_flag();
-            let mut ticket = pending(&pool, ReservationPlan::new(1, 1), notify);
+            let mut ticket = pending(&pool, 1, notify);
 
             let closing = thread::spawn(move || reservation.close_acquisition());
             let returning = thread::spawn(move || drop(debit));
@@ -884,6 +780,8 @@ mod loom_tests {
                 Poll::Pending => panic!("grant remained pending after pressure retired"),
             };
             drop(next);
+            drop(anchor);
+            drop(unreserved);
             assert_eq!(pool.snapshot().admission_used, 0);
         });
     }
@@ -892,19 +790,19 @@ mod loom_tests {
     fn unreserved_debit_racing_coverage_close_remains_charged() {
         loom::model(|| {
             let pool = BufferPool::new(4, 1);
-            let reservation = pool.try_reserve(ReservationPlan::new(1, 0)).unwrap();
+            let reservation = pool.try_reserve(1).unwrap();
 
             let acquiring = pool.clone();
             let debit =
-                thread::spawn(move || PoolInner::debit_unreserved(&acquiring.inner, 1).unwrap());
+                thread::spawn(move || PoolInner::debit_coverage(&acquiring.inner, 1).unwrap());
             let closing = thread::spawn(move || reservation.close_acquisition());
 
             let debit = debit.join().unwrap();
             closing.join().unwrap();
 
             let snapshot = pool.snapshot();
-            assert_eq!(snapshot.unreserved_coverage, 0);
-            assert_eq!(snapshot.unreserved_live, 1);
+            assert_eq!(snapshot.available_coverage, 0);
+            assert_eq!(snapshot.charged_live, 1);
             assert_eq!(snapshot.unreserved_debt, 1);
             assert_eq!(snapshot.admission_used, 1);
 
@@ -917,8 +815,8 @@ mod loom_tests {
     fn unreserved_return_racing_coverage_close_retires_charge() {
         loom::model(|| {
             let pool = BufferPool::new(4, 1);
-            let reservation = pool.try_reserve(ReservationPlan::new(1, 0)).unwrap();
-            let debit = PoolInner::debit_unreserved(&pool.inner, 1).unwrap();
+            let reservation = pool.try_reserve(1).unwrap();
+            let debit = PoolInner::debit_coverage(&pool.inner, 1).unwrap();
 
             let returning = thread::spawn(move || drop(debit));
             let closing = thread::spawn(move || reservation.close_acquisition());
@@ -926,8 +824,8 @@ mod loom_tests {
             closing.join().unwrap();
 
             let snapshot = pool.snapshot();
-            assert_eq!(snapshot.unreserved_coverage, 0);
-            assert_eq!(snapshot.unreserved_live, 0);
+            assert_eq!(snapshot.available_coverage, 0);
+            assert_eq!(snapshot.charged_live, 0);
             assert_eq!(snapshot.unreserved_debt, 0);
             assert_eq!(snapshot.admission_used, 0);
         });

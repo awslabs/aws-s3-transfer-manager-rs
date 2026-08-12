@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Lock-free aggregate accounting for acquisition without a reservation.
+//! Lock-free aggregate acquisition accounting.
 //!
-//! Total coverage remains protected by the admission mutex. This module packs
-//! available coverage and sticky debt into one atomic word so acquisition,
+//! Active planned demand remains protected by the admission mutex. This module
+//! packs available coverage and sticky debt into one atomic word so acquisition,
 //! return, grant, and close cannot observe a torn pair.
 
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
@@ -20,35 +20,35 @@ const DEBT_SHIFT: u32 = u32::BITS;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CountOverflow;
 
-/// Aggregate state changed at transport acquisition frequency.
-pub(in crate::runtime::buffer_pool) struct UnreservedState {
+/// Aggregate state changed at carrier acquisition frequency.
+pub(in crate::runtime::buffer_pool) struct CoverageState {
     packed: AtomicU64,
 }
 
-/// One coherent sample of [`UnreservedState`].
+/// One coherent sample of [`CoverageState`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::runtime::buffer_pool) struct UnreservedSnapshot {
-    /// Active-plan coverage not yet consumed by an unreserved owner.
+pub(in crate::runtime::buffer_pool) struct CoverageSnapshot {
+    /// Active planned demand not occupied by an acquisition.
     pub(in crate::runtime::buffer_pool) available_coverage: usize,
-    /// Live unreserved ownership not covered by active plans.
+    /// Ownership pressure not covered by active planned demand.
     pub(in crate::runtime::buffer_pool) debt: usize,
 }
 
-/// Result of installing one unreserved owner charge.
+/// Result of installing aggregate acquisition charges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Debit {
     /// Additional debt introduced by this transition.
     pub(super) new_debt: usize,
 }
 
-/// Result of retiring unreserved owner charges.
+/// Result of retiring aggregate acquisition charges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Release {
     /// Debt removed by this transition.
     pub(super) repaid_debt: usize,
 }
 
-impl UnreservedState {
+impl CoverageState {
     /// Create empty aggregate state.
     pub(in crate::runtime::buffer_pool) fn new() -> Self {
         Self {
@@ -82,7 +82,7 @@ impl UnreservedState {
         }
     }
 
-    /// Install owner charges, consuming coverage before creating debt.
+    /// Install acquisition charges, consuming coverage before creating debt.
     ///
     /// Debt-producing callers hold admission serialization so preparation and
     /// admission pressure remain one logical transaction.
@@ -97,7 +97,7 @@ impl UnreservedState {
                 return Err(CountOverflow);
             }
             Ok((
-                UnreservedSnapshot {
+                CoverageSnapshot {
                     available_coverage: snapshot.available_coverage - covered,
                     debt,
                 },
@@ -106,7 +106,7 @@ impl UnreservedState {
         })
     }
 
-    /// Retire owner charges, repaying debt before restoring coverage.
+    /// Retire acquisition charges, repaying debt before restoring coverage.
     pub(super) fn release(&self, count: usize) -> Release {
         let count = checked_count(count).expect("released carrier count exceeds packed state");
         self.update(|snapshot| {
@@ -115,16 +115,16 @@ impl UnreservedState {
             let available_coverage = snapshot
                 .available_coverage
                 .checked_add(restored_coverage)
-                .expect("unreserved return exceeds live ownership");
+                .expect("aggregate return exceeds live ownership");
             Ok((
-                UnreservedSnapshot {
+                CoverageSnapshot {
                     available_coverage,
                     debt: snapshot.debt - repaid_debt,
                 },
                 Release { repaid_debt },
             ))
         })
-        .expect("unreserved return must fit packed state")
+        .expect("aggregate return must fit packed state")
     }
 
     /// Publish coverage from a newly active reservation.
@@ -139,7 +139,7 @@ impl UnreservedState {
                 .checked_add(count)
                 .ok_or(CountOverflow)?;
             Ok((
-                UnreservedSnapshot {
+                CoverageSnapshot {
                     available_coverage,
                     debt: snapshot.debt,
                 },
@@ -150,8 +150,8 @@ impl UnreservedState {
 
     /// Withdraw coverage from a closing reservation.
     ///
-    /// Unused coverage is removed first. Any remainder becomes debt so live
-    /// unreserved ownership remains charged.
+    /// Unused coverage is removed first. Any remainder becomes debt so
+    /// outstanding acquisitions remain charged.
     pub(super) fn remove_coverage(&self, count: usize) {
         let count = checked_count(count).expect("removed coverage exceeds packed state");
         self.update(|snapshot| {
@@ -162,7 +162,7 @@ impl UnreservedState {
                 .checked_add(new_debt)
                 .expect("closing coverage overflowed unreserved debt");
             Ok((
-                UnreservedSnapshot {
+                CoverageSnapshot {
                     available_coverage: snapshot.available_coverage - removed,
                     debt,
                 },
@@ -173,13 +173,13 @@ impl UnreservedState {
     }
 
     /// Load one coherent diagnostic and admission sample.
-    pub(in crate::runtime::buffer_pool) fn snapshot(&self) -> UnreservedSnapshot {
+    pub(in crate::runtime::buffer_pool) fn snapshot(&self) -> CoverageSnapshot {
         unpack(self.packed.load(Ordering::Acquire))
     }
 
     fn update<T>(
         &self,
-        mut transition: impl FnMut(UnreservedSnapshot) -> Result<(UnreservedSnapshot, T), CountOverflow>,
+        mut transition: impl FnMut(CoverageSnapshot) -> Result<(CoverageSnapshot, T), CountOverflow>,
     ) -> Result<T, CountOverflow> {
         let mut current = self.packed.load(Ordering::Acquire);
         loop {
@@ -208,12 +208,12 @@ fn checked_count(count: usize) -> Result<usize, CountOverflow> {
 fn pack(available_coverage: usize, debt: usize) -> u64 {
     let available_coverage =
         u32::try_from(available_coverage).expect("available coverage exceeds packed state");
-    let debt = u32::try_from(debt).expect("unreserved debt exceeds packed state");
+    let debt = u32::try_from(debt).expect("aggregate debt exceeds packed state");
     u64::from(available_coverage) | (u64::from(debt) << DEBT_SHIFT)
 }
 
-fn unpack(packed: u64) -> UnreservedSnapshot {
-    UnreservedSnapshot {
+fn unpack(packed: u64) -> CoverageSnapshot {
+    CoverageSnapshot {
         available_coverage: (packed as u32) as usize,
         debt: (packed >> DEBT_SHIFT) as usize,
     }
@@ -225,13 +225,13 @@ mod tests {
 
     #[test]
     fn grant_does_not_absorb_existing_debt() {
-        let state = UnreservedState::new();
+        let state = CoverageState::new();
         assert_eq!(state.debit(1, MAX_CARRIERS).unwrap().new_debt, 1);
         state.add_coverage(1).unwrap();
 
         assert_eq!(
             state.snapshot(),
-            UnreservedSnapshot {
+            CoverageSnapshot {
                 available_coverage: 1,
                 debt: 1,
             }
@@ -240,14 +240,14 @@ mod tests {
 
     #[test]
     fn close_converts_consumed_coverage_to_debt() {
-        let state = UnreservedState::new();
+        let state = CoverageState::new();
         state.add_coverage(1).unwrap();
         assert!(state.try_debit_covered(1).unwrap());
         state.remove_coverage(1);
 
         assert_eq!(
             state.snapshot(),
-            UnreservedSnapshot {
+            CoverageSnapshot {
                 available_coverage: 0,
                 debt: 1,
             }
@@ -265,7 +265,7 @@ mod loom_tests {
     #[test]
     fn acquire_racing_close_preserves_live_charge() {
         loom::model(|| {
-            let state = Arc::new(UnreservedState::new());
+            let state = Arc::new(CoverageState::new());
             state.add_coverage(1).unwrap();
 
             let acquiring = Arc::clone(&state);
@@ -281,7 +281,7 @@ mod loom_tests {
             close.join().unwrap();
             assert_eq!(
                 state.snapshot(),
-                UnreservedSnapshot {
+                CoverageSnapshot {
                     available_coverage: 0,
                     debt: 1,
                 }
@@ -292,7 +292,7 @@ mod loom_tests {
     #[test]
     fn return_racing_close_retires_live_charge() {
         loom::model(|| {
-            let state = Arc::new(UnreservedState::new());
+            let state = Arc::new(CoverageState::new());
             state.add_coverage(1).unwrap();
             assert!(state.try_debit_covered(1).unwrap());
 
@@ -305,7 +305,7 @@ mod loom_tests {
             close.join().unwrap();
             assert_eq!(
                 state.snapshot(),
-                UnreservedSnapshot {
+                CoverageSnapshot {
                     available_coverage: 0,
                     debt: 0,
                 }
