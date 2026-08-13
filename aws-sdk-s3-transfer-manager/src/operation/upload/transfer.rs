@@ -222,6 +222,7 @@ impl UploadTransfer {
                         part_reader,
                         completed_parts,
                         response_builder,
+                        content_length,
                         ..
                     } = std::mem::replace(&mut *state, UploadState::Done)
                     {
@@ -231,6 +232,7 @@ impl UploadTransfer {
                             completed_parts: Some(completed_parts),
                             response_builder: Some(response_builder),
                             complete_in_flight: false,
+                            content_length,
                         };
                     }
                     drop(state);
@@ -355,6 +357,7 @@ impl UploadTransfer {
                 parts_in_flight: 0,
                 completed_parts: Vec::with_capacity(total_parts as usize),
                 response_builder,
+                content_length,
             };
         }
 
@@ -519,6 +522,7 @@ impl UploadTransfer {
                 part_reader,
                 completed_parts,
                 response_builder,
+                content_length,
                 ..
             } = std::mem::replace(&mut *state, UploadState::Done)
             {
@@ -528,6 +532,7 @@ impl UploadTransfer {
                     completed_parts: Some(completed_parts),
                     response_builder: Some(response_builder),
                     complete_in_flight: false,
+                    content_length,
                 };
             }
             drop(state);
@@ -654,7 +659,7 @@ impl UploadTransfer {
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
-        let (upload_id, mut completed_parts, response_builder, part_reader) = {
+        let (upload_id, mut completed_parts, response_builder, part_reader, content_length) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             match &mut *state {
                 UploadState::Completing {
@@ -662,6 +667,7 @@ impl UploadTransfer {
                     completed_parts,
                     response_builder,
                     part_reader,
+                    content_length,
                     ..
                 } => (
                     upload_id.take().expect("upload_id already taken"),
@@ -672,6 +678,7 @@ impl UploadTransfer {
                         .take()
                         .expect("response_builder already taken"),
                     part_reader.take().expect("part_reader already taken"),
+                    *content_length,
                 ),
                 _ => panic!("unexpected state for complete_mpu"),
             }
@@ -685,6 +692,11 @@ impl UploadTransfer {
             .s3_client()
             .complete_multipart_upload()
             .upload_id(&upload_id)
+            // S3 sums the parts it assembled and rejects CompleteMPU when the
+            // total doesn't match this value, so a dropped or duplicated part
+            // surfaces as a failed complete rather than a wrong-sized object.
+            // Required by SEP step 7.
+            .mpu_object_size(content_length as i64)
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(completed_parts))

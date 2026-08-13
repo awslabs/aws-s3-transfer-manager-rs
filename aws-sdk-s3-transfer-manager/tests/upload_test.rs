@@ -225,3 +225,62 @@ async fn test_large_upload_part_size_bump() {
         expected_part_size
     );
 }
+
+/// CompleteMultipartUpload must carry `MpuObjectSize` set to the full content
+/// length so S3 rejects the request if the object it assembled is a different
+/// size (a dropped or duplicated part). Required by SEP step 7.
+#[tokio::test]
+async fn test_complete_mpu_sends_mpu_object_size() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    // Two full parts plus a partial one, so the total is not a part-size multiple
+    // and a stale part-count-derived value would not match.
+    let content_length = 2 * part_size + 1024;
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+
+    // Match only when MpuObjectSize equals the full content length. With the
+    // field absent (or wrong) no rule matches and the upload fails, so the
+    // assertion below is what pins the behavior.
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.mpu_object_size() == Some(content_length as i64))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    );
+
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let stream = TestStream::new(rx, content_length, content_length as u64);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-mpu-object-size")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    drop(tx);
+    handle
+        .join()
+        .await
+        .expect("upload should succeed: CompleteMPU must carry MpuObjectSize = content length");
+}

@@ -30,6 +30,8 @@ pub(crate) enum UploadState {
         parts_in_flight: usize,
         completed_parts: Vec<CompletedPart>,
         response_builder: UploadOutputBuilder,
+        /// Full object content length, carried through to CompleteMPU as `MpuObjectSize`.
+        content_length: u64,
     },
     /// All parts done, calling CompleteMPU (MPU only)
     Completing {
@@ -38,6 +40,7 @@ pub(crate) enum UploadState {
         completed_parts: Option<Vec<CompletedPart>>,
         response_builder: Option<UploadOutputBuilder>,
         complete_in_flight: bool,
+        content_length: u64,
     },
     /// PutObject in flight (single request upload)
     PutObjectInFlight,
