@@ -443,7 +443,30 @@ impl UploadTransfer {
             Err(e) => return self.fail(e.into()),
         };
 
+        // Claim part 1 now, at read time — NOT after the send completes. A part read is what
+        // establishes that the stream is non-empty, and the send that follows can take a long time.
+        // Recording it later would let a concurrently-dispatched read that hits end-of-stream see
+        // "nothing emitted" while this part is still in flight, and synthesize a second part 1.
+        self.mark_part_emitted();
+
         self.send_part(data).await
+    }
+
+    /// Record that a part has been read from the stream, so a later end-of-stream does not treat the
+    /// stream as empty and synthesize an empty part 1.
+    ///
+    /// Called at read time rather than on send completion: see the ordering note at the call site.
+    fn mark_part_emitted(&self) {
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        if let UploadState::Transferring {
+            plan: PartPlan::Unknown {
+                first_part_emitted, ..
+            },
+            ..
+        } = &mut *state
+        {
+            *first_part_emitted = true;
+        }
     }
 
     /// Upload one part and record it, then advance the state machine.
@@ -542,15 +565,11 @@ impl UploadTransfer {
             } = &mut *state
             {
                 completed_parts.push(completed);
-                if let PartPlan::Unknown {
-                    first_part_emitted, ..
-                } = plan
-                {
-                    // A data-bearing part also claims part 1, so a stream that turned out non-empty
-                    // never synthesizes an empty one.
-                    *first_part_emitted = true;
+                if matches!(plan, PartPlan::Unknown { .. }) {
                     // No declared length to trust, so the object size is summed from what we sent.
                     // Exact once end-of-stream is reached, which is when CompleteMPU reads it.
+                    // (`first_part_emitted` is claimed at read time, not here — see
+                    // `mark_part_emitted`.)
                     *object_size += bytes_sent;
                 }
             }
@@ -1192,5 +1211,63 @@ mod tests {
         transfer.execute(&mut work).await;
 
         assert!(transfer.take_result().is_some());
+    }
+
+    /// The 10,000-part ceiling is enforced before dispatch, with an error that names the
+    /// remedy.
+    ///
+    /// An unknown-length upload has no part count to bound it, so without this guard the next
+    /// dispatch would send `PartNumber = 10001` and take S3's `InvalidArgument` — which says
+    /// nothing about part size. Reaching the ceiling through the public API would need 50 GiB
+    /// (part size is clamped to >= 5 MiB), so the plan state is driven directly here.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_unknown_length_part_ceiling_is_enforced() {
+        let s3_client = mock_s3_client_for_mpu();
+        let transfer = create_test_transfer(s3_client, vec![0u8; 16 * 1024 * 1024]);
+
+        // Drive through CreateMPU so the transfer is in `Transferring`.
+        let mut work = assert_ready(transfer.poll_work());
+        transfer.execute(&mut work).await;
+
+        // Pretend this is an unknown-length transfer that has already dispatched every part it
+        // is allowed to.
+        {
+            let mut state = transfer.inner.state.lock().expect("lock poisoned");
+            if let UploadState::Transferring {
+                plan,
+                parts_dispatched,
+                parts_in_flight,
+                ..
+            } = &mut *state
+            {
+                *plan = PartPlan::Unknown {
+                    eof: false,
+                    first_part_emitted: true,
+                };
+                *parts_dispatched = MAX_PARTS;
+                *parts_in_flight = 0;
+            } else {
+                panic!("expected Transferring after CreateMPU");
+            }
+        }
+
+        // The next poll must refuse to dispatch part MAX_PARTS + 1.
+        assert!(matches!(transfer.poll_work(), PollWork::Done));
+
+        let err = transfer
+            .ctx()
+            .take_error()
+            .expect("exceeding the part ceiling must record an error");
+        assert_eq!(&ErrorKind::InputInvalid, err.kind());
+        // Per this crate's convention `Display` renders the kind and the detail hangs off
+        // `source()` (see `display_omits_source_message`), so that is where the remedy must be.
+        let detail = std::error::Error::source(&err)
+            .expect("the ceiling error must carry a detail message")
+            .to_string();
+        assert!(
+            detail.contains("part size") && detail.contains("10000"),
+            "error detail must name the ceiling and the remedy, got: {detail}"
+        );
     }
 }

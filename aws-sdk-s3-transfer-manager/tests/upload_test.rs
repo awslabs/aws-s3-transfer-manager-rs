@@ -538,3 +538,73 @@ async fn test_known_length_sends_declared_size_not_running_sum() {
         .await
         .expect("a known-length upload must send its declared content length as MpuObjectSize");
 }
+
+/// A stream that yields data must never *also* send an empty part 1.
+///
+/// The empty-part rule only applies when the stream turned out to be empty. Parts
+/// are dispatched speculatively, so the dispatch that reads end-of-stream can run
+/// while the first data part is still in flight; if "has anything been emitted" is
+/// recorded only once that send completes, the end-of-stream dispatch sees "nothing
+/// emitted" and synthesizes a *second* part 1. CompleteMultipartUpload would then
+/// list part 1 twice — and whichever write S3 kept last could truncate the object.
+#[tokio::test]
+async fn test_unknown_length_with_data_never_sends_empty_part() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    // Split the part rules by body size so the empty one's call count is the assertion.
+    let empty_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() == Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
+    let data_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() != Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("data-etag").build());
+
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &empty_part, &data_part, &complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    // Exactly one data part, then end-of-stream.
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect("upload should succeed");
+
+    assert_eq!(
+        1,
+        data_part.num_calls(),
+        "the single data part must be uploaded once"
+    );
+    assert_eq!(
+        0,
+        empty_part.num_calls(),
+        "a stream that yielded data must not also send an empty part 1"
+    );
+}
