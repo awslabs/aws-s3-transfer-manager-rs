@@ -97,10 +97,9 @@ impl UploadTransfer {
         request: UploadInput,
         stream: InputStream,
     ) -> Self {
-        // `None` for a `PartStream` whose total size is not known up front (see
-        // `docs/design/unknown-length-upload.md`). Such a source is always `is_mpu_only`, so it
-        // routes through the multipart path and its parts are dispatched speculatively until the
-        // reader reports end-of-stream.
+        // `None` for a `PartStream` whose total size is not known up front. Such a source is always
+        // `is_mpu_only`, so it routes through the multipart path and its parts are dispatched
+        // speculatively until the reader reports end-of-stream (see `PartPlan`).
         let content_length = stream.size_hint().upper();
 
         // Only meaningful when the length is known; an unknown-length transfer reports
