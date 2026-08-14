@@ -500,3 +500,53 @@ async fn test_objects_transfer() {
         .unwrap();
     upload_handle.join().await.unwrap();
 }
+
+/// A multipart upload sets `MpuObjectSize = full content length` on
+/// CompleteMultipartUpload, and S3 accepts it and stores the correct size —
+/// covering the real-S3 half of SEP step 7's server-side enforcement.
+///
+/// A "S3 rejects a mismatch" negative path is intentionally omitted. The TM
+/// upload path derives `MpuObjectSize` from the same content length it uses
+/// to size and count the parts it sends, so it cannot naturally emit a value
+/// that disagrees with what it uploaded; a negative case would require either
+/// a test-only backdoor into production code (leaks a foot-gun into the
+/// public surface) or a hand-rolled MPU that bypasses TM entirely (tests
+/// S3, not TM). The mock-level tests in `upload_test.rs` and
+/// `upload_objects_test.rs` cover the "field must be present and correct on
+/// the emitted request" half.
+#[tokio::test]
+async fn test_multi_part_upload_sends_mpu_object_size() {
+    let _logs = show_test_logs();
+    let file_size = 20 * 1024 * 1024; // 20 MiB — above the 8 MiB default part size, so multipart
+    let object_key = generate_key("mpu-object-size");
+    let (bucket_name, express_bucket_name) = get_bucket_names();
+
+    for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
+        let (tm, s3_client) = test_tm().await;
+
+        perform_upload(
+            &tm,
+            bucket,
+            &object_key,
+            None,
+            create_input_stream(file_size),
+        )
+        .await;
+
+        let head = s3_client
+            .head_object()
+            .bucket(bucket)
+            .key(&object_key)
+            .send()
+            .await
+            .expect("HeadObject succeeds after upload");
+        assert_eq!(
+            head.content_length(),
+            Some(file_size as i64),
+            "S3 must store the full content length; a divergence would mean either \
+             MpuObjectSize was not sent (S3 would still store the wrong size but not \
+             flag it) or was wrong and S3 rejected the complete (which surfaces as an \
+             upload failure above, not a size mismatch here)",
+        );
+    }
+}

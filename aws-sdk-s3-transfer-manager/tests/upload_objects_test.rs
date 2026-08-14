@@ -1631,3 +1631,93 @@ async fn test_stress_parent_lock_contention() {
     .await
     .expect("test_stress_parent_lock_contention timed out — single-poll exclusivity on the composite descriptor is likely broken");
 }
+
+/// Every child multipart upload spawned by `upload_objects` must send
+/// `MpuObjectSize` on CompleteMultipartUpload, so S3 can reject a request
+/// that assembled a wrong-sized object (dropped or duplicated part).
+/// Required by SEP step 7.
+///
+/// The mock matches CompleteMPU only when `mpu_object_size` equals the child's
+/// content length. With the field absent or wrong on any child, no rule matches
+/// that request and the child fails — the join below then surfaces the
+/// failure. Passing under `objects_uploaded == files.len()` is what pins the
+/// field's presence on every child.
+#[tokio::test]
+async fn test_upload_objects_children_send_mpu_object_size() {
+    timeout(TEST_TIMEOUT, async {
+        // Three files of distinct sizes, all above the multipart threshold, so
+        // a naive "always send the same value" implementation would only pass
+        // one child at a time.
+        let one_mib = ByteUnit::Mebibyte.as_bytes_u64();
+        let files = vec![
+            ("a.bin", (5 * one_mib) as usize),
+            ("b.bin", (6 * one_mib) as usize),
+            ("nested/c.bin", (7 * one_mib) as usize),
+        ];
+        let test_dir = create_test_dir(Some("test"), files.clone(), &[]);
+
+        let bucket_name = "test-bucket";
+        let upload_id = "test-upload-id".to_owned();
+
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+            let upload_id = upload_id.clone();
+            move || {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id(upload_id.clone())
+                    .build()
+            }
+        });
+
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .then_output(|| UploadPartOutput::builder().build());
+
+        // Match CompleteMPU only when MpuObjectSize is one of the known file
+        // sizes. The mock is size-set-aware rather than per-key because
+        // upload_objects dispatches children concurrently and there is no
+        // ordering guarantee against a specific key.
+        let expected_sizes: Vec<i64> = files
+            .iter()
+            .map(|(_, size)| *size as i64)
+            .collect();
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+            .match_requests(move |req| {
+                req.mpu_object_size()
+                    .is_some_and(|n| expected_sizes.contains(&n))
+            })
+            .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[create_mpu, upload_part, complete_mpu]
+        );
+
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .multipart_threshold(PartSize::Target(5))
+            .build();
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let handle = sut
+            .upload_objects()
+            .bucket(bucket_name)
+            .source(test_dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .initiate()
+            .unwrap();
+
+        let output = handle.join().await.unwrap();
+        assert_eq!(
+            3,
+            output.objects_uploaded(),
+            "every child must send MpuObjectSize = its content length; a child whose CompleteMPU request omits the field will not match the mock and will fail",
+        );
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no child should fail: {:?}",
+            output.failed_transfers(),
+        );
+    })
+    .await
+    .expect("test_upload_objects_children_send_mpu_object_size timed out");
+}
