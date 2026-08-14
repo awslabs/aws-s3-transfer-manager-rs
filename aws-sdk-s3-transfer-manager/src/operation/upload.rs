@@ -77,11 +77,6 @@ impl Upload {
 
         let stream = input.take_body();
 
-        // TODO: Relax this constraint - unknown content length implies MPU
-        if stream.size_hint().upper().is_none() {
-            return Err(crate::io::error::Error::upper_bound_size_hint_required().into());
-        }
-
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 

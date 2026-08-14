@@ -10,7 +10,6 @@ use tokio::task::JoinError;
 
 #[derive(Debug)]
 pub(crate) enum ErrorKind {
-    UpperBoundSizeHintRequired,
     OffsetGreaterThanFileSize,
     OffsetNotAlignedWithPartNumber(u64, u64),
     TaskFailed(JoinError),
@@ -24,9 +23,6 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn upper_bound_size_hint_required() -> Error {
-        ErrorKind::UpperBoundSizeHintRequired.into()
-    }
     pub(crate) fn offset_not_aligned_with_part_number(offset: u64, part_number: u64) -> Error {
         ErrorKind::OffsetNotAlignedWithPartNumber(offset, part_number).into()
     }
@@ -46,10 +42,6 @@ impl From<StdIoError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            ErrorKind::UpperBoundSizeHintRequired => write!(
-                f,
-                "size hint upper bound (SizeHint::upper) is required but was None"
-            ),
             ErrorKind::OffsetGreaterThanFileSize => write!(
                 f,
                 "offset must be less than or equal to file size but was greater than"
@@ -68,7 +60,6 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match &self.kind {
-            ErrorKind::UpperBoundSizeHintRequired => None,
             ErrorKind::OffsetGreaterThanFileSize => None,
             ErrorKind::OffsetNotAlignedWithPartNumber(_, _) => None,
             ErrorKind::IoError(err) => Some(err as _),
