@@ -550,3 +550,64 @@ async fn test_multi_part_upload_sends_mpu_object_size() {
         );
     }
 }
+
+/// End-to-end: `if_none_match("*")` on a fresh key succeeds (satisfied) and on
+/// an existing key fails with [`ErrorKind::PreconditionFailed`] (violated).
+///
+/// Mock coverage in `upload_test.rs` pins the wire behavior (header forwarded,
+/// 412 mapped). This e2e adds server-side confirmation that:
+///   1. S3 accepts the header on the real request path (typos, encoding,
+///      request-signing changes would not be caught by mocks);
+///   2. a real 412 comes back with the same HTTP shape we map — i.e. the
+///      classifier is not brittle against wire-level differences between the
+///      mock and the service.
+///
+/// Runs against the general-purpose bucket only. Per the S3 conditional-writes
+/// docs, `If-None-Match` / `If-Match` are defined in terms of general-purpose
+/// (versioned / version-suspended) bucket behavior; support on S3 Express One
+/// Zone directory buckets is not affirmed there, so we don't assert it here.
+// TODO(RUST-1203): extend to the S3 Express bucket once conditional-write
+// support on directory buckets is confirmed on a real run.
+#[tokio::test]
+async fn test_upload_if_none_match_star() {
+    use aws_sdk_s3_transfer_manager::error::ErrorKind;
+
+    let _logs = show_test_logs();
+    let (bucket_name, _express_bucket_name) = get_bucket_names();
+    let object_key = generate_key("if-none-match-star");
+
+    let (tm, _) = test_tm().await;
+
+    // 1) Satisfied: no object exists at this key, so If-None-Match: "*"
+    //    (create-if-absent) is allowed.
+    tm.upload()
+        .bucket(&bucket_name)
+        .key(&object_key)
+        .if_none_match("*")
+        .body(create_input_stream(1024))
+        .initiate()
+        .expect("initiate should succeed")
+        .join()
+        .await
+        .expect("first upload with If-None-Match: * must succeed against a fresh key");
+
+    // 2) Violated: the object we just created collides with the same
+    //    precondition on the second upload. Expect PreconditionFailed —
+    //    NOT a generic ServiceError.
+    let err = tm
+        .upload()
+        .bucket(&bucket_name)
+        .key(&object_key)
+        .if_none_match("*")
+        .body(create_input_stream(1024))
+        .initiate()
+        .expect("initiate should succeed")
+        .join()
+        .await
+        .expect_err("second upload with If-None-Match: * must fail against an existing key");
+    assert!(
+        matches!(err.kind(), ErrorKind::PreconditionFailed),
+        "expected ErrorKind::PreconditionFailed, got {:?}",
+        err.kind()
+    );
+}
