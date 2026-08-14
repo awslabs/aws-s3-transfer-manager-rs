@@ -647,6 +647,8 @@ impl UploadTransfer {
             .take()
             .expect("stream should be present for PutObject");
 
+        // Unreachable for an unknown-length source: only a `PartStream` can omit the upper bound,
+        // and such a stream is `is_mpu_only`, so `poll_work` routes it to CreateMPU and never here.
         let content_length = stream
             .size_hint()
             .upper()

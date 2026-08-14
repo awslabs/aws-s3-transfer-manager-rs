@@ -550,3 +550,148 @@ async fn test_multi_part_upload_sends_mpu_object_size() {
         );
     }
 }
+
+/// A `PartStream` with no size-hint upper bound: the unknown-content-length case.
+///
+/// Parts are handed over a channel and closing the sender is end-of-stream, which
+/// is how a caller like Mountpoint streams an object whose final size is only
+/// known once the writer closes.
+#[derive(Debug)]
+struct UnknownLengthStream {
+    next_part_num: u64,
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+}
+
+impl UnknownLengthStream {
+    fn new(rx: tokio::sync::mpsc::Receiver<bytes::Bytes>) -> Self {
+        Self {
+            next_part_num: 1,
+            rx,
+        }
+    }
+}
+
+impl PartStream for UnknownLengthStream {
+    fn poll_part(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(b)) => {
+                let part_num = self.next_part_num;
+                self.next_part_num += 1;
+                Poll::Ready(Some(Ok(PartData::new(part_num, b))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// No upper bound — routes the upload down the unknown-length path.
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// An upload from a stream with no declared content length transfers, and S3
+/// stores an object of exactly the streamed size.
+#[tokio::test]
+async fn test_upload_unknown_content_length() {
+    let _logs = show_test_logs();
+    let (tm, s3_client) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let key = generate_key("unknown-content-length");
+
+    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    // Deliberately not a part-size multiple, so a size derived from the part count
+    // rather than the bytes actually read would not match.
+    let tail = 1024;
+    let expected_len = 2 * part_size + tail;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket(bucket_name.as_str())
+        .key(key.as_str())
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            tx.send(bytes::Bytes::from(vec![b'z'; part_size]))
+                .await
+                .unwrap();
+        }
+        tx.send(bytes::Bytes::from(vec![b'z'; tail])).await.unwrap();
+        // End of stream.
+        drop(tx);
+    });
+
+    handle
+        .join()
+        .await
+        .expect("an unknown-length stream must upload successfully");
+
+    let head = s3_client
+        .head_object()
+        .bucket(bucket_name.as_str())
+        .key(key.as_str())
+        .send()
+        .await
+        .expect("uploaded object must exist");
+    assert_eq!(
+        Some(expected_len as i64),
+        head.content_length(),
+        "stored object size must equal the number of bytes streamed"
+    );
+}
+
+/// An empty stream with no declared content length completes as a normal 0-byte
+/// object.
+///
+/// S3 rejects a CompleteMultipartUpload that lists no parts, so the transfer
+/// uploads a single empty part. This confirms against real S3 what the mock
+/// cannot: that such an upload is accepted and stores a 0-byte object.
+#[tokio::test]
+async fn test_upload_unknown_content_length_empty() {
+    let _logs = show_test_logs();
+    let (tm, s3_client) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+
+    for checksum in [None, Some(ChecksumStrategy::default())] {
+        let key = generate_key("unknown-content-length-empty");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // Empty: end-of-stream without ever sending a part.
+        drop(tx);
+
+        let handle = tm
+            .upload()
+            .bucket(bucket_name.as_str())
+            .key(key.as_str())
+            .set_checksum_strategy(checksum.clone())
+            .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+            .initiate()
+            .unwrap();
+
+        handle
+            .join()
+            .await
+            .expect("an empty unknown-length stream must complete as a 0-byte object");
+
+        let head = s3_client
+            .head_object()
+            .bucket(bucket_name.as_str())
+            .key(key.as_str())
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("uploaded empty object must exist");
+        assert_eq!(
+            Some(0),
+            head.content_length(),
+            "an empty stream must store a 0-byte object"
+        );
+    }
+}
