@@ -285,8 +285,12 @@ the gap is exhausted, the download returns `Pending`. When the consumer reads da
 the read head and wakes the transfer. The gap scales with concurrency to avoid becoming a
 throughput bottleneck at high concurrency while still bounding memory from out-of-order completion.
 
-**Buffer pool.** Transfers acquire buffer tickets before generating work. When the memory budget is
-exhausted, transfers return `Pending`. When buffers are released, blocked transfers are woken.
+**Buffer pool.** A transfer polls a `ReserveFuture` for the work item's planned memory envelope before
+dispatch. While admission is pending, it retains the candidate work and future and returns
+`Pending`. The pool assigns the `Reservation` before waking the transfer; a later poll moves that
+reservation into the dispatched work. Reservation close, cancellation, and carrier returns that
+reduce admission use reconsider queued admission according to the
+[memory design](./memory.md#scheduler-admission-and-dispatch).
 
 When a transfer returns `Pending`, it leaves the ready set. The scheduler does not poll it again
 until something calls `scheduler.wake(id)`, which re-inserts the transfer into the ready set and
