@@ -249,6 +249,50 @@ impl UploadFluentBuilder {
     pub fn get_checksum_strategy(&self) -> Option<&ChecksumStrategy> {
         self.inner.get_checksum_strategy()
     }
+
+    /// <p>Uploads the object only if the object's ETag matches the value provided; otherwise, S3 returns a <code>412 Precondition Failed</code> error, surfaced by the transfer manager as [`ErrorKind::PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed). Applies to both <code>PutObject</code> and <code>CompleteMultipartUpload</code>.</p>
+    /// <p>Note that for a fresh key with no existing object, <code>If-Match</code> has nothing to match and S3 will fail the request; prefer [`if_none_match`](Self::if_none_match) with <code>"*"</code> for create-if-absent semantics.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>.</p>
+    pub fn if_match(mut self, input: impl Into<String>) -> Self {
+        self.inner = self.inner.if_match(input);
+        self
+    }
+
+    /// <p>Uploads the object only if the object's ETag matches the value provided; otherwise, S3 returns a <code>412 Precondition Failed</code> error, surfaced by the transfer manager as [`ErrorKind::PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed). Applies to both <code>PutObject</code> and <code>CompleteMultipartUpload</code>.</p>
+    /// <p>Note that for a fresh key with no existing object, <code>If-Match</code> has nothing to match and S3 will fail the request; prefer [`if_none_match`](Self::if_none_match) with <code>"*"</code> for create-if-absent semantics.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>.</p>
+    pub fn set_if_match(mut self, input: Option<String>) -> Self {
+        self.inner = self.inner.set_if_match(input);
+        self
+    }
+
+    /// <p>Uploads the object only if the object's ETag matches the value provided; otherwise, S3 returns a <code>412 Precondition Failed</code> error, surfaced by the transfer manager as [`ErrorKind::PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed). Applies to both <code>PutObject</code> and <code>CompleteMultipartUpload</code>.</p>
+    /// <p>Note that for a fresh key with no existing object, <code>If-Match</code> has nothing to match and S3 will fail the request; prefer [`if_none_match`](Self::if_none_match) with <code>"*"</code> for create-if-absent semantics.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>.</p>
+    pub fn get_if_match(&self) -> Option<&str> {
+        self.inner.get_if_match()
+    }
+
+    /// <p>Uploads the object only if no object with the same key exists (typically set to <code>"*"</code>); otherwise, S3 returns a <code>412 Precondition Failed</code> error, surfaced by the transfer manager as [`ErrorKind::PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed). Applies to both <code>PutObject</code> and <code>CompleteMultipartUpload</code>.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>.</p>
+    pub fn if_none_match(mut self, input: impl Into<String>) -> Self {
+        self.inner = self.inner.if_none_match(input);
+        self
+    }
+
+    /// <p>Uploads the object only if no object with the same key exists (typically set to <code>"*"</code>); otherwise, S3 returns a <code>412 Precondition Failed</code> error, surfaced by the transfer manager as [`ErrorKind::PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed). Applies to both <code>PutObject</code> and <code>CompleteMultipartUpload</code>.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>.</p>
+    pub fn set_if_none_match(mut self, input: Option<String>) -> Self {
+        self.inner = self.inner.set_if_none_match(input);
+        self
+    }
+
+    /// <p>Uploads the object only if no object with the same key exists (typically set to <code>"*"</code>); otherwise, S3 returns a <code>412 Precondition Failed</code> error, surfaced by the transfer manager as [`ErrorKind::PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed). Applies to both <code>PutObject</code> and <code>CompleteMultipartUpload</code>.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>.</p>
+    pub fn get_if_none_match(&self) -> Option<&str> {
+        self.inner.get_if_none_match()
+    }
+
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub fn expires(mut self, input: ::aws_smithy_types::DateTime) -> Self {
         self.inner = self.inner.expires(input);

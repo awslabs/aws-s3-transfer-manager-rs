@@ -264,6 +264,13 @@ fn retry_cause(ge: &GuardError<Error>) -> String {
 /// that budget over time while the outer re-issue — bounded by [`MAX_ATTEMPTS`]
 /// and paced by the 1s throttle base — gives the service room to recover.
 ///
+/// A [`PreconditionFailed`](crate::error::ErrorKind::PreconditionFailed) — a
+/// user-set `If-Match` / `If-None-Match` not holding — is **deterministically
+/// terminal**. Retrying cannot change the object state that caused the 412, so
+/// the loop must not consume attempt budget on it. Called out as its own arm
+/// (rather than falling into the "everything else" wildcard) to make the intent
+/// explicit and to keep this claim under test.
+///
 /// Everything else is terminal: a non-throttle modeled service error and any
 /// non-transport inner error.
 ///
@@ -273,6 +280,7 @@ fn retry_cause(ge: &GuardError<Error>) -> String {
 pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecision {
     match ge {
         GuardError::DeadlineExceeded(_) => RetryDecision::NoRetry,
+        GuardError::Inner(e) if e.is_precondition_failed() => RetryDecision::NoRetry,
         GuardError::Inner(e) if e.is_transient_transport() => RetryDecision::Retry,
         GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
         GuardError::Inner(_) => RetryDecision::NoRetry,
@@ -746,6 +754,19 @@ mod tests {
     #[test]
     fn upload_other_inner_error_is_terminal() {
         let err = Error::new(ErrorKind::RuntimeError, "not a transport error");
+        assert_eq!(
+            classify_upload_part_retry(&GuardError::Inner(err)),
+            RetryDecision::NoRetry
+        );
+    }
+
+    #[test]
+    fn upload_precondition_failed_is_terminal() {
+        // A user-set If-Match / If-None-Match not holding cannot be recovered
+        // by retrying — the object state that produced the 412 is stable and
+        // consuming attempt budget is wasteful. Pinned so the classifier's
+        // explicit arm can't silently regress into the wildcard.
+        let err = Error::new(ErrorKind::PreconditionFailed, "412");
         assert_eq!(
             classify_upload_part_retry(&GuardError::Inner(err)),
             RetryDecision::NoRetry

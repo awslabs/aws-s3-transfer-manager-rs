@@ -33,6 +33,8 @@ pub(crate) fn copy_fields_to_put_object_request(
         .set_grant_read(upload_input.grant_read.clone())
         .set_grant_read_acp(upload_input.grant_read_acp.clone())
         .set_grant_write_acp(upload_input.grant_write_acp.clone())
+        .set_if_match(upload_input.if_match.clone())
+        .set_if_none_match(upload_input.if_none_match.clone())
         .set_key(upload_input.key.clone())
         .set_metadata(upload_input.metadata.clone())
         .set_object_lock_legal_hold_status(upload_input.object_lock_legal_hold_status.clone())
@@ -176,6 +178,8 @@ where
 {
     let mut complete_mpu_builder = complete_mpu_builder
         .set_bucket(upload_input.bucket.clone())
+        .set_if_match(upload_input.if_match.clone())
+        .set_if_none_match(upload_input.if_none_match.clone())
         .set_key(upload_input.key.clone())
         .set_request_payer(upload_input.request_payer.clone())
         .set_expected_bucket_owner(upload_input.expected_bucket_owner.clone())
@@ -256,6 +260,8 @@ mod tests {
             .grant_read("test-read")
             .grant_read_acp("test-read-acp")
             .grant_write_acp("test-write-acp")
+            .if_match("\"some-etag\"")
+            .if_none_match("*")
             .key("test-key")
             .metadata("key", "value")
             .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
@@ -299,6 +305,8 @@ mod tests {
                         upload_req.expected_bucket_owner(),
                         put_object_req.expected_bucket_owner()
                     );
+                    assert_eq!(upload_req.if_match(), put_object_req.if_match());
+                    assert_eq!(upload_req.if_none_match(), put_object_req.if_none_match());
                     assert_eq!(upload_req.key(), put_object_req.key());
                     assert_eq!(upload_req.request_payer(), put_object_req.request_payer());
                     assert_eq!(
@@ -483,17 +491,8 @@ mod tests {
             upload_req.expected_bucket_owner(),
             complete_mpu_req.expected_bucket_owner()
         );
-        // TODO(https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/117): Enable these assertions
-        /*
-        assert_eq!(
-            upload_req.if_match(),
-            complete_mpu_req.if_match()
-        );
-        assert_eq!(
-            upload_req.if_none_match(),
-            complete_mpu_req.if_none_match()
-        );
-        */
+        assert_eq!(upload_req.if_match(), complete_mpu_req.if_match());
+        assert_eq!(upload_req.if_none_match(), complete_mpu_req.if_none_match());
         assert_eq!(upload_req.key(), complete_mpu_req.key());
         assert_eq!(upload_req.request_payer(), complete_mpu_req.request_payer());
         assert_eq!(
