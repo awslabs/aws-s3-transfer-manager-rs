@@ -63,6 +63,13 @@ pub(crate) enum UploadWork {
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
+/// Initial capacity for the completed-part list when the content length is unknown.
+///
+/// There is no part count to size it by, so this only avoids a few early reallocations; the list
+/// grows as parts complete. Matches the CRT reference's default, which is likewise "arbitrary
+/// picked to avoid using allocations and using too much memory".
+const UNKNOWN_LENGTH_DEFAULT_NUM_PARTS: usize = 32;
+
 /// Upload transfer that generates and executes upload work.
 ///
 /// Cheap to clone - all state is behind `Arc`.
@@ -240,7 +247,7 @@ impl UploadTransfer {
                 // check at the top of the next poll reports `Done`.
                 if matches!(plan, PartPlan::Unknown { .. }) && *parts_dispatched >= MAX_PARTS {
                     drop(state);
-                    self.inner.ctx.set_failed(Error::new(
+                    self.inner.ctx.set_failed_and_signal(Error::new(
                         ErrorKind::InputInvalid,
                         format!(
                             "stream exceeds the maximum of {MAX_PARTS} parts at the current part \
@@ -248,7 +255,6 @@ impl UploadTransfer {
                              without a known content length"
                         ),
                     ));
-                    self.inner.ctx.signal_terminal();
                     return PollWork::Done;
                 }
 
@@ -374,10 +380,6 @@ impl UploadTransfer {
             },
         );
 
-        // An unknown-length upload has no part count to size the vec by; use a small default (the
-        // CRT reference uses the same, "arbitrary picked to avoid using allocations and using too
-        // much memory") and let it grow.
-        const UNKNOWN_LENGTH_DEFAULT_NUM_PARTS: usize = 32;
         let completed_parts_capacity = match &plan {
             PartPlan::Known { total_parts } => *total_parts as usize,
             PartPlan::Unknown { .. } => UNKNOWN_LENGTH_DEFAULT_NUM_PARTS,
