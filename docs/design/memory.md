@@ -9,48 +9,40 @@ data path.
 One memory pool defines one admission, accounting, and physical-storage domain. A transfer manager
 can construct the pool or use a caller-provided handle shared with another component. Managed work
 reserves planned demand before dispatch and acquires writable buffers while executing. Reservation
-controls admission; acquisition selects physical memory. Traffic through an HTTP client configured
-with the pool shares the same accounting even when a transport read carries no reservation. Private
-protocol scratch and clients without the pool remain outside its accounting.
+controls admission; acquisition selects physical memory. The baseline HTTP path copies decoded
+payload from transport-owned `Bytes` into reserved pooled storage. A future transport integration
+may acquire unreserved storage when it cannot carry a reservation. Private protocol
+scratch and clients without the pool remain outside its accounting.
 
 ## Requirements
 
 ### Bound admission and account overage
 
-Configured capacity is the ceiling applied when admitting managed work. Concurrent uploads,
-downloads, retry bodies, completed output awaiting consumption, and pooled transport reads share one
-accounting domain rather than independent direction, connection, or transfer limits.
+Configured capacity is the normal ceiling for managed admission. Uploads, downloads, retry bodies,
+completed output awaiting consumption, and pooled response frames share that ceiling rather than
+independent direction, connection, or transfer limits.
 
-Configured capacity is not a hard limit on process RSS or mapped address space. It neither requires
-the pool to allocate that amount of memory nor establishes a floor that the pool retains.
+Configured capacity does not preallocate memory and is not a hard limit on process RSS or mapped
+address space.
 
-An acquisition without a reservation may take pooled ownership above configured capacity. A request
-admitted while managed work is otherwise idle may do the same. In either case, the memory enters
-accounting before use and displaces later managed work until its owners release it.
-
-Unreserved acquisition by manager-owned integrations originates from work the manager dispatched.
-Withholding new admission stops additional work from adding to the overage, and owner release drains
-it. A shared pool-enabled client or another independently driven integration can add traffic outside
-manager dispatch and therefore requires an external bound for configured capacity to remain
-meaningful.
+Pooled ownership acquired without an open envelope, or retained after its envelope closes, may put
+admission above configured capacity. That ownership remains accounted and delays later managed work
+until its owners release it.
 
 ### Share one accounting domain across components
 
-`BufferPool` is a public, cloneable handle. A caller can construct one pool, retain a handle, and
-configure a transfer manager to use that same pool. Reservations, unreserved acquisition, ownership
-charges, prepared capacity, and observability remain common across every handle.
+An explicitly supplied pool can place a transfer manager and another component in one admission,
+ownership, preparation, and metrics domain. Their reservations and carrier charges share one
+configured capacity.
 
-A component that requires bounded admission uses reservation before acquisition. Unreserved
-acquisition remains an explicit escape for an integration that cannot carry direct-acquisition
-authority; sharing the handle alone does not turn that path into a hard memory bound.
+A component that requires bounded admission reserves before acquisition. Unreserved acquisition
+does not become bounded merely because its caller shares the pool.
 
-Reservation order and idle-only eligibility cover the complete pool. A head request from one
-component blocks later requests from every component, and its progress may depend on earlier
-reservations held by other components closing. This preserves one no-bypass FIFO and one combined
-bound; it does not provide per-component latency isolation.
+FIFO order and idle-only eligibility are pool-wide. One component's head request may block later
+requests from every component; the shared domain provides no per-component latency isolation.
 
-Transfer-manager shutdown cancels that manager's pending work and drops its pool and provider
-handles. It does not close a pool that another caller still owns.
+Transfer-manager shutdown releases only that manager's state. It does not close a pool retained by
+another caller.
 
 ### Resolve memory contention before dispatch
 
@@ -65,18 +57,12 @@ against pool contention rather than infallible physical allocation.
 
 ### Support acquisition when a reservation cannot be carried
 
-An internal integration boundary that cannot present a reservation may use unreserved acquisition.
-Request-blind transport receive is the motivating capability: a writable-storage provider can place
-decoded payload directly into pooled memory without transfer or reservation identity. A transport
-without that provider can return foreign bytes for reserved staging instead.
+An integration boundary that cannot present a reservation may use unreserved acquisition. The pool
+accounts that ownership before exposing writable memory. Configured capacity alone does not make the
+acquisition wait or fail; failure requires an inability to obtain physical storage.
 
-Direct-acquisition authority enforces one reservation's envelope when that authority can cross the
-integration boundary. Without it, exhausting configured capacity does not make unreserved
-acquisition wait for another buffer owner or fail by itself. The acquisition may fail when physical
-memory cannot be obtained. Its memory enters pool accounting before writable access is exposed to
-the caller.
-
-Unreserved accounting is independent of protocol, frame boundaries, and request identity.
+An independently driven unreserved issuer requires its own backpressure. The pool cannot bound work
+that continues outside managed admission.
 
 ### Keep memory ownership with the bytes
 
@@ -96,40 +82,31 @@ attempts.
 
 ### Preserve admission order and oversized progress
 
-Admission pressure delays managed work instead of rejecting it. Without admission order, a stream of
-small requests can consume each release and indefinitely defer an earlier large request. Delayed
-work is therefore admitted in arrival order once preceding demand retires.
+Admission pressure delays managed work instead of rejecting it. FIFO order prevents a stream of
+small requests from indefinitely deferring an earlier large request.
 
-A request larger than configured capacity, or blocked only by memory held outside active managed
-demand, runs once no other managed demand remains. Idle-only admission applies to one managed
-request at a time under either condition. Progress assumes that earlier reservations eventually
-close and required physical allocation succeeds.
+When no active planned demand remains, the FIFO head may be admitted even if its envelope exceeds
+configured capacity or retained ownership would otherwise block it. This idle-only exception admits
+at most one managed request at a time. Progress assumes earlier reservations close and physical
+preparation succeeds.
 
-Cancelling delayed work removes its demand from admission. Cancellation after admission releases
-future direct-acquisition authority; memory already handed to an owner remains accounted until its
-final owner returns.
+Cancellation removes delayed demand or closes future direct-acquisition authority. Memory already
+owned remains accounted until final return.
 
 ### Release without scheduler or runtime participation
 
-The final payload owner may drop on any thread and may outlive the transfer manager handle. Its
-return path releases both physical memory and the associated accounting without a scheduler turn,
-an async runtime, or a fallible upgrade of weak state. Live owners retain the state required to
-complete their return.
+The final payload owner may drop on any thread and outlive the transfer manager handle. It retains
+the state required to release physical memory and accounting without a scheduler turn, an async
+runtime, or a weak-state upgrade.
 
-Requiring a scheduler turn for release can wedge admission and scheduling: memory-owning work can
-occupy the dispatch capacity needed to run the release that would unblock it.
-
-When a return or cancellation makes delayed work eligible, that work is reconsidered without waiting
-for unrelated scheduler or admission activity.
-
-Reconsideration may run synchronously on the thread that drops the final payload owner. Accounting
-and physical release do not require another task to run. Registered reservation wakers run only
-after pool locks are released.
+A return or cancellation that makes delayed work eligible reconsiders that work directly.
+Reconsideration may run on the thread dropping the final owner. Registered reservation wakers run
+only after pool locks are released.
 
 ### Reuse storage without retaining the peak working set
 
 Steady traffic reuses buffers across operations instead of allocating and freeing one part-sized
-object for every I/O. Free buffers can serve uploads, downloads, retries, or transport reads rather
+object for every I/O. Free buffers can serve uploads, downloads, retries, or response frames rather
 than reserving fixed portions of configured capacity for each path.
 
 The pool can add capacity as demand grows. After a period with no managed work, it reclaims wholly
@@ -146,40 +123,23 @@ contiguous ranges are an optimization.
 
 ### Provide page-granular pooled memory
 
-Each pool allocation unit begins at a page boundary, occupies a whole number of pages, and shares no
-page with another allocation unit. This lets placement, protection, reclamation, and registration
-operate without affecting a page owned by another live allocation.
+Each carrier begins at a page boundary, occupies a whole number of pages, and shares no page with
+another carrier. Placement, protection, reclamation, and registration cannot affect a page owned by
+another live carrier.
 
 Page granularity does not make every payload view suitable for direct I/O. Linux `O_DIRECT`
 requirements can vary by filesystem and device and may require per-file `STATX_DIOALIGN` checks
 ([open(2)][open2], [statx(2)][statx2]). Payload that starts inside a buffer, short intermediate
 writes, and a final unaligned tail require aligned assembly or a buffered fallback.
 
-### Preserve placement opportunities without static partitions
-
-The initial design has one compatibility domain. Any prepared carrier can satisfy any acquisition.
-
-The storage model preserves a place for future NUMA preference, registration, or completion
-ownership without partitioning capacity by upload, download, connection, or transfer. A future hard
-domain requires request-side capability and admission semantics; this design does not claim either.
-NUMA locality remains a preference unless an integration makes it a hard requirement.
-
 ### Scale buffer reuse across cores and pool size
 
-Buffer acquisition and return occur for every payload unit moved through the pool. Their frequency
-is much higher than admission, growth, or reclamation. Covered acquisition that completes within
-the optimistic scan budget and return that restores available coverage have bounded cost independent
-of total pool size and avoid global serialization.
+Covered acquisition within the optimistic scan budget and coverage-restoring return have bounded
+cost independent of pool size and avoid global serialization.
 
-An acquisition that adds an uncovered charge serializes charge publication and any required
-preparation, then releases admission before optimistic bitmap work. Its accounting transition or
-preparation may still delay other admission operations.
-
-A reusable-storage miss may enter serialized registry-wide fallback. A return that removes an
-uncovered charge may enter admission serialization to reconsider the FIFO. These slow regimes
-preserve exhaustive reuse and admission liveness but are outside the common-path cost guarantee.
-Contention alone cannot cause an acquisition to grow repeatedly without making progress.
-Operating-system allocation latency remains outside this guarantee.
+Publishing an uncovered charge, preparing storage, serialized registry-wide fallback, and returning
+an uncovered charge may enter admission serialization. These slow paths preserve exhaustive reuse
+and admission liveness. Contention alone cannot cause repeated growth without progress.
 
 ### Contain resource failures
 
@@ -223,14 +183,14 @@ BufferPool
     +-- CoverageState
     |   `-- available coverage and uncovered charges
     +-- Arena
-    |   `-- physical storage, carrier acquisition, reuse, reclamation
+    |   `-- physical storage, carrier claiming, reuse, reclamation
     `-- MaintenanceCoordinator
         `-- idle deadlines, cleanup retry, thread lifecycle
 ```
 
 `AdmissionState` decides whether planned demand may be dispatched. `CoverageState` accounts
-acquisition and return at carrier frequency. `Arena` owns mappings and carrier state but does not
-grant admission. A reservation grant prepares capacity for the admitted total.
+per-carrier acquisition and return. `Arena` owns mappings and carrier state but does not grant
+admission. A reservation grant prepares capacity for the admitted total.
 
 All capacity and accounting quantities in this design count carriers. A carrier is one fixed-size,
 page-granular unit of physical ownership. The arena may group carriers into larger mapping and
@@ -298,7 +258,6 @@ memory and accounting. In ownership diagrams, an arrow points from a holder to t
 
 ```text
 BufferPool --------------------------+
-Pool-enabled transport provider -----+
 ReservationState --------------------+
 CarrierGuard ------------------------+
 ReserveFuture -----------------------+--> Arc<PoolInner>
@@ -369,9 +328,9 @@ buffer types:
 
 ```text
 dispatched work + Reservation -- acquire(min_bytes) ----------+
-provider without reservation -- acquire_unreserved(min_bytes) +--> PooledBufMut
+caller without reservation -- acquire_unreserved(min_bytes) +--> PooledBufMut
                                                                     |
-                                               PooledBufMut::reserve(additional)
+                                              PooledBufMut::reserve(min_writable)
                                                       reuses tail, then
                                                       acquires shortfall
                                                                     |
@@ -440,11 +399,11 @@ A covered acquisition changes available coverage into a charge without changing
 `admission_used`. The unreserved acquisition in the example consumes available coverage just like
 the direct acquisition; its API path does not make the charge uncovered.
 
-After the third row, one unit of available coverage remains. A request for two more carriers,
-whether unreserved or direct when direct-acquisition authority permits, would consume that unit and
-add one uncovered charge. `admission_used` would rise from four to five. A later grant would add its
-complete envelope without removing that charge. Otherwise successive grants could absorb the same
-outstanding ownership without any carrier returning.
+**Overage case.** After the third row, one unit of available coverage remains. A separate request
+for two more carriers, whether unreserved or direct when direct-acquisition authority permits, would
+consume that unit and add one uncovered charge. `admission_used` would rise from four to five. A
+later grant would add its complete envelope without removing that charge. Otherwise successive
+grants could absorb the same outstanding ownership without any carrier returning.
 
 Close removes the one unused unit from admission. The three carrier owners remain, so their charges
 move outside the closed envelope. No carrier moves and no memory is allocated during this
@@ -452,11 +411,13 @@ reclassification. Prepared capacity remains available after the final return and
 
 The accounting fields name the states in that lifecycle:
 
-- **Active planned demand** (`active_planned_demand`) is the sum of all open envelopes.
-- **Available coverage** (`available_coverage`) is the unoccupied part of active planned demand.
-- **Uncovered charges** (`uncovered_charges`) are charges outside active planned demand.
-- **Outstanding charges** (`outstanding_charges`) include carrier charges and acquisition debits
-  awaiting transfer to physical carriers.
+- **Active planned demand** (`active_planned_demand`) is the sum of all open reservation envelopes.
+- **Available coverage** (`available_coverage`) is the unused portion of those envelopes.
+  Acquisition converts coverage into an ownership charge without changing admission.
+- **Uncovered charges** (`uncovered_charges`) account live or in-flight ownership outside open
+  envelope coverage.
+- **Outstanding charges** (`outstanding_charges`) count all covered and uncovered ownership,
+  including acquisition debits awaiting transfer to physical carriers.
 
 Admission and physical preparation gate on:
 
@@ -509,7 +470,7 @@ struct CarrierCount(usize);
 Byte requests convert to `CarrierCount` at the acquisition boundary. `usize` supports indexing and
 geometry without making the semantic type depend on the packed accounting representation.
 
-Aggregate accounting has serialized state and carrier-frequency state:
+Aggregate accounting has serialized admission state and lock-free charge state:
 
 ```rust
 struct PoolInner {
@@ -543,7 +504,7 @@ struct CoverageState {
 `AdmissionState` serializes grant policy, physical preparation, FIFO state, planned-demand changes,
 and acquisition transitions that add uncovered charges. `parked_reservations_total` increments
 saturating once when a reservation request first enters the FIFO. `CoverageState` linearizes
-carrier-frequency debit and return. A debit fully covered by available coverage and a return that
+per-carrier debit and return. A debit fully covered by available coverage and a return that
 only restores coverage complete with one compare-and-exchange loop. The containing acquisition
 enters admission serialization to publish and prepare a shortfall, or before serialized fallback
 after an optimistic physical miss.
@@ -779,8 +740,8 @@ waker when `Waker::will_wake` reports a different task. A notified future theref
 assigned reservation rather than racing another caller for released capacity.
 
 Drain may invoke a waker synchronously on any thread that releases admission, including a thread
-dropping the final payload owner. No pool lock is held. Synchronous pool reentry is valid; a blocking
-waker delays only the invoking operation and cannot violate pool correctness.
+dropping the final payload owner. No pool lock is held. Synchronous pool reentry is valid; a
+blocking waker delays only the invoking operation and cannot violate pool correctness.
 
 Dropping a queued future cancels its request and drains again if cancellation exposed a new head.
 Dropping a future after grant but before observation drops the stored reservation and retires its
@@ -813,7 +774,7 @@ Reservation close and front cancellation reconsider the FIFO within their serial
 A return that removes uncovered charges enters admission serialization after its packed accounting
 transition. FIFO drain collects wakers while serialized and invokes them after unlocking.
 
-#### Acquisition
+#### Mutable buffer acquisition and growth
 
 Initial acquisition creates one mutable allocation stream with a minimum writable byte capacity.
 The buffer can extend that stream without moving initialized bytes:
@@ -833,7 +794,7 @@ impl BufferPool {
 }
 
 impl PooledBufMut {
-    pub fn reserve(&mut self, additional: usize) -> Result<(), AcquireError>;
+    pub fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError>;
 }
 
 #[non_exhaustive]
@@ -854,8 +815,8 @@ growth.
 
 The pool rejects zero with `AcquireError::InvalidSize`, then converts `min_bytes` to a nonzero
 carrier count once. The conversion and acquisition either provide at least that capacity or return
-an error. `PooledBufMut::reserve(additional)` guarantees that `remaining_mut()` is at least
-`additional` on success. Zero is a no-op. It uses the buffer's current writable tail before
+an error. `PooledBufMut::reserve(min_writable)` guarantees that `remaining_mut()` is at least
+`min_writable` on success. Zero is a no-op. It uses the buffer's current writable tail before
 converting only the shortfall to a carrier count.
 
 `InvalidSize` means the requested byte count is zero. `ForeignReservation` means the reservation
@@ -922,11 +883,16 @@ succeeds; rollback leaves the reservation and pool usable.
 
 #### Close and return
 
-Closing consumes the public handle and revokes retained direct-acquisition authority:
+Closing consumes the public handle and revokes retained direct-acquisition authority. Dropping an
+open reservation performs the same transition:
 
 ```rust
 impl Reservation {
     pub fn close_acquisition(self);
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self);
 }
 ```
 
@@ -940,21 +906,15 @@ growth debit wins  -> growth may complete; close prevents later growth
 close wins         -> growth requiring carriers returns ReservationClosed
 ```
 
-A growth rollback after close retires its in-flight debit without reopening direct-acquisition
-authority. Dropping an open reservation performs the same close transition. A buffer operation
-satisfied entirely by its existing writable tail does not debit direct-acquisition authority and
-remains valid after close.
+A growth debit can win this race and then fail physical allocation after close. Its rollback retires
+that in-flight debit but leaves the reservation state closed. A buffer operation satisfied entirely
+by its existing writable tail does not debit direct-acquisition authority and remains valid after
+close.
 
 Coverage is aggregate rather than attributed to individual reservations. Closing envelope `E`
 therefore removes `E` units from aggregate planned demand. It removes available units first. If
 fewer than `E` units remain available, the rest are occupied by charges that must remain accounted
 after close. [Appendix A](#reservation-close) gives the complete transition.
-
-For the four-carrier example, one unit remains available and three are occupied. Close removes the
-one unused unit and reclassifies the three occupied units as uncovered charges. No new charge is
-created. Reserved buffers, direct carrier guards, and in-flight direct debits retain
-`ReservationState` until their private references drop. Only guards and debits contribute to its
-local outstanding count.
 
 Close and aggregate return may execute concurrently. If return linearizes first, it restores
 coverage for close to withdraw. If close linearizes first, close records uncovered charges for
@@ -993,6 +953,9 @@ and growth rollback cannot reopen a closed reservation.
 
 **Obligations.**
 
+Obligation IDs use `A` for admission and accounting, `P` for physical storage, `O` for ownership
+and delivery, `I` for integration, and `C` for configuration and operations.
+
 - **A1: Accounting bounds.** Available coverage does not exceed active planned demand, and each
   physical carrier owner has one aggregate charge.
 - **A2: Charge before storage.** Acquisition installs its complete charge before physical claim.
@@ -1029,40 +992,47 @@ The physical hierarchy is:
   `Active`, `Draining`, or `Dead` state.
 
 ```text
-one stable BlockSlot
-
-slot lifetime:        |---------------------------------------------|
-current = A:               |----------|
-current = None:                       |----|
-current = B:                             |------------------|
-```
-
-Only one incarnation is current. Revival allocates a new incarnation and bitmap; it never clears
-and reuses a bitmap from an earlier activation. An old claim attempt may retain incarnation A after
-the slot publishes incarnation B, but the two attempts mutate different bitmap objects.
-
-Each block contains a whole number of equal-size carriers:
-
-```text
-block base
-    |
-    v
-+-----------+-----------+-----------+-----------+
-| carrier 0 | carrier 1 | carrier 2 | carrier 3 |
-+-----------+-----------+-----------+-----------+
+Arena
++-- BlockSlot 0
+|   +-- VirtualRange: [carrier 0][carrier 1][carrier 2][carrier 3]
+|   `-- current -----> BlockIncarnation A { state, in_use bitmap }
+|
++-- BlockSlot 1
+|   +-- VirtualRange: [carrier 0][carrier 1][carrier 2][carrier 3]
+|   `-- current -----> BlockIncarnation B { state, in_use bitmap }
+|
+`-- ...
 
 carrier_address = block_base + carrier_index * carrier_size
 block_bytes     = carrier_count * carrier_size
 ```
 
+Only one incarnation is current for a slot. Revival allocates a new incarnation and bitmap; it never
+clears and reuses a bitmap from an earlier activation. An old claim attempt may retain incarnation A
+after the slot publishes incarnation B, but the two attempts mutate different bitmap objects.
+
 The block base and carrier size are page multiples, so every carrier begins on a page boundary and
 shares no page with another carrier. A final partial bitmap word is masked by immutable
 `valid_masks`; padding bits never name carriers and are never claimable.
 
-One carrier size removes size-class fragmentation and makes every free carrier suitable for every
-byte-capacity request. It retains internal tail waste and per-carrier ownership cost. Contiguous
-runs within one block are an optimization. A request can complete from carriers in different
-blocks.
+**Alternative: Multiple carrier size classes.** Rejected: multiple classes can reduce internal tail
+waste but partition reusable capacity and add size-class admission and ownership. One page-multiple
+carrier size makes every free carrier suitable for every request. It retains internal tail waste and
+per-carrier ownership cost. A request may span blocks; contiguous runs are an optimization.
+
+The pool geometry is private:
+
+```rust
+struct PoolGeometry {
+    page_size: NonZeroUsize,
+    carrier_size: NonZeroUsize,
+    carriers_per_block: NonZeroUsize,
+}
+```
+
+Construction validates page and carrier alignment, whole-carrier block size, bitmap and valid-mask
+coverage, and every address and byte calculation. Configured capacity need not be a whole number of
+blocks; whole-block preparation may exceed configured capacity without changing admission.
 
 The stable per-block state is:
 
@@ -1120,8 +1090,8 @@ Physical quantities describe different states:
   that distinction.
 - **Prepared capacity** has completed the mapping, protection, and pool-wide setup required for
   acquisition.
-- **Physical live** counts carriers retained by provisional bit owners, mutable buffers, or
-  immutable owners.
+- **Physical live** counts carriers unavailable for reuse because a provisional claim, mutable
+  buffer, or immutable byte owner retains them.
 
 Configured capacity is an admission policy. It does not imply that the same amount is mapped,
 committed, prepared, or resident.
@@ -1132,6 +1102,7 @@ The arena's registry and serialized growth state are:
 struct Arena {
     carrier_size: usize,
     registry: BlockRegistry,
+    // Serializes slot preparation, registry rebuild, and exhaustive fallback.
     state: Mutex<ArenaState>,
 }
 
@@ -1174,9 +1145,10 @@ Reservation preparation already holds admission serialization when it enters the
 acquisition miss enters admission serialization before taking `ArenaState`; no path holds
 `ArenaState` while acquiring `AdmissionState`.
 
-Slots are fungible. A slot does not record whether its block was prepared below or above configured
-capacity. Admission state already records configured capacity and total prepared capacity;
-reclamation derives excess prepared capacity from those aggregate quantities.
+All `BlockSlot` values belong to one compatibility domain and are fungible. A slot does not record
+whether its block was prepared below or above configured capacity. Admission state already records
+configured capacity and total prepared capacity; reclamation derives excess prepared capacity from
+those aggregate quantities.
 
 Preparation operates on whole blocks. Under admission serialization it:
 
@@ -1194,9 +1166,8 @@ Block rounding may prepare spare carriers without admitting additional demand. T
 remain reusable. Before claiming them, an acquisition consumes available coverage and records any
 remainder as uncovered charges.
 
-The initial design has one compatibility domain. Exhaustive fallback finds enough free capacity
-when the accounting and bitmap invariants hold. A preference for contiguity or locality does not
-authorize growth while reusable capacity remains available.
+The single compatibility domain lets exhaustive fallback find enough free capacity whenever the
+accounting and bitmap invariants hold.
 
 Reservation grant prepares through the complete post-grant admission floor before publishing the
 grant. Existing prepared capacity satisfies part or all of that floor; every newly required block
@@ -1212,7 +1183,7 @@ Preparation may run synchronously. Mapping, placement, registration, or operatin
 fail and return an acquisition or reservation error. No progress guarantee places a time bound on
 those operations.
 
-#### Carrier acquisition
+#### Carrier claiming and fallback
 
 One arena acquisition requests a complete carrier batch. It returns every requested carrier or an
 error; no partial batch is exposed.
@@ -1272,6 +1243,7 @@ The ownership stages are linear:
 ```rust
 struct WonWord {
     word_index: usize,
+    // Bits changed from clear to set by one bitmap operation.
     mask: u64,
 }
 
@@ -1282,6 +1254,7 @@ struct IncarnationIdentity(NonZeroUsize);
 struct ProvisionalBits {
     slot: Arc<BlockSlot>,
     incarnation_identity: IncarnationIdentity,
+    // Every remaining bit is cleared on rollback.
     won: Vec<WonWord>,
 }
 
@@ -1289,6 +1262,7 @@ struct CarrierAllocation {
     slot: Arc<BlockSlot>,
     index: u32,
     incarnation_identity: IncarnationIdentity,
+    // Checked only after the bit passes the Active gate.
     ptr: NonNull<MaybeUninit<u8>>,
 }
 
@@ -1329,9 +1303,6 @@ impl Drop for PendingAcquisition {
     }
 }
 ```
-
-`WonWord` records only bits won by one bitmap operation in one word. It neither caps a block at one
-word nor records candidate bits that belonged to another claimant.
 
 `IncarnationIdentity` is the nonzero allocation address of the protected `BlockIncarnation`,
 captured only as an opaque comparison token. It is never converted back into a pointer. A valid
@@ -1713,8 +1684,6 @@ incarnation, identity or lifecycle mismatch, or clear bit indicates double retur
 allocator corruption, or a broken trim/revival invariant. The non-returning fail-stop handler
 aborts without clearing an unexpected bit or releasing accounting.
 
-The physical return completes before the accounting return.
-
 The strong `Arc<PoolInner>` keeps the slot registry, admission state, and final-return path alive
 after public pool handles or reservations have dropped. One escaped immutable view therefore
 retains the pool as well as its carrier. The carrier's live bitmap bit prevents trim of its block.
@@ -1795,10 +1764,8 @@ struct BufferCursor {
 }
 ```
 
-`SmallVec` keeps up to four runs inside `PooledBufMut`; a more fragmented acquisition spills
-additional runs to heap storage. Four is an inline-capacity preference, not an acquisition or
-fragmentation limit. The inline capacity may change without changing the ownership or accounting
-contracts.
+`SmallVec` is an inline-storage optimization. Its capacity does not limit acquisition or
+fragmentation and may change without changing the ownership contract.
 
 `ExclusiveRange` is linear and private. It cannot be cloned. Its consuming split operations produce
 disjoint ranges, so publication can remove an initialized prefix while retaining exclusive mutable
@@ -1814,8 +1781,8 @@ impl PooledBufMut {
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn initialized_chunk(&self) -> &[u8];
-    /// Ensures at least `additional` uninitialized writable bytes remain.
-    pub fn reserve(&mut self, additional: usize) -> Result<(), AcquireError>;
+    /// Ensures at least `min_writable` uninitialized writable bytes remain.
+    pub fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError>;
     pub fn publish_prefix(&mut self, count: usize) -> Bytes;
     pub fn freeze(self) -> SegmentedBytes;
 }
@@ -1851,11 +1818,11 @@ len()                     = 13 KiB
 initialized_chunk().len() = 8 KiB
 ```
 
-`reserve(additional)` guarantees `remaining_mut() >= additional` on success. It returns immediately
-when the existing tail satisfies the request. Otherwise it computes:
+`reserve(min_writable)` guarantees `remaining_mut() >= min_writable` on success. It returns
+immediately when the existing tail satisfies the request. Otherwise it computes:
 
 ```text
-shortfall = additional - remaining_mut()
+shortfall = min_writable - remaining_mut()
 new_carriers = ceil(shortfall / carrier_size)
 ```
 
@@ -1865,7 +1832,7 @@ the pool. A buffer never changes modes. Failure leaves its runs, cursors, initia
 existing writable tail unchanged.
 
 Closing a reservation revokes new-carrier acquisition but does not invalidate existing buffers.
-After close, `reserve` succeeds when the current tail already satisfies `additional` and returns
+After close, `reserve` succeeds when the current tail already satisfies `min_writable` and returns
 `AcquireError::ReservationClosed` when more carriers are required.
 
 Carrier rounding is therefore per buffer rather than per call to `reserve`. With 4 KiB carriers, a
@@ -1910,7 +1877,7 @@ mutable hold with no initialized output; the carrier returns unless an earlier p
 shares its guard. An initialized prefix in a partially used carrier retains that carrier and
 discards its unused suffix.
 
-#### Immutable publication
+#### Immutable `Bytes` publication
 
 `publish_prefix` normalizes the publication cursor to the first carrier with initialized
 unpublished bytes, then returns one contiguous `Bytes` from that carrier. It does not cross a
@@ -1992,7 +1959,7 @@ Converting an owner-backed `Bytes` into `BytesMut` performs a deep copy
 ([`from_owner` contract][bytes-from-owner]). A consumer cannot recover mutable access to pool
 storage through the immutable handle.
 
-#### Segmented delivery
+#### `SegmentedBytes`
 
 `SegmentedBytes` presents immutable data without requiring physically adjacent carriers. A
 `Segment` is one contiguous initialized presentation range. An `OwnedRange` records which owner
@@ -2074,9 +2041,9 @@ test unambiguous, and the owners keep every byte in the merged range live. A for
 `slot_id: None` and starts a new segment even if its address happens to be adjacent.
 
 Address lookup on an incoming `Bytes` supplies presentation metadata only. It cannot prove that the
-view is the final owner or recover the acquisition's accounting provenance. Pool-backed incoming views
-therefore remain `Hold::View(Bytes)`; construction never creates another `CarrierGuard` or clears a
-bitmap bit from an address.
+view is the final owner or recover the acquisition's accounting provenance. Pool-backed incoming
+views therefore remain `Hold::View(Bytes)`; construction never creates another `CarrierGuard` or
+clears a bitmap bit from an address.
 
 **Alternative: Recover carrier ownership from incoming views.** Rejected: an unseen clone or slice
 may still retain the original owner. Returning the carrier from pointer metadata would make live
@@ -2197,20 +2164,14 @@ pool-independent one-segment value and retains the supplied `Bytes` as its owner
 
 ## Integration
 
-Transfer-manager work that can present a `Reservation` uses reserved acquisition. This includes
-source staging and the default download path: an ordinary transport returns foreign `Bytes`, and
-the transfer manager copies decoded payload into reserved pooled storage before delivery. The copy
-leaves transient transport memory outside pool accounting but requires no transport modification.
+Transfer-manager work that can present a `Reservation` uses reserved acquisition. Upload staging and
+the default download path both follow this rule. Hyper returns foreign `Bytes`; the transfer manager
+copies decoded payload into reserved pooled storage before retaining or delivering it. The copy
+transiently holds transport memory outside pool accounting but requires no transport modification.
 
-An optional writable-storage provider can instead place decoded payload directly into pooled
-storage. The provider is request-blind and uses unreserved acquisition because Hyper's receive
-contract does not carry direct-acquisition authority through the SDK, client, connection, and
-protocol decoder. This removes the staging copy but does not provide a hard bound for independently
-driven transport traffic.
-
-Both paths produce the types defined under
-[Ownership and delivery](#ownership-and-delivery). Final byte owners return physical storage and
-accounting without scheduler participation.
+An integration boundary that cannot carry a reservation may use unreserved acquisition. It accounts
+writable storage before use and publishes through the same `Bytes` and `SegmentedBytes` ownership
+types. The baseline Hyper integration does not use this path.
 
 ### Scheduler admission and dispatch
 
@@ -2241,23 +2202,20 @@ impl Wake for SchedulerWake {
 }
 ```
 
-The transfer polls its stored future with a `Waker` built from `SchedulerWake`. The scheduler marks
-every wake request even while the transfer descriptor is claimed for `poll_work()`. If the future
-is granted after registering its waker but before `poll_work()` returns `Pending`, the scheduler
-observes that mark when it releases the claim and reinserts the transfer. No notification can be
-lost in the poll-to-pending interval.
+The transfer polls its stored future with a `Waker` built from `SchedulerWake`. The scheduler
+records every wake request even while the transfer descriptor is claimed for `poll_work()`. If
+the future is granted after registering its waker but before `poll_work()` returns `Pending`, the
+scheduler observes that mark when it releases the claim and reinserts the transfer. No notification
+is lost in the poll-to-pending interval.
 
-Reservation or preparation failure produces no `IoRequest`. Cancellation removes queued
-admission by dropping the stored future, or consumes an already granted reservation before
-dispatch. Cancellation after dispatch stops producers, closes direct-acquisition authority, and drops
-unpublished mutable buffers. Immutable bytes already published retain their own carriers and
-charges.
+Reservation or preparation failure produces no `IoRequest`. Cancellation removes queued admission
+by dropping the stored future, or consumes an already granted reservation before dispatch.
+Cancellation after dispatch stops producers, closes direct-acquisition authority, and drops
+unpublished mutable buffers. Immutable bytes already published retain their carriers and charges.
 
-Execution code holding the work item uses `pool.acquire(&reservation, min_bytes)`. A configured
-HTTP provider is not given the reservation, a derived ticket, or a per-request allocation
-allowance. Without that provider, the collector uses the reservation when it copies foreign
-transport bytes into pooled staging. Both forms keep scheduler admission independent of the
-transport's request and connection lifecycle.
+Execution code uses `pool.acquire(&reservation, min_bytes)`. The download collector uses the same
+reservation when copying foreign transport bytes into pooled staging. Scheduler admission remains
+independent of the transport's request and connection lifecycle.
 
 The reservation envelope includes the carrier-rounded shape of every independent buffer that can be
 live at once. `ReservationCapacityExceeded` while completing a part or range indicates an
@@ -2270,7 +2228,9 @@ complete.
 An upload that stages part data in the pool uses one `PooledBufMut` for each concurrently staged
 part. A known part length may be acquired in one request. An incremental source retains the same
 buffer and calls `reserve` before each fill, so the part's writable tail remains available across
-reads. The completed part freezes into `SegmentedBytes`:
+reads. A source read advances initialization only by its completed byte count; short completion,
+error, or cancellation leaves the remaining range uninitialized and unpublishable. The completed
+part freezes into `SegmentedBytes`:
 
 ```text
 Reservation
@@ -2281,9 +2241,9 @@ pool.acquire(part capacity)
     v
 PooledBufMut
     |
-    +-- PooledBufMut::reserve(additional) --> disk/source read --+
-    |                                                           |
-    +<----------------------------------------------------------+
+    +-- PooledBufMut::reserve(min_writable) --> source read --+
+    |                                                        |
+    +<-------------------------------------------------------+
     |
     `-- freeze --> SegmentedBytes
                          |
@@ -2294,19 +2254,19 @@ PooledBufMut
             +------ same holds -------+
 ```
 
-Parallel parts use separate buffers because their fill, retry, publication, and ownership
-lifetimes are independent. A final partial carrier belongs to that part and may remain retained by
-its final immutable segment.
+Parallel parts use separate buffers because their fill, retry, publication, and ownership lifetimes
+are independent. A final partial carrier belongs to that part and may remain retained by its final
+immutable segment.
 
 Each SDK attempt receives a fresh body and cursor over the same immutable holds. The retained
-`SegmentedBytes` remains live through SDK retries and any transfer-manager retry checkpoint that
-can replay the part. `SdkBody::retryable` rebuilds a body for each clone attempt, and
+`SegmentedBytes` remains live through SDK retries and any transfer-manager retry checkpoint that can
+replay the part. `SdkBody::retryable` rebuilds a body for each clone attempt, and
 `SdkBody::try_clone` succeeds only when such a rebuild operation exists
 ([`SdkBody` retry support][sdk-body-retry]).
 
 Retry requires either a source that can be read again or immutable bytes retained through the retry
 window. An addressable file or range source can rebuild an attempt by rereading its input. A
-forward-only source cannot; it retains the staged `SegmentedBytes` or supplies another replay layer.
+forward-only source retains the staged `SegmentedBytes` or supplies another replay layer.
 Caller-owned `Bytes` and other already-resident upload memory remain outside pool accounting unless
 copied into pooled storage.
 
@@ -2316,86 +2276,65 @@ requiring one contiguous value ([`SdkBody` HTTP body adapter][sdk-body-http]).
 
 Segmentation does not require a gather copy for checksum calculation, signing, or aws-chunked
 framing. The body adapters consume frames in order. A streaming checksum body updates the checksum
-per data frame and emits the value in trailers
-([checksum body][sdk-checksum-body]). A segmented streaming `SdkBody` therefore selects a different
-wire shape from a single in-memory `Bytes` when SDK-owned checksum calculation is enabled: the
-checksum is carried in an aws-chunked trailer rather than an HTTP header
-([S3 checksum selection][s3-checksum-selection], [aws-chunked selection][s3-chunked-selection]).
-The upload path may preserve header placement by calculating the checksum while filling and setting
-the header before transmit. Both paths retain a segmented body; neither requires a gather copy.
+per data frame and emits the value in trailers ([checksum body][sdk-checksum-body]). A segmented
+streaming `SdkBody` therefore selects a different wire shape from a single in-memory `Bytes` when
+SDK-owned checksum calculation is enabled: the checksum is carried in an aws-chunked trailer rather
+than an HTTP header ([S3 checksum selection][s3-checksum-selection],
+[aws-chunked selection][s3-chunked-selection]). The upload path may preserve header placement by
+calculating the checksum while filling and setting the header before transmit. Both paths retain a
+segmented body; neither requires a gather copy.
 
 The upload calls `Reservation::close_acquisition` or drops the reservation after no staging buffer
 may require another carrier. Replaying an existing `SegmentedBytes` does not require open
-direct-acquisition authority. Closing does not release carriers retained by the retry body. A staging
-buffer that survives close may consume its existing writable tail but receives
+direct-acquisition authority. Closing does not release carriers retained by the retry body. A
+staging buffer that survives close may consume its existing writable tail but receives
 `ReservationClosed` if it attempts to grow.
 
 ### Download receive and delivery
 
 A ranged GET reserves its planned payload range before dispatch. The reservation is not passed
-through the SDK to the HTTP client. The default collector copies foreign transport frames into one
-reserved mutable stream. A configured writable-storage provider instead publishes pool-backed
-frames through unreserved acquisition:
+through the SDK to Hyper. The collector copies foreign response frames into one reserved mutable
+stream:
 
 ```text
 poll_work()
   -> poll BufferPool::reserve(range envelope)
-  -> dispatch GET
+  -> execute(GET)
        |
        v
-HTTP Frame<Bytes>
+Hyper Frame<Bytes>
        |
-       +-- foreign transport --> acquire reserved --> copy into staging --+
-       |                                                                  |
-       `-- writable provider --> acquire_unreserved --> pool-backed frame -+
-                                                                          |
-                                                                   SegmentedBytes
-                                                                          |
-                                                                   deliver or write
+       v
+pool.acquire(&reservation, min_bytes)
+       |
+       v
+copy initialized bytes -> publish or freeze -> SegmentedBytes
 ```
 
-The default collector initializes a reserved `PooledBufMut` from each foreign frame, then publishes
-or freezes the copied bytes. The direct collector pushes pool-backed body `Bytes` into
-`SegmentedBytes` and retains their existing owner through `Hold::View`. `SegmentedBytes` may also
-carry an uncopied foreign view when an integration explicitly accepts memory outside pool
-accounting. Address-range lookup may coalesce adjacent presentation ranges, but it never
-reconstructs a `CarrierGuard`, transfers a bitmap bit, or recovers reservation provenance from a
-pointer.
+Each response has an independent `PooledBufMut`. The collector reuses its writable tail across
+frames and calls `reserve` only when the next copy does not fit. Concurrent ranges and retry
+attempts use separate buffers because their transport and terminal lifetimes are independent.
+Foreign input is released after its bytes have been copied.
 
-Each response using reserved staging has an independent mutable stream. With a writable-storage
-provider, each active response attempt has an independent unreserved allocation stream; repeated
-socket reads reuse its writable tail and call `reserve` only when the tail cannot hold the next
-read. Concurrent ranges and retry attempts use separate buffers because their transport and
-terminal lifetimes are independent.
+The reservation closes after the response reaches a terminal state and no transfer retry or reserved
+acquisition can begin. Download output may outlive the reservation, work item, HTTP client, public
+pool handle, or transfer manager. Each pooled byte owner retains its `CarrierGuard` and `PoolInner`
+until final drop.
 
-The reservation closes after the response reaches a terminal state and no transfer retry or
-reserved acquisition can begin. Download output may outlive the reservation, work item, HTTP
-client, public pool handle, or transfer manager. Each pooled `Bytes` owner retains its
-`CarrierGuard` and `PoolInner` until final drop, so this escape does not require the output type to
-retain the reservation.
-
-Error and control bodies have no guessed pre-dispatch allowance. Without a writable-storage
-provider, they remain foreign unless a managed path deliberately copies them into reserved staging.
-A configured provider acquires their storage through the same unreserved path and accounts any
-demand beyond available coverage.
+Error and control bodies have no guessed pre-dispatch allowance. They remain foreign unless a
+managed path deliberately copies them into reserved staging.
 
 Every `Bytes` or `SegmentedBytes` clone extends the lifetime of its carrier charges. After
 reservation close, retained owners can keep uncovered charges live and delay grants anywhere in the
 shared FIFO. The pool cannot distinguish retry-required retention from an incidental clone.
 Cancellation and terminal paths release every transfer-manager-owned clone not retained by an
-active retry, delivery, or I/O lifetime, or by a lifetime explicitly transferred to a caller. A
-cache that retains pooled bytes intentionally remains charged and must pair retention with its own
-admission and eviction policy.
+active retry, delivery, I/O, or caller lifetime. A cache that intentionally retains pooled bytes
+remains charged and pairs retention with its own admission and eviction policy.
 
-### Disk I/O
-
-Upload reads initialize `PooledBufMut`. A read advances initialization only by the byte count
-reported complete. Error, cancellation, or short completion leaves the remaining range
-uninitialized and unpublishable.
+#### Disk writes
 
 Once decoded payload is in pooled carriers, the download sink writes the same storage without
-another staging copy before disk I/O. A writable-storage provider also avoids the transport-to-pool
-copy. Download writes consume `SegmentedBytes` through `Buf`. Vectored writes call
+another staging copy. It consumes `SegmentedBytes` through `Buf`. Vectored writes call
 `chunks_vectored` and advance the cursor by the completed byte count, including on short writes:
 
 ```text
@@ -2407,121 +2346,31 @@ SegmentedBytes
   -> release every owner crossed by the new cursor
 ```
 
-The buffer owner and all I/O metadata remain live until synchronous return or asynchronous
-completion. Cancellation of completion-based I/O does not release owners until the cancellation or
-original operation has produced its terminal completion.
+The buffer owner and all I/O metadata remain live until synchronous return or asynchronous terminal
+completion. Cancelling completion-based I/O does not release owners until cancellation or the
+original operation produces that completion.
 
 Submission size is independent of carrier size. The I/O path may coalesce already available,
 file-offset-contiguous segments into a larger submission, but it does not retain carriers waiting
 for a preferred byte count. Buffered vectored writes accept any published segment layout.
 
-Direct I/O adds constraints on the address, length, and file offset of each submitted range.
-Page-aligned carrier bases alone do not satisfy those constraints. The sink determines the required
-alignment for the selected file and device and classifies each output range before its first write
-([`open(2)`][open2], [`statx(2)`][statx2]):
-
-- An aligned dense run may be submitted directly without copying.
-- A range that cannot preserve address and file-offset phase uses aligned assembly or buffered I/O.
-- A final sub-block tail may use a disjoint buffered write after all direct ranges.
-
-Direct and buffered writes never cover overlapping file pages. The chosen route remains fixed for
-the affected range, so page-cache and direct-I/O ownership cannot diverge for the same bytes.
+Direct I/O adds address, length, and file-offset constraints. Page-aligned carrier bases alone do
+not satisfy them. The sink determines the required alignment for the selected file and device
+([`open(2)`][open2], [`statx(2)`][statx2]). Aligned dense runs may be submitted directly. Other
+ranges use aligned assembly or buffered I/O, including a final unaligned tail. Direct and buffered
+writes never cover overlapping file pages.
 
 ### Hyper transport boundary
 
-The default Hyper integration requires no writable-storage provider. Hyper returns ordinary
-`Bytes`; the transfer manager copies decoded payload into reserved pooled staging. This accounts the
-retained delivery bytes but pays one copy and transiently holds Hyper-owned memory outside the pool.
-It is the initial reserved-staging integration.
+Hyper exposes response payload as `Bytes` and does not currently provide a supported interface for
+supplying reusable receive buffers ([Hyper buffer-pool discussion][hyper-buffer-pool]). The baseline
+therefore copies decoded payload into reserved pooled storage. Transport-owned memory remains
+outside pool accounting until that copy completes.
 
-The optional zero-copy receive integration installs a writable-storage provider shared at client or
-connection scope with a strong `Arc<PoolInner>`. The provider is request-blind: each new response
-allocation stream calls `acquire_unreserved`, retains that buffer for its response attempt, and
-calls `PooledBufMut::reserve` when its writable tail is insufficient. The provider does not accept
-a `Reservation` or transfer-manager type. Another transport needs an equivalent seam only when it
-places receive data directly into pooled storage.
-
-Passing direct-acquisition authority through request extensions is not part of this contract. Such
-an extension could attribute some HTTP/1 receive storage, but it does not provide that authority
-when H2 selects frame storage before stream lookup. A richer upstream contract may add reserved
-attribution; the unreserved path remains required wherever storage is selected before that
-attribution exists.
-
-Using a dedicated transfer-manager client keeps planned demand and request-blind receive demand in
-one operational domain. If the same provider-backed client serves independently driven traffic,
-that traffic may add uncovered charges and delay managed admission. Configured capacity cannot
-bound an open set of callers that continues to issue requests independently of transfer-manager
-backpressure.
-
-The memory-side receive contract is:
-
-```text
-acquire owned writable storage
-    |
-initialize a prefix
-    |
-publish Bytes over that prefix
-    |
-retain only the disjoint writable suffix
-    |
-reserve when the suffix is insufficient
-    |
-publish again, release the suffix, or terminate
-    |
-final owner returns the carrier
-```
-
-A successful short read retains the writable suffix rather than acquiring another carrier for the
-next read. Carrier demand then follows payload capacity instead of socket-read count. A transport
-poll that returns `Pending` before initializing any byte may release the untouched buffer; the
-registered I/O waker, not buffer ownership, preserves read progress. If the transport has
-initialized unpublished bytes before yielding, it retains the mutable buffer and its progress until
-those bytes are published or the operation terminates.
-
-The pool's unreserved acquisition is synchronous: it reuses storage, grows prepared capacity, or
-returns an allocation error without waiting for another carrier owner. This does not require the
-upstream provider API to be synchronous. A poll-based API can return the pool result immediately
-and retain the ability to support other providers whose supply is asynchronous.
-
-The Hyper HTTP/1 adapter keeps headers, chunk framing, and trailers in bounded protocol scratch and
-publishes decoded payload from body carriers. Bytes read beyond the final header delimiter may
-require one bounded copy into the first body carrier. This copy does not require gathering the
-remaining body.
-
-HTTP/2 requires a lower receive seam than wrapping Hyper's `Incoming` or `h2::RecvStream`. The H2
-codec receives a complete frame in `BytesMut`, then freezes DATA payload before stream lookup and
-before Hyper polls it ([frame decode][h2-data-decode], [DATA freeze][h2-data-freeze],
-[frame dispatch][h2-frame-dispatch]). Hyper receives the resulting `Bytes` only when it polls the
-stream body ([Hyper H2 body][hyper-h2-body]). Writable-storage-provider ownership must therefore
-enter H2 before DATA freeze.
-
-The pooled path reads the frame header into bounded protocol scratch before selecting DATA payload
-storage. The decoded stream ID selects any retained stream suffix or a new provider acquisition.
-The concrete parser and provider APIs belong to the Hyper/H2 transport design; they must preserve
-this ownership boundary.
-
-The H2 adapter privately maps Hyper's generic provider to stream-aware receive state. A decoded DATA
-frame keeps its writable suffix pending while `Connection` submits the frame to `Streams`.
-Acceptance into the stream's receive queue assigns the suffix to that stream. Only later DATA for
-the same stream may reuse it; the codec never lends a stream-owned suffix to another stream.
-Rejected, discarded, or erroneous DATA drops the pending suffix before control returns or the error
-propagates. END_STREAM drops the new pending suffix and retires any previously stream-owned suffix.
-
-One stream retains at most one stream-owned suffix. This avoids cross-stream backing ownership but
-can retain one partially used carrier per receiving stream; those carriers remain charged and
-participate in pool backpressure. A suffix assigned by an earlier frame can remain after the
-application stops receiving. `RecvStream` drop, local reset, receive-side closure, and stream-store
-removal therefore record an idempotent receive-interest closure in `Streams` and wake `Connection`.
-`Connection` drains those lifecycle notifications and asks the codec to discard stream-owned
-writable capacity for that stream ([H2 stream lookup][h2-stream-lookup]). Published payload `Bytes`
-remain valid through their owners. H2 flow-control credit is released according to protocol
-consumption and may precede final `Bytes` drop ([Hyper flow-control release][hyper-h2-body]).
-Carrier return remains tied to byte ownership and is independent of flow-control release.
-
-Completion-native network receive has a different ownership direction: the transport or kernel
-selects storage before reporting received bytes. TLS may also place ciphertext below the HTTP
-decoder. Such a path requires a pre-received-data or completion-owned transport seam and is not an
-implementation of this writable-body provider contract.
+Zero-copy receive requires an upstream allocation and ownership seam before payload publication,
+including H2 stream lifecycle and any TLS or completion-owned input. That transport design is future
+work. The pool's unreserved acquisition and immutable-publication contracts provide the memory-side
+primitives without defining the transport API.
 
 **Obligations.**
 
@@ -2533,18 +2382,11 @@ implementation of this writable-body provider contract.
 - **I3: Staging and replay.** Reserved staging charges copied bytes before exposure. One
   incrementally filled upload part reuses one buffer, and replay retains every byte through its
   final consuming attempt while preserving exact length and order.
-- **I4: Download ownership.** Collection retains incoming owners without reconstructing physical
-  return or accounting ownership. Each response stream reuses its mutable suffix until terminal
-  cleanup.
+- **I4: Download ownership.** Reserved collection reuses one mutable stream per response, publishes
+  only copied bytes, and releases foreign input after copy completion.
 - **I5: Disk completion.** Submitted byte owners remain live through terminal completion. Short
   writes release exactly the completed prefix, and direct and buffered writes do not overlap file
   pages.
-- **I6: Provider lifetime.** A provider retains `PoolInner` while it may acquire or return storage.
-  Partial initialization retains mutable ownership; every terminal path releases unpublished
-  storage and leaves published bytes to their owners.
-- **I7: H2 stream ownership.** Provider state exists before DATA allocation. The decoded stream ID
-  selects storage; acceptance assigns a pending suffix to one stream, and rejection or terminal
-  stream state releases it without coupling flow-control credit to carrier return.
 
 ## Configuration and operations
 
@@ -2622,7 +2464,7 @@ An invalid fraction or a resolved value below one carrier returns
 representation returns `CapacityOverflow`. `MemoryDetectionUnavailable` is unreachable for
 `Limit` and `Auto`.
 
-The packed coverage state stores each component in `u32`. With a minimum 4 KiB carrier,
+The packed coverage state stores each component in `u32`. With a 4 KiB carrier,
 `u32::MAX` carriers represent almost 16 TiB. Configuration and every envelope conversion check this
 limit before changing admission state. Byte conversion for public reporting is also checked.
 
@@ -2633,6 +2475,10 @@ with their original pool until release.
 **Alternative: Apply a fixed minimum capacity.** Rejected: a 512 MiB minimum consumes all detected
 memory in a 512 MiB container and contradicts the required process headroom. Idle-only admission
 already permits progress for an envelope larger than configured capacity.
+
+The pool starts without prepared blocks. Construction establishes policy, geometry, accounting, and
+maintenance state; admission or acquisition prepares the first block. `carrier_size()` exposes the
+rounding unit for callers that align independent buffers or I/O fills. Other geometry is internal.
 
 ### Transfer-manager configuration
 
@@ -2685,40 +2531,6 @@ Every clone refers to the same admission, accounting, storage, maintenance, and 
 exposing a cloneable pool handle. An explicitly supplied pool exposes the same `MemoryMetrics`
 contract through `BufferPool::metrics()`.
 
-Transport configuration is independent. A transport receives the pool only when the optional
-direct writable-storage provider is enabled. Otherwise the transfer manager uses the same pool for
-reserved staging and the transport continues to return foreign `Bytes`.
-
-### Geometry and startup
-
-One pool uses one carrier class. Callers can query `carrier_size()` to align independent
-acquisitions and I/O fill sizes. The remaining geometry is internal:
-
-```rust
-struct PoolGeometry {
-    page_size: NonZeroUsize,
-    carrier_size: NonZeroUsize,
-    carriers_per_block: NonZeroUsize,
-}
-```
-
-Construction validates that carrier size is a multiple of runtime page size, block size is a
-checked whole-carrier multiple, bitmap and valid-mask lengths represent every carrier exactly, and
-the resulting address and byte calculations cannot overflow. Configured capacity need not be a
-whole number of blocks. Whole-block preparation can therefore make `prepared_capacity` exceed
-configured capacity without changing admission.
-
-Carrier size, carriers per block, optimistic scan effort, and reclaim intervals are implementation
-parameters selected by measurement. They are not public tuning requirements. Carrier size remains
-observable because independent buffers are rounded separately. Callers that control fill geometry
-should request whole-carrier increments except for the final extent. Geometry values are reported
-at pool construction so an operational record identifies the geometry in use.
-
-The pool starts without prepared blocks. Construction establishes policy, geometry, accounting,
-and maintenance state; growth reserves stable virtual ranges and prepares backing when admission or
-acquisition first requires capacity. Initial prewarming and external memory-pressure monitoring are
-not part of this design.
-
 ### Maintenance coordinator
 
 Reclamation and cleanup recovery run on a lazy pool-owned thread rather than an async runtime
@@ -2750,70 +2562,43 @@ struct IdleDeadline {
 }
 ```
 
-The scheduler's global-idle transition arms a deadline for the current activity epoch. New managed
-work increments the epoch and invalidates that deadline. The signal is advisory: reclamation still
-depends on live-bit, admission-floor, and retention-target eligibility, and shared pool users do not
-participate in an idle-notification protocol. A stale deadline cannot initiate reclamation. The
-timeout supplies cache hysteresis; it does not participate in allocator safety.
-
-At a valid deadline, the coordinator applies the target and eligibility rules under
-[Reclamation policy](#reclamation-policy). If live carriers prevent the target, the coordinator
-keeps reclaim intent and retries after a bounded delay while the epoch remains current. Carrier
-return does not signal the coordinator. A later scan observes newly free blocks.
-
-Cleanup retry is independent of global idle. A failed whole-range protection operation leaves its
-block in `ProtectionPending`; a failed discard records `reclaim_pending` on an inactive block. The
-coordinator retries those block-local operations without making either block claimable. Preparation
-serializes with retry, so delayed cleanup cannot affect a revived block.
+The scheduler's global-idle transition and mapping cleanup failures signal the coordinator.
+[Reclamation policy](#reclamation-policy) defines idle epochs, deadlines, retry, and trim
+eligibility. [Mapping and revival](#mapping-and-revival) defines protection and discard recovery.
+The coordinator executes those operations without changing their safety conditions.
 
 The first deadline or cleanup request starts the thread. The worker owns
-`Arc<MaintenanceControl>` and `Weak<PoolInner>`. It waits on the control block without retaining the
-pool. When work is due, it releases the control mutex, upgrades the weak pool reference for one work
-pass, and drops that temporary strong reference before waiting again. The control block contains no
-admission, arena, slot, or mapping state.
+`Arc<MaintenanceControl>` and `Weak<PoolInner>`. It waits without retaining the pool. When work is
+due, it releases the control mutex, upgrades the weak pool reference for one pass, and drops that
+strong reference before waiting again. The control block contains no admission, arena, slot, or
+mapping state.
 
-After releasing the temporary strong reference, the worker accesses no pool state and either begins
-another weak upgrade or exits. A thread-creation failure marks maintenance disabled and reports
-degraded reclamation. Admission, acquisition, and owner return remain valid; free prepared capacity
-may remain resident until pool destruction.
+After releasing the temporary strong reference, the worker accesses no pool state. A thread-creation
+failure disables maintenance and reports degraded reclamation. Admission, acquisition, and owner
+return remain valid; free prepared capacity may remain resident until pool destruction.
 
-Exact idle timeout and retry cadence are measurement parameters. They are constants rather than
-public controls.
+Idle timeout and retry cadence are measured constants, not public controls.
 
 ### Shutdown and destruction
 
-Transfer-manager shutdown releases only state owned by that manager:
+Transfer-manager shutdown drops its queued reservation futures, undispatched reservations,
+in-flight mutable buffers, and pool handle through their normal cancellation paths. Existing
+immutable byte owners remain valid and continue to return physical storage and accounting.
 
-```text
-stop generating managed work
-  -> drop queued ReserveFuture values
-  -> drop undispatched and completed Reservation values
-  -> stop manager-owned HTTP providers
-  -> drop the manager's BufferPool handle
-```
+A shared pool remains operational while another caller owns a handle. Its FIFO, unreserved
+acquisition, maintenance, and metrics are independent of transfer-manager shutdown.
 
-Dropping a queued future cancels its waiter. Dropping an untaken grant retires its envelope.
-In-flight work releases direct-acquisition authority, unpublished mutable buffers, and provider
-handles through its normal cancellation path. Existing immutable byte owners remain valid and
-continue to return physical storage and accounting.
+`BufferPool`, `ReserveFuture`, `ReservationState`, and carrier guards retain `Arc<PoolInner>`. The
+maintenance thread retains only `Weak<PoolInner>` while waiting. Final pool destruction therefore
+begins only after no handle, waiter, reservation, mutable buffer, or immutable byte owner can access
+pool storage.
 
-A shared pool remains open while another caller owns a handle. Its FIFO, unreserved acquisition,
-maintenance coordinator, and metrics collection continue to operate independently of
-transfer-manager shutdown.
-
-`BufferPool`, `ReserveFuture`, `ReservationState`, transport providers, and carrier guards retain
-`Arc<PoolInner>`. The maintenance thread retains `Weak<PoolInner>` and
-`Arc<MaintenanceControl>`, which contains no pool storage. `PoolInner` destruction can therefore
-begin only after no public handle, waiter, reservation, provider, mutable buffer, or immutable byte
-owner can access pool storage.
-
-Final destruction marks maintenance stopping and wakes the worker. A thread other than the
-maintenance worker joins it before releasing pool state. If the worker's temporary upgrade is the
-final `Arc<PoolInner>`, destruction runs on that worker and must not join itself. The worker has
-completed its final pool access before releasing that reference and exits without another access;
-this self-destruction case drops the join handle without joining. After the worker can no longer
-access pool state, destruction cancels idle deadlines and cleanup retries and releases every slot's
-stable virtual range. Neither path requires a scheduler or async runtime.
+Final destruction marks maintenance stopping and wakes the worker. A thread other than the worker
+joins it before releasing pool state. If the worker's temporary upgrade is the final
+`Arc<PoolInner>`, destruction runs on that worker and drops the join handle without joining itself.
+The worker has completed its final pool access before releasing that reference. Destruction then
+cancels maintenance work and releases each slot's stable virtual range without a scheduler or async
+runtime.
 
 ### Failure containment
 
@@ -2830,9 +2615,9 @@ Recoverable resource failures remain local:
 | Maintenance-thread creation                       | Maintenance is disabled; ordinary paths continue and affected blocks stay unavailable |
 | Ownership, identity, or address-reservation check | The non-returning fail-stop handler aborts without continuing allocator mutation      |
 
-The pool does not allocate unaccounted fallback memory after a pool acquisition fails. Temporary
-growth remains pool-owned and charged before writable access. A transport can fall back to its
-ordinary allocator only when its provider contract explicitly permits leaving pool accounting.
+The pool returns no unaccounted fallback memory after acquisition failure. Temporary growth remains
+pool-owned and charged before writable access. A caller may allocate outside the pool, but that
+memory is outside the pool's bound.
 
 Anonymous mapping and protection success do not guarantee that every later first-touch fault will
 succeed under operating-system overcommit or container pressure. Automatic sizing leaves
@@ -2918,7 +2703,7 @@ Operational signals are organized by the failure they diagnose:
 | A block remains unavailable                 | protection-pending and reclaim-pending capacity, retry and failure counts | Platform cleanup is degraded but isolated to named blocks                   |
 | Allocation or preparation fails             | operation error, requested capacity, prepared capacity, platform error    | The caller encountered a physical resource failure                          |
 
-Normal reservation transitions are `trace`. Carrier-frequency successful acquisition and return
+Normal reservation transitions are `trace`. Per-carrier successful acquisition and return
 require no event. Reservation parking and serialized fallback are `trace` with monotonic diagnostic
 counters. Block preparation, idle deadline changes, and successful reclamation are `debug`.
 Allocation, protection, discard, maintenance-thread, and fail-stop precursor events are `warn` or
@@ -2963,7 +2748,8 @@ physical_live
     <= prepared_capacity
 ```
 
-[Acquisition](#acquisition) installs the complete aggregate debit before claiming storage.
+[Mutable buffer acquisition and growth](#mutable-buffer-acquisition-and-growth) installs the
+complete aggregate debit before claiming storage.
 Preparation reaches the post-transition `admission_used` before a grant completes, an uncovered
 acquisition exposes writable memory, or admission serialization is released. Final owner return
 clears the physical bit before releasing its charge. [Block trim](#block-trim) preserves the
@@ -2978,7 +2764,8 @@ may exceed it.
 
 A grant prepares capacity through its resulting `admission_used`. Reserved and unreserved
 acquisition follow the bounded search and serialized fallback defined under
-[Carrier acquisition](#carrier-acquisition). They return the complete requested carrier batch or an
+[Carrier claiming and fallback](#carrier-claiming-and-fallback). They return the complete requested
+carrier batch or an
 error and do not wait for another carrier owner to return memory.
 
 This prevents admitted work from occupying execution capacity while waiting for memory held by work
@@ -3019,7 +2806,8 @@ reservation close cannot invalidate data retained by a caller, transport, or I/O
 ### Published bytes never alias writable memory
 
 Each carrier has one non-cloneable mutable authority.
-[Immutable publication](#immutable-publication) consumes authority over an initialized prefix and
+[Immutable Bytes publication](#immutable-bytes-publication) consumes authority over an initialized
+prefix and
 may retain authority only over a disjoint suffix. Immutable views, their clones, and segmented
 containers retain the carrier guard but cannot recover mutable access to pool storage.
 
@@ -3042,12 +2830,11 @@ affected block nonclaimable; it does not weaken the ownership of another block o
 
 ### Release survives shutdown
 
-[Shutdown and destruction](#shutdown-and-destruction) drops that manager's queued futures,
-reservations, providers, and pool handle. It does not revoke another handle's reservation or
-provider access. Carrier guards and byte owners retain `PoolInner` and can complete rollback and
-final return after every transfer-manager handle has dropped. Pool maintenance and admission remain
-available while any public handle or waiter remains; final destruction begins only after no such
-owner remains.
+[Shutdown and destruction](#shutdown-and-destruction) drops only manager-owned futures,
+reservations, buffers, and pool handles. It does not revoke another handle's reservation or pooled
+byte ownership. Carrier guards and byte owners retain `PoolInner` and complete rollback or final
+return after every transfer-manager handle has dropped. Maintenance and admission remain available
+while another public handle or waiter exists.
 
 Recoverable allocation and cleanup failures expose no partially owned writable buffer. A detected
 ownership, incarnation, or stable-address violation enters the non-returning fail-stop path before
@@ -3064,7 +2851,7 @@ operations, ownership transitions, scatter width, and carrier returns.
 Block size controls mapping amortization, all-free scan length, reclaim granularity, and how much
 capacity one long-lived carrier can keep prepared. Geometry selection must account for small
 objects, large multipart transfers, mixed upload and download traffic, intended core counts, and
-aggregate multi-NIC rates beyond 600 Gbps.
+aggregate rates on target hardware.
 
 These choices do not change the stable-slot, fresh-incarnation, batched-fallback, or ownership
 contracts.
@@ -3079,7 +2866,7 @@ retained RSS against repeated preparation across traffic bursts. Retry cadence t
 latency against repeated platform calls while a block remains unavailable.
 
 Measurements must include mixed object sizes, burst and sustained traffic, idle gaps, allocation
-failure, high core counts, and aggregate network rates above 600 Gbps. These constants do not change
+failure, high core counts, and aggregate rates on target hardware. These constants do not change
 the exhaustive serialized fallback, idle-epoch invalidation, or fail-closed cleanup contracts.
 
 ## Future Work
@@ -3106,15 +2893,17 @@ domains requires an explicit admission policy: preserve one global FIFO and perm
 capacity to idle, or partition admission and define fairness across partitions. Static direction
 quotas remain unnecessary.
 
-### Reservation-aware transport acquisition
+### Pool-backed transport receive
 
-A transport contract may carry optional direct-acquisition authority to its writable-buffer provider.
-Payload acquisition attributable to one transfer can then use `acquire` rather than
-`acquire_unreserved`. Protocol scratch, connection-level state, reads selected before attribution,
-and integrations without that contract continue to require unreserved acquisition.
+A future transport receive-buffer interface may acquire unreserved pooled storage before publishing
+payload bytes. A richer contract may also carry direct-acquisition authority after request or stream
+attribution, allowing attributable payload to use `acquire` instead of `acquire_unreserved`.
+Protocol scratch, connection state, and reads selected before attribution remain outside that
+authority.
 
-The accounting model does not depend on this extension. Both paths consume the same aggregate
-coverage, and transport attribution cannot recover ownership from an already published byte view.
+The accounting model does not depend on either extension. Both acquisition paths consume aggregate
+coverage, and no transport integration can recover accounting ownership from an already published
+byte view.
 
 ### TLS and completion-owned receive
 
@@ -3123,9 +2912,9 @@ bytes. TLS may retain and mutate encrypted input before publishing disjoint plai
 that path requires an owned-input contract through TLS and a pre-received-data or completion-owned
 HTTP transport seam.
 
-Stable carrier addresses, initialized-range publication, and hard compatibility keys preserve the
-required ownership model. The readiness-oriented writable provider remains a separate transport
-mode; completion ownership does not fit its borrowed writable-tail contract.
+Stable carrier addresses, initialized-range publication, and future compatibility keys preserve the
+required ownership model. Readiness-oriented receive allocation and completion-owned receive require
+distinct transport ownership contracts.
 
 ### External pressure
 
@@ -3136,19 +2925,10 @@ portable process-level pressure notification is not available on every target.
 
 ### Shared-domain fairness and attribution
 
-Several transfer managers or independently driven components can share one `BufferPool`. Reserved
-requests enter one FIFO, and every handle observes the same admission, ownership, preparation, and
-metrics state. Unreserved acquisition remains outside the normal configured-capacity gate
-regardless of which component performs it.
-
-Eligibility and ordering are pool-wide. A head request from one component can block later requests
-from every other component, and its progress may require earlier reservations owned by another
-component to close. The benefit is one coherent configured bound and one no-bypass order. The cost
-is the absence of per-component latency isolation.
-
-Per-component quotas, weighted fairness, and operational attribution are not part of this design.
-Adding them requires participant identity and policy inside the shared domain; independent
-accounting over one arena would not provide a combined memory bound.
+A shared pool has one FIFO, configured capacity, and metrics domain. It provides no per-component
+latency isolation or attribution. Adding quotas, weighted fairness, or participant metrics requires
+component identity and policy inside that shared domain; independent accounting over one arena would
+not preserve a combined memory bound.
 
 ## Appendix A: Admission transitions
 
@@ -3220,7 +3000,7 @@ covered and shortfall acquisitions acquire a fresh guard only if optimistic phys
 Mutable-buffer growth computes `N` from only the shortfall below the requested writable capacity:
 
 ```text
-shortfall = additional.saturating_sub(remaining_mut)
+shortfall = min_writable.saturating_sub(remaining_mut)
 N = ceil(shortfall / carrier_size)
 ```
 
@@ -3517,14 +3297,12 @@ section; one property may discharge several contracts.
 | ---------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | I1         | `poll_work()` dispatches only a granted, prepared reservation          | Scheduler integration test with parking and cancellation                  | Dispatch while the reservation future is pending           |
 | I1         | Wake racing `poll_work()` pending cannot strand a granted reservation  | Scheduler state-machine test across registration and claim release        | Ignore a wake recorded while the transfer is claimed       |
+| I2         | Cancellation releases manager holds without invalidating escaped bytes | Integration tests across queued, dispatched, and published states         | Release published bytes or retain unpublished buffers      |
 | I3         | Upload retry retains exact bytes through the final consuming attempt   | Retry tests with partial body polling and source failure                  | Release staged bytes before the last retry                 |
 | I3         | Upload parts reuse one mutable stream across source reads              | Multipart tests with carrier-misaligned read completions                  | Allocate one buffer for every source read                  |
 | I3, I4     | Reserved staging preserves bytes and releases foreign input after copy | Download tests with frame and carrier boundary mismatch                   | Publish before copy completion or retain foreign input     |
 | I4, I5     | Download and disk completion retain owners through final access        | Integration tests with partial reads, writes, and cancellation            | Drop byte owners immediately after submission              |
-| I4         | A download response reuses its suffix across transport reads           | Transport tests spanning carrier and publication boundaries               | Acquire a new buffer for every transport read              |
-| I2, I6     | Every terminal HTTP path releases unpublished capacity                 | H1 and H2 lifecycle tests for EOF, reset, rejection, and body drop        | Retain one writable suffix after terminal state            |
-| I6         | Pending after partial initialization retains mutable ownership         | Transport tests over every initialized prefix                             | Drop a partially initialized buffer on `Pending`           |
-| I7         | An H2 stream-owned suffix is reused only by its owning stream          | Concurrent multi-stream receive and cancellation tests                    | Lend one suffix to another stream                          |
+| I4         | A download response reuses its suffix across response frames           | Collector tests spanning carrier and publication boundaries               | Acquire a new buffer for every response frame              |
 | C2         | A stale idle epoch cannot reclaim after new managed work               | Maintenance state-machine test with deadline races                        | Accept an expired epoch after activity                     |
 | C2         | Cleanup retry cannot race preparation or revived access                | Concurrency test with injected protection and discard failures            | Run discard without the slot mapping lock                  |
 | C1         | Capacity detection honors process and container limits                 | Platform tests for physical memory, cgroup limits, and explicit overrides | Ignore the effective process or container limit            |
@@ -3539,10 +3317,11 @@ section; one property may discharge several contracts.
 
 Benchmarks select carrier size, block size, optimistic scan work, idle timing, and retry cadence.
 They cover small-object waste, scatter width, allocation churn, packed-state contention,
-fragmented reuse, idle burst recovery, high core counts, and aggregate rates above 600 Gbps.
+fragmented reuse, idle burst recovery, high core counts, and aggregate rates on target hardware.
 Benchmark results tune constants; they do not weaken ownership, accounting, fallback, or
 reclamation invariants.
 
+[hyper-buffer-pool]: https://github.com/hyperium/hyper/discussions/4139
 [dekker]: https://en.wikipedia.org/wiki/Dekker%27s_algorithm
 [bytes-buf]: https://docs.rs/bytes/1.12.1/bytes/trait.Buf.html
 [bytes-buf-mut]: https://docs.rs/bytes/1.12.1/bytes/trait.BufMut.html
@@ -3562,8 +3341,3 @@ reclamation invariants.
 [sdk-checksum-body]: https://github.com/smithy-lang/smithy-rs/blob/f10257612a93616cae942a5c7a44747a8a9a505a/rust-runtime/aws-smithy-checksums/src/body/calculate.rs#L76-L123
 [s3-checksum-selection]: https://github.com/awslabs/aws-sdk-rust/blob/df3f0a472d192594823536e3574edc0b4ae0bb91/sdk/s3/src/http_request_checksum.rs#L249-L283
 [s3-chunked-selection]: https://github.com/awslabs/aws-sdk-rust/blob/df3f0a472d192594823536e3574edc0b4ae0bb91/sdk/s3/src/aws_chunked.rs#L198-L206
-[h2-data-decode]: https://github.com/hyperium/h2/blob/46bfd629f8167adbb542dfcaf5378690dada997a/src/codec/framed_read.rs#L119-L145
-[h2-data-freeze]: https://github.com/hyperium/h2/blob/46bfd629f8167adbb542dfcaf5378690dada997a/src/codec/framed_read.rs#L235-L244
-[h2-frame-dispatch]: https://github.com/hyperium/h2/blob/46bfd629f8167adbb542dfcaf5378690dada997a/src/proto/connection.rs#L318-L365
-[h2-stream-lookup]: https://github.com/hyperium/h2/blob/46bfd629f8167adbb542dfcaf5378690dada997a/src/proto/streams/streams.rs#L544-L609
-[hyper-h2-body]: https://github.com/hyperium/hyper/blob/116a9dfec5e38bd77993dac9b61520a29d002321/src/body/incoming.rs#L235-L249
