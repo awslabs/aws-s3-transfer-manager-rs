@@ -16,23 +16,25 @@ use crate::operation::upload::UploadOutputBuilder;
 /// `PartStream` of unknown length does not: parts are dispatched speculatively and the phase ends
 /// when the reader reports end-of-stream. Modelling the two as one enum keeps the illegal
 /// combination — a part count *and* an end-of-stream flag — unrepresentable.
+///
+/// The unknown-length variant carries no emitted-yet / end-of-stream flags. Those questions are
+/// answered from the reader's own [`parts_yielded`](crate::io::part_reader::PartReader::parts_yielded)
+/// count, which is incremented under the read lock — so a caller driving speculative concurrent
+/// reads observes a count that is always ordered with end-of-stream, with no second lock of its own
+/// to race against. Keeping the count on the reader is what makes "was the stream empty?" and "did
+/// it exceed the part limit?" race-free.
 #[derive(Debug)]
 pub(crate) enum PartPlan {
     /// Content length known up front: dispatch until `total_parts` have been issued.
-    Known { total_parts: u64 },
-    /// Content length unknown: dispatch until the reader reports end-of-stream.
-    Unknown {
-        /// Set once a read returns end-of-stream. Gates any further dispatch.
-        eof: bool,
-        /// Whether any part has been emitted yet.
-        ///
-        /// S3 rejects a `CompleteMultipartUpload` that lists no parts, so an empty stream must
-        /// still upload one (empty) part. Several part-work items can be dispatched before any of
-        /// them reads, so more than one can observe "end-of-stream, nothing emitted"; this flag is
-        /// claimed by a check-and-set under the state lock so exactly one of them synthesizes
-        /// part 1. Data-bearing parts set it too, so a non-empty stream never synthesizes one.
-        first_part_emitted: bool,
+    Known {
+        total_parts: u64,
+        /// The size declared by the source, sent as `MpuObjectSize` on complete. It did not come
+        /// from our own part accounting, so it is an *independent* witness — it also catches a part
+        /// this crate dropped or duplicated, which a sum of what we uploaded cannot.
+        declared_object_size: u64,
     },
+    /// Content length unknown: dispatch until the reader reports end-of-stream.
+    Unknown,
 }
 
 /// State machine for tracking upload work progress.
@@ -53,16 +55,19 @@ pub(crate) enum UploadState {
         parts_dispatched: u64,
         /// How this phase decides every part has been dispatched.
         plan: PartPlan,
+        /// Unknown-length only: set once a read reports end-of-stream, to stop dispatch and let the
+        /// phase drain and complete. Its *timing* is not correctness-critical — a late set only
+        /// causes a few extra speculative reads that no-op — so it is a plain flag, not the racy
+        /// emitted-flag it replaces. Emptiness is judged from the reader's `parts_yielded()`, not
+        /// from here.
+        eof: bool,
         parts_in_flight: usize,
         completed_parts: Vec<CompletedPart>,
         response_builder: UploadOutputBuilder,
-        /// Full object size, carried through to CompleteMPU as `MpuObjectSize`.
-        ///
-        /// For [`PartPlan::Known`] this is the length declared by the source, set once at
-        /// `CreateMultipartUpload` time. For [`PartPlan::Unknown`] there is no declared length, so
-        /// it accumulates the byte length of each part actually uploaded and is exact only once
-        /// end-of-stream is reached — which is the point at which it is read.
-        object_size: u64,
+        /// Running total of bytes actually uploaded, summed as each part completes. Consistent
+        /// meaning on both paths: for `Unknown` it *is* the object size sent on complete; for
+        /// `Known` it is checked (`<=`) against the declared upper bound before completing.
+        bytes_uploaded: u64,
     },
     /// All parts done, calling CompleteMPU (MPU only)
     Completing {
@@ -71,8 +76,10 @@ pub(crate) enum UploadState {
         completed_parts: Option<Vec<CompletedPart>>,
         response_builder: Option<UploadOutputBuilder>,
         complete_in_flight: bool,
-        /// Final object size, sent as `MpuObjectSize`. See `Transferring::object_size`.
-        object_size: u64,
+        /// See [`PartPlan`] for how the `MpuObjectSize` to send is chosen from this and the plan.
+        plan: PartPlan,
+        /// Total bytes uploaded. See `Transferring::bytes_uploaded`.
+        bytes_uploaded: u64,
     },
     /// PutObject in flight (single request upload)
     PutObjectInFlight,

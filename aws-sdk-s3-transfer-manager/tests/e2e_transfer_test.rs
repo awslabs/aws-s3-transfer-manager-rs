@@ -594,39 +594,37 @@ impl PartStream for UnknownLengthStream {
     }
 }
 
-/// An upload from a stream with no declared content length transfers, and S3
-/// stores an object of exactly the streamed size.
-#[tokio::test]
-async fn test_upload_unknown_content_length() {
-    let _logs = show_test_logs();
-    let (tm, s3_client) = test_tm().await;
-    let (bucket_name, _) = get_bucket_names();
-    let key = generate_key("unknown-content-length");
+/// Stream `parts`, one message each, then end-of-stream, as an unknown-length upload;
+/// download it back and assert the bytes round-trip exactly. Returns nothing — panics on
+/// any mismatch.
+///
+/// Downloading and comparing the actual bytes (not just the size) is what catches a
+/// dropped, duplicated, or reordered part — the failure modes an unknown-length upload is
+/// most exposed to, since it has no declared size for S3 to cross-check against.
+async fn unknown_length_round_trip(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    bucket: &str,
+    key: &str,
+    parts: Vec<bytes::Bytes>,
+) {
+    let expected: Vec<u8> = parts.iter().flatten().copied().collect();
 
-    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
-    // Deliberately not a part-size multiple, so a size derived from the part count
-    // rather than the bytes actually read would not match.
-    let tail = 1024;
-    let expected_len = 2 * part_size + tail;
-
-    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
     let handle = tm
         .upload()
-        .bucket(bucket_name.as_str())
-        .key(key.as_str())
+        .bucket(bucket)
+        .key(key)
         .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
         .initiate()
         .unwrap();
 
     tokio::spawn(async move {
-        for _ in 0..2 {
-            tx.send(bytes::Bytes::from(vec![b'z'; part_size]))
-                .await
-                .unwrap();
+        for part in parts {
+            if tx.send(part).await.is_err() {
+                return;
+            }
         }
-        tx.send(bytes::Bytes::from(vec![b'z'; tail])).await.unwrap();
-        // End of stream.
-        drop(tx);
+        drop(tx); // end of stream
     });
 
     handle
@@ -634,33 +632,89 @@ async fn test_upload_unknown_content_length() {
         .await
         .expect("an unknown-length stream must upload successfully");
 
-    let head = s3_client
-        .head_object()
-        .bucket(bucket_name.as_str())
-        .key(key.as_str())
-        .send()
-        .await
-        .expect("uploaded object must exist");
+    let mut download = tm.download().bucket(bucket).key(key).initiate().unwrap();
+    let body = drain(&mut download).await.unwrap();
+
     assert_eq!(
-        Some(expected_len as i64),
-        head.content_length(),
-        "stored object size must equal the number of bytes streamed"
+        body.len(),
+        expected.len(),
+        "downloaded object size must equal the streamed size"
+    );
+    assert_eq!(
+        body, expected,
+        "downloaded bytes must match what was streamed, in order"
     );
 }
 
-/// An empty stream with no declared content length completes as a normal 0-byte
-/// object.
+/// A multi-part unknown-length stream round-trips byte-for-byte. The tail part is
+/// deliberately not a part-size multiple, so any size taken from a part count rather than
+/// the bytes actually read would be wrong.
+#[tokio::test]
+async fn test_upload_unknown_content_length_multipart() {
+    let _logs = show_test_logs();
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let key = generate_key("unknown-content-length-multipart");
+
+    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let parts = vec![
+        bytes::Bytes::from(vec![b'a'; part_size]),
+        bytes::Bytes::from(vec![b'b'; part_size]),
+        bytes::Bytes::from(vec![b'c'; 1024]), // partial tail
+    ];
+    unknown_length_round_trip(&tm, bucket_name.as_str(), key.as_str(), parts).await;
+}
+
+/// A single-part unknown-length stream (a small streamed file) round-trips. This is the
+/// case the duplicate-part-1 race lived in — one data part read while the end-of-stream
+/// read runs concurrently — so it exercises exactly the path that used to corrupt objects.
+#[tokio::test]
+async fn test_upload_unknown_content_length_single_part() {
+    let _logs = show_test_logs();
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let key = generate_key("unknown-content-length-single");
+
+    let parts = vec![bytes::Bytes::from(vec![b'x'; 1024])];
+    unknown_length_round_trip(&tm, bucket_name.as_str(), key.as_str(), parts).await;
+}
+
+/// Many small parts, well past the unknown-length default part-list capacity, round-trip in
+/// order. Confirms the growing part list assembles correctly on real S3.
+#[tokio::test]
+async fn test_upload_unknown_content_length_many_parts() {
+    let _logs = show_test_logs();
+    let (tm, _) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let key = generate_key("unknown-content-length-many");
+
+    // 40 full parts at the 5 MiB minimum crosses the 32 default capacity. Distinct byte per
+    // part so a reordering shows up as a content mismatch, not just a size match.
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let parts: Vec<bytes::Bytes> = (0..40u8)
+        .map(|i| bytes::Bytes::from(vec![i; part_size]))
+        .collect();
+    unknown_length_round_trip(&tm, bucket_name.as_str(), key.as_str(), parts).await;
+}
+
+/// An empty stream with no declared content length completes as a normal 0-byte object,
+/// with and without a checksum strategy.
 ///
-/// S3 rejects a CompleteMultipartUpload that lists no parts, so the transfer
-/// uploads a single empty part. This confirms against real S3 what the mock
-/// cannot: that such an upload is accepted and stores a 0-byte object.
+/// S3 rejects a CompleteMultipartUpload that lists no parts, so the transfer uploads a
+/// single empty part. This confirms against real S3 what the mock cannot: that such an
+/// upload is accepted, stores a 0-byte object, downloads back to zero bytes, and — with a
+/// checksum strategy — that the full-object checksum over zero bytes is accepted.
 #[tokio::test]
 async fn test_upload_unknown_content_length_empty() {
     let _logs = show_test_logs();
     let (tm, s3_client) = test_tm().await;
     let (bucket_name, _) = get_bucket_names();
 
-    for checksum in [None, Some(ChecksumStrategy::default())] {
+    for checksum in [
+        None,
+        Some(ChecksumStrategy::default()),
+        Some(ChecksumStrategy::with_calculated_crc32()),
+    ] {
         let key = generate_key("unknown-content-length-empty");
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Empty: end-of-stream without ever sending a part.
@@ -693,5 +747,62 @@ async fn test_upload_unknown_content_length_empty() {
             head.content_length(),
             "an empty stream must store a 0-byte object"
         );
+
+        // And it must download back as zero bytes.
+        let mut download = tm
+            .download()
+            .bucket(bucket_name.as_str())
+            .key(key.as_str())
+            .initiate()
+            .unwrap();
+        let body = drain(&mut download).await.unwrap();
+        assert!(body.is_empty(), "empty object must download as zero bytes");
     }
+}
+
+/// An unknown-length upload that supplies a full-object checksum has it stored on the
+/// object, verified against real S3 (the mock only checks the header is sent, not that S3
+/// accepts and records it).
+#[tokio::test]
+async fn test_upload_unknown_content_length_with_checksum() {
+    let _logs = show_test_logs();
+    let (tm, s3_client) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let key = generate_key("unknown-content-length-checksum");
+
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket(bucket_name.as_str())
+        .key(key.as_str())
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let _ = tx.send(bytes::Bytes::from(vec![b'k'; part_size])).await;
+        }
+        drop(tx);
+    });
+
+    handle
+        .join()
+        .await
+        .expect("an unknown-length upload with a checksum strategy must succeed");
+
+    let head = s3_client
+        .head_object()
+        .bucket(bucket_name.as_str())
+        .key(key.as_str())
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("uploaded object must exist");
+    assert!(
+        head.checksum_crc32().is_some(),
+        "S3 must have stored the CRC32 checksum for an unknown-length upload"
+    );
 }

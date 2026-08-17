@@ -5,6 +5,7 @@
 use std::cmp;
 use std::fs::File;
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
@@ -89,6 +90,14 @@ impl Builder {
 pub(crate) struct PartReader {
     inner: Inner,
     stream_cx: StreamContext,
+    /// Count of parts this reader has yielded (returned as `Ok(Some(..))`).
+    ///
+    /// Incremented in [`next_part`](Self::next_part) as each part is produced, so it is ordered with
+    /// the reads: end-of-stream (`Ok(None)`) is only observed after every yielded part has already
+    /// bumped this. That lets a caller driving speculative, concurrent reads decide two things
+    /// race-free — whether the stream was empty (`0` at end-of-stream) and whether it has exceeded a
+    /// part limit — without a second lock of its own that could interleave with the read.
+    parts_yielded: AtomicU64,
 }
 
 impl PartReader {
@@ -106,12 +115,21 @@ impl PartReader {
         };
 
         let stream_cx = StreamContext::new(part_size, direct_io, metrics, telemetry);
-        Ok(Self { inner, stream_cx })
+        Ok(Self {
+            inner,
+            stream_cx,
+            parts_yielded: AtomicU64::new(0),
+        })
     }
 
     #[allow(dead_code)] // TODO: re-wire upload part validation
     pub(crate) fn part_size(&self) -> usize {
         self.stream_cx.part_size()
+    }
+
+    /// Number of parts yielded so far. See the field docs on the ordering guarantee.
+    pub(crate) fn parts_yielded(&self) -> u64 {
+        self.parts_yielded.load(Ordering::Acquire)
     }
 }
 
@@ -124,10 +142,22 @@ enum Inner {
 
 impl PartReader {
     pub(crate) async fn next_part(&self) -> Result<Option<PartData>, Error> {
+        // `parts_yielded` is passed down so each reader increments it *inside the same lock that
+        // produces the part*. Incrementing here in the outer call — after the inner released its
+        // lock — would leave a window in which a concurrent reader observes end-of-stream with a
+        // stale count, which is the race this counter exists to close.
         match &self.inner {
-            Inner::Bytes(bytes) => bytes.next_part(&self.stream_cx).await,
-            Inner::Fs(path_body) => path_body.next_part(&self.stream_cx).await,
-            Inner::Dyn(part_stream) => part_stream.next_part(&self.stream_cx).await,
+            Inner::Bytes(bytes) => bytes.next_part(&self.stream_cx, &self.parts_yielded).await,
+            Inner::Fs(path_body) => {
+                path_body
+                    .next_part(&self.stream_cx, &self.parts_yielded)
+                    .await
+            }
+            Inner::Dyn(part_stream) => {
+                part_stream
+                    .next_part(&self.stream_cx, &self.parts_yielded)
+                    .await
+            }
         }
     }
 
@@ -187,7 +217,11 @@ impl BytesPartReader {
 }
 
 impl BytesPartReader {
-    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
+    async fn next_part(
+        &self,
+        stream_cx: &StreamContext,
+        parts_yielded: &AtomicU64,
+    ) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
             return Ok(None);
@@ -209,6 +243,8 @@ impl BytesPartReader {
         state.offset += data.len() as u64;
         state.remaining -= data.len() as u64;
         let part = PartData::new(part_number, data).mark_last(state.is_end());
+        // Under `state` — ordered with the yield.
+        parts_yielded.fetch_add(1, Ordering::Release);
         Ok(Some(part))
     }
 }
@@ -245,16 +281,21 @@ impl PathBodyPartReader {
 }
 
 impl PathBodyPartReader {
-    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
-        let (offset, part_number, part_size, is_last) = match self.advance(stream_cx)? {
-            Some(PathBodyReadCursor {
-                offset,
-                part_number,
-                part_size,
-                is_last,
-            }) => (offset, part_number, part_size, is_last),
-            None => return Ok(None),
-        };
+    async fn next_part(
+        &self,
+        stream_cx: &StreamContext,
+        parts_yielded: &AtomicU64,
+    ) -> Result<Option<PartData>, Error> {
+        let (offset, part_number, part_size, is_last) =
+            match self.advance(stream_cx, parts_yielded)? {
+                Some(PathBodyReadCursor {
+                    offset,
+                    part_number,
+                    part_size,
+                    is_last,
+                }) => (offset, part_number, part_size, is_last),
+                None => return Ok(None),
+            };
         // grab a buffer to fill from the context
         let mut dst = stream_cx.new_buffer(part_size as usize);
         // SAFETY: We set the length to capacity so the read has a full slice to fill.
@@ -286,7 +327,11 @@ impl PathBodyPartReader {
     // Advances the `PartReaderState` to the next state and returns `PathBodyReadCursor`
     // (offset, part_number, part_size, is_last), which will be used in the upcoming
     // `read_file_chunk` execution.
-    fn advance(&self, stream_cx: &StreamContext) -> Result<Option<PathBodyReadCursor>, Error> {
+    fn advance(
+        &self,
+        stream_cx: &StreamContext,
+        parts_yielded: &AtomicU64,
+    ) -> Result<Option<PathBodyReadCursor>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
             return Ok(None);
@@ -305,6 +350,10 @@ impl PathBodyPartReader {
         state.offset += part_size;
         state.part_number += 1;
         state.remaining -= part_size;
+
+        // Under `state` — ordered with the yield. A part is committed here even though the file read
+        // happens after the lock is released; `advance` returning `Some` is the yield.
+        parts_yielded.fetch_add(1, Ordering::Release);
 
         Ok(Some(PathBodyReadCursor {
             offset,
@@ -382,11 +431,23 @@ impl DynPartReader {
             inner: tokio::sync::Mutex::new(inner),
         }
     }
-    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
+    async fn next_part(
+        &self,
+        stream_cx: &StreamContext,
+        parts_yielded: &AtomicU64,
+    ) -> Result<Option<PartData>, Error> {
         // TODO - can we do better than a mutex here? should we spawn a dedicated task and use channels instead
         let mut stream = self.inner.lock().await;
         match stream.next(stream_cx).await {
-            Some(result) => result.map(Some).map_err(|err| err.into()),
+            Some(Ok(part)) => {
+                // Under the stream mutex — ordered with the yield. This is the whole reason the
+                // count lives on the reader: reads here are serialized, so a caller that observes
+                // end-of-stream (the `None` arm) is guaranteed to see every prior part counted, with
+                // no separate lock of its own that could interleave between a read and the count.
+                parts_yielded.fetch_add(1, Ordering::Release);
+                Ok(Some(part))
+            }
+            Some(Err(err)) => Err(err.into()),
             None => Ok(None),
         }
     }
@@ -401,6 +462,7 @@ impl DynPartReader {
 #[cfg(test)]
 mod test {
     use std::io::Write;
+    use std::sync::atomic::AtomicU64;
     use std::task::Poll;
 
     use bytes::{Buf, Bytes};
@@ -577,9 +639,10 @@ mod test {
         let data = Bytes::from("test data for alignment error");
         let reader = BytesPartReader::new(data);
         let stream_cx = test_stream_cx(5);
+        let yielded = AtomicU64::new(0);
 
         // First call should succeed
-        let result = reader.next_part(&stream_cx).await;
+        let result = reader.next_part(&stream_cx, &yielded).await;
         assert!(result.is_ok());
 
         // Manually corrupt the offset to create misalignment
@@ -589,7 +652,7 @@ mod test {
         }
 
         // Second call should fail with offset_not_aligned_with_part_number error
-        let result = reader.next_part(&stream_cx).await;
+        let result = reader.next_part(&stream_cx, &yielded).await;
         assert!(result.is_err());
     }
 
@@ -599,8 +662,13 @@ mod test {
         let data = Bytes::from("test");
         let reader = BytesPartReader::new(data);
         let stream_cx = test_stream_cx(10);
+        let yielded = AtomicU64::new(0);
 
-        let result = reader.next_part(&stream_cx).await.unwrap().unwrap();
+        let result = reader
+            .next_part(&stream_cx, &yielded)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(result.is_last.unwrap());
     }
 
@@ -616,16 +684,17 @@ mod test {
         };
         let reader = PathBodyPartReader::new(path_body).unwrap();
         let stream_cx = test_stream_cx(5);
+        let yielded = AtomicU64::new(0);
 
         // First advance should succeed
-        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        let result = reader.advance(&stream_cx, &yielded).unwrap().unwrap();
         assert_eq!(result.offset, 10);
         assert_eq!(result.part_number, 1);
         assert_eq!(result.part_size, 5);
         assert!(!result.is_last);
 
         // Second advance should succeed
-        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        let result = reader.advance(&stream_cx, &yielded).unwrap().unwrap();
         assert_eq!(result.offset, 15);
         assert_eq!(result.part_number, 2);
         assert_eq!(result.part_size, 5);
@@ -638,7 +707,7 @@ mod test {
         }
 
         // Third advance should fail due to misaligned offset
-        let result = reader.advance(&stream_cx);
+        let result = reader.advance(&stream_cx, &yielded);
         assert!(result.is_err());
     }
 
@@ -654,8 +723,9 @@ mod test {
         };
         let reader = PathBodyPartReader::new(path_body).unwrap();
         let stream_cx = test_stream_cx(10);
+        let yielded = AtomicU64::new(0);
 
-        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        let result = reader.advance(&stream_cx, &yielded).unwrap().unwrap();
         assert!(result.is_last);
     }
 }

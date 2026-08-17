@@ -41,7 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::{Error, ErrorKind};
-use crate::io::part_reader::Builder as PartReaderBuilder;
+use crate::io::part_reader::{Builder as PartReaderBuilder, PartReader};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{PartPlan, UploadState};
 use crate::operation::upload::input::convert::{
@@ -62,6 +62,14 @@ pub(crate) enum UploadWork {
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
+
+/// The discriminant of [`PartPlan`], read without borrowing the plan's fields — used where a caller
+/// only needs to know which mode it is in (e.g. the read-time part-count guard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartPlanKind {
+    Known,
+    Unknown,
+}
 
 /// Initial capacity for the completed-part list when the content length is unknown.
 ///
@@ -218,14 +226,18 @@ impl UploadTransfer {
             UploadState::Transferring {
                 parts_dispatched,
                 plan,
+                eof,
                 parts_in_flight,
                 ..
             } => {
                 // Has every part been dispatched? For a known length that is a part count; for an
-                // unknown length it is the reader having reported end-of-stream.
+                // unknown length it is the reader having reported end-of-stream. The part-limit
+                // guard for unknown length lives at read time in `execute`, keyed on the reader's
+                // yielded-count, not here — `parts_dispatched` counts speculative dispatches, which
+                // run one ahead of what the reader has actually produced.
                 let all_dispatched = match plan {
-                    PartPlan::Known { total_parts } => *parts_dispatched >= *total_parts,
-                    PartPlan::Unknown { eof, .. } => *eof,
+                    PartPlan::Known { total_parts, .. } => *parts_dispatched >= *total_parts,
+                    PartPlan::Unknown => *eof,
                 };
 
                 if all_dispatched {
@@ -238,24 +250,6 @@ impl UploadTransfer {
                     drop(state);
                     self.inner.ctx.try_wake();
                     return PollWork::Pending;
-                }
-
-                // An unknown-length upload has no part count to bound it, so guard the S3 limit
-                // here: without this the next dispatch would send `PartNumber = MAX_PARTS + 1` and
-                // take S3's `InvalidArgument`, which says nothing about the remedy. Failing in
-                // `poll_work` is safe — the transfer is terminal on return, so the `is_active()`
-                // check at the top of the next poll reports `Done`.
-                if matches!(plan, PartPlan::Unknown { .. }) && *parts_dispatched >= MAX_PARTS {
-                    drop(state);
-                    self.inner.ctx.set_failed_and_signal(Error::new(
-                        ErrorKind::InputInvalid,
-                        format!(
-                            "stream exceeds the maximum of {MAX_PARTS} parts at the current part \
-                             size; configure a larger part size to upload an object this large \
-                             without a known content length"
-                        ),
-                    ));
-                    return PollWork::Done;
                 }
 
                 *parts_dispatched += 1;
@@ -357,11 +351,9 @@ impl UploadTransfer {
         let plan = match content_length {
             Some(content_length) => PartPlan::Known {
                 total_parts: content_length.div_ceil(part_size),
+                declared_object_size: content_length,
             },
-            None => PartPlan::Unknown {
-                eof: false,
-                first_part_emitted: false,
-            },
+            None => PartPlan::Unknown,
         };
 
         tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
@@ -381,8 +373,8 @@ impl UploadTransfer {
         );
 
         let completed_parts_capacity = match &plan {
-            PartPlan::Known { total_parts } => *total_parts as usize,
-            PartPlan::Unknown { .. } => UNKNOWN_LENGTH_DEFAULT_NUM_PARTS,
+            PartPlan::Known { total_parts, .. } => *total_parts as usize,
+            PartPlan::Unknown => UNKNOWN_LENGTH_DEFAULT_NUM_PARTS,
         };
 
         {
@@ -392,12 +384,11 @@ impl UploadTransfer {
                 part_reader,
                 parts_dispatched: 0,
                 plan,
+                eof: false,
                 parts_in_flight: 0,
                 completed_parts: Vec::with_capacity(completed_parts_capacity),
                 response_builder,
-                // Known: the declared length, an independent witness. Unknown: accumulated from the
-                // parts actually uploaded as they complete.
-                object_size: content_length.unwrap_or(0),
+                bytes_uploaded: 0,
             };
         }
 
@@ -428,53 +419,89 @@ impl UploadTransfer {
             Ok(Some(data)) => data,
             Ok(None) => {
                 tracing::trace!("part_reader exhausted");
-                // For an unknown-length stream this is the signal that ends the transfer, and — if
-                // nothing was ever emitted — the point at which one caller owes an empty part 1 so
-                // that an empty stream still completes as a normal (empty) object.
-                if self.set_eof_and_claim_empty_first_part() {
-                    tracing::debug!(
-                        target: crate::telemetry::TARGET_TRANSFER,
-                        "empty unknown-length stream; uploading a single empty part",
-                    );
-                    return self.send_part(PartData::new(1, Bytes::new())).await;
-                }
-                self.maybe_transition_to_completing();
-                return WorkOutcome::Success { data: None };
+                // Unknown-length end-of-stream. The reader's yielded-count is now final — it was
+                // incremented under the reader's own lock as each part was produced, so a `None`
+                // here is ordered after every part it will ever yield. That lets us decide, without
+                // a second racing lock, whether the stream was empty.
+                return self.on_end_of_stream(&part_reader).await;
             }
             Err(e) => return self.fail(e.into()),
         };
 
-        // Claim part 1 now, at read time — NOT after the send completes. A part read is what
-        // establishes that the stream is non-empty, and the send that follows can take a long time.
-        // Recording it later would let a concurrently-dispatched read that hits end-of-stream see
-        // "nothing emitted" while this part is still in flight, and synthesize a second part 1.
-        self.mark_part_emitted();
+        // Guard the S3 part-count ceiling by the number of parts the reader has actually yielded,
+        // not by speculative dispatches. Fail before sending the (MAX_PARTS + 1)-th so the caller
+        // gets an error naming the remedy instead of S3's opaque `InvalidArgument` on part 10001.
+        if matches!(self.plan_kind(), Some(PartPlanKind::Unknown))
+            && part_reader.parts_yielded() > MAX_PARTS
+        {
+            return self.fail(Error::new(
+                ErrorKind::InputInvalid,
+                format!(
+                    "stream exceeds the maximum of {MAX_PARTS} parts at the current part size; \
+                     configure a larger part size to upload an object this large without a known \
+                     content length"
+                ),
+            ));
+        }
 
         self.send_part(data).await
     }
 
-    /// Record that a part has been read from the stream, so a later end-of-stream does not treat the
-    /// stream as empty and synthesize an empty part 1.
+    /// Handle an unknown-length reader reaching end-of-stream: mark `eof`, and if the stream turned
+    /// out empty, synthesize the one zero-length part S3 requires (a multipart upload must list at
+    /// least one part).
     ///
-    /// Called at read time rather than on send completion: see the ordering note at the call site.
-    fn mark_part_emitted(&self) {
-        let mut state = self.inner.state.lock().expect("lock poisoned");
-        if let UploadState::Transferring {
-            plan: PartPlan::Unknown {
-                first_part_emitted, ..
-            },
-            ..
-        } = &mut *state
-        {
-            *first_part_emitted = true;
+    /// Emptiness is `part_reader.parts_yielded() == 0`, which is race-free: the count is bumped
+    /// under the reader's lock as each part is produced, so a `None` read is ordered after all of
+    /// them. Exactly one caller synthesizes, because only the caller that flips `eof` false→true —
+    /// a single-winner check under the state lock — takes the synthesize branch.
+    async fn on_end_of_stream(&self, part_reader: &PartReader) -> WorkOutcome {
+        let empty_and_owned = {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
+                UploadState::Transferring { eof, .. } if !*eof => {
+                    *eof = true;
+                    // This caller flipped eof; it alone may synthesize. The reader's count is final
+                    // now, so `== 0` is an exact emptiness test.
+                    part_reader.parts_yielded() == 0
+                }
+                _ => false,
+            }
+        };
+        // `eof` may unblock a `poll_work` parked on in-flight parts, and it is set here in `execute`
+        // while the poller may already be parked — so signal the edge or the transfer hangs (see the
+        // wake protocol on `TransferContext::set_pending`).
+        self.inner.ctx.try_wake();
+
+        if empty_and_owned {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "empty unknown-length stream; uploading a single empty part",
+            );
+            return self.send_part(PartData::new(1, Bytes::new())).await;
+        }
+
+        self.maybe_transition_to_completing();
+        WorkOutcome::Success { data: None }
+    }
+
+    /// The kind of the current `Transferring` plan, if the transfer is transferring.
+    fn plan_kind(&self) -> Option<PartPlanKind> {
+        let state = self.inner.state.lock().expect("lock poisoned");
+        match &*state {
+            UploadState::Transferring { plan, .. } => Some(match plan {
+                PartPlan::Known { .. } => PartPlanKind::Known,
+                PartPlan::Unknown => PartPlanKind::Unknown,
+            }),
+            _ => None,
         }
     }
 
     /// Upload one part and record it, then advance the state machine.
     ///
     /// Shared by the ordinary read-a-part path and the synthesized empty part 1 (see
-    /// [`Self::set_eof_and_claim_empty_first_part`]), so both go through the same retry
-    /// classification, metrics, and completion handoff.
+    /// [`Self::on_end_of_stream`]), so both go through the same retry classification, metrics, and
+    /// completion handoff.
     async fn send_part(&self, data: PartData) -> WorkOutcome {
         // 2. Send part over network
         let upload_id = {
@@ -560,19 +587,15 @@ impl UploadTransfer {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             if let UploadState::Transferring {
                 completed_parts,
-                plan,
-                object_size,
+                bytes_uploaded,
                 ..
             } = &mut *state
             {
                 completed_parts.push(completed);
-                if matches!(plan, PartPlan::Unknown { .. }) {
-                    // No declared length to trust, so the object size is summed from what we sent.
-                    // Exact once end-of-stream is reached, which is when CompleteMPU reads it.
-                    // (`first_part_emitted` is claimed at read time, not here — see
-                    // `mark_part_emitted`.)
-                    *object_size += bytes_sent;
-                }
+                // Summed on both paths so the field means one thing. For unknown length this becomes
+                // the `MpuObjectSize` sent on complete; for known length it is checked against the
+                // declared size before completing.
+                *bytes_uploaded += bytes_sent;
             }
         }
 
@@ -599,13 +622,14 @@ impl UploadTransfer {
             parts_in_flight,
             parts_dispatched,
             plan,
+            eof,
             ..
         } = &mut *state
         {
             *parts_in_flight -= 1;
             let all_dispatched = match plan {
-                PartPlan::Known { total_parts } => *parts_dispatched >= *total_parts,
-                PartPlan::Unknown { eof, .. } => *eof,
+                PartPlan::Known { total_parts, .. } => *parts_dispatched >= *total_parts,
+                PartPlan::Unknown => *eof,
             };
             all_dispatched && *parts_in_flight == 0
         } else {
@@ -617,47 +641,6 @@ impl UploadTransfer {
             drop(state);
             self.inner.ctx.try_wake();
         }
-    }
-
-    /// Record that the reader reached end-of-stream, and decide whether this caller owes an empty
-    /// part 1.
-    ///
-    /// S3 rejects a `CompleteMultipartUpload` that lists no parts, so an empty stream must still
-    /// upload one part. Because several part-work items can be dispatched before any of them reads,
-    /// more than one can see "end-of-stream with nothing emitted"; the right to synthesize part 1 is
-    /// therefore claimed by a check-and-set here, under the state lock, rather than by testing a
-    /// value the caller read earlier. Exactly one caller sees `true`.
-    ///
-    /// Returns `true` if this caller must send an empty part 1.
-    fn set_eof_and_claim_empty_first_part(&self) -> bool {
-        let mut state = self.inner.state.lock().expect("lock poisoned");
-        let claimed = match &mut *state {
-            UploadState::Transferring { plan, .. } => match plan {
-                PartPlan::Unknown {
-                    eof,
-                    first_part_emitted,
-                } => {
-                    *eof = true;
-                    if *first_part_emitted {
-                        false
-                    } else {
-                        // Claim it: no data part was emitted, so this caller owns part 1.
-                        *first_part_emitted = true;
-                        true
-                    }
-                }
-                // A known-length reader only reports end-of-stream after every counted part, so
-                // there is nothing to synthesize.
-                PartPlan::Known { .. } => false,
-            },
-            _ => false,
-        };
-        drop(state);
-        // `eof` is what unblocks a `poll_work` parked on in-flight parts. It is set here, in
-        // `execute`, while the poller may already be parked, so the edge must be signalled or the
-        // transfer hangs (see the wake protocol on `TransferContext::set_pending`).
-        self.inner.ctx.try_wake();
-        claimed
     }
 
     async fn execute_put_object(&self, stream: &mut Option<InputStream>) -> WorkOutcome {
@@ -781,7 +764,7 @@ impl UploadTransfer {
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
-        let (upload_id, mut completed_parts, response_builder, part_reader, object_size) = {
+        let (upload_id, mut completed_parts, response_builder, part_reader, plan, bytes_uploaded) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             match &mut *state {
                 UploadState::Completing {
@@ -789,7 +772,8 @@ impl UploadTransfer {
                     completed_parts,
                     response_builder,
                     part_reader,
-                    object_size,
+                    plan,
+                    bytes_uploaded,
                     ..
                 } => (
                     upload_id.take().expect("upload_id already taken"),
@@ -800,13 +784,48 @@ impl UploadTransfer {
                         .take()
                         .expect("response_builder already taken"),
                     part_reader.take().expect("part_reader already taken"),
-                    *object_size,
+                    std::mem::replace(plan, PartPlan::Unknown),
+                    *bytes_uploaded,
                 ),
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
 
         completed_parts.sort_by_key(|p| p.part_number);
+
+        // S3 sums the parts it assembled and rejects CompleteMPU when the total doesn't match the
+        // `MpuObjectSize` we send, so a dropped or duplicated part surfaces as a failed complete
+        // rather than a wrong-sized object (SEP step 7). The value differs by path:
+        //
+        // - Known: the size the source declared — an *independent* witness, since it did not come
+        //   from our own part accounting, so it also catches a part this crate dropped or a source
+        //   that delivered a different number of bytes than it declared. S3 does the comparison.
+        // - Unknown: no declared size exists, so we send what we uploaded. That still catches an
+        //   S3-side assembly mismatch, but cannot catch our own miscount — it's the same number.
+        //
+        // Do not unify the known path onto `bytes_uploaded`; that would drop the independent check.
+        let object_size = match plan {
+            PartPlan::Known {
+                declared_object_size,
+                ..
+            } => {
+                // `declared_object_size` is `size_hint().upper()` — an upper *bound*, exact for the
+                // crate's own buffer/file sources and `>=` actual for a custom `PartStream` that
+                // reports only a bound. A correct read is capped at the declared length, so uploading
+                // *more* than declared can only mean our own part accounting over-counted; assert that
+                // as a dev tripwire before we round-trip to S3. Not `==`: under-delivery against a
+                // declared upper bound is a legal input (S3 still rejects a genuine assembled-size
+                // mismatch via the value we send), and turning that into a panic is the failure mode
+                // this operation was changed to stop doing.
+                debug_assert!(
+                    bytes_uploaded <= declared_object_size,
+                    "uploaded {bytes_uploaded} bytes, more than the declared upper bound of \
+                     {declared_object_size}; part accounting over-counted"
+                );
+                declared_object_size
+            }
+            PartPlan::Unknown => bytes_uploaded,
+        };
 
         // An unknown-length transfer could not report a total while in flight (progress is genuinely
         // unknowable there). By now the stream has ended and `object_size` is exact, so final
@@ -820,16 +839,6 @@ impl UploadTransfer {
             .s3_client()
             .complete_multipart_upload()
             .upload_id(&upload_id)
-            // S3 sums the parts it assembled and rejects CompleteMPU when the
-            // total doesn't match this value, so a dropped or duplicated part
-            // surfaces as a failed complete rather than a wrong-sized object.
-            // Required by SEP step 7.
-            //
-            // For a known length this is the size declared by the source — an independent witness,
-            // so it also catches a part this crate itself dropped or duplicated. For an unknown
-            // length there is no such witness: the value is summed from the parts actually
-            // uploaded, which still catches an S3-side assembly mismatch. Do not "simplify" the
-            // known path onto the running sum; that would quietly lose the independent check.
             .mpu_object_size(object_size as i64)
             .multipart_upload(
                 CompletedMultipartUpload::builder()
@@ -897,7 +906,8 @@ fn transition_to_completing(state: &mut UploadState) {
         part_reader,
         completed_parts,
         response_builder,
-        object_size,
+        plan,
+        bytes_uploaded,
         ..
     } = std::mem::replace(state, UploadState::Done)
     {
@@ -907,7 +917,8 @@ fn transition_to_completing(state: &mut UploadState) {
             completed_parts: Some(completed_parts),
             response_builder: Some(response_builder),
             complete_in_flight: false,
-            object_size,
+            plan,
+            bytes_uploaded,
         };
     }
 }
@@ -1212,63 +1223,5 @@ mod tests {
         transfer.execute(&mut work).await;
 
         assert!(transfer.take_result().is_some());
-    }
-
-    /// The 10,000-part ceiling is enforced before dispatch, with an error that names the
-    /// remedy.
-    ///
-    /// An unknown-length upload has no part count to bound it, so without this guard the next
-    /// dispatch would send `PartNumber = 10001` and take S3's `InvalidArgument` — which says
-    /// nothing about part size. Reaching the ceiling through the public API would need 50 GiB
-    /// (part size is clamped to >= 5 MiB), so the plan state is driven directly here.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn test_unknown_length_part_ceiling_is_enforced() {
-        let s3_client = mock_s3_client_for_mpu();
-        let transfer = create_test_transfer(s3_client, vec![0u8; 16 * 1024 * 1024]);
-
-        // Drive through CreateMPU so the transfer is in `Transferring`.
-        let mut work = assert_ready(transfer.poll_work());
-        transfer.execute(&mut work).await;
-
-        // Pretend this is an unknown-length transfer that has already dispatched every part it
-        // is allowed to.
-        {
-            let mut state = transfer.inner.state.lock().expect("lock poisoned");
-            if let UploadState::Transferring {
-                plan,
-                parts_dispatched,
-                parts_in_flight,
-                ..
-            } = &mut *state
-            {
-                *plan = PartPlan::Unknown {
-                    eof: false,
-                    first_part_emitted: true,
-                };
-                *parts_dispatched = MAX_PARTS;
-                *parts_in_flight = 0;
-            } else {
-                panic!("expected Transferring after CreateMPU");
-            }
-        }
-
-        // The next poll must refuse to dispatch part MAX_PARTS + 1.
-        assert!(matches!(transfer.poll_work(), PollWork::Done));
-
-        let err = transfer
-            .ctx()
-            .take_error()
-            .expect("exceeding the part ceiling must record an error");
-        assert_eq!(&ErrorKind::InputInvalid, err.kind());
-        // Per this crate's convention `Display` renders the kind and the detail hangs off
-        // `source()` (see `display_omits_source_message`), so that is where the remedy must be.
-        let detail = std::error::Error::source(&err)
-            .expect("the ceiling error must carry a detail message")
-            .to_string();
-        assert!(
-            detail.contains("part size") && detail.contains("10000"),
-            "error detail must name the ceiling and the remedy, got: {detail}"
-        );
     }
 }
