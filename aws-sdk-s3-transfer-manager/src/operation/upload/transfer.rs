@@ -205,9 +205,15 @@ impl UploadTransfer {
                         return PollWork::Pending;
                     }
 
-                    let use_mpu = stream.as_ref().is_some_and(|s| s.is_mpu_only())
-                        || content_length.unwrap_or(0)
-                            >= self.inner.ctx.handle.mpu_threshold_bytes();
+                    // The single-request path requires a content length, so a source without one has
+                    // to go multipart regardless of what the threshold comparison would say.
+                    let use_mpu = match *content_length {
+                        None => true,
+                        Some(len) => {
+                            stream.as_ref().is_some_and(|s| s.is_mpu_only())
+                                || len >= self.inner.ctx.handle.mpu_threshold_bytes()
+                        }
+                    };
                     return if use_mpu {
                         *init_in_flight = true;
                         PollWork::ready(IoRequest {
@@ -613,8 +619,8 @@ impl UploadTransfer {
             .take()
             .expect("stream should be present for PutObject");
 
-        // Unreachable for an unknown-length source: only a `PartStream` can omit the upper bound,
-        // and such a stream is `is_mpu_only`, so `poll_work` routes it to CreateMPU and never here.
+        // `poll_work` sends every source without a declared length to the multipart path, so reaching
+        // here means the length is known.
         let content_length = stream
             .size_hint()
             .upper()
@@ -865,26 +871,17 @@ impl UploadTransfer {
 /// the `CompleteMPU` it unlocks on the same poll; `on_part_completed` wakes a poller parked on the
 /// drain.
 fn try_begin_completing(state: &mut UploadState) -> bool {
-    if let UploadState::Transferring {
-        parts_dispatched,
-        plan,
-        eof,
-        parts_in_flight,
-        ..
-    } = state
-    {
-        if plan.all_dispatched(*parts_dispatched, *eof) && *parts_in_flight == 0 {
-            transition_to_completing(state);
-            return true;
-        }
+    // `mem::replace` below makes this call the single owner of the moved-out fields, so completion is
+    // set up exactly once even though both callers race to be the last one out.
+    let ready = matches!(
+        state,
+        UploadState::Transferring { parts_dispatched, plan, eof, parts_in_flight, .. }
+            if plan.all_dispatched(*parts_dispatched, *eof) && *parts_in_flight == 0
+    );
+    if !ready {
+        return false;
     }
-    false
-}
 
-/// Move a `Transferring` state to `Completing`, carrying the accumulated object size across. Only
-/// [`try_begin_completing`] calls this, once the completion condition holds. The `mem::replace`
-/// makes the caller the single owner of the moved-out fields, so completion is set up exactly once.
-fn transition_to_completing(state: &mut UploadState) {
     if let UploadState::Transferring {
         upload_id,
         part_reader,
@@ -905,6 +902,7 @@ fn transition_to_completing(state: &mut UploadState) {
             bytes_uploaded,
         };
     }
+    true
 }
 
 impl Transfer for UploadTransfer {
@@ -972,6 +970,52 @@ mod tests {
             RuleMode::MatchAny,
             &[create_mpu, upload_part, complete_mpu]
         )
+    }
+
+    /// A source with no declared length is routed to the multipart path, which is the only one that
+    /// can serve it. The stream is below the multipart threshold, so a threshold comparison against a
+    /// defaulted-to-zero length would pick the single-request path instead.
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_poll_work_unknown_length_routes_to_multipart() {
+        struct NoUpperBound;
+        impl crate::io::PartStream for NoUpperBound {
+            fn poll_part(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _stream_cx: &crate::io::StreamContext,
+            ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+                std::task::Poll::Ready(None)
+            }
+            fn size_hint(&self) -> crate::io::SizeHint {
+                crate::io::SizeHint::default()
+            }
+        }
+
+        let handle = crate::client::Handle::test_handle_tokio(
+            crate::Config::builder()
+                .client(mock_client!(aws_sdk_s3, []))
+                .build(),
+        );
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = UploadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            InputStream::from_part_stream(NoUpperBound),
+        );
+
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(
+            matches!(work.data_mut::<UploadWork>(), UploadWork::CreateMPU),
+            "an unknown-length source must not be routed to the single-request path"
+        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
