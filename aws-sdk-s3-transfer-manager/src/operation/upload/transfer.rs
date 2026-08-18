@@ -63,14 +63,6 @@ pub(crate) enum UploadWork {
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
-/// The discriminant of [`PartPlan`], read without borrowing the plan's fields — used where a caller
-/// only needs to know which mode it is in (e.g. the read-time part-count guard).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PartPlanKind {
-    Known,
-    Unknown,
-}
-
 /// Initial capacity for the completed-part list when the content length is unknown.
 ///
 /// There is no part count to size it by, so this only avoids a few early reallocations; the list
@@ -195,86 +187,80 @@ impl UploadTransfer {
 
         let mut state = self.inner.state.lock().expect("lock poisoned");
 
-        match &mut *state {
-            UploadState::PendingInit {
-                init_in_flight,
-                content_length,
-                stream,
-            } => {
-                if *init_in_flight {
-                    self.inner.ctx.set_pending();
-                    return PollWork::Pending;
-                }
-
-                let use_mpu = stream.as_ref().is_some_and(|s| s.is_mpu_only())
-                    || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
-                if use_mpu {
-                    *init_in_flight = true;
-                    PollWork::ready(IoRequest {
-                        data: Some(Box::new(UploadWork::CreateMPU)),
-                    })
-                } else {
-                    let taken_stream = stream.take().expect("stream already taken");
-                    *state = UploadState::PutObjectInFlight;
-                    PollWork::ready(IoRequest {
-                        data: Some(Box::new(UploadWork::PutObject {
-                            stream: Some(taken_stream),
-                        })),
-                    })
-                }
+        loop {
+            // Serve the `CompleteMPU` a transition unlocks on this same poll, rather than parking
+            // and waiting to be re-polled for work this call already knows about.
+            if try_begin_completing(&mut state) {
+                continue;
             }
-            UploadState::Transferring {
-                parts_dispatched,
-                plan,
-                eof,
-                parts_in_flight,
-                ..
-            } => {
-                // Has every part been dispatched? For a known length that is a part count; for an
-                // unknown length it is the reader having reported end-of-stream. The part-limit
-                // guard for unknown length lives at read time in `execute`, keyed on the reader's
-                // yielded-count, not here — `parts_dispatched` counts speculative dispatches, which
-                // run one ahead of what the reader has actually produced.
-                let all_dispatched = match plan {
-                    PartPlan::Known { total_parts, .. } => *parts_dispatched >= *total_parts,
-                    PartPlan::Unknown => *eof,
-                };
 
-                if all_dispatched {
-                    if *parts_in_flight > 0 {
+            match &mut *state {
+                UploadState::PendingInit {
+                    init_in_flight,
+                    content_length,
+                    stream,
+                } => {
+                    if *init_in_flight {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
                     }
-                    // All parts sent and completed — transition to Completing
-                    transition_to_completing(&mut state);
-                    drop(state);
-                    self.inner.ctx.try_wake();
-                    return PollWork::Pending;
-                }
 
-                *parts_dispatched += 1;
-                *parts_in_flight += 1;
-                PollWork::ready(IoRequest {
-                    data: Some(Box::new(UploadWork::UploadPart)),
-                })
-            }
-            UploadState::Completing {
-                complete_in_flight, ..
-            } => {
-                if *complete_in_flight {
+                    let use_mpu = stream.as_ref().is_some_and(|s| s.is_mpu_only())
+                        || content_length.unwrap_or(0)
+                            >= self.inner.ctx.handle.mpu_threshold_bytes();
+                    return if use_mpu {
+                        *init_in_flight = true;
+                        PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::CreateMPU)),
+                        })
+                    } else {
+                        let taken_stream = stream.take().expect("stream already taken");
+                        *state = UploadState::PutObjectInFlight;
+                        PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::PutObject {
+                                stream: Some(taken_stream),
+                            })),
+                        })
+                    };
+                }
+                UploadState::Transferring {
+                    parts_dispatched,
+                    plan,
+                    eof,
+                    parts_in_flight,
+                    ..
+                } => {
+                    // Not ready to complete (the check above returned false), so either parts remain
+                    // to dispatch, or all are dispatched and we wait for the in-flight ones to drain.
+                    if plan.all_dispatched(*parts_dispatched, *eof) {
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
+
+                    *parts_dispatched += 1;
+                    *parts_in_flight += 1;
+                    return PollWork::ready(IoRequest {
+                        data: Some(Box::new(UploadWork::UploadPart)),
+                    });
+                }
+                UploadState::Completing {
+                    complete_in_flight, ..
+                } => {
+                    if *complete_in_flight {
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
+                    *complete_in_flight = true;
+                    return PollWork::ready(IoRequest {
+                        data: Some(Box::new(UploadWork::CompleteMPU)),
+                    });
+                }
+                UploadState::PutObjectInFlight => {
                     self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 }
-                *complete_in_flight = true;
-                PollWork::ready(IoRequest {
-                    data: Some(Box::new(UploadWork::CompleteMPU)),
-                })
+                UploadState::Done => return PollWork::Done,
             }
-            UploadState::PutObjectInFlight => {
-                self.inner.ctx.set_pending();
-                PollWork::Pending
-            }
-            UploadState::Done => PollWork::Done,
         }
     }
 
@@ -403,10 +389,12 @@ impl UploadTransfer {
     }
 
     async fn execute_upload_part(&self) -> WorkOutcome {
-        let part_reader = {
+        let (part_reader, is_unknown) = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
-                UploadState::Transferring { part_reader, .. } => part_reader.clone(),
+                UploadState::Transferring {
+                    part_reader, plan, ..
+                } => (part_reader.clone(), matches!(plan, PartPlan::Unknown)),
                 _ => panic!("unexpected state for read_part"),
             }
         };
@@ -419,10 +407,6 @@ impl UploadTransfer {
             Ok(Some(data)) => data,
             Ok(None) => {
                 tracing::trace!("part_reader exhausted");
-                // Unknown-length end-of-stream. The reader's yielded-count is now final — it was
-                // incremented under the reader's own lock as each part was produced, so a `None`
-                // here is ordered after every part it will ever yield. That lets us decide, without
-                // a second racing lock, whether the stream was empty.
                 return self.on_end_of_stream(&part_reader).await;
             }
             Err(e) => return self.fail(e.into()),
@@ -431,9 +415,7 @@ impl UploadTransfer {
         // Guard the S3 part-count ceiling by the number of parts the reader has actually yielded,
         // not by speculative dispatches. Fail before sending the (MAX_PARTS + 1)-th so the caller
         // gets an error naming the remedy instead of S3's opaque `InvalidArgument` on part 10001.
-        if matches!(self.plan_kind(), Some(PartPlanKind::Unknown))
-            && part_reader.parts_yielded() > MAX_PARTS
-        {
+        if is_unknown && part_reader.parts_yielded() > MAX_PARTS {
             return self.fail(Error::new(
                 ErrorKind::InputInvalid,
                 format!(
@@ -451,19 +433,19 @@ impl UploadTransfer {
     /// out empty, synthesize the one zero-length part S3 requires (a multipart upload must list at
     /// least one part).
     ///
-    /// Emptiness is `part_reader.parts_yielded() == 0`, which is race-free: the count is bumped
-    /// under the reader's lock as each part is produced, so a `None` read is ordered after all of
-    /// them. Exactly one caller synthesizes, because only the caller that flips `eof` false→true —
-    /// a single-winner check under the state lock — takes the synthesize branch.
+    /// `parts_yielded()` is final at end-of-stream (see its docs for the ordering guarantee), so
+    /// `== 0` is an exact emptiness test. Exactly one caller synthesizes: only the one that flips
+    /// `eof` false→true takes that branch.
     async fn on_end_of_stream(&self, part_reader: &PartReader) -> WorkOutcome {
         let empty_and_owned = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             match &mut *state {
-                UploadState::Transferring { eof, .. } if !*eof => {
+                UploadState::Transferring { eof, plan, .. } if !*eof => {
                     *eof = true;
-                    // This caller flipped eof; it alone may synthesize. The reader's count is final
-                    // now, so `== 0` is an exact emptiness test.
-                    part_reader.parts_yielded() == 0
+                    // Gated on `Unknown`: a declared length already carries a part count, so a
+                    // source that declares a size and then delivers nothing must not have a part
+                    // invented for it — that would contradict the size it declared.
+                    matches!(plan, PartPlan::Unknown) && part_reader.parts_yielded() == 0
                 }
                 _ => false,
             }
@@ -481,20 +463,8 @@ impl UploadTransfer {
             return self.send_part(PartData::new(1, Bytes::new())).await;
         }
 
-        self.maybe_transition_to_completing();
+        self.on_part_completed();
         WorkOutcome::Success { data: None }
-    }
-
-    /// The kind of the current `Transferring` plan, if the transfer is transferring.
-    fn plan_kind(&self) -> Option<PartPlanKind> {
-        let state = self.inner.state.lock().expect("lock poisoned");
-        match &*state {
-            UploadState::Transferring { plan, .. } => Some(match plan {
-                PartPlan::Known { .. } => PartPlanKind::Known,
-                PartPlan::Unknown => PartPlanKind::Unknown,
-            }),
-            _ => None,
-        }
     }
 
     /// Upload one part and record it, then advance the state machine.
@@ -611,33 +581,26 @@ impl UploadTransfer {
             ..Default::default()
         });
 
-        self.maybe_transition_to_completing();
+        self.on_part_completed();
 
         WorkOutcome::Success { data: None }
     }
 
-    fn maybe_transition_to_completing(&self) {
+    /// Release the slot a dispatched `UploadPart` held, and hand off to `Completing` if it was the
+    /// last one out.
+    ///
+    /// Fires for every completed `UploadPart` dispatch, including one whose read only found
+    /// end-of-stream. This is the mutator side of the wake protocol: the state that could unblock a
+    /// parked `poll_work` is mutated under the lock, then the lock is dropped before signalling.
+    fn on_part_completed(&self) {
         let mut state = self.inner.state.lock().expect("lock poisoned");
-        let should_complete = if let UploadState::Transferring {
-            parts_in_flight,
-            parts_dispatched,
-            plan,
-            eof,
-            ..
+        if let UploadState::Transferring {
+            parts_in_flight, ..
         } = &mut *state
         {
             *parts_in_flight -= 1;
-            let all_dispatched = match plan {
-                PartPlan::Known { total_parts, .. } => *parts_dispatched >= *total_parts,
-                PartPlan::Unknown => *eof,
-            };
-            all_dispatched && *parts_in_flight == 0
-        } else {
-            false
-        };
-
-        if should_complete {
-            transition_to_completing(&mut state);
+        }
+        if try_begin_completing(&mut state) {
             drop(state);
             self.inner.ctx.try_wake();
         }
@@ -895,11 +858,32 @@ impl UploadTransfer {
     }
 }
 
-/// Move a `Transferring` state to `Completing`, carrying the accumulated object size across.
+/// If every part has been dispatched and none remain in flight, move `Transferring` → `Completing`
+/// and report that it did.
 ///
-/// Both the poll path (every part dispatched, nothing in flight) and the part-completion path can be
-/// the last one out, so they share this to keep the handoff identical. The `mem::replace` makes the
-/// caller the single owner of the moved-out fields, so completion is set up exactly once.
+/// The single point that begins completion. Its two callers have distinct roles: `poll_work` serves
+/// the `CompleteMPU` it unlocks on the same poll; `on_part_completed` wakes a poller parked on the
+/// drain.
+fn try_begin_completing(state: &mut UploadState) -> bool {
+    if let UploadState::Transferring {
+        parts_dispatched,
+        plan,
+        eof,
+        parts_in_flight,
+        ..
+    } = state
+    {
+        if plan.all_dispatched(*parts_dispatched, *eof) && *parts_in_flight == 0 {
+            transition_to_completing(state);
+            return true;
+        }
+    }
+    false
+}
+
+/// Move a `Transferring` state to `Completing`, carrying the accumulated object size across. Only
+/// [`try_begin_completing`] calls this, once the completion condition holds. The `mem::replace`
+/// makes the caller the single owner of the moved-out fields, so completion is set up exactly once.
 fn transition_to_completing(state: &mut UploadState) {
     if let UploadState::Transferring {
         upload_id,

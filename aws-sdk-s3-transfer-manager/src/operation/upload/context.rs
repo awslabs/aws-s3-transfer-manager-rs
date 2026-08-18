@@ -12,29 +12,34 @@ use crate::operation::upload::UploadOutputBuilder;
 
 /// How the `Transferring` phase decides it has dispatched every part.
 ///
-/// A source with a known length (a buffer or a file) yields an exact part count up front. A
-/// `PartStream` of unknown length does not: parts are dispatched speculatively and the phase ends
-/// when the reader reports end-of-stream. Modelling the two as one enum keeps the illegal
-/// combination — a part count *and* an end-of-stream flag — unrepresentable.
-///
-/// The unknown-length variant carries no emitted-yet / end-of-stream flags. Those questions are
-/// answered from the reader's own [`parts_yielded`](crate::io::part_reader::PartReader::parts_yielded)
-/// count, which is incremented under the read lock — so a caller driving speculative concurrent
-/// reads observes a count that is always ordered with end-of-stream, with no second lock of its own
-/// to race against. Keeping the count on the reader is what makes "was the stream empty?" and "did
-/// it exceed the part limit?" race-free.
+/// A known length yields an exact part count up front; an unknown-length `PartStream` does not, so
+/// its parts are dispatched speculatively and the phase ends when the reader reports end-of-stream.
+/// One enum for both keeps a part count and an end-of-stream flag from coexisting.
 #[derive(Debug)]
 pub(crate) enum PartPlan {
     /// Content length known up front: dispatch until `total_parts` have been issued.
     Known {
         total_parts: u64,
-        /// The size declared by the source, sent as `MpuObjectSize` on complete. It did not come
-        /// from our own part accounting, so it is an *independent* witness — it also catches a part
-        /// this crate dropped or duplicated, which a sum of what we uploaded cannot.
+        /// Size declared by the source, sent as `MpuObjectSize` on complete. It does not come from
+        /// our own part accounting, so it independently catches a part dropped or duplicated here.
         declared_object_size: u64,
     },
     /// Content length unknown: dispatch until the reader reports end-of-stream.
     Unknown,
+}
+
+impl PartPlan {
+    /// Whether every part has been dispatched: a part count for `Known`, end-of-stream for
+    /// `Unknown`.
+    ///
+    /// `parts_dispatched` counts speculative dispatches, which run ahead of what the reader has
+    /// actually produced, so it answers only "is dispatch finished" — never "how many parts exist".
+    pub(crate) fn all_dispatched(&self, parts_dispatched: u64, eof: bool) -> bool {
+        match self {
+            PartPlan::Known { total_parts, .. } => parts_dispatched >= *total_parts,
+            PartPlan::Unknown => eof,
+        }
+    }
 }
 
 /// State machine for tracking upload work progress.
@@ -55,18 +60,14 @@ pub(crate) enum UploadState {
         parts_dispatched: u64,
         /// How this phase decides every part has been dispatched.
         plan: PartPlan,
-        /// Unknown-length only: set once a read reports end-of-stream, to stop dispatch and let the
-        /// phase drain and complete. Its *timing* is not correctness-critical — a late set only
-        /// causes a few extra speculative reads that no-op — so it is a plain flag, not the racy
-        /// emitted-flag it replaces. Emptiness is judged from the reader's `parts_yielded()`, not
-        /// from here.
+        /// Unknown-length only: set once a read reports end-of-stream; gates further dispatch. Its
+        /// timing is not correctness-critical — a late set only costs speculative reads that no-op.
         eof: bool,
         parts_in_flight: usize,
         completed_parts: Vec<CompletedPart>,
         response_builder: UploadOutputBuilder,
-        /// Running total of bytes actually uploaded, summed as each part completes. Consistent
-        /// meaning on both paths: for `Unknown` it *is* the object size sent on complete; for
-        /// `Known` it is checked (`<=`) against the declared upper bound before completing.
+        /// Running total of bytes uploaded, summed as each part completes. For `Unknown` this is the
+        /// object size sent on complete; for `Known` it is checked (`<=`) against the declared bound.
         bytes_uploaded: u64,
     },
     /// All parts done, calling CompleteMPU (MPU only)

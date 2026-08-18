@@ -337,7 +337,6 @@ async fn test_complete_mpu_sends_mpu_object_size() {
 // reporting end-of-stream rather than from a part count.
 
 /// A stream with no declared length uploads via multipart and completes.
-/// Previously this panicked on `content_length required`.
 #[tokio::test]
 async fn test_unknown_length_multipart_upload() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -892,5 +891,176 @@ async fn test_unknown_length_many_parts_grows_part_list() {
         num_parts,
         upload_part.num_calls(),
         "every part must be uploaded exactly once"
+    );
+}
+
+pin_project! {
+    /// An unknown-length `PartStream` that yields `total` one-byte parts, then end-of-stream.
+    ///
+    /// Parts are produced without waiting on a channel, so a test can drive the part count past a
+    /// limit without also taking on caller-data backpressure.
+    #[derive(Debug)]
+    struct CountingUnknownLengthStream {
+        next_part_num: u64,
+        total: u64,
+    }
+}
+
+impl PartStream for CountingUnknownLengthStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        if *this.next_part_num > *this.total {
+            return Poll::Ready(None);
+        }
+        let part_number = *this.next_part_num;
+        *this.next_part_num += 1;
+        Poll::Ready(Some(Ok(PartData::new(
+            part_number,
+            Bytes::from_static(b"x"),
+        ))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// A stream exceeding the S3 part limit fails with a message naming the remedy.
+///
+/// The guard keys on parts the reader actually yielded, so an exactly-`MAX_PARTS` stream must still
+/// succeed — only the part past the limit trips it. Driving this through the public API is what pins
+/// the trip point; the part size is irrelevant to the count, so one byte per part suffices.
+#[tokio::test]
+async fn test_unknown_length_exceeding_part_limit_fails() {
+    const MAX_PARTS: u64 = 10_000;
+
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(CountingUnknownLengthStream {
+            next_part_num: 1,
+            total: MAX_PARTS + 1,
+        }))
+        .initiate()
+        .unwrap();
+
+    let err = handle
+        .join()
+        .await
+        .expect_err("a stream past the part limit must fail");
+
+    assert_eq!(ErrorKind::InputInvalid, *err.kind());
+    let msg = format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(&err)
+    );
+    assert!(
+        msg.contains("maximum of 10000 parts"),
+        "error must name the part limit and the remedy, got: {msg}"
+    );
+}
+
+/// A stream of exactly `MAX_PARTS` must upload, not trip the limit.
+///
+/// End-of-stream on a custom stream is only observed on the dispatch after the last part, so a guard
+/// keyed on dispatches rather than parts actually yielded would reject this legitimate object.
+#[tokio::test]
+async fn test_unknown_length_exactly_max_parts_succeeds() {
+    const MAX_PARTS: u64 = 10_000;
+
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(CountingUnknownLengthStream {
+            next_part_num: 1,
+            total: MAX_PARTS,
+        }))
+        .initiate()
+        .unwrap();
+
+    handle
+        .join()
+        .await
+        .expect("a stream of exactly the maximum part count must upload");
+}
+
+/// The synthesized empty part belongs to the unknown-length path only.
+///
+/// A declared length already gives the dispatch loop a part count, so a source that declares a size
+/// and then delivers nothing must not have a part invented on its behalf — that would upload a part
+/// the caller never produced, and one that contradicts the size it declared.
+#[tokio::test]
+async fn test_known_length_never_synthesizes_empty_part() {
+    let upload_id = "test-upload-id".to_owned();
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    // Split the part rules by body size so the empty one's call count is the assertion.
+    let empty_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() == Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
+    let data_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() != Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("data-etag").build());
+
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &empty_part, &data_part, &complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    // `TestStream` reports an exact size hint, so this is the known-length path. Declare a size and
+    // deliver nothing, which is what drives a read to end-of-stream with no part yielded.
+    let (tx, rx) = mpsc::channel(1);
+    let declared = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::new(
+            rx, 0, declared,
+        )))
+        .initiate()
+        .unwrap();
+
+    drop(tx);
+    let _ = handle.join().await;
+
+    assert_eq!(
+        0,
+        empty_part.num_calls(),
+        "a declared-length source must never have an empty part synthesized for it"
     );
 }

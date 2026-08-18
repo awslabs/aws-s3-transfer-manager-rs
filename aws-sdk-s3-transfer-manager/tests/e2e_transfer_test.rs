@@ -665,9 +665,10 @@ async fn test_upload_unknown_content_length_multipart() {
     unknown_length_round_trip(&tm, bucket_name.as_str(), key.as_str(), parts).await;
 }
 
-/// A single-part unknown-length stream (a small streamed file) round-trips. This is the
-/// case the duplicate-part-1 race lived in — one data part read while the end-of-stream
-/// read runs concurrently — so it exercises exactly the path that used to corrupt objects.
+/// A single-part unknown-length stream (a small streamed file) round-trips.
+///
+/// One data part is read while the end-of-stream read runs concurrently, so a spurious empty part 1
+/// would surface here as a wrong-sized object.
 #[tokio::test]
 async fn test_upload_unknown_content_length_single_part() {
     let _logs = show_test_logs();
