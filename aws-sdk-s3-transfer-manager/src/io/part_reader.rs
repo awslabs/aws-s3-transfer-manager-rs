@@ -115,12 +115,17 @@ impl PartReader {
         self.stream_cx.part_size()
     }
 
-    /// Number of parts yielded so far (returned as `Ok(Some(..))`).
+    /// Number of parts this reader has produced.
     ///
-    /// Each variant tracks this under the same lock that produces a part, so the count is ordered
-    /// with the reads: end-of-stream (`Ok(None)`) is only observed after every yielded part is
-    /// already counted. That lets a caller driving speculative, concurrent reads decide whether the
-    /// stream was empty (`0` at end-of-stream) without a second lock of its own to race against.
+    /// Exact for `Dyn`, and bumped inside the lock that produces the part: end-of-stream
+    /// (`Ok(None)`) is only observed once every part the stream will yield is counted, so a caller
+    /// driving speculative, concurrent reads can test emptiness (`0` at end-of-stream) without a
+    /// second lock of its own to race against. Only `Dyn` can have an unknown length, so only `Dyn`
+    /// needs that.
+    ///
+    /// `Bytes` and `Fs` derive it from their part-number cursor. `Fs` advances that cursor when it
+    /// reserves a part, so its count can lead the parts actually returned by an in-flight or failed
+    /// read.
     pub(crate) fn parts_yielded(&self) -> u64 {
         match &self.inner {
             Inner::Bytes(bytes) => bytes.parts_yielded(),
@@ -202,7 +207,6 @@ impl BytesPartReader {
 }
 
 impl BytesPartReader {
-    /// Derived from the part-number cursor, which advances under `state` as each part is produced.
     fn parts_yielded(&self) -> u64 {
         self.state.lock().expect("lock valid").part_number - 1
     }
@@ -265,7 +269,6 @@ impl PathBodyPartReader {
 }
 
 impl PathBodyPartReader {
-    /// Derived from the part-number cursor, which advances under `state` as each part is committed.
     fn parts_yielded(&self) -> u64 {
         self.state.lock().expect("lock valid").part_number - 1
     }

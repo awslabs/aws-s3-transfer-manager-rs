@@ -236,8 +236,8 @@ impl UploadTransfer {
                     parts_in_flight,
                     ..
                 } => {
-                    // Not ready to complete (the check above returned false), so either parts remain
-                    // to dispatch, or all are dispatched and we wait for the in-flight ones to drain.
+                    // Dispatch finished here means parts are still in flight; `try_begin_completing`
+                    // above would have fired otherwise.
                     if plan.all_dispatched(*parts_dispatched, *eof) {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
@@ -568,9 +568,6 @@ impl UploadTransfer {
             } = &mut *state
             {
                 completed_parts.push(completed);
-                // Summed on both paths so the field means one thing. For unknown length this becomes
-                // the `MpuObjectSize` sent on complete; for known length it is checked against the
-                // declared size before completing.
                 *bytes_uploaded += bytes_sent;
             }
         }
@@ -763,29 +760,17 @@ impl UploadTransfer {
         completed_parts.sort_by_key(|p| p.part_number);
 
         // S3 sums the parts it assembled and rejects CompleteMPU when the total doesn't match the
-        // `MpuObjectSize` we send, so a dropped or duplicated part surfaces as a failed complete
-        // rather than a wrong-sized object (SEP step 7). The value differs by path:
-        //
-        // - Known: the size the source declared — an *independent* witness, since it did not come
-        //   from our own part accounting, so it also catches a part this crate dropped or a source
-        //   that delivered a different number of bytes than it declared. S3 does the comparison.
-        // - Unknown: no declared size exists, so we send what we uploaded. That still catches an
-        //   S3-side assembly mismatch, but cannot catch our own miscount — it's the same number.
-        //
-        // Do not unify the known path onto `bytes_uploaded`; that would drop the independent check.
+        // `MpuObjectSize` sent, so a dropped or duplicated part fails the complete instead of
+        // silently producing a wrong-sized object (SEP step 7). Sending the source's declared size on
+        // the known path keeps that check independent of our own part accounting; the unknown path has
+        // no declared size, so its check can only catch an S3-side assembly mismatch.
         let object_size = match plan {
             PartPlan::Known {
                 declared_object_size,
                 ..
             } => {
-                // `declared_object_size` is `size_hint().upper()` — an upper *bound*, exact for the
-                // crate's own buffer/file sources and `>=` actual for a custom `PartStream` that
-                // reports only a bound. A correct read is capped at the declared length, so uploading
-                // *more* than declared can only mean our own part accounting over-counted; assert that
-                // as a dev tripwire before we round-trip to S3. Not `==`: under-delivery against a
-                // declared upper bound is a legal input (S3 still rejects a genuine assembled-size
-                // mismatch via the value we send), and turning that into a panic is the failure mode
-                // this operation was changed to stop doing.
+                // `declared_object_size` is `size_hint().upper()` — a bound, so under-delivery is
+                // legal input and only over-delivery implies we over-counted.
                 debug_assert!(
                     bytes_uploaded <= declared_object_size,
                     "uploaded {bytes_uploaded} bytes, more than the declared upper bound of \
@@ -867,12 +852,10 @@ impl UploadTransfer {
 /// If every part has been dispatched and none remain in flight, move `Transferring` → `Completing`
 /// and report that it did.
 ///
-/// The single point that begins completion. Its two callers have distinct roles: `poll_work` serves
-/// the `CompleteMPU` it unlocks on the same poll; `on_part_completed` wakes a poller parked on the
-/// drain.
+/// Returns `true` to exactly one caller: the `mem::replace` below makes that call the sole owner of
+/// the moved-out fields, so completion is set up once even when a poll and a part completion race to
+/// be last one out.
 fn try_begin_completing(state: &mut UploadState) -> bool {
-    // `mem::replace` below makes this call the single owner of the moved-out fields, so completion is
-    // set up exactly once even though both callers race to be the last one out.
     let ready = matches!(
         state,
         UploadState::Transferring { parts_dispatched, plan, eof, parts_in_flight, .. }

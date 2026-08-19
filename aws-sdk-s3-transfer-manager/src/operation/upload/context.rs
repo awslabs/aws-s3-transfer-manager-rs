@@ -14,7 +14,6 @@ use crate::operation::upload::UploadOutputBuilder;
 ///
 /// A known length yields an exact part count up front; an unknown-length `PartStream` does not, so
 /// its parts are dispatched speculatively and the phase ends when the reader reports end-of-stream.
-/// One enum for both keeps a part count and an end-of-stream flag from coexisting.
 #[derive(Debug)]
 pub(crate) enum PartPlan {
     /// Content length known up front: dispatch until `total_parts` have been issued.
