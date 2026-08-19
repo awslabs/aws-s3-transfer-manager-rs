@@ -82,14 +82,13 @@ pub enum ErrorKind {
     /// A request to S3 failed. The originating operation, service error code,
     /// message, and request ids are available via the accessors on [`Error`]
     /// ([`Error::operation_name`], [`Error::code`], [`Error::request_id`]).
+    ///
+    /// Service-specific outcomes are identified by their code rather than by a
+    /// kind of their own. A conditional write whose precondition did not hold
+    /// (`if_match` / `if_none_match` on an upload) arrives here with
+    /// [`Error::code`] of `"PreconditionFailed"`; S3 reports that code in the
+    /// response body, so it is available whatever HTTP status carries it.
     ServiceError,
-
-    /// A conditional-write precondition set on an [`upload`](crate::operation::upload)
-    /// (`If-Match` / `If-None-Match`) did not match; S3 responded with
-    /// `412 Precondition Failed`. The originating operation and service metadata
-    /// are still available via the accessors on [`Error`], the same as for a
-    /// generic [`ServiceError`](Self::ServiceError).
-    PreconditionFailed,
 
     /// Object integrity validation failed: the received bytes did not match the
     /// expected checksum. See the wrapped [`IntegrityError`] for detail.
@@ -270,21 +269,6 @@ impl Error {
         )
     }
 
-    /// Whether this error is a conditional-write precondition failure: a
-    /// caller-supplied `If-Match` / `If-None-Match` on an
-    /// [`upload`](crate::operation::upload) that S3 rejected with
-    /// `412 Precondition Failed`.
-    ///
-    /// Kept `pub(crate)` for now: the only consumer is the upload retry
-    /// classifier, and the public precondition signal callers branch on is the
-    /// [`ErrorKind::PreconditionFailed`] variant reached via [`Error::kind`].
-    /// Promoting this to `pub` later is non-breaking if a caller convenience is
-    /// wanted; adding it to the public surface now — during the 1.0 API freeze
-    /// (RUST-1202) — is the harder-to-reverse choice.
-    pub(crate) fn is_precondition_failed(&self) -> bool {
-        matches!(self.kind, ErrorKind::PreconditionFailed)
-    }
-
     /// Whether this error was a transient transport failure (connection IO error
     /// or client-side timeout) as opposed to a service response. Such failures
     /// are safe to re-issue and may not have been recovered by the SDK's own
@@ -381,12 +365,6 @@ impl fmt::Display for Error {
                     if let Some(c) = &m.code {
                         write!(f, " ({c})")?;
                     }
-                }
-            }
-            ErrorKind::PreconditionFailed => {
-                write!(f, "precondition failed")?;
-                if let Some(m) = self.service() {
-                    write!(f, " calling {}", m.operation)?;
                 }
             }
             ErrorKind::IntegrityError(ie) => {
@@ -548,19 +526,6 @@ where
     }
 }
 
-/// Whether an `SdkError` is a service response with HTTP status 412 (Precondition
-/// Failed). Used to distinguish a user-set `If-Match` / `If-None-Match`
-/// precondition failure from a generic service error, so callers can branch on
-/// [`ErrorKind::PreconditionFailed`] without string-matching a service code.
-fn sdk_err_is_precondition_failed<E>(
-    e: &SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
-) -> bool {
-    matches!(
-        e,
-        SdkError::ServiceError(ctx) if ctx.raw().status().as_u16() == 412
-    )
-}
-
 /// Whether a single [`ConnectorError`] frame denotes a transient transport
 /// failure: an IO error, a client-side timeout, or one the http client tagged
 /// [`RetryErrorKind::TransientError`] (an incomplete/truncated response, TLS
@@ -633,59 +598,6 @@ where
             ..Default::default()
         })),
     }
-}
-
-/// Converts an S3 `SdkError` into an [`Error`], classifying an HTTP 412 service
-/// response as [`ErrorKind::PreconditionFailed`] and everything else exactly as
-/// [`service_error`] does (yielding [`ErrorKind::ServiceError`]).
-///
-/// The resulting `Error` carries the same operation / code / request-id metadata
-/// in both arms — only the `kind` differs — so a caller that hits a 412 can
-/// branch on [`ErrorKind::PreconditionFailed`] without string-matching a service
-/// code, while still reaching the underlying `SdkError` via
-/// [`std::error::Error::source`].
-///
-/// This is the single site that classifies 412s. It is called from the upload
-/// PutObject / CompleteMultipartUpload paths, the only requests that carry
-/// caller-supplied `If-Match` / `If-None-Match` preconditions; a 412 is not
-/// expected elsewhere. No log is emitted here — the upload transfer's `fail`
-/// path already `debug!`-logs the fully-rendered error (which names the
-/// operation and request id) at the terminal boundary, and a precondition
-/// failure is a caller-requested outcome, not a degraded state that warrants
-/// `warn!`.
-fn service_error_with_precondition<E>(
-    operation: &'static str,
-    e: SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
-) -> Error
-where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-{
-    let precondition_failed = sdk_err_is_precondition_failed(&e);
-    let mut err = service_error(operation, e);
-    if precondition_failed {
-        err.kind = ErrorKind::PreconditionFailed;
-    }
-    err
-}
-
-/// Converts a PutObject `SdkError` from the upload path, classifying a 412 as
-/// [`ErrorKind::PreconditionFailed`]. See [`service_error_with_precondition`].
-pub(crate) fn from_put_object_sdk_err(
-    e: SdkError<PutObjectError, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
-) -> Error {
-    service_error_with_precondition("PutObject", e)
-}
-
-/// Converts a CompleteMultipartUpload `SdkError` from the upload path,
-/// classifying a 412 as [`ErrorKind::PreconditionFailed`].
-/// See [`service_error_with_precondition`].
-pub(crate) fn from_complete_mpu_sdk_err(
-    e: SdkError<
-        CompleteMultipartUploadError,
-        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
-    >,
-) -> Error {
-    service_error_with_precondition("CompleteMultipartUpload", e)
 }
 
 macro_rules! from_sdk_error {
@@ -947,67 +859,16 @@ mod tests {
         )));
     }
 
-    // --- 412 (precondition failed) classification -----------------------------
+    // --- conditional-write precondition failures ------------------------------
 
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
 
-    fn service_response<E>(status: u16, err: E) -> SdkError<E, HttpResponse>
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        SdkError::service_error(
-            err,
-            HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty()),
-        )
-    }
-
-    /// Build a minimal `GetObjectError` value for status-based classification
-    /// tests — the specific variant doesn't matter, only the wrapping response.
-    fn any_get_object_error() -> GetObjectError {
-        GetObjectError::generic(
-            aws_smithy_types::error::ErrorMetadata::builder()
-                .code("PreconditionFailed")
-                .build(),
-        )
-    }
-
     #[test]
-    fn precondition_412_service_error_is_precondition_failed() {
-        let err: SdkError<GetObjectError, HttpResponse> =
-            service_response(412, any_get_object_error());
-        assert!(sdk_err_is_precondition_failed(&err));
-    }
-
-    #[test]
-    fn precondition_400_service_error_is_not_precondition_failed() {
-        // A 400 with a bogus PreconditionFailed code header is NOT a 412 —
-        // the classifier must key off the wire status, not the code string.
-        let err: SdkError<GetObjectError, HttpResponse> =
-            service_response(400, any_get_object_error());
-        assert!(!sdk_err_is_precondition_failed(&err));
-    }
-
-    #[test]
-    fn precondition_500_service_error_is_not_precondition_failed() {
-        let err: SdkError<GetObjectError, HttpResponse> =
-            service_response(500, any_get_object_error());
-        assert!(!sdk_err_is_precondition_failed(&err));
-    }
-
-    #[test]
-    fn precondition_dispatch_failure_is_not_precondition_failed() {
-        // Transport-level failure — never a 412 by construction.
-        assert!(!sdk_err_is_precondition_failed(&dispatch(
-            ConnectorError::io("reset".into())
-        )));
-    }
-
-    #[test]
-    fn service_error_with_precondition_promotes_412_and_keeps_metadata() {
-        // A 412 becomes PreconditionFailed but must retain the same service
-        // metadata (operation name, and the SdkError as source) a plain
-        // ServiceError would carry — only the kind differs.
+    fn precondition_failure_surfaces_as_service_error_with_code() {
+        // A failed `If-Match` / `If-None-Match` gets no kind of its own: callers
+        // identify it by the service code. S3 supplies that in the response body,
+        // so it is reachable whatever status the failure arrives with.
         let sdk: SdkError<PutObjectError, HttpResponse> = SdkError::service_error(
             PutObjectError::generic(
                 aws_smithy_types::error::ErrorMetadata::builder()
@@ -1016,28 +877,13 @@ mod tests {
             ),
             HttpResponse::new(StatusCode::try_from(412).unwrap(), SdkBody::empty()),
         );
-        let err = service_error_with_precondition("PutObject", sdk);
-        assert!(matches!(err.kind(), ErrorKind::PreconditionFailed));
+        let err = Error::from(sdk);
+        assert!(matches!(err.kind(), ErrorKind::ServiceError));
+        assert_eq!(err.code(), Some("PreconditionFailed"));
         assert_eq!(err.operation_name(), Some("PutObject"));
         // The underlying SdkError is preserved as the source.
         assert!(std::error::Error::source(&err)
             .and_then(|s| s.downcast_ref::<SdkError<PutObjectError, HttpResponse>>())
             .is_some());
-    }
-
-    #[test]
-    fn service_error_with_precondition_leaves_non_412_as_service_error() {
-        // A 500 stays a generic ServiceError — the promotion is 412-only.
-        let sdk: SdkError<PutObjectError, HttpResponse> = SdkError::service_error(
-            PutObjectError::generic(
-                aws_smithy_types::error::ErrorMetadata::builder()
-                    .code("InternalError")
-                    .build(),
-            ),
-            HttpResponse::new(StatusCode::try_from(500).unwrap(), SdkBody::empty()),
-        );
-        let err = service_error_with_precondition("PutObject", sdk);
-        assert!(matches!(err.kind(), ErrorKind::ServiceError));
-        assert_eq!(err.operation_name(), Some("PutObject"));
     }
 }

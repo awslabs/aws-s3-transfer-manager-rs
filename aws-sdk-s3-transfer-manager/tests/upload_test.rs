@@ -293,7 +293,7 @@ async fn test_complete_mpu_sends_mpu_object_size() {
         .expect("upload should succeed: CompleteMPU must carry MpuObjectSize = content length");
 }
 
-// --- Conditional-write preconditions (RUST-1203) -----------------------------
+// --- Conditional-write preconditions -----------------------------------------
 //
 // Assertion shape: use `match_requests` to fail the mock unless the request
 // carries the header we expect, so a missing/wrong precondition surfaces as a
@@ -324,13 +324,13 @@ async fn test_put_object_forwards_if_none_match() {
         .expect("PutObject must carry the caller's If-None-Match header");
 }
 
-/// When S3 returns 412 on the single-PUT path, the transfer must surface
-/// [`ErrorKind::PreconditionFailed`] — the caller's `If-Match` didn't hold, and
-/// that's semantically distinct from a generic service error. The 412 must also
-/// be terminal: neither the SDK's own retry (412 is a non-retryable 4xx) nor the
-/// TM's outer retry loop may re-issue it, so the request is sent exactly once.
+/// When S3 returns 412 on the single-PUT path, the transfer must fail with the
+/// service code reachable — that is how a caller tells a failed `If-Match` from
+/// any other service error. The 412 must also be terminal: neither the SDK's own
+/// retry (412 is a non-retryable 4xx) nor the TM's outer retry loop may re-issue
+/// it, so the request is sent exactly once.
 #[tokio::test]
-async fn test_put_object_412_maps_to_precondition_failed() {
+async fn test_put_object_412_surfaces_precondition_failed_code() {
     let put_object = mock!(aws_sdk_s3::Client::put_object).then_http_response(|| {
         HttpResponse::new(
             StatusCode::try_from(412).unwrap(),
@@ -355,9 +355,14 @@ async fn test_put_object_412_maps_to_precondition_failed() {
         .await
         .expect_err("a 412 on PutObject must fail the upload");
     assert!(
-        matches!(err.kind(), ErrorKind::PreconditionFailed),
-        "expected ErrorKind::PreconditionFailed, got {:?}",
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
         err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "caller must be able to identify the precondition failure by service code"
     );
     // The underlying SdkError is preserved as the source for callers who want
     // the raw 412 detail.
@@ -431,10 +436,10 @@ async fn test_complete_mpu_forwards_if_match() {
 }
 
 /// When S3 rejects `CompleteMultipartUpload` with 412, the multipart path must
-/// surface [`ErrorKind::PreconditionFailed`]. Mirrors the single-PUT test but
+/// surface the same service code the single-PUT path does. Mirrors that test but
 /// exercises the MPU code path (which fails at a different site than PutObject).
 #[tokio::test]
-async fn test_complete_mpu_412_maps_to_precondition_failed() {
+async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
     let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let content_length = 2 * part_size;
@@ -484,9 +489,14 @@ async fn test_complete_mpu_412_maps_to_precondition_failed() {
         .await
         .expect_err("a 412 on CompleteMultipartUpload must fail the upload");
     assert!(
-        matches!(err.kind(), ErrorKind::PreconditionFailed),
-        "expected ErrorKind::PreconditionFailed, got {:?}",
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
         err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "caller must be able to identify the precondition failure by service code"
     );
     let src = std::error::Error::source(&err).expect("source is set");
     assert!(

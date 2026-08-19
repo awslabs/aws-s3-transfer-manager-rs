@@ -552,22 +552,22 @@ async fn test_multi_part_upload_sends_mpu_object_size() {
 }
 
 /// End-to-end: `if_none_match("*")` on a fresh key succeeds (satisfied) and on
-/// an existing key fails with [`ErrorKind::PreconditionFailed`] (violated).
+/// an existing key fails (violated).
 ///
 /// Mock coverage in `upload_test.rs` pins the wire behavior (header forwarded,
-/// 412 mapped). This e2e adds server-side confirmation that:
+/// service code surfaced). This e2e adds server-side confirmation that:
 ///   1. S3 accepts the header on the real request path (typos, encoding,
 ///      request-signing changes would not be caught by mocks);
-///   2. a real 412 comes back with the same HTTP shape we map — i.e. the
-///      classifier is not brittle against wire-level differences between the
-///      mock and the service.
+///   2. a real precondition failure carries the `PreconditionFailed` service
+///      code, so callers can identify it without wire-level assumptions the
+///      mock might not share with the service.
 ///
 /// Runs against the general-purpose bucket only. Per the S3 conditional-writes
 /// docs, `If-None-Match` / `If-Match` are defined in terms of general-purpose
 /// (versioned / version-suspended) bucket behavior; support on S3 Express One
 /// Zone directory buckets is not affirmed there, so we don't assert it here.
-// TODO(RUST-1203): extend to the S3 Express bucket once conditional-write
-// support on directory buckets is confirmed on a real run.
+// TODO: extend to the S3 Express bucket once conditional-write support on
+// directory buckets is confirmed on a real run.
 #[tokio::test]
 async fn test_upload_if_none_match_star() {
     use aws_sdk_s3_transfer_manager::error::ErrorKind;
@@ -592,8 +592,7 @@ async fn test_upload_if_none_match_star() {
         .expect("first upload with If-None-Match: * must succeed against a fresh key");
 
     // 2) Violated: the object we just created collides with the same
-    //    precondition on the second upload. Expect PreconditionFailed —
-    //    NOT a generic ServiceError.
+    //    precondition on the second upload.
     let err = tm
         .upload()
         .bucket(&bucket_name)
@@ -606,8 +605,13 @@ async fn test_upload_if_none_match_star() {
         .await
         .expect_err("second upload with If-None-Match: * must fail against an existing key");
     assert!(
-        matches!(err.kind(), ErrorKind::PreconditionFailed),
-        "expected ErrorKind::PreconditionFailed, got {:?}",
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
         err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "real S3 must supply the service code callers identify the failure by"
     );
 }

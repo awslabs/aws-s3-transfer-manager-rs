@@ -602,13 +602,7 @@ impl UploadTransfer {
                     .send()
                     .instrument(tracing::debug_span!("send-put-object"))
                     .await
-                    .map_err(|e| {
-                        // Classify via from_put_object_sdk_err so a 412 (the
-                        // caller's If-Match / If-None-Match not holding) surfaces
-                        // as ErrorKind::PreconditionFailed rather than a generic
-                        // ServiceError — see the helper for the rationale.
-                        crate::retry::GuardError::Inner(crate::error::from_put_object_sdk_err(e))
-                    })
+                    .map_err(|e| crate::retry::GuardError::Inner(e.into()))
             }
         })
         .instrument(tracing::debug_span!(
@@ -729,10 +723,7 @@ impl UploadTransfer {
             .await
         {
             Ok(resp) => resp,
-            Err(e) => {
-                // Reclassify a 412 to PreconditionFailed, as execute_put_object does.
-                return self.fail(crate::error::from_complete_mpu_sdk_err(e));
-            }
+            Err(e) => return self.fail(e.into()),
         };
 
         let result = response_builder

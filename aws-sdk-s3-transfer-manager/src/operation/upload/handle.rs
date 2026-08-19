@@ -167,9 +167,6 @@ impl UploadHandle {
             match abort_policy {
                 FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
                 FailedMultipartUploadPolicy::AbortUpload => {
-                    // AbortMultipartUpload carries no `If-Match`/`If-None-Match`
-                    // (see `copy_fields_to_abort_mpu_request`), so cleaning up
-                    // after a conditional-write failure cannot itself 412.
                     let resp = copy_fields_to_abort_mpu_request(
                         self.transfer.request(),
                         ctx.s3_client()
