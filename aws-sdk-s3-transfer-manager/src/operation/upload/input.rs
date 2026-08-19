@@ -57,6 +57,16 @@ pub struct UploadInput {
     pub content_type: Option<String>,
     #[doc = std::include_str!("checksum_strategy.md")]
     pub checksum_strategy: Option<ChecksumStrategy>,
+    /// <p>Uploads the object only if the ETag (entity tag) value provided during the WRITE operation matches the ETag of the object in S3. If the ETag values do not match, the operation returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should fetch the object's ETag and retry the upload.</p>
+    /// <p>Expects the ETag value as a string.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub if_match: Option<String>,
+    /// <p>Uploads the object only if the object key name does not already exist in the bucket specified. Otherwise, Amazon S3 returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should retry the upload.</p>
+    /// <p>Expects the '*' (asterisk) character.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub if_none_match: Option<String>,
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub expires: Option<::aws_smithy_types::DateTime>,
     /// <p>Gives the grantee READ, READ_ACP, and WRITE_ACP permissions on the object.</p><note>
@@ -246,6 +256,20 @@ impl UploadInput {
     pub fn checksum_strategy(&self) -> Option<&ChecksumStrategy> {
         self.checksum_strategy.as_ref()
     }
+    /// <p>Uploads the object only if the ETag (entity tag) value provided during the WRITE operation matches the ETag of the object in S3. If the ETag values do not match, the operation returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should fetch the object's ETag and retry the upload.</p>
+    /// <p>Expects the ETag value as a string.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn if_match(&self) -> Option<&str> {
+        self.if_match.as_deref()
+    }
+    /// <p>Uploads the object only if the object key name does not already exist in the bucket specified. Otherwise, Amazon S3 returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should retry the upload.</p>
+    /// <p>Expects the '*' (asterisk) character.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn if_none_match(&self) -> Option<&str> {
+        self.if_none_match.as_deref()
+    }
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub fn expires(&self) -> Option<&::aws_smithy_types::DateTime> {
         self.expires.as_ref()
@@ -424,6 +448,8 @@ impl Debug for UploadInput {
         formatter.field("content_md5", &self.content_md5);
         formatter.field("content_type", &self.content_type);
         formatter.field("checksum_strategy", &self.checksum_strategy);
+        formatter.field("if_match", &self.if_match);
+        formatter.field("if_none_match", &self.if_none_match);
         formatter.field("expires", &self.expires);
         formatter.field("grant_full_control", &self.grant_full_control);
         formatter.field("grant_read", &self.grant_read);
@@ -481,6 +507,8 @@ pub struct UploadInputBuilder {
     pub(crate) content_md5: Option<String>,
     pub(crate) content_type: Option<String>,
     pub(crate) checksum_strategy: Option<ChecksumStrategy>,
+    pub(crate) if_match: Option<String>,
+    pub(crate) if_none_match: Option<String>,
     pub(crate) expires: Option<::aws_smithy_types::DateTime>,
     pub(crate) grant_full_control: Option<String>,
     pub(crate) grant_read: Option<String>,
@@ -717,6 +745,52 @@ impl UploadInputBuilder {
     #[doc = std::include_str!("checksum_strategy.md")]
     pub fn get_checksum_strategy(&self) -> Option<&ChecksumStrategy> {
         self.checksum_strategy.as_ref()
+    }
+    /// <p>Uploads the object only if the ETag (entity tag) value provided during the WRITE operation matches the ETag of the object in S3. If the ETag values do not match, the operation returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should fetch the object's ETag and retry the upload.</p>
+    /// <p>Expects the ETag value as a string.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn if_match(mut self, input: impl Into<String>) -> Self {
+        self.if_match = Some(input.into());
+        self
+    }
+    /// <p>Uploads the object only if the ETag (entity tag) value provided during the WRITE operation matches the ETag of the object in S3. If the ETag values do not match, the operation returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should fetch the object's ETag and retry the upload.</p>
+    /// <p>Expects the ETag value as a string.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn set_if_match(mut self, input: Option<String>) -> Self {
+        self.if_match = input;
+        self
+    }
+    /// <p>Uploads the object only if the ETag (entity tag) value provided during the WRITE operation matches the ETag of the object in S3. If the ETag values do not match, the operation returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should fetch the object's ETag and retry the upload.</p>
+    /// <p>Expects the ETag value as a string.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn get_if_match(&self) -> Option<&str> {
+        self.if_match.as_deref()
+    }
+    /// <p>Uploads the object only if the object key name does not already exist in the bucket specified. Otherwise, Amazon S3 returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should retry the upload.</p>
+    /// <p>Expects the '*' (asterisk) character.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn if_none_match(mut self, input: impl Into<String>) -> Self {
+        self.if_none_match = Some(input.into());
+        self
+    }
+    /// <p>Uploads the object only if the object key name does not already exist in the bucket specified. Otherwise, Amazon S3 returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should retry the upload.</p>
+    /// <p>Expects the '*' (asterisk) character.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn set_if_none_match(mut self, input: Option<String>) -> Self {
+        self.if_none_match = input;
+        self
+    }
+    /// <p>Uploads the object only if the object key name does not already exist in the bucket specified. Otherwise, Amazon S3 returns a <code>412 Precondition Failed</code> error.</p>
+    /// <p>If a conflicting operation occurs during the upload S3 returns a <code>409 ConditionalRequestConflict</code> response. On a 409 failure you should retry the upload.</p>
+    /// <p>Expects the '*' (asterisk) character.</p>
+    /// <p>For more information about conditional requests, see <a href="https://tools.ietf.org/html/rfc7232">RFC 7232</a>, or <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html">Conditional requests</a> in the <i>Amazon S3 User Guide</i>.</p>
+    pub fn get_if_none_match(&self) -> Option<&str> {
+        self.if_none_match.as_deref()
     }
     /// <p>The date and time at which the object is no longer cacheable. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc7234#section-5.3">https://www.rfc-editor.org/rfc/rfc7234#section-5.3</a>.</p>
     pub fn expires(mut self, input: ::aws_smithy_types::DateTime) -> Self {
@@ -1300,6 +1374,8 @@ impl UploadInputBuilder {
             content_md5: self.content_md5,
             content_type: self.content_type,
             checksum_strategy: self.checksum_strategy,
+            if_match: self.if_match,
+            if_none_match: self.if_none_match,
             expires: self.expires,
             grant_full_control: self.grant_full_control,
             grant_read: self.grant_read,
@@ -1341,6 +1417,8 @@ impl Debug for UploadInputBuilder {
         formatter.field("content_md5", &self.content_md5);
         formatter.field("content_type", &self.content_type);
         formatter.field("checksum_strategy", &self.checksum_strategy);
+        formatter.field("if_match", &self.if_match);
+        formatter.field("if_none_match", &self.if_none_match);
         formatter.field("expires", &self.expires);
         formatter.field("grant_full_control", &self.grant_full_control);
         formatter.field("grant_read", &self.grant_read);

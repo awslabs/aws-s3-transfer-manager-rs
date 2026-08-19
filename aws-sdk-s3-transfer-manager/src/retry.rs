@@ -265,7 +265,8 @@ fn retry_cause(ge: &GuardError<Error>) -> String {
 /// and paced by the 1s throttle base — gives the service room to recover.
 ///
 /// Everything else is terminal: a non-throttle modeled service error and any
-/// non-transport inner error.
+/// non-transport inner error. That includes a `412` from a user-set `If-Match` /
+/// `If-None-Match` — retrying cannot change the object state that caused it.
 ///
 /// [`GuardError::DeadlineExceeded`]: uploads carry no latency deadline (no
 /// `guarded` composition), so this arm is unreachable in practice; retained for
@@ -724,8 +725,9 @@ mod tests {
 
     #[test]
     fn upload_non_throttle_service_error_is_terminal() {
-        // A modeled service error with no throttle code (e.g. AccessDenied) is
-        // terminal: not transient transport, not a throttle.
+        // A modeled service error with no throttle code is terminal: not transient
+        // transport, not a throttle. Covers `AccessDenied` and equally a `412` from
+        // a caller's `If-Match` / `If-None-Match`, which retrying cannot resolve.
         let err = Error::test_service_error("AccessDenied");
         assert_eq!(
             classify_upload_part_retry(&GuardError::Inner(err)),

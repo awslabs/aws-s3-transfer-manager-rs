@@ -82,6 +82,12 @@ pub enum ErrorKind {
     /// A request to S3 failed. The originating operation, service error code,
     /// message, and request ids are available via the accessors on [`Error`]
     /// ([`Error::operation_name`], [`Error::code`], [`Error::request_id`]).
+    ///
+    /// Service-specific outcomes are identified by their code rather than by a
+    /// kind of their own. A conditional write whose precondition did not hold
+    /// (`if_match` / `if_none_match` on an upload) arrives here with
+    /// [`Error::code`] of `"PreconditionFailed"`; S3 reports that code in the
+    /// response body, so it is available whatever HTTP status carries it.
     ServiceError,
 
     /// Object integrity validation failed: the received bytes did not match the
@@ -851,5 +857,33 @@ mod tests {
         assert!(!is_sdk_transient_transport(&dispatch(
             ConnectorError::user("bad request".into())
         )));
+    }
+
+    // --- conditional-write precondition failures ------------------------------
+
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+
+    #[test]
+    fn precondition_failure_surfaces_as_service_error_with_code() {
+        // A failed `If-Match` / `If-None-Match` gets no kind of its own: callers
+        // identify it by the service code. S3 supplies that in the response body,
+        // so it is reachable whatever status the failure arrives with.
+        let sdk: SdkError<PutObjectError, HttpResponse> = SdkError::service_error(
+            PutObjectError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code("PreconditionFailed")
+                    .build(),
+            ),
+            HttpResponse::new(StatusCode::try_from(412).unwrap(), SdkBody::empty()),
+        );
+        let err = Error::from(sdk);
+        assert!(matches!(err.kind(), ErrorKind::ServiceError));
+        assert_eq!(err.code(), Some("PreconditionFailed"));
+        assert_eq!(err.operation_name(), Some("PutObject"));
+        // The underlying SdkError is preserved as the source.
+        assert!(std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<SdkError<PutObjectError, HttpResponse>>())
+            .is_some());
     }
 }
