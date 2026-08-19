@@ -188,12 +188,6 @@ impl UploadTransfer {
         let mut state = self.inner.state.lock().expect("lock poisoned");
 
         loop {
-            // Serve the `CompleteMPU` a transition unlocks on this same poll, rather than parking
-            // and waiting to be re-polled for work this call already knows about.
-            if try_begin_completing(&mut state) {
-                continue;
-            }
-
             match &mut *state {
                 UploadState::PendingInit {
                     init_in_flight,
@@ -236,9 +230,13 @@ impl UploadTransfer {
                     parts_in_flight,
                     ..
                 } => {
-                    // Dispatch finished here means parts are still in flight; `try_begin_completing`
-                    // above would have fired otherwise.
                     if plan.all_dispatched(*parts_dispatched, *eof) {
+                        // Last one out: transition now and serve the `CompleteMPU` it unlocks on
+                        // this same poll, rather than parking for a re-poll.
+                        if try_begin_completing(&mut state) {
+                            continue;
+                        }
+                        // Parts are still in flight; `on_part_completed` wakes this poll.
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
                     }
