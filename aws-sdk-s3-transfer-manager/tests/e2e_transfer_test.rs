@@ -615,3 +615,79 @@ async fn test_upload_if_none_match_star() {
         "real S3 must supply the service code callers identify the failure by"
     );
 }
+
+/// End-to-end: `if_match` on the object's current ETag succeeds (satisfied) and on
+/// a stale one fails (violated).
+///
+/// Covers the other conditional-write mode from [`test_upload_if_none_match_star`]:
+/// overwrite-if-unchanged, which a caller reaches by reading an ETag and writing it
+/// back. Each upload uses a different body length so a successful write moves the
+/// ETag, which is what makes the original genuinely stale rather than fabricated.
+///
+/// General-purpose bucket only, for the reason given on
+/// [`test_upload_if_none_match_star`].
+#[tokio::test]
+async fn test_upload_if_match_etag() {
+    use aws_sdk_s3_transfer_manager::error::ErrorKind;
+
+    let _logs = show_test_logs();
+    let (bucket_name, _express_bucket_name) = get_bucket_names();
+    let object_key = generate_key("if-match-etag");
+
+    let (tm, s3_client) = test_tm().await;
+
+    // Seed the key unconditionally, then read the ETag a caller would condition on.
+    perform_upload(
+        &tm,
+        &bucket_name,
+        &object_key,
+        None,
+        create_input_stream(1024),
+    )
+    .await;
+    let original_etag = s3_client
+        .head_object()
+        .bucket(&bucket_name)
+        .key(&object_key)
+        .send()
+        .await
+        .expect("head_object on the seeded key should succeed")
+        .e_tag()
+        .expect("S3 returns an ETag for a stored object")
+        .to_owned();
+
+    // 1) Satisfied: the ETag still matches, so the overwrite is allowed.
+    tm.upload()
+        .bucket(&bucket_name)
+        .key(&object_key)
+        .if_match(original_etag.as_str())
+        .body(create_input_stream(2048))
+        .initiate()
+        .expect("initiate should succeed")
+        .join()
+        .await
+        .expect("upload with If-Match on the current ETag must succeed");
+
+    // 2) Violated: that overwrite moved the ETag, so the original is now stale.
+    let err = tm
+        .upload()
+        .bucket(&bucket_name)
+        .key(&object_key)
+        .if_match(original_etag.as_str())
+        .body(create_input_stream(512))
+        .initiate()
+        .expect("initiate should succeed")
+        .join()
+        .await
+        .expect_err("upload with If-Match on a stale ETag must fail");
+    assert!(
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
+        err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "real S3 must supply the service code callers identify the failure by"
+    );
+}
