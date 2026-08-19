@@ -871,6 +871,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    // A test that returns with work still in flight leaves a strong `Handle` on the
+    // ambient runtime, so the `Handle` — and the S3 client it owns — is never dropped
+    // and shows up as a leak at process exit. Those tests are asan-gated too; see the
+    // note on `test_handle_managed` for the same root cause on managed threads.
     fn test_handle(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
@@ -1295,6 +1299,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_panic_transfer_cleaned_up_and_error_propagated() {
         let _logs = show_test_logs();
@@ -2203,6 +2208,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_panic_in_composite_poll_work() {
         let handle = test_handle(4);
@@ -2622,6 +2628,7 @@ mod tests {
     /// the IO charge; this pins that both are applied so that regression fails.
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_fused_ready_spawned_charges_both_io_and_spawn_vruntime() {
         let handle = test_handle(4);
