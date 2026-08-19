@@ -602,7 +602,7 @@ impl UploadTransfer {
                     .send()
                     .instrument(tracing::debug_span!("send-put-object"))
                     .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                    .map_err(|e| crate::retry::GuardError::Inner(e.into()))
             }
         })
         .instrument(tracing::debug_span!(

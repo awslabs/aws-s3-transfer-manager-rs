@@ -8,13 +8,21 @@ use std::sync::Arc;
 use std::task::ready;
 use std::{task::Poll, time::Duration};
 
-use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+use aws_sdk_s3::operation::complete_multipart_upload::{
+    CompleteMultipartUploadError, CompleteMultipartUploadOutput,
+};
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_sdk_s3_transfer_manager::error::ErrorKind;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::result::SdkError;
+use aws_smithy_runtime_api::http::StatusCode;
+use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 
@@ -283,4 +291,217 @@ async fn test_complete_mpu_sends_mpu_object_size() {
         .join()
         .await
         .expect("upload should succeed: CompleteMPU must carry MpuObjectSize = content length");
+}
+
+// --- Conditional-write preconditions -----------------------------------------
+//
+// Assertion shape: use `match_requests` to fail the mock unless the request
+// carries the header we expect, so a missing/wrong precondition surfaces as a
+// join failure rather than a silent pass.
+
+/// A single-PUT upload with `if_none_match("*")` must forward the header to
+/// `PutObject`. Satisfied case: the mock rule matches, upload succeeds.
+#[tokio::test]
+async fn test_put_object_forwards_if_none_match() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(|req| req.if_none_match() == Some("*"))
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_none_match("*")
+        .body(InputStream::from(vec![0u8; 1024]))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("PutObject must carry the caller's If-None-Match header");
+}
+
+/// When S3 returns 412 on the single-PUT path, the transfer must fail with the
+/// service code reachable — that is how a caller tells a failed `If-Match` from
+/// any other service error. The 412 must also be terminal: neither the SDK's own
+/// retry (412 is a non-retryable 4xx) nor the TM's outer retry loop may re-issue
+/// it, so the request is sent exactly once.
+#[tokio::test]
+async fn test_put_object_412_surfaces_precondition_failed_code() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object).then_http_response(|| {
+        HttpResponse::new(
+            StatusCode::try_from(412).unwrap(),
+            SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
+        )
+    });
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let err = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_match("\"stale-etag\"")
+        .body(InputStream::from(vec![0u8; 1024]))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a 412 on PutObject must fail the upload");
+    assert!(
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
+        err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "caller must be able to identify the precondition failure by service code"
+    );
+    // The underlying SdkError is preserved as the source for callers who want
+    // the raw 412 detail.
+    let src = std::error::Error::source(&err).expect("source is set");
+    assert!(
+        src.downcast_ref::<SdkError<PutObjectError, HttpResponse>>()
+            .is_some(),
+        "source should be the underlying PutObject SdkError"
+    );
+    // A precondition failure is deterministic — it must not be retried.
+    assert_eq!(
+        put_object.num_calls(),
+        1,
+        "PutObject 412 must be issued exactly once (no SDK or TM retry)"
+    );
+}
+
+/// The multipart path must forward `if_match` / `if_none_match` to
+/// `CompleteMultipartUpload` (and only there — never on `CreateMultipartUpload`
+/// or `UploadPart`, where S3 doesn't accept them and mixing them in would
+/// silently drop the header at build time).
+#[tokio::test]
+async fn test_complete_mpu_forwards_if_match() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content_length = 2 * part_size;
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+
+    let expected_etag = "\"expected-etag\"";
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.if_match() == Some(expected_etag))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let stream = TestStream::new(rx, content_length, content_length as u64);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_match(expected_etag)
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    drop(tx);
+    handle
+        .join()
+        .await
+        .expect("CompleteMultipartUpload must carry the caller's If-Match header");
+}
+
+/// When S3 rejects `CompleteMultipartUpload` with 412, the multipart path must
+/// surface the same service code the single-PUT path does. Mirrors that test but
+/// exercises the MPU code path (which fails at a different site than PutObject).
+#[tokio::test]
+async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content_length = 2 * part_size;
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu =
+        mock!(aws_sdk_s3::Client::complete_multipart_upload).then_http_response(|| {
+            HttpResponse::new(
+                StatusCode::try_from(412).unwrap(),
+                SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
+            )
+        });
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let stream = TestStream::new(rx, content_length, content_length as u64);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_match("\"stale-etag\"")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    drop(tx);
+    let err = handle
+        .join()
+        .await
+        .expect_err("a 412 on CompleteMultipartUpload must fail the upload");
+    assert!(
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
+        err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "caller must be able to identify the precondition failure by service code"
+    );
+    let src = std::error::Error::source(&err).expect("source is set");
+    assert!(
+        src.downcast_ref::<SdkError<CompleteMultipartUploadError, HttpResponse>>()
+            .is_some(),
+        "source should be the underlying CompleteMultipartUpload SdkError"
+    );
 }
