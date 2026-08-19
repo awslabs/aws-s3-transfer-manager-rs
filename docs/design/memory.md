@@ -1555,6 +1555,24 @@ fault. Deactivation failure enters `ProtectionPending` without assuming that pri
 remains. Discard success makes backing absent or reclaimable; discard failure may retain resident
 pages but cannot make the block claimable.
 
+**Alternative: Allocator-owned blocks.** A page-aligned allocation provides the same common-path
+carrier claim, return, and reuse while retained. The standard allocator API does not provide a
+per-block operation that revokes access and makes backing reclaimable while preserving ownership of
+the allocation. Retaining idle blocks therefore leaves resident-set reduction to allocator policy.
+Deallocating them gives up the address and makes physical release behavior allocator-dependent. This
+is a viable simpler design when reuse is primary and reclamation is best effort. The selected design
+instead gives idle trim an explicit page-level operation and failure contract.
+
+**Alternative: Release and replace virtual ranges.** A pool using operating-system mappings could
+release a trimmed range and allocate a new range on later growth. This returns virtual address space
+with the backing but makes trim a topology change. Old claim attempts and registry snapshots must
+retire before the address can be reused, or every stale lookup must detect replacement. Revival also
+requires a new slot or registry publication. The selected backend can make a block inaccessible and
+discard its backing or make it reclaimable without waiting for metadata readers to quiesce. Those
+readers may still observe the retired incarnation, but cannot construct or dereference a carrier
+pointer. The cost is one retained virtual reservation per peak block slot and target-specific
+mapping and recovery state.
+
 Correctness does not assume that a failed protection call leaves the prior protection unchanged.
 
 Prepared bytes are logically uninitialized regardless of initial or recommitted contents. Physical
