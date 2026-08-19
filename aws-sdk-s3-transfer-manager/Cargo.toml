@@ -40,21 +40,18 @@ hdrhistogram = "7"
 http-body-1x = { package = "http-body", version = "1" }
 same-file = "1.0.6"
 dial9-tokio-telemetry = { version = "0.3", optional = true, features = ["cpu-profiling"] }
+arc-swap = "1.9.2"
 
 [features]
 dial9 = ["dep:dial9-tokio-telemetry"]
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }
 
-# Total physical RAM via sysctl(hw.memsize).
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-
-# Total physical RAM via GlobalMemoryStatusEx; descriptor limit is not low on
-# Windows, so the connection cap there is the absolute ceiling.
+# Virtual memory and total physical RAM.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.128.0", features = ["behavior-version-latest", "test-util"] }
