@@ -34,16 +34,16 @@ use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use tracing::Instrument;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::error::Error;
-use crate::io::part_reader::Builder as PartReaderBuilder;
-use crate::io::InputStream;
-use crate::operation::upload::context::UploadState;
+use crate::error::{Error, ErrorKind};
+use crate::io::part_reader::{Builder as PartReaderBuilder, PartReader};
+use crate::io::{InputStream, PartData};
+use crate::operation::upload::context::{PartPlan, UploadState};
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
@@ -62,6 +62,13 @@ pub(crate) enum UploadWork {
 
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
+
+/// Initial capacity for the completed-part list when the content length is unknown.
+///
+/// There is no part count to size it by, so this only avoids a few early reallocations; the list
+/// grows as parts complete. Matches the CRT reference's default, which is likewise "arbitrary
+/// picked to avoid using allocations and using too much memory".
+const UNKNOWN_LENGTH_DEFAULT_NUM_PARTS: usize = 32;
 
 /// Upload transfer that generates and executes upload work.
 ///
@@ -97,19 +104,22 @@ impl UploadTransfer {
         request: UploadInput,
         stream: InputStream,
     ) -> Self {
-        // TODO: For unknown content length (streaming uploads), this will need adjustment.
-        let content_length = stream
-            .size_hint()
-            .upper()
-            .expect("content_length required; unknown length not yet supported");
+        // `None` for a `PartStream` whose total size is not known up front. Such a source is always
+        // `is_mpu_only`, so it routes through the multipart path and its parts are dispatched
+        // speculatively until the reader reports end-of-stream (see `PartPlan`).
+        let content_length = stream.size_hint().upper();
 
-        ctx.set_total_bytes(content_length);
+        // Only meaningful when the length is known; an unknown-length transfer reports
+        // `total_bytes: None` while in progress and sets it at end-of-stream.
+        if let Some(content_length) = content_length {
+            ctx.set_total_bytes(content_length);
+        }
 
         let inner = Arc::new(UploadTransferInner {
             ctx,
             state: Mutex::new(UploadState::PendingInit {
                 stream: Some(stream),
-                content_length: Some(content_length),
+                content_length,
                 init_in_flight: false,
             }),
             request: Arc::new(request),
@@ -177,91 +187,84 @@ impl UploadTransfer {
 
         let mut state = self.inner.state.lock().expect("lock poisoned");
 
-        match &mut *state {
-            UploadState::PendingInit {
-                init_in_flight,
-                content_length,
-                stream,
-            } => {
-                if *init_in_flight {
-                    self.inner.ctx.set_pending();
-                    return PollWork::Pending;
-                }
-
-                let use_mpu = stream.as_ref().is_some_and(|s| s.is_mpu_only())
-                    || content_length.unwrap_or(0) >= self.inner.ctx.handle.mpu_threshold_bytes();
-                if use_mpu {
-                    *init_in_flight = true;
-                    PollWork::ready(IoRequest {
-                        data: Some(Box::new(UploadWork::CreateMPU)),
-                    })
-                } else {
-                    let taken_stream = stream.take().expect("stream already taken");
-                    *state = UploadState::PutObjectInFlight;
-                    PollWork::ready(IoRequest {
-                        data: Some(Box::new(UploadWork::PutObject {
-                            stream: Some(taken_stream),
-                        })),
-                    })
-                }
-            }
-            UploadState::Transferring {
-                parts_dispatched,
-                total_parts,
-                parts_in_flight,
-                ..
-            } => {
-                if *parts_dispatched >= *total_parts {
-                    if *parts_in_flight > 0 {
+        loop {
+            match &mut *state {
+                UploadState::PendingInit {
+                    init_in_flight,
+                    content_length,
+                    stream,
+                } => {
+                    if *init_in_flight {
                         self.inner.ctx.set_pending();
                         return PollWork::Pending;
                     }
-                    // All parts sent and completed — transition to Completing
-                    if let UploadState::Transferring {
-                        upload_id,
-                        part_reader,
-                        completed_parts,
-                        response_builder,
-                        content_length,
-                        ..
-                    } = std::mem::replace(&mut *state, UploadState::Done)
-                    {
-                        *state = UploadState::Completing {
-                            upload_id: Some(upload_id),
-                            part_reader: Some(part_reader),
-                            completed_parts: Some(completed_parts),
-                            response_builder: Some(response_builder),
-                            complete_in_flight: false,
-                            content_length,
-                        };
-                    }
-                    drop(state);
-                    self.inner.ctx.try_wake();
-                    return PollWork::Pending;
+
+                    // The single-request path requires a content length, so a source without one has
+                    // to go multipart regardless of what the threshold comparison would say.
+                    let use_mpu = match *content_length {
+                        None => true,
+                        Some(len) => {
+                            stream.as_ref().is_some_and(|s| s.is_mpu_only())
+                                || len >= self.inner.ctx.handle.mpu_threshold_bytes()
+                        }
+                    };
+                    return if use_mpu {
+                        *init_in_flight = true;
+                        PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::CreateMPU)),
+                        })
+                    } else {
+                        let taken_stream = stream.take().expect("stream already taken");
+                        *state = UploadState::PutObjectInFlight;
+                        PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::PutObject {
+                                stream: Some(taken_stream),
+                            })),
+                        })
+                    };
                 }
-                *parts_dispatched += 1;
-                *parts_in_flight += 1;
-                PollWork::ready(IoRequest {
-                    data: Some(Box::new(UploadWork::UploadPart)),
-                })
-            }
-            UploadState::Completing {
-                complete_in_flight, ..
-            } => {
-                if *complete_in_flight {
+                UploadState::Transferring {
+                    parts_dispatched,
+                    plan,
+                    eof,
+                    parts_in_flight,
+                    ..
+                } => {
+                    if plan.all_dispatched(*parts_dispatched, *eof) {
+                        // Last one out: transition now and serve the `CompleteMPU` it unlocks on
+                        // this same poll, rather than parking for a re-poll.
+                        if try_begin_completing(&mut state) {
+                            continue;
+                        }
+                        // Parts are still in flight; `on_part_completed` wakes this poll.
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
+
+                    *parts_dispatched += 1;
+                    *parts_in_flight += 1;
+                    return PollWork::ready(IoRequest {
+                        data: Some(Box::new(UploadWork::UploadPart)),
+                    });
+                }
+                UploadState::Completing {
+                    complete_in_flight, ..
+                } => {
+                    if *complete_in_flight {
+                        self.inner.ctx.set_pending();
+                        return PollWork::Pending;
+                    }
+                    *complete_in_flight = true;
+                    return PollWork::ready(IoRequest {
+                        data: Some(Box::new(UploadWork::CompleteMPU)),
+                    });
+                }
+                UploadState::PutObjectInFlight => {
                     self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 }
-                *complete_in_flight = true;
-                PollWork::ready(IoRequest {
-                    data: Some(Box::new(UploadWork::CompleteMPU)),
-                })
+                UploadState::Done => return PollWork::Done,
             }
-            UploadState::PutObjectInFlight => {
-                self.inner.ctx.set_pending();
-                PollWork::Pending
-            }
-            UploadState::Done => PollWork::Done,
         }
     }
 
@@ -318,18 +321,30 @@ impl UploadTransfer {
                     ..
                 } => (
                     stream.take().expect("stream already taken"),
-                    content_length.take().expect("content_length already taken"),
+                    content_length.take(),
                 ),
                 _ => panic!("unexpected state for create_mpu"),
             }
         };
 
-        let part_size = cmp::max(
-            self.inner.ctx.handle.upload_part_size_bytes(),
-            content_length.div_ceil(MAX_PARTS),
-        );
+        // With a known length the part size is bumped so the part count fits within `MAX_PARTS`.
+        // With an unknown length there is no total to bump against, so the configured size is used
+        // as-is and the object is bounded by `part_size * MAX_PARTS` (guarded in `poll_work`).
+        let part_size = match content_length {
+            Some(content_length) => cmp::max(
+                self.inner.ctx.handle.upload_part_size_bytes(),
+                content_length.div_ceil(MAX_PARTS),
+            ),
+            None => self.inner.ctx.handle.upload_part_size_bytes(),
+        };
 
-        let total_parts = content_length.div_ceil(part_size);
+        let plan = match content_length {
+            Some(content_length) => PartPlan::Known {
+                total_parts: content_length.div_ceil(part_size),
+                declared_object_size: content_length,
+            },
+            None => PartPlan::Unknown,
+        };
 
         tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
 
@@ -347,23 +362,29 @@ impl UploadTransfer {
             },
         );
 
+        let completed_parts_capacity = match &plan {
+            PartPlan::Known { total_parts, .. } => *total_parts as usize,
+            PartPlan::Unknown => UNKNOWN_LENGTH_DEFAULT_NUM_PARTS,
+        };
+
         {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             *state = UploadState::Transferring {
                 upload_id,
                 part_reader,
                 parts_dispatched: 0,
-                total_parts,
+                plan,
+                eof: false,
                 parts_in_flight: 0,
-                completed_parts: Vec::with_capacity(total_parts as usize),
+                completed_parts: Vec::with_capacity(completed_parts_capacity),
                 response_builder,
-                content_length,
+                bytes_uploaded: 0,
             };
         }
 
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            total_parts,
+            total_parts = content_length.map(|len| len.div_ceil(part_size)),
             part_size,
             "MPU created, transferring",
         );
@@ -372,10 +393,12 @@ impl UploadTransfer {
     }
 
     async fn execute_upload_part(&self) -> WorkOutcome {
-        let part_reader = {
+        let (part_reader, is_unknown) = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
-                UploadState::Transferring { part_reader, .. } => part_reader.clone(),
+                UploadState::Transferring {
+                    part_reader, plan, ..
+                } => (part_reader.clone(), matches!(plan, PartPlan::Unknown)),
                 _ => panic!("unexpected state for read_part"),
             }
         };
@@ -388,12 +411,72 @@ impl UploadTransfer {
             Ok(Some(data)) => data,
             Ok(None) => {
                 tracing::trace!("part_reader exhausted");
-                self.maybe_transition_to_completing();
-                return WorkOutcome::Success { data: None };
+                return self.on_end_of_stream(&part_reader).await;
             }
             Err(e) => return self.fail(e.into()),
         };
 
+        // Guard the S3 part-count ceiling by the number of parts the reader has actually yielded,
+        // not by speculative dispatches. Fail before sending the (MAX_PARTS + 1)-th so the caller
+        // gets an error naming the remedy instead of S3's opaque `InvalidArgument` on part 10001.
+        if is_unknown && part_reader.parts_yielded() > MAX_PARTS {
+            return self.fail(Error::new(
+                ErrorKind::InputInvalid,
+                format!(
+                    "stream exceeds the maximum of {MAX_PARTS} parts at the current part size; \
+                     configure a larger part size to upload an object this large without a known \
+                     content length"
+                ),
+            ));
+        }
+
+        self.send_part(data).await
+    }
+
+    /// Handle an unknown-length reader reaching end-of-stream: mark `eof`, and if the stream turned
+    /// out empty, synthesize the one zero-length part S3 requires (a multipart upload must list at
+    /// least one part).
+    ///
+    /// `parts_yielded()` is final at end-of-stream (see its docs for the ordering guarantee), so
+    /// `== 0` is an exact emptiness test. Exactly one caller synthesizes: only the one that flips
+    /// `eof` false→true takes that branch.
+    async fn on_end_of_stream(&self, part_reader: &PartReader) -> WorkOutcome {
+        let empty_and_owned = {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
+                UploadState::Transferring { eof, plan, .. } if !*eof => {
+                    *eof = true;
+                    // Gated on `Unknown`: a declared length already carries a part count, so a
+                    // source that declares a size and then delivers nothing must not have a part
+                    // invented for it — that would contradict the size it declared.
+                    matches!(plan, PartPlan::Unknown) && part_reader.parts_yielded() == 0
+                }
+                _ => false,
+            }
+        };
+        // `eof` may unblock a `poll_work` parked on in-flight parts, and it is set here in `execute`
+        // while the poller may already be parked — so signal the edge or the transfer hangs (see the
+        // wake protocol on `TransferContext::set_pending`).
+        self.inner.ctx.try_wake();
+
+        if empty_and_owned {
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "empty unknown-length stream; uploading a single empty part",
+            );
+            return self.send_part(PartData::new(1, Bytes::new())).await;
+        }
+
+        self.on_part_completed();
+        WorkOutcome::Success { data: None }
+    }
+
+    /// Upload one part and record it, then advance the state machine.
+    ///
+    /// Shared by the ordinary read-a-part path and the synthesized empty part 1 (see
+    /// [`Self::on_end_of_stream`]), so both go through the same retry classification, metrics, and
+    /// completion handoff.
+    async fn send_part(&self, data: PartData) -> WorkOutcome {
         // 2. Send part over network
         let upload_id = {
             let state = self.inner.state.lock().expect("lock poisoned");
@@ -477,10 +560,13 @@ impl UploadTransfer {
         {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             if let UploadState::Transferring {
-                completed_parts, ..
+                completed_parts,
+                bytes_uploaded,
+                ..
             } = &mut *state
             {
                 completed_parts.push(completed);
+                *bytes_uploaded += bytes_sent;
             }
         }
 
@@ -496,45 +582,26 @@ impl UploadTransfer {
             ..Default::default()
         });
 
-        self.maybe_transition_to_completing();
+        self.on_part_completed();
 
         WorkOutcome::Success { data: None }
     }
 
-    fn maybe_transition_to_completing(&self) {
+    /// Release the slot a dispatched `UploadPart` held, and hand off to `Completing` if it was the
+    /// last one out.
+    ///
+    /// Fires for every completed `UploadPart` dispatch, including one whose read only found
+    /// end-of-stream. This is the mutator side of the wake protocol: the state that could unblock a
+    /// parked `poll_work` is mutated under the lock, then the lock is dropped before signalling.
+    fn on_part_completed(&self) {
         let mut state = self.inner.state.lock().expect("lock poisoned");
-        let should_complete = if let UploadState::Transferring {
-            parts_in_flight,
-            parts_dispatched,
-            total_parts,
-            ..
+        if let UploadState::Transferring {
+            parts_in_flight, ..
         } = &mut *state
         {
             *parts_in_flight -= 1;
-            *parts_dispatched >= *total_parts && *parts_in_flight == 0
-        } else {
-            false
-        };
-
-        if should_complete {
-            if let UploadState::Transferring {
-                upload_id,
-                part_reader,
-                completed_parts,
-                response_builder,
-                content_length,
-                ..
-            } = std::mem::replace(&mut *state, UploadState::Done)
-            {
-                *state = UploadState::Completing {
-                    upload_id: Some(upload_id),
-                    part_reader: Some(part_reader),
-                    completed_parts: Some(completed_parts),
-                    response_builder: Some(response_builder),
-                    complete_in_flight: false,
-                    content_length,
-                };
-            }
+        }
+        if try_begin_completing(&mut state) {
             drop(state);
             self.inner.ctx.try_wake();
         }
@@ -547,6 +614,8 @@ impl UploadTransfer {
             .take()
             .expect("stream should be present for PutObject");
 
+        // `poll_work` sends every source without a declared length to the multipart path, so reaching
+        // here means the length is known.
         let content_length = stream
             .size_hint()
             .upper()
@@ -659,7 +728,7 @@ impl UploadTransfer {
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
-        let (upload_id, mut completed_parts, response_builder, part_reader, content_length) = {
+        let (upload_id, mut completed_parts, response_builder, part_reader, plan, bytes_uploaded) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             match &mut *state {
                 UploadState::Completing {
@@ -667,7 +736,8 @@ impl UploadTransfer {
                     completed_parts,
                     response_builder,
                     part_reader,
-                    content_length,
+                    plan,
+                    bytes_uploaded,
                     ..
                 } => (
                     upload_id.take().expect("upload_id already taken"),
@@ -678,7 +748,8 @@ impl UploadTransfer {
                         .take()
                         .expect("response_builder already taken"),
                     part_reader.take().expect("part_reader already taken"),
-                    *content_length,
+                    std::mem::replace(plan, PartPlan::Unknown),
+                    *bytes_uploaded,
                 ),
                 _ => panic!("unexpected state for complete_mpu"),
             }
@@ -686,17 +757,41 @@ impl UploadTransfer {
 
         completed_parts.sort_by_key(|p| p.part_number);
 
+        // S3 sums the parts it assembled and rejects CompleteMPU when the total doesn't match the
+        // `MpuObjectSize` sent, so a dropped or duplicated part fails the complete instead of
+        // silently producing a wrong-sized object (SEP step 7). Sending the source's declared size on
+        // the known path keeps that check independent of our own part accounting; the unknown path has
+        // no declared size, so its check can only catch an S3-side assembly mismatch.
+        let object_size = match plan {
+            PartPlan::Known {
+                declared_object_size,
+                ..
+            } => {
+                // `declared_object_size` is `size_hint().upper()` — a bound, so under-delivery is
+                // legal input and only over-delivery implies we over-counted.
+                debug_assert!(
+                    bytes_uploaded <= declared_object_size,
+                    "uploaded {bytes_uploaded} bytes, more than the declared upper bound of \
+                     {declared_object_size}; part accounting over-counted"
+                );
+                declared_object_size
+            }
+            PartPlan::Unknown => bytes_uploaded,
+        };
+
+        // An unknown-length transfer could not report a total while in flight (progress is genuinely
+        // unknowable there). By now the stream has ended and `object_size` is exact, so final
+        // metrics report the true size. `set_total_bytes` is a `OnceLock` set, so this is a no-op
+        // when the length was known up front.
+        self.inner.ctx.set_total_bytes(object_size);
+
         let base_req = self
             .inner
             .ctx
             .s3_client()
             .complete_multipart_upload()
             .upload_id(&upload_id)
-            // S3 sums the parts it assembled and rejects CompleteMPU when the
-            // total doesn't match this value, so a dropped or duplicated part
-            // surfaces as a failed complete rather than a wrong-sized object.
-            // Required by SEP step 7.
-            .mpu_object_size(content_length as i64)
+            .mpu_object_size(object_size as i64)
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(completed_parts))
@@ -750,6 +845,45 @@ impl UploadTransfer {
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
+}
+
+/// If every part has been dispatched and none remain in flight, move `Transferring` → `Completing`
+/// and report that it did.
+///
+/// Returns `true` to exactly one caller: the `mem::replace` below makes that call the sole owner of
+/// the moved-out fields, so completion is set up once even when a poll and a part completion race to
+/// be last one out.
+fn try_begin_completing(state: &mut UploadState) -> bool {
+    let ready = matches!(
+        state,
+        UploadState::Transferring { parts_dispatched, plan, eof, parts_in_flight, .. }
+            if plan.all_dispatched(*parts_dispatched, *eof) && *parts_in_flight == 0
+    );
+    if !ready {
+        return false;
+    }
+
+    if let UploadState::Transferring {
+        upload_id,
+        part_reader,
+        completed_parts,
+        response_builder,
+        plan,
+        bytes_uploaded,
+        ..
+    } = std::mem::replace(state, UploadState::Done)
+    {
+        *state = UploadState::Completing {
+            upload_id: Some(upload_id),
+            part_reader: Some(part_reader),
+            completed_parts: Some(completed_parts),
+            response_builder: Some(response_builder),
+            complete_in_flight: false,
+            plan,
+            bytes_uploaded,
+        };
+    }
+    true
 }
 
 impl Transfer for UploadTransfer {
@@ -817,6 +951,52 @@ mod tests {
             RuleMode::MatchAny,
             &[create_mpu, upload_part, complete_mpu]
         )
+    }
+
+    /// A source with no declared length is routed to the multipart path, which is the only one that
+    /// can serve it. The stream is below the multipart threshold, so a threshold comparison against a
+    /// defaulted-to-zero length would pick the single-request path instead.
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_poll_work_unknown_length_routes_to_multipart() {
+        struct NoUpperBound;
+        impl crate::io::PartStream for NoUpperBound {
+            fn poll_part(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _stream_cx: &crate::io::StreamContext,
+            ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+                std::task::Poll::Ready(None)
+            }
+            fn size_hint(&self) -> crate::io::SizeHint {
+                crate::io::SizeHint::default()
+            }
+        }
+
+        let handle = crate::client::Handle::test_handle_tokio(
+            crate::Config::builder()
+                .client(mock_client!(aws_sdk_s3, []))
+                .build(),
+        );
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = UploadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            InputStream::from_part_stream(NoUpperBound),
+        );
+
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(
+            matches!(work.data_mut::<UploadWork>(), UploadWork::CreateMPU),
+            "an unknown-length source must not be routed to the single-request path"
+        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

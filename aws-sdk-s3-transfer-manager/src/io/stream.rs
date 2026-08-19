@@ -163,6 +163,19 @@ impl InputStream {
     /// NOTE: Implementing `PartStream` directly is a more advanced use case. You should reach for
     /// one of the provided implementations or adapters first if possible.
     ///
+    /// # Streams of unknown length
+    ///
+    /// A stream whose [`size_hint`](PartStream::size_hint) has no upper bound is read until it ends,
+    /// with no declared total. Prefer declaring a size when one is available, because without it:
+    ///
+    /// - The object is capped at `part_size * 10_000` — about 78 GiB at the default part size, since
+    ///   there is no total to size parts against. Exceeding it fails partway through, not up front,
+    ///   and the parts already uploaded are lost. Configure a larger part size for larger objects.
+    /// - A failure mid-stream leaves an incomplete multipart upload. Call
+    ///   [`abort`](crate::operation::upload::UploadHandle::abort), or use S3 lifecycle rules.
+    /// - `MpuObjectSize` is the size actually uploaded rather than an independently declared one, so
+    ///   it cannot detect a part this crate dropped or duplicated.
+    ///
     /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
     pub fn from_part_stream<T: PartStream + Send + Sync + 'static>(stream: T) -> Self {
         let inner = RawInputStream::Dyn(BoxStream::new(stream));

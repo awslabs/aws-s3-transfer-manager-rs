@@ -5,6 +5,7 @@
 use std::cmp;
 use std::fs::File;
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
@@ -113,6 +114,25 @@ impl PartReader {
     pub(crate) fn part_size(&self) -> usize {
         self.stream_cx.part_size()
     }
+
+    /// Number of parts this reader has produced.
+    ///
+    /// Exact for `Dyn`, and bumped inside the lock that produces the part: end-of-stream
+    /// (`Ok(None)`) is only observed once every part the stream will yield is counted, so a caller
+    /// driving speculative, concurrent reads can test emptiness (`0` at end-of-stream) without a
+    /// second lock of its own to race against. Only `Dyn` can have an unknown length, so only `Dyn`
+    /// needs that.
+    ///
+    /// `Bytes` and `Fs` derive it from their part-number cursor. `Fs` advances that cursor when it
+    /// reserves a part, so its count can lead the parts actually returned by an in-flight or failed
+    /// read.
+    pub(crate) fn parts_yielded(&self) -> u64 {
+        match &self.inner {
+            Inner::Bytes(bytes) => bytes.parts_yielded(),
+            Inner::Fs(path_body) => path_body.parts_yielded(),
+            Inner::Dyn(part_stream) => part_stream.parts_yielded(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -187,6 +207,10 @@ impl BytesPartReader {
 }
 
 impl BytesPartReader {
+    fn parts_yielded(&self) -> u64 {
+        self.state.lock().expect("lock valid").part_number - 1
+    }
+
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
@@ -245,6 +269,10 @@ impl PathBodyPartReader {
 }
 
 impl PathBodyPartReader {
+    fn parts_yielded(&self) -> u64 {
+        self.state.lock().expect("lock valid").part_number - 1
+    }
+
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let (offset, part_number, part_size, is_last) = match self.advance(stream_cx)? {
             Some(PathBodyReadCursor {
@@ -374,19 +402,34 @@ pub(crate) mod file_util {
 #[derive(Debug)]
 struct DynPartReader {
     inner: tokio::sync::Mutex<BoxStream>,
+    /// Counted explicitly: unlike the buffer and file variants, a `PartStream` carries no
+    /// part-number cursor to derive it from.
+    parts_yielded: AtomicU64,
 }
 
 impl DynPartReader {
     fn new(inner: BoxStream) -> Self {
         Self {
             inner: tokio::sync::Mutex::new(inner),
+            parts_yielded: AtomicU64::new(0),
         }
     }
+
+    fn parts_yielded(&self) -> u64 {
+        self.parts_yielded.load(Ordering::Acquire)
+    }
+
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         // TODO - can we do better than a mutex here? should we spawn a dedicated task and use channels instead
         let mut stream = self.inner.lock().await;
         match stream.next(stream_cx).await {
-            Some(result) => result.map(Some).map_err(|err| err.into()),
+            Some(Ok(part)) => {
+                // Counted inside the lock that produces the part: a concurrent end-of-stream read
+                // must not be able to observe a stale count.
+                self.parts_yielded.fetch_add(1, Ordering::Release);
+                Ok(Some(part))
+            }
+            Some(Err(err)) => Err(err.into()),
             None => Ok(None),
         }
     }

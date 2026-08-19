@@ -17,6 +17,7 @@ use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3_transfer_manager::error::ErrorKind;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
@@ -86,6 +87,49 @@ impl PartStream for TestStream {
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::exact(self.size_hint)
+    }
+}
+
+pin_project! {
+    /// A `PartStream` whose total size is not known up front: `size_hint` has no upper bound.
+    ///
+    /// Mirrors a caller like Mountpoint, which writes an object whose final size is only known once
+    /// the writer closes. Parts arrive over a channel; closing the sender is end-of-stream.
+    #[derive(Debug)]
+    struct UnknownLengthStream {
+        next_part_num: u64,
+        rx: mpsc::Receiver<Bytes>,
+    }
+}
+
+impl UnknownLengthStream {
+    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+        Self {
+            next_part_num: 1,
+            rx,
+        }
+    }
+}
+
+impl PartStream for UnknownLengthStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        let data = ready!(this.rx.poll_recv(cx));
+        let part = data.map(|b| {
+            let part_num = *this.next_part_num;
+            *this.next_part_num += 1;
+            Ok(PartData::new(part_num, b))
+        });
+        Poll::Ready(part)
+    }
+
+    /// No upper bound — this is what routes the upload down the unknown-length path.
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
     }
 }
 
@@ -291,6 +335,741 @@ async fn test_complete_mpu_sends_mpu_object_size() {
         .join()
         .await
         .expect("upload should succeed: CompleteMPU must carry MpuObjectSize = content length");
+}
+
+// --- Unknown content length --------------------------------------------------
+//
+// An unknown-length source is always a `PartStream`, which is `is_mpu_only`, so
+// these all exercise the multipart path. Termination comes from the reader
+// reporting end-of-stream rather than from a part count.
+
+/// A stream with no declared length uploads via multipart and completes.
+#[tokio::test]
+async fn test_unknown_length_multipart_upload() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    // Two full parts, then end-of-stream by dropping the sender.
+    for _ in 0..2 {
+        tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    }
+    drop(tx);
+
+    handle
+        .join()
+        .await
+        .expect("an unknown-length stream must upload, not panic");
+}
+
+/// An empty unknown-length stream must complete as a normal 0-byte object.
+///
+/// S3 rejects a CompleteMultipartUpload that lists no parts, so "no bytes" cannot
+/// mean "no parts": the transfer synthesizes a single empty part 1. The mock
+/// asserts exactly that shape — one UploadPart, part number 1, zero bytes.
+#[tokio::test]
+async fn test_unknown_length_empty_stream() {
+    let upload_id = "test-upload-id".to_owned();
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    // Matches only a zero-length part 1; anything else leaves the rule unproven.
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(1) && req.content_length() == Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
+
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(|req| req.mpu_object_size() == Some(0))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    // Empty: end-of-stream without ever sending data.
+    drop(tx);
+
+    handle
+        .join()
+        .await
+        .expect("an empty unknown-length stream must complete as a 0-byte object");
+
+    // Exactly one part, so CompleteMPU cannot have carried a duplicate part 1.
+    assert_eq!(
+        upload_part.num_calls(),
+        1,
+        "empty stream must upload exactly one (empty) part"
+    );
+}
+
+/// `MpuObjectSize` for an unknown-length upload is the sum of the bytes actually
+/// uploaded. With no declared length there is no independent witness, but the
+/// value must still be sent so S3 can reject a mismatched assembly.
+#[tokio::test]
+async fn test_unknown_length_mpu_object_size_is_running_sum() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    // Deliberately not a part-size multiple, so a part-count-derived value wouldn't match.
+    let total = 2 * part_size + 1024;
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.mpu_object_size() == Some(total as i64))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; 1024])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect(
+        "CompleteMPU must carry MpuObjectSize equal to the summed bytes of an unknown-length stream",
+    );
+}
+
+/// A known-length upload must keep sending its *declared* size as `MpuObjectSize`,
+/// not a sum accumulated from the parts it uploaded.
+///
+/// The declared length is an independent witness: it comes from the source rather
+/// than from this crate's own part accounting, so it also catches a part the crate
+/// itself dropped or duplicated. A running sum cannot. Unifying the two paths onto
+/// one accumulator would look like a simplification and would quietly lose that,
+/// so this pins the known-length path against that refactor.
+#[tokio::test]
+async fn test_known_length_sends_declared_size_not_running_sum() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let declared = 2 * part_size;
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    // Drop every part on the floor: no part response contributes an ETag, so a
+    // sum-derived MpuObjectSize would be wrong while the declared one stays right.
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.mpu_object_size() == Some(declared as i64))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(2);
+    let stream = TestStream::new(rx, declared, declared as u64);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    drop(tx);
+
+    handle
+        .join()
+        .await
+        .expect("a known-length upload must send its declared content length as MpuObjectSize");
+}
+
+/// A stream that yields data must never *also* send an empty part 1.
+///
+/// The empty-part rule only applies when the stream turned out to be empty. Parts
+/// are dispatched speculatively, so the dispatch that reads end-of-stream can run
+/// while the first data part is still in flight; if "has anything been emitted" is
+/// recorded only once that send completes, the end-of-stream dispatch sees "nothing
+/// emitted" and synthesizes a *second* part 1. CompleteMultipartUpload would then
+/// list part 1 twice — and whichever write S3 kept last could truncate the object.
+#[tokio::test]
+async fn test_unknown_length_with_data_never_sends_empty_part() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    // Split the part rules by body size so the empty one's call count is the assertion.
+    let empty_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() == Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
+    let data_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() != Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("data-etag").build());
+
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &empty_part, &data_part, &complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    // Exactly one data part, then end-of-stream.
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect("upload should succeed");
+
+    assert_eq!(
+        1,
+        data_part.num_calls(),
+        "the single data part must be uploaded once"
+    );
+    assert_eq!(
+        0,
+        empty_part.num_calls(),
+        "a stream that yielded data must not also send an empty part 1"
+    );
+}
+
+pin_project! {
+    /// An unknown-length `PartStream` that also supplies a full-object checksum.
+    ///
+    /// `full_object_checksum` is consulted once, after the final part, and only when the
+    /// upload uses a `FullObject` checksum strategy without a value set up front. Pairing
+    /// it with an unknown length is the combination the design flagged as needing
+    /// coverage: the size is not known when the strategy is chosen.
+    #[derive(Debug)]
+    struct UnknownLengthChecksumStream {
+        next_part_num: u64,
+        rx: mpsc::Receiver<Bytes>,
+        full_object_checksum: Option<String>,
+    }
+}
+
+impl UnknownLengthChecksumStream {
+    fn new(rx: mpsc::Receiver<Bytes>, full_object_checksum: Option<String>) -> Self {
+        Self {
+            next_part_num: 1,
+            rx,
+            full_object_checksum,
+        }
+    }
+}
+
+impl PartStream for UnknownLengthChecksumStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        let data = ready!(this.rx.poll_recv(cx));
+        let part = data.map(|b| {
+            let part_num = *this.next_part_num;
+            *this.next_part_num += 1;
+            Ok(PartData::new(part_num, b))
+        });
+        Poll::Ready(part)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+
+    fn full_object_checksum(&self) -> Option<String> {
+        self.full_object_checksum.clone()
+    }
+}
+
+/// A full-object checksum supplied by the stream must reach CompleteMultipartUpload even
+/// though the length was never declared.
+///
+/// The checksum is a property of the stream, not of any part, so it is orthogonal to the
+/// unknown-length machinery — this pins that, since the value is only produced after the
+/// final part and the transfer decides "final" from end-of-stream rather than a count.
+#[tokio::test]
+async fn test_unknown_length_forwards_full_object_checksum() {
+    let upload_id = "test-upload-id".to_owned();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    // Base64 of a CRC32 value; the mock only checks that it is forwarded verbatim.
+    let expected_checksum = "AAAAAA==";
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.checksum_crc32() == Some(expected_checksum))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(1);
+    let stream = UnknownLengthChecksumStream::new(rx, Some(expected_checksum.to_owned()));
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+
+    handle
+        .join()
+        .await
+        .expect("a stream-supplied full-object checksum must be sent on CompleteMPU");
+}
+
+/// An unknown-length transfer cannot report a total while in flight, but its final
+/// metrics must report the true size.
+///
+/// `total_bytes` is seeded from the size hint, which is absent here, so it is set once
+/// end-of-stream makes the summed size exact. Without that, a completed streaming upload
+/// would report `total_bytes: None` forever.
+#[tokio::test]
+async fn test_unknown_length_reports_total_bytes_after_completion() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tail = 512;
+    let expected = (part_size + tail) as u64;
+
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    // No declared length, so nothing to report yet.
+    assert_eq!(
+        None,
+        handle.metrics().total_bytes,
+        "an unknown-length transfer must not invent a total while in flight"
+    );
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; tail])).await.unwrap();
+    drop(tx);
+
+    let output = handle.join().await.expect("upload should succeed");
+
+    assert_eq!(
+        Some(expected),
+        output.metrics.total_bytes,
+        "final metrics must report the streamed size once end-of-stream makes it exact"
+    );
+    assert_eq!(
+        expected, output.metrics.network_tx,
+        "every streamed byte must be accounted for on the wire"
+    );
+}
+
+/// A reader error part-way through an unknown-length stream fails the transfer rather
+/// than being mistaken for end-of-stream.
+///
+/// `Ok(None)` means "done" and `Err` means "broken"; conflating them would silently
+/// complete a truncated object, which is the worst possible outcome for an upload.
+#[tokio::test]
+async fn test_unknown_length_reader_error_fails_transfer() {
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(FailingUnknownLengthStream {
+            yielded: false,
+        }))
+        .initiate()
+        .unwrap();
+
+    let err = handle
+        .join()
+        .await
+        .expect_err("a reader error must fail the upload, not complete it");
+    assert!(
+        matches!(err.kind(), ErrorKind::IOError),
+        "expected an IO error, got {:?}",
+        err.kind()
+    );
+}
+
+/// Yields one part, then errors — never reports end-of-stream.
+#[derive(Debug)]
+struct FailingUnknownLengthStream {
+    yielded: bool,
+}
+
+impl PartStream for FailingUnknownLengthStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        if self.yielded {
+            return Poll::Ready(Some(Err(std::io::Error::other("simulated reader failure"))));
+        }
+        self.yielded = true;
+        let data = vec![0u8; stream_cx.part_size()];
+        Poll::Ready(Some(Ok(PartData::new(1, data))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// A stream that yields more parts than the unknown-length default capacity must still
+/// complete with every part accounted for.
+///
+/// With no declared length there is no part count to size `completed_parts` by, so it
+/// starts at a small default (32) and grows. This walks past that boundary so a
+/// mis-sized or truncated part list would show up as a wrong `MpuObjectSize`.
+#[tokio::test]
+async fn test_unknown_length_many_parts_grows_part_list() {
+    let upload_id = "test-upload-id".to_owned();
+    // Smallest permitted part size keeps the test cheap; 40 parts crosses the 32 default.
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let num_parts = 40usize;
+    let expected_total = (part_size * num_parts) as i64;
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.mpu_object_size() == Some(expected_total))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let (tx, rx) = mpsc::channel(4);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+
+    tokio::spawn(async move {
+        for _ in 0..num_parts {
+            if tx.send(Bytes::from(vec![0u8; part_size])).await.is_err() {
+                return;
+            }
+        }
+        drop(tx);
+    });
+
+    handle
+        .join()
+        .await
+        .expect("an unknown-length stream must handle more parts than the default capacity");
+
+    assert_eq!(
+        num_parts,
+        upload_part.num_calls(),
+        "every part must be uploaded exactly once"
+    );
+}
+
+pin_project! {
+    /// An unknown-length `PartStream` that yields `total` one-byte parts, then end-of-stream.
+    ///
+    /// Parts are produced without waiting on a channel, so a test can drive the part count past a
+    /// limit without also taking on caller-data backpressure.
+    #[derive(Debug)]
+    struct CountingUnknownLengthStream {
+        next_part_num: u64,
+        total: u64,
+    }
+}
+
+impl PartStream for CountingUnknownLengthStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        if *this.next_part_num > *this.total {
+            return Poll::Ready(None);
+        }
+        let part_number = *this.next_part_num;
+        *this.next_part_num += 1;
+        Poll::Ready(Some(Ok(PartData::new(
+            part_number,
+            Bytes::from_static(b"x"),
+        ))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// A stream exceeding the S3 part limit fails with a message naming the remedy.
+///
+/// The guard keys on parts the reader actually yielded, so an exactly-`MAX_PARTS` stream must still
+/// succeed — only the part past the limit trips it. Driving this through the public API is what pins
+/// the trip point; the part size is irrelevant to the count, so one byte per part suffices.
+#[tokio::test]
+async fn test_unknown_length_exceeding_part_limit_fails() {
+    const MAX_PARTS: u64 = 10_000;
+
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(CountingUnknownLengthStream {
+            next_part_num: 1,
+            total: MAX_PARTS + 1,
+        }))
+        .initiate()
+        .unwrap();
+
+    let err = handle
+        .join()
+        .await
+        .expect_err("a stream past the part limit must fail");
+
+    assert_eq!(ErrorKind::InputInvalid, *err.kind());
+    let msg = format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(&err)
+    );
+    assert!(
+        msg.contains("maximum of 10000 parts"),
+        "error must name the part limit and the remedy, got: {msg}"
+    );
+}
+
+/// A stream of exactly `MAX_PARTS` must upload, not trip the limit.
+///
+/// End-of-stream on a custom stream is only observed on the dispatch after the last part, so a guard
+/// keyed on dispatches rather than parts actually yielded would reject this legitimate object.
+#[tokio::test]
+async fn test_unknown_length_exactly_max_parts_succeeds() {
+    const MAX_PARTS: u64 = 10_000;
+
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(CountingUnknownLengthStream {
+            next_part_num: 1,
+            total: MAX_PARTS,
+        }))
+        .initiate()
+        .unwrap();
+
+    handle
+        .join()
+        .await
+        .expect("a stream of exactly the maximum part count must upload");
+}
+
+/// The synthesized empty part belongs to the unknown-length path only.
+///
+/// A declared length already gives the dispatch loop a part count, so a source that declares a size
+/// and then delivers nothing must not have a part invented on its behalf — that would upload a part
+/// the caller never produced, and one that contradicts the size it declared.
+#[tokio::test]
+async fn test_known_length_never_synthesizes_empty_part() {
+    let upload_id = "test-upload-id".to_owned();
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+
+    // Split the part rules by body size so the empty one's call count is the assertion.
+    let empty_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() == Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
+    let data_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.content_length() != Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("data-etag").build());
+
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &empty_part, &data_part, &complete_mpu]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    // `TestStream` reports an exact size hint, so this is the known-length path. Declare a size and
+    // deliver nothing, which is what drives a read to end-of-stream with no part yielded.
+    let (tx, rx) = mpsc::channel(1);
+    let declared = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::new(
+            rx, 0, declared,
+        )))
+        .initiate()
+        .unwrap();
+
+    drop(tx);
+    let _ = handle.join().await;
+
+    assert_eq!(
+        0,
+        empty_part.num_calls(),
+        "a declared-length source must never have an empty part synthesized for it"
+    );
 }
 
 // --- Conditional-write preconditions -----------------------------------------
