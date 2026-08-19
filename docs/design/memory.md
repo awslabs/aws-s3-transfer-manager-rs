@@ -1262,8 +1262,6 @@ struct CarrierAllocation {
     slot: Arc<BlockSlot>,
     index: u32,
     incarnation_identity: IncarnationIdentity,
-    // Checked only after the bit passes the Active gate.
-    ptr: NonNull<MaybeUninit<u8>>,
 }
 
 struct ClaimBatch {
@@ -1309,6 +1307,10 @@ captured only as an opaque comparison token. It is never converted back into a p
 post-gate owner keeps its incarnation current through its live bit, so allocator address reuse
 cannot occur during a valid comparison. Identity remains diagnostic: bitmap ownership and the
 claim-trim gate authorize rollback, return, and pointer construction.
+
+A `CarrierAllocation` stores the block slot and carrier index rather than a derived pointer. Its
+ownership bit prevents the block mapping from being deactivated while the allocation is live. Byte
+access derives a temporary pointer from the slot's validated `VirtualRange` and carrier index.
 
 `PendingAcquisition::finish` succeeds only when `claimed == required`. It consumes the complete
 batch and matching accounting debit, converts every provisional bit to one `CarrierAllocation`, and
@@ -1611,8 +1613,9 @@ choices.
 - **P2: Physical ownership.** A set valid bit has one `ProvisionalBits` or `CarrierAllocation`
   owner. Pointer construction follows a successful `Active` gate and stays within the owning
   `VirtualRange`.
-- **P3: Activation publication.** Preparation or revival adds prepared capacity before publishing
-  `Active`, and every activation uses a fresh bitmap.
+- **P3: Activation publication.** Initial preparation or revival adds prepared capacity before
+  publishing a fresh `Active` incarnation. Protection recovery adds prepared capacity before
+  restoring its retained `Draining` incarnation to `Active` and does not reset that bitmap.
 - **P4: Claim-trim exclusion.** Claim protects its incarnation through the state gate. Claim and
   trim cannot both miss the other's publication; gate-failure rollback uses the protected
   incarnation, and a gate-passed bit prevents replacement until return.
@@ -3253,24 +3256,25 @@ section; one property may discharge several contracts.
 
 ### Physical-storage verification
 
-| Obligation | Property                                                                  | Evidence                                                 | Negative control                                               |
-| ---------- | ------------------------------------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
-| P4         | Claim and trim cannot both pass their gate                                | Loom over one claim and one trim                         | Weaken either store-load pair to acquire/release               |
-| P3, P4     | Stale rollback cannot clear a revived carrier                             | Loom over claim, trim, revival, and new claim            | Reset and reuse one bitmap across activations                  |
-| P4         | Gate-failure rollback writes only through the protected incarnation       | Loom with removal of `current` before rollback           | Reacquire `current` for stale rollback                         |
-| P2, P5     | Post-gate batch rollback and final return clear exactly owned bits        | Loom plus multiword property tests                       | Clear the candidate mask instead of won bits                   |
-| P1         | Padding bits never become carriers or affect all-free                     | Property tests around every final-word width             | Omit `valid_masks` from claim or trim                          |
-| P1, P2     | Pool ownership spine is `Send + Sync` through `VirtualRange`              | Compile-time trait assertions and unsafe-code inspection | Store an unwrapped `NonNull` directly in `BlockSlot`           |
-| P1, P2     | Address lookup classifies only complete in-range views                    | Boundary property tests over sorted block ranges         | Classify by start address without checking the end             |
-| P6         | Fallback lock scope excludes pending finish and rollback                  | Deterministic miss-path tests plus lock assertions       | Finish or drop pending while admission remains held            |
-| P4         | Gate-failure rollback remains valid after range deactivation              | Loom over claim, trim, and delayed rollback              | Allocate incarnation metadata inside `VirtualRange`            |
-| P6         | Serialized fallback exhausts prepared capacity before growth              | Deterministic fragmented-registry tests                  | Grow after an optimistic miss without exhaustive recheck       |
-| P6         | Fresh growth reserves the fallback claimant's carriers before publication | Concurrent fallback and fast-claim test                  | Publish the free incarnation before preclaiming the batch      |
-| P7         | Protection and discard failure leave the block nonclaimable               | Failure injection at each mapping transition             | Restore `Active` from a failed platform call                   |
-| P3, P7     | Mapping failures preserve the admission floor                             | Failure injection across prepare, trim, and recovery     | Count failed preparation or subtract failed deactivation twice |
-| P8         | Idle retention does not decay within one idle epoch                       | Maintenance state-machine test over repeated scans       | Derive each retry target from current prepared capacity        |
-| P9         | Corrupt ownership state aborts before allocator mutation continues        | Fail-stop injection at each ownership check              | Clear a bit or release accounting after a failed check         |
-| A8, C3     | Shared-pool shutdown preserves other handles and final return             | Composed Loom with queue, reservation, and `Bytes`       | Drop pool state when manager-owned handles disappear           |
+| Obligation | Property                                                                  | Evidence                                                  | Negative control                                               |
+| ---------- | ------------------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| P4         | Claim and trim cannot both pass their gate                                | Loom over one claim and one trim                          | Weaken either store-load pair to acquire/release               |
+| P3, P4     | Stale rollback cannot clear a revived carrier                             | Loom over claim, trim, revival, and new claim             | Reset and reuse one bitmap across activations                  |
+| P3, P4, P7 | Protection recovery preserves ownership in the retained incarnation       | Loom over claim, failed deactivation, recovery, and claim | Reset the retained bitmap during protection recovery           |
+| P4         | Gate-failure rollback writes only through the protected incarnation       | Loom with removal of `current` before rollback            | Reacquire `current` for stale rollback                         |
+| P2, P5     | Post-gate batch rollback and final return clear exactly owned bits        | Loom plus multiword property tests                        | Clear the candidate mask instead of won bits                   |
+| P1         | Padding bits never become carriers or affect all-free                     | Property tests around every final-word width              | Omit `valid_masks` from claim or trim                          |
+| P1, P2     | Pool ownership spine is `Send + Sync` through `VirtualRange`              | Compile-time trait assertions and unsafe-code inspection  | Store an unwrapped `NonNull` directly in `BlockSlot`           |
+| P1, P2     | Address lookup classifies only complete in-range views                    | Boundary property tests over sorted block ranges          | Classify by start address without checking the end             |
+| P6         | Fallback lock scope excludes pending finish and rollback                  | Deterministic miss-path tests plus lock assertions        | Finish or drop pending while admission remains held            |
+| P4         | Gate-failure rollback remains valid after range deactivation              | Loom over claim, trim, and delayed rollback               | Allocate incarnation metadata inside `VirtualRange`            |
+| P6         | Serialized fallback exhausts prepared capacity before growth              | Deterministic fragmented-registry tests                   | Grow after an optimistic miss without exhaustive recheck       |
+| P6         | Fresh growth reserves the fallback claimant's carriers before publication | Concurrent fallback and fast-claim test                   | Publish the free incarnation before preclaiming the batch      |
+| P7         | Protection and discard failure leave the block nonclaimable               | Failure injection at each mapping transition              | Restore `Active` from a failed platform call                   |
+| P3, P7     | Mapping failures preserve the admission floor                             | Failure injection across prepare, trim, and recovery      | Count failed preparation or subtract failed deactivation twice |
+| P8         | Idle retention does not decay within one idle epoch                       | Maintenance state-machine test over repeated scans        | Derive each retry target from current prepared capacity        |
+| P9         | Corrupt ownership state aborts before allocator mutation continues        | Fail-stop injection at each ownership check               | Clear a bit or release accounting after a failed check         |
+| A8, C3     | Shared-pool shutdown preserves other handles and final return             | Composed Loom with queue, reservation, and `Bytes`        | Drop pool state when manager-owned handles disappear           |
 
 ### Ownership verification
 
