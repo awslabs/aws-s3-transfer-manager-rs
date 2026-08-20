@@ -5,6 +5,7 @@
 
 //! Fixed-size carrier geometry, virtual memory, and physical ownership.
 
+mod arena;
 mod block;
 mod geometry;
 mod virtual_memory;
