@@ -494,8 +494,9 @@ mod sys {
             // reservation.
             let committed =
                 unsafe { VirtualAlloc(base.as_ptr().cast(), len, MEM_COMMIT, PAGE_READWRITE) };
-            let committed = NonNull::new(committed.cast()).ok_or_else(io::Error::last_os_error)?;
-            if committed.cast::<MaybeUninit<u8>>() != base {
+            let committed: NonNull<MaybeUninit<u8>> =
+                NonNull::new(committed.cast()).ok_or_else(io::Error::last_os_error)?;
+            if committed != base {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "VirtualAlloc committed a different address",
