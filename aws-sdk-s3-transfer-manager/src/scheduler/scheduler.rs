@@ -2670,6 +2670,7 @@ mod tests {
             observed
         );
 
+        scheduler.cancel_transfer(id).wait_for_idle().await;
         handle.runtime.shutdown();
     }
 
