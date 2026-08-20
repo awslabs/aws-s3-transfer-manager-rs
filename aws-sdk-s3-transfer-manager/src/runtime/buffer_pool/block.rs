@@ -17,13 +17,6 @@ use super::CarrierCount;
 use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
-/// Incarnation state that permits carrier claims.
-const ACTIVE: u8 = 0;
-/// Incarnation state that rejects claims while trim confirms ownership.
-const DRAINING: u8 = 1;
-/// Incarnation state whose mapping is no longer accessible.
-const DEAD: u8 = 2;
-
 /// Failure to construct, prepare, or claim from one block.
 #[derive(Debug)]
 pub(super) enum BlockError {
@@ -81,7 +74,7 @@ pub(super) enum TrimBlocked {
     /// The slot has no prepared incarnation.
     NotPrepared,
     /// Removing the block would violate the caller's prepared-capacity floor.
-    Required,
+    FloorViolation,
     /// A carrier claim won the claim-trim gate.
     Busy,
     /// A prior trim or failed protection transition still owns the slot.
@@ -109,6 +102,62 @@ enum MappingState {
     Prepared,
     /// A protection call failed and the complete range must be recovered.
     ProtectionPending,
+}
+
+/// Claim-trim gate state for one block incarnation.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncarnationState {
+    /// Carrier claims may proceed.
+    Active = 0,
+    /// Trim is confirming that no carrier is owned.
+    Draining = 1,
+    /// The incarnation's mapping is inaccessible.
+    Dead = 2,
+}
+
+/// Atomic storage for [`IncarnationState`].
+struct AtomicIncarnationState(AtomicU8);
+
+impl AtomicIncarnationState {
+    /// Creates an atomic state with `value`.
+    fn new(value: IncarnationState) -> Self {
+        Self(AtomicU8::new(value as u8))
+    }
+
+    /// Loads and validates the current state.
+    fn load(&self, order: Ordering) -> IncarnationState {
+        Self::decode(self.0.load(order))
+    }
+
+    /// Stores `value` with `order`.
+    fn store(&self, value: IncarnationState, order: Ordering) {
+        self.0.store(value as u8, order);
+    }
+
+    /// Compares and exchanges two typed states.
+    fn compare_exchange(
+        &self,
+        current: IncarnationState,
+        new: IncarnationState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<IncarnationState, IncarnationState> {
+        self.0
+            .compare_exchange(current as u8, new as u8, success, failure)
+            .map(Self::decode)
+            .map_err(Self::decode)
+    }
+
+    /// Converts a stored representation into a state.
+    fn decode(value: u8) -> IncarnationState {
+        match value {
+            value if value == IncarnationState::Active as u8 => IncarnationState::Active,
+            value if value == IncarnationState::Draining as u8 => IncarnationState::Draining,
+            value if value == IncarnationState::Dead as u8 => IncarnationState::Dead,
+            _ => invariant_violation("incarnation contains an invalid state"),
+        }
+    }
 }
 
 /// Stable identity of one carrier within an incarnation.
@@ -141,7 +190,7 @@ struct WonWord {
 /// Occupancy metadata for one activation of a stable block slot.
 struct BlockIncarnation {
     /// Claim-trim gate state.
-    state: AtomicU8,
+    state: AtomicIncarnationState,
     /// Fixed bitmap with one ownership bit per carrier.
     ///
     /// Each atomic word covers 64 carriers. Padding bits in the final word
@@ -156,7 +205,7 @@ impl BlockIncarnation {
         in_use.try_reserve_exact(bitmap_words)?;
         in_use.extend((0..bitmap_words).map(|_| AtomicU64::new(0)));
         Ok(Self {
-            state: AtomicU8::new(ACTIVE),
+            state: AtomicIncarnationState::new(IncarnationState::Active),
             in_use: in_use.into_boxed_slice(),
         })
     }
@@ -172,6 +221,8 @@ impl BlockIncarnation {
 
 #[cfg(not(all(test, s3_tm_loom)))]
 mod incarnation_cell {
+    //! Lock-free production publication for block incarnations.
+
     use arc_swap::{ArcSwapOption, Guard};
 
     use super::BlockIncarnation;
@@ -221,6 +272,8 @@ mod incarnation_cell {
 
 #[cfg(all(test, s3_tm_loom))]
 mod incarnation_cell {
+    //! Loom-instrumented publication with owned incarnation guards.
+
     use super::BlockIncarnation;
     use crate::runtime::sync::sync::{Arc, Mutex};
 
@@ -276,8 +329,6 @@ pub(super) struct BlockSlot {
     range: VirtualRange,
     /// Checked carrier and bitmap dimensions.
     geometry: PoolGeometry,
-    /// Fixed mask for the carrier bits represented by each bitmap word.
-    valid_masks: Box<[u64]>,
     /// Serialized mapping and cleanup state.
     mapping: Mutex<MappingState>,
     /// Published claimable incarnation.
@@ -285,18 +336,11 @@ pub(super) struct BlockSlot {
 }
 
 impl BlockSlot {
-    /// Reserves an inaccessible virtual range and allocates immutable masks.
+    /// Reserves an inaccessible virtual range.
     ///
-    /// Returns [`BlockError::Allocation`] if mask allocation fails or
-    /// [`BlockError::VirtualMemory`] if the address range cannot be reserved.
+    /// Returns [`BlockError::VirtualMemory`] if the address range cannot be
+    /// reserved.
     pub(super) fn new(id: u32, geometry: PoolGeometry) -> Result<Self, BlockError> {
-        let mut valid_masks = Vec::new();
-        valid_masks.try_reserve_exact(geometry.bitmap_words())?;
-        valid_masks.extend(
-            (0..geometry.bitmap_words())
-                .map(|word| geometry.valid_mask(word).expect("word belongs to geometry")),
-        );
-
         let range = VirtualRange::reserve(
             geometry.block_size(),
             NonZeroUsize::new(geometry.page_size()).expect("geometry has a nonzero page size"),
@@ -305,7 +349,6 @@ impl BlockSlot {
             id,
             range,
             geometry,
-            valid_masks: valid_masks.into_boxed_slice(),
             mapping: Mutex::new(MappingState::Reserved {
                 reclaim_pending: false,
             }),
@@ -320,9 +363,10 @@ impl BlockSlot {
 
     /// Prepares the range and makes one incarnation active.
     ///
-    /// `prepared` must be serialized with every capacity transition. The count
-    /// is incremented before `Active` becomes visible. Protection failure
-    /// leaves the slot nonclaimable and does not change `prepared`.
+    /// The caller holds the admission lock that protects the pool-wide
+    /// `prepared` count and admission floor. The count is incremented before
+    /// `Active` becomes visible. Protection failure leaves the slot
+    /// nonclaimable and does not change `prepared`.
     pub(super) fn prepare(&self, prepared: &mut CarrierCount) -> Result<(), BlockError> {
         let mut mapping = self.mapping.lock();
         let current = self.current.load();
@@ -343,7 +387,7 @@ impl BlockSlot {
 
         if let Some(incarnation) = current.as_ref() {
             if !matches!(*mapping, MappingState::ProtectionPending)
-                || incarnation.state.load(Ordering::Acquire) != DRAINING
+                || incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining
             {
                 invariant_violation("only protection recovery may retain a draining incarnation");
             }
@@ -357,7 +401,9 @@ impl BlockSlot {
         *mapping = MappingState::Prepared;
         *prepared = next_prepared;
         if let Some(incarnation) = current.as_ref() {
-            incarnation.state.store(ACTIVE, Ordering::SeqCst);
+            incarnation
+                .state
+                .store(IncarnationState::Active, Ordering::SeqCst);
         } else if self.current.swap(fresh).is_some() {
             invariant_violation("preparation replaced a current incarnation");
         }
@@ -366,9 +412,10 @@ impl BlockSlot {
 
     /// Confirms that this block may be removed from prepared capacity.
     ///
-    /// `prepared` must be serialized with every capacity transition. Success
-    /// subtracts the complete block and returns cleanup authority. A live bit
-    /// restores `Active` without changing `prepared`.
+    /// The caller holds the admission lock that protects the pool-wide
+    /// `prepared` count and admission floor. Success subtracts the complete
+    /// block and returns cleanup authority. A live bit restores `Active`
+    /// without changing `prepared`.
     pub(super) fn start_trim(
         slot: &Arc<Self>,
         prepared: &mut CarrierCount,
@@ -386,35 +433,50 @@ impl BlockSlot {
             invariant_violation("prepared mapping has no current incarnation");
         };
         match incarnation.state.load(Ordering::Acquire) {
-            ACTIVE => {}
-            DRAINING => return Err(TrimBlocked::CleanupPending),
-            DEAD => invariant_violation("prepared mapping has a dead current incarnation"),
-            _ => invariant_violation("prepared mapping has an invalid incarnation state"),
+            IncarnationState::Active => {}
+            IncarnationState::Draining => return Err(TrimBlocked::CleanupPending),
+            IncarnationState::Dead => {
+                invariant_violation("prepared mapping has a dead current incarnation")
+            }
         }
 
         let Some(next_prepared) = prepared.checked_sub(slot.carrier_count()) else {
             invariant_violation("prepared capacity excludes an active block");
         };
         if next_prepared < floor {
-            return Err(TrimBlocked::Required);
+            return Err(TrimBlocked::FloorViolation);
         }
 
         if incarnation
             .state
-            .compare_exchange(ACTIVE, DRAINING, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                IncarnationState::Active,
+                IncarnationState::Draining,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_err()
         {
             return Err(TrimBlocked::CleanupPending);
         }
-        model_seq_cst_store_load();
+        loom_seq_cst_fence();
 
         let busy = incarnation
             .in_use
             .iter()
-            .zip(&slot.valid_masks)
-            .any(|(word, valid)| word.load(Ordering::SeqCst) & valid != 0);
+            .enumerate()
+            .any(|(word_index, word)| {
+                let valid = if word_index + 1 == slot.geometry.bitmap_words() {
+                    slot.geometry.final_word_mask()
+                } else {
+                    u64::MAX
+                };
+                word.load(Ordering::SeqCst) & valid != 0
+            });
         if busy {
-            incarnation.state.store(ACTIVE, Ordering::SeqCst);
+            incarnation
+                .state
+                .store(IncarnationState::Active, Ordering::SeqCst);
             return Err(TrimBlocked::Busy);
         }
 
@@ -428,8 +490,10 @@ impl BlockSlot {
 
     /// Retries pending whole-range protection or backing reclaim.
     ///
-    /// A slot with no pending work returns success without changing state.
-    /// Failure leaves the slot nonclaimable and identifies the required retry.
+    /// Pool maintenance calls this after a cleanup operation records pending
+    /// work. A slot with no pending work returns success without changing
+    /// state. Failure leaves the slot nonclaimable and identifies the required
+    /// retry.
     pub(super) fn retry_cleanup(&self) -> Result<(), CleanupRetry> {
         let mut mapping = self.mapping.lock();
         match *mapping {
@@ -439,9 +503,10 @@ impl BlockSlot {
                     invariant_violation("prepared mapping has no current incarnation");
                 };
                 match incarnation.state.load(Ordering::Acquire) {
-                    ACTIVE | DRAINING => Ok(()),
-                    DEAD => invariant_violation("prepared mapping has a dead current incarnation"),
-                    _ => invariant_violation("prepared mapping has an invalid incarnation state"),
+                    IncarnationState::Active | IncarnationState::Draining => Ok(()),
+                    IncarnationState::Dead => {
+                        invariant_violation("prepared mapping has a dead current incarnation")
+                    }
                 }
             }
             MappingState::Reserved {
@@ -470,7 +535,7 @@ impl BlockSlot {
             }
             MappingState::ProtectionPending => {
                 if let Some(incarnation) = self.current.load().as_ref() {
-                    if incarnation.state.load(Ordering::Acquire) != DRAINING {
+                    if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
                         invariant_violation(
                             "protection-pending mapping has a non-draining incarnation",
                         );
@@ -497,10 +562,12 @@ impl BlockSlot {
         *mapping = MappingState::Reserved { reclaim_pending };
 
         if let Some(incarnation) = self.current.load().as_ref() {
-            if incarnation.state.load(Ordering::Acquire) != DRAINING {
+            if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
                 invariant_violation("cleanup found a non-draining current incarnation");
             }
-            incarnation.state.store(DEAD, Ordering::Release);
+            incarnation
+                .state
+                .store(IncarnationState::Dead, Ordering::Release);
             let removed = self
                 .current
                 .swap(None)
@@ -549,9 +616,8 @@ impl BlockSlot {
             invariant_violation("owned carriers name a different incarnation");
         }
         match current.state.load(Ordering::Acquire) {
-            ACTIVE | DRAINING => {}
-            DEAD => invariant_violation("owned carriers name a dead incarnation"),
-            _ => invariant_violation("owned carriers name an invalid incarnation state"),
+            IncarnationState::Active | IncarnationState::Draining => {}
+            IncarnationState::Dead => invariant_violation("owned carriers name a dead incarnation"),
         }
 
         for word in won {
@@ -584,8 +650,13 @@ impl BlockSlot {
                 incarnation
                     .in_use
                     .iter()
-                    .zip(&self.valid_masks)
-                    .map(|(word, valid)| {
+                    .enumerate()
+                    .map(|(word_index, word)| {
+                        let valid = if word_index + 1 == self.geometry.bitmap_words() {
+                            self.geometry.final_word_mask()
+                        } else {
+                            u64::MAX
+                        };
                         (word.load(Ordering::Acquire) & valid).count_ones() as usize
                     })
                     .sum()
@@ -594,7 +665,7 @@ impl BlockSlot {
     }
 }
 
-/// Linear cleanup authority for a confirmed trim.
+/// Single-owner cleanup token for a confirmed trim.
 ///
 /// Dropping an unfinished token performs the same cleanup attempt as
 /// [`TrimCleanup::finish`].
@@ -635,7 +706,7 @@ impl TrimCleanup {
             invariant_violation("trim cleanup lost its current incarnation");
         };
         if !Arc::ptr_eq(incarnation, &self.incarnation)
-            || incarnation.state.load(Ordering::Acquire) != DRAINING
+            || incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining
         {
             invariant_violation("trim cleanup no longer owns the draining incarnation");
         }
@@ -692,13 +763,14 @@ impl BlockClaimAttempt {
 
     /// Claims up to `count` free bits and returns the number won.
     ///
-    /// A claim may lose candidate bits after its relaxed load. For example:
+    /// A competing claim may take a candidate after the relaxed load:
     ///
     /// ```text
-    /// observed  = 0b0010
-    /// candidate = 0b0101
-    /// previous  = 0b0110  // another claim took bit 2
-    /// won       = 0b0001  // candidate & !previous
+    /// this claim loads       0b0010  // bit 1 is occupied
+    /// this claim selects     0b0101  // free bits 0 and 2
+    /// another claim sets     0b0100  // competitor wins bit 2
+    /// fetch_or returns       0b0110  // occupancy before this fetch_or
+    /// this claim wins        0b0001  // candidate & !previous
     /// ```
     fn take(&mut self, mut count: usize) -> usize {
         let incarnation = self
@@ -707,15 +779,15 @@ impl BlockClaimAttempt {
             .expect("a claim attempt protects one incarnation");
         let mut taken = 0;
 
-        for (word_index, (word, valid)) in incarnation
-            .in_use
-            .iter()
-            .zip(&self.slot.valid_masks)
-            .enumerate()
-        {
+        for (word_index, word) in incarnation.in_use.iter().enumerate() {
             if count == 0 {
                 break;
             }
+            let valid = if word_index + 1 == self.slot.geometry.bitmap_words() {
+                self.slot.geometry.final_word_mask()
+            } else {
+                u64::MAX
+            };
             let observed = word.load(Ordering::Relaxed);
             let candidate = take_lowest(!observed & valid, count);
             if candidate == 0 {
@@ -745,14 +817,13 @@ impl BlockClaimAttempt {
             .incarnation
             .as_ref()
             .expect("a claim attempt protects one incarnation");
-        model_seq_cst_store_load();
+        loom_seq_cst_fence();
         match incarnation.state.load(Ordering::SeqCst) {
-            ACTIVE => {}
-            DRAINING | DEAD => {
+            IncarnationState::Active => {}
+            IncarnationState::Draining | IncarnationState::Dead => {
                 self.rollback_original();
                 return None;
             }
-            _ => invariant_violation("claim observed an invalid incarnation state"),
         }
 
         let incarnation = BlockIncarnation::identity(incarnation);
@@ -781,7 +852,7 @@ impl Drop for BlockClaimAttempt {
     }
 }
 
-/// Linear ownership of gate-passed bits not yet converted to carriers.
+/// Single-owner set of gate-passed bits not yet converted to carriers.
 pub(super) struct ProvisionalBits {
     /// Slot containing the owned bits.
     slot: Arc<BlockSlot>,
@@ -843,7 +914,7 @@ impl Drop for ProvisionalBits {
     }
 }
 
-/// Linear physical ownership of one carrier.
+/// Single-owner physical allocation for one carrier.
 pub(super) struct CarrierAllocation {
     /// Slot that retains the carrier address.
     slot: Arc<BlockSlot>,
@@ -921,11 +992,12 @@ fn take_lowest(mut available: u64, count: usize) -> u64 {
     selected
 }
 
-/// Models the global store-load order supplied by production `SeqCst`.
+/// Supplies the store-load edge missing from Loom's atomic model.
 ///
-/// Loom 0.7 treats `SeqCst` accesses as `AcqRel`, but models a `SeqCst` fence.
+/// Production `SeqCst` operations already provide the required global order.
+/// Loom 0.7 treats those accesses as `AcqRel`, but models a `SeqCst` fence.
 #[inline]
-fn model_seq_cst_store_load() {
+fn loom_seq_cst_fence() {
     #[cfg(all(test, s3_tm_loom))]
     loom::sync::atomic::fence(Ordering::SeqCst);
 }
@@ -933,6 +1005,12 @@ fn model_seq_cst_store_load() {
 /// Stops execution after an ownership or lifecycle invariant fails.
 #[cold]
 fn invariant_violation(message: &'static str) -> ! {
+    tracing::error!(
+        target: crate::telemetry::TARGET_MEMORY,
+        reason = message,
+        "buffer-pool ownership invariant violated; aborting"
+    );
+
     #[cfg(test)]
     panic!("buffer-pool ownership invariant violated: {message}");
 
@@ -952,7 +1030,7 @@ mod tests {
 
     fn geometry(carriers: usize) -> PoolGeometry {
         let page_size = page_size().unwrap().get();
-        PoolGeometry::new(page_size, page_size, carriers).unwrap()
+        PoolGeometry::new(page_size, page_size * carriers, page_size).unwrap()
     }
 
     fn prepared_slot(carriers: usize) -> (Arc<BlockSlot>, CarrierCount) {
@@ -1053,6 +1131,23 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_retry_is_a_noop_without_pending_work() {
+        let slot = Arc::new(BlockSlot::new(7, geometry(1)).unwrap());
+        let mut prepared = CarrierCount::ZERO;
+
+        slot.retry_cleanup().unwrap();
+        assert!(matches!(
+            BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::ZERO),
+            Err(TrimBlocked::NotPrepared)
+        ));
+
+        slot.prepare(&mut prepared).unwrap();
+        slot.retry_cleanup().unwrap();
+        assert_eq!(prepared, CarrierCount::new(1));
+        assert_mapping(&slot, MappingState::Prepared);
+    }
+
+    #[test]
     fn carrier_pointer_is_derived_from_live_ownership() {
         let (slot, _) = prepared_slot(1);
         let mut carriers = BlockSlot::try_claim(&slot, CarrierCount::new(1))
@@ -1122,6 +1217,34 @@ mod tests {
     }
 
     #[test]
+    fn partial_claim_crosses_a_bitmap_word_boundary() {
+        let (slot, _) = prepared_slot(66);
+        let first = BlockSlot::try_claim(&slot, CarrierCount::new(63))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+
+        let second = BlockSlot::try_claim(&slot, CarrierCount::new(3))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+
+        assert_eq!(first.last().unwrap().id.index, 62);
+        assert_eq!(
+            second
+                .iter()
+                .map(|carrier| carrier.id.index)
+                .collect::<Vec<_>>(),
+            vec![63, 64, 65]
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(slot.live_carriers(), 0);
+    }
+
+    #[test]
     fn provisional_word_bits_map_to_carrier_indices() {
         let (slot, _) = prepared_slot(68);
         let incarnation = {
@@ -1169,7 +1292,7 @@ mod tests {
 
         assert!(matches!(
             BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::new(1)),
-            Err(TrimBlocked::Required)
+            Err(TrimBlocked::FloorViolation)
         ));
         assert_eq!(prepared, CarrierCount::new(2));
 
@@ -1266,6 +1389,10 @@ mod tests {
         assert!(BlockSlot::try_claim(&slot, CarrierCount::new(1))
             .unwrap()
             .is_none());
+        assert!(matches!(
+            BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::ZERO),
+            Err(TrimBlocked::CleanupPending)
+        ));
 
         slot.prepare(&mut prepared).unwrap();
         assert_eq!(prepared, CarrierCount::new(1));
@@ -1413,6 +1540,38 @@ mod tests {
     }
 
     #[test]
+    fn slot_mismatch_stops_before_clearing() {
+        let (slot, _) = prepared_slot(1);
+        let mut carriers = BlockSlot::try_claim(&slot, CarrierCount::new(1))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        let carrier = carriers.pop().unwrap();
+        let wrong = CarrierId {
+            slot: carrier.id.slot + 1,
+            ..carrier.id
+        };
+
+        let result = catch_unwind(AssertUnwindSafe(|| slot.release_one(wrong)));
+
+        assert!(result.is_err());
+        assert_eq!(slot.live_carriers(), 1);
+        drop(carrier);
+        assert_eq!(slot.live_carriers(), 0);
+    }
+
+    #[test]
+    fn selects_only_the_requested_low_bits() {
+        assert_eq!(take_lowest(0, 8), 0);
+        assert_eq!(take_lowest(0b1011_0100, 0), 0);
+        assert_eq!(take_lowest(0b1011_0100, 1), 0b0000_0100);
+        assert_eq!(take_lowest(0b1011_0100, 3), 0b0011_0100);
+        assert_eq!(take_lowest(0b1011_0100, usize::MAX), 0b1011_0100);
+        assert_eq!(take_lowest(u64::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
     fn zero_claim_is_rejected_without_mutation() {
         let (slot, _) = prepared_slot(1);
 
@@ -1440,7 +1599,7 @@ mod loom_tests {
     use crate::runtime::sync::thread;
 
     fn prepared_slot() -> (Arc<BlockSlot>, CarrierCount) {
-        let geometry = PoolGeometry::new(4096, 4096, 1).unwrap();
+        let geometry = PoolGeometry::new(4096, 4096, 4096).unwrap();
         let slot = Arc::new(BlockSlot::new(0, geometry).unwrap());
         let mut prepared = CarrierCount::ZERO;
         slot.prepare(&mut prepared).unwrap();
@@ -1590,7 +1749,9 @@ mod loom_tests {
                 .current
                 .load()
                 .as_ref()
-                .map(|incarnation| incarnation.state.load(Ordering::Acquire) == ACTIVE)
+                .map(|incarnation| {
+                    incarnation.state.load(Ordering::Acquire) == IncarnationState::Active
+                })
                 .unwrap_or(false);
             if active {
                 let mut prepared = prepared.lock();
@@ -1607,6 +1768,33 @@ mod loom_tests {
                     reclaim_pending: false
                 }
             );
+        });
+    }
+
+    #[test]
+    fn two_claimants_cannot_own_one_carrier() {
+        loom::model(|| {
+            let (slot, _) = prepared_slot();
+
+            let first_slot = Arc::clone(&slot);
+            let first = thread::spawn(move || {
+                BlockSlot::try_claim(&first_slot, CarrierCount::new(1)).unwrap()
+            });
+            let second_slot = Arc::clone(&slot);
+            let second = thread::spawn(move || {
+                BlockSlot::try_claim(&second_slot, CarrierCount::new(1)).unwrap()
+            });
+
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            let owned = first.as_ref().map_or(0, |claim| claim.len().get())
+                + second.as_ref().map_or(0, |claim| claim.len().get());
+
+            assert_eq!(owned, 1);
+            assert_eq!(slot.live_carriers(), 1);
+            drop(first);
+            drop(second);
+            assert_eq!(slot.live_carriers(), 0);
         });
     }
 }

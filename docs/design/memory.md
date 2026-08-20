@@ -1012,8 +1012,9 @@ clears and reuses a bitmap from an earlier activation. An old claim attempt may 
 after the slot publishes incarnation B, but the two attempts mutate different bitmap objects.
 
 The block base and carrier size are page multiples, so every carrier begins on a page boundary and
-shares no page with another carrier. A final partial bitmap word is masked by immutable
-`valid_masks`; padding bits never name carriers and are never claimable.
+shares no page with another carrier. `final_word_mask` clears padding bits in a partial final bitmap
+word; padding bits never name carriers and are never claimable. Complete interior words use
+`u64::MAX` without separate stored entries.
 
 **Alternative: Multiple carrier size classes.** Rejected: multiple classes can reduce internal tail
 waste but partition reusable capacity and add size-class admission and ownership. One page-multiple
@@ -1025,14 +1026,18 @@ The pool geometry is private:
 ```rust
 struct PoolGeometry {
     page_size: NonZeroUsize,
+    block_size: NonZeroUsize,
     carrier_size: NonZeroUsize,
     carriers_per_block: NonZeroUsize,
+    bitmap_words: NonZeroUsize,
+    final_word_mask: u64,
 }
 ```
 
-Construction validates page and carrier alignment, whole-carrier block size, bitmap and valid-mask
-coverage, and every address and byte calculation. Configured capacity need not be a whole number of
-blocks; whole-block preparation may exceed configured capacity without changing admission.
+Construction accepts block size in bytes, validates page and carrier alignment and whole-carrier
+block size, then derives carrier count, bitmap size, and the final-word mask. Configured capacity
+need not be a whole number of blocks; whole-block preparation may exceed configured capacity
+without changing admission.
 
 The stable per-block state is:
 
@@ -1054,9 +1059,7 @@ unsafe impl Sync for VirtualRange {}
 struct BlockSlot {
     id: u32,
     range: VirtualRange,
-    carrier_size: usize,
-    carrier_count: CarrierCount,
-    valid_masks: Box<[u64]>,
+    geometry: PoolGeometry,
 
     // Serializes target-specific protection, discard, and revival.
     mapping: Mutex<MappingState>,
@@ -1064,8 +1067,8 @@ struct BlockSlot {
 }
 
 struct BlockIncarnation {
-    state: AtomicU8,             // Active | Draining | Dead
-    in_use: Box<[AtomicU64]>,    // one bit per carrier
+    state: AtomicIncarnationState, // Active | Draining | Dead
+    in_use: Box<[AtomicU64]>,      // one bit per carrier
 }
 ```
 
@@ -1367,7 +1370,7 @@ Trim separates the bounded admission transition from protection and discard work
 3. Scan that incarnation's bitmap.
 4. If a bit is set, restore `Active`; `prepared_capacity` has not changed.
 5. If all bits are clear, subtract the block from `prepared_capacity`.
-6. Return a linear cleanup token and release admission serialization.
+6. Return a single-owner cleanup token and release admission serialization.
 7. Make the complete range inaccessible and discard backing outside admission serialization.
 8. Publish `Dead` and clear `current`.
 
@@ -1675,7 +1678,7 @@ One completed carrier acquisition creates one `CarrierGuard`:
 struct CarrierGuard {
     // State required to validate return and release the aggregate charge.
     pool: Arc<PoolInner>,
-    // Linear physical-return capability, taken exactly once by final drop.
+    // Single-owner physical-return capability, taken once by final drop.
     allocation: Option<CarrierAllocation>,
     // Originating reservation state for a direct acquisition.
     direct: Option<Arc<ReservationState>>,
@@ -2865,9 +2868,10 @@ clearing an unexpected bit or releasing its charge.
 
 ### Carrier and block geometry
 
-Carrier size and carriers per block are measurement choices. Carrier size must be a multiple of the
-runtime page size. Smaller carriers reduce small-object and tail waste but increase bitmap
-operations, ownership transitions, scatter width, and carrier returns.
+Carrier and block sizes are measurement choices. Carrier size must be a multiple of the runtime page
+size, and block size must be a whole number of carriers. Smaller carriers reduce small-object and
+tail waste but increase bitmap operations, ownership transitions, scatter width, and carrier
+returns.
 
 Block size controls mapping amortization, all-free scan length, reclaim granularity, and how much
 capacity one long-lived carrier can keep prepared. Geometry selection must account for small
@@ -3281,7 +3285,7 @@ section; one property may discharge several contracts.
 | P3, P4, P7 | Protection recovery preserves ownership in the retained incarnation       | Loom over claim, failed deactivation, recovery, and claim | Reset the retained bitmap during protection recovery           |
 | P4         | Gate-failure rollback writes only through the protected incarnation       | Loom with removal of `current` before rollback            | Reacquire `current` for stale rollback                         |
 | P2, P5     | Post-gate batch rollback and final return clear exactly owned bits        | Loom plus multiword property tests                        | Clear the candidate mask instead of won bits                   |
-| P1         | Padding bits never become carriers or affect all-free                     | Property tests around every final-word width              | Omit `valid_masks` from claim or trim                          |
+| P1         | Padding bits never become carriers or affect all-free                     | Property tests around every final-word width              | Ignore `final_word_mask` during claim or trim                  |
 | P1, P2     | Pool ownership spine is `Send + Sync` through `VirtualRange`              | Compile-time trait assertions and unsafe-code inspection  | Store an unwrapped `NonNull` directly in `BlockSlot`           |
 | P1, P2     | Address lookup classifies only complete in-range views                    | Boundary property tests over sorted block ranges          | Classify by start address without checking the end             |
 | P6         | Fallback lock scope excludes pending finish and rollback                  | Deterministic miss-path tests plus lock assertions        | Finish or drop pending while admission remains held            |
