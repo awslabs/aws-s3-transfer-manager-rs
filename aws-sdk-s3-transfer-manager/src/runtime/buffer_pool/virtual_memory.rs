@@ -295,9 +295,17 @@ impl VirtualRange {
 
 impl Drop for VirtualRange {
     fn drop(&mut self) {
-        // Drop cannot report a release failure. Continuing after losing the
-        // reservation invariant could permit address reuse under live owners.
-        if sys::release(self.base, self.len).is_err() {
+        // A valid reservation release cannot fail. Drop cannot return the
+        // platform error or retry after relinquishing ownership of this value.
+        if let Err(error) = sys::release(self.base, self.len) {
+            tracing::error!(
+                target: crate::telemetry::TARGET_MEMORY,
+                operation = %VirtualMemoryOperation::Release,
+                error = %error,
+                base = self.base_address(),
+                len = self.len,
+                "buffer-pool virtual range release failed; aborting"
+            );
             std::process::abort();
         }
     }
@@ -727,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_transition_failure_is_consumed_once() {
+    fn injected_transition_failures_are_consumed_once() {
         let page_size = page_size().unwrap();
         let range = VirtualRange::reserve(page_size.get(), page_size).unwrap();
         range.inject_failure_once(VirtualMemoryOperation::Prepare);
@@ -735,6 +743,21 @@ mod tests {
         let error = range.prepare().unwrap_err();
 
         assert_eq!(error.operation(), VirtualMemoryOperation::Prepare);
+        assert!(error
+            .to_string()
+            .contains("virtual-memory preparation failed"));
+        assert!(std::error::Error::source(&error).is_some());
+        range.prepare().unwrap();
+
+        range.inject_failure_once(VirtualMemoryOperation::Deactivate);
+        let error = range.deactivate().unwrap_err();
+        assert_eq!(error.operation(), VirtualMemoryOperation::Deactivate);
+        range.deactivate().unwrap();
+
+        range.inject_failure_once(VirtualMemoryOperation::Discard);
+        let error = range.discard().unwrap_err();
+        assert_eq!(error.operation(), VirtualMemoryOperation::Discard);
+        range.discard().unwrap();
         range.prepare().unwrap();
     }
 
@@ -751,6 +774,10 @@ mod tests {
             assert!(range.ptr_for_range(range.len(), 1).is_none());
             assert!(range.ptr_for_range(range.len() - 1, 2).is_none());
             assert!(range.ptr_for_range(usize::MAX, 2).is_none());
+            assert_eq!(
+                range.ptr_for_range(0, range.len()).unwrap().addr().get(),
+                range.base_address()
+            );
             assert_eq!(
                 range
                     .ptr_for_range(1, range.len() - 1)
