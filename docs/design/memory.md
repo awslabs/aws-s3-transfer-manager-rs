@@ -1012,8 +1012,9 @@ clears and reuses a bitmap from an earlier activation. An old claim attempt may 
 after the slot publishes incarnation B, but the two attempts mutate different bitmap objects.
 
 The block base and carrier size are page multiples, so every carrier begins on a page boundary and
-shares no page with another carrier. A final partial bitmap word is masked by immutable
-`valid_masks`; padding bits never name carriers and are never claimable.
+shares no page with another carrier. `final_word_mask` clears padding bits in a partial final bitmap
+word; padding bits never name carriers and are never claimable. Complete interior words use
+`u64::MAX` without separate stored entries.
 
 **Alternative: Multiple carrier size classes.** Rejected: multiple classes can reduce internal tail
 waste but partition reusable capacity and add size-class admission and ownership. One page-multiple
@@ -1025,14 +1026,18 @@ The pool geometry is private:
 ```rust
 struct PoolGeometry {
     page_size: NonZeroUsize,
+    block_size: NonZeroUsize,
     carrier_size: NonZeroUsize,
     carriers_per_block: NonZeroUsize,
+    bitmap_words: NonZeroUsize,
+    final_word_mask: u64,
 }
 ```
 
-Construction validates page and carrier alignment, whole-carrier block size, bitmap and valid-mask
-coverage, and every address and byte calculation. Configured capacity need not be a whole number of
-blocks; whole-block preparation may exceed configured capacity without changing admission.
+Construction accepts block size in bytes, validates page and carrier alignment and whole-carrier
+block size, then derives carrier count, bitmap size, and the final-word mask. Configured capacity
+need not be a whole number of blocks; whole-block preparation may exceed configured capacity
+without changing admission.
 
 The stable per-block state is:
 
@@ -1054,9 +1059,7 @@ unsafe impl Sync for VirtualRange {}
 struct BlockSlot {
     id: u32,
     range: VirtualRange,
-    carrier_size: usize,
-    carrier_count: CarrierCount,
-    valid_masks: Box<[u64]>,
+    geometry: PoolGeometry,
 
     // Serializes target-specific protection, discard, and revival.
     mapping: Mutex<MappingState>,
@@ -1064,8 +1067,8 @@ struct BlockSlot {
 }
 
 struct BlockIncarnation {
-    state: AtomicU8,             // Active | Draining | Dead
-    in_use: Box<[AtomicU64]>,    // one bit per carrier
+    state: AtomicIncarnationState, // Active | Draining | Dead
+    in_use: Box<[AtomicU64]>,      // one bit per carrier
 }
 ```
 
@@ -1262,8 +1265,6 @@ struct CarrierAllocation {
     slot: Arc<BlockSlot>,
     index: u32,
     incarnation_identity: IncarnationIdentity,
-    // Checked only after the bit passes the Active gate.
-    ptr: NonNull<MaybeUninit<u8>>,
 }
 
 struct ClaimBatch {
@@ -1309,6 +1310,10 @@ captured only as an opaque comparison token. It is never converted back into a p
 post-gate owner keeps its incarnation current through its live bit, so allocator address reuse
 cannot occur during a valid comparison. Identity remains diagnostic: bitmap ownership and the
 claim-trim gate authorize rollback, return, and pointer construction.
+
+A `CarrierAllocation` stores the block slot and carrier index rather than a derived pointer. Its
+ownership bit prevents the block mapping from being deactivated while the allocation is live. Byte
+access derives a temporary pointer from the slot's validated `VirtualRange` and carrier index.
 
 `PendingAcquisition::finish` succeeds only when `claimed == required`. It consumes the complete
 batch and matching accounting debit, converts every provisional bit to one `CarrierAllocation`, and
@@ -1365,7 +1370,7 @@ Trim separates the bounded admission transition from protection and discard work
 3. Scan that incarnation's bitmap.
 4. If a bit is set, restore `Active`; `prepared_capacity` has not changed.
 5. If all bits are clear, subtract the block from `prepared_capacity`.
-6. Return a linear cleanup token and release admission serialization.
+6. Return a single-owner cleanup token and release admission serialization.
 7. Make the complete range inaccessible and discard backing outside admission serialization.
 8. Publish `Dead` and clear `current`.
 
@@ -1553,6 +1558,24 @@ fault. Deactivation failure enters `ProtectionPending` without assuming that pri
 remains. Discard success makes backing absent or reclaimable; discard failure may retain resident
 pages but cannot make the block claimable.
 
+**Alternative: Allocator-owned blocks.** A page-aligned allocation provides the same common-path
+carrier claim, return, and reuse while retained. The standard allocator API does not provide a
+per-block operation that revokes access and makes backing reclaimable while preserving ownership of
+the allocation. Retaining idle blocks therefore leaves resident-set reduction to allocator policy.
+Deallocating them gives up the address and makes physical release behavior allocator-dependent. This
+is a viable simpler design when reuse is primary and reclamation is best effort. The selected design
+instead gives idle trim an explicit page-level operation and failure contract.
+
+**Alternative: Release and replace virtual ranges.** A pool using operating-system mappings could
+release a trimmed range and allocate a new range on later growth. This returns virtual address space
+with the backing but makes trim a topology change. Old claim attempts and registry snapshots must
+retire before the address can be reused, or every stale lookup must detect replacement. Revival also
+requires a new slot or registry publication. The selected backend can make a block inaccessible and
+discard its backing or make it reclaimable without waiting for metadata readers to quiesce. Those
+readers may still observe the retired incarnation, but cannot construct or dereference a carrier
+pointer. The cost is one retained virtual reservation per peak block slot and target-specific
+mapping and recovery state.
+
 Correctness does not assume that a failed protection call leaves the prior protection unchanged.
 
 Prepared bytes are logically uninitialized regardless of initial or recommitted contents. Physical
@@ -1611,8 +1634,9 @@ choices.
 - **P2: Physical ownership.** A set valid bit has one `ProvisionalBits` or `CarrierAllocation`
   owner. Pointer construction follows a successful `Active` gate and stays within the owning
   `VirtualRange`.
-- **P3: Activation publication.** Preparation or revival adds prepared capacity before publishing
-  `Active`, and every activation uses a fresh bitmap.
+- **P3: Activation publication.** Initial preparation or revival adds prepared capacity before
+  publishing a fresh `Active` incarnation. Protection recovery adds prepared capacity before
+  restoring its retained `Draining` incarnation to `Active` and does not reset that bitmap.
 - **P4: Claim-trim exclusion.** Claim protects its incarnation through the state gate. Claim and
   trim cannot both miss the other's publication; gate-failure rollback uses the protected
   incarnation, and a gate-passed bit prevents replacement until return.
@@ -1654,7 +1678,7 @@ One completed carrier acquisition creates one `CarrierGuard`:
 struct CarrierGuard {
     // State required to validate return and release the aggregate charge.
     pool: Arc<PoolInner>,
-    // Linear physical-return capability, taken exactly once by final drop.
+    // Single-owner physical-return capability, taken once by final drop.
     allocation: Option<CarrierAllocation>,
     // Originating reservation state for a direct acquisition.
     direct: Option<Arc<ReservationState>>,
@@ -2844,9 +2868,10 @@ clearing an unexpected bit or releasing its charge.
 
 ### Carrier and block geometry
 
-Carrier size and carriers per block are measurement choices. Carrier size must be a multiple of the
-runtime page size. Smaller carriers reduce small-object and tail waste but increase bitmap
-operations, ownership transitions, scatter width, and carrier returns.
+Carrier and block sizes are measurement choices. Carrier size must be a multiple of the runtime page
+size, and block size must be a whole number of carriers. Smaller carriers reduce small-object and
+tail waste but increase bitmap operations, ownership transitions, scatter width, and carrier
+returns.
 
 Block size controls mapping amortization, all-free scan length, reclaim granularity, and how much
 capacity one long-lived carrier can keep prepared. Geometry selection must account for small
@@ -3253,24 +3278,25 @@ section; one property may discharge several contracts.
 
 ### Physical-storage verification
 
-| Obligation | Property                                                                  | Evidence                                                 | Negative control                                               |
-| ---------- | ------------------------------------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
-| P4         | Claim and trim cannot both pass their gate                                | Loom over one claim and one trim                         | Weaken either store-load pair to acquire/release               |
-| P3, P4     | Stale rollback cannot clear a revived carrier                             | Loom over claim, trim, revival, and new claim            | Reset and reuse one bitmap across activations                  |
-| P4         | Gate-failure rollback writes only through the protected incarnation       | Loom with removal of `current` before rollback           | Reacquire `current` for stale rollback                         |
-| P2, P5     | Post-gate batch rollback and final return clear exactly owned bits        | Loom plus multiword property tests                       | Clear the candidate mask instead of won bits                   |
-| P1         | Padding bits never become carriers or affect all-free                     | Property tests around every final-word width             | Omit `valid_masks` from claim or trim                          |
-| P1, P2     | Pool ownership spine is `Send + Sync` through `VirtualRange`              | Compile-time trait assertions and unsafe-code inspection | Store an unwrapped `NonNull` directly in `BlockSlot`           |
-| P1, P2     | Address lookup classifies only complete in-range views                    | Boundary property tests over sorted block ranges         | Classify by start address without checking the end             |
-| P6         | Fallback lock scope excludes pending finish and rollback                  | Deterministic miss-path tests plus lock assertions       | Finish or drop pending while admission remains held            |
-| P4         | Gate-failure rollback remains valid after range deactivation              | Loom over claim, trim, and delayed rollback              | Allocate incarnation metadata inside `VirtualRange`            |
-| P6         | Serialized fallback exhausts prepared capacity before growth              | Deterministic fragmented-registry tests                  | Grow after an optimistic miss without exhaustive recheck       |
-| P6         | Fresh growth reserves the fallback claimant's carriers before publication | Concurrent fallback and fast-claim test                  | Publish the free incarnation before preclaiming the batch      |
-| P7         | Protection and discard failure leave the block nonclaimable               | Failure injection at each mapping transition             | Restore `Active` from a failed platform call                   |
-| P3, P7     | Mapping failures preserve the admission floor                             | Failure injection across prepare, trim, and recovery     | Count failed preparation or subtract failed deactivation twice |
-| P8         | Idle retention does not decay within one idle epoch                       | Maintenance state-machine test over repeated scans       | Derive each retry target from current prepared capacity        |
-| P9         | Corrupt ownership state aborts before allocator mutation continues        | Fail-stop injection at each ownership check              | Clear a bit or release accounting after a failed check         |
-| A8, C3     | Shared-pool shutdown preserves other handles and final return             | Composed Loom with queue, reservation, and `Bytes`       | Drop pool state when manager-owned handles disappear           |
+| Obligation | Property                                                                  | Evidence                                                  | Negative control                                               |
+| ---------- | ------------------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| P4         | Claim and trim cannot both pass their gate                                | Loom over one claim and one trim                          | Weaken either store-load pair to acquire/release               |
+| P3, P4     | Stale rollback cannot clear a revived carrier                             | Loom over claim, trim, revival, and new claim             | Reset and reuse one bitmap across activations                  |
+| P3, P4, P7 | Protection recovery preserves ownership in the retained incarnation       | Loom over claim, failed deactivation, recovery, and claim | Reset the retained bitmap during protection recovery           |
+| P4         | Gate-failure rollback writes only through the protected incarnation       | Loom with removal of `current` before rollback            | Reacquire `current` for stale rollback                         |
+| P2, P5     | Post-gate batch rollback and final return clear exactly owned bits        | Loom plus multiword property tests                        | Clear the candidate mask instead of won bits                   |
+| P1         | Padding bits never become carriers or affect all-free                     | Property tests around every final-word width              | Ignore `final_word_mask` during claim or trim                  |
+| P1, P2     | Pool ownership spine is `Send + Sync` through `VirtualRange`              | Compile-time trait assertions and unsafe-code inspection  | Store an unwrapped `NonNull` directly in `BlockSlot`           |
+| P1, P2     | Address lookup classifies only complete in-range views                    | Boundary property tests over sorted block ranges          | Classify by start address without checking the end             |
+| P6         | Fallback lock scope excludes pending finish and rollback                  | Deterministic miss-path tests plus lock assertions        | Finish or drop pending while admission remains held            |
+| P4         | Gate-failure rollback remains valid after range deactivation              | Loom over claim, trim, and delayed rollback               | Allocate incarnation metadata inside `VirtualRange`            |
+| P6         | Serialized fallback exhausts prepared capacity before growth              | Deterministic fragmented-registry tests                   | Grow after an optimistic miss without exhaustive recheck       |
+| P6         | Fresh growth reserves the fallback claimant's carriers before publication | Concurrent fallback and fast-claim test                   | Publish the free incarnation before preclaiming the batch      |
+| P7         | Protection and discard failure leave the block nonclaimable               | Failure injection at each mapping transition              | Restore `Active` from a failed platform call                   |
+| P3, P7     | Mapping failures preserve the admission floor                             | Failure injection across prepare, trim, and recovery      | Count failed preparation or subtract failed deactivation twice |
+| P8         | Idle retention does not decay within one idle epoch                       | Maintenance state-machine test over repeated scans        | Derive each retry target from current prepared capacity        |
+| P9         | Corrupt ownership state aborts before allocator mutation continues        | Fail-stop injection at each ownership check               | Clear a bit or release accounting after a failed check         |
+| A8, C3     | Shared-pool shutdown preserves other handles and final return             | Composed Loom with queue, reservation, and `Bytes`        | Drop pool state when manager-owned handles disappear           |
 
 ### Ownership verification
 
