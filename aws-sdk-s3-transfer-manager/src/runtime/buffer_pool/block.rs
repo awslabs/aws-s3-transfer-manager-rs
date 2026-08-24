@@ -9,6 +9,7 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
+#[cfg(test)]
 use std::ops::Range;
 use std::ptr::NonNull;
 
@@ -242,11 +243,7 @@ impl BlockIncarnation {
             if remaining == 0 {
                 break;
             }
-            let valid = if word_index + 1 == geometry.bitmap_words() {
-                geometry.final_word_mask()
-            } else {
-                u64::MAX
-            };
+            let valid = bitmap_word_mask(geometry, word_index);
             let mask = take_lowest(valid, remaining);
             let taken = mask.count_ones() as usize;
             word.store(mask, Ordering::Relaxed);
@@ -429,6 +426,7 @@ impl BlockSlot {
     ///
     /// The integer range grants no access to the backing memory. `None`
     /// reports address arithmetic overflow.
+    #[cfg(test)]
     pub(super) fn address_range(&self) -> Option<Range<usize>> {
         let start = self.base_address();
         start.checked_add(self.reserved_len()).map(|end| start..end)
@@ -598,11 +596,7 @@ impl BlockSlot {
             .iter()
             .enumerate()
             .any(|(word_index, word)| {
-                let valid = if word_index + 1 == slot.geometry.bitmap_words() {
-                    slot.geometry.final_word_mask()
-                } else {
-                    u64::MAX
-                };
+                let valid = bitmap_word_mask(slot.geometry, word_index);
                 word.load(Ordering::SeqCst) & valid != 0
             });
         if busy {
@@ -841,11 +835,7 @@ impl BlockSlot {
             .iter()
             .enumerate()
             .all(|(word_index, word)| {
-                let valid = if word_index + 1 == self.geometry.bitmap_words() {
-                    self.geometry.final_word_mask()
-                } else {
-                    u64::MAX
-                };
+                let valid = bitmap_word_mask(self.geometry, word_index);
                 word.load(Ordering::Acquire) & valid == 0
             })
     }
@@ -862,11 +852,7 @@ impl BlockSlot {
                     .iter()
                     .enumerate()
                     .map(|(word_index, word)| {
-                        let valid = if word_index + 1 == self.geometry.bitmap_words() {
-                            self.geometry.final_word_mask()
-                        } else {
-                            u64::MAX
-                        };
+                        let valid = bitmap_word_mask(self.geometry, word_index);
                         (word.load(Ordering::Acquire) & valid).count_ones() as usize
                     })
                     .sum()
@@ -1055,11 +1041,7 @@ impl BlockClaimAttempt {
             }
             inspected += 1;
             let word = &incarnation.in_use[word_index];
-            let valid = if word_index + 1 == self.slot.geometry.bitmap_words() {
-                self.slot.geometry.final_word_mask()
-            } else {
-                u64::MAX
-            };
+            let valid = bitmap_word_mask(self.slot.geometry, word_index);
             let observed = word.load(Ordering::Relaxed);
             let candidate = take_lowest(!observed & valid, count);
             if candidate == 0 {
@@ -1088,11 +1070,7 @@ impl BlockClaimAttempt {
         for (word_index, word) in incarnation.in_use.iter().enumerate() {
             let mut observed = word.load(Ordering::Relaxed);
             while count != 0 {
-                let valid = if word_index + 1 == self.slot.geometry.bitmap_words() {
-                    self.slot.geometry.final_word_mask()
-                } else {
-                    u64::MAX
-                };
+                let valid = bitmap_word_mask(self.slot.geometry, word_index);
                 let candidate = take_lowest(!observed & valid, count);
                 if candidate == 0 {
                     break;
@@ -1294,6 +1272,13 @@ fn clear_owned_bits(word: &AtomicU64, mask: u64) {
             Err(actual) => observed = actual,
         }
     }
+}
+
+/// Returns valid bits for a checked bitmap word.
+fn bitmap_word_mask(geometry: PoolGeometry, word_index: usize) -> u64 {
+    geometry
+        .bitmap_word_mask(word_index)
+        .unwrap_or_else(|| invariant_violation("incarnation bitmap exceeds block geometry"))
 }
 
 /// Selects at most `count` least-significant bits from `available`.

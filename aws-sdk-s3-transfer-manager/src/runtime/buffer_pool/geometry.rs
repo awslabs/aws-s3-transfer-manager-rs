@@ -182,6 +182,21 @@ impl PoolGeometry {
         self.final_word_mask
     }
 
+    /// Returns valid carrier bits for one bitmap word.
+    ///
+    /// Complete words use every bit. A partial final word excludes padding
+    /// bits. `None` reports a word outside this geometry.
+    pub(super) fn bitmap_word_mask(self, word_index: usize) -> Option<u64> {
+        if word_index >= self.bitmap_words() {
+            return None;
+        }
+        if word_index + 1 == self.bitmap_words() {
+            Some(self.final_word_mask())
+        } else {
+            Some(u64::MAX)
+        }
+    }
+
     /// Rounds a nonzero byte request up to whole carriers.
     pub(super) fn carriers_for_bytes(self, bytes: usize) -> Result<CarrierCount, GeometryError> {
         if bytes == 0 {
@@ -290,15 +305,25 @@ mod tests {
     fn masks_every_partial_bitmap_width() {
         for carriers in 1..=BITS_PER_BITMAP_WORD * 3 {
             let geometry = PoolGeometry::new(1, carriers, 1).unwrap();
-            let complete_words = geometry.bitmap_words() - 1;
-            let valid = complete_words * BITS_PER_BITMAP_WORD
-                + geometry.final_word_mask().count_ones() as usize;
+            let valid = (0..geometry.bitmap_words())
+                .map(|word_index| {
+                    let mask = geometry.bitmap_word_mask(word_index).unwrap();
+                    let expected = if word_index + 1 == geometry.bitmap_words() {
+                        geometry.final_word_mask()
+                    } else {
+                        u64::MAX
+                    };
+                    assert_eq!(mask, expected);
+                    mask.count_ones() as usize
+                })
+                .sum::<usize>();
 
             assert_eq!(
                 geometry.bitmap_words(),
                 carriers.div_ceil(BITS_PER_BITMAP_WORD)
             );
             assert_eq!(valid, carriers);
+            assert_eq!(geometry.bitmap_word_mask(geometry.bitmap_words()), None);
         }
     }
 
