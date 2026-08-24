@@ -374,6 +374,7 @@ impl ClaimBatch {
     }
 
     /// Returns the required carrier count.
+    #[cfg(test)]
     pub(super) fn required(&self) -> CarrierCount {
         self.required
     }
@@ -467,7 +468,7 @@ struct ArenaDiagnostics {
     blocks_prepared: AtomicU64,
     /// Stable virtual ranges added to the registry.
     block_ranges_reserved: AtomicU64,
-    /// Provisional carriers returned without publication.
+    /// Carriers returned because a claim batch ended without publication.
     rolled_back_carriers: AtomicU64,
     /// Slots inspected while selecting trim candidates.
     trim_slots_scanned: AtomicU64,
@@ -497,7 +498,7 @@ impl ArenaDiagnostics {
         saturating_add(&self.block_ranges_reserved, 1);
     }
 
-    /// Records provisional carrier ownership returned by rollback.
+    /// Records carriers returned when a claim batch ends without publication.
     fn record_rolled_back_carriers(&self, carriers: usize) {
         saturating_add(&self.rolled_back_carriers, diagnostic_count(carriers));
     }
@@ -534,7 +535,7 @@ pub(super) struct ArenaDiagnosticSnapshot {
     pub(super) blocks_prepared: u64,
     /// Stable virtual ranges added to the registry.
     pub(super) block_ranges_reserved: u64,
-    /// Provisional carriers returned without publication.
+    /// Carriers returned because a claim batch ended without publication.
     pub(super) rolled_back_carriers: u64,
     /// Slots inspected while selecting trim candidates.
     pub(super) trim_slots_scanned: u64,
