@@ -41,6 +41,7 @@ http-body-1x = { package = "http-body", version = "1" }
 same-file = "1.0.6"
 dial9-tokio-telemetry = { version = "0.3", optional = true, features = ["cpu-profiling"] }
 arc-swap = "1.9.2"
+smallvec = "1"
 
 [features]
 dial9 = ["dep:dial9-tokio-telemetry"]
