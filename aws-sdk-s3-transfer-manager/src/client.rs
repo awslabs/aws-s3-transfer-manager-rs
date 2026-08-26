@@ -285,6 +285,11 @@ impl Client {
                             builder = builder.http_client(http_client.clone());
                         }
                     }
+                    crate::config::user_agent::install(
+                        &mut builder,
+                        config.framework_metadata().cloned(),
+                        config.runtime_mode().clone(),
+                    );
                     aws_sdk_s3::Client::from_conf(builder.build())
                 }
             };

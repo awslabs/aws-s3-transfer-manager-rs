@@ -10,6 +10,7 @@ use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, ReadAhead, RuntimeMode};
 
 pub(crate) mod loader;
+pub(crate) mod user_agent;
 
 /// Minimum upload part size in bytes
 pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
@@ -133,8 +134,7 @@ impl Config {
         self.machine_profile.as_ref()
     }
 
-    /// Returns the framework metadata setting when using transfer manager.
-    #[doc(hidden)]
+    /// The framework metadata this config carries, if a framework set one.
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
         self.framework_metadata.as_ref()
     }
@@ -265,13 +265,12 @@ impl Builder {
         self
     }
 
-    /// Sets the framework metadata for the transfer manager.
+    /// Identifies a framework built on top of the transfer manager in the user agent.
     ///
-    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
-    /// gets sent along with requests.
-    #[doc(hidden)]
-    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
-        self.framework_metadata = framework_metadata;
+    /// Added as `lib/<name>/<version>` alongside the transfer manager's own attribution,
+    /// not in place of it.
+    pub fn framework_metadata(mut self, framework_metadata: FrameworkMetadata) -> Self {
+        self.framework_metadata = Some(framework_metadata);
         self
     }
 

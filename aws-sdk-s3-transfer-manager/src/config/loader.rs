@@ -4,45 +4,10 @@
  */
 
 use aws_config::BehaviorVersion;
-use aws_runtime::sdk_feature::AwsSdkFeature;
-use aws_runtime::user_agent::{ApiMetadata, AwsUserAgent, FrameworkMetadata};
-use aws_sdk_s3::config::{Intercept, IntoShared};
-use aws_types::os_shim_internal::Env;
+use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::config::{Builder, Config};
 use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, RuntimeMode};
-
-#[derive(Debug)]
-struct S3TransferManagerInterceptor {
-    frame_work_meta_data: Option<FrameworkMetadata>,
-}
-
-impl Intercept for S3TransferManagerInterceptor {
-    fn name(&self) -> &'static str {
-        "S3TransferManager"
-    }
-
-    fn read_before_execution(
-        &self,
-        _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
-        cfg: &mut aws_sdk_s3::config::ConfigBag,
-    ) -> Result<(), aws_sdk_s3::error::BoxError> {
-        // Assume the interceptor only be added to the client constructed by the loader.
-        // In this case, there should not be any user agent was sent before this interceptor starts.
-        // Create our own user agent with S3Transfer feature and user passed-in framework_meta_data if any.
-        cfg.interceptor_state()
-            .store_append(AwsSdkFeature::S3Transfer);
-        let api_metadata = cfg.load::<ApiMetadata>().unwrap();
-        let mut ua = AwsUserAgent::new_from_environment(Env::real(), api_metadata.clone());
-        if let Some(framework_metadata) = self.frame_work_meta_data.clone() {
-            ua = ua.with_framework_metadata(framework_metadata);
-        }
-
-        cfg.interceptor_state().store_put(ua);
-
-        Ok(())
-    }
-}
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
@@ -102,12 +67,8 @@ impl ConfigLoader {
         self
     }
 
-    /// Sets the framework metadata for the transfer manager.
-    ///
-    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
-    /// gets sent along with requests.
-    #[doc(hidden)]
-    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
+    /// Identifies a framework built on top of the transfer manager in the user agent.
+    pub fn framework_metadata(mut self, framework_metadata: FrameworkMetadata) -> Self {
         self.builder = self.builder.framework_metadata(framework_metadata);
         self
     }
@@ -133,12 +94,8 @@ impl ConfigLoader {
         // construction stays free of blocking DMI reads and network IMDS calls.
         let profile = detect_machine_profile().await;
 
-        let mut sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
+        let sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
 
-        let interceptor = S3TransferManagerInterceptor {
-            frame_work_meta_data: self.builder.framework_metadata.clone(),
-        };
-        sdk_client_builder.push_interceptor(S3TransferManagerInterceptor::into_shared(interceptor));
         let builder = self
             .builder
             .machine_profile(Some(profile))
@@ -302,9 +259,9 @@ mod tests {
         let (http_client, captured_request) = capture_request(None);
         let config = crate::from_env()
             .part_size(PartSize::Target(8))
-            .framework_metadata(Some(
+            .framework_metadata(
                 FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
-            ))
+            )
             .load()
             .await;
         // Build the TM client so we can extract the S3 client's config with interceptors.
@@ -338,5 +295,11 @@ mod tests {
         let expected_req = captured_request.expect_request();
         let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
         assert!(user_agent.contains("lib/some-framework/1.3"));
+        // The framework's metadata is added alongside ours, not in place of it.
+        let ours = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
+        assert!(
+            user_agent.contains(ours),
+            "our attribution was displaced by the framework's: {user_agent:?}"
+        );
     }
 }
