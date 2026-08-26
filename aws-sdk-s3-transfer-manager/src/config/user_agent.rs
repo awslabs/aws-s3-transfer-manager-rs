@@ -14,19 +14,11 @@ use aws_types::os_shim_internal::Env;
 /// the transfer manager's version, and `rust-tm` distinguishes it from the CRT-backed one.
 const TM_METADATA: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
 
-/// Adds an `md/` section, dropping it if it does not validate — attribution must never fail
-/// a transfer.
-fn with_metadata(ua: AwsUserAgent, value: &'static str) -> AwsUserAgent {
-    match AdditionalMetadata::new(value) {
-        Ok(metadata) => ua.with_additional_metadata(metadata),
-        Err(_) => ua,
-    }
-}
-
 /// Install the transfer manager's user agent attribution on an S3 client builder.
 ///
-/// Called once per client from [`Client::new`](crate::Client::new), the one place both
-/// construction paths arrive as a builder we own, so each section appears exactly once.
+/// Called once per client from [`Client::new`](crate::Client::new), on the one client source we
+/// build ourselves, so each section appears exactly once. A client the caller hands over is used
+/// as built and carries none of this.
 pub(crate) fn install(
     builder: &mut aws_sdk_s3::config::Builder,
     framework_metadata: Option<FrameworkMetadata>,
@@ -69,7 +61,12 @@ impl Intercept for S3TransferManagerInterceptor {
         // No `ApiMetadata` to build from: leave it to the SDK, which raises its own error.
         let Some(mut ua) = base else { return Ok(()) };
 
-        ua = with_metadata(ua, TM_METADATA);
+        // `TM_METADATA` is a compile-time constant of legal metadata characters, so the error
+        // arm is unreachable; it is handled rather than unwrapped because attribution must never
+        // fail a transfer.
+        if let Ok(metadata) = AdditionalMetadata::new(TM_METADATA) {
+            ua = ua.with_additional_metadata(metadata);
+        }
 
         if let Some(framework_metadata) = self.framework_metadata.clone() {
             ua = ua.with_framework_metadata(framework_metadata);
@@ -92,6 +89,16 @@ mod tests {
     use aws_smithy_runtime::client::http::test_util::capture_request;
     use std::borrow::Cow;
 
+    fn test_credentials() -> SharedCredentialsProvider {
+        SharedCredentialsProvider::new(Credentials::new(
+            "ANOTREAL",
+            "notrealrnrELgWzOk3IfjzDKtFBhDby",
+            None,
+            None,
+            "test",
+        ))
+    }
+
     /// Drives one download through a transfer manager built from `s3_config(..)` and
     /// returns the `x-amz-user-agent` it sent. That path is the one a caller who brings
     /// their own S3 configuration takes, and installation covers it because
@@ -104,18 +111,9 @@ mod tests {
     /// Note the S3 client is configured *without* `with_test_defaults()`, which would
     /// seed `AwsUserAgent::for_tests()` into the config bag and short-circuit the
     /// assembly under test; credentials and behavior version are set directly instead.
-    fn test_credentials() -> SharedCredentialsProvider {
-        SharedCredentialsProvider::new(Credentials::new(
-            "ANOTREAL",
-            "notrealrnrELgWzOk3IfjzDKtFBhDby",
-            None,
-            None,
-            "test",
-        ))
-    }
-
     async fn captured_user_agent(
-        tm_tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
+        runtime_mode: RuntimeMode,
+        framework_metadata: Option<FrameworkMetadata>,
         tweak: impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder,
     ) -> String {
         let (http_client, captured) = capture_request(None);
@@ -131,7 +129,9 @@ mod tests {
             crate::config::S3ClientConfig::new(tweak(builder)).enable_runtime_http(false);
 
         let tm = crate::Client::new(
-            tm_tweak(crate::Config::builder())
+            crate::Config::builder()
+                .runtime_mode(runtime_mode)
+                .framework_metadata(framework_metadata)
                 .s3_config(s3_config)
                 .build(),
         );
@@ -155,10 +155,9 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn preserves_customer_app_name() {
-        let ua = captured_user_agent(
-            |c| c.runtime_mode(RuntimeMode::MultiThreadTokio),
-            |b| b.app_name(AppName::new("my-app").unwrap()),
-        )
+        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| {
+            b.app_name(AppName::new("my-app").unwrap())
+        })
         .await;
         assert!(ua.contains("app/my-app"), "app id missing from {ua:?}");
     }
@@ -168,8 +167,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_transfer_manager_version() {
-        let ua =
-            captured_user_agent(|c| c.runtime_mode(RuntimeMode::MultiThreadTokio), |b| b).await;
+        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| b).await;
         let expected = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
         assert!(ua.contains(expected), "{expected:?} missing from {ua:?}");
     }
@@ -179,8 +177,8 @@ mod tests {
     /// happening; this is the tripwire if one is ever added.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn emits_each_marker_once() {
-        let ua = captured_user_agent(|c| c.runtime_mode(RuntimeMode::Managed), |b| b).await;
+    async fn emits_our_marker_once() {
+        let ua = captured_user_agent(RuntimeMode::Managed, None, |b| b).await;
         assert_eq!(ua.matches("md/rust-tm#").count(), 1, "{ua:?}");
     }
 
@@ -191,14 +189,7 @@ mod tests {
     async fn framework_metadata_joins_our_attribution() {
         let framework =
             FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap();
-        let ua = captured_user_agent(
-            |c| {
-                c.runtime_mode(RuntimeMode::MultiThreadTokio)
-                    .framework_metadata(Some(framework))
-            },
-            |b| b,
-        )
-        .await;
+        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, Some(framework), |b| b).await;
         assert!(
             ua.contains("lib/some-framework/1.3"),
             "framework metadata missing from {ua:?}"
@@ -216,10 +207,9 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn preserves_user_agent_already_in_config_bag() {
-        let ua = captured_user_agent(
-            |c| c.runtime_mode(RuntimeMode::MultiThreadTokio),
-            |b| b.with_test_defaults(),
-        )
+        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| {
+            b.with_test_defaults()
+        })
         .await;
         assert!(
             ua.contains("api/test-service/0.123"),
@@ -237,8 +227,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_s3_transfer_business_metric() {
-        let ua =
-            captured_user_agent(|c| c.runtime_mode(RuntimeMode::MultiThreadTokio), |b| b).await;
+        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| b).await;
         let metrics = ua
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
@@ -322,10 +311,10 @@ mod tests {
         }
     }
 
-    /// Spelled the way the shared grammar allows — `sdk-metadata = "aws-sdk-" sdk-name
-    /// "/" version`, and `sdk-name` already enumerates `cli` — so this fixture is not a
-    /// non-conformant string for anyone to copy.
-    const OWNED_USER_AGENT: &str = "aws-sdk-cli/2.36.23 md/command#s3.cp";
+    /// A stand-in for whatever the caller writes, not a conformant user agent — it omits the
+    /// `ua/`, `os/` and `lang/` sections the grammar requires. What is under test is that the
+    /// value survives to the wire verbatim.
+    const OWNED_USER_AGENT: &str = "aws-cli/2.36.23 md/command#s3.cp";
 
     /// A caller that needs a leading product token cannot get one through the config
     /// bag — everything stored there still renders through `aws_ua_header()`, whose
@@ -340,13 +329,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_caller_can_own_both_headers() {
-        let ua = captured_user_agent(
-            |c| c.runtime_mode(RuntimeMode::MultiThreadTokio),
-            |mut b| {
-                b.push_interceptor(OverrideUserAgent.into_shared());
-                b
-            },
-        )
+        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |mut b| {
+            b.push_interceptor(OverrideUserAgent.into_shared());
+            b
+        })
         .await;
         assert_eq!(ua, OWNED_USER_AGENT);
     }

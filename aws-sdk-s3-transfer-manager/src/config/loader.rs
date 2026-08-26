@@ -202,11 +202,8 @@ async fn imds_instance_type() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use crate::types::PartSize;
     use aws_config::Region;
-    use aws_runtime::user_agent::FrameworkMetadata;
     use aws_sdk_s3::config::Intercept;
     use aws_smithy_runtime::client::http::test_util::capture_request;
 
@@ -257,15 +254,16 @@ mod tests {
         assert!(!imds_disabled_value(None), "unset defaults to enabled");
     }
 
+    /// The loader builds its own S3 configuration, so a captured request can only be had by
+    /// extracting that configuration and rebuilding a client from it. What this covers is the
+    /// loader path reaching the wire with our attribution; the sections themselves are owned by
+    /// the tests in [`crate::config::user_agent`].
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn load_with_interceptor_and_framework_metadata() {
+    async fn load_path_emits_attribution() {
         let (http_client, captured_request) = capture_request(None);
         let config = crate::from_env()
             .part_size(PartSize::Target(8))
-            .framework_metadata(Some(
-                FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
-            ))
             .load()
             .await;
         // Build the TM client so we can extract the S3 client's config with interceptors.
@@ -295,15 +293,12 @@ mod tests {
             .unwrap();
         // Expect to fail
         let _ = handle.body_mut().next().await;
-        // Check the request made contains the expected framework meta data in user agent.
         let expected_req = captured_request.expect_request();
         let user_agent = expected_req.headers().get("x-amz-user-agent").unwrap();
-        assert!(user_agent.contains("lib/some-framework/1.3"));
-        // The framework's metadata is added alongside ours, not in place of it.
         let ours = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
         assert!(
             user_agent.contains(ours),
-            "our attribution was displaced by the framework's: {user_agent:?}"
+            "loader path carries no attribution: {user_agent:?}"
         );
     }
 }
