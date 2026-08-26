@@ -5,7 +5,6 @@
 
 //! User agent attribution for requests the transfer manager issues.
 
-use crate::types::RuntimeMode;
 use aws_runtime::sdk_feature::AwsSdkFeature;
 use aws_runtime::user_agent::{AdditionalMetadata, ApiMetadata, AwsUserAgent, FrameworkMetadata};
 use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
@@ -14,14 +13,6 @@ use aws_types::os_shim_internal::Env;
 /// This crate's identity in the user agent. Neither `aws-sdk-rust/…` nor `api/s3/…` carries
 /// the transfer manager's version, and `rust-tm` distinguishes it from the CRT-backed one.
 const TM_METADATA: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
-
-/// Which runtime implementation is in use, not how it is tuned.
-fn runtime_mode_metadata(runtime_mode: &RuntimeMode) -> &'static str {
-    match runtime_mode {
-        RuntimeMode::Managed => "rust-tm-rt#managed",
-        RuntimeMode::MultiThreadTokio => "rust-tm-rt#tokio-mt",
-    }
-}
 
 /// Adds an `md/` section, dropping it if it does not validate — attribution must never fail
 /// a transfer.
@@ -39,21 +30,13 @@ fn with_metadata(ua: AwsUserAgent, value: &'static str) -> AwsUserAgent {
 pub(crate) fn install(
     builder: &mut aws_sdk_s3::config::Builder,
     framework_metadata: Option<FrameworkMetadata>,
-    runtime_mode: RuntimeMode,
 ) {
-    builder.push_interceptor(
-        S3TransferManagerInterceptor {
-            framework_metadata,
-            runtime_mode,
-        }
-        .into_shared(),
-    );
+    builder.push_interceptor(S3TransferManagerInterceptor { framework_metadata }.into_shared());
 }
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
     framework_metadata: Option<FrameworkMetadata>,
-    runtime_mode: RuntimeMode,
 }
 
 impl Intercept for S3TransferManagerInterceptor {
@@ -87,7 +70,6 @@ impl Intercept for S3TransferManagerInterceptor {
         let Some(mut ua) = base else { return Ok(()) };
 
         ua = with_metadata(ua, TM_METADATA);
-        ua = with_metadata(ua, runtime_mode_metadata(&self.runtime_mode));
 
         if let Some(framework_metadata) = self.framework_metadata.clone() {
             ua = ua.with_framework_metadata(framework_metadata);
@@ -192,41 +174,14 @@ mod tests {
         assert!(ua.contains(expected), "{expected:?} missing from {ua:?}");
     }
 
-    /// Which runtime the manager is on decides whether it owns its threads or borrows the
-    /// caller's, and `MultiThreadTokio` is slower by design — so a caller reporting poor
-    /// throughput is answered by this section before anything else. `Managed` is the default.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn emits_runtime_mode() {
-        let ua = captured_user_agent(|c| c.runtime_mode(RuntimeMode::Managed), |b| b).await;
-        assert!(
-            ua.contains("md/rust-tm-rt#managed"),
-            "runtime mode missing from {ua:?}"
-        );
-    }
-
-    /// The other half of [`emits_runtime_mode`]: the section has to distinguish the two
-    /// modes, not merely be present.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn emits_runtime_mode_for_tokio_runtime() {
-        let ua =
-            captured_user_agent(|c| c.runtime_mode(RuntimeMode::MultiThreadTokio), |b| b).await;
-        assert!(
-            ua.contains("md/rust-tm-rt#tokio-mt"),
-            "runtime mode missing or wrong in {ua:?}"
-        );
-    }
-
-    /// Both `md/` sections are appended to a list, so a second copy of the interceptor adds a
-    /// second copy of each rather than replacing it. A single installation site is what keeps
-    /// that from happening; this is the tripwire if one is ever added.
+    /// The `md/` section is appended to a list, so a second copy of the interceptor adds a
+    /// second copy rather than replacing it. A single installation site is what keeps that from
+    /// happening; this is the tripwire if one is ever added.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_each_marker_once() {
         let ua = captured_user_agent(|c| c.runtime_mode(RuntimeMode::Managed), |b| b).await;
         assert_eq!(ua.matches("md/rust-tm#").count(), 1, "{ua:?}");
-        assert_eq!(ua.matches("md/rust-tm-rt#").count(), 1, "{ua:?}");
     }
 
     /// A framework adding its own attribution must not cost ours, so both belong in the same
@@ -239,7 +194,7 @@ mod tests {
         let ua = captured_user_agent(
             |c| {
                 c.runtime_mode(RuntimeMode::MultiThreadTokio)
-                    .framework_metadata(framework)
+                    .framework_metadata(Some(framework))
             },
             |b| b,
         )

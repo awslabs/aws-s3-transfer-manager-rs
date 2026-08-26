@@ -134,7 +134,8 @@ impl Config {
         self.machine_profile.as_ref()
     }
 
-    /// The framework metadata this config carries, if a framework set one.
+    /// Returns the framework metadata setting when using transfer manager.
+    #[doc(hidden)]
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
         self.framework_metadata.as_ref()
     }
@@ -265,12 +266,13 @@ impl Builder {
         self
     }
 
-    /// Identifies a framework built on top of the transfer manager in the user agent.
+    /// Sets the framework metadata for the transfer manager.
     ///
-    /// Added as `lib/<name>/<version>` alongside the transfer manager's own attribution,
-    /// not in place of it.
-    pub fn framework_metadata(mut self, framework_metadata: FrameworkMetadata) -> Self {
-        self.framework_metadata = Some(framework_metadata);
+    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
+    /// gets sent along with requests.
+    #[doc(hidden)]
+    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
+        self.framework_metadata = framework_metadata;
         self
     }
 

@@ -1,5 +1,4 @@
 allowed_external_types = [
-    "aws_runtime::user_agent::FrameworkMetadata",
     "aws_sdk_s3::*",
     "aws_smithy_runtime_api::*",
     "aws_smithy_types::*",

@@ -5,9 +5,6 @@
 
 use crate::metrics::{unit::ByteUnit, Throughput};
 
-/// Identifies a framework built on the transfer manager, as `lib/<name>/<version>`.
-pub use aws_runtime::user_agent::FrameworkMetadata;
-
 /// The target part size for an upload or download request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]

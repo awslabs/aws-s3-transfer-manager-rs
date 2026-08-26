@@ -67,8 +67,12 @@ impl ConfigLoader {
         self
     }
 
-    /// Identifies a framework built on top of the transfer manager in the user agent.
-    pub fn framework_metadata(mut self, framework_metadata: FrameworkMetadata) -> Self {
+    /// Sets the framework metadata for the transfer manager.
+    ///
+    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
+    /// gets sent along with requests.
+    #[doc(hidden)]
+    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
         self.builder = self.builder.framework_metadata(framework_metadata);
         self
     }
@@ -259,9 +263,9 @@ mod tests {
         let (http_client, captured_request) = capture_request(None);
         let config = crate::from_env()
             .part_size(PartSize::Target(8))
-            .framework_metadata(
+            .framework_metadata(Some(
                 FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap(),
-            )
+            ))
             .load()
             .await;
         // Build the TM client so we can extract the S3 client's config with interceptors.

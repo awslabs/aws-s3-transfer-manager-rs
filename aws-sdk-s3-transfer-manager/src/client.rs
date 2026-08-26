@@ -288,7 +288,6 @@ impl Client {
                     crate::config::user_agent::install(
                         &mut builder,
                         config.framework_metadata().cloned(),
-                        config.runtime_mode().clone(),
                     );
                     aws_sdk_s3::Client::from_conf(builder.build())
                 }
