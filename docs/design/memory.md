@@ -540,9 +540,19 @@ Available coverage never exceeds the demand that created it:
 available_coverage <= active_planned_demand
 ```
 
-Grant adds equal planned demand and available coverage. Acquisition only lowers coverage. Close
-lowers planned demand and removes no more coverage than its envelope. Return restores coverage only
-after uncovered charges have been removed.
+The sum of direct outstanding charges across open reservations also cannot overlap available
+coverage:
+
+```text
+available_coverage + open_direct_outstanding <= active_planned_demand
+```
+
+Grant adds equal planned demand and available coverage. Acquisition publishes its aggregate charge
+before adding direct outstanding authority, so that direct addition is already reflected by lower
+coverage or a new uncovered charge. Close uses the closing reservation's direct outstanding count
+and the remaining active demand to distinguish coverage it may withdraw. Return lowers direct
+outstanding before restoring coverage. Unreserved acquisition only lowers coverage and does not
+affect the direct term.
 
 A carrier is never live before it is charged:
 
@@ -833,17 +843,24 @@ Reserved growth never switches to unreserved acquisition or expands its envelope
 existing initialized data when the surrounding protocol permits a partial value; a complete part,
 range, or other indivisible value fails when its buffer cannot grow to the required size.
 
-Initial direct acquisition and reserved buffer growth first debit direct-acquisition authority.
-Unreserved buffers retain only pool authority and cannot switch to reserved growth; reserved
-buffers cannot switch to unreserved growth. Both modes then debit the complete new carrier count
-from aggregate accounting before asking the arena for physical storage:
+Initial direct acquisition and reserved buffer growth publish the complete aggregate charge before
+debiting direct-acquisition authority. Unreserved buffers retain only pool authority and cannot
+switch to reserved growth; reserved buffers cannot switch to unreserved growth. Both modes debit
+aggregate accounting before asking the arena for physical storage:
 
 1. Consume as much `available_coverage` as remains.
 2. Add any shortfall to `uncovered_charges` while admission is serialized.
 3. Prepare physical capacity for the resulting `admission_used`.
-4. Release admission before optimistic physical claim.
-5. On an optimistic miss, acquire a fresh `AdmissionGuard` before serialized arena fallback.
-6. Transfer one aggregate charge and optional direct provenance to each `CarrierGuard`.
+4. Release admission after any required preparation.
+5. For reserved acquisition, atomically debit direct-acquisition authority. If close or capacity
+   exhaustion rejects the debit, roll back the aggregate charge.
+6. Perform optimistic physical claim.
+7. On an optimistic miss, acquire a fresh `AdmissionGuard` before serialized arena fallback.
+8. Transfer one aggregate charge and optional direct provenance to each `CarrierGuard`.
+
+Reserved acquisition may first load the direct state to reject authority that is already closed or
+exhausted before aggregate preparation. That precheck does not reserve authority; the atomic debit
+after aggregate publication remains authoritative.
 
 An acquisition fully covered by available coverage performs the aggregate debit through
 `CoverageState` without the admission mutex. A shortfall enters admission serialization before
@@ -855,11 +872,12 @@ cannot reduce aggregate prepared capacity below a floor that includes the in-fli
 The claim-trim gate protects any particular block selected concurrently. Deferring charge
 publication until after claim would remove the aggregate protection.
 
-Preparation failure applies the inverse transition and restores direct-acquisition authority before
-returning an error. A later physical failure rolls back owned bits before reversing the published
-charge. If that reversal removes an uncovered charge, it uses the same admission-drain escalation as
-[final return](#close-and-return). No writable memory is exposed before the complete acquisition
-commits.
+Aggregate preparation failure changes no direct-acquisition authority. If the later direct debit is
+rejected, the acquisition reverses its aggregate charge before returning the direct-authority
+error. A later physical failure rolls back owned bits, retires direct authority, and then reverses
+the aggregate charge. If that reversal removes an uncovered charge, it uses the same
+admission-drain escalation as [final return](#close-and-return). No writable memory is exposed
+before the complete acquisition commits.
 
 `AcquisitionDebit` owns charges awaiting transfer to carrier guards:
 
@@ -898,12 +916,12 @@ impl Drop for Reservation {
 
 `acquire` is synchronous and borrows the non-cloneable public `Reservation`, so consuming that
 handle makes another initial acquire structurally impossible. Existing reserved buffers retain
-private `Arc<ReservationState>` values and may race growth with close. The packed reservation owner
-state linearizes that race:
+private `Arc<ReservationState>` values and may race growth with close. The aggregate charge is
+published before the packed reservation owner state linearizes that race:
 
 ```text
 growth debit wins  -> growth may complete; close prevents later growth
-close wins         -> growth requiring carriers returns ReservationClosed
+close wins         -> growth rolls back its aggregate charge and returns ReservationClosed
 ```
 
 A growth debit can win this race and then fail physical allocation after close. Its rollback retires
@@ -911,10 +929,13 @@ that in-flight debit but leaves the reservation state closed. A buffer operation
 by its existing writable tail does not debit direct-acquisition authority and remains valid after
 close.
 
-Coverage is aggregate rather than attributed to individual reservations. Closing envelope `E`
-therefore removes `E` units from aggregate planned demand. It removes available units first. If
-fewer than `E` units remain available, the rest are occupied by charges that must remain accounted
-after close. [Appendix A](#reservation-close) gives the complete transition.
+Coverage remains aggregate rather than partitioned by reservation. The packed close transition
+returns the closing reservation's direct outstanding count `D`. At most `E - D` units of its
+envelope are nominally unused at that point. Close removes those available units while preserving
+coverage attributable to remaining active demand. A direct return may lower `D` and restore
+coverage after the close snapshot; availability above remaining active demand is removed as part of
+the closing envelope. If unreserved acquisition consumed some nominally unused coverage, close
+reclassifies that deficit instead. [Appendix A](#reservation-close) gives the complete transition.
 
 Close and aggregate return may execute concurrently. If return linearizes first, it restores
 coverage for close to withdraw. If close linearizes first, close records uncovered charges for
@@ -3015,16 +3036,22 @@ available_coverage -= covered
 uncovered_charges += N - covered
 ```
 
-A direct initial acquisition or reserved-buffer growth first reserves `N` units of
-direct-acquisition authority and rejects the request when `direct_outstanding + N > envelope`.
-Consuming the public `Reservation` prevents another initial acquisition after close. Existing
-buffers retain private state, so close races growth through the packed reservation owner state:
-either the complete debit precedes close or growth observes `CLOSED` and returns
-`ReservationClosed`. An unreserved acquisition has no direct-acquisition-authority transition. If
-`N - covered` is nonzero, the acquisition publishes the complete charge and prepares to the new
-`admission_used` while holding admission, then releases admission before optimistic physical claim.
-The published charge keeps the prepared-capacity floor in force across that unlocked window. Both
-covered and shortfall acquisitions acquire a fresh guard only if optimistic physical claim misses.
+A direct initial acquisition or reserved-buffer growth first publishes the aggregate debit, then
+atomically reserves `N` units of direct-acquisition authority. It rejects the request when
+`direct_outstanding + N > envelope` or the owner state is `CLOSED`, and rolls back the aggregate
+debit before returning that error. Consuming the public `Reservation` prevents another initial
+acquisition after close. Existing buffers retain private state, so close races growth through the
+packed reservation owner state: either the direct debit precedes close, with its aggregate charge
+already published, or growth observes `CLOSED` and reverses that charge. An unreserved acquisition
+has no direct-acquisition-authority transition. If `N - covered` is nonzero, the acquisition
+publishes the complete charge and prepares to the new `admission_used` while holding admission,
+then releases admission before the direct debit and optimistic physical claim. The published charge
+keeps the prepared-capacity floor in force across that unlocked window. Both covered and shortfall
+acquisitions acquire a fresh guard only if optimistic physical claim misses.
+
+An advisory direct-state load may reject an already closed or exhausted reservation before the
+aggregate debit. It does not authorize acquisition and cannot replace the post-aggregate atomic
+debit.
 
 Mutable-buffer growth computes `N` from only the shortfall below the requested writable capacity:
 
@@ -3068,18 +3095,26 @@ held guard before entering arena state.
 Closing an envelope `E` consumes its public direct-acquisition authority exactly once:
 
 ```text
-unused_removed = min(E, available_coverage)
-occupied_reclassified = E - unused_removed
+D = direct_outstanding observed by the close transition
+potentially_unused = E - D
+remaining_active = active_planned_demand - E
 
-active_planned_demand -= E
+nominally_unused = min(potentially_unused, available_coverage)
+required_for_active = available_coverage.saturating_sub(remaining_active)
+unused_removed = max(nominally_unused, required_for_active)
+reclassified = E - unused_removed
+
+active_planned_demand = remaining_active
 available_coverage -= unused_removed
-uncovered_charges += occupied_reclassified
+uncovered_charges += reclassified
 ```
 
-Close creates no owner and removes no charge. It withdraws unused planned demand and leaves
-occupied demand represented as uncovered charges. Close racing final return produces the same
-state in either linearization order because each operation changes available coverage and uncovered
-charges as one packed transition.
+Without a concurrent direct return, `reclassified` is at least `D`. If return lowers direct
+outstanding after close observes `D` and restores aggregate coverage before the close CAS,
+`required_for_active` removes that newly unused coverage. Close creates no owner and removes no
+charge. It cannot withdraw available coverage needed by another open reservation's direct
+authority. Close racing final return produces the same state in every interleaving because each
+operation changes available coverage and uncovered charges as one packed transition.
 
 ### Prepared-capacity transitions
 
@@ -3168,6 +3203,11 @@ as a search hint may use `Relaxed`; ownership is decided by the gated `fetch_or`
 The packed accounting CAS that releases a charge is ordered after physical bitmap return. A grant
 or metrics sample that observes the accounting release therefore cannot precede the physical return
 that made the carrier reusable.
+
+Reserved acquisition publishes its packed aggregate debit before its reservation-local direct
+debit. Close reads the direct count from the same atomic transition that sets `CLOSED`; a direct
+debit that loses this race reverses its already-published aggregate charge. A successful direct
+debit therefore names a published charge until its corresponding return retires it.
 
 Prepared-capacity accounting precedes `Active` publication. Deactivation follows `Draining`,
 all-free confirmation, and prepared-capacity removal. Immutable byte publication requires no
@@ -3278,6 +3318,7 @@ section; one property may discharge several contracts.
 | A3         | Partial acquisition failure restores every debit and direct-acquisition authority | Failure injection after each claim and conversion      | Drop the debit before provisional and completed carriers          |
 | A4         | Close racing buffer growth has one complete outcome                               | Loom over authority, debit, rollback, and close        | Split `CLOSED` from the direct-authority debit                    |
 | A4         | Concurrent acquisitions consume direct-acquisition authority exactly once         | Loom over packed reservation owner state               | Load and store authority without compare-and-exchange             |
+| A4, A5     | Close preserves another open reservation's coverage and every surviving charge     | Multi-reservation regression and composed Loom         | Derive unused coverage only from the global available lane        |
 | A1         | Count conversion and packed lanes never overflow                                  | Boundary property tests over byte and carrier counts   | Remove one checked conversion                                     |
 
 ### Physical-storage verification
