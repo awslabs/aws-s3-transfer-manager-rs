@@ -9,17 +9,16 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
-#[cfg(test)]
-use std::ops::Range;
 use std::ptr::NonNull;
 
 use super::geometry::PoolGeometry;
-#[cfg(test)]
-use super::virtual_memory::VirtualMemoryOperation;
 use super::virtual_memory::{VirtualMemoryError, VirtualRange};
 use super::CarrierCount;
 use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use {super::virtual_memory::VirtualMemoryOperation, std::ops::Range};
 
 /// Failure to construct, prepare, or claim from one block.
 #[derive(Debug)]
@@ -96,15 +95,15 @@ pub(super) enum TrimBlocked {
     FloorViolation,
     /// A carrier claim won the claim-trim gate.
     Busy,
-    /// A prior trim or failed protection transition still owns the slot.
+    /// A prior trim or failed deactivation still owns the slot.
     CleanupPending,
 }
 
 /// Failed cleanup work that remains safe to retry while the slot is inactive.
 #[derive(Debug)]
 pub(super) enum CleanupRetry {
-    /// Whole-range protection is unknown and must be recovered.
-    ProtectionPending(VirtualMemoryError),
+    /// Whole-range deactivation failed and remains safe to retry.
+    DeactivationPending(VirtualMemoryError),
     /// The range is inaccessible, but backing may remain resident.
     ReclaimPending(VirtualMemoryError),
 }
@@ -119,8 +118,10 @@ enum MappingState {
     },
     /// The complete range is readable and writable.
     Prepared,
-    /// A protection call failed and the complete range must be recovered.
-    ProtectionPending,
+    /// Mapping preparation failed before an incarnation was published.
+    ActivationRecoveryPending,
+    /// Mapping deactivation failed while a draining incarnation remained.
+    DeactivationRecoveryPending,
 }
 
 /// Claim-trim gate state for one block incarnation.
@@ -149,23 +150,49 @@ impl AtomicIncarnationState {
         Self::decode(self.0.load(order))
     }
 
-    /// Stores `value` with `order`.
-    fn store(&self, value: IncarnationState, order: Ordering) {
-        self.0.store(value as u8, order);
+    /// Starts the claim-trim gate transition.
+    fn try_start_trim(&self) -> Result<(), IncarnationState> {
+        self.0
+            .compare_exchange(
+                IncarnationState::Active as u8,
+                IncarnationState::Draining as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(Self::decode)
     }
 
-    /// Compares and exchanges two typed states.
-    fn compare_exchange(
-        &self,
-        current: IncarnationState,
-        new: IncarnationState,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<IncarnationState, IncarnationState> {
-        self.0
-            .compare_exchange(current as u8, new as u8, success, failure)
-            .map(Self::decode)
-            .map_err(Self::decode)
+    /// Restores a draining incarnation after trim is abandoned or reversed.
+    fn restore_active(&self) {
+        if self
+            .0
+            .compare_exchange(
+                IncarnationState::Draining as u8,
+                IncarnationState::Active as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            invariant_violation("only a draining incarnation may return to active");
+        }
+    }
+
+    /// Retires a draining incarnation after its mapping becomes inaccessible.
+    fn retire(&self) {
+        if self
+            .0
+            .compare_exchange(
+                IncarnationState::Draining as u8,
+                IncarnationState::Dead as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            invariant_violation("only a draining incarnation may retire");
+        }
     }
 
     /// Converts a stored representation into a state.
@@ -368,6 +395,16 @@ mod incarnation_cell {
 use incarnation_cell::{IncarnationCell, IncarnationGuard};
 
 /// Stable block geometry, mapping, and replaceable ownership metadata.
+///
+/// Mapping state and the current incarnation remain separately synchronized
+/// so carrier claims never take `mapping`. Their legal combinations are:
+///
+/// | Mapping state                 | Current incarnation                    |
+/// |-------------------------------|----------------------------------------|
+/// | `Reserved`                    | none                                   |
+/// | `Prepared`                    | `Active` or trim-owned `Draining`      |
+/// | `ActivationRecoveryPending`   | none                                   |
+/// | `DeactivationRecoveryPending` | `Draining`                             |
 pub(super) struct BlockSlot {
     /// Stable slot index.
     id: u32,
@@ -446,14 +483,39 @@ impl BlockSlot {
     pub(super) fn prepare(&self, prepared: &mut CarrierCount) -> Result<(), BlockError> {
         let mut mapping = self.mapping.lock();
         let current = self.current.load();
-        if matches!(*mapping, MappingState::Prepared) {
-            return Err(BlockError::AlreadyPrepared);
-        }
+        let create_fresh = match *mapping {
+            MappingState::Prepared => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("prepared mapping has no current incarnation");
+                };
+                if incarnation.state.load(Ordering::Acquire) == IncarnationState::Dead {
+                    invariant_violation("prepared mapping has a dead current incarnation");
+                }
+                return Err(BlockError::AlreadyPrepared);
+            }
+            MappingState::Reserved { .. } | MappingState::ActivationRecoveryPending => {
+                if current.as_ref().is_some() {
+                    invariant_violation("inactive mapping retains a current incarnation");
+                }
+                true
+            }
+            MappingState::DeactivationRecoveryPending => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("deactivation recovery lost its current incarnation");
+                };
+                if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
+                    invariant_violation(
+                        "deactivation recovery retained a non-draining incarnation",
+                    );
+                }
+                false
+            }
+        };
 
         let next_prepared = prepared
             .checked_add(self.carrier_count())
             .ok_or(BlockError::PreparedCapacityOverflow)?;
-        let fresh = if current.as_ref().is_none() {
+        let fresh = if create_fresh {
             Some(Arc::new(BlockIncarnation::try_new(
                 self.geometry.bitmap_words(),
             )?))
@@ -461,25 +523,19 @@ impl BlockSlot {
             None
         };
 
-        if let Some(incarnation) = current.as_ref() {
-            if !matches!(*mapping, MappingState::ProtectionPending)
-                || incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining
-            {
-                invariant_violation("only protection recovery may retain a draining incarnation");
-            }
-        }
-
         if let Err(error) = self.range.prepare() {
-            *mapping = MappingState::ProtectionPending;
+            *mapping = if current.as_ref().is_some() {
+                MappingState::DeactivationRecoveryPending
+            } else {
+                MappingState::ActivationRecoveryPending
+            };
             return Err(error.into());
         }
 
         *mapping = MappingState::Prepared;
         *prepared = next_prepared;
         if let Some(incarnation) = current.as_ref() {
-            incarnation
-                .state
-                .store(IncarnationState::Active, Ordering::SeqCst);
+            incarnation.state.restore_active();
         } else if self.current.swap(fresh).is_some() {
             invariant_violation("preparation replaced a current incarnation");
         }
@@ -488,7 +544,8 @@ impl BlockSlot {
 
     /// Prepares a reusable inactive slot with `count` carriers already owned.
     ///
-    /// The caller serializes the pool-wide `prepared` count and admission
+    /// Serialized arena fallback calls this after exhausting active capacity.
+    /// The caller also serializes the pool-wide `prepared` count and admission
     /// floor.
     ///
     /// `None` reports an active slot or cleanup-pending incarnation. Success
@@ -512,8 +569,33 @@ impl BlockSlot {
         }
 
         let mut mapping = slot.mapping.lock();
-        if matches!(*mapping, MappingState::Prepared) || slot.current.load().as_ref().is_some() {
-            return Ok(None);
+        let current = slot.current.load();
+        match *mapping {
+            MappingState::Prepared => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("prepared mapping has no current incarnation");
+                };
+                if incarnation.state.load(Ordering::Acquire) == IncarnationState::Dead {
+                    invariant_violation("prepared mapping has a dead current incarnation");
+                }
+                return Ok(None);
+            }
+            MappingState::DeactivationRecoveryPending => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("deactivation recovery lost its current incarnation");
+                };
+                if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
+                    invariant_violation(
+                        "deactivation recovery retained a non-draining incarnation",
+                    );
+                }
+                return Ok(None);
+            }
+            MappingState::Reserved { .. } | MappingState::ActivationRecoveryPending => {
+                if current.as_ref().is_some() {
+                    invariant_violation("inactive mapping retains a current incarnation");
+                }
+            }
         }
 
         let next_prepared = prepared
@@ -524,7 +606,7 @@ impl BlockSlot {
         let incarnation = BlockIncarnation::identity(&fresh);
 
         if let Err(error) = slot.range.prepare() {
-            *mapping = MappingState::ProtectionPending;
+            *mapping = MappingState::ActivationRecoveryPending;
             return Err(error.into());
         }
 
@@ -555,7 +637,9 @@ impl BlockSlot {
         match *mapping {
             MappingState::Prepared => {}
             MappingState::Reserved { .. } => return Err(TrimBlocked::NotPrepared),
-            MappingState::ProtectionPending => return Err(TrimBlocked::CleanupPending),
+            MappingState::ActivationRecoveryPending | MappingState::DeactivationRecoveryPending => {
+                return Err(TrimBlocked::CleanupPending)
+            }
         }
 
         let current = slot.current.load();
@@ -577,16 +661,7 @@ impl BlockSlot {
             return Err(TrimBlocked::FloorViolation);
         }
 
-        if incarnation
-            .state
-            .compare_exchange(
-                IncarnationState::Active,
-                IncarnationState::Draining,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
+        if incarnation.state.try_start_trim().is_err() {
             return Err(TrimBlocked::CleanupPending);
         }
         loom_seq_cst_fence();
@@ -600,9 +675,7 @@ impl BlockSlot {
                 word.load(Ordering::SeqCst) & valid != 0
             });
         if busy {
-            incarnation
-                .state
-                .store(IncarnationState::Active, Ordering::SeqCst);
+            incarnation.state.restore_active();
             return Err(TrimBlocked::Busy);
         }
 
@@ -629,7 +702,7 @@ impl BlockSlot {
                     invariant_violation("prepared mapping has no current incarnation");
                 };
                 match incarnation.state.load(Ordering::Acquire) {
-                    IncarnationState::Active | IncarnationState::Draining => Ok(()),
+                    IncarnationState::Active | IncarnationState::Draining => return Ok(()),
                     IncarnationState::Dead => {
                         invariant_violation("prepared mapping has a dead current incarnation")
                     }
@@ -641,7 +714,7 @@ impl BlockSlot {
                 if self.current.load().as_ref().is_some() {
                     invariant_violation("inactive mapping has a current incarnation");
                 }
-                Ok(())
+                return Ok(());
             }
             MappingState::Reserved {
                 reclaim_pending: true,
@@ -649,7 +722,7 @@ impl BlockSlot {
                 if self.current.load().as_ref().is_some() {
                     invariant_violation("inactive reclaim has a current incarnation");
                 }
-                match self.range.discard() {
+                return match self.range.discard() {
                     Ok(()) => {
                         *mapping = MappingState::Reserved {
                             reclaim_pending: false,
@@ -657,25 +730,33 @@ impl BlockSlot {
                         Ok(())
                     }
                     Err(error) => Err(CleanupRetry::ReclaimPending(error)),
+                };
+            }
+            MappingState::ActivationRecoveryPending => {
+                if self.current.load().as_ref().is_some() {
+                    invariant_violation("activation recovery retained a current incarnation");
                 }
             }
-            MappingState::ProtectionPending => {
-                if let Some(incarnation) = self.current.load().as_ref() {
-                    if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
-                        invariant_violation(
-                            "protection-pending mapping has a non-draining incarnation",
-                        );
-                    }
-                }
-                if let Err(error) = self.range.deactivate() {
-                    return Err(CleanupRetry::ProtectionPending(error));
-                }
-                *mapping = MappingState::Reserved {
-                    reclaim_pending: false,
+            MappingState::DeactivationRecoveryPending => {
+                let current = self.current.load();
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("deactivation recovery lost its current incarnation");
                 };
-                self.finish_inactive_cleanup(&mut mapping)
+                if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
+                    invariant_violation(
+                        "deactivation recovery retained a non-draining incarnation",
+                    );
+                }
             }
         }
+
+        if let Err(error) = self.range.deactivate() {
+            return Err(CleanupRetry::DeactivationPending(error));
+        }
+        *mapping = MappingState::Reserved {
+            reclaim_pending: false,
+        };
+        self.finish_inactive_cleanup(&mut mapping)
     }
 
     /// Retires a draining incarnation after the range becomes inaccessible.
@@ -688,12 +769,7 @@ impl BlockSlot {
         *mapping = MappingState::Reserved { reclaim_pending };
 
         if let Some(incarnation) = self.current.load().as_ref() {
-            if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
-                invariant_violation("cleanup found a non-draining current incarnation");
-            }
-            incarnation
-                .state
-                .store(IncarnationState::Dead, Ordering::Release);
+            incarnation.state.retire();
             let removed = self
                 .current
                 .swap(None)
@@ -713,6 +789,7 @@ impl BlockSlot {
     ///
     /// Returns `None` when no incarnation is published, no bit is free, or
     /// trim wins the state gate. Zero returns [`BlockError::InvalidClaimCount`].
+    #[cfg(test)]
     pub(super) fn try_claim(
         slot: &Arc<Self>,
         count: CarrierCount,
@@ -942,8 +1019,8 @@ impl TrimCleanup {
         }
 
         if let Err(error) = self.slot.range.deactivate() {
-            *mapping = MappingState::ProtectionPending;
-            return Err(CleanupRetry::ProtectionPending(error));
+            *mapping = MappingState::DeactivationRecoveryPending;
+            return Err(CleanupRetry::DeactivationPending(error));
         }
 
         *mapping = MappingState::Reserved {
@@ -1010,6 +1087,7 @@ impl BlockClaimAttempt {
     /// fetch_or returns       0b0110  // occupancy before this fetch_or
     /// this claim wins        0b0001  // candidate & !previous
     /// ```
+    #[cfg(test)]
     fn take(&mut self, count: usize) -> usize {
         self.take_words(0, self.slot.geometry.bitmap_words(), count)
             .0
@@ -1362,6 +1440,29 @@ mod tests {
     }
 
     #[test]
+    fn incarnation_transitions_enforce_their_predecessors() {
+        let state = AtomicIncarnationState::new(IncarnationState::Active);
+
+        assert_eq!(state.try_start_trim(), Ok(()));
+        assert_eq!(state.load(Ordering::Acquire), IncarnationState::Draining);
+        assert_eq!(state.try_start_trim(), Err(IncarnationState::Draining));
+        state.restore_active();
+        assert_eq!(state.load(Ordering::Acquire), IncarnationState::Active);
+
+        let invalid_retire = catch_unwind(AssertUnwindSafe(|| state.retire()));
+        assert!(invalid_retire.is_err());
+        assert_eq!(state.load(Ordering::Acquire), IncarnationState::Active);
+
+        state.try_start_trim().unwrap();
+        state.retire();
+        assert_eq!(state.load(Ordering::Acquire), IncarnationState::Dead);
+
+        let invalid_restore = catch_unwind(AssertUnwindSafe(|| state.restore_active()));
+        assert!(invalid_restore.is_err());
+        assert_eq!(state.load(Ordering::Acquire), IncarnationState::Dead);
+    }
+
+    #[test]
     fn preparation_publishes_claimable_capacity() {
         let (slot, prepared) = prepared_slot(3);
 
@@ -1417,6 +1518,44 @@ mod tests {
     }
 
     #[test]
+    fn preclaimed_activation_crosses_bitmap_words_without_padding() {
+        let slot = Arc::new(BlockSlot::new(7, geometry(70)).unwrap());
+        let mut prepared = CarrierCount::ZERO;
+
+        let preclaimed =
+            BlockSlot::prepare_and_claim_if_inactive(&slot, &mut prepared, CarrierCount::new(67))
+                .unwrap()
+                .expect("fresh slot should activate")
+                .into_carriers()
+                .unwrap();
+
+        assert_eq!(prepared, CarrierCount::new(70));
+        assert_eq!(preclaimed.len(), 67);
+        assert_eq!(preclaimed.first().unwrap().carrier_index(), 0);
+        assert_eq!(preclaimed.last().unwrap().carrier_index(), 66);
+
+        let remaining = BlockSlot::try_claim(&slot, CarrierCount::new(70))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(CarrierAllocation::carrier_index)
+                .collect::<Vec<_>>(),
+            vec![67, 68, 69]
+        );
+        assert!(BlockSlot::try_claim(&slot, CarrierCount::new(1))
+            .unwrap()
+            .is_none());
+
+        drop(preclaimed);
+        drop(remaining);
+        assert_eq!(slot.live_carriers(), 0);
+    }
+
+    #[test]
     fn failed_preclaimed_activation_publishes_no_ownership() {
         let slot = Arc::new(BlockSlot::new(7, geometry(2)).unwrap());
         let mut prepared = CarrierCount::ZERO;
@@ -1440,7 +1579,7 @@ mod tests {
         assert_eq!(prepared, CarrierCount::ZERO);
         assert_eq!(slot.live_carriers(), 0);
         assert!(current_identity(&slot).is_none());
-        assert_mapping(&slot, MappingState::ProtectionPending);
+        assert_mapping(&slot, MappingState::ActivationRecoveryPending);
     }
 
     #[test]
@@ -1479,7 +1618,7 @@ mod tests {
         let cleanup = BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::ZERO).unwrap();
         assert!(matches!(
             cleanup.finish(),
-            Err(CleanupRetry::ProtectionPending(_))
+            Err(CleanupRetry::DeactivationPending(_))
         ));
 
         assert!(BlockSlot::prepare_and_claim_if_inactive(
@@ -1524,7 +1663,7 @@ mod tests {
                 if error.operation() == VirtualMemoryOperation::Prepare
         ));
         assert_eq!(prepared, CarrierCount::ZERO);
-        assert_mapping(&slot, MappingState::ProtectionPending);
+        assert_mapping(&slot, MappingState::ActivationRecoveryPending);
         assert!(current_identity(&slot).is_none());
         assert!(BlockSlot::try_claim(&slot, CarrierCount::new(1))
             .unwrap()
@@ -1543,7 +1682,7 @@ mod tests {
         slot.range
             .inject_failure_once(VirtualMemoryOperation::Prepare);
         assert!(slot.prepare(&mut prepared).is_err());
-        assert_mapping(&slot, MappingState::ProtectionPending);
+        assert_mapping(&slot, MappingState::ActivationRecoveryPending);
         assert!(current_identity(&slot).is_none());
 
         slot.retry_cleanup().unwrap();
@@ -1877,11 +2016,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            CleanupRetry::ProtectionPending(ref error)
+            CleanupRetry::DeactivationPending(ref error)
                 if error.operation() == VirtualMemoryOperation::Deactivate
         ));
         assert_eq!(prepared, CarrierCount::ZERO);
-        assert_mapping(&slot, MappingState::ProtectionPending);
+        assert_mapping(&slot, MappingState::DeactivationRecoveryPending);
         assert_eq!(current_identity(&slot), Some(original_identity));
         assert!(BlockSlot::try_claim(&slot, CarrierCount::new(1))
             .unwrap()
@@ -1909,7 +2048,7 @@ mod tests {
         let cleanup = BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::ZERO).unwrap();
         assert!(matches!(
             cleanup.finish(),
-            Err(CleanupRetry::ProtectionPending(_))
+            Err(CleanupRetry::DeactivationPending(_))
         ));
 
         slot.retry_cleanup().unwrap();
@@ -2004,7 +2143,7 @@ mod tests {
         drop(cleanup);
 
         assert_eq!(prepared, CarrierCount::ZERO);
-        assert_mapping(&slot, MappingState::ProtectionPending);
+        assert_mapping(&slot, MappingState::DeactivationRecoveryPending);
         assert!(current_identity(&slot).is_some());
         assert!(BlockSlot::try_claim(&slot, CarrierCount::new(1))
             .unwrap()
@@ -2071,6 +2210,21 @@ mod tests {
         assert_eq!(take_lowest(0b1011_0100, 3), 0b0011_0100);
         assert_eq!(take_lowest(0b1011_0100, usize::MAX), 0b1011_0100);
         assert_eq!(take_lowest(u64::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn repeated_wins_in_one_word_share_one_record() {
+        let mut won = Vec::new();
+
+        record_won(&mut won, 1, 0b0001);
+        record_won(&mut won, 1, 0b0100);
+        record_won(&mut won, 2, 0b0010);
+
+        assert_eq!(won.len(), 2);
+        assert_eq!(won[0].word_index, 1);
+        assert_eq!(won[0].mask, 0b0101);
+        assert_eq!(won[1].word_index, 2);
+        assert_eq!(won[1].mask, 0b0010);
     }
 
     /// Covers every occupancy pattern in the low bytes plus full-width cases.
@@ -2237,7 +2391,7 @@ mod loom_tests {
             let cleanup = BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::ZERO).unwrap();
             assert!(matches!(
                 cleanup.finish(),
-                Err(CleanupRetry::ProtectionPending(_))
+                Err(CleanupRetry::DeactivationPending(_))
             ));
             assert_eq!(attempt.take(1), 1);
 
@@ -2451,6 +2605,32 @@ mod loom_tests {
             assert_eq!(slot.live_carriers(), 1);
             drop(first);
             drop(second);
+            assert_eq!(slot.live_carriers(), 0);
+        });
+    }
+
+    #[test]
+    fn concurrent_returns_clear_disjoint_bits_in_one_word() {
+        loom::model(|| {
+            let geometry = PoolGeometry::new(4096, 8192, 4096).unwrap();
+            let slot = Arc::new(BlockSlot::new(0, geometry).unwrap());
+            let mut prepared = CarrierCount::ZERO;
+            slot.prepare(&mut prepared).unwrap();
+            let carriers = BlockSlot::try_claim(&slot, CarrierCount::new(2))
+                .unwrap()
+                .unwrap()
+                .into_carriers()
+                .unwrap();
+            let mut carriers = carriers.into_iter();
+            let first = carriers.next().unwrap();
+            let second = carriers.next().unwrap();
+            assert!(carriers.next().is_none());
+
+            let first = thread::spawn(move || drop(first));
+            let second = thread::spawn(move || drop(second));
+            first.join().unwrap();
+            second.join().unwrap();
+
             assert_eq!(slot.live_carriers(), 0);
         });
     }
