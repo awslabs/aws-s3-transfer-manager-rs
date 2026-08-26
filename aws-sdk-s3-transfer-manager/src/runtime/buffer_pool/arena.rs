@@ -3,7 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Stable block registry and physical-allocation coordination.
+//! Multi-block carrier acquisition and stable-range lookup.
+//!
+//! [`Arena`] publishes immutable registry generations for lock-free optimistic
+//! scans and address classification. A miss enters serialized fallback, which
+//! exhausts reusable capacity before preparing another block. The arena owns
+//! physical topology and claims; admission policy and byte presentation remain
+//! in higher layers.
 
 use std::collections::TryReserveError;
 use std::fmt;
@@ -14,6 +20,215 @@ use super::geometry::PoolGeometry;
 use super::CarrierCount;
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
+
+/// Stable slots and their atomically published lookup index.
+pub(super) struct Arena {
+    /// Shared block geometry.
+    geometry: PoolGeometry,
+    /// Maximum bitmap words inspected by one optimistic claim.
+    optimistic_scan_words: usize,
+    /// Rotating flattened bitmap-word origin.
+    scan_origin: AtomicUsize,
+    /// Internal scan, growth, and rollback counters.
+    diagnostics: Arc<ArenaDiagnostics>,
+    /// Lock-free registry publication.
+    registry: BlockRegistry,
+    /// Serialized slot creation and registry rebuilding.
+    state: Mutex<ArenaState>,
+}
+
+impl Arena {
+    /// Creates an empty arena with fixed block geometry.
+    pub(super) fn new(
+        geometry: PoolGeometry,
+        optimistic_scan_words: usize,
+    ) -> Result<Self, ArenaError> {
+        if optimistic_scan_words == 0 {
+            return Err(ArenaError::InvalidScanBudget);
+        }
+        Ok(Self {
+            geometry,
+            optimistic_scan_words,
+            scan_origin: AtomicUsize::new(0),
+            diagnostics: Arc::new(ArenaDiagnostics::default()),
+            registry: BlockRegistry::new(),
+            state: Mutex::new(ArenaState {
+                slots: Vec::new(),
+                next_slot: Some(0),
+            }),
+        })
+    }
+
+    /// Reserves and publishes one inactive stable block slot.
+    ///
+    /// Failure leaves the registry and slot identifier unchanged.
+    #[cfg(test)]
+    fn reserve_slot(&self) -> Result<Arc<BlockSlot>, ArenaError> {
+        let mut state = self.state.lock();
+        self.reserve_slot_locked(&mut state)
+    }
+
+    /// Reserves and publishes one slot while holding arena serialization.
+    ///
+    /// The mutable state reference proves exclusive access without reacquiring
+    /// the mutex. Failure leaves the state and registry generation unchanged.
+    fn reserve_slot_locked(&self, state: &mut ArenaState) -> Result<Arc<BlockSlot>, ArenaError> {
+        let slot_id = state.next_slot.ok_or(ArenaError::SlotIdExhausted)?;
+
+        state.slots.try_reserve(1)?;
+        let slot = Arc::new(BlockSlot::new(slot_id, self.geometry)?);
+        let generation = RegistryGeneration::try_with_slot(&state.slots, &slot)?;
+
+        state.slots.push(Arc::clone(&slot));
+        state.next_slot = slot_id.checked_add(1);
+        self.registry.publish(generation);
+        self.diagnostics.record_block_range_reserved();
+        Ok(slot)
+    }
+
+    /// Classifies a complete nonempty range within one stable block slot.
+    ///
+    /// Integer addresses are used only for comparison. This method does not
+    /// construct a pointer or authorize access to the classified range.
+    pub(super) fn classify_range(&self, start: usize, len: usize) -> Option<ClassifiedRange> {
+        self.registry.load().classify_range(start, len)
+    }
+
+    /// Selects one block observed active and free.
+    ///
+    /// Selection is a lock-free hint. A claim may race this scan, so the
+    /// caller must use [`BlockSlot::start_trim`] to recheck the lifecycle,
+    /// bitmap, and prepared-capacity floor under admission serialization.
+    pub(super) fn select_trim_candidate(&self) -> Option<Arc<BlockSlot>> {
+        let generation = self.registry_generation();
+        let mut scanned = 0;
+        let candidate = generation.slots_in_claim_order().iter().find_map(|slot| {
+            scanned += 1;
+            slot.appears_free().then(|| Arc::clone(slot))
+        });
+        self.diagnostics.record_trim_slots_scanned(scanned);
+        candidate
+    }
+
+    /// Returns one private arena diagnostic sample.
+    pub(super) fn diagnostics(&self) -> ArenaDiagnosticSnapshot {
+        self.diagnostics.snapshot()
+    }
+
+    /// Claims a complete or partial batch within the optimistic scan budget.
+    ///
+    /// The returned batch retains every gate-passed bit. A complete batch may
+    /// be converted to carrier owners. A partial batch remains suitable for
+    /// serialized fallback and returns its bits if dropped.
+    pub(super) fn claim_optimistic(
+        &self,
+        required: CarrierCount,
+    ) -> Result<ClaimBatch, ArenaError> {
+        if required == CarrierCount::ZERO {
+            return Err(ArenaError::InvalidClaimCount);
+        }
+
+        let generation = self.registry_generation();
+        let slots = generation.slots_in_claim_order();
+        let words_per_slot = self.geometry.bitmap_words();
+        let total_positions =
+            slots
+                .len()
+                .checked_mul(words_per_slot)
+                .ok_or(ArenaError::ScanSpaceOverflow {
+                    slots: slots.len(),
+                    words_per_slot,
+                })?;
+        let mut batch = ClaimBatch::new(required, Arc::clone(&self.diagnostics));
+        if total_positions == 0 {
+            self.diagnostics.record_optimistic_scan(0, true);
+            return Ok(batch);
+        }
+
+        let budget = self.optimistic_scan_words.min(total_positions);
+        let origin = self.scan_origin.fetch_add(budget, Ordering::Relaxed) % total_positions;
+        while batch.inspected_words < budget && !batch.is_complete() {
+            let position = wrapped_position(origin, batch.inspected_words, total_positions);
+            let slot_index = position / words_per_slot;
+            let start_word = position % words_per_slot;
+            let word_limit = (words_per_slot - start_word).min(budget - batch.inspected_words);
+            let claim = BlockSlot::try_claim_words(
+                &slots[slot_index],
+                start_word,
+                word_limit,
+                batch.remaining(),
+            )?;
+            let inspected = claim.inspected_words();
+            if inspected == 0 || inspected > word_limit {
+                invariant_violation("bounded block claim reported invalid scan work");
+            }
+            batch.inspected_words += inspected;
+            if let Some(provisional) = claim.into_provisional() {
+                batch.push(provisional)?;
+            }
+        }
+        self.diagnostics
+            .record_optimistic_scan(batch.inspected_words, !batch.is_complete());
+        Ok(batch)
+    }
+
+    /// Completes a partial batch through exhaustive reuse and private growth.
+    ///
+    /// The caller serializes `prepared` with the pool-wide admission floor.
+    /// This method then holds arena serialization through the full registry
+    /// recheck and every preparation. Existing inactive slots are reused
+    /// before another stable range is reserved.
+    pub(super) fn complete_claim_serialized(
+        &self,
+        prepared: &mut CarrierCount,
+        batch: &mut ClaimBatch,
+    ) -> Result<(), ArenaError> {
+        if batch.is_complete() {
+            return Ok(());
+        }
+        self.diagnostics.record_serialized_fallback();
+
+        let mut state = self.state.lock();
+        for slot in &state.slots {
+            if batch.is_complete() {
+                return Ok(());
+            }
+            if let Some(provisional) = BlockSlot::try_claim_exhaustive(slot, batch.remaining())? {
+                batch.push(provisional)?;
+            }
+        }
+
+        for slot in &state.slots {
+            if batch.is_complete() {
+                return Ok(());
+            }
+            let count = std::cmp::min(batch.remaining(), slot.carrier_count());
+            if let Some(provisional) =
+                BlockSlot::prepare_and_claim_if_inactive(slot, prepared, count)?
+            {
+                self.diagnostics.record_block_prepared();
+                batch.push(provisional)?;
+            }
+        }
+
+        while !batch.is_complete() {
+            let slot = self.reserve_slot_locked(&mut state)?;
+            let count = std::cmp::min(batch.remaining(), slot.carrier_count());
+            let provisional = BlockSlot::prepare_and_claim_if_inactive(&slot, prepared, count)?
+                .unwrap_or_else(|| {
+                    invariant_violation("new arena slot was not reusable for private growth")
+                });
+            self.diagnostics.record_block_prepared();
+            batch.push(provisional)?;
+        }
+        Ok(())
+    }
+
+    /// Protects the current immutable registry generation.
+    fn registry_generation(&self) -> RegistryGenerationGuard {
+        self.registry.load()
+    }
+}
 
 /// Failure to configure, claim, reserve, or publish arena storage.
 #[derive(Debug)]
@@ -134,215 +349,6 @@ impl From<BlockError> for ArenaError {
 impl From<TryReserveError> for ArenaError {
     fn from(error: TryReserveError) -> Self {
         Self::Allocation(error)
-    }
-}
-
-/// Stable slots and their atomically published lookup index.
-pub(super) struct Arena {
-    /// Shared block geometry.
-    geometry: PoolGeometry,
-    /// Maximum bitmap words inspected by one optimistic claim.
-    optimistic_scan_words: usize,
-    /// Rotating flattened bitmap-word origin.
-    scan_origin: AtomicUsize,
-    /// Internal scan, growth, and rollback counters.
-    diagnostics: Arc<ArenaDiagnostics>,
-    /// Lock-free registry publication.
-    registry: BlockRegistry,
-    /// Serialized slot creation and registry rebuilding.
-    state: Mutex<ArenaState>,
-}
-
-impl Arena {
-    /// Creates an empty arena with fixed block geometry.
-    pub(super) fn new(
-        geometry: PoolGeometry,
-        optimistic_scan_words: usize,
-    ) -> Result<Self, ArenaError> {
-        if optimistic_scan_words == 0 {
-            return Err(ArenaError::InvalidScanBudget);
-        }
-        Ok(Self {
-            geometry,
-            optimistic_scan_words,
-            scan_origin: AtomicUsize::new(0),
-            diagnostics: Arc::new(ArenaDiagnostics::default()),
-            registry: BlockRegistry::new(),
-            state: Mutex::new(ArenaState {
-                slots: Vec::new(),
-                next_slot: Some(0),
-            }),
-        })
-    }
-
-    /// Reserves and publishes one inactive stable block slot.
-    ///
-    /// Failure leaves the registry and slot identifier unchanged.
-    #[cfg(test)]
-    fn reserve_slot(&self) -> Result<Arc<BlockSlot>, ArenaError> {
-        let mut state = self.state.lock();
-        self.reserve_slot_locked(&mut state)
-    }
-
-    /// Reserves and publishes one slot while holding arena serialization.
-    ///
-    /// The mutable state reference proves exclusive access without reacquiring
-    /// the mutex. Failure leaves the state and registry generation unchanged.
-    fn reserve_slot_locked(&self, state: &mut ArenaState) -> Result<Arc<BlockSlot>, ArenaError> {
-        let slot_id = state.next_slot.ok_or(ArenaError::SlotIdExhausted)?;
-
-        state.slots.try_reserve(1)?;
-        let slot = Arc::new(BlockSlot::new(slot_id, self.geometry)?);
-        let snapshot = RegistrySnapshot::try_with_slot(&state.slots, &slot)?;
-
-        state.slots.push(Arc::clone(&slot));
-        state.next_slot = slot_id.checked_add(1);
-        self.registry.publish(snapshot);
-        self.diagnostics.record_block_range_reserved();
-        Ok(slot)
-    }
-
-    /// Classifies a complete nonempty range within one stable block slot.
-    ///
-    /// Integer addresses are used only for comparison. This method does not
-    /// construct a pointer or authorize access to the classified range.
-    pub(super) fn classify_range(&self, start: usize, len: usize) -> Option<ClassifiedRange> {
-        self.registry.load().classify_range(start, len)
-    }
-
-    /// Selects one block observed active and free.
-    ///
-    /// Selection is a lock-free hint. A claim may race this scan, so the
-    /// caller must use [`BlockSlot::start_trim`] to recheck the lifecycle,
-    /// bitmap, and prepared-capacity floor under admission serialization.
-    pub(super) fn select_trim_candidate(&self) -> Option<Arc<BlockSlot>> {
-        let snapshot = self.snapshot();
-        let mut scanned = 0;
-        let candidate = snapshot.claim_slots().iter().find_map(|slot| {
-            scanned += 1;
-            slot.appears_free().then(|| Arc::clone(slot))
-        });
-        self.diagnostics.record_trim_slots_scanned(scanned);
-        candidate
-    }
-
-    /// Returns one private arena diagnostic sample.
-    pub(super) fn diagnostics(&self) -> ArenaDiagnosticSnapshot {
-        self.diagnostics.snapshot()
-    }
-
-    /// Claims a complete or partial batch within the optimistic scan budget.
-    ///
-    /// The returned batch retains every gate-passed bit. A complete batch may
-    /// be converted to carrier owners. A partial batch remains suitable for
-    /// serialized fallback and returns its bits if dropped.
-    pub(super) fn claim_optimistic(
-        &self,
-        required: CarrierCount,
-    ) -> Result<ClaimBatch, ArenaError> {
-        if required == CarrierCount::ZERO {
-            return Err(ArenaError::InvalidClaimCount);
-        }
-
-        let snapshot = self.snapshot();
-        let slots = snapshot.claim_slots();
-        let words_per_slot = self.geometry.bitmap_words();
-        let total_positions =
-            slots
-                .len()
-                .checked_mul(words_per_slot)
-                .ok_or(ArenaError::ScanSpaceOverflow {
-                    slots: slots.len(),
-                    words_per_slot,
-                })?;
-        let mut batch = ClaimBatch::new(required, Arc::clone(&self.diagnostics));
-        if total_positions == 0 {
-            self.diagnostics.record_optimistic_scan(0, true);
-            return Ok(batch);
-        }
-
-        let budget = self.optimistic_scan_words.min(total_positions);
-        let origin = self.scan_origin.fetch_add(budget, Ordering::Relaxed) % total_positions;
-        while batch.inspected_words < budget && !batch.is_complete() {
-            let position = wrapped_position(origin, batch.inspected_words, total_positions);
-            let slot_index = position / words_per_slot;
-            let start_word = position % words_per_slot;
-            let word_limit = (words_per_slot - start_word).min(budget - batch.inspected_words);
-            let claim = BlockSlot::try_claim_words(
-                &slots[slot_index],
-                start_word,
-                word_limit,
-                batch.remaining(),
-            )?;
-            let inspected = claim.inspected_words();
-            if inspected == 0 || inspected > word_limit {
-                invariant_violation("bounded block claim reported invalid scan work");
-            }
-            batch.inspected_words += inspected;
-            if let Some(provisional) = claim.into_provisional() {
-                batch.push(provisional)?;
-            }
-        }
-        self.diagnostics
-            .record_optimistic_scan(batch.inspected_words, !batch.is_complete());
-        Ok(batch)
-    }
-
-    /// Completes a partial batch through exhaustive reuse and private growth.
-    ///
-    /// The caller serializes `prepared` with the pool-wide admission floor.
-    /// This method then holds arena serialization through the full registry
-    /// recheck and every preparation. Existing inactive slots are reused
-    /// before another stable range is reserved.
-    pub(super) fn complete_claim_serialized(
-        &self,
-        prepared: &mut CarrierCount,
-        batch: &mut ClaimBatch,
-    ) -> Result<(), ArenaError> {
-        if batch.is_complete() {
-            return Ok(());
-        }
-        self.diagnostics.record_serialized_fallback();
-
-        let mut state = self.state.lock();
-        for slot in &state.slots {
-            if batch.is_complete() {
-                return Ok(());
-            }
-            if let Some(provisional) = BlockSlot::try_claim_exhaustive(slot, batch.remaining())? {
-                batch.push(provisional)?;
-            }
-        }
-
-        for slot in &state.slots {
-            if batch.is_complete() {
-                return Ok(());
-            }
-            let count = std::cmp::min(batch.remaining(), slot.carrier_count());
-            if let Some(provisional) =
-                BlockSlot::prepare_and_claim_if_inactive(slot, prepared, count)?
-            {
-                self.diagnostics.record_block_prepared();
-                batch.push(provisional)?;
-            }
-        }
-
-        while !batch.is_complete() {
-            let slot = self.reserve_slot_locked(&mut state)?;
-            let count = std::cmp::min(batch.remaining(), slot.carrier_count());
-            let provisional = BlockSlot::prepare_and_claim_if_inactive(&slot, prepared, count)?
-                .unwrap_or_else(|| {
-                    invariant_violation("new arena slot was not reusable for private growth")
-                });
-            self.diagnostics.record_block_prepared();
-            batch.push(provisional)?;
-        }
-        Ok(())
-    }
-
-    /// Protects the current immutable registry snapshot.
-    fn snapshot(&self) -> RegistryGuard {
-        self.registry.load()
     }
 }
 
@@ -585,32 +591,32 @@ impl BlockRegistry {
     /// Creates a registry containing no slots.
     fn new() -> Self {
         Self {
-            current: registry_cell::RegistryCell::new(Arc::new(RegistrySnapshot::empty())),
+            current: registry_cell::RegistryCell::new(Arc::new(RegistryGeneration::empty())),
         }
     }
 
     /// Protects the current registry generation.
-    fn load(&self) -> RegistryGuard {
-        RegistryGuard {
+    fn load(&self) -> RegistryGenerationGuard {
+        RegistryGenerationGuard {
             inner: self.current.load(),
         }
     }
 
     /// Publishes a complete registry generation.
-    fn publish(&self, snapshot: RegistrySnapshot) {
-        self.current.store(Arc::new(snapshot));
+    fn publish(&self, generation: RegistryGeneration) {
+        self.current.store(Arc::new(generation));
     }
 }
 
 /// Protected access to one immutable registry generation.
-struct RegistryGuard {
+struct RegistryGenerationGuard {
     inner: registry_cell::RegistryCellGuard,
 }
 
-impl RegistryGuard {
+impl RegistryGenerationGuard {
     /// Returns slots in stable physical-claim order.
-    fn claim_slots(&self) -> &[Arc<BlockSlot>] {
-        &self.inner.as_ref().claim_slots
+    fn slots_in_claim_order(&self) -> &[Arc<BlockSlot>] {
+        &self.inner.as_ref().slots_in_claim_order
     }
 
     /// Classifies a complete nonempty range within one slot.
@@ -620,18 +626,18 @@ impl RegistryGuard {
 }
 
 /// Immutable claim and address indexes published as one generation.
-struct RegistrySnapshot {
+struct RegistryGeneration {
     /// Stable scan order for physical acquisition.
-    claim_slots: Box<[Arc<BlockSlot>]>,
+    slots_in_claim_order: Box<[Arc<BlockSlot>]>,
     /// Non-overlapping virtual ranges sorted by address.
     address_ranges: Box<[AddressRange]>,
 }
 
-impl RegistrySnapshot {
+impl RegistryGeneration {
     /// Creates an empty registry generation.
     fn empty() -> Self {
         Self {
-            claim_slots: Box::default(),
+            slots_in_claim_order: Box::default(),
             address_ranges: Box::default(),
         }
     }
@@ -643,21 +649,21 @@ impl RegistrySnapshot {
             .checked_add(1)
             .ok_or(ArenaError::RegistryCapacityOverflow)?;
 
-        let mut claim_slots = Vec::new();
-        claim_slots.try_reserve_exact(new_len)?;
-        claim_slots.extend(slots.iter().cloned());
-        claim_slots.push(Arc::clone(slot));
+        let mut slots_in_claim_order = Vec::new();
+        slots_in_claim_order.try_reserve_exact(new_len)?;
+        slots_in_claim_order.extend(slots.iter().cloned());
+        slots_in_claim_order.push(Arc::clone(slot));
 
         let mut address_ranges = Vec::new();
         address_ranges.try_reserve_exact(new_len)?;
-        for (slot_index, slot) in claim_slots.iter().enumerate() {
+        for (slot_index, slot) in slots_in_claim_order.iter().enumerate() {
             address_ranges.push(AddressRange::for_slot(slot, slot_index)?);
         }
         address_ranges.sort_unstable_by_key(|range| range.start);
         validate_address_ranges(&address_ranges)?;
 
         Ok(Self {
-            claim_slots: claim_slots.into_boxed_slice(),
+            slots_in_claim_order: slots_in_claim_order.into_boxed_slice(),
             address_ranges: address_ranges.into_boxed_slice(),
         })
     }
@@ -676,10 +682,11 @@ impl RegistrySnapshot {
         if end > range.end {
             return None;
         }
-        let slot =
-            Arc::clone(self.claim_slots.get(range.slot_index).unwrap_or_else(|| {
-                invariant_violation("registry range has an invalid slot index")
-            }));
+        let slot = Arc::clone(
+            self.slots_in_claim_order
+                .get(range.slot_index)
+                .unwrap_or_else(|| invariant_violation("registry range has an invalid slot index")),
+        );
         Some(ClassifiedRange {
             slot,
             offset: start - range.start,
@@ -694,7 +701,7 @@ struct AddressRange {
     start: usize,
     /// Exclusive end of the reservation.
     end: usize,
-    /// Index into [`RegistrySnapshot::claim_slots`].
+    /// Index into [`RegistryGeneration::slots_in_claim_order`].
     slot_index: usize,
 }
 
@@ -774,17 +781,17 @@ mod registry_cell {
 
     use arc_swap::{ArcSwap, Guard};
 
-    use super::RegistrySnapshot;
+    use super::RegistryGeneration;
     use crate::runtime::sync::sync::Arc;
 
     /// Atomic storage for the current registry generation.
     pub(super) struct RegistryCell {
-        inner: ArcSwap<RegistrySnapshot>,
+        inner: ArcSwap<RegistryGeneration>,
     }
 
     impl RegistryCell {
         /// Creates a cell containing `initial`.
-        pub(super) fn new(initial: Arc<RegistrySnapshot>) -> Self {
+        pub(super) fn new(initial: Arc<RegistryGeneration>) -> Self {
             Self {
                 inner: ArcSwap::from(initial),
             }
@@ -798,19 +805,19 @@ mod registry_cell {
         }
 
         /// Replaces the current generation.
-        pub(super) fn store(&self, snapshot: Arc<RegistrySnapshot>) {
-            self.inner.store(snapshot);
+        pub(super) fn store(&self, generation: Arc<RegistryGeneration>) {
+            self.inner.store(generation);
         }
     }
 
     /// Protection for one loaded registry generation.
     pub(super) struct RegistryCellGuard {
-        inner: Guard<Arc<RegistrySnapshot>>,
+        inner: Guard<Arc<RegistryGeneration>>,
     }
 
     impl RegistryCellGuard {
         /// Returns the protected generation.
-        pub(super) fn as_ref(&self) -> &RegistrySnapshot {
+        pub(super) fn as_ref(&self) -> &RegistryGeneration {
             &self.inner
         }
     }
@@ -820,17 +827,17 @@ mod registry_cell {
 mod registry_cell {
     //! Loom-instrumented publication with owned registry generations.
 
-    use super::RegistrySnapshot;
+    use super::RegistryGeneration;
     use crate::runtime::sync::sync::{Arc, Mutex};
 
     /// Loom-instrumented storage for the current registry generation.
     pub(super) struct RegistryCell {
-        inner: Mutex<Arc<RegistrySnapshot>>,
+        inner: Mutex<Arc<RegistryGeneration>>,
     }
 
     impl RegistryCell {
         /// Creates a cell containing `initial`.
-        pub(super) fn new(initial: Arc<RegistrySnapshot>) -> Self {
+        pub(super) fn new(initial: Arc<RegistryGeneration>) -> Self {
             Self {
                 inner: Mutex::new(initial),
             }
@@ -844,19 +851,19 @@ mod registry_cell {
         }
 
         /// Replaces the current generation.
-        pub(super) fn store(&self, snapshot: Arc<RegistrySnapshot>) {
-            *self.inner.lock() = snapshot;
+        pub(super) fn store(&self, generation: Arc<RegistryGeneration>) {
+            *self.inner.lock() = generation;
         }
     }
 
     /// Owned protection for one loaded registry generation.
     pub(super) struct RegistryCellGuard {
-        inner: Arc<RegistrySnapshot>,
+        inner: Arc<RegistryGeneration>,
     }
 
     impl RegistryCellGuard {
         /// Returns the protected generation.
-        pub(super) fn as_ref(&self) -> &RegistrySnapshot {
+        pub(super) fn as_ref(&self) -> &RegistryGeneration {
             &self.inner
         }
     }
@@ -929,7 +936,10 @@ mod tests {
         let arena = Arena::new(geometry(), 4).unwrap();
 
         assert!(arena.classify_range(1, 1).is_none());
-        assert!(arena.snapshot().claim_slots().is_empty());
+        assert!(arena
+            .registry_generation()
+            .slots_in_claim_order()
+            .is_empty());
     }
 
     #[test]
@@ -937,29 +947,56 @@ mod tests {
         let arena = Arena::new(geometry(), 4).unwrap();
         let first = arena.reserve_slot().unwrap();
         let second = arena.reserve_slot().unwrap();
-        let snapshot = arena.snapshot();
+        let generation = arena.registry_generation();
 
         assert_eq!(
-            snapshot
-                .claim_slots()
+            generation
+                .slots_in_claim_order()
                 .iter()
                 .map(|slot| slot.id())
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert_eq!(snapshot.inner.as_ref().address_ranges.len(), 2);
-        assert!(snapshot
+        assert_eq!(generation.inner.as_ref().address_ranges.len(), 2);
+        assert!(generation
             .inner
             .as_ref()
             .address_ranges
             .windows(2)
             .all(|pair| pair[0].end <= pair[1].start));
-        assert!(snapshot
-            .claim_slots()
+        assert!(generation
+            .slots_in_claim_order()
             .iter()
             .any(|slot| Arc::ptr_eq(slot, &first)));
-        assert!(snapshot
-            .claim_slots()
+        assert!(generation
+            .slots_in_claim_order()
+            .iter()
+            .any(|slot| Arc::ptr_eq(slot, &second)));
+    }
+
+    #[test]
+    fn production_registry_guard_survives_concurrent_publication() {
+        let arena = Arc::new(Arena::new(geometry(), 4).unwrap());
+        let first = arena.reserve_slot().unwrap();
+        let old_generation = arena.registry_generation();
+
+        let writer_arena = Arc::clone(&arena);
+        let writer = thread::spawn(move || writer_arena.reserve_slot().unwrap());
+        let second = writer.join().unwrap();
+        let new_generation = arena.registry_generation();
+
+        assert_eq!(old_generation.slots_in_claim_order().len(), 1);
+        assert!(Arc::ptr_eq(
+            &old_generation.slots_in_claim_order()[0],
+            &first
+        ));
+        assert_eq!(new_generation.slots_in_claim_order().len(), 2);
+        assert!(new_generation
+            .slots_in_claim_order()
+            .iter()
+            .any(|slot| Arc::ptr_eq(slot, &first)));
+        assert!(new_generation
+            .slots_in_claim_order()
             .iter()
             .any(|slot| Arc::ptr_eq(slot, &second)));
     }
@@ -985,6 +1022,36 @@ mod tests {
         assert!(arena.classify_range(range.start, 0).is_none());
         assert!(arena.classify_range(range.end - 1, 2).is_none());
         assert!(arena.classify_range(usize::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn classification_rejects_gaps_and_cross_slot_ranges() {
+        let geometry = geometry();
+        let slots_in_claim_order = (0..3)
+            .map(|slot_id| Arc::new(BlockSlot::new(slot_id, geometry).unwrap()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let generation = RegistryGeneration {
+            slots_in_claim_order,
+            address_ranges: vec![
+                AddressRange::new(0x1000, 0x1000, 0).unwrap(),
+                AddressRange::new(0x2000, 0x1000, 1).unwrap(),
+                AddressRange::new(0x4000, 0x1000, 2).unwrap(),
+            ]
+            .into_boxed_slice(),
+        };
+
+        let second = generation
+            .classify_range(0x2000, 1)
+            .expect("the second range begins at its lower boundary");
+        assert!(Arc::ptr_eq(
+            second.slot(),
+            &generation.slots_in_claim_order[1]
+        ));
+        assert_eq!(second.offset(), 0);
+
+        assert!(generation.classify_range(0x3000, 1).is_none());
+        assert!(generation.classify_range(0x1fff, 2).is_none());
     }
 
     #[test]
@@ -1042,7 +1109,10 @@ mod tests {
             arena.reserve_slot(),
             Err(ArenaError::SlotIdExhausted)
         ));
-        assert!(arena.snapshot().claim_slots().is_empty());
+        assert!(arena
+            .registry_generation()
+            .slots_in_claim_order()
+            .is_empty());
     }
 
     #[test]
@@ -1280,7 +1350,7 @@ mod tests {
 
         assert!(batch.is_complete());
         assert_eq!(prepared, CarrierCount::new(65));
-        assert_eq!(arena.snapshot().claim_slots().len(), 1);
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 1);
         let carriers = batch.finish().unwrap();
         assert_eq!(carriers[0].carrier_index(), 64);
         drop(carriers);
@@ -1310,7 +1380,7 @@ mod tests {
 
         assert!(batch.is_complete());
         assert_eq!(prepared, CarrierCount::new(6));
-        assert_eq!(arena.snapshot().claim_slots().len(), 3);
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 3);
         let carriers = batch.finish().unwrap();
         assert!(slots.iter().all(|slot| {
             carriers
@@ -1338,7 +1408,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(prepared, CarrierCount::new(2));
-        assert_eq!(arena.snapshot().claim_slots().len(), 1);
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 1);
         let carriers = batch.finish().unwrap();
         assert_eq!(carriers[0].slot_id(), inactive.id());
         drop(carriers);
@@ -1357,7 +1427,7 @@ mod tests {
 
         assert!(batch.is_complete());
         assert_eq!(prepared, CarrierCount::new(6));
-        assert_eq!(arena.snapshot().claim_slots().len(), 3);
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 3);
         let carriers = batch.finish().unwrap();
         assert_eq!(carriers.len(), 5);
         assert_eq!(
@@ -1391,7 +1461,7 @@ mod tests {
         assert_eq!(prepared, CarrierCount::new(2));
         assert_eq!(batch.claimed(), CarrierCount::new(2));
         assert!(!batch.is_complete());
-        assert_eq!(arena.snapshot().claim_slots().len(), 2);
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 2);
         drop(batch);
         assert_fully_free(&first);
         assert!(BlockSlot::try_claim(&second, CarrierCount::new(1))
@@ -1415,10 +1485,10 @@ mod tests {
         ));
         assert_eq!(prepared, CarrierCount::new(usize::MAX));
         assert_eq!(batch.claimed(), CarrierCount::ZERO);
-        let slots = arena.snapshot();
-        assert_eq!(slots.claim_slots().len(), 1);
+        let generation = arena.registry_generation();
+        assert_eq!(generation.slots_in_claim_order().len(), 1);
         assert!(
-            BlockSlot::try_claim(&slots.claim_slots()[0], CarrierCount::new(1))
+            BlockSlot::try_claim(&generation.slots_in_claim_order()[0], CarrierCount::new(1))
                 .unwrap()
                 .is_none()
         );
@@ -1457,7 +1527,7 @@ mod tests {
         let first = first.join().unwrap();
         let second = second.join().unwrap();
         assert_eq!(*prepared.lock().unwrap(), CarrierCount::new(4));
-        assert_eq!(arena.snapshot().claim_slots().len(), 2);
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 2);
         assert!(first.iter().all(|left| second.iter().all(|right| {
             (left.slot_id(), left.carrier_index()) != (right.slot_id(), right.carrier_index())
         })));
@@ -1583,11 +1653,14 @@ mod loom_tests {
     use super::*;
     use crate::runtime::sync::thread;
 
-    fn assert_coherent(snapshot: &RegistryGuard) {
-        let snapshot = snapshot.inner.as_ref();
-        assert_eq!(snapshot.claim_slots.len(), snapshot.address_ranges.len());
-        for range in &snapshot.address_ranges {
-            let slot = &snapshot.claim_slots[range.slot_index];
+    fn assert_coherent(generation: &RegistryGenerationGuard) {
+        let generation = generation.inner.as_ref();
+        assert_eq!(
+            generation.slots_in_claim_order.len(),
+            generation.address_ranges.len()
+        );
+        for range in &generation.address_ranges {
+            let slot = &generation.slots_in_claim_order[range.slot_index];
             assert_eq!(slot.address_range(), Some(range.start..range.end));
         }
     }
@@ -1607,14 +1680,14 @@ mod loom_tests {
 
             let reader_arena = Arc::clone(&arena);
             let reader = thread::spawn(move || {
-                assert_coherent(&reader_arena.snapshot());
+                assert_coherent(&reader_arena.registry_generation());
             });
 
             writer.join().unwrap();
             reader.join().unwrap();
-            let snapshot = arena.snapshot();
-            assert_coherent(&snapshot);
-            assert_eq!(snapshot.claim_slots().len(), 2);
+            let generation = arena.registry_generation();
+            assert_coherent(&generation);
+            assert_eq!(generation.slots_in_claim_order().len(), 2);
         });
     }
 
@@ -1647,6 +1720,43 @@ mod loom_tests {
             if let (Some(first), Some(second)) = (&first, &second) {
                 assert_ne!(first[0].carrier_index(), second[0].carrier_index());
             }
+        });
+    }
+
+    #[test]
+    fn concurrent_claims_use_distinct_rotated_windows() {
+        loom::model(|| {
+            let page_size = page_size().unwrap().get();
+            let geometry = PoolGeometry::new(page_size, page_size * 65, page_size).unwrap();
+            let arena = Arc::new(Arena::new(geometry, 1).unwrap());
+            let slot = arena.reserve_slot().unwrap();
+            let mut prepared = CarrierCount::ZERO;
+            slot.prepare(&mut prepared).unwrap();
+
+            let claim = |arena: Arc<Arena>| {
+                thread::spawn(move || {
+                    arena
+                        .claim_optimistic(CarrierCount::new(1))
+                        .unwrap()
+                        .finish()
+                        .unwrap()
+                })
+            };
+            let first = claim(Arc::clone(&arena));
+            let second = claim(Arc::clone(&arena));
+
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            let mut indices = [first[0].carrier_index(), second[0].carrier_index()];
+            indices.sort_unstable();
+            assert_eq!(indices, [0, 64]);
+
+            drop(first);
+            drop(second);
+            let returned = BlockSlot::try_claim(&slot, slot.carrier_count())
+                .unwrap()
+                .expect("both rotated-window owners returned");
+            assert_eq!(returned.len(), slot.carrier_count());
         });
     }
 

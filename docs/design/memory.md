@@ -1114,12 +1114,12 @@ struct ArenaState {
 }
 
 struct BlockRegistry {
-    snapshot: ArcSwap<RegistrySnapshot>,
+    generation: ArcSwap<RegistryGeneration>,
 }
 
-struct RegistrySnapshot {
+struct RegistryGeneration {
     // Stable scan order for physical acquisition.
-    claim_slots: Box<[Arc<BlockSlot>]>,
+    slots_in_claim_order: Box<[Arc<BlockSlot>]>,
     // Non-overlapping virtual ranges sorted by start address.
     address_ranges: Box<[AddressRange]>,
 }
@@ -1128,18 +1128,18 @@ struct AddressRange {
     // Exposed addresses used only for comparison; end is exclusive.
     start: usize,
     end: usize,
-    // Index into RegistrySnapshot::claim_slots.
+    // Index into RegistryGeneration::slots_in_claim_order.
     slot_index: usize,
 }
 ```
 
-`BlockRegistry` publishes claim order and address classification as one immutable snapshot.
-Optimistic claim scans load `claim_slots` without taking `ArenaState`. An incoming immutable view
-uses binary search over `address_ranges` and accepts a match only when its complete checked range
-lies within one slot. The integer bounds classify addresses only; carrier pointers are always
-derived from `VirtualRange`.
+`BlockRegistry` publishes claim order and address classification as one immutable generation.
+Optimistic claim scans load `slots_in_claim_order` without taking `ArenaState`. An incoming
+immutable view uses binary search over `address_ranges` and accepts a match only when its complete
+checked range lies within one slot. The integer bounds classify addresses only; carrier pointers
+are always derived from `VirtualRange`.
 
-Snapshot construction rejects address overflow, overlap, or an invalid slot index. Growth rebuilds
+Generation construction rejects address overflow, overlap, or an invalid slot index. Growth rebuilds
 and publishes both arrays while holding `ArenaState`. Return goes directly to the slot recorded by
 the carrier allocation and does not scan the registry.
 
@@ -1193,7 +1193,7 @@ error; no partial batch is exposed.
 
 The common path performs a bounded amount of optimistic bitmap work from a rotating origin:
 
-1. Load one immutable registry snapshot.
+1. Load one immutable registry generation.
 2. Inspect at most the configured number of bitmap words across `Active` blocks.
 3. Keep every bit won from each atomic bitmap operation.
 4. Confirm that each touched block remains `Active` after the bitmap mutation.
@@ -1572,7 +1572,7 @@ instead gives idle trim an explicit page-level operation and failure contract.
 
 **Alternative: Release and replace virtual ranges.** A pool using operating-system mappings could
 release a trimmed range and allocate a new range on later growth. This returns virtual address space
-with the backing but makes trim a topology change. Old claim attempts and registry snapshots must
+with the backing but makes trim a topology change. Old claim attempts and registry generations must
 retire before the address can be reused, or every stale lookup must detect replacement. Revival also
 requires a new slot or registry publication. The selected backend can make a block inaccessible and
 discard its backing or make it reclaimable without waiting for metadata readers to quiesce. Those
@@ -2049,7 +2049,7 @@ impl<'a> SegmentedBytesBuilder<'a> {
 immutable producer view, whether pool-backed or foreign. `push_segmented` consumes the input's
 remaining segments and their existing holds; it does not reconstruct ownership from pointers.
 `PooledBufMut::freeze` constructs pooled segments directly. The private builder resolves the
-complete range of `push_view` with a binary search over the registry snapshot's sorted address
+complete range of `push_view` with a binary search over the registry generation's sorted address
 ranges; the finished value retains no builder borrow. Owner boundaries need not be presentation
 boundaries:
 
@@ -3158,7 +3158,7 @@ as a search hint may use `Relaxed`; ownership is decided by the gated `fetch_or`
 | Packed coverage and uncovered charges | Load or failed CAS retry                      | `Acquire`                                                |
 | Packed coverage and uncovered charges | Successful debit, grant, close, or return CAS | `AcqRel`                                                 |
 | Reservation owner state               | Direct debit, close, rollback, or return      | One packed `AcqRel` read-modify-write                    |
-| Block registry                        | Publish or load immutable registry snapshot   | ArcSwap publication and guard contract                   |
+| Block registry                        | Publish or load immutable registry generation | ArcSwap publication and guard contract                   |
 | Current block incarnation             | Publish, replace, or protect incarnation      | ArcSwap publication and guard contract                   |
 | Wait result                           | Store terminal result and consume it          | `WaitSlot` mutex                                         |
 | Admission ledger and FIFO             | Every read and write                          | `AdmissionState` mutex                                   |
