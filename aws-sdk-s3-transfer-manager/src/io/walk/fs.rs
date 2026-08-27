@@ -2561,4 +2561,172 @@ mod tests {
             "concurrent walks must yield the same entries as serial walk"
         );
     }
+
+    // --- S3 key-order tests ---
+
+    // Entries must be emitted in UTF-8 byte order, as ListObjectsV2 returns keys.
+    fn assert_s3_key_order(entries: &[DirEntry]) {
+        let emitted: Vec<String> = entries.iter().map(|e| norm(e.relative_path())).collect();
+        let mut expected = emitted.clone();
+        expected.sort();
+        assert_eq!(emitted, expected, "walk must emit keys in UTF-8 byte order");
+    }
+
+    fn emitted(entries: &[DirEntry]) -> Vec<String> {
+        entries.iter().map(|e| norm(e.relative_path())).collect()
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_nested_before_sibling() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/c"), "").unwrap();
+        fs::write(dir.path().join("az.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // 'z' (0x7A) > '/' (0x2F), so the nested key comes first.
+        assert_eq!(emitted(&entries), vec!["a/c", "az.txt"]);
+        assert_s3_key_order(&entries);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_shared_prefix() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("test")).unwrap();
+        fs::write(dir.path().join("test/inner.txt"), "").unwrap();
+        fs::write(dir.path().join("test-123.txt"), "").unwrap();
+        fs::write(dir.path().join("test.txt"), "").unwrap();
+        fs::write(dir.path().join("test0.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // Divergent bytes: '-' 0x2D, '.' 0x2E, '/' 0x2F, '0' 0x30.
+        assert_eq!(
+            emitted(&entries),
+            vec!["test-123.txt", "test.txt", "test/inner.txt", "test0.txt"]
+        );
+        assert_s3_key_order(&entries);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_across_depths() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("b/c")).unwrap();
+        fs::write(dir.path().join("b/c/d.txt"), "").unwrap();
+        fs::write(dir.path().join("b/z.txt"), "").unwrap();
+        fs::write(dir.path().join("b.txt"), "").unwrap();
+        fs::write(dir.path().join("ba.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        assert_eq!(
+            emitted(&entries),
+            vec!["b.txt", "b/c/d.txt", "b/z.txt", "ba.txt"]
+        );
+        assert_s3_key_order(&entries);
+    }
+
+    // Random tree; returns the file count. Fragments bracket '/' (0x2F) in byte
+    // order, where interleaving matters. ASCII only until NFC/NFD is settled.
+    fn build_random_tree(rng: &mut fastrand::Rng, root: &Path, depth: usize) -> usize {
+        const FRAGMENTS: &[&str] = &[
+            "a", "a.txt", "a-1", "a+1", "a 1", "a%1", "a#1", "a0", "az", "b", "b.dat", "bz",
+        ];
+        let mut files = 0;
+        for _ in 0..rng.usize(1..=6) {
+            let path = root.join(FRAGMENTS[rng.usize(..FRAGMENTS.len())]);
+            if path.exists() {
+                continue;
+            }
+            if depth > 0 && rng.bool() {
+                fs::create_dir(&path).unwrap();
+                files += build_random_tree(rng, &path, depth - 1);
+            } else {
+                fs::write(&path, "").unwrap();
+                files += 1;
+            }
+        }
+        files
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_property() {
+        for seed in 0..32u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let dir = tempdir().unwrap();
+            let expected = build_random_tree(&mut rng, dir.path(), 3);
+
+            let walk = walker()
+                .recursive(true)
+                .sort(true)
+                .build()
+                .walk(ctx(dir.path()));
+            let (entries, errors) = collect_entries(walk).await;
+            assert!(
+                errors.is_empty(),
+                "seed {seed}: unexpected errors: {errors:?}"
+            );
+            assert_eq!(entries.len(), expected, "seed {seed}: wrong entry count");
+
+            let keys = emitted(&entries);
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted, "seed {seed}: emitted out of key order");
+        }
+    }
+
+    // Directories are read on demand, so removing an entry from a directory the
+    // walk has not reached yet must not disturb it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_entry_removed_before_its_directory_is_read() {
+        let dir = tempdir().unwrap();
+        for sub in ["a", "b"] {
+            fs::create_dir(dir.path().join(sub)).unwrap();
+            for name in ["1", "2", "3"] {
+                fs::write(dir.path().join(sub).join(name), "").unwrap();
+            }
+        }
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+
+        // The first entry comes from `a`, so `b` is still unread.
+        let first = walk.next().await.unwrap().unwrap();
+        assert!(norm(first.relative_path()).starts_with("a/"));
+        fs::remove_file(dir.path().join("b/2")).unwrap();
+
+        let mut keys = vec![norm(first.relative_path())];
+        while let Some(result) = walk.next().await {
+            keys.push(norm(result.expect("walk must not fail").relative_path()));
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["a/1", "a/2", "a/3", "b/1", "b/3"]);
+    }
 }
