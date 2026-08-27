@@ -15,9 +15,10 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as DiagnosticOrdering};
 
+use super::admission::AdmissionGuard;
 use super::block::{BlockError, BlockSlot, CarrierAllocation, ProvisionalBits};
 use super::geometry::PoolGeometry;
-use super::CarrierCount;
+use super::{invariant_violation, CarrierCount};
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
@@ -63,7 +64,7 @@ impl Arena {
     ///
     /// Failure leaves the registry and slot identifier unchanged.
     #[cfg(test)]
-    fn reserve_slot(&self) -> Result<Arc<BlockSlot>, ArenaError> {
+    pub(super) fn reserve_slot(&self) -> Result<Arc<BlockSlot>, ArenaError> {
         let mut state = self.state.lock();
         self.reserve_slot_locked(&mut state)
     }
@@ -113,6 +114,43 @@ impl Arena {
     /// Returns one private arena diagnostic sample.
     pub(super) fn diagnostics(&self) -> ArenaDiagnosticSnapshot {
         self.diagnostics.snapshot()
+    }
+
+    /// Prepares capacity through `target` under admission serialization.
+    ///
+    /// Whole-block preparation may raise prepared capacity above `target`.
+    /// Stable slots remain in the arena after trim. This operation scans those
+    /// slots, skips capacity that is already prepared, and revives inactive or
+    /// recovery-pending slots before reserving another virtual range. A failure
+    /// retains capacity prepared by earlier iterations but publishes no
+    /// admission grant.
+    pub(super) fn prepare_to(
+        &self,
+        admission: &mut AdmissionGuard<'_>,
+        target: CarrierCount,
+    ) -> Result<(), ArenaError> {
+        if admission.prepared_capacity() >= target {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock();
+        for slot in &state.slots {
+            if admission.prepared_capacity() >= target {
+                return Ok(());
+            }
+            match slot.prepare(admission.prepared_capacity_mut()) {
+                Ok(()) => self.diagnostics.record_block_prepared(),
+                Err(BlockError::AlreadyPrepared) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        while admission.prepared_capacity() < target {
+            let slot = self.reserve_slot_locked(&mut state)?;
+            slot.prepare(admission.prepared_capacity_mut())?;
+            self.diagnostics.record_block_prepared();
+        }
+        Ok(())
     }
 
     /// Claims a complete or partial batch within the optimistic scan budget.
@@ -174,13 +212,13 @@ impl Arena {
 
     /// Completes a partial batch through exhaustive reuse and private growth.
     ///
-    /// The caller serializes `prepared` with the pool-wide admission floor.
-    /// This method then holds arena serialization through the full registry
-    /// recheck and every preparation. Existing inactive slots are reused
-    /// before another stable range is reserved.
+    /// `admission` proves that the caller owns the prepared-capacity floor.
+    /// This method holds arena serialization through the full registry recheck
+    /// and every preparation. Existing inactive slots are reused before
+    /// another stable range is reserved.
     pub(super) fn complete_claim_serialized(
         &self,
-        prepared: &mut CarrierCount,
+        admission: &mut AdmissionGuard<'_>,
         batch: &mut ClaimBatch,
     ) -> Result<(), ArenaError> {
         if batch.is_complete() {
@@ -203,9 +241,11 @@ impl Arena {
                 return Ok(());
             }
             let count = std::cmp::min(batch.remaining(), slot.carrier_count());
-            if let Some(provisional) =
-                BlockSlot::prepare_and_claim_if_inactive(slot, prepared, count)?
-            {
+            if let Some(provisional) = BlockSlot::prepare_and_claim_if_inactive(
+                slot,
+                admission.prepared_capacity_mut(),
+                count,
+            )? {
                 self.diagnostics.record_block_prepared();
                 batch.push(provisional)?;
             }
@@ -214,10 +254,14 @@ impl Arena {
         while !batch.is_complete() {
             let slot = self.reserve_slot_locked(&mut state)?;
             let count = std::cmp::min(batch.remaining(), slot.carrier_count());
-            let provisional = BlockSlot::prepare_and_claim_if_inactive(&slot, prepared, count)?
-                .unwrap_or_else(|| {
-                    invariant_violation("new arena slot was not reusable for private growth")
-                });
+            let provisional = BlockSlot::prepare_and_claim_if_inactive(
+                &slot,
+                admission.prepared_capacity_mut(),
+                count,
+            )?
+            .unwrap_or_else(|| {
+                invariant_violation("new arena slot was not reusable for private growth")
+            });
             self.diagnostics.record_block_prepared();
             batch.push(provisional)?;
         }
@@ -869,30 +913,12 @@ mod registry_cell {
     }
 }
 
-/// Stops execution after a registry invariant fails.
-#[cold]
-fn invariant_violation(message: &'static str) -> ! {
-    tracing::error!(
-        target: crate::telemetry::TARGET_MEMORY,
-        reason = message,
-        "buffer-pool registry invariant violated; aborting"
-    );
-
-    #[cfg(test)]
-    panic!("buffer-pool registry invariant violated: {message}");
-
-    #[cfg(not(test))]
-    {
-        let _ = message;
-        std::process::abort()
-    }
-}
-
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
-    use std::sync::{Barrier, Mutex as StdMutex};
+    use std::sync::Barrier;
     use std::thread;
 
+    use super::super::admission::{AdmissionGuard, AdmissionState, MAX_PACKED_CARRIERS};
     use super::super::block::TrimBlocked;
     use super::super::virtual_memory::{page_size, VirtualMemoryOperation};
     use super::super::CarrierCount;
@@ -910,6 +936,15 @@ mod tests {
             page_size,
         )
         .unwrap()
+    }
+
+    fn admission_with_prepared(prepared: CarrierCount) -> Mutex<AdmissionState> {
+        let state = Mutex::new(AdmissionState::new(MAX_PACKED_CARRIERS));
+        {
+            let mut admission = AdmissionGuard::new(state.lock());
+            *admission.prepared_capacity_mut() = prepared;
+        }
+        state
     }
 
     fn prepare_slots(arena: &Arena, count: usize) -> Vec<Arc<BlockSlot>> {
@@ -1333,6 +1368,73 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_to_rounds_to_blocks_and_is_idempotent() {
+        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
+
+        arena
+            .prepare_to(&mut admission, CarrierCount::new(3))
+            .unwrap();
+
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(4));
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 2);
+        assert_eq!(arena.diagnostics().blocks_prepared, 2);
+
+        arena
+            .prepare_to(&mut admission, CarrierCount::new(4))
+            .unwrap();
+        assert_eq!(arena.diagnostics().blocks_prepared, 2);
+    }
+
+    #[test]
+    fn test_prepare_to_reuses_an_inactive_slot_before_reserving() {
+        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let slot = arena.reserve_slot().unwrap();
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
+
+        arena
+            .prepare_to(&mut admission, CarrierCount::new(1))
+            .unwrap();
+
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(2));
+        assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 1);
+        assert_fully_free(&slot);
+    }
+
+    #[test]
+    fn test_prepare_to_failure_retains_earlier_preparation() {
+        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let first = arena.reserve_slot().unwrap();
+        let second = arena.reserve_slot().unwrap();
+        second.inject_failure_once(VirtualMemoryOperation::Prepare);
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
+
+        let error = arena
+            .prepare_to(&mut admission, CarrierCount::new(3))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArenaError::Block(BlockError::VirtualMemory(ref error))
+                if error.operation() == VirtualMemoryOperation::Prepare
+        ));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(2));
+        assert_fully_free(&first);
+        assert!(BlockSlot::try_claim(&second, CarrierCount::new(1))
+            .unwrap()
+            .is_none());
+
+        arena
+            .prepare_to(&mut admission, CarrierCount::new(3))
+            .unwrap();
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(4));
+        assert_fully_free(&second);
+    }
+
+    #[test]
     fn serialized_fallback_rechecks_active_capacity_before_growth() {
         let arena = Arena::new(geometry_with_carriers(65), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
@@ -1342,14 +1444,15 @@ mod tests {
             .unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
         assert_eq!(batch.claimed(), CarrierCount::ZERO);
-        let mut prepared = CarrierCount::new(65);
+        let admission = admission_with_prepared(CarrierCount::new(65));
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap();
 
         assert!(batch.is_complete());
-        assert_eq!(prepared, CarrierCount::new(65));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(65));
         assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 1);
         let carriers = batch.finish().unwrap();
         assert_eq!(carriers[0].carrier_index(), 64);
@@ -1372,14 +1475,15 @@ mod tests {
             .collect::<Vec<_>>();
         let mut batch = arena.claim_optimistic(CarrierCount::new(3)).unwrap();
         assert_eq!(batch.claimed(), CarrierCount::new(1));
-        let mut prepared = CarrierCount::new(6);
+        let admission = admission_with_prepared(CarrierCount::new(6));
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap();
 
         assert!(batch.is_complete());
-        assert_eq!(prepared, CarrierCount::new(6));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(6));
         assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 3);
         let carriers = batch.finish().unwrap();
         assert!(slots.iter().all(|slot| {
@@ -1401,13 +1505,14 @@ mod tests {
         let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
         let inactive = arena.reserve_slot().unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
-        let mut prepared = CarrierCount::ZERO;
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap();
 
-        assert_eq!(prepared, CarrierCount::new(2));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(2));
         assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 1);
         let carriers = batch.finish().unwrap();
         assert_eq!(carriers[0].slot_id(), inactive.id());
@@ -1419,14 +1524,15 @@ mod tests {
     fn serialized_fallback_grows_whole_blocks_until_complete() {
         let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(5)).unwrap();
-        let mut prepared = CarrierCount::ZERO;
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap();
 
         assert!(batch.is_complete());
-        assert_eq!(prepared, CarrierCount::new(6));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(6));
         assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 3);
         let carriers = batch.finish().unwrap();
         assert_eq!(carriers.len(), 5);
@@ -1447,10 +1553,11 @@ mod tests {
         let second = arena.reserve_slot().unwrap();
         second.inject_failure_once(VirtualMemoryOperation::Prepare);
         let mut batch = arena.claim_optimistic(CarrierCount::new(3)).unwrap();
-        let mut prepared = CarrierCount::ZERO;
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         let error = arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap_err();
 
         assert!(matches!(
@@ -1458,7 +1565,7 @@ mod tests {
             ArenaError::Block(BlockError::VirtualMemory(ref error))
                 if error.operation() == VirtualMemoryOperation::Prepare
         ));
-        assert_eq!(prepared, CarrierCount::new(2));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(2));
         assert_eq!(batch.claimed(), CarrierCount::new(2));
         assert!(!batch.is_complete());
         assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 2);
@@ -1473,17 +1580,18 @@ mod tests {
     fn serialized_growth_rejects_prepared_capacity_overflow() {
         let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
-        let mut prepared = CarrierCount::new(usize::MAX);
+        let admission = admission_with_prepared(CarrierCount::new(usize::MAX));
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         let error = arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap_err();
 
         assert!(matches!(
             error,
             ArenaError::Block(BlockError::PreparedCapacityOverflow)
         ));
-        assert_eq!(prepared, CarrierCount::new(usize::MAX));
+        assert_eq!(admission.prepared_capacity(), CarrierCount::new(usize::MAX));
         assert_eq!(batch.claimed(), CarrierCount::ZERO);
         let generation = arena.registry_generation();
         assert_eq!(generation.slots_in_claim_order().len(), 1);
@@ -1497,36 +1605,39 @@ mod tests {
     #[test]
     fn concurrent_serialized_fallbacks_retain_private_growth() {
         let arena = Arc::new(Arena::new(geometry_with_carriers(2), 1).unwrap());
-        let prepared = Arc::new(StdMutex::new(CarrierCount::ZERO));
+        let admission = Arc::new(admission_with_prepared(CarrierCount::ZERO));
         let start = Arc::new(Barrier::new(2));
 
         let fallback =
-            |arena: Arc<Arena>, prepared: Arc<StdMutex<CarrierCount>>, start: Arc<Barrier>| {
+            |arena: Arc<Arena>, admission: Arc<Mutex<AdmissionState>>, start: Arc<Barrier>| {
                 thread::spawn(move || {
                     let mut batch = arena.claim_optimistic(CarrierCount::new(2)).unwrap();
                     start.wait();
-                    let mut prepared = prepared.lock().unwrap();
+                    let mut admission = AdmissionGuard::new(admission.lock());
                     arena
-                        .complete_claim_serialized(&mut prepared, &mut batch)
+                        .complete_claim_serialized(&mut admission, &mut batch)
                         .unwrap();
-                    drop(prepared);
+                    drop(admission);
                     batch.finish().unwrap()
                 })
             };
         let first = fallback(
             Arc::clone(&arena),
-            Arc::clone(&prepared),
+            Arc::clone(&admission),
             Arc::clone(&start),
         );
         let second = fallback(
             Arc::clone(&arena),
-            Arc::clone(&prepared),
+            Arc::clone(&admission),
             Arc::clone(&start),
         );
 
         let first = first.join().unwrap();
         let second = second.join().unwrap();
-        assert_eq!(*prepared.lock().unwrap(), CarrierCount::new(4));
+        assert_eq!(
+            AdmissionGuard::new(admission.lock()).prepared_capacity(),
+            CarrierCount::new(4)
+        );
         assert_eq!(arena.registry_generation().slots_in_claim_order().len(), 2);
         assert!(first.iter().all(|left| second.iter().all(|right| {
             (left.slot_id(), left.carrier_index()) != (right.slot_id(), right.carrier_index())
@@ -1590,10 +1701,11 @@ mod tests {
         let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
         arena.reserve_slot().unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(3)).unwrap();
-        let mut prepared = CarrierCount::ZERO;
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
 
         arena
-            .complete_claim_serialized(&mut prepared, &mut batch)
+            .complete_claim_serialized(&mut admission, &mut batch)
             .unwrap();
         let before_rollback = arena.diagnostics();
 
@@ -1649,9 +1761,19 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
+    use super::super::admission::{AdmissionGuard, AdmissionState, MAX_PACKED_CARRIERS};
     use super::super::virtual_memory::page_size;
     use super::*;
     use crate::runtime::sync::thread;
+
+    fn admission_with_prepared(prepared: CarrierCount) -> Mutex<AdmissionState> {
+        let state = Mutex::new(AdmissionState::new(MAX_PACKED_CARRIERS));
+        {
+            let mut admission = AdmissionGuard::new(state.lock());
+            *admission.prepared_capacity_mut() = prepared;
+        }
+        state
+    }
 
     fn assert_coherent(generation: &RegistryGenerationGuard) {
         let generation = generation.inner.as_ref();
@@ -1772,11 +1894,12 @@ mod loom_tests {
                 let mut batch = fallback_arena
                     .claim_optimistic(CarrierCount::new(1))
                     .unwrap();
-                let mut prepared = CarrierCount::ZERO;
+                let admission = admission_with_prepared(CarrierCount::ZERO);
+                let mut admission = AdmissionGuard::new(admission.lock());
                 fallback_arena
-                    .complete_claim_serialized(&mut prepared, &mut batch)
+                    .complete_claim_serialized(&mut admission, &mut batch)
                     .unwrap();
-                assert_eq!(prepared, CarrierCount::new(2));
+                assert_eq!(admission.prepared_capacity(), CarrierCount::new(2));
                 batch.finish().unwrap()
             });
 

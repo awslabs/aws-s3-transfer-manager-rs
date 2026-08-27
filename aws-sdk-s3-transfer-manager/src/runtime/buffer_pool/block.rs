@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 
 use super::geometry::PoolGeometry;
 use super::virtual_memory::{VirtualMemoryError, VirtualRange};
-use super::CarrierCount;
+use super::{invariant_violation, CarrierCount};
 use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
@@ -1391,25 +1391,6 @@ fn record_won(won: &mut Vec<WonWord>, word_index: usize, mask: u64) {
 fn loom_seq_cst_fence() {
     #[cfg(all(test, s3_tm_loom))]
     loom::sync::atomic::fence(Ordering::SeqCst);
-}
-
-/// Stops execution after an ownership or lifecycle invariant fails.
-#[cold]
-fn invariant_violation(message: &'static str) -> ! {
-    tracing::error!(
-        target: crate::telemetry::TARGET_MEMORY,
-        reason = message,
-        "buffer-pool ownership invariant violated; aborting"
-    );
-
-    #[cfg(test)]
-    panic!("buffer-pool ownership invariant violated: {message}");
-
-    #[cfg(not(test))]
-    {
-        let _ = message;
-        std::process::abort()
-    }
 }
 
 #[cfg(all(test, not(s3_tm_loom)))]
