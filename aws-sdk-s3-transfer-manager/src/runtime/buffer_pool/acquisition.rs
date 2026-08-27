@@ -11,19 +11,11 @@
 
 use std::fmt;
 
-use smallvec::SmallVec;
-
 use super::admission::{AdmissionGuard, DirectDebitError, ReservationState, ReserveError};
 use super::arena::{ArenaError, ClaimBatch};
-use super::block::{BlockError, CarrierAllocation};
+use super::block::{BlockError, BlockSlot, CarrierAllocation};
 use super::{invariant_violation, CarrierCount, PoolInner};
 use crate::runtime::sync::sync::Arc;
-
-/// Carrier runs stored inline before metadata spills to the heap.
-const INLINE_CARRIER_RUNS: usize = 4;
-
-/// Fallible carrier-run storage shared with the mutable-buffer layer.
-type CarrierRuns = SmallVec<[CarrierRun; INLINE_CARRIER_RUNS]>;
 
 /// Failure to acquire a complete mutable carrier batch.
 #[non_exhaustive]
@@ -158,7 +150,7 @@ impl PendingAcquisition {
     }
 
     /// Converts one complete physical batch into grouped carrier ownership.
-    fn finish(mut self) -> Result<AcquiredRuns, AcquireError> {
+    fn finish(mut self) -> Result<Vec<Arc<CarrierGuard>>, AcquireError> {
         let claim = self
             .claim
             .take()
@@ -186,7 +178,7 @@ impl PendingAcquisition {
             invariant_violation("complete acquisition left untransferred charges");
         }
 
-        AcquiredRuns::try_from_guards(std::mem::take(&mut self.guards))
+        Ok(std::mem::take(&mut self.guards))
     }
 }
 
@@ -195,143 +187,6 @@ impl Drop for PendingAcquisition {
         self.guards.clear();
         drop(self.claim.take());
         drop(self.debit.take());
-    }
-}
-
-/// Complete carrier runs returned by one acquisition transaction.
-pub(crate) struct AcquiredRuns {
-    /// Contiguous physical runs in ascending slot and carrier order.
-    runs: CarrierRuns,
-    /// Complete carrier-rounded capacity.
-    capacity: usize,
-}
-
-impl AcquiredRuns {
-    /// Groups physical owners into ascending adjacent carrier runs.
-    fn try_from_guards(mut guards: Vec<Arc<CarrierGuard>>) -> Result<AcquiredRuns, AcquireError> {
-        guards.sort_unstable_by_key(|guard| guard.identity());
-        let pool = Arc::clone(
-            &guards
-                .first()
-                .unwrap_or_else(|| invariant_violation("complete acquisition contains no carrier"))
-                .pool,
-        );
-
-        let mut runs = CarrierRuns::new();
-        let mut capacity = 0usize;
-        for guard in guards {
-            capacity = capacity
-                .checked_add(guard.capacity())
-                .ok_or(AcquireError::CapacityOverflow)?;
-            if let Some(run) = runs.last_mut() {
-                if run.can_append(&guard) {
-                    run.try_append(guard)?;
-                    continue;
-                }
-            }
-            if allocation_failure_injected(&pool) {
-                return Err(AcquireError::PhysicalAllocationFailed);
-            }
-            runs.try_reserve(1)
-                .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
-            runs.push(CarrierRun::try_new(guard)?);
-        }
-
-        Ok(Self { runs, capacity })
-    }
-
-    /// Returns the complete carrier-rounded byte capacity.
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Returns the number of contiguous carrier runs.
-    pub(crate) fn run_count(&self) -> usize {
-        self.runs.len()
-    }
-
-    /// Transfers the grouped carrier owners to the mutable-buffer layer.
-    pub(super) fn into_runs(self) -> CarrierRuns {
-        self.runs
-    }
-}
-
-/// Adjacent carriers within one stable block slot.
-pub(super) struct CarrierRun {
-    /// Stable block slot containing the run.
-    slot_id: u32,
-    /// First carrier index within the slot.
-    first_carrier: u32,
-    /// Total run capacity in bytes.
-    capacity: usize,
-    /// Per-carrier owners in ascending address order.
-    carriers: Vec<Arc<CarrierGuard>>,
-}
-
-impl CarrierRun {
-    /// Creates a run containing one carrier.
-    fn try_new(guard: Arc<CarrierGuard>) -> Result<Self, AcquireError> {
-        let (slot_id, first_carrier) = guard.identity();
-        let capacity = guard.capacity();
-        let mut carriers = Vec::new();
-        if allocation_failure_injected(&guard.pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
-        }
-        carriers
-            .try_reserve_exact(1)
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
-        carriers.push(guard);
-        Ok(Self {
-            slot_id,
-            first_carrier,
-            capacity,
-            carriers,
-        })
-    }
-
-    /// Returns whether `guard` immediately follows this run.
-    fn can_append(&self, guard: &CarrierGuard) -> bool {
-        let run_len = u32::try_from(self.carriers.len())
-            .unwrap_or_else(|_| invariant_violation("carrier run length exceeds block geometry"));
-        let next = self
-            .first_carrier
-            .checked_add(run_len)
-            .unwrap_or_else(|| invariant_violation("carrier run end exceeds block geometry"));
-        guard.identity() == (self.slot_id, next)
-    }
-
-    /// Appends one adjacent carrier without exposing a partial run on failure.
-    fn try_append(&mut self, guard: Arc<CarrierGuard>) -> Result<(), AcquireError> {
-        if allocation_failure_injected(&guard.pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
-        }
-        self.carriers
-            .try_reserve(1)
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
-        self.capacity = self
-            .capacity
-            .checked_add(guard.capacity())
-            .ok_or(AcquireError::CapacityOverflow)?;
-        self.carriers.push(guard);
-        Ok(())
-    }
-
-    /// Returns the run's total byte capacity.
-    pub(super) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Returns the first carrier's checked writable pointer.
-    pub(super) fn ptr(&self) -> std::ptr::NonNull<std::mem::MaybeUninit<u8>> {
-        self.carriers
-            .first()
-            .unwrap_or_else(|| invariant_violation("carrier run contains no carriers"))
-            .ptr()
-    }
-
-    /// Transfers per-carrier ownership in ascending address order.
-    pub(super) fn into_carriers(self) -> Vec<Arc<CarrierGuard>> {
-        self.carriers
     }
 }
 
@@ -346,13 +201,21 @@ pub(super) struct CarrierGuard {
 }
 
 impl CarrierGuard {
-    /// Returns stable identity used only to group adjacent carriers.
-    fn identity(&self) -> (u32, u32) {
+    /// Returns pool-local indices used to group carriers within one buffer.
+    pub(super) fn identity(&self) -> (u32, u32) {
         let allocation = self
             .allocation
             .as_ref()
             .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"));
         (allocation.slot_id(), allocation.carrier_index())
+    }
+
+    /// Returns the concrete slot that roots this carrier's pointer provenance.
+    pub(super) fn slot(&self) -> &Arc<BlockSlot> {
+        self.allocation
+            .as_ref()
+            .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"))
+            .slot()
     }
 
     /// Returns this carrier's byte capacity.
@@ -391,7 +254,7 @@ pub(super) fn acquire_count(
     pool: &Arc<PoolInner>,
     direct: Option<Arc<ReservationState>>,
     count: CarrierCount,
-) -> Result<AcquiredRuns, AcquireError> {
+) -> Result<Vec<Arc<CarrierGuard>>, AcquireError> {
     let debit = AcquisitionDebit::install(pool, direct, count)?;
     let mut pending = PendingAcquisition::new(debit);
     pending.claim = Some(
@@ -423,7 +286,7 @@ pub(super) fn acquire_count(
 }
 
 /// Returns whether test injection fails this fallible allocation boundary.
-fn allocation_failure_injected(pool: &PoolInner) -> bool {
+pub(super) fn allocation_failure_injected(pool: &PoolInner) -> bool {
     #[cfg(test)]
     {
         pool.test_hooks.take_acquisition_allocation_failure()
@@ -478,7 +341,7 @@ mod tests {
     use super::super::block::{BlockSlot, TrimBlocked};
     use super::super::test_util::{poll_reserve, test_pool_with_scan as test_pool};
     use super::super::virtual_memory::VirtualMemoryOperation;
-    use super::super::{BufferPool, Reservation};
+    use super::super::{BufferPool, PooledBufMut, Reservation};
     use super::*;
 
     struct ClaimingWake {
@@ -556,7 +419,7 @@ mod tests {
         let acquired = pool.acquire(&reservation, carrier_size + 1).unwrap();
 
         assert_eq!(acquired.capacity(), carrier_size * 2);
-        assert_eq!(acquired.run_count(), 1);
+        assert_eq!(acquired.test_run_count(), 1);
         assert_eq!(direct.test_owner_state(), (false, CarrierCount::new(2)));
         assert_eq!(
             pool.inner.test_accounting_state(),
@@ -592,9 +455,9 @@ mod tests {
         let acquired = pool.acquire_unreserved(carrier_size * 3).unwrap();
 
         assert_eq!(acquired.capacity(), carrier_size * 3);
-        assert_eq!(acquired.run_count(), 2);
-        assert_eq!(acquired.runs[0].capacity(), carrier_size * 2);
-        assert_eq!(acquired.runs[1].capacity(), carrier_size);
+        assert_eq!(acquired.test_run_count(), 2);
+        assert_eq!(acquired.test_run_capacity(0), carrier_size * 2);
+        assert_eq!(acquired.test_run_capacity(1), carrier_size);
         assert_eq!(
             pool.inner.test_accounting_state(),
             (
@@ -630,7 +493,7 @@ mod tests {
         let acquired = pool.acquire(&reservation, carrier_size * 65).unwrap();
 
         assert_eq!(acquired.capacity(), carrier_size * 65);
-        assert_eq!(acquired.run_count(), 1);
+        assert_eq!(acquired.test_run_count(), 1);
         assert_eq!(pool.inner.arena.diagnostics().serialized_fallbacks, 1);
     }
 
@@ -851,7 +714,7 @@ mod tests {
         struct Owner {
             actor: usize,
             carriers: usize,
-            runs: AcquiredRuns,
+            runs: PooledBufMut,
         }
 
         fn next(state: &mut u64) -> usize {
@@ -1002,7 +865,7 @@ mod tests {
         fn assert_send<T: Send>() {}
         fn assert_send_sync<T: Send + Sync>() {}
 
-        assert_send::<AcquiredRuns>();
+        assert_send::<PooledBufMut>();
         assert_send_sync::<CarrierGuard>();
     }
 

@@ -323,6 +323,11 @@ impl Drop for Reservation {
 }
 
 impl ReservationState {
+    /// Returns the pool whose direct authority this state represents.
+    pub(super) fn pool(&self) -> &Arc<PoolInner> {
+        &self.pool
+    }
+
     /// Returns whether this reservation belongs to `pool`.
     pub(super) fn belongs_to(&self, pool: &Arc<PoolInner>) -> bool {
         Arc::ptr_eq(&self.pool, pool)

@@ -459,6 +459,63 @@ impl BlockSlot {
         self.range.len()
     }
 
+    /// Derives a checked immutable pointer from this slot's provenance root.
+    ///
+    /// # Safety
+    ///
+    /// The caller must retain initialized immutable ownership over the
+    /// complete subrange. That ownership must keep its carrier bits live so
+    /// trim cannot deactivate the slot while the pointer is used.
+    pub(super) unsafe fn ptr_for_immutable_range(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Option<NonNull<u8>> {
+        // SAFETY: the caller supplies the initialized owner and deactivation
+        // exclusion required by `VirtualRange::ptr_for_range`.
+        unsafe {
+            self.range
+                .ptr_for_range(offset, len)
+                .map(NonNull::cast::<u8>)
+        }
+    }
+
+    /// Debug-checks that every carrier intersecting `offset..offset + len`
+    /// remains live.
+    ///
+    /// This detects violations of the immutable-owner contract. A set bit
+    /// alone does not prove that a particular owner controls that bit.
+    #[cfg(debug_assertions)]
+    pub(super) fn debug_assert_immutable_range_live(&self, offset: usize, len: usize) {
+        let end = offset.checked_add(len);
+        debug_assert!(
+            len != 0 && end.is_some_and(|end| end <= self.geometry.block_size()),
+            "immutable range is outside its block slot"
+        );
+        let Some(end) = end.filter(|end| len != 0 && *end <= self.geometry.block_size()) else {
+            return;
+        };
+        let current = self.current.load();
+        let Some(incarnation) = current.as_ref() else {
+            debug_assert!(false, "immutable range has no current incarnation");
+            return;
+        };
+        let first = offset / self.geometry.carrier_size();
+        let last = (end - 1) / self.geometry.carrier_size();
+        for index in first..=last {
+            let word_index = index / u64::BITS as usize;
+            let mask = 1u64 << (index % u64::BITS as usize);
+            let live = incarnation
+                .in_use
+                .get(word_index)
+                .is_some_and(|word| word.load(Ordering::Acquire) & mask != 0);
+            debug_assert!(
+                live,
+                "immutable range includes a carrier without a live bit"
+            );
+        }
+    }
+
     /// Returns the reserved half-open address range.
     ///
     /// The integer range grants no access to the backing memory. `None`
@@ -1287,6 +1344,11 @@ pub(super) struct CarrierAllocation {
 }
 
 impl CarrierAllocation {
+    /// Returns the concrete slot that roots this carrier's pointer provenance.
+    pub(super) fn slot(&self) -> &Arc<BlockSlot> {
+        &self.slot
+    }
+
     /// Returns the stable block-slot identifier.
     pub(super) fn slot_id(&self) -> u32 {
         self.id.slot
@@ -1456,6 +1518,26 @@ mod tests {
 
         drop(claimed);
         assert_eq!(slot.live_carriers(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_immutable_range_live_check_covers_each_intersecting_carrier() {
+        let (slot, _) = prepared_slot(3);
+        let carrier_size = slot.geometry.carrier_size();
+        let claimed = BlockSlot::try_claim(&slot, CarrierCount::new(2))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+
+        slot.debug_assert_immutable_range_live(carrier_size - 1, 2);
+        drop(claimed);
+
+        let missing_live_bit = catch_unwind(AssertUnwindSafe(|| {
+            slot.debug_assert_immutable_range_live(carrier_size - 1, 2);
+        }));
+        assert!(missing_live_bit.is_err());
     }
 
     #[test]
