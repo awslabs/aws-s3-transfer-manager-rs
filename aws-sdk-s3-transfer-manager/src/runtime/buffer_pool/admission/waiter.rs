@@ -15,21 +15,21 @@ use super::super::{BufferPool, CarrierCount, PoolInner};
 use super::{wake_all, Reservation, ReserveError};
 
 /// One reservation request retained in FIFO order.
-pub(super) struct Waiter {
+pub(in crate::runtime::buffer_pool) struct Waiter {
     /// Complete requested envelope.
-    pub(super) envelope: CarrierCount,
+    pub(in crate::runtime::buffer_pool) envelope: CarrierCount,
     /// Grant-versus-cancellation linearization point.
-    pub(super) slot: Arc<WaitSlot>,
+    pub(in crate::runtime::buffer_pool) slot: Arc<WaitSlot>,
 }
 
 /// Result slot shared by admission and one reservation future.
-pub(super) struct WaitSlot {
+pub(in crate::runtime::buffer_pool) struct WaitSlot {
     /// Serializes grant, cancellation, and result consumption.
-    pub(super) state: Mutex<WaitState>,
+    pub(in crate::runtime::buffer_pool) state: Mutex<WaitState>,
 }
 
 /// Lifecycle of one queued reservation result.
-pub(super) enum WaitState {
+pub(in crate::runtime::buffer_pool) enum WaitState {
     /// Admission owns the queue link and may transfer a terminal result.
     Queued { waker: Waker },
     /// Admission transferred one prepared reservation.
@@ -41,7 +41,7 @@ pub(super) enum WaitState {
 }
 
 /// Result of the first reservation poll under admission serialization.
-pub(super) enum ReservationPoll {
+pub(in crate::runtime::buffer_pool) enum ReservationPoll {
     /// The request was granted without entering the FIFO.
     Ready(Reservation),
     /// The request was linked behind existing or ineligible work.
@@ -74,7 +74,7 @@ pub(crate) struct ReserveFuture {
 
 impl WaitSlot {
     /// Creates one queued result slot with its initial task waker.
-    pub(super) fn new(waker: Waker) -> Self {
+    pub(in crate::runtime::buffer_pool) fn new(waker: Waker) -> Self {
         Self {
             state: Mutex::new(WaitState::Queued { waker }),
         }
@@ -173,59 +173,9 @@ fn poll_slot(
 
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
-    use std::sync::Arc as StdArc;
-    use std::task::Wake;
-
-    use super::super::super::geometry::PoolGeometry;
-    use super::super::super::virtual_memory::{page_size, VirtualMemoryOperation};
+    use super::super::super::test_util::{counting_waker, poll_reserve, test_pool, wake_count};
+    use super::super::super::virtual_memory::VirtualMemoryOperation;
     use super::*;
-
-    struct CountingWake {
-        count: AtomicUsize,
-    }
-
-    impl Wake for CountingWake {
-        fn wake(self: StdArc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &StdArc<Self>) {
-            self.count.fetch_add(1, StdOrdering::Release);
-        }
-    }
-
-    fn counting_waker() -> (Waker, StdArc<CountingWake>) {
-        let state = StdArc::new(CountingWake {
-            count: AtomicUsize::new(0),
-        });
-        (Waker::from(StdArc::clone(&state)), state)
-    }
-
-    fn wake_count(state: &CountingWake) -> usize {
-        state.count.load(StdOrdering::Acquire)
-    }
-
-    fn test_pool(block_carriers: usize, configured: usize) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(
-            page_size,
-            page_size.checked_mul(block_carriers).unwrap(),
-            page_size,
-        )
-        .unwrap();
-        let pool =
-            BufferPool::from_validated_parts(geometry, CarrierCount::new(configured), 1).unwrap();
-        (pool, page_size)
-    }
-
-    fn poll_reserve(
-        future: &mut ReserveFuture,
-        waker: &Waker,
-    ) -> Poll<Result<Reservation, ReserveError>> {
-        let mut context = Context::from_waker(waker);
-        Pin::new(future).poll(&mut context)
-    }
 
     fn assert_pending(future: &mut ReserveFuture, waker: &Waker) {
         assert!(poll_reserve(future, waker).is_pending());
@@ -532,26 +482,13 @@ mod loom_tests {
     use std::sync::Arc as StdArc;
     use std::task::Wake;
 
-    use super::super::super::geometry::PoolGeometry;
-    use super::super::super::virtual_memory::page_size;
+    use super::super::super::test_util::{
+        counting_waker, poll_reserve, test_single_carrier_pool as test_pool,
+    };
     use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
     use crate::runtime::sync::thread;
 
     use super::*;
-
-    struct CountingWake {
-        count: Arc<AtomicUsize>,
-    }
-
-    impl Wake for CountingWake {
-        fn wake(self: StdArc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &StdArc<Self>) {
-            self.count.fetch_add(1, Ordering::AcqRel);
-        }
-    }
 
     struct PollingWake {
         future: Arc<Mutex<Option<ReserveFuture>>>,
@@ -583,30 +520,6 @@ mod loom_tests {
         fn wake_by_ref(self: &StdArc<Self>) {
             self.poll_terminal();
         }
-    }
-
-    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
-        let count = Arc::new(AtomicUsize::new(0));
-        let state = CountingWake {
-            count: Arc::clone(&count),
-        };
-        (Waker::from(StdArc::new(state)), count)
-    }
-
-    fn test_pool(configured: usize) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(page_size, page_size, page_size).unwrap();
-        let pool =
-            BufferPool::from_validated_parts(geometry, CarrierCount::new(configured), 1).unwrap();
-        (pool, page_size)
-    }
-
-    fn poll_reserve(
-        future: &mut ReserveFuture,
-        waker: &Waker,
-    ) -> Poll<Result<Reservation, ReserveError>> {
-        let mut context = Context::from_waker(waker);
-        Pin::new(future).poll(&mut context)
     }
 
     #[test]
