@@ -13,15 +13,17 @@ use std::fmt;
 
 use smallvec::SmallVec;
 
-use super::admission::{
-    AdmissionGuard, DirectDebitError, Reservation, ReservationState, ReserveError,
-};
+use super::admission::{AdmissionGuard, DirectDebitError, ReservationState, ReserveError};
 use super::arena::{ArenaError, ClaimBatch};
 use super::block::{BlockError, CarrierAllocation};
-use super::{BufferPool, CarrierCount, PoolInner};
-#[cfg(test)]
-use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
+use super::{invariant_violation, CarrierCount, PoolInner};
 use crate::runtime::sync::sync::Arc;
+
+/// Carrier runs stored inline before metadata spills to the heap.
+const INLINE_CARRIER_RUNS: usize = 4;
+
+/// Fallible carrier-run storage shared with the mutable-buffer layer.
+type CarrierRuns = SmallVec<[CarrierRun; INLINE_CARRIER_RUNS]>;
 
 /// Failure to acquire a complete mutable carrier batch.
 #[non_exhaustive]
@@ -59,92 +61,6 @@ impl fmt::Display for AcquireError {
 }
 
 impl std::error::Error for AcquireError {}
-
-/// One-shot failure injection for fallible acquisition metadata boundaries.
-#[cfg(test)]
-pub(super) struct AcquisitionAllocationFailures {
-    /// Remaining boundaries before the injected failure.
-    remaining: AtomicUsize,
-}
-
-#[cfg(test)]
-impl AcquisitionAllocationFailures {
-    /// Creates a disabled injector.
-    pub(super) fn new() -> Self {
-        Self {
-            remaining: AtomicUsize::new(0),
-        }
-    }
-
-    /// Fails the `boundary`th subsequent metadata reservation.
-    fn inject_on_nth(&self, boundary: usize) {
-        assert!(boundary != 0, "failure boundary must be nonzero");
-        self.remaining
-            .compare_exchange(0, boundary, Ordering::AcqRel, Ordering::Acquire)
-            .expect("an acquisition allocation failure is already pending");
-    }
-
-    /// Returns whether this boundary consumes the injected failure.
-    fn take(&self) -> bool {
-        self.remaining
-            .fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |remaining| match remaining {
-                    0 => None,
-                    1 => Some(0),
-                    remaining => Some(remaining - 1),
-                },
-            )
-            .is_ok_and(|previous| previous == 1)
-    }
-}
-
-impl BufferPool {
-    /// Acquires a complete carrier-rounded batch under one reservation.
-    pub(crate) fn acquire(
-        &self,
-        reservation: &Reservation,
-        min_bytes: usize,
-    ) -> Result<AcquiredRuns, AcquireError> {
-        let count = self.acquisition_count(min_bytes)?;
-        let direct = reservation
-            .acquisition_state()
-            .ok_or(AcquireError::ReservationClosed)?;
-        if !direct.belongs_to(&self.inner) {
-            return Err(AcquireError::ForeignReservation);
-        }
-        acquire_count(&self.inner, Some(Arc::clone(direct)), count)
-    }
-
-    /// Acquires a complete carrier-rounded batch without a reservation.
-    pub(crate) fn acquire_unreserved(
-        &self,
-        min_bytes: usize,
-    ) -> Result<AcquiredRuns, AcquireError> {
-        let count = self.acquisition_count(min_bytes)?;
-        acquire_count(&self.inner, None, count)
-    }
-
-    /// Converts one acquisition request to its complete carrier count.
-    fn acquisition_count(&self, min_bytes: usize) -> Result<CarrierCount, AcquireError> {
-        self.inner
-            .arena
-            .carriers_for_bytes(min_bytes)
-            .map_err(|error| match error {
-                super::geometry::GeometryError::ZeroByteRequest => AcquireError::InvalidSize,
-                _ => AcquireError::CapacityOverflow,
-            })
-    }
-
-    /// Injects one acquisition metadata allocation failure for tests.
-    #[cfg(test)]
-    fn inject_acquisition_allocation_failure(&self, boundary: usize) {
-        self.inner
-            .acquisition_allocation_failures
-            .inject_on_nth(boundary);
-    }
-}
 
 /// Aggregate and optional direct charges not yet owned by carrier guards.
 struct AcquisitionDebit {
@@ -196,19 +112,15 @@ impl AcquisitionDebit {
 
     /// Transfers one physical allocation and its accounting provenance.
     fn transfer(&mut self, allocation: CarrierAllocation) -> Arc<CarrierGuard> {
-        assert!(
-            self.untransferred != CarrierCount::ZERO,
-            "acquisition debit transferred too many charges"
-        );
+        let Some(untransferred) = self.untransferred.checked_sub(CarrierCount::new(1)) else {
+            invariant_violation("acquisition debit transferred too many charges");
+        };
         let guard = Arc::new(CarrierGuard {
             pool: Arc::clone(&self.pool),
             allocation: Some(allocation),
             direct: self.direct.as_ref().map(Arc::clone),
         });
-        self.untransferred = self
-            .untransferred
-            .checked_sub(CarrierCount::new(1))
-            .expect("acquisition debit must retain a transferred charge");
+        self.untransferred = untransferred;
         guard
     }
 }
@@ -250,12 +162,12 @@ impl PendingAcquisition {
         let claim = self
             .claim
             .take()
-            .expect("pending acquisition must retain its physical claim");
+            .unwrap_or_else(|| invariant_violation("pending acquisition lost its physical claim"));
         let allocations = claim.finish().map_err(map_arena_error)?;
         let pool = &self
             .debit
             .as_ref()
-            .expect("pending acquisition must retain its accounting debit")
+            .unwrap_or_else(|| invariant_violation("pending acquisition lost its accounting debit"))
             .pool;
         if allocation_failure_injected(pool) {
             return Err(AcquireError::PhysicalAllocationFailed);
@@ -264,18 +176,15 @@ impl PendingAcquisition {
             .try_reserve_exact(allocations.len())
             .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
 
-        let debit = self
-            .debit
-            .as_mut()
-            .expect("pending acquisition must retain its accounting debit");
+        let debit = self.debit.as_mut().unwrap_or_else(|| {
+            invariant_violation("pending acquisition lost its accounting debit")
+        });
         for allocation in allocations {
             self.guards.push(debit.transfer(allocation));
         }
-        assert_eq!(
-            debit.untransferred,
-            CarrierCount::ZERO,
-            "complete acquisition left untransferred charges"
-        );
+        if debit.untransferred != CarrierCount::ZERO {
+            invariant_violation("complete acquisition left untransferred charges");
+        }
 
         AcquiredRuns::try_from_guards(std::mem::take(&mut self.guards))
     }
@@ -292,7 +201,7 @@ impl Drop for PendingAcquisition {
 /// Complete carrier runs returned by one acquisition transaction.
 pub(crate) struct AcquiredRuns {
     /// Contiguous physical runs in ascending slot and carrier order.
-    runs: SmallVec<[CarrierRun; 4]>,
+    runs: CarrierRuns,
     /// Complete carrier-rounded capacity.
     capacity: usize,
 }
@@ -304,16 +213,11 @@ impl AcquiredRuns {
         let pool = Arc::clone(
             &guards
                 .first()
-                .expect("complete acquisition must contain a carrier")
+                .unwrap_or_else(|| invariant_violation("complete acquisition contains no carrier"))
                 .pool,
         );
 
-        let mut runs = SmallVec::<[CarrierRun; 4]>::new();
-        if allocation_failure_injected(&pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
-        }
-        runs.try_reserve(guards.len())
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+        let mut runs = CarrierRuns::new();
         let mut capacity = 0usize;
         for guard in guards {
             capacity = capacity
@@ -325,6 +229,11 @@ impl AcquiredRuns {
                     continue;
                 }
             }
+            if allocation_failure_injected(&pool) {
+                return Err(AcquireError::PhysicalAllocationFailed);
+            }
+            runs.try_reserve(1)
+                .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
             runs.push(CarrierRun::try_new(guard)?);
         }
 
@@ -342,7 +251,7 @@ impl AcquiredRuns {
     }
 
     /// Transfers the grouped carrier owners to the mutable-buffer layer.
-    pub(super) fn into_runs(self) -> SmallVec<[CarrierRun; 4]> {
+    pub(super) fn into_runs(self) -> CarrierRuns {
         self.runs
     }
 }
@@ -382,12 +291,12 @@ impl CarrierRun {
 
     /// Returns whether `guard` immediately follows this run.
     fn can_append(&self, guard: &CarrierGuard) -> bool {
-        let run_len =
-            u32::try_from(self.carriers.len()).expect("carrier run length must fit block geometry");
+        let run_len = u32::try_from(self.carriers.len())
+            .unwrap_or_else(|_| invariant_violation("carrier run length exceeds block geometry"));
         let next = self
             .first_carrier
             .checked_add(run_len)
-            .expect("carrier run end must fit block geometry");
+            .unwrap_or_else(|| invariant_violation("carrier run end exceeds block geometry"));
         guard.identity() == (self.slot_id, next)
     }
 
@@ -416,7 +325,7 @@ impl CarrierRun {
     pub(super) fn ptr(&self) -> std::ptr::NonNull<std::mem::MaybeUninit<u8>> {
         self.carriers
             .first()
-            .expect("carrier run must be nonempty")
+            .unwrap_or_else(|| invariant_violation("carrier run contains no carriers"))
             .ptr()
     }
 
@@ -442,7 +351,7 @@ impl CarrierGuard {
         let allocation = self
             .allocation
             .as_ref()
-            .expect("live carrier guard must retain its allocation");
+            .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"));
         (allocation.slot_id(), allocation.carrier_index())
     }
 
@@ -450,7 +359,7 @@ impl CarrierGuard {
     pub(super) fn capacity(&self) -> usize {
         self.allocation
             .as_ref()
-            .expect("live carrier guard must retain its allocation")
+            .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"))
             .capacity()
     }
 
@@ -458,7 +367,7 @@ impl CarrierGuard {
     pub(super) fn ptr(&self) -> std::ptr::NonNull<std::mem::MaybeUninit<u8>> {
         self.allocation
             .as_ref()
-            .expect("live carrier guard must retain its allocation")
+            .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"))
             .ptr()
     }
 }
@@ -468,7 +377,7 @@ impl Drop for CarrierGuard {
         let allocation = self
             .allocation
             .take()
-            .expect("carrier guard returned its allocation more than once");
+            .unwrap_or_else(|| invariant_violation("carrier guard returned its allocation twice"));
         drop(allocation);
         if let Some(direct) = self.direct.as_ref() {
             direct.release(CarrierCount::new(1));
@@ -478,7 +387,7 @@ impl Drop for CarrierGuard {
 }
 
 /// Installs accounting, acquires a complete physical batch, and groups it.
-fn acquire_count(
+pub(super) fn acquire_count(
     pool: &Arc<PoolInner>,
     direct: Option<Arc<ReservationState>>,
     count: CarrierCount,
@@ -494,7 +403,7 @@ fn acquire_count(
     if !pending
         .claim
         .as_ref()
-        .expect("pending acquisition must retain its claim")
+        .unwrap_or_else(|| invariant_violation("pending acquisition lost its claim"))
         .is_complete()
     {
         let fallback = {
@@ -504,7 +413,7 @@ fn acquire_count(
                 pending
                     .claim
                     .as_mut()
-                    .expect("pending acquisition must retain its claim"),
+                    .unwrap_or_else(|| invariant_violation("pending acquisition lost its claim")),
             )
         };
         fallback.map_err(map_arena_error)?;
@@ -517,7 +426,7 @@ fn acquire_count(
 fn allocation_failure_injected(pool: &PoolInner) -> bool {
     #[cfg(test)]
     {
-        pool.acquisition_allocation_failures.take()
+        pool.test_hooks.take_acquisition_allocation_failure()
     }
     #[cfg(not(test))]
     {
@@ -560,18 +469,16 @@ fn map_arena_error(error: ArenaError) -> AcquireError {
 
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc as StdArc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Poll, Wake, Waker};
     use std::time::Duration;
 
     use super::super::block::{BlockSlot, TrimBlocked};
-    use super::super::geometry::PoolGeometry;
-    use super::super::virtual_memory::{page_size, VirtualMemoryOperation};
-    use super::super::ReserveFuture;
+    use super::super::test_util::{poll_reserve, test_pool_with_scan as test_pool};
+    use super::super::virtual_memory::VirtualMemoryOperation;
+    use super::super::{BufferPool, Reservation};
     use super::*;
 
     struct ClaimingWake {
@@ -595,35 +502,6 @@ mod tests {
             self.claimed.store(claim.is_complete(), Ordering::Release);
             self.wakes.fetch_add(1, Ordering::Release);
         }
-    }
-
-    fn test_pool(
-        block_carriers: usize,
-        configured: usize,
-        optimistic_scan_words: usize,
-    ) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(
-            page_size,
-            page_size.checked_mul(block_carriers).unwrap(),
-            page_size,
-        )
-        .unwrap();
-        let pool = BufferPool::from_validated_parts(
-            geometry,
-            CarrierCount::new(configured),
-            optimistic_scan_words,
-        )
-        .unwrap();
-        (pool, page_size)
-    }
-
-    fn poll_reserve(
-        future: &mut ReserveFuture,
-        waker: &Waker,
-    ) -> Poll<Result<Reservation, ReserveError>> {
-        let mut context = Context::from_waker(waker);
-        Pin::new(future).poll(&mut context)
     }
 
     #[test]
@@ -957,6 +835,157 @@ mod tests {
     }
 
     #[test]
+    fn test_reserved_composition_preserves_normal_capacity() {
+        const CONFIGURED_CARRIERS: usize = 4;
+        const RESERVATION_SLOTS: usize = 4;
+        const SEQUENCES: u64 = 32;
+        const STEPS: usize = 48;
+
+        struct Actor {
+            reservation: Option<Reservation>,
+            envelope: usize,
+            outstanding: usize,
+            used: bool,
+        }
+
+        struct Owner {
+            actor: usize,
+            carriers: usize,
+            runs: AcquiredRuns,
+        }
+
+        fn next(state: &mut u64) -> usize {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*state >> 32) as usize
+        }
+
+        for sequence in 0..SEQUENCES {
+            let (pool, carrier_size) = test_pool(CONFIGURED_CARRIERS, CONFIGURED_CARRIERS, 1);
+            let mut state = sequence + 1;
+            let mut actors: Vec<Actor> = (0..RESERVATION_SLOTS)
+                .map(|_| Actor {
+                    reservation: None,
+                    envelope: 0,
+                    outstanding: 0,
+                    used: false,
+                })
+                .collect();
+            let mut owners = Vec::<Owner>::new();
+
+            for _ in 0..STEPS {
+                match next(&mut state) % 4 {
+                    0 => {
+                        let active: usize = actors
+                            .iter()
+                            .filter_map(|actor| actor.reservation.as_ref().map(|_| actor.envelope))
+                            .sum();
+                        let live: usize = owners.iter().map(|owner| owner.carriers).sum();
+
+                        // When no reservation is active, one request may exceed
+                        // the normal ceiling so retained owners cannot stop
+                        // progress. This model covers normal-ceiling admission.
+                        if active == 0 && live != 0 {
+                            continue;
+                        }
+                        let Some(actor) = actors.iter_mut().find(|actor| !actor.used) else {
+                            continue;
+                        };
+                        let envelope = 1 + next(&mut state) % (CONFIGURED_CARRIERS - 1);
+                        if let Some(reservation) =
+                            pool.try_reserve(envelope * carrier_size).unwrap()
+                        {
+                            actor.reservation = Some(reservation);
+                            actor.envelope = envelope;
+                            actor.used = true;
+                        }
+                    }
+                    1 => {
+                        let candidates: Vec<usize> = actors
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, actor)| {
+                                (actor.reservation.is_some() && actor.outstanding < actor.envelope)
+                                    .then_some(index)
+                            })
+                            .collect();
+                        if candidates.is_empty() {
+                            continue;
+                        }
+                        let actor_index = candidates[next(&mut state) % candidates.len()];
+                        let actor = &mut actors[actor_index];
+                        let remaining = actor.envelope - actor.outstanding;
+                        let carriers = 1 + next(&mut state) % remaining;
+                        let runs = pool
+                            .acquire(actor.reservation.as_ref().unwrap(), carriers * carrier_size)
+                            .unwrap();
+                        actor.outstanding += carriers;
+                        owners.push(Owner {
+                            actor: actor_index,
+                            carriers,
+                            runs,
+                        });
+                    }
+                    2 => {
+                        let open: Vec<usize> = actors
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, actor)| actor.reservation.as_ref().map(|_| index))
+                            .collect();
+                        if let Some(index) = open.get(next(&mut state) % open.len().max(1)) {
+                            actors[*index]
+                                .reservation
+                                .take()
+                                .unwrap()
+                                .close_acquisition();
+                        }
+                    }
+                    _ => {
+                        if owners.is_empty() {
+                            continue;
+                        }
+                        let index = next(&mut state) % owners.len();
+                        let owner = owners.swap_remove(index);
+                        actors[owner.actor].outstanding -= owner.carriers;
+                        drop(owner.runs);
+                    }
+                }
+
+                let live: usize = owners.iter().map(|owner| owner.carriers).sum();
+                let active: usize = actors
+                    .iter()
+                    .filter_map(|actor| actor.reservation.as_ref().map(|_| actor.envelope))
+                    .sum();
+                let metrics = pool.metrics();
+                assert!(
+                    live <= CONFIGURED_CARRIERS,
+                    "sequence {sequence} retained {live} carriers above the normal ceiling"
+                );
+                assert_eq!(
+                    metrics.charged_capacity_bytes(),
+                    (live * carrier_size) as u64,
+                    "sequence {sequence} lost or duplicated a carrier charge"
+                );
+                assert_eq!(
+                    metrics.active_planned_demand_bytes(),
+                    (active * carrier_size) as u64,
+                    "sequence {sequence} diverged from its open envelopes"
+                );
+            }
+
+            for actor in &mut actors {
+                drop(actor.reservation.take());
+            }
+            drop(owners);
+            let metrics = pool.metrics();
+            assert_eq!(metrics.active_planned_demand_bytes(), 0);
+            assert_eq!(metrics.charged_capacity_bytes(), 0);
+            assert_eq!(metrics.admission_used_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn test_carrier_owner_retains_pool_until_final_return() {
         let (pool, carrier_size) = test_pool(1, 1, 1);
         let weak = Arc::downgrade(&pool.inner);
@@ -1052,57 +1081,16 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::Arc as StdArc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::Poll;
 
     use super::super::block::{BlockSlot, TrimBlocked};
-    use super::super::geometry::PoolGeometry;
-    use super::super::virtual_memory::page_size;
-    use super::super::ReserveFuture;
+    use super::super::test_util::{
+        counting_waker, poll_reserve, test_single_carrier_pool as test_pool,
+    };
     use super::*;
-    use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
+    use crate::runtime::sync::sync::atomic::Ordering;
     use crate::runtime::sync::sync::Arc;
     use crate::runtime::sync::thread;
-
-    struct CountingWake {
-        count: Arc<AtomicUsize>,
-    }
-
-    impl Wake for CountingWake {
-        fn wake(self: StdArc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &StdArc<Self>) {
-            self.count.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    fn test_pool(configured: usize) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(page_size, page_size, page_size).unwrap();
-        let pool =
-            BufferPool::from_validated_parts(geometry, CarrierCount::new(configured), 1).unwrap();
-        (pool, page_size)
-    }
-
-    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
-        let count = Arc::new(AtomicUsize::new(0));
-        let state = CountingWake {
-            count: Arc::clone(&count),
-        };
-        (Waker::from(StdArc::new(state)), count)
-    }
-
-    fn poll_reserve(
-        future: &mut ReserveFuture,
-        waker: &Waker,
-    ) -> Poll<Result<Reservation, ReserveError>> {
-        let mut context = Context::from_waker(waker);
-        Pin::new(future).poll(&mut context)
-    }
 
     #[test]
     fn test_final_return_racing_close_converges() {

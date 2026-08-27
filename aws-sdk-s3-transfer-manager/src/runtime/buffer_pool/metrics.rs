@@ -44,15 +44,18 @@ pub(super) struct MemoryMetricState {
 impl MemoryMetrics {
     /// Constructs one sample from validated carrier counts.
     pub(super) fn from_carriers(carrier_size: usize, state: MemoryMetricState) -> Self {
-        let configured_capacity_bytes = to_bytes(state.configured_capacity, carrier_size);
-        let admission_used_bytes = to_bytes(state.admission_used, carrier_size);
+        let configured_capacity_bytes = carriers_to_bytes(state.configured_capacity, carrier_size);
+        let admission_used_bytes = carriers_to_bytes(state.admission_used, carrier_size);
         Self {
             configured_capacity_bytes,
             admission_used_bytes,
-            active_planned_demand_bytes: to_bytes(state.active_planned_demand, carrier_size),
-            charged_capacity_bytes: to_bytes(state.charged_capacity, carrier_size),
+            active_planned_demand_bytes: carriers_to_bytes(
+                state.active_planned_demand,
+                carrier_size,
+            ),
+            charged_capacity_bytes: carriers_to_bytes(state.charged_capacity, carrier_size),
             admission_overage_bytes: admission_used_bytes.saturating_sub(configured_capacity_bytes),
-            prepared_capacity_bytes: to_bytes(state.prepared_capacity, carrier_size),
+            prepared_capacity_bytes: carriers_to_bytes(state.prepared_capacity, carrier_size),
             queued_reservations: state.queued_reservations,
             parked_reservations_total: state.parked_reservations_total,
         }
@@ -100,7 +103,7 @@ impl MemoryMetrics {
 }
 
 /// Converts a validated carrier count to its public byte representation.
-fn to_bytes(count: CarrierCount, carrier_size: usize) -> u64 {
+fn carriers_to_bytes(count: CarrierCount, carrier_size: usize) -> u64 {
     let count = u64::try_from(count.get()).expect("carrier count must fit metric representation");
     let carrier_size =
         u64::try_from(carrier_size).expect("carrier size must fit metric representation");
@@ -111,36 +114,9 @@ fn to_bytes(count: CarrierCount, carrier_size: usize) -> u64 {
 
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll, Waker};
-
     use futures_test::task::new_count_waker;
 
-    use super::super::geometry::PoolGeometry;
-    use super::super::virtual_memory::page_size;
-    use super::super::{BufferPool, CarrierCount, Reservation, ReserveError, ReserveFuture};
-
-    fn test_pool(block_carriers: usize, configured: usize) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(
-            page_size,
-            page_size.checked_mul(block_carriers).unwrap(),
-            page_size,
-        )
-        .unwrap();
-        let pool =
-            BufferPool::from_validated_parts(geometry, CarrierCount::new(configured), 1).unwrap();
-        (pool, page_size)
-    }
-
-    fn poll_reserve(
-        future: &mut ReserveFuture,
-        waker: &Waker,
-    ) -> Poll<Result<Reservation, ReserveError>> {
-        let mut context = Context::from_waker(waker);
-        Pin::new(future).poll(&mut context)
-    }
+    use super::super::test_util::{poll_reserve, test_pool};
 
     #[test]
     fn test_metrics_report_admission_ownership_and_queue_state() {
@@ -205,22 +181,13 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    use super::super::geometry::PoolGeometry;
-    use super::super::virtual_memory::page_size;
-    use super::super::{BufferPool, CarrierCount};
+    use super::super::test_util::test_single_carrier_pool;
     use crate::runtime::sync::thread;
-
-    fn test_pool() -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(page_size, page_size, page_size).unwrap();
-        let pool = BufferPool::from_validated_parts(geometry, CarrierCount::new(1), 1).unwrap();
-        (pool, page_size)
-    }
 
     #[test]
     fn test_metrics_sample_close_and_return_as_complete_states() {
         loom::model(|| {
-            let (pool, carrier_size) = test_pool();
+            let (pool, carrier_size) = test_single_carrier_pool(1);
             let reservation = pool
                 .try_reserve(carrier_size)
                 .unwrap()

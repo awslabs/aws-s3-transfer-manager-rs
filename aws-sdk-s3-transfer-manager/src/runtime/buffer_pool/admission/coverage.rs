@@ -11,7 +11,7 @@
 
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 
-use super::super::CarrierCount;
+use super::super::{invariant_violation, CarrierCount};
 
 /// Number of bits in one packed accounting lane.
 const LANE_BITS: u32 = u32::BITS;
@@ -22,9 +22,9 @@ pub(in crate::runtime::buffer_pool) const MAX_PACKED_CARRIERS: CarrierCount =
 
 /// A packed transition cannot represent its result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CoverageOverflow;
+pub(in crate::runtime::buffer_pool) struct CoverageOverflow;
 
-/// Aggregate state changed at carrier-acquisition frequency.
+/// Packed coverage and ownership pressure updated by acquisition and return.
 pub(in crate::runtime::buffer_pool) struct CoverageState {
     /// Low lane: available coverage. High lane: uncovered charges.
     packed: AtomicU64,
@@ -32,25 +32,25 @@ pub(in crate::runtime::buffer_pool) struct CoverageState {
 
 /// One coherent sample of [`CoverageState`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CoverageSnapshot {
+pub(in crate::runtime::buffer_pool) struct CoverageSnapshot {
     /// Open-envelope capacity not occupied by an acquisition.
-    pub(super) available: CarrierCount,
+    pub(in crate::runtime::buffer_pool) available: CarrierCount,
     /// Ownership pressure outside open-envelope coverage.
-    pub(super) uncovered: CarrierCount,
+    pub(in crate::runtime::buffer_pool) uncovered: CarrierCount,
 }
 
 /// Result of installing aggregate acquisition charges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CoverageDebit {
+pub(in crate::runtime::buffer_pool) struct CoverageDebit {
     /// Uncovered charges introduced by this transition.
-    pub(super) uncovered_added: CarrierCount,
+    pub(in crate::runtime::buffer_pool) uncovered_added: CarrierCount,
 }
 
 /// Result of retiring aggregate acquisition charges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CoverageReturn {
+pub(in crate::runtime::buffer_pool) struct CoverageReturn {
     /// Uncovered charges removed by this transition.
-    pub(super) uncovered_removed: CarrierCount,
+    pub(in crate::runtime::buffer_pool) uncovered_removed: CarrierCount,
 }
 
 impl CoverageState {
@@ -65,7 +65,10 @@ impl CoverageState {
     ///
     /// `Ok(false)` leaves state unchanged. The caller must enter admission
     /// serialization before installing an uncovered charge.
-    pub(super) fn try_debit_covered(&self, count: CarrierCount) -> Result<bool, CoverageOverflow> {
+    pub(in crate::runtime::buffer_pool) fn try_debit_covered(
+        &self,
+        count: CarrierCount,
+    ) -> Result<bool, CoverageOverflow> {
         checked_lane(count)?;
         let mut current = self.packed.load(Ordering::Acquire);
 
@@ -91,7 +94,7 @@ impl CoverageState {
     ///
     /// Callers that may add an uncovered charge hold admission serialization.
     /// `maximum_uncovered` enforces the packed global admission bound.
-    pub(super) fn debit(
+    pub(in crate::runtime::buffer_pool) fn debit(
         &self,
         count: CarrierCount,
         maximum_uncovered: CarrierCount,
@@ -121,8 +124,10 @@ impl CoverageState {
     }
 
     /// Retires charges, removing uncovered charges before restoring coverage.
-    pub(super) fn release(&self, count: CarrierCount) -> CoverageReturn {
-        checked_lane(count).expect("released carrier count must fit packed accounting");
+    pub(in crate::runtime::buffer_pool) fn release(&self, count: CarrierCount) -> CoverageReturn {
+        if checked_lane(count).is_err() {
+            invariant_violation("released carrier count exceeds packed accounting");
+        }
         self.update(|snapshot| {
             let uncovered_removed = CarrierCount::new(count.get().min(snapshot.uncovered.get()));
             let restored = count
@@ -144,14 +149,17 @@ impl CoverageState {
                 CoverageReturn { uncovered_removed },
             ))
         })
-        .expect("aggregate return must fit packed accounting")
+        .unwrap_or_else(|_| invariant_violation("aggregate return exceeds packed accounting"))
     }
 
     /// Publishes unused coverage from one newly active envelope.
     ///
     /// Existing uncovered charges remain unchanged. A later grant cannot
     /// absorb ownership that predates it.
-    pub(super) fn add_coverage(&self, count: CarrierCount) -> Result<(), CoverageOverflow> {
+    pub(in crate::runtime::buffer_pool) fn add_coverage(
+        &self,
+        count: CarrierCount,
+    ) -> Result<(), CoverageOverflow> {
         checked_lane(count)?;
         self.update(|snapshot| {
             let available = snapshot
@@ -173,19 +181,24 @@ impl CoverageState {
     /// Direct outstanding charges are already present in aggregate accounting.
     /// Availability above remaining active demand belongs to a return that
     /// raced the direct snapshot and must also leave with this envelope.
-    pub(super) fn remove_coverage(
+    pub(in crate::runtime::buffer_pool) fn remove_coverage(
         &self,
         envelope: CarrierCount,
         direct_outstanding: CarrierCount,
         remaining_active: CarrierCount,
     ) {
-        checked_lane(envelope).expect("closed envelope must fit packed accounting");
-        checked_lane(direct_outstanding)
-            .expect("closing direct outstanding must fit packed accounting");
-        checked_lane(remaining_active).expect("remaining active demand must fit packed accounting");
-        let potentially_unused = envelope
-            .checked_sub(direct_outstanding)
-            .expect("closing direct outstanding exceeds its envelope");
+        if checked_lane(envelope).is_err() {
+            invariant_violation("closed envelope exceeds packed accounting");
+        }
+        if checked_lane(direct_outstanding).is_err() {
+            invariant_violation("closing direct outstanding exceeds packed accounting");
+        }
+        if checked_lane(remaining_active).is_err() {
+            invariant_violation("remaining active demand exceeds packed accounting");
+        }
+        let potentially_unused = envelope.checked_sub(direct_outstanding).unwrap_or_else(|| {
+            invariant_violation("closing direct outstanding exceeds its envelope")
+        });
         self.update(|snapshot| {
             let nominally_unused =
                 CarrierCount::new(potentially_unused.get().min(snapshot.available.get()));
@@ -213,11 +226,11 @@ impl CoverageState {
                 (),
             ))
         })
-        .expect("reservation close must fit packed accounting");
+        .unwrap_or_else(|_| invariant_violation("reservation close exceeds packed accounting"));
     }
 
     /// Loads one coherent accounting sample.
-    pub(super) fn snapshot(&self) -> CoverageSnapshot {
+    pub(in crate::runtime::buffer_pool) fn snapshot(&self) -> CoverageSnapshot {
         unpack(self.packed.load(Ordering::Acquire))
     }
 

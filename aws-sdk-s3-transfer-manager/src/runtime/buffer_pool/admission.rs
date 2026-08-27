@@ -17,10 +17,13 @@ use std::task::Waker;
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::sync::{Arc, MutexGuard};
 
-use super::arena::ArenaError;
-use super::block::BlockError;
-use super::metrics::{MemoryMetricState, MemoryMetrics};
-use super::{CarrierCount, PoolInner};
+use super::{invariant_violation, CarrierCount, PoolInner};
+
+/// Closed bit in [`ReservationOwnerState::packed`].
+const RESERVATION_CLOSED: u64 = 1 << 63;
+
+/// Direct owners and in-flight debits in [`ReservationOwnerState::packed`].
+const DIRECT_OUTSTANDING_MASK: u64 = !RESERVATION_CLOSED;
 
 mod coverage;
 use coverage::CoverageSnapshot;
@@ -28,31 +31,16 @@ pub(super) use coverage::{CoverageState, MAX_PACKED_CARRIERS};
 
 mod waiter;
 pub(crate) use waiter::ReserveFuture;
-use waiter::{ReservationPoll, WaitSlot, WaitState, Waiter};
+pub(super) use waiter::{ReservationPoll, WaitSlot, WaitState, Waiter};
 
 /// Planned-demand state protected by the pool admission mutex.
 pub(super) struct AdmissionState {
     /// Counters participating in grant and preparation decisions.
-    ledger: AdmissionLedger,
+    pub(super) ledger: AdmissionLedger,
     /// Reservation requests retained in strict arrival order.
-    waiters: VecDeque<Waiter>,
+    pub(super) waiters: VecDeque<Waiter>,
     /// Cumulative requests that entered the FIFO.
-    parked_reservations_total: u64,
-}
-
-/// Proof that one operation owns admission serialization.
-pub(super) struct AdmissionGuard<'a> {
-    inner: MutexGuard<'a, AdmissionState>,
-}
-
-/// Carrier-granular values used to decide and back new admission.
-struct AdmissionLedger {
-    /// Normal admission ceiling.
-    configured_capacity: CarrierCount,
-    /// Capacity whose complete preparation steps have succeeded.
-    prepared_capacity: CarrierCount,
-    /// Complete envelopes whose acquisition authority remains open.
-    active_planned_demand: CarrierCount,
+    pub(super) parked_reservations_total: u64,
 }
 
 impl AdmissionState {
@@ -68,6 +56,11 @@ impl AdmissionState {
             parked_reservations_total: 0,
         }
     }
+}
+
+/// Proof that one operation owns admission serialization.
+pub(super) struct AdmissionGuard<'a> {
+    pub(super) inner: MutexGuard<'a, AdmissionState>,
 }
 
 impl<'a> AdmissionGuard<'a> {
@@ -87,12 +80,12 @@ impl<'a> AdmissionGuard<'a> {
     }
 
     /// Returns whether one fresh request is immediately eligible.
-    fn can_grant(&self, coverage: CoverageSnapshot, envelope: CarrierCount) -> bool {
+    pub(super) fn can_grant(&self, coverage: CoverageSnapshot, envelope: CarrierCount) -> bool {
         self.inner.ledger.can_grant(coverage, envelope)
     }
 
     /// Computes and validates the post-grant admission floor.
-    fn grant_target(
+    pub(super) fn grant_target(
         &self,
         coverage: CoverageSnapshot,
         envelope: CarrierCount,
@@ -101,7 +94,7 @@ impl<'a> AdmissionGuard<'a> {
     }
 
     /// Publishes one prepared grant.
-    fn commit_grant(
+    pub(super) fn commit_grant(
         &mut self,
         coverage: &CoverageState,
         envelope: CarrierCount,
@@ -110,7 +103,7 @@ impl<'a> AdmissionGuard<'a> {
     }
 
     /// Retires one open envelope without releasing its carrier owners.
-    fn close_envelope(
+    pub(super) fn close_envelope(
         &mut self,
         coverage: &CoverageState,
         envelope: CarrierCount,
@@ -125,7 +118,9 @@ impl<'a> AdmissionGuard<'a> {
     pub(super) fn maximum_uncovered(&self) -> CarrierCount {
         MAX_PACKED_CARRIERS
             .checked_sub(self.inner.ledger.active_planned_demand)
-            .expect("active planned demand must fit packed admission")
+            .unwrap_or_else(|| {
+                invariant_violation("active planned demand exceeds packed admission")
+            })
     }
 
     /// Returns the floor required by the current admission state.
@@ -143,16 +138,33 @@ impl<'a> AdmissionGuard<'a> {
     }
 }
 
+/// Carrier-granular values used to decide and back new admission.
+pub(super) struct AdmissionLedger {
+    /// Normal admission ceiling.
+    pub(super) configured_capacity: CarrierCount,
+    /// Capacity whose complete preparation steps have succeeded.
+    pub(super) prepared_capacity: CarrierCount,
+    /// Complete envelopes whose acquisition authority remains open.
+    pub(super) active_planned_demand: CarrierCount,
+}
+
 impl AdmissionLedger {
     /// Returns active envelopes plus ownership outside their coverage.
-    fn admission_used(&self, coverage: CoverageSnapshot) -> Result<CarrierCount, ReserveError> {
+    pub(super) fn admission_used(
+        &self,
+        coverage: CoverageSnapshot,
+    ) -> Result<CarrierCount, ReserveError> {
         self.active_planned_demand
             .checked_add(coverage.uncovered)
             .filter(|count| *count <= MAX_PACKED_CARRIERS)
             .ok_or(ReserveError::CapacityOverflow)
     }
 
-    /// Checks the normal ceiling or the idle-only progress rule.
+    /// Returns whether one envelope may be granted now.
+    ///
+    /// A request normally fits below the configured ceiling. If no reservation
+    /// remains active, one request may exceed that ceiling so retained
+    /// uncovered ownership cannot prevent all future progress.
     fn can_grant(&self, coverage: CoverageSnapshot, envelope: CarrierCount) -> bool {
         let normal = self
             .admission_used(coverage)
@@ -210,19 +222,19 @@ impl AdmissionLedger {
         envelope: CarrierCount,
         direct_outstanding: CarrierCount,
     ) {
-        self.active_planned_demand = self
-            .active_planned_demand
-            .checked_sub(envelope)
-            .expect("reservation close exceeds active planned demand");
+        let Some(remaining_active) = self.active_planned_demand.checked_sub(envelope) else {
+            invariant_violation("reservation close exceeds active planned demand");
+        };
+        self.active_planned_demand = remaining_active;
         coverage.remove_coverage(envelope, direct_outstanding, self.active_planned_demand);
         self.assert_invariants(coverage.snapshot());
     }
 
     /// Checks identities required after each serialized transition.
-    fn assert_invariants(&self, coverage: CoverageSnapshot) {
+    pub(super) fn assert_invariants(&self, coverage: CoverageSnapshot) {
         let admission_used = self
             .admission_used(coverage)
-            .expect("completed admission state must fit packed accounting");
+            .unwrap_or_else(|_| invariant_violation("completed admission exceeds packed capacity"));
         if self.prepared_capacity < admission_used {
             invariant_violation("prepared capacity does not cover admission used");
         }
@@ -277,7 +289,7 @@ pub(super) struct ReservationState {
 
 impl Reservation {
     /// Creates one open reservation for an already published grant.
-    fn new(pool: Arc<PoolInner>, envelope: CarrierCount) -> Self {
+    pub(super) fn new(pool: Arc<PoolInner>, envelope: CarrierCount) -> Self {
         Self {
             state: Some(Arc::new(ReservationState {
                 pool,
@@ -355,313 +367,11 @@ impl ReservationState {
     }
 }
 
-impl PoolInner {
-    /// Returns one coherent admission and aggregate memory sample.
-    pub(super) fn memory_metrics(&self) -> MemoryMetrics {
-        let admission = self.admission.lock();
-        let coverage = self.coverage.snapshot();
-        admission.ledger.assert_invariants(coverage);
-
-        let admission_used = admission
-            .ledger
-            .admission_used(coverage)
-            .expect("completed admission state must fit packed accounting");
-        let covered_charges = admission
-            .ledger
-            .active_planned_demand
-            .checked_sub(coverage.available)
-            .expect("available coverage cannot exceed active planned demand");
-        let charged_capacity = covered_charges
-            .checked_add(coverage.uncovered)
-            .expect("completed charge state must fit packed accounting");
-
-        MemoryMetrics::from_carriers(
-            self.arena.carrier_size(),
-            MemoryMetricState {
-                configured_capacity: admission.ledger.configured_capacity,
-                admission_used,
-                active_planned_demand: admission.ledger.active_planned_demand,
-                charged_capacity,
-                prepared_capacity: admission.ledger.prepared_capacity,
-                queued_reservations: admission.waiters.len(),
-                parked_reservations_total: admission.parked_reservations_total,
-            },
-        )
-    }
-
-    /// Returns one coherent admission and aggregate sample for composed tests.
-    #[cfg(test)]
-    pub(super) fn test_accounting_state(
-        &self,
-    ) -> (
-        CarrierCount,
-        CarrierCount,
-        CarrierCount,
-        CarrierCount,
-        usize,
-    ) {
-        let admission = self.admission.lock();
-        let coverage = self.coverage.snapshot();
-        (
-            admission.ledger.prepared_capacity,
-            admission.ledger.active_planned_demand,
-            coverage.available,
-            coverage.uncovered,
-            admission.waiters.len(),
-        )
-    }
-
-    /// Attempts an aggregate debit without admission serialization.
-    ///
-    /// `Ok(false)` leaves accounting unchanged and requires the caller to use
-    /// the serialized shortfall path.
-    pub(super) fn try_debit_covered(&self, count: CarrierCount) -> Result<bool, ReserveError> {
-        self.coverage
-            .try_debit_covered(count)
-            .map_err(|_| ReserveError::CapacityOverflow)
-    }
-
-    /// Publishes a shortfall debit and prepares through its admission floor.
-    ///
-    /// Failure reverses the aggregate debit before returning. The caller
-    /// remains responsible for rolling back reservation-local authority.
-    pub(super) fn debit_and_prepare_locked(
-        pool: &Arc<Self>,
-        admission: &mut AdmissionGuard<'_>,
-        count: CarrierCount,
-    ) -> Result<(), ReserveError> {
-        pool.coverage
-            .debit(count, admission.maximum_uncovered())
-            .map_err(|_| ReserveError::CapacityOverflow)?;
-
-        let floor = match admission.acquisition_floor(&pool.coverage) {
-            Ok(floor) => floor,
-            Err(error) => {
-                admission.rollback_acquisition(&pool.coverage, count);
-                return Err(error);
-            }
-        };
-        if let Err(error) = pool.arena.prepare_to(admission, floor) {
-            admission.rollback_acquisition(&pool.coverage, count);
-            return Err(map_preparation_error(error));
-        }
-        Ok(())
-    }
-
-    /// Attempts one immediate grant without bypassing the FIFO.
-    pub(super) fn try_reserve_count(
-        pool: &Arc<Self>,
-        envelope: CarrierCount,
-    ) -> Result<Option<Reservation>, ReserveError> {
-        if envelope == CarrierCount::ZERO {
-            return Err(ReserveError::InvalidSize);
-        }
-        if envelope > MAX_PACKED_CARRIERS {
-            return Err(ReserveError::CapacityOverflow);
-        }
-
-        let mut admission = AdmissionGuard::new(pool.admission.lock());
-        if !admission.inner.waiters.is_empty() {
-            return Ok(None);
-        }
-        let coverage = pool.coverage.snapshot();
-        if !admission.can_grant(coverage, envelope) {
-            return Ok(None);
-        }
-
-        Self::prepare_and_grant_locked(pool, &mut admission, envelope).map(Some)
-    }
-
-    /// Grants one first-poll request or links it behind existing work.
-    fn reserve_or_enqueue(
-        pool: &Arc<Self>,
-        envelope: CarrierCount,
-        waker: Waker,
-    ) -> Result<ReservationPoll, ReserveError> {
-        if envelope == CarrierCount::ZERO {
-            return Err(ReserveError::InvalidSize);
-        }
-        if envelope > MAX_PACKED_CARRIERS {
-            return Err(ReserveError::CapacityOverflow);
-        }
-
-        let mut admission = AdmissionGuard::new(pool.admission.lock());
-        let coverage = pool.coverage.snapshot();
-        if admission.inner.waiters.is_empty() && admission.can_grant(coverage, envelope) {
-            return Self::prepare_and_grant_locked(pool, &mut admission, envelope)
-                .map(ReservationPoll::Ready);
-        }
-
-        admission
-            .inner
-            .waiters
-            .try_reserve(1)
-            .map_err(|_| ReserveError::PhysicalPreparationFailed)?;
-        let slot = Arc::new(WaitSlot::new(waker));
-        admission.inner.waiters.push_back(Waiter {
-            envelope,
-            slot: Arc::clone(&slot),
-        });
-        admission.inner.parked_reservations_total =
-            admission.inner.parked_reservations_total.saturating_add(1);
-        Ok(ReservationPoll::Queued(slot))
-    }
-
-    /// Removes one cancelled queue link and reconsiders the exposed head.
-    fn cancel_waiter(pool: &Arc<Self>, slot: &Arc<WaitSlot>) -> Vec<Waker> {
-        let mut admission = AdmissionGuard::new(pool.admission.lock());
-        if let Some(index) = admission
-            .inner
-            .waiters
-            .iter()
-            .position(|waiter| Arc::ptr_eq(&waiter.slot, slot))
-        {
-            admission.inner.waiters.remove(index);
-        }
-        Self::drain_fifo_locked(pool, &mut admission)
-    }
-
-    /// Prepares and publishes one grant while admission is serialized.
-    fn prepare_and_grant_locked(
-        pool: &Arc<Self>,
-        admission: &mut AdmissionGuard<'_>,
-        envelope: CarrierCount,
-    ) -> Result<Reservation, ReserveError> {
-        let coverage = pool.coverage.snapshot();
-        let target = admission.grant_target(coverage, envelope)?;
-        pool.arena
-            .prepare_to(admission, target)
-            .map_err(map_preparation_error)?;
-        admission.commit_grant(&pool.coverage, envelope)?;
-        Ok(Reservation::new(Arc::clone(pool), envelope))
-    }
-
-    /// Transfers every eligible FIFO head and returns wakers for post-unlock use.
-    fn drain_fifo_locked(pool: &Arc<Self>, admission: &mut AdmissionGuard<'_>) -> Vec<Waker> {
-        let mut wakers = Vec::new();
-        while let Some(front) = admission.inner.waiters.front() {
-            let envelope = front.envelope;
-            let slot = Arc::clone(&front.slot);
-            let mut slot_state = slot.state.lock();
-
-            match &*slot_state {
-                WaitState::Taken => {
-                    admission.inner.waiters.pop_front();
-                    continue;
-                }
-                WaitState::Queued { .. } => {}
-                WaitState::Granted(_) | WaitState::Failed(_) => {
-                    panic!("terminal reservation result remained linked in the FIFO");
-                }
-            }
-
-            let coverage = pool.coverage.snapshot();
-            if !admission.can_grant(coverage, envelope) {
-                break;
-            }
-
-            let result = Self::prepare_and_grant_locked(pool, admission, envelope);
-            let previous = std::mem::replace(&mut *slot_state, WaitState::Taken);
-            let WaitState::Queued { waker } = previous else {
-                panic!("reservation head changed while its slot lock was held");
-            };
-            *slot_state = match result {
-                Ok(reservation) => WaitState::Granted(reservation),
-                Err(error) => WaitState::Failed(error),
-            };
-
-            let removed = admission
-                .inner
-                .waiters
-                .pop_front()
-                .expect("reservation head disappeared while admission was held");
-            assert!(
-                Arc::ptr_eq(&removed.slot, &slot),
-                "FIFO head changed while admission was held"
-            );
-            wakers.push(waker);
-        }
-        wakers
-    }
-
-    /// Retires aggregate charges and reconsiders work exposed by repayment.
-    ///
-    /// Physical ownership and direct provenance are returned before this
-    /// boundary. Coverage-only returns stay lock-free. Repayment of uncovered
-    /// charges enters admission and invokes wakers only after unlocking.
-    pub(super) fn release_acquisition_charges(pool: &Arc<Self>, count: CarrierCount) {
-        let returned = pool.coverage.release(count);
-        if returned.uncovered_removed == CarrierCount::ZERO {
-            return;
-        }
-
-        let wakers = {
-            let mut admission = AdmissionGuard::new(pool.admission.lock());
-            let wakers = Self::drain_fifo_locked(pool, &mut admission);
-            admission
-                .inner
-                .ledger
-                .assert_invariants(pool.coverage.snapshot());
-            wakers
-        };
-        wake_all(wakers);
-    }
-}
-
 /// Wakes terminal reservation futures after every pool lock is released.
-fn wake_all(wakers: Vec<Waker>) {
+pub(super) fn wake_all(wakers: Vec<Waker>) {
     for waker in wakers {
         waker.wake();
     }
-}
-
-fn map_preparation_error(error: ArenaError) -> ReserveError {
-    match error {
-        ArenaError::Block(BlockError::PreparedCapacityOverflow)
-        | ArenaError::SlotIdExhausted
-        | ArenaError::RegistryCapacityOverflow
-        | ArenaError::AddressOverflow { .. }
-        | ArenaError::ScanSpaceOverflow { .. } => ReserveError::CapacityOverflow,
-        ArenaError::Block(_)
-        | ArenaError::Allocation(_)
-        | ArenaError::InvalidScanBudget
-        | ArenaError::InvalidClaimCount
-        | ArenaError::IncompleteClaim { .. }
-        | ArenaError::AddressOverlap { .. } => ReserveError::PhysicalPreparationFailed,
-    }
-}
-
-/// Stops execution after an admission or accounting invariant fails.
-#[cold]
-fn invariant_violation(message: &'static str) -> ! {
-    tracing::error!(
-        target: crate::telemetry::TARGET_MEMORY,
-        reason = message,
-        "buffer-pool admission invariant violated; aborting"
-    );
-
-    #[cfg(test)]
-    panic!("buffer-pool admission invariant violated: {message}");
-
-    #[cfg(not(test))]
-    {
-        let _ = message;
-        std::process::abort()
-    }
-}
-
-/// Closed bit in [`ReservationOwnerState::packed`].
-const RESERVATION_CLOSED: u64 = 1 << 63;
-
-/// Direct owners and in-flight debits in [`ReservationOwnerState::packed`].
-const DIRECT_OUTSTANDING_MASK: u64 = !RESERVATION_CLOSED;
-
-/// Reservation-local acquisition state.
-///
-/// The high bit records close. The remaining bits count direct carrier owners
-/// and acquisition debits that have not yet become owners.
-struct ReservationOwnerState {
-    packed: AtomicU64,
 }
 
 /// Why a reservation-local debit could not be installed.
@@ -684,6 +394,14 @@ struct ReservationOwnerSnapshot {
     direct_outstanding: CarrierCount,
 }
 
+/// Reservation-local acquisition state.
+///
+/// The high bit records close. The remaining bits count direct carrier owners
+/// and acquisition debits that have not yet become owners.
+struct ReservationOwnerState {
+    packed: AtomicU64,
+}
+
 impl ReservationOwnerState {
     /// Creates open authority with no direct owners.
     fn new() -> Self {
@@ -692,7 +410,10 @@ impl ReservationOwnerState {
         }
     }
 
-    /// Checks one debit without reserving direct-acquisition authority.
+    /// Rejects a debit that the current state already makes impossible.
+    ///
+    /// This load does not reserve authority and may race close or another
+    /// debit. [`Self::try_debit`] performs the authoritative atomic update.
     fn precheck_debit(
         &self,
         envelope: CarrierCount,
@@ -758,7 +479,7 @@ impl ReservationOwnerState {
         }
         Some(CarrierCount::new(
             usize::try_from(previous & DIRECT_OUTSTANDING_MASK)
-                .expect("direct owner count must fit usize"),
+                .unwrap_or_else(|_| invariant_violation("direct owner count does not fit usize")),
         ))
     }
 
@@ -767,7 +488,9 @@ impl ReservationOwnerState {
     /// Returns `true` when the reservation remains open. Release preserves the
     /// closed bit and cannot restore acquisition authority after close.
     fn release(&self, count: CarrierCount) -> bool {
-        let count = u64::try_from(count.get()).expect("direct release count must fit owner state");
+        let count = u64::try_from(count.get()).unwrap_or_else(|_| {
+            invariant_violation("direct release count does not fit owner state")
+        });
         let previous = self
             .packed
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -776,7 +499,9 @@ impl ReservationOwnerState {
                     .checked_sub(count)
                     .map(|next| (current & RESERVATION_CLOSED) | next)
             })
-            .expect("direct release exceeds outstanding ownership");
+            .unwrap_or_else(|_| {
+                invariant_violation("direct release exceeds outstanding ownership")
+            });
         previous & RESERVATION_CLOSED == 0
     }
 
@@ -786,8 +511,9 @@ impl ReservationOwnerState {
         ReservationOwnerSnapshot {
             closed: packed & RESERVATION_CLOSED != 0,
             direct_outstanding: CarrierCount::new(
-                usize::try_from(packed & DIRECT_OUTSTANDING_MASK)
-                    .expect("direct owner count must fit usize"),
+                usize::try_from(packed & DIRECT_OUTSTANDING_MASK).unwrap_or_else(|_| {
+                    invariant_violation("direct owner count does not fit usize")
+                }),
             ),
         }
     }
@@ -795,23 +521,10 @@ impl ReservationOwnerState {
 
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
-    use super::super::geometry::PoolGeometry;
-    use super::super::virtual_memory::{page_size, VirtualMemoryOperation};
+    use super::super::test_util::test_pool;
+    use super::super::virtual_memory::VirtualMemoryOperation;
     use super::super::BufferPool;
     use super::*;
-
-    fn test_pool(block_carriers: usize, configured: usize) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(
-            page_size,
-            page_size.checked_mul(block_carriers).unwrap(),
-            page_size,
-        )
-        .unwrap();
-        let pool =
-            BufferPool::from_validated_parts(geometry, CarrierCount::new(configured), 1).unwrap();
-        (pool, page_size)
-    }
 
     #[test]
     fn test_immediate_grant_prepares_before_publication() {
@@ -1076,21 +789,11 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    use super::super::geometry::PoolGeometry;
-    use super::super::virtual_memory::page_size;
-    use super::super::BufferPool;
+    use super::super::test_util::test_single_carrier_pool as test_pool;
     use crate::runtime::sync::sync::Arc;
     use crate::runtime::sync::thread;
 
     use super::*;
-
-    fn test_pool(configured: usize) -> (BufferPool, usize) {
-        let page_size = page_size().unwrap().get();
-        let geometry = PoolGeometry::new(page_size, page_size, page_size).unwrap();
-        let pool =
-            BufferPool::from_validated_parts(geometry, CarrierCount::new(configured), 1).unwrap();
-        (pool, page_size)
-    }
 
     #[test]
     fn test_concurrent_immediate_grants_respect_normal_capacity() {

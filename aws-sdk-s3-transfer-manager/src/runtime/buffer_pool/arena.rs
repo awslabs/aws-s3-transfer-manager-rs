@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering as DiagnosticOrdering};
 
 use super::admission::AdmissionGuard;
 use super::block::{BlockError, BlockSlot, CarrierAllocation, ProvisionalBits};
-use super::geometry::{GeometryError, PoolGeometry};
-use super::CarrierCount;
+use super::geometry::PoolGeometry;
+use super::{invariant_violation, CarrierCount};
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
@@ -116,22 +116,14 @@ impl Arena {
         self.diagnostics.snapshot()
     }
 
-    /// Converts a nonzero byte request to whole carriers.
-    pub(super) fn carriers_for_bytes(&self, bytes: usize) -> Result<CarrierCount, GeometryError> {
-        self.geometry.carriers_for_bytes(bytes)
-    }
-
-    /// Returns the fixed byte capacity of one carrier.
-    pub(super) fn carrier_size(&self) -> usize {
-        self.geometry.carrier_size()
-    }
-
     /// Prepares capacity through `target` under admission serialization.
     ///
     /// Whole-block preparation may raise prepared capacity above `target`.
-    /// Existing inactive slots are retried before another stable range is
-    /// reserved. A failure retains capacity prepared by earlier iterations but
-    /// publishes no admission grant.
+    /// Stable slots remain in the arena after trim. This operation scans those
+    /// slots, skips capacity that is already prepared, and revives inactive or
+    /// recovery-pending slots before reserving another virtual range. A failure
+    /// retains capacity prepared by earlier iterations but publishes no
+    /// admission grant.
     pub(super) fn prepare_to(
         &self,
         admission: &mut AdmissionGuard<'_>,
@@ -918,25 +910,6 @@ mod registry_cell {
         pub(super) fn as_ref(&self) -> &RegistryGeneration {
             &self.inner
         }
-    }
-}
-
-/// Stops execution after a registry invariant fails.
-#[cold]
-fn invariant_violation(message: &'static str) -> ! {
-    tracing::error!(
-        target: crate::telemetry::TARGET_MEMORY,
-        reason = message,
-        "buffer-pool registry invariant violated; aborting"
-    );
-
-    #[cfg(test)]
-    panic!("buffer-pool registry invariant violated: {message}");
-
-    #[cfg(not(test))]
-    {
-        let _ = message;
-        std::process::abort()
     }
 }
 
