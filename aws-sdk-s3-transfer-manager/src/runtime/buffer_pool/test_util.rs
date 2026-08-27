@@ -11,13 +11,15 @@ use std::sync::Arc as StdArc;
 use std::task::Wake;
 use std::task::{Context, Poll, Waker};
 
+use bytes::BufMut;
+
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::Arc;
 
 use super::admission::{Reservation, ReserveError, ReserveFuture};
 use super::geometry::PoolGeometry;
 use super::virtual_memory::page_size;
-use super::{BufferPool, CarrierCount, PoolInner};
+use super::{BufferPool, CarrierCount, PoolInner, PooledBufMut};
 
 /// Waker state that records each wake through the active atomic backend.
 struct CountingWake {
@@ -78,6 +80,15 @@ impl BufferPool {
         self.inner
             .test_hooks
             .inject_acquisition_allocation_failure(boundary);
+    }
+
+    /// Returns whether an acquisition metadata failure remains pending.
+    pub(super) fn acquisition_allocation_failure_pending(&self) -> bool {
+        self.inner
+            .test_hooks
+            .acquisition_allocation_failure
+            .load(Ordering::Acquire)
+            != 0
     }
 }
 
@@ -148,6 +159,21 @@ pub(super) fn test_pool_with_scan(
 /// Constructs a pool whose block and carrier are one runtime page.
 pub(super) fn test_single_carrier_pool(configured: usize) -> (BufferPool, usize) {
     test_pool(1, configured)
+}
+
+/// Initializes bytes through the pooled buffer's `BufMut` boundary.
+pub(super) fn write_pooled(buffer: &mut PooledBufMut, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let written = {
+            let chunk = buffer.chunk_mut();
+            let written = chunk.len().min(bytes.len());
+            chunk[..written].copy_from_slice(&bytes[..written]);
+            written
+        };
+        // SAFETY: the preceding copy initialized exactly `written` bytes.
+        unsafe { buffer.advance_mut(written) };
+        bytes = &bytes[written..];
+    }
 }
 
 /// Polls one reservation future with an explicit waker.

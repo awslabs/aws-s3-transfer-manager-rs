@@ -15,11 +15,14 @@ mod arena;
 mod block;
 mod geometry;
 mod metrics;
+mod pooled_buf;
+mod segmented_bytes;
 #[cfg(test)]
 mod test_util;
 mod virtual_memory;
 
-use acquisition::{acquire_count, AcquireError, AcquiredRuns};
+use acquisition::acquire_count;
+pub(crate) use acquisition::AcquireError;
 use admission::{
     wake_all, AdmissionGuard, AdmissionState, CoverageState, ReservationPoll, WaitSlot, WaitState,
     Waiter, MAX_PACKED_CARRIERS,
@@ -29,6 +32,9 @@ use arena::{Arena, ArenaError};
 use block::BlockError;
 use geometry::{GeometryError, PoolGeometry};
 use metrics::{MemoryMetricState, MemoryMetrics};
+use pooled_buf::GrowthAuthority;
+pub(crate) use pooled_buf::PooledBufMut;
+pub(crate) use segmented_bytes::SegmentedBytes;
 
 #[cfg(test)]
 use test_util::TestHooks;
@@ -100,7 +106,7 @@ impl BufferPool {
         &self,
         reservation: &Reservation,
         min_bytes: usize,
-    ) -> Result<AcquiredRuns, AcquireError> {
+    ) -> Result<PooledBufMut, AcquireError> {
         let count = self.acquisition_count(min_bytes)?;
         let direct = reservation
             .acquisition_state()
@@ -108,7 +114,9 @@ impl BufferPool {
         if !direct.belongs_to(&self.inner) {
             return Err(AcquireError::ForeignReservation);
         }
-        acquire_count(&self.inner, Some(Arc::clone(direct)), count)
+        let direct = Arc::clone(direct);
+        let guards = acquire_count(&self.inner, Some(Arc::clone(&direct)), count)?;
+        PooledBufMut::try_new(GrowthAuthority::reserved(direct), guards)
     }
 
     /// Acquires at least `min_bytes` without reservation-local authority.
@@ -120,9 +128,10 @@ impl BufferPool {
     pub(crate) fn acquire_unreserved(
         &self,
         min_bytes: usize,
-    ) -> Result<AcquiredRuns, AcquireError> {
+    ) -> Result<PooledBufMut, AcquireError> {
         let count = self.acquisition_count(min_bytes)?;
-        acquire_count(&self.inner, None, count)
+        let guards = acquire_count(&self.inner, None, count)?;
+        PooledBufMut::try_new(GrowthAuthority::unreserved(Arc::clone(&self.inner)), guards)
     }
 
     /// Converts one public byte request to its checked carrier envelope.

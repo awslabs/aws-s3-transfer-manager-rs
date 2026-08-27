@@ -1155,10 +1155,11 @@ struct AddressRange {
 ```
 
 `BlockRegistry` publishes claim order and address classification as one immutable generation.
-Optimistic claim scans load `slots_in_claim_order` without taking `ArenaState`. An incoming
-immutable view uses binary search over `address_ranges` and accepts a match only when its complete
-checked range lies within one slot. The integer bounds classify addresses only; carrier pointers
-are always derived from `VirtualRange`.
+Optimistic claim scans load `slots_in_claim_order` without taking `ArenaState`. Address
+classification uses binary search over `address_ranges` and accepts a match only when its complete
+checked range lies within one slot. The integer bounds supply metadata only; carrier pointers are
+always derived from `VirtualRange`. Classification does not widen the range-limited provenance of
+an incoming immutable view.
 
 Generation construction rejects address overflow, overlap, or an invalid slot index. Growth rebuilds
 and publishes both arrays while holding `ArenaState`. Return goes directly to the slot recorded by
@@ -1785,16 +1786,13 @@ struct CarrierRun {
     slot_id: u32,
     // Index of the run's first carrier within the slot.
     first_carrier: u32,
-    // Start of the contiguous writable run.
-    ptr: NonNull<MaybeUninit<u8>>,
-    // Total byte capacity of the run.
-    capacity: usize,
     // Per-carrier ownership in ascending address order.
-    carriers: VecDeque<WritableCarrier>,
+    carriers: Vec<WritableCarrier>,
 }
 
 struct WritableCarrier {
-    guard: Arc<CarrierGuard>,
+    // None after publication transfers the carrier's final mutable hold.
+    guard: Option<Arc<CarrierGuard>>,
     // Unique mutable authority over the carrier's unpublished suffix.
     writable: ExclusiveRange,
     // Initialized prefix within `writable`.
@@ -1809,12 +1807,16 @@ struct ExclusiveRange {
 struct BufferCursor {
     run: usize,
     carrier: usize,
-    offset: usize,
 }
 ```
 
 `SmallVec` is an inline-storage optimization. Its capacity does not limit acquisition or
 fragmentation and may change without changing the ownership contract.
+
+Carrier entries remain positionally stable while the buffer lives. Publishing a carrier's complete
+remaining range takes its guard and leaves an empty metadata entry; the buffer then retains no
+ownership or charge for that carrier, and cursor normalization skips the entry. Stable entries keep
+publication from shifting the write cursor while later growth appends carriers.
 
 `ExclusiveRange` is linear and private. It cannot be cloned. Its consuming split operations produce
 disjoint ranges, so publication can remove an initialized prefix while retaining exclusive mutable
@@ -2027,8 +2029,8 @@ pub struct SegmentedBytes {
 
 #[derive(Clone)]
 struct Segment {
-    // Stable slot identity used only to validate presentation adjacency.
-    slot_id: Option<u32>,
+    // Concrete slot proving common pointer provenance before coalescing.
+    slot: Option<Arc<BlockSlot>>,
     // Start and length of one contiguous initialized presentation range.
     ptr: NonNull<u8>,
     len: usize,
@@ -2050,16 +2052,16 @@ enum Hold {
     View(Bytes),
 }
 
-struct SegmentedBytesBuilder<'a> {
-    // Resolves incoming views against stable slot ranges during construction.
-    arena: &'a Arena,
+struct SegmentedBytesBuilder {
+    // Optional pool used to recover canonical pointers for opaque views.
+    pool: Option<Arc<PoolInner>>,
     // Presentation ranges assembled so far.
     segments: VecDeque<Segment>,
     // Sum of the assembled presentation lengths.
     remaining: usize,
 }
 
-impl<'a> SegmentedBytesBuilder<'a> {
+impl SegmentedBytesBuilder {
     fn push_segmented(&mut self, buffer: SegmentedBytes);
     fn push_view(&mut self, view: Bytes);
     fn finish(self) -> SegmentedBytes;
@@ -2069,10 +2071,9 @@ impl<'a> SegmentedBytesBuilder<'a> {
 `Hold::Pooled` retains storage frozen directly from `PooledBufMut`. `Hold::View` retains an existing
 immutable producer view, whether pool-backed or foreign. `push_segmented` consumes the input's
 remaining segments and their existing holds; it does not reconstruct ownership from pointers.
-`PooledBufMut::freeze` constructs pooled segments directly. The private builder resolves the
-complete range of `push_view` with a binary search over the registry generation's sorted address
-ranges; the finished value retains no builder borrow. Owner boundaries need not be presentation
-boundaries:
+`PooledBufMut::freeze` constructs pooled segments directly with stable slot identity and pointers
+derived from the slot's `VirtualRange`. Owner boundaries need not be presentation boundaries for
+those direct pooled ranges:
 
 ```text
 one Segment, assuming 64 KiB carriers: contiguous presentation [0..192 KiB]
@@ -2084,15 +2085,23 @@ one Segment, assuming 64 KiB carriers: contiguous presentation [0..192 KiB]
        owner A              owner B              owner C
 ```
 
-Construction extends the previous segment only when both ranges have the same known `slot_id` and
-the previous range ends at the next range's pointer. Stable block-slot address ranges make this
-test unambiguous, and the owners keep every byte in the merged range live. A foreign view has
-`slot_id: None` and starts a new segment even if its address happens to be adjacent.
+Construction extends the previous segment only when both ranges identify the same concrete
+`BlockSlot` by `Arc::ptr_eq`, the previous range ends at the next range's pointer, and both pointers
+retain provenance derived from that slot's stable `VirtualRange`. A pool-local numeric slot index is
+not sufficient identity. The owners keep every byte in the merged range live.
 
-Address lookup on an incoming `Bytes` supplies presentation metadata only. It cannot prove that the
-view is the final owner or recover the acquisition's accounting provenance. Pool-backed incoming
-views therefore remain `Hold::View(Bytes)`; construction never creates another `CarrierGuard` or
-clears a bitmap bit from an address.
+An opaque `Bytes` remains `Hold::View(Bytes)` and never authorizes physical or accounting return.
+When the builder has the pool that may have produced the view, integer address classification can
+locate a complete range within one concrete `BlockSlot`. Classification does not widen the
+range-limited provenance of `Bytes::as_ptr()`. Instead, the builder derives a new checked pointer
+from that slot's `VirtualRange` provenance root while the original `Bytes` remains the initialized
+immutable owner. Pool-produced byte owners keep their carrier bits live, so trim cannot deactivate
+the range while any classified view remains.
+
+Classified views may coalesce with adjacent classified or direct pooled ranges from the same
+concrete slot. A foreign view, a view from another pool, or a range crossing a slot boundary remains
+an independent segment. Construction never creates another `CarrierGuard` or clears a bitmap bit
+from an address.
 
 **Alternative: Recover carrier ownership from incoming views.** Rejected: an unseen clone or slice
 may still retain the original owner. Returning the carrier from pointer metadata would make live
@@ -2202,8 +2211,10 @@ pool-independent one-segment value and retains the supplied `Bytes` as its owner
 - **O6: Immutable ownership.** Clones, slices, and separate windows share carrier charges without
   duplicating them. Freeze returns wholly unused carriers and retains partial carriers only through
   initialized ranges.
-- **O7: Segment ownership.** Ordered holds cover every unconsumed byte. Coalescing requires a known
-  equal slot and pointer adjacency; incoming views never authorize physical or accounting return.
+- **O7: Segment ownership.** Ordered holds cover every unconsumed byte. Coalescing requires direct
+  pooled ranges or classified opaque views with equal concrete slot identity, slot-rooted
+  provenance, and pointer adjacency. Unclassified views remain separate segments and no view
+  authorizes physical or accounting return.
 - **O8: Read cursors.** `Buf::advance` releases only crossed holds, `chunks_vectored` respects
   destination capacity, and clones retain independent cursors and owners.
 - **O9: Contiguous conversion and unsafe access.** Zero-copy conversion retains source charges.
@@ -3231,7 +3242,7 @@ initialized, and the synchronization that excludes mutation or reclamation.
 | Construct `ContiguousOwner`             | Ordered owners cover every byte in the contiguous range for the complete owner lifetime                                   |
 | Form `&[u8]`, `IoSlice`, or I/O source  | The referenced range is initialized and retained for the complete borrow or asynchronous operation                        |
 | Implement `Send` or `Sync`              | Moving or sharing the type cannot duplicate mutable authority; every shared pointer names immutable synchronized storage  |
-| Coalesce adjacent presentation ranges   | Both ranges have the same known stable slot and pointer adjacency; retained owners cover the merged range                 |
+| Coalesce adjacent presentation ranges   | Both pointers derive from the same stable slot, are adjacent, and retained owners cover the merged range                 |
 | Clear bits after gate failure           | The protected incarnation and bitmap remain allocated outside the block's inaccessible `VirtualRange`                     |
 | Make a block inaccessible or discard it | The claim-trim gate confirmed all-free, prepared accounting no longer includes it, and the slot retains address ownership |
 
@@ -3353,6 +3364,7 @@ section; one property may discharge several contracts.
 | O3         | Failed growth preserves bytes, cursors, and writable capacity         | Failure injection and Miri at every growth commit step | Append runs before the complete acquisition commits     |
 | O1, O6     | One carrier returns once after its final view, slice, and suffix drop | Guard-level Loom and arbitrary drop-order tests        | Create one return guard per view or per run             |
 | O7         | Segment owners cover every unconsumed byte                            | Property tests over builder input and cursor movement  | Merge unknown or nonadjacent ranges                     |
+| O7, P2     | Classified views use concrete slot identity and slot-rooted provenance | Strict-provenance Miri over same-slot, cross-carrier, foreign, and cross-pool views | Extend `Bytes::as_ptr()` or classify by pool-local slot index |
 | O8         | `Buf` never reports an empty chunk while bytes remain                 | Generic-consumer property test                         | Leave the cursor on an exhausted segment boundary       |
 | O4         | Mutable and publication cursors normalize across carriers             | Generic `BufMut` and repeated-publication tests        | Leave either cursor on an exhausted carrier boundary    |
 | O4, O5     | Publication never crosses `initialized_chunk`                         | Miri and boundary tests over every carrier split       | Bound publication by total initialized length           |
