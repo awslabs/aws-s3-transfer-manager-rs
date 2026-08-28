@@ -217,6 +217,38 @@ struct CarrierId {
     incarnation: IncarnationIdentity,
 }
 
+/// Stable physical location of one carrier within an arena.
+///
+/// The location orders carriers for run construction. It does not identify the
+/// block incarnation that owns a live carrier bit.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct CarrierLocation {
+    /// Pool-local block-slot index.
+    slot_id: u32,
+    /// Carrier index within the slot.
+    carrier_index: u32,
+}
+
+impl CarrierLocation {
+    /// Creates one arena location.
+    pub(super) const fn new(slot_id: u32, carrier_index: u32) -> Self {
+        Self {
+            slot_id,
+            carrier_index,
+        }
+    }
+
+    /// Returns the pool-local block-slot index.
+    pub(super) const fn slot_id(self) -> u32 {
+        self.slot_id
+    }
+
+    /// Returns the carrier index within the slot.
+    pub(super) const fn carrier_index(self) -> u32 {
+        self.carrier_index
+    }
+}
+
 /// Comparison-only identity for one block activation.
 ///
 /// The live carrier bit, not this value, prevents incarnation replacement.
@@ -1349,14 +1381,19 @@ impl CarrierAllocation {
         &self.slot
     }
 
+    /// Returns this carrier's stable physical location within the arena.
+    pub(super) fn location(&self) -> CarrierLocation {
+        CarrierLocation::new(self.id.slot, self.id.index)
+    }
+
     /// Returns the stable block-slot identifier.
     pub(super) fn slot_id(&self) -> u32 {
-        self.id.slot
+        self.location().slot_id()
     }
 
     /// Returns the carrier index within its block.
     pub(super) fn carrier_index(&self) -> u32 {
-        self.id.index
+        self.location().carrier_index()
     }
 
     /// Returns the carrier capacity in bytes.

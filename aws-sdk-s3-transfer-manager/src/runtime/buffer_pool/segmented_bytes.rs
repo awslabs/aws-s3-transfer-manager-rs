@@ -3,11 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Immutable segmented byte presentation with explicit owner coverage.
+//! Immutable byte streams with independent presentation and owner boundaries.
 //!
-//! Segments describe contiguous presentation ranges. Owner boundaries remain
-//! independent so advancing a reader can release each carrier as soon as its
-//! final byte is crossed.
+//! A presentation segment is one range that [`Buf::chunk`] or
+//! [`Buf::chunks_vectored`] may expose. An owner boundary records how long one
+//! pooled carrier or opaque [`Bytes`] value must remain live. Several adjacent
+//! owners may share one presentation segment, so vectored I/O sees fewer
+//! ranges while [`Buf::advance`] can still release crossed owners promptly.
+//!
+//! Coalescing is a pointer-provenance operation, not an address-only
+//! optimization. Pooled ranges merge only when they derive from the same
+//! concrete block slot. Opaque views merge only after a pool-aware builder
+//! classifies their complete range and derives a new pointer from that slot.
 
 use std::collections::VecDeque;
 use std::io::IoSlice;
@@ -22,6 +29,13 @@ use super::PoolInner;
 use crate::runtime::sync::sync::Arc;
 
 /// Immutable bytes presented as one or more contiguous segments.
+///
+/// Cloning creates an independent read cursor while sharing the underlying
+/// owners. Advancing one clone releases an owner only after all other clones
+/// and immutable views have released it.
+///
+/// [`Self::into_contiguous`] is zero-copy for zero or one remaining segment.
+/// Multiple remaining segments are copied in logical order.
 #[derive(Clone)]
 pub(crate) struct SegmentedBytes {
     /// Presentation ranges in logical byte order.
@@ -46,7 +60,8 @@ impl SegmentedBytes {
     /// Consumes this value and returns one contiguous immutable buffer.
     ///
     /// Empty and single-segment values do not copy. Multiple segments are
-    /// copied in logical order while each source owner remains live.
+    /// copied in logical order while each source owner remains live until its
+    /// bytes have been copied.
     pub(crate) fn into_contiguous(mut self) -> Bytes {
         match self.segments.len() {
             0 => Bytes::new(),
@@ -230,6 +245,10 @@ impl From<Bytes> for SegmentedBytes {
 }
 
 /// One contiguous initialized presentation range.
+///
+/// `owners` covers this complete range in order. Its boundaries may be finer
+/// than the presentation range so consumption can release backing storage
+/// without splitting the segment exposed through [`Buf`].
 #[derive(Clone)]
 struct Segment {
     /// Concrete slot proving common pointer provenance before coalescing.
@@ -300,6 +319,11 @@ enum Hold {
 }
 
 /// Constructs segmented values while preserving complete owner coverage.
+///
+/// A pool-aware builder may recognize opaque views produced by that pool. It
+/// recovers no return authority from an address: the incoming [`Bytes`] remains
+/// the owner, while classification supplies only a slot-rooted pointer suitable
+/// for safe coalescing.
 pub(super) struct SegmentedBytesBuilder {
     /// Optional pool used to recover canonical pointers for opaque views.
     pool: Option<Arc<PoolInner>>,
@@ -765,6 +789,9 @@ mod tests {
         let mut frozen = mutable.freeze();
         frozen.advance(carrier_size - 2);
 
+        let mut empty = [];
+        assert_eq!(frozen.chunks_vectored(&mut empty), 0);
+
         let mut one = [IoSlice::new(&[])];
         assert_eq!(frozen.chunks_vectored(&mut one), 1);
         assert_eq!(&*one[0], &input[carrier_size - 2..carrier_size]);
@@ -871,11 +898,21 @@ mod tests {
 
     #[test]
     fn test_empty_segmented_value_obeys_buf_contract() {
-        let value = SegmentedBytes::from(Bytes::new());
+        let mut value = SegmentedBytes::from(Bytes::new());
         assert!(value.is_empty());
         assert_eq!(value.remaining(), 0);
         assert!(value.chunk().is_empty());
+        value.advance(0);
+        let mut slices = [IoSlice::new(&[])];
+        assert_eq!(value.chunks_vectored(&mut slices), 0);
         assert!(value.into_contiguous().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "advanced beyond segmented byte length")]
+    fn test_segmented_bytes_rejects_advance_beyond_remaining() {
+        let mut value = SegmentedBytes::from(Bytes::from_static(b"abc"));
+        value.advance(4);
     }
 
     #[test]
