@@ -752,20 +752,27 @@ impl FsWalk {
             WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
-        // Build the ancestor chain for children of this directory.
-        let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-            let kind = WalkError::classify_io(&e);
-            let kind = if depth == 0
-                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-            {
-                WalkErrorKind::SourceUnreadable
-            } else {
-                kind
-            };
-            WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
-        })?);
-        let mut next_ancestors = ancestor_handles.to_vec();
-        next_ancestors.push(Arc::clone(&self_handle));
+        // Ancestor chain for children of this directory. Only symlinked
+        // directories can form a cycle, so when symlinks are not followed the
+        // chain is never consulted and the open()+fstat is pure cost.
+        let next_ancestors = if self.config.follow_symlinks {
+            let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
+                let kind = WalkError::classify_io(&e);
+                let kind = if depth == 0
+                    && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
+                {
+                    WalkErrorKind::SourceUnreadable
+                } else {
+                    kind
+                };
+                WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
+            })?);
+            let mut chain = ancestor_handles.to_vec();
+            chain.push(self_handle);
+            chain
+        } else {
+            Vec::new()
+        };
 
         let mut result = ReadDirResult {
             children: Vec::new(),

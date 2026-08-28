@@ -75,11 +75,50 @@ fn build_front_loaded(root: &Path, subdirs: usize, files_per_dir: usize) -> usiz
 }
 
 fn walker(key_order: bool) -> FsWalker {
+    walker_with(key_order, false)
+}
+
+fn walker_with(key_order: bool, follow_symlinks: bool) -> FsWalker {
     FsWalker::builder()
         .recursive(true)
         .sort(true)
         .key_order(key_order)
+        .follow_symlinks(follow_symlinks)
         .build()
+}
+
+// Following symlinks adds an open()+fstat per directory for cycle detection.
+// Same fixture, same run, so the delta is attributable.
+fn drain_follow(rt: &tokio::runtime::Runtime, root: &Path, follow_symlinks: bool) -> usize {
+    rt.block_on(async {
+        let ctx = FsWalkContext::builder().root(root).build();
+        let mut walk = walker_with(false, follow_symlinks).walk(ctx);
+        let mut n = 0;
+        while let Some(result) = walk.next().await {
+            if result.is_ok() {
+                n += 1;
+            }
+        }
+        n
+    })
+}
+
+fn walk_cycle_detection_cost(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let count = build_balanced(dir.path(), 10, 3, 10);
+
+    let mut group = c.benchmark_group("walk_cycle_detection");
+    group.throughput(Throughput::Elements(count as u64));
+    for (label, follow) in [("no_follow", false), ("follow_symlinks", true)] {
+        group.bench_function(BenchmarkId::new("balanced_1110dirs", label), |b| {
+            b.iter(|| black_box(drain_follow(&rt, dir.path(), follow)));
+        });
+    }
+    group.finish();
 }
 
 fn drain(rt: &tokio::runtime::Runtime, root: &Path, key_order: bool) -> usize {
@@ -170,7 +209,12 @@ fn walk_first_entry_latency(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, walk_throughput, walk_first_entry_latency);
+criterion_group!(
+    benches,
+    walk_throughput,
+    walk_first_entry_latency,
+    walk_cycle_detection_cost
+);
 
 fn main() {
     benches();
