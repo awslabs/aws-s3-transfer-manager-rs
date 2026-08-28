@@ -262,7 +262,7 @@ struct Segment {
 }
 
 impl Segment {
-    /// Removes an already consumed prefix and rebases owner boundaries.
+    /// Removes a consumed prefix after its crossed owners were released.
     fn trim_prefix(mut self, count: usize) -> Self {
         assert!(count <= self.len, "trim exceeds segment");
         if count == 0 {
@@ -272,14 +272,17 @@ impl Segment {
             invariant_violation("complete segment must be removed instead of trimmed");
         }
 
-        while self.owners.front().is_some_and(|owner| owner.end <= count) {
-            self.owners.pop_front();
-        }
         if self.owners.is_empty() {
             invariant_violation("remaining segment has no owner");
         }
+        if self.owners.front().is_some_and(|owner| owner.end <= count) {
+            invariant_violation("trimmed segment retained a consumed owner");
+        }
         for owner in &mut self.owners {
-            owner.end -= count;
+            owner.end = owner
+                .end
+                .checked_sub(count)
+                .unwrap_or_else(|| invariant_violation("trim exceeds an owner boundary"));
         }
         // SAFETY: `count` is within the segment retained by the remaining
         // owners.
@@ -562,6 +565,18 @@ mod tests {
     }
 
     #[test]
+    fn test_freeze_of_empty_mutable_buffer_returns_every_carrier() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let mutable = pool.acquire_unreserved(carrier_size * 2).unwrap();
+
+        let frozen = mutable.freeze();
+
+        assert!(frozen.is_empty());
+        assert_eq!(frozen.segments.len(), 0);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
     fn test_freeze_coalesces_adjacent_carriers_but_preserves_owner_ranges() {
         let (pool, carrier_size) = test_pool(2, 2);
         let input: Vec<u8> = (0..carrier_size * 2)
@@ -704,7 +719,49 @@ mod tests {
         // Supply exact address adjacency without depending on mmap placement.
         let adjacent_start = left_segment.end_address().unwrap();
         assert!(left_segment.can_append(Some(left_slot), adjacent_start));
+        assert!(!left_segment.can_append(Some(left_slot), adjacent_start + 1));
         assert!(!left_segment.can_append(Some(right_slot), adjacent_start));
+    }
+
+    #[test]
+    fn test_same_slot_nonadjacent_ranges_remain_separate_segments() {
+        let (pool, carrier_size) = test_pool(3, 3);
+        let mut left = pool.acquire_unreserved(carrier_size).unwrap();
+        let gap = pool.acquire_unreserved(carrier_size).unwrap();
+        let mut right = pool.acquire_unreserved(carrier_size).unwrap();
+        write_pooled(&mut left, &vec![0x11; carrier_size]);
+        write_pooled(&mut right, &vec![0x22; carrier_size]);
+        let left = left.freeze();
+        let right = right.freeze();
+
+        let left_segment = &left.segments[0];
+        let right_segment = &right.segments[0];
+        assert!(Arc::ptr_eq(
+            left_segment.slot.as_ref().unwrap(),
+            right_segment.slot.as_ref().unwrap()
+        ));
+        assert_ne!(
+            left_segment.end_address(),
+            Some(right_segment.ptr.as_ptr().addr())
+        );
+
+        let mut builder = SegmentedBytesBuilder::new();
+        builder.push_segmented(left);
+        builder.push_segmented(right);
+        let combined = builder.finish();
+
+        assert_eq!(combined.segments.len(), 2);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 3) as u64
+        );
+        drop(gap);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 2) as u64
+        );
+        drop(combined);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
     #[test]
@@ -760,6 +817,28 @@ mod tests {
     }
 
     #[test]
+    fn test_one_advance_crosses_owner_and_segment_boundaries() {
+        let (pool, carrier_size) = test_pool(2, 3);
+        let input: Vec<u8> = (0..carrier_size * 3)
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        assert_eq!(frozen.segments.len(), 2);
+        assert_eq!(frozen.segments[0].owners.len(), 2);
+
+        let advanced = carrier_size * 2 + 7;
+        frozen.advance(advanced);
+
+        assert_eq!(frozen.len(), carrier_size - 7);
+        assert_eq!(frozen.chunk(), &input[advanced..]);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        drop(frozen);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
     fn test_clones_advance_independently_and_retain_crossed_owners() {
         let (pool, carrier_size) = test_pool(2, 2);
         let mut mutable = pool.acquire_unreserved(carrier_size * 2).unwrap();
@@ -803,6 +882,43 @@ mod tests {
     }
 
     #[test]
+    fn test_buf_copy_to_bytes_releases_crossed_pooled_owner() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let input: Vec<u8> = (0..carrier_size * 2)
+            .map(|index| (index.wrapping_mul(41) % 251) as u8)
+            .collect();
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        let copied_len = carrier_size + 3;
+
+        let copied = frozen.copy_to_bytes(copied_len);
+
+        assert_eq!(copied, input[..copied_len]);
+        assert_eq!(frozen.chunk(), &input[copied_len..]);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        drop(frozen);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_buf_get_u32_crosses_pooled_segment_boundary() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let mut input = vec![0; carrier_size + 2];
+        input[carrier_size - 2..].copy_from_slice(&[0x01, 0x23, 0x45, 0x67]);
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        frozen.advance(carrier_size - 2);
+
+        let value = frozen.get_u32();
+
+        assert_eq!(value, 0x0123_4567);
+        assert!(frozen.is_empty());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
     fn test_one_segment_contiguous_conversion_is_zero_copy() {
         let (pool, carrier_size) = test_pool(2, 2);
         let input = vec![0x6b; carrier_size * 2];
@@ -824,6 +940,29 @@ mod tests {
     }
 
     #[test]
+    fn test_partially_consumed_one_segment_conversion_is_zero_copy() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let input: Vec<u8> = (0..carrier_size * 2)
+            .map(|index| (index.wrapping_mul(13) % 251) as u8)
+            .collect();
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        let advanced = carrier_size + 7;
+        frozen.advance(advanced);
+        let source_ptr = frozen.chunk().as_ptr();
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+
+        let contiguous = frozen.into_contiguous();
+
+        assert_eq!(contiguous.as_ptr(), source_ptr);
+        assert_eq!(contiguous, input[advanced..]);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        drop(contiguous);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
     fn test_multiple_segment_contiguous_conversion_copies_and_releases_pool() {
         let (pool, carrier_size) = test_pool(1, 2);
         let input: Vec<u8> = (0..carrier_size * 2)
@@ -836,6 +975,25 @@ mod tests {
         let contiguous = frozen.into_contiguous();
 
         assert_eq!(contiguous, input);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_partially_consumed_multiple_segment_conversion_copies_remaining_bytes() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let input: Vec<u8> = (0..carrier_size * 2)
+            .map(|index| (index.wrapping_mul(23) % 251) as u8)
+            .collect();
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        let advanced = carrier_size - 3;
+        frozen.advance(advanced);
+        assert_eq!(frozen.segments.len(), 2);
+
+        let contiguous = frozen.into_contiguous();
+
+        assert_eq!(contiguous, input[advanced..]);
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
@@ -906,6 +1064,90 @@ mod tests {
         let mut slices = [IoSlice::new(&[])];
         assert_eq!(value.chunks_vectored(&mut slices), 0);
         assert!(value.into_contiguous().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "segment owners do not cover its complete range")]
+    fn test_segmented_bytes_rejects_incomplete_owner_coverage() {
+        let source = Bytes::from_static(b"abcd");
+        let ptr = NonNull::new(source.as_ptr().cast_mut()).expect("static bytes are nonempty");
+        let segment = Segment {
+            slot: None,
+            ptr,
+            len: source.len(),
+            owners: VecDeque::from([OwnedRange {
+                end: source.len() - 1,
+                hold: Hold::View(source),
+            }]),
+        };
+
+        let _ = SegmentedBytes::from_parts(VecDeque::from([segment]), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "segment owner boundaries are not ordered coverage")]
+    fn test_segmented_bytes_rejects_unordered_owner_boundaries() {
+        let source = Bytes::from_static(b"abcd");
+        let ptr = NonNull::new(source.as_ptr().cast_mut()).expect("static bytes are nonempty");
+        let segment = Segment {
+            slot: None,
+            ptr,
+            len: source.len(),
+            owners: VecDeque::from([
+                OwnedRange {
+                    end: 3,
+                    hold: Hold::View(source.clone()),
+                },
+                OwnedRange {
+                    end: 2,
+                    hold: Hold::View(source),
+                },
+            ]),
+        };
+
+        let _ = SegmentedBytes::from_parts(VecDeque::from([segment]), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "segment lengths do not match remaining bytes")]
+    fn test_segmented_bytes_rejects_remaining_length_mismatch() {
+        let source = Bytes::from_static(b"abcd");
+        let ptr = NonNull::new(source.as_ptr().cast_mut()).expect("static bytes are nonempty");
+        let segment = Segment {
+            slot: None,
+            ptr,
+            len: source.len(),
+            owners: VecDeque::from([OwnedRange {
+                end: source.len(),
+                hold: Hold::View(source),
+            }]),
+        };
+
+        let _ = SegmentedBytes::from_parts(VecDeque::from([segment]), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "trimmed segment retained a consumed owner")]
+    fn test_segment_trim_rejects_a_retained_consumed_owner() {
+        let source = Bytes::from_static(b"abcd");
+        let ptr = NonNull::new(source.as_ptr().cast_mut()).expect("static bytes are nonempty");
+        let segment = Segment {
+            slot: None,
+            ptr,
+            len: source.len(),
+            owners: VecDeque::from([
+                OwnedRange {
+                    end: 2,
+                    hold: Hold::View(source.clone()),
+                },
+                OwnedRange {
+                    end: source.len(),
+                    hold: Hold::View(source),
+                },
+            ]),
+        };
+
+        let _ = segment.trim_prefix(2);
     }
 
     #[test]
