@@ -13,6 +13,7 @@ mod acquisition;
 mod admission;
 mod arena;
 mod block;
+mod config;
 mod geometry;
 mod metrics;
 mod pooled_buf;
@@ -30,6 +31,8 @@ use admission::{
 pub(crate) use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError};
 use block::BlockError;
+use config::ResolvedPoolConfig;
+pub(crate) use config::{BufferPoolBuildError, MemoryCapacity};
 use geometry::{GeometryError, PoolGeometry};
 use metrics::{MemoryMetricState, MemoryMetrics};
 use pooled_buf::GrowthAuthority;
@@ -46,6 +49,23 @@ pub(crate) struct BufferPool {
 }
 
 impl BufferPool {
+    /// Constructs an empty pool from capacity policy and detected memory.
+    ///
+    /// Capacity and geometry are fixed before publication. Construction does
+    /// not reserve virtual ranges, prepare backing, or start maintenance.
+    pub(crate) fn from_capacity(
+        capacity: MemoryCapacity,
+        detected_memory: Option<usize>,
+    ) -> Result<Self, BufferPoolBuildError> {
+        let resolved = ResolvedPoolConfig::resolve(capacity, detected_memory)?;
+        Ok(Self::from_parts(
+            resolved.geometry,
+            resolved.configured_capacity,
+            resolved.optimistic_scan_words,
+        )
+        .unwrap_or_else(|_| invariant_violation("validated pool configuration was rejected")))
+    }
+
     /// Constructs a pool from checked geometry and internal configuration.
     ///
     /// Invalid capacity indicates an internal configuration defect. Public
@@ -94,6 +114,11 @@ impl BufferPool {
     /// Returns one coherent sample of this pool's memory state.
     pub(crate) fn metrics(&self) -> MemoryMetrics {
         self.inner.memory_metrics()
+    }
+
+    /// Returns the fixed writable allocation unit in bytes.
+    pub(crate) fn carrier_size(&self) -> usize {
+        self.inner.geometry.carrier_size()
     }
 
     /// Acquires at least `min_bytes` under one reservation.
