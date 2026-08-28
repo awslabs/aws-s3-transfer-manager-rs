@@ -13,7 +13,7 @@ use std::fmt;
 
 use super::admission::{AdmissionGuard, DirectDebitError, ReservationState, ReserveError};
 use super::arena::{ArenaError, ClaimBatch};
-use super::block::{BlockError, BlockSlot, CarrierAllocation};
+use super::block::{BlockError, BlockSlot, CarrierAllocation, CarrierLocation};
 use super::{invariant_violation, CarrierCount, PoolInner};
 use crate::runtime::sync::sync::Arc;
 
@@ -31,8 +31,10 @@ pub(crate) enum AcquireError {
     ReservationCapacityExceeded,
     /// Geometry or accounting cannot represent the request.
     CapacityOverflow,
-    /// Physical storage or ownership metadata could not be allocated.
+    /// Physical storage could not be reserved or prepared.
     PhysicalAllocationFailed,
+    /// Ownership metadata could not reserve the required capacity.
+    MetadataAllocationFailed,
 }
 
 impl fmt::Display for AcquireError {
@@ -48,6 +50,9 @@ impl fmt::Display for AcquireError {
                 f.write_str("acquisition exceeds buffer-pool accounting capacity")
             }
             Self::PhysicalAllocationFailed => f.write_str("physical buffer-pool allocation failed"),
+            Self::MetadataAllocationFailed => {
+                f.write_str("buffer-pool ownership metadata allocation failed")
+            }
         }
     }
 }
@@ -162,11 +167,11 @@ impl PendingAcquisition {
             .unwrap_or_else(|| invariant_violation("pending acquisition lost its accounting debit"))
             .pool;
         if allocation_failure_injected(pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
+            return Err(AcquireError::MetadataAllocationFailed);
         }
         self.guards
             .try_reserve_exact(allocations.len())
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+            .map_err(|_| AcquireError::MetadataAllocationFailed)?;
 
         let debit = self.debit.as_mut().unwrap_or_else(|| {
             invariant_violation("pending acquisition lost its accounting debit")
@@ -201,13 +206,13 @@ pub(super) struct CarrierGuard {
 }
 
 impl CarrierGuard {
-    /// Returns pool-local indices used to group carriers within one buffer.
-    pub(super) fn identity(&self) -> (u32, u32) {
+    /// Returns the physical location used to group adjacent carriers.
+    pub(super) fn location(&self) -> CarrierLocation {
         let allocation = self
             .allocation
             .as_ref()
             .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"));
-        (allocation.slot_id(), allocation.carrier_index())
+        allocation.location()
     }
 
     /// Returns the concrete slot that roots this carrier's pointer provenance.
@@ -285,17 +290,17 @@ pub(super) fn acquire_count(
     pending.finish()
 }
 
-/// Returns whether test injection fails this fallible allocation boundary.
+/// Returns whether test injection fails this metadata allocation boundary.
+#[cfg(test)]
 pub(super) fn allocation_failure_injected(pool: &PoolInner) -> bool {
-    #[cfg(test)]
-    {
-        pool.test_hooks.take_acquisition_allocation_failure()
-    }
-    #[cfg(not(test))]
-    {
-        let _ = pool;
-        false
-    }
+    pool.test_hooks.take_acquisition_allocation_failure()
+}
+
+/// Removes the metadata failure-injection seam from production paths.
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn allocation_failure_injected(_pool: &PoolInner) -> bool {
+    false
 }
 
 fn map_direct_debit_error(error: DirectDebitError) -> AcquireError {
@@ -310,6 +315,7 @@ fn map_reserve_error(error: ReserveError) -> AcquireError {
     match error {
         ReserveError::InvalidSize => AcquireError::InvalidSize,
         ReserveError::PhysicalPreparationFailed => AcquireError::PhysicalAllocationFailed,
+        ReserveError::MetadataAllocationFailed => AcquireError::MetadataAllocationFailed,
         ReserveError::CapacityOverflow => AcquireError::CapacityOverflow,
     }
 }
@@ -321,8 +327,10 @@ fn map_arena_error(error: ArenaError) -> AcquireError {
         | ArenaError::RegistryCapacityOverflow
         | ArenaError::AddressOverflow { .. }
         | ArenaError::ScanSpaceOverflow { .. } => AcquireError::CapacityOverflow,
+        ArenaError::Block(BlockError::Allocation(_)) | ArenaError::Allocation(_) => {
+            AcquireError::MetadataAllocationFailed
+        }
         ArenaError::Block(_)
-        | ArenaError::Allocation(_)
         | ArenaError::InvalidScanBudget
         | ArenaError::InvalidClaimCount
         | ArenaError::IncompleteClaim { .. }
@@ -365,6 +373,32 @@ mod tests {
             self.claimed.store(claim.is_complete(), Ordering::Release);
             self.wakes.fetch_add(1, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn test_metadata_failures_retain_their_error_classification() {
+        assert_eq!(
+            map_reserve_error(ReserveError::MetadataAllocationFailed),
+            AcquireError::MetadataAllocationFailed
+        );
+
+        let arena_error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        assert_eq!(
+            map_arena_error(ArenaError::Allocation(arena_error)),
+            AcquireError::MetadataAllocationFailed
+        );
+
+        let block_error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        assert_eq!(
+            map_arena_error(ArenaError::Block(BlockError::Allocation(block_error))),
+            AcquireError::MetadataAllocationFailed
+        );
+
+        let preparation_error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        assert_eq!(
+            super::super::map_preparation_error(ArenaError::Allocation(preparation_error)),
+            ReserveError::MetadataAllocationFailed
+        );
     }
 
     #[test]
@@ -883,7 +917,7 @@ mod tests {
             assert!(
                 matches!(
                     pool.acquire(&reservation, carrier_size * 2),
-                    Err(AcquireError::PhysicalAllocationFailed)
+                    Err(AcquireError::MetadataAllocationFailed)
                 ),
                 "metadata boundary {boundary} did not fail"
             );

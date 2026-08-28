@@ -311,7 +311,7 @@ impl PoolInner {
             .inner
             .waiters
             .try_reserve(1)
-            .map_err(|_| ReserveError::PhysicalPreparationFailed)?;
+            .map_err(|_| ReserveError::MetadataAllocationFailed)?;
         let slot = Arc::new(WaitSlot::new(waker));
         admission.inner.waiters.push_back(Waiter {
             envelope,
@@ -434,8 +434,10 @@ fn map_preparation_error(error: ArenaError) -> ReserveError {
         | ArenaError::RegistryCapacityOverflow
         | ArenaError::AddressOverflow { .. }
         | ArenaError::ScanSpaceOverflow { .. } => ReserveError::CapacityOverflow,
+        ArenaError::Block(BlockError::Allocation(_)) | ArenaError::Allocation(_) => {
+            ReserveError::MetadataAllocationFailed
+        }
         ArenaError::Block(_)
-        | ArenaError::Allocation(_)
         | ArenaError::InvalidScanBudget
         | ArenaError::InvalidClaimCount
         | ArenaError::IncompleteClaim { .. }

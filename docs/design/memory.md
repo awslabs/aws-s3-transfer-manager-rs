@@ -602,6 +602,7 @@ impl Future for ReserveFuture {
 pub enum ReserveError {
     InvalidSize,
     PhysicalPreparationFailed,
+    MetadataAllocationFailed,
     CapacityOverflow,
 }
 ```
@@ -609,6 +610,9 @@ pub enum ReserveError {
 `try_reserve` attempts one immediate grant. It returns `Ok(None)` when an older waiter exists or the
 request is not immediately eligible. It may allocate reservation state and prepare physical
 capacity when it grants. A zero-byte request returns `ReserveError::InvalidSize`.
+`PhysicalPreparationFailed` reports virtual-storage preparation. `MetadataAllocationFailed` reports
+failure to reserve queue, registry, bitmap, claim, or ownership metadata. Both leave admission and
+ownership state unchanged.
 
 `reserve` creates a `ReserveFuture` without entering admission. The future's first poll converts the
 request to a carrier count and performs one admission operation:
@@ -815,6 +819,7 @@ pub enum AcquireError {
     ReservationCapacityExceeded,
     CapacityOverflow,
     PhysicalAllocationFailed,
+    MetadataAllocationFailed,
 }
 ```
 
@@ -835,8 +840,9 @@ reservation has closed.
 `ReservationCapacityExceeded` means carrier rounding would exceed the reservation's remaining
 direct-acquisition authority. `CapacityOverflow` means the request cannot be represented by pool
 geometry or packed accounting. `PhysicalAllocationFailed` means physical storage could not be
-prepared. These errors expose no partial initial buffer. Failed buffer growth preserves its
-initialized bytes, publication state, and prior writable capacity.
+prepared. `MetadataAllocationFailed` means ownership metadata could not reserve required capacity.
+These errors expose no partial initial buffer. Failed buffer growth preserves its initialized
+bytes, publication state, and prior writable capacity.
 
 Reserved growth never switches to unreserved acquisition or expands its envelope.
 `ReservationCapacityExceeded` leaves the existing buffer unchanged. Its caller may retain the
@@ -2668,6 +2674,7 @@ Recoverable resource failures remain local:
 | ------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | Invalid capacity, geometry, or counter range      | Pool construction fails before publishing a handle                                    |
 | Virtual-range reservation                         | That growth or acquisition attempt fails                                              |
+| Ownership metadata reservation                    | That growth or acquisition attempt fails without exposing partial ownership            |
 | Reservation preparation                           | That request fails; reusable capacity prepared before the failure remains available   |
 | Reserved or unreserved acquisition                | The complete debit rolls back; no partial writable buffer escapes                     |
 | Whole-range protection                            | The block enters its nonclaimable recovery state outside prepared capacity            |

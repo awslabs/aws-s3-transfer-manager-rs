@@ -3,12 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Growable mutable buffers backed by exclusively owned pool carriers.
+//! Mutable byte streams backed by exclusively owned pool carriers.
 //!
-//! Acquisition installs accounting and returns one guard per carrier. This
-//! module arranges those guards in logical write order, tracks initialization,
-//! and transfers initialized prefixes into immutable owners without moving
-//! bytes.
+//! Acquisition returns charged carrier guards without assigning byte-level
+//! meaning to their storage. [`PooledBufMut`] arranges those carriers in logical
+//! write order and implements the remaining ownership transitions:
+//!
+//! - [`BufMut`] exposes only uninitialized storage held exclusively by the
+//!   mutable buffer.
+//! - [`PooledBufMut::publish_prefix`] removes initialized bytes from mutable
+//!   authority and transfers them to an immutable [`Bytes`] owner.
+//! - [`PooledBufMut::freeze`] ends growth and transfers all remaining
+//!   initialized bytes to [`SegmentedBytes`].
+//!
+//! Growth consumes retained writable capacity before acquiring more carriers.
+//! A buffer never changes between reserved and unreserved growth.
 
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
@@ -19,6 +28,7 @@ use smallvec::SmallVec;
 
 use super::acquisition::{acquire_count, allocation_failure_injected, AcquireError, CarrierGuard};
 use super::admission::ReservationState;
+use super::block::CarrierLocation;
 use super::geometry::GeometryError;
 use super::segmented_bytes::SegmentedBytesBuilder;
 use super::{invariant_violation, CarrierCount, PoolInner, SegmentedBytes};
@@ -30,7 +40,18 @@ const INLINE_CARRIER_RUNS: usize = 4;
 /// Contiguous physical runs in logical byte order.
 type CarrierRuns = SmallVec<[CarrierRun; INLINE_CARRIER_RUNS]>;
 
-/// One growable mutable allocation stream.
+/// One growable, exclusively writable stream of pooled bytes.
+///
+/// `len()` counts initialized bytes that remain owned by this mutable buffer.
+/// `remaining_mut()` counts retained uninitialized capacity, and `capacity()`
+/// is their sum. Publishing bytes reduces both `len()` and `capacity()` because
+/// the immutable result takes ownership of that range.
+///
+/// The buffer implements [`BufMut`] but does not expose its initialized prefix
+/// as one slice. Initialized bytes may cross carrier boundaries; callers use
+/// [`Self::initialized_chunk`] and [`Self::publish_prefix`] to transfer one
+/// contiguous prefix at a time, or [`Self::freeze`] to finish the complete
+/// segmented value.
 pub(crate) struct PooledBufMut {
     /// Selects reserved or unreserved acquisition for every later growth.
     growth: GrowthAuthority,
@@ -47,7 +68,10 @@ pub(crate) struct PooledBufMut {
 }
 
 impl PooledBufMut {
-    /// Builds a mutable stream from one complete carrier acquisition.
+    /// Takes every carrier from one complete acquisition.
+    ///
+    /// Failure drops all guards and returns their physical and accounting
+    /// ownership. No partial mutable buffer escapes.
     pub(super) fn try_new(
         growth: GrowthAuthority,
         guards: Vec<Arc<CarrierGuard>>,
@@ -66,11 +90,17 @@ impl PooledBufMut {
     }
 
     /// Returns initialized and writable bytes retained by this buffer.
+    ///
+    /// This is `len() + remaining_mut()`, not the original allocation size.
+    /// Publishing removes capacity from the mutable buffer.
     pub(crate) fn capacity(&self) -> usize {
         self.retained_capacity
     }
 
     /// Returns initialized bytes that have not been published.
+    ///
+    /// The bytes may span multiple carriers and therefore may not be
+    /// contiguous in memory.
     pub(crate) fn len(&self) -> usize {
         self.initialized
     }
@@ -201,7 +231,7 @@ impl PooledBufMut {
     ///
     /// Wholly unused carriers return immediately. An initialized prefix in a
     /// partially used carrier retains that carrier and discards its writable
-    /// suffix.
+    /// suffix. The operation does not copy initialized bytes.
     pub(crate) fn freeze(self) -> SegmentedBytes {
         let pool = Arc::clone(self.growth.pool());
         let Self { runs, .. } = self;
@@ -248,11 +278,11 @@ impl PooledBufMut {
         let appended_runs = staged.len() - usize::from(merge_first);
 
         if allocation_failure_injected(self.growth.pool()) {
-            return Err(AcquireError::PhysicalAllocationFailed);
+            return Err(AcquireError::MetadataAllocationFailed);
         }
         self.runs
             .try_reserve(appended_runs)
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+            .map_err(|_| AcquireError::MetadataAllocationFailed)?;
 
         if merge_first {
             let incoming = staged.remove(0);
@@ -261,12 +291,12 @@ impl PooledBufMut {
                 .last_mut()
                 .unwrap_or_else(|| invariant_violation("merge target disappeared"));
             if allocation_failure_injected(self.growth.pool()) {
-                return Err(AcquireError::PhysicalAllocationFailed);
+                return Err(AcquireError::MetadataAllocationFailed);
             }
             current
                 .carriers
                 .try_reserve(incoming.carriers.len())
-                .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+                .map_err(|_| AcquireError::MetadataAllocationFailed)?;
             current.carriers.extend(incoming.carriers);
         }
         self.runs.extend(staged);
@@ -470,7 +500,10 @@ unsafe impl BufMut for PooledBufMut {
     }
 }
 
-/// Authority retained for every later growth of one buffer.
+/// Fixed acquisition authority for every growth of one mutable buffer.
+///
+/// Retaining the mode prevents a reserved buffer from escaping its envelope
+/// through unreserved growth.
 pub(super) enum GrowthAuthority {
     /// New carriers must debit this reservation.
     Reserved(Arc<ReservationState>),
@@ -507,6 +540,11 @@ impl GrowthAuthority {
 }
 
 /// Adjacent carriers within one stable block slot.
+///
+/// Runs preserve logical byte order and reduce the top-level metadata needed
+/// for the common case where acquisition returns neighboring carriers. A run
+/// groups cursors only; each carrier keeps its own guard and pointer, and
+/// immutable coalescing performs a separate slot-identity check.
 struct CarrierRun {
     /// Stable block slot containing the run.
     slot_id: u32,
@@ -519,18 +557,18 @@ struct CarrierRun {
 impl CarrierRun {
     /// Creates a run containing one carrier.
     fn try_new(pool: &PoolInner, guard: Arc<CarrierGuard>) -> Result<Self, AcquireError> {
-        let (slot_id, first_carrier) = guard.identity();
+        let location = guard.location();
         let mut carriers = Vec::new();
         if allocation_failure_injected(pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
+            return Err(AcquireError::MetadataAllocationFailed);
         }
         carriers
             .try_reserve_exact(1)
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+            .map_err(|_| AcquireError::MetadataAllocationFailed)?;
         carriers.push(WritableCarrier::new(guard));
         Ok(Self {
-            slot_id,
-            first_carrier,
+            slot_id: location.slot_id(),
+            first_carrier: location.carrier_index(),
             carriers,
         })
     }
@@ -543,7 +581,7 @@ impl CarrierRun {
             .first_carrier
             .checked_add(run_len)
             .unwrap_or_else(|| invariant_violation("carrier run end exceeds block geometry"));
-        guard.identity() == (self.slot_id, next)
+        guard.location() == CarrierLocation::new(self.slot_id, next)
     }
 
     /// Returns whether `incoming` immediately follows this run.
@@ -561,17 +599,21 @@ impl CarrierRun {
         guard: Arc<CarrierGuard>,
     ) -> Result<(), AcquireError> {
         if allocation_failure_injected(pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
+            return Err(AcquireError::MetadataAllocationFailed);
         }
         self.carriers
             .try_reserve(1)
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+            .map_err(|_| AcquireError::MetadataAllocationFailed)?;
         self.carriers.push(WritableCarrier::new(guard));
         Ok(())
     }
 }
 
 /// Unique mutable authority over one carrier's unpublished suffix.
+///
+/// `initialized` divides `writable` into an initialized prefix followed by an
+/// uninitialized suffix. Prefix publication advances `writable` and may leave
+/// this positional entry empty so existing cursors remain stable.
 struct WritableCarrier {
     /// Shared physical and accounting ownership while a range remains.
     guard: Option<Arc<CarrierGuard>>,
@@ -666,6 +708,9 @@ impl BufferCursor {
 }
 
 /// Immutable initialized view retained by one carrier guard.
+///
+/// `Bytes::from_owner` may clone or slice this owner. The final owner drop
+/// releases the guard after every derived immutable view is gone.
 struct PooledWindow {
     guard: Arc<CarrierGuard>,
     ptr: NonNull<u8>,
@@ -703,7 +748,7 @@ fn build_runs(
     if guards.is_empty() {
         invariant_violation("complete acquisition contains no carriers");
     }
-    guards.sort_unstable_by_key(|guard| guard.identity());
+    guards.sort_unstable_by_key(|guard| guard.location());
 
     let mut runs = CarrierRuns::new();
     let mut capacity = 0usize;
@@ -718,10 +763,10 @@ fn build_runs(
             }
         }
         if allocation_failure_injected(pool) {
-            return Err(AcquireError::PhysicalAllocationFailed);
+            return Err(AcquireError::MetadataAllocationFailed);
         }
         runs.try_reserve(1)
-            .map_err(|_| AcquireError::PhysicalAllocationFailed)?;
+            .map_err(|_| AcquireError::MetadataAllocationFailed)?;
         runs.push(CarrierRun::try_new(pool, guard)?);
     }
     Ok((runs, capacity))
@@ -757,6 +802,44 @@ mod tests {
         assert_eq!(buffer.remaining_mut(), carrier_size - 1);
         assert_eq!(buffer.initialized_chunk(), &input[..carrier_size]);
         assert_eq!(buffer.chunk_mut().len(), carrier_size - 1);
+    }
+
+    #[test]
+    fn test_buf_mut_put_slice_crosses_carrier_boundaries() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let mut buffer = pool.acquire_unreserved(carrier_size + 3).unwrap();
+        let input: Vec<u8> = (0..carrier_size + 3)
+            .map(|index| (index.wrapping_mul(19) % 251) as u8)
+            .collect();
+
+        buffer.put_slice(&input);
+
+        assert_eq!(buffer.len(), input.len());
+        assert_eq!(buffer.remaining_mut(), carrier_size - 3);
+        assert_eq!(buffer.initialized_chunk(), &input[..carrier_size]);
+        let first = buffer.publish_prefix(carrier_size);
+        assert_eq!(first, input[..carrier_size]);
+        assert_eq!(buffer.initialized_chunk(), &input[carrier_size..]);
+    }
+
+    #[test]
+    fn test_buf_mut_zero_and_exact_boundary_advance_select_next_carrier() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let mut buffer = pool.acquire_unreserved(carrier_size * 2).unwrap();
+
+        let initial_len = buffer.chunk_mut().len();
+        // SAFETY: advancing by zero initializes no bytes.
+        unsafe { buffer.advance_mut(0) };
+        assert_eq!(buffer.chunk_mut().len(), initial_len);
+
+        let initialized = vec![0x5a; carrier_size];
+        buffer.chunk_mut()[..carrier_size].copy_from_slice(&initialized);
+        // SAFETY: the preceding fill initialized the complete first chunk.
+        unsafe { buffer.advance_mut(carrier_size) };
+
+        assert_eq!(buffer.len(), carrier_size);
+        assert_eq!(buffer.chunk_mut().len(), carrier_size);
+        assert_eq!(buffer.initialized_chunk(), initialized);
     }
 
     #[test]
@@ -878,7 +961,7 @@ mod tests {
                 assert!(result.is_ok(), "boundary {boundary} was not reached");
                 break;
             }
-            assert_eq!(result, Err(AcquireError::PhysicalAllocationFailed));
+            assert_eq!(result, Err(AcquireError::MetadataAllocationFailed));
             assert_eq!(buffer.capacity(), carrier_size);
             assert_eq!(buffer.len(), 3);
             assert_eq!(buffer.remaining_mut(), carrier_size - 3);
@@ -951,6 +1034,23 @@ mod tests {
         assert_eq!(buffer.initialized_chunk(), b"defXYZ");
         let second = buffer.publish_prefix(6);
         assert_eq!(second, b"defXYZ"[..]);
+    }
+
+    #[test]
+    fn test_growth_skips_a_fully_published_carrier_entry() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let mut buffer = pool.acquire_unreserved(carrier_size).unwrap();
+        buffer.put_slice(&vec![0x11; carrier_size]);
+        let published = buffer.publish_prefix(carrier_size);
+
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), 0);
+        buffer.reserve(1).unwrap();
+        buffer.put_slice(b"next");
+        let frozen = buffer.freeze();
+
+        assert_eq!(published, vec![0x11; carrier_size]);
+        assert_eq!(frozen.chunk(), b"next");
     }
 
     #[test]
