@@ -277,7 +277,12 @@ impl Client {
             };
 
             let s3_client = match config.take_s3_client_source() {
-                crate::config::S3ClientSource::Provided(client) => client,
+                crate::config::S3ClientSource::Provided(client) => {
+                    crate::config::user_agent::install_on_client(
+                        client,
+                        config.framework_metadata().cloned(),
+                    )
+                }
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
                     let mut builder = s3_config.builder;
                     if s3_config.enable_runtime_http {

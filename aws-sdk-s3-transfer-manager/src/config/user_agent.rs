@@ -15,16 +15,41 @@ use aws_types::os_shim_internal::Env;
 /// distinguishes it from the CRT-backed one.
 const RUST_TM_VERSION: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
 
+/// Identifies our interceptor on a client that already carries one.
+const INTERCEPTOR_NAME: &str = "S3TransferManager";
+
 /// Install the transfer manager's user agent attribution on an S3 client builder.
-///
-/// Called once per client from [`Client::new`](crate::Client::new), on the one client source we
-/// build ourselves, so each section appears exactly once. A client the caller hands over is used
-/// as built and carries none of this.
 pub(crate) fn install(
     builder: &mut aws_sdk_s3::config::Builder,
     framework_metadata: Option<FrameworkMetadata>,
 ) {
     builder.push_interceptor(S3TransferManagerInterceptor { framework_metadata }.into_shared());
+}
+
+/// Install on a client the caller handed over, rebuilding it from its own configuration.
+///
+/// `Config::to_builder` carries the config layer, runtime components, runtime plugins and
+/// behavior version across as a whole, so the rebuilt client differs from the original only by
+/// the added interceptor.
+///
+/// A client that already carries one is returned untouched: the `md/` section is appended to a
+/// list, so a second installation emits a second copy. That case is reached whenever a client
+/// built by one transfer manager is handed to another, which the composite operations do for
+/// every child transfer.
+pub(crate) fn install_on_client(
+    client: aws_sdk_s3::Client,
+    framework_metadata: Option<FrameworkMetadata>,
+) -> aws_sdk_s3::Client {
+    if client
+        .config()
+        .interceptors()
+        .any(|interceptor| interceptor.name() == INTERCEPTOR_NAME)
+    {
+        return client;
+    }
+    let mut builder = client.config().to_builder();
+    install(&mut builder, framework_metadata);
+    aws_sdk_s3::Client::from_conf(builder.build())
 }
 
 #[derive(Debug)]
@@ -34,7 +59,7 @@ struct S3TransferManagerInterceptor {
 
 impl Intercept for S3TransferManagerInterceptor {
     fn name(&self) -> &'static str {
-        "S3TransferManager"
+        INTERCEPTOR_NAME
     }
 
     /// The SDK's own `UserAgentInterceptor` runs later and yields to any [`AwsUserAgent`]
@@ -174,8 +199,8 @@ mod tests {
     }
 
     /// The `md/` section is appended to a list, so a second copy of the interceptor adds a
-    /// second copy rather than replacing it. A single installation site is what keeps that from
-    /// happening; this is the tripwire if one is ever added.
+    /// second copy rather than replacing it. This covers the path we build ourselves;
+    /// [`an_already_instrumented_client_is_not_attributed_twice`] covers the other one.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_our_marker_once() {
@@ -239,53 +264,162 @@ mod tests {
         );
     }
 
-    /// A client the caller hands over is used as built, and interceptors cannot be pushed onto
-    /// a finished client — so this path carries none of our attribution. Asserted rather than
-    /// left implicit, because the sections are absent by construction and a reader has no way
-    /// to tell that from an oversight.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn provided_client_carries_no_attribution() {
-        let (http_client, captured) = capture_request(None);
-        let s3_client = aws_sdk_s3::Client::from_conf(
+    /// Builds a client the way a caller who brings their own does, over a capture transport.
+    fn provided_client(
+        http_client: impl aws_sdk_s3::config::HttpClient + 'static,
+    ) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::from_conf(
             aws_sdk_s3::config::Builder::default()
                 .http_client(http_client)
                 .region(Region::from_static("us-west-2"))
                 .credentials_provider(test_credentials())
                 .behavior_version(BehaviorVersion::latest())
                 .build(),
-        );
+        )
+    }
 
+    /// Drives one download through a transfer manager built on a client the caller supplied.
+    async fn download_through(client: aws_sdk_s3::Client) {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_mode(RuntimeMode::MultiThreadTokio)
-                .client(s3_client)
+                .client(client)
                 .build(),
         );
         let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
         let _ = handle.body_mut().next().await;
+    }
 
+    /// A caller who hands over a finished client gets attribution too: the client is rebuilt
+    /// from its own configuration with our interceptor added, since one cannot be pushed onto a
+    /// client that is already built.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn provided_client_gets_attribution() {
+        let (http_client, captured) = capture_request(None);
+        download_through(provided_client(http_client)).await;
         let ua = captured
             .expect_request()
             .headers()
             .get("x-amz-user-agent")
             .expect("user agent header is set")
             .to_string();
-        // Guards the assertions below: they are absences, and would pass just as well on a
-        // header that was never assembled.
-        assert!(ua.contains("api/s3/"), "not a real user agent: {ua:?}");
-        assert!(
-            !ua.contains("md/rust-tm"),
-            "provided client unexpectedly carries our attribution: {ua:?}"
-        );
+
+        let ours = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
+        assert!(ua.contains(ours), "{ours:?} missing from {ua:?}");
         let metrics = ua
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
             .expect("user agent carries a metrics section");
         assert!(
-            !metrics.split(',').any(|id| id == "G"),
-            "provided client unexpectedly carries the S3Transfer metric: {ua:?}"
+            metrics.split(',').any(|id| id == "G"),
+            "S3Transfer metric missing from {metrics:?} in {ua:?}"
         );
+    }
+
+    /// Rebuilding a caller's client must not cost them anything they configured on it, so this
+    /// asserts one property from each place a setting can live: the config layer (`app_name`,
+    /// `force_path_style`), the endpoint resolver (`endpoint_url`), the identity and auth
+    /// resolvers (the credentials and region the request is signed with), a runtime component
+    /// they registered (their own interceptor), and the transport — the captured request only
+    /// exists at all if their `http_client` survived.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn rebuilding_a_provided_client_keeps_its_configuration() {
+        let (http_client, captured) = capture_request(None);
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::default()
+                .http_client(http_client)
+                .region(Region::from_static("eu-central-1"))
+                .credentials_provider(test_credentials())
+                .behavior_version(BehaviorVersion::latest())
+                .app_name(AppName::new("callers-app").unwrap())
+                .endpoint_url("https://s3.example.internal")
+                .force_path_style(true)
+                .interceptor(MarkHeader)
+                .build(),
+        );
+        download_through(client).await;
+        let request = captured.expect_request();
+
+        // Endpoint resolver and the S3-specific addressing flag.
+        assert_eq!(
+            request.uri(),
+            "https://s3.example.internal/foo/bar?x-id=GetObject",
+            "endpoint or path style lost in the rebuild"
+        );
+        // Auth: the credential scope names their region, and the credential their access key.
+        let authorization = request
+            .headers()
+            .get("authorization")
+            .expect("request is signed");
+        assert!(
+            authorization.contains("ANOTREAL/") && authorization.contains("eu-central-1/s3/"),
+            "credentials or region lost in the rebuild: {authorization:?}"
+        );
+        // A runtime component the caller registered.
+        assert_eq!(
+            request.headers().get("x-callers-interceptor"),
+            Some("ran"),
+            "the caller's interceptor was lost in the rebuild"
+        );
+
+        let ua = request
+            .headers()
+            .get("x-amz-user-agent")
+            .expect("user agent header is set")
+            .to_string();
+        assert!(ua.contains("app/callers-app"), "app name lost: {ua:?}");
+        let ours = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
+        assert!(ua.contains(ours), "{ours:?} missing from {ua:?}");
+    }
+
+    /// Stands in for whatever a caller registers on their own client: it proves the rebuild kept
+    /// their runtime components by leaving a mark on the request.
+    #[derive(Debug)]
+    struct MarkHeader;
+
+    impl Intercept for MarkHeader {
+        fn name(&self) -> &'static str {
+            "MarkHeader"
+        }
+
+        fn modify_before_signing(
+            &self,
+            ctx: &mut aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut<'_>,
+            _components: &aws_sdk_s3::config::RuntimeComponents,
+            _cfg: &mut aws_sdk_s3::config::ConfigBag,
+        ) -> Result<(), aws_sdk_s3::error::BoxError> {
+            ctx.request_mut()
+                .headers_mut()
+                .insert("x-callers-interceptor", "ran");
+            Ok(())
+        }
+    }
+
+    /// Handing a transfer manager's own client to a second one must not attribute it twice —
+    /// the `md/` section is appended to a list. This is the shape the composite operations
+    /// create: `download_objects` gives `handle.s3_client` to each child transfer.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_already_instrumented_client_is_not_attributed_twice() {
+        let (http_client, captured) = capture_request(None);
+        let first = crate::Client::new(
+            crate::Config::builder()
+                .runtime_mode(RuntimeMode::MultiThreadTokio)
+                .client(provided_client(http_client))
+                .build(),
+        );
+        // The clone a child transfer would be handed.
+        download_through(first.handle.s3_client.clone()).await;
+        let ua = captured
+            .expect_request()
+            .headers()
+            .get("x-amz-user-agent")
+            .expect("user agent header is set")
+            .to_string();
+
+        assert_eq!(ua.matches("md/rust-tm#").count(), 1, "{ua:?}");
     }
 
     /// Writes both user agent headers verbatim before signing, which is where a caller
