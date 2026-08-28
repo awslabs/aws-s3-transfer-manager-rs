@@ -10,9 +10,10 @@ use aws_runtime::user_agent::{AdditionalMetadata, ApiMetadata, AwsUserAgent, Fra
 use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 
-/// This crate's identity in the user agent. Neither `aws-sdk-rust/…` nor `api/s3/…` carries
-/// the transfer manager's version, and `rust-tm` distinguishes it from the CRT-backed one.
-const TM_METADATA: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
+/// This crate's name and version, as the `md/` pair the user agent carries. Neither
+/// `aws-sdk-rust/…` nor `api/s3/…` carries the transfer manager's version, and `rust-tm`
+/// distinguishes it from the CRT-backed one.
+const RUST_TM_VERSION: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
 
 /// Install the transfer manager's user agent attribution on an S3 client builder.
 ///
@@ -61,10 +62,10 @@ impl Intercept for S3TransferManagerInterceptor {
         // No `ApiMetadata` to build from: leave it to the SDK, which raises its own error.
         let Some(mut ua) = base else { return Ok(()) };
 
-        // `TM_METADATA` is a compile-time constant of legal metadata characters, so the error
-        // arm is unreachable; it is handled rather than unwrapped because attribution must never
-        // fail a transfer.
-        if let Ok(metadata) = AdditionalMetadata::new(TM_METADATA) {
+        // `RUST_TM_VERSION` is a compile-time constant of legal metadata characters, so the
+        // error arm is unreachable; it is handled rather than unwrapped because attribution must
+        // never fail a transfer.
+        if let Ok(metadata) = AdditionalMetadata::new(RUST_TM_VERSION) {
             ua = ua.with_additional_metadata(metadata);
         }
 
