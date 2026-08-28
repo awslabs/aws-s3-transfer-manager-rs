@@ -12,6 +12,11 @@ name = "throughput"
 path = "throughput.rs"
 harness = false
 
+[[bench]]
+name = "walk"
+path = "walk.rs"
+harness = false
+
 [dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }
@@ -20,4 +25,5 @@ aws-config = "1"
 s3-mock-server = { path = "../s3-mock-server" }
 aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
 bytes = "1"
+tempfile = "3.12.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
