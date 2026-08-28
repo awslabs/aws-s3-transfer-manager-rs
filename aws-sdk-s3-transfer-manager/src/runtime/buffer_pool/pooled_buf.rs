@@ -52,6 +52,14 @@ type CarrierRuns = SmallVec<[CarrierRun; INLINE_CARRIER_RUNS]>;
 /// [`Self::initialized_chunk`] and [`Self::publish_prefix`] to transfer one
 /// contiguous prefix at a time, or [`Self::freeze`] to finish the complete
 /// segmented value.
+///
+/// Growth reuses this buffer's retained writable tail before acquiring another
+/// carrier. Freezing a partially initialized carrier discards mutable access
+/// to its unused suffix, while the immutable prefix keeps the complete carrier
+/// charged. Several partially filled buffers can therefore exhaust a
+/// reservation's carrier allowance even when their initialized byte lengths
+/// fit within the reservation. The allowance returns when each final immutable
+/// owner drops.
 pub(crate) struct PooledBufMut {
     /// Selects reserved or unreserved acquisition for every later growth.
     growth: GrowthAuthority,
@@ -137,9 +145,8 @@ impl PooledBufMut {
         let carrier = self
             .carrier(self.publish_cursor)
             .filter(|carrier| carrier.initialized != 0)
-            .or_else(|| self.first_carrier_matching(|carrier| carrier.initialized != 0))
             .unwrap_or_else(|| {
-                invariant_violation("initialized buffer has no publication carrier")
+                invariant_violation("publication cursor does not name initialized bytes")
             });
 
         // SAFETY: `initialized` is the prefix written through this buffer's
@@ -155,7 +162,9 @@ impl PooledBufMut {
     /// Ensures that at least `min_writable` uninitialized bytes remain.
     ///
     /// Existing tail capacity is consumed before the shortfall is rounded to
-    /// complete carriers. Failure leaves this buffer unchanged.
+    /// complete carriers. Only capacity retained by this buffer can satisfy
+    /// the guarantee; unused tails discarded by other buffers are not shared.
+    /// Failure leaves this buffer unchanged.
     pub(crate) fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError> {
         let remaining = self.remaining_mut();
         if min_writable <= remaining {
@@ -302,6 +311,7 @@ impl PooledBufMut {
         self.runs.extend(staged);
         self.retained_capacity = retained_capacity;
         self.reset_write_cursor();
+        self.normalize_publish_cursor();
         Ok(())
     }
 
@@ -332,17 +342,6 @@ impl PooledBufMut {
         self.publish_cursor = self
             .cursor_matching_from(self.publish_cursor, |carrier| carrier.initialized != 0)
             .unwrap_or_else(|| BufferCursor::end(self.runs.len()));
-    }
-
-    /// Returns the first carrier satisfying `predicate`.
-    fn first_carrier_matching(
-        &self,
-        predicate: impl Fn(&WritableCarrier) -> bool,
-    ) -> Option<&WritableCarrier> {
-        self.runs
-            .iter()
-            .flat_map(|run| run.carriers.iter())
-            .find(|carrier| predicate(carrier))
     }
 
     /// Returns the first carrier cursor satisfying `predicate`.
@@ -693,6 +692,7 @@ impl ExclusiveRange {
 
 /// Run and carrier position inside one mutable buffer.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct BufferCursor {
     run: usize,
     carrier: usize,
@@ -786,6 +786,59 @@ mod tests {
 
     use super::super::test_util::{test_pool, write_pooled};
     use super::*;
+
+    /// Checks the aggregate fields and cursors against per-carrier state.
+    fn assert_buffer_invariants(buffer: &PooledBufMut) {
+        let mut retained_capacity = 0usize;
+        let mut initialized = 0usize;
+        let mut writable = 0usize;
+
+        for run in &buffer.runs {
+            assert!(!run.carriers.is_empty());
+            for (offset, carrier) in run.carriers.iter().enumerate() {
+                assert!(carrier.initialized <= carrier.writable.len());
+                assert_eq!(carrier.guard.is_some(), !carrier.writable.is_empty());
+
+                if let Some(guard) = carrier.guard.as_ref() {
+                    let offset = u32::try_from(offset).expect("test run exceeds u32");
+                    let carrier_index = run
+                        .first_carrier
+                        .checked_add(offset)
+                        .expect("test run exceeds block geometry");
+                    assert_eq!(
+                        guard.location(),
+                        CarrierLocation::new(run.slot_id, carrier_index)
+                    );
+                }
+
+                retained_capacity = retained_capacity
+                    .checked_add(carrier.writable.len())
+                    .expect("test capacity overflow");
+                initialized = initialized
+                    .checked_add(carrier.initialized)
+                    .expect("test initialization overflow");
+                writable = writable
+                    .checked_add(carrier.remaining_mut())
+                    .expect("test writable capacity overflow");
+            }
+        }
+
+        assert_eq!(buffer.retained_capacity, retained_capacity);
+        assert_eq!(buffer.initialized, initialized);
+        assert_eq!(buffer.remaining_mut(), writable);
+        assert_eq!(
+            buffer.publish_cursor,
+            buffer
+                .first_cursor_matching(|carrier| carrier.initialized != 0)
+                .unwrap_or_else(|| BufferCursor::end(buffer.runs.len()))
+        );
+        assert_eq!(
+            buffer.write_cursor,
+            buffer
+                .first_cursor_matching(|carrier| carrier.remaining_mut() != 0)
+                .unwrap_or_else(|| BufferCursor::end(buffer.runs.len()))
+        );
+    }
 
     #[test]
     fn test_mutable_initialization_crosses_carrier_boundaries() {
@@ -1018,6 +1071,119 @@ mod tests {
     }
 
     #[test]
+    fn test_interleaved_publication_growth_and_freeze_preserve_multirun_state() {
+        let (pool, carrier_size) = test_pool(1, 3);
+        let first_input: Vec<u8> = (0..carrier_size + 3)
+            .map(|index| (index.wrapping_mul(17) % 251) as u8)
+            .collect();
+        let second_input: Vec<u8> = (0..carrier_size + 2)
+            .map(|index| (index.wrapping_mul(29) % 251) as u8)
+            .collect();
+        let mut buffer = pool.acquire_unreserved(first_input.len()).unwrap();
+        assert_eq!(buffer.test_run_count(), 2);
+        assert_buffer_invariants(&buffer);
+
+        write_pooled(&mut buffer, &first_input);
+        assert_buffer_invariants(&buffer);
+        let first = buffer.publish_prefix(carrier_size);
+        assert_buffer_invariants(&buffer);
+        let second_prefix = buffer.publish_prefix(2);
+        assert_buffer_invariants(&buffer);
+
+        buffer.reserve(carrier_size + 2).unwrap();
+        assert_eq!(buffer.test_run_count(), 3);
+        assert_buffer_invariants(&buffer);
+        write_pooled(&mut buffer, &second_input);
+        assert_buffer_invariants(&buffer);
+        let second_rest = buffer.publish_prefix(carrier_size - 2);
+        assert_buffer_invariants(&buffer);
+        let frozen = buffer.freeze().into_contiguous();
+
+        let mut output = BytesMut::with_capacity(first_input.len() + second_input.len());
+        output.extend_from_slice(&first);
+        output.extend_from_slice(&second_prefix);
+        output.extend_from_slice(&second_rest);
+        output.extend_from_slice(&frozen);
+        let mut expected = first_input;
+        expected.extend_from_slice(&second_input);
+        assert_eq!(output, expected.as_slice());
+
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 3) as u64
+        );
+        drop(first);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 2) as u64
+        );
+        drop(second_prefix);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 2) as u64
+        );
+        drop(second_rest);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        drop(frozen);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_carrier_runs_spill_preserves_mutable_stream() {
+        let run_count = INLINE_CARRIER_RUNS + 1;
+        let (pool, carrier_size) = test_pool(1, run_count);
+        let input: Vec<u8> = (0..carrier_size * run_count)
+            .map(|index| (index.wrapping_mul(37) % 251) as u8)
+            .collect();
+        let mut buffer = pool.acquire_unreserved(input.len()).unwrap();
+
+        assert_eq!(buffer.test_run_count(), run_count);
+        assert!(buffer.runs.spilled());
+        assert_buffer_invariants(&buffer);
+        write_pooled(&mut buffer, &input);
+        assert_buffer_invariants(&buffer);
+
+        let frozen = buffer.freeze().into_contiguous();
+
+        assert_eq!(frozen, input);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_dropping_empty_mutable_buffer_returns_every_carrier() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let buffer = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 2) as u64
+        );
+
+        drop(buffer);
+
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_reserve_overflow_preserves_existing_buffer() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let mut buffer = pool.acquire_unreserved(carrier_size).unwrap();
+        write_pooled(&mut buffer, b"existing");
+        let before = (buffer.capacity(), buffer.len(), buffer.remaining_mut());
+
+        assert_eq!(
+            buffer.reserve(usize::MAX),
+            Err(AcquireError::CapacityOverflow)
+        );
+
+        assert_eq!(
+            (buffer.capacity(), buffer.len(), buffer.remaining_mut()),
+            before
+        );
+        assert_eq!(buffer.initialized_chunk(), b"existing");
+        assert_buffer_invariants(&buffer);
+    }
+
+    #[test]
     fn test_publish_prefix_leaves_a_disjoint_mutable_suffix() {
         let (pool, carrier_size) = test_pool(1, 1);
         let mut buffer = pool.acquire_unreserved(carrier_size).unwrap();
@@ -1046,6 +1212,7 @@ mod tests {
         assert!(buffer.is_empty());
         assert_eq!(buffer.capacity(), 0);
         buffer.reserve(1).unwrap();
+        assert_buffer_invariants(&buffer);
         buffer.put_slice(b"next");
         let frozen = buffer.freeze();
 
@@ -1168,6 +1335,18 @@ mod tests {
                 assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "publication cursor does not name initialized bytes")]
+    fn test_initialized_chunk_rejects_a_stale_publication_cursor() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let mut buffer = pool.acquire_unreserved(carrier_size + 1).unwrap();
+        write_pooled(&mut buffer, &vec![0x5a; carrier_size + 1]);
+        let _first = buffer.publish_prefix(carrier_size);
+        buffer.publish_cursor = BufferCursor::START;
+
+        let _ = buffer.initialized_chunk();
     }
 
     #[test]
