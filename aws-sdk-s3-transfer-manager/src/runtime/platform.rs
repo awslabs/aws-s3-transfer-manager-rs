@@ -185,10 +185,9 @@ fn round_pow2(n: usize) -> usize {
     }
 }
 
-/// Usable RAM: the smaller of the cgroup memory limit and physical RAM. Linux
-/// only; `None` elsewhere or on a read failure, in which case the caller falls
-/// back to a conservative default.
-#[cfg(target_os = "linux")]
+/// Usable RAM: the smaller of the process memory limit and physical RAM where
+/// the platform exposes both values. `None` reports detection failure.
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub(crate) fn available_ram() -> Option<usize> {
     match (meminfo_total(), cgroup_mem_limit()) {
         (Some(total), Some(cgroup)) => Some(total.min(cgroup)),
@@ -197,9 +196,39 @@ pub(crate) fn available_ram() -> Option<usize> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+)))]
 pub(crate) fn available_ram() -> Option<usize> {
     None
+}
+
+#[cfg(target_os = "freebsd")]
+pub(crate) fn available_ram() -> Option<usize> {
+    // hw.physmem is physical memory in bytes.
+    // Ref: sysctl(3) <https://man.freebsd.org/cgi/man.cgi?query=sysctl&sektion=3>
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: sysctlbyname writes at most `len` bytes into `bytes`; the name is
+    // a valid nul-terminated string and no new value is supplied.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.physmem".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && bytes > 0 {
+        usize::try_from(bytes).ok()
+    } else {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -245,7 +274,7 @@ pub(crate) fn available_ram() -> Option<usize> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn meminfo_total() -> Option<usize> {
     parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
@@ -260,7 +289,7 @@ fn meminfo_total() -> Option<usize> {
 /// Refs: cgroups(7) /proc/[pid]/cgroup <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
 /// cgroup v2 memory.max <https://docs.kernel.org/admin-guide/cgroup-v2.html>;
 /// cgroup v1 memory.limit_in_bytes <https://docs.kernel.org/admin-guide/cgroup-v1/memory.html>
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn cgroup_mem_limit() -> Option<usize> {
     let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
@@ -271,7 +300,7 @@ fn cgroup_mem_limit() -> Option<usize> {
 /// Read each candidate limit file and return the smallest real limit; "max" and
 /// the v1 unlimited sentinel are ignored ("max" via `parse_cgroup_limit`, the
 /// sentinel via `min` with physical RAM in `available_ram`).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn min_limit(files: &[PathBuf]) -> Option<usize> {
     files
         .iter()
@@ -284,7 +313,7 @@ fn min_limit(files: &[PathBuf]) -> Option<usize> {
 /// this value in kB.
 ///
 /// Ref: proc_meminfo(5) <https://man7.org/linux/man-pages/man5/proc_meminfo.5.html>
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn parse_meminfo_total(meminfo: &str) -> Option<usize> {
     let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
     line.split_whitespace()
@@ -297,7 +326,7 @@ fn parse_meminfo_total(meminfo: &str) -> Option<usize> {
 /// Parse a cgroup memory-limit value into bytes. "max" (v2 unlimited) yields
 /// `None`. The v1 unlimited sentinel is a huge number that `available_ram`
 /// discards via `min` with physical RAM, so it needs no special case.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn parse_cgroup_limit(raw: &str) -> Option<usize> {
     let raw = raw.trim();
     if raw == "max" {
@@ -308,7 +337,7 @@ fn parse_cgroup_limit(raw: &str) -> Option<usize> {
 
 /// `memory.max` candidate paths for the cgroup v2 unified hierarchy, leaf-first.
 /// Empty when this process has no v2 cgroup line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v2_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
     let Some(path) = cgroup_v2_path(proc_cgroup) else {
         return Vec::new();
@@ -320,7 +349,7 @@ fn cgroup_v2_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
 
 /// `memory.limit_in_bytes` candidate paths for the cgroup v1 memory controller,
 /// leaf-first. Empty when this process has no v1 memory cgroup line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v1_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
     let Some(path) = cgroup_v1_memory_path(proc_cgroup) else {
         return Vec::new();
@@ -331,7 +360,7 @@ fn cgroup_v1_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
 }
 
 /// The cgroup path from a v2 unified line (`0::<path>`).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v2_path(proc_cgroup: &str) -> Option<String> {
     proc_cgroup.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -344,7 +373,7 @@ fn cgroup_v2_path(proc_cgroup: &str) -> Option<String> {
 
 /// The cgroup path from the v1 line whose controllers include `memory`
 /// (`<id>:<controllers>:<path>`).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v1_memory_path(proc_cgroup: &str) -> Option<String> {
     proc_cgroup.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -361,7 +390,7 @@ fn cgroup_v1_memory_path(proc_cgroup: &str) -> Option<String> {
 /// into `<...> mountpoint options [optional]` and `<fstype> <source> <superopts>`.
 ///
 /// Ref: proc_pid_mountinfo(5) <https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html>
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn mountinfo_mount(mountinfo: &str, fstype: &str, super_opt: Option<&str>) -> Option<String> {
     mountinfo.lines().find_map(|line| {
         let (left, right) = line.split_once(" - ")?;
@@ -382,7 +411,7 @@ fn mountinfo_mount(mountinfo: &str, fstype: &str, super_opt: Option<&str>) -> Op
 
 /// Limit-file paths from `<mount><cgroup_path>` up to `<mount>`, leaf-first, so a
 /// tighter parent limit is included.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
     let mount = Path::new(mount);
     let rel = cgroup_path.trim_start_matches('/');
