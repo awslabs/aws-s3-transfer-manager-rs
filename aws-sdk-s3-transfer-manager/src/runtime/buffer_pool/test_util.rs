@@ -22,6 +22,27 @@ use super::geometry::PoolGeometry;
 use super::virtual_memory::page_size;
 use super::{BufferPool, CarrierCount, PoolInner, PooledBufMut};
 
+/// Independently reconstructed state for a quiescent pool.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PoolAudit {
+    /// Complete open reservation envelopes.
+    pub(super) active_planned_demand: CarrierCount,
+    /// Open-envelope capacity not occupied by an acquisition.
+    pub(super) available_coverage: CarrierCount,
+    /// Charges outside open-envelope coverage.
+    pub(super) uncovered_charges: CarrierCount,
+    /// Aggregate acquisition charges reconstructed from accounting.
+    pub(super) charged_capacity: CarrierCount,
+    /// Prepared capacity serialized by admission.
+    pub(super) prepared_capacity: CarrierCount,
+    /// Valid live bits reconstructed from block incarnations.
+    pub(super) live_carriers: CarrierCount,
+    /// Reservation futures linked in FIFO order.
+    pub(super) queued_reservations: usize,
+    /// Blocks unavailable while trim or mapping recovery remains pending.
+    pub(super) cleanup_pending_blocks: usize,
+}
+
 /// Waker state that records each wake through the active atomic backend.
 struct CountingWake {
     count: Arc<AtomicUsize>,
@@ -190,6 +211,64 @@ impl BufferPool {
             .test_hooks
             .maintenance_spawn_attempts
             .load(Ordering::Acquire)
+    }
+
+    /// Reconstructs and validates all load-bearing pool accounting.
+    ///
+    /// No claim, return, reservation, or maintenance operation may overlap
+    /// this audit. Holding admission stabilizes planned demand and prepared
+    /// capacity; external quiescence stabilizes lock-free bitmap ownership.
+    pub(super) fn audit_quiescent(&self) -> PoolAudit {
+        let admission = self.inner.admission.lock();
+        let coverage = self.inner.coverage.snapshot();
+        admission.ledger.assert_invariants(coverage);
+        let lifecycle = self.inner.arena.lifecycle_snapshot();
+
+        let covered_charges = admission
+            .ledger
+            .active_planned_demand
+            .checked_sub(coverage.available)
+            .expect("available coverage exceeds active planned demand");
+        let charged_capacity = covered_charges
+            .checked_add(coverage.uncovered)
+            .expect("quiescent charged capacity overflowed");
+
+        assert_eq!(
+            lifecycle.prepared_capacity, admission.ledger.prepared_capacity,
+            "prepared accounting disagrees with active block incarnations"
+        );
+        assert_eq!(
+            lifecycle.live_carriers, charged_capacity,
+            "aggregate charges disagree with live carrier bits"
+        );
+
+        PoolAudit {
+            active_planned_demand: admission.ledger.active_planned_demand,
+            available_coverage: coverage.available,
+            uncovered_charges: coverage.uncovered,
+            charged_capacity,
+            prepared_capacity: admission.ledger.prepared_capacity,
+            live_carriers: lifecycle.live_carriers,
+            queued_reservations: admission.waiters.len(),
+            cleanup_pending_blocks: lifecycle.cleanup_pending_blocks,
+        }
+    }
+
+    /// Asserts that no accounting, physical ownership, or cleanup remains.
+    pub(super) fn assert_quiescent_zero(&self) {
+        assert_eq!(
+            self.audit_quiescent(),
+            PoolAudit {
+                active_planned_demand: CarrierCount::ZERO,
+                available_coverage: CarrierCount::ZERO,
+                uncovered_charges: CarrierCount::ZERO,
+                charged_capacity: CarrierCount::ZERO,
+                prepared_capacity: CarrierCount::ZERO,
+                live_carriers: CarrierCount::ZERO,
+                queued_reservations: 0,
+                cleanup_pending_blocks: 0,
+            }
+        );
     }
 }
 

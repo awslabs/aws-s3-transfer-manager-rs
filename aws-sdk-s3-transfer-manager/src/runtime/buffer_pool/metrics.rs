@@ -5,6 +5,8 @@
 
 //! Stable memory-pressure metrics derived from one admission sample.
 
+use super::arena::{ArenaDiagnosticSnapshot, ArenaLifecycleSnapshot};
+use super::maintenance::MaintenanceDiagnosticSnapshot;
 use super::CarrierCount;
 
 /// Point-in-time memory state for one shared pool domain.
@@ -39,6 +41,84 @@ pub(super) struct MemoryMetricState {
     pub(super) queued_reservations: usize,
     /// Cumulative requests that entered the FIFO.
     pub(super) parked_reservations_total: u64,
+}
+
+/// Operational counters and lifecycle state for one shared pool domain.
+///
+/// This crate-private snapshot is intentionally separate from stable memory
+/// metrics. It may scan block state and is intended for diagnostics, tests,
+/// and rare tracing rather than allocator decisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MemoryDiagnostics {
+    /// Bitmap-owned carriers observed across the arena.
+    pub(crate) live_carriers: usize,
+    /// Prepared carriers reconstructed from active block incarnations.
+    pub(crate) prepared_carriers: usize,
+    /// Blocks unavailable while trim or mapping recovery remains pending.
+    pub(crate) cleanup_pending_blocks: usize,
+    /// Bitmap words charged to completed optimistic scans.
+    pub(crate) optimistic_scan_words: u64,
+    /// Optimistic scans that returned incomplete ownership.
+    pub(crate) optimistic_misses: u64,
+    /// Partial claims that entered serialized fallback.
+    pub(crate) serialized_fallbacks: u64,
+    /// Blocks successfully prepared.
+    pub(crate) blocks_prepared: u64,
+    /// Stable virtual ranges added to the registry.
+    pub(crate) block_ranges_reserved: u64,
+    /// Provisional carriers returned by incomplete claim batches.
+    pub(crate) rolled_back_carriers: u64,
+    /// Slots inspected while selecting trim candidates.
+    pub(crate) trim_slots_scanned: u64,
+    /// Blocks successfully reclaimed.
+    pub(crate) blocks_reclaimed: u64,
+    /// Pending mapping cleanup operations retried.
+    pub(crate) cleanup_retries: u64,
+    /// Cleanup retry attempts that remained pending.
+    pub(crate) cleanup_failures: u64,
+    /// Scheduler-global idle intervals that armed a deadline.
+    pub(crate) idle_deadlines: u64,
+    /// Successfully created maintenance workers.
+    pub(crate) worker_starts: u64,
+    /// Worker creation failures that disabled maintenance.
+    pub(crate) worker_start_failures: u64,
+    /// Reclaim actions executed by the worker.
+    pub(crate) reclaim_passes: u64,
+    /// Reclaim actions that remained blocked after a pass.
+    pub(crate) reclaim_retries: u64,
+    /// Cleanup generations requested after mapping failures.
+    pub(crate) cleanup_requests: u64,
+}
+
+impl MemoryDiagnostics {
+    /// Composes independent arena and maintenance diagnostic samples.
+    pub(super) fn from_snapshots(
+        arena: ArenaDiagnosticSnapshot,
+        lifecycle: ArenaLifecycleSnapshot,
+        maintenance: MaintenanceDiagnosticSnapshot,
+    ) -> Self {
+        Self {
+            live_carriers: lifecycle.live_carriers.get(),
+            prepared_carriers: lifecycle.prepared_capacity.get(),
+            cleanup_pending_blocks: lifecycle.cleanup_pending_blocks,
+            optimistic_scan_words: arena.optimistic_scan_words,
+            optimistic_misses: arena.optimistic_misses,
+            serialized_fallbacks: arena.serialized_fallbacks,
+            blocks_prepared: arena.blocks_prepared,
+            block_ranges_reserved: arena.block_ranges_reserved,
+            rolled_back_carriers: arena.rolled_back_carriers,
+            trim_slots_scanned: arena.trim_slots_scanned,
+            blocks_reclaimed: arena.blocks_reclaimed,
+            cleanup_retries: arena.cleanup_retries,
+            cleanup_failures: arena.cleanup_failures,
+            idle_deadlines: maintenance.idle_deadlines,
+            worker_starts: maintenance.worker_starts,
+            worker_start_failures: maintenance.worker_start_failures,
+            reclaim_passes: maintenance.reclaim_passes,
+            reclaim_retries: maintenance.reclaim_retries,
+            cleanup_requests: maintenance.cleanup_requests,
+        }
+    }
 }
 
 impl MemoryMetrics {

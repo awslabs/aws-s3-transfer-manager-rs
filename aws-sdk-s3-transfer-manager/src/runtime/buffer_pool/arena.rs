@@ -20,6 +20,7 @@ use super::block::{
     BlockError, BlockSlot, CarrierAllocation, ProvisionalBits, TrimBlocked, TrimCleanup,
 };
 use super::geometry::PoolGeometry;
+use super::virtual_memory::VirtualMemoryOperation;
 use super::{invariant_violation, CarrierCount};
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
@@ -156,9 +157,15 @@ impl Arena {
             match slot.retry_cleanup() {
                 Ok(false) => {}
                 Ok(true) => self.diagnostics.record_cleanup_retry(),
-                Err(_) => {
+                Err(error) => {
                     self.diagnostics.record_cleanup_retry();
                     self.diagnostics.record_cleanup_failure();
+                    tracing::warn!(
+                        target: crate::telemetry::TARGET_MEMORY,
+                        slot_id = slot.id(),
+                        error = ?error,
+                        "buffer-pool mapping cleanup retry failed"
+                    );
                     complete = false;
                 }
             }
@@ -174,6 +181,30 @@ impl Arena {
     /// Returns one private arena diagnostic sample.
     pub(super) fn diagnostics(&self) -> ArenaDiagnosticSnapshot {
         self.diagnostics.snapshot()
+    }
+
+    /// Scans slot lifecycle state for private diagnostics and test audits.
+    pub(super) fn lifecycle_snapshot(&self) -> ArenaLifecycleSnapshot {
+        let generation = self.registry_generation();
+        let mut snapshot = ArenaLifecycleSnapshot::default();
+        for slot in generation.slots_in_claim_order() {
+            let block = slot.lifecycle_snapshot();
+            snapshot.prepared_capacity = snapshot
+                .prepared_capacity
+                .checked_add(block.prepared_capacity)
+                .unwrap_or_else(|| invariant_violation("arena prepared diagnostic overflow"));
+            snapshot.live_carriers = snapshot
+                .live_carriers
+                .checked_add(block.live_carriers)
+                .unwrap_or_else(|| invariant_violation("arena live diagnostic overflow"));
+            if block.cleanup_pending {
+                snapshot.cleanup_pending_blocks = snapshot
+                    .cleanup_pending_blocks
+                    .checked_add(1)
+                    .unwrap_or_else(|| invariant_violation("arena cleanup diagnostic overflow"));
+            }
+        }
+        snapshot
     }
 
     /// Prepares capacity through `target` under admission serialization.
@@ -383,6 +414,17 @@ pub(super) enum ArenaError {
         /// Second overlapping range end.
         second_end: usize,
     },
+}
+
+impl ArenaError {
+    /// Returns whether this failure left an inactive slot needing recovery.
+    pub(super) fn cleanup_required(&self) -> bool {
+        matches!(
+            self,
+            Self::Block(BlockError::VirtualMemory(error))
+                if error.operation() == VirtualMemoryOperation::Prepare
+        )
+    }
 }
 
 impl fmt::Display for ArenaError {
@@ -679,6 +721,17 @@ pub(super) struct ArenaDiagnosticSnapshot {
     pub(super) cleanup_retries: u64,
     /// Mapping-cleanup attempts that remain pending.
     pub(super) cleanup_failures: u64,
+}
+
+/// Slot state sampled independently of monotonic arena counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct ArenaLifecycleSnapshot {
+    /// Capacity represented by prepared active incarnations.
+    pub(super) prepared_capacity: CarrierCount,
+    /// Valid bitmap bits owned by claims or carrier guards.
+    pub(super) live_carriers: CarrierCount,
+    /// Slots blocked by trim or mapping recovery.
+    pub(super) cleanup_pending_blocks: usize,
 }
 
 /// Result of scanning the registry for one trim candidate.

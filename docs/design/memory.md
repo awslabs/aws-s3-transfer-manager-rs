@@ -2604,8 +2604,11 @@ worker:
 
 ```rust
 struct MaintenanceCoordinator {
+    configured_capacity: CarrierCount,
+    block_capacity: CarrierCount,
     control: Arc<MaintenanceControl>,
-    thread: OnceLock<JoinHandle<()>>,
+    diagnostics: Arc<MaintenanceDiagnostics>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct MaintenanceControl {
@@ -2616,8 +2619,9 @@ struct MaintenanceControl {
 struct MaintenanceState {
     activity_epoch: u64,
     idle_deadline: Option<IdleDeadline>,
-    reclaim_requested: bool,
-    cleanup_requested: bool,
+    reclaim: Option<ReclaimRequest>,
+    cleanup: Option<CleanupRequest>,
+    next_cleanup_generation: u64,
     stopping: bool,
     disabled: bool,
 }
@@ -2638,6 +2642,11 @@ The first deadline or cleanup request starts the thread. The worker owns
 due, it releases the control mutex, upgrades the weak pool reference for one pass, and drops that
 strong reference before waiting again. The control block contains no admission, arena, slot, or
 mapping state.
+
+The coordinator copies immutable configured and block capacity at construction, so worker startup
+does not enter admission. Its worker mutex serializes concurrent first signals and lets final
+destruction take the join handle exactly once. Diagnostics are atomic observations and do not
+participate in policy or lifecycle decisions.
 
 After releasing the temporary strong reference, the worker accesses no pool state. A thread-creation
 failure disables maintenance and reports degraded reclamation. Admission, acquisition, and owner
