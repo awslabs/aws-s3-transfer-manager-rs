@@ -219,22 +219,41 @@ impl BufferPool {
     /// this audit. Holding admission stabilizes planned demand and prepared
     /// capacity; external quiescence stabilizes lock-free bitmap ownership.
     pub(super) fn audit_quiescent(&self) -> PoolAudit {
-        let admission = self.inner.admission.lock();
-        let coverage = self.inner.coverage.snapshot();
-        admission.ledger.assert_invariants(coverage);
-        let lifecycle = self.inner.arena.lifecycle_snapshot();
+        let (
+            active_planned_demand,
+            available_coverage,
+            uncovered_charges,
+            charged_capacity,
+            prepared_capacity,
+            queued_reservations,
+            lifecycle,
+        ) = {
+            let admission = self.inner.admission.lock();
+            let coverage = self.inner.coverage.snapshot();
+            admission.ledger.assert_invariants(coverage);
+            let lifecycle = self.inner.arena.lifecycle_snapshot();
 
-        let covered_charges = admission
-            .ledger
-            .active_planned_demand
-            .checked_sub(coverage.available)
-            .expect("available coverage exceeds active planned demand");
-        let charged_capacity = covered_charges
-            .checked_add(coverage.uncovered)
-            .expect("quiescent charged capacity overflowed");
+            let covered_charges = admission
+                .ledger
+                .active_planned_demand
+                .checked_sub(coverage.available)
+                .expect("available coverage exceeds active planned demand");
+            let charged_capacity = covered_charges
+                .checked_add(coverage.uncovered)
+                .expect("quiescent charged capacity overflowed");
+            (
+                admission.ledger.active_planned_demand,
+                coverage.available,
+                coverage.uncovered,
+                charged_capacity,
+                admission.ledger.prepared_capacity,
+                admission.waiters.len(),
+                lifecycle,
+            )
+        };
 
         assert_eq!(
-            lifecycle.prepared_capacity, admission.ledger.prepared_capacity,
+            lifecycle.prepared_capacity, prepared_capacity,
             "prepared accounting disagrees with active block incarnations"
         );
         assert_eq!(
@@ -243,13 +262,13 @@ impl BufferPool {
         );
 
         PoolAudit {
-            active_planned_demand: admission.ledger.active_planned_demand,
-            available_coverage: coverage.available,
-            uncovered_charges: coverage.uncovered,
+            active_planned_demand,
+            available_coverage,
+            uncovered_charges,
             charged_capacity,
-            prepared_capacity: admission.ledger.prepared_capacity,
+            prepared_capacity,
             live_carriers: lifecycle.live_carriers,
-            queued_reservations: admission.waiters.len(),
+            queued_reservations,
             cleanup_pending_blocks: lifecycle.cleanup_pending_blocks,
         }
     }
@@ -363,4 +382,80 @@ pub(super) fn poll_reserve(
 ) -> Poll<Result<Reservation, ReserveError>> {
     let mut context = Context::from_waker(waker);
     Pin::new(future).poll(&mut context)
+}
+
+#[cfg(not(s3_tm_loom))]
+mod audit_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::super::admission::MAX_PACKED_CARRIERS;
+    use super::*;
+
+    #[test]
+    fn test_audit_reconciles_nonzero_reservation_and_ownership() {
+        let (pool, carrier_size) = test_pool(2, 8);
+        let reservation = pool
+            .try_reserve(carrier_size * 3)
+            .unwrap()
+            .expect("reservation");
+        let owned = pool.acquire(&reservation, carrier_size * 2).unwrap();
+
+        assert_eq!(
+            pool.audit_quiescent(),
+            PoolAudit {
+                active_planned_demand: CarrierCount::new(3),
+                available_coverage: CarrierCount::new(1),
+                uncovered_charges: CarrierCount::ZERO,
+                charged_capacity: CarrierCount::new(2),
+                prepared_capacity: CarrierCount::new(4),
+                live_carriers: CarrierCount::new(2),
+                queued_reservations: 0,
+                cleanup_pending_blocks: 0,
+            }
+        );
+
+        drop(owned);
+        drop(reservation);
+    }
+
+    #[test]
+    fn test_audit_rejects_prepared_accounting_mismatch() {
+        let (pool, carrier_size) = test_pool(2, 4);
+        let owned = pool.acquire_unreserved(carrier_size).unwrap();
+        let prepared = pool.audit_quiescent().prepared_capacity;
+        {
+            let mut admission = pool.inner.admission.lock();
+            admission.ledger.prepared_capacity = CarrierCount::new(1);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| pool.audit_quiescent()));
+
+        pool.inner.admission.lock().ledger.prepared_capacity = prepared;
+        assert!(
+            result.is_err(),
+            "audit accepted inconsistent prepared state"
+        );
+        drop(owned);
+    }
+
+    #[test]
+    fn test_audit_rejects_live_ownership_mismatch() {
+        let (pool, carrier_size) = test_pool(2, 4);
+        let owned = pool.acquire_unreserved(carrier_size).unwrap();
+        let count = CarrierCount::new(1);
+        let returned = pool.inner.coverage.release(count);
+        assert_eq!(returned.uncovered_removed, count);
+
+        let result = catch_unwind(AssertUnwindSafe(|| pool.audit_quiescent()));
+
+        pool.inner
+            .coverage
+            .debit(count, MAX_PACKED_CARRIERS)
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "audit accepted inconsistent ownership accounting"
+        );
+        drop(owned);
+    }
 }

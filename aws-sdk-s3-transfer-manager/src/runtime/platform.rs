@@ -210,12 +210,13 @@ pub(crate) fn available_ram() -> Option<usize> {
 #[cfg(target_os = "freebsd")]
 pub(crate) fn available_ram() -> Option<usize> {
     // hw.physmem is physical memory in bytes.
-    // Ref: sysctl(3) <https://man.freebsd.org/cgi/man.cgi?query=sysctl&sektion=3>
+    // Ref: sysctlbyname(3)
+    // <https://man.freebsd.org/cgi/man.cgi?query=sysctlbyname&sektion=3>
     let mut bytes: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
-    // SAFETY: sysctlbyname writes at most `len` bytes into `bytes`; the name is
-    // a valid nul-terminated string and no new value is supplied.
-    let rc = unsafe {
+    // SAFETY: `bytes` is writable for the input value of `len`; `hw.physmem`
+    // is nul-terminated, and null `newp` with zero `newlen` performs a read.
+    let result = unsafe {
         libc::sysctlbyname(
             c"hw.physmem".as_ptr(),
             (&mut bytes as *mut u64).cast(),
@@ -224,11 +225,10 @@ pub(crate) fn available_ram() -> Option<usize> {
             0,
         )
     };
-    if rc == 0 && bytes > 0 {
-        usize::try_from(bytes).ok()
-    } else {
-        None
+    if result != 0 || len != std::mem::size_of::<u64>() || bytes == 0 {
+        return None;
     }
+    usize::try_from(bytes).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -907,7 +907,12 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
     #[test]
     #[cfg_attr(
         miri,
