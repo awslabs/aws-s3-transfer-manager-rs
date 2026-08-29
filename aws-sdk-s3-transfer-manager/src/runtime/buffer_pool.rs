@@ -15,6 +15,7 @@ mod arena;
 mod block;
 mod config;
 mod geometry;
+mod maintenance;
 mod metrics;
 mod pooled_buf;
 mod segmented_bytes;
