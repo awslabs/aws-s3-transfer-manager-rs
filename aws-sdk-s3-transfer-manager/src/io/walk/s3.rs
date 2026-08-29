@@ -353,6 +353,11 @@ impl std::fmt::Debug for S3Walk {
 }
 
 impl S3Walk {
+    // The prefix this walk lists under, for deriving keys relative to it.
+    pub(crate) fn prefix(&self) -> Option<&str> {
+        self.config.prefix.as_deref()
+    }
+
     /// Return the next object from the walk.
     ///
     /// Returns:
