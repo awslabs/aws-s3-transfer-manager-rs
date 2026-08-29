@@ -30,6 +30,12 @@ const AUTO_CAPACITY_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Automatic capacity when effective memory cannot be detected.
 const AUTO_CAPACITY_FALLBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Explicit fraction bits stored by an IEEE 754 binary64 value.
+const F64_FRACTION_BITS: u32 = 52;
+
+/// Exponent bias used by an IEEE 754 binary64 value.
+const F64_EXPONENT_BIAS: u32 = 1023;
+
 /// Configured memory policy for one buffer pool.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -146,15 +152,44 @@ fn resolve_capacity_bytes(
                 .map_err(|_| BufferPoolBuildError::CapacityOverflow),
         },
         MemoryCapacity::Fraction(fraction) => {
-            if !(fraction.is_finite() && 0.0 < fraction && fraction <= 1.0) {
+            if !(0.0 < fraction && fraction <= 1.0) {
                 return Err(BufferPoolBuildError::InvalidCapacity);
             }
             let detected =
                 detected_memory.ok_or(BufferPoolBuildError::MemoryDetectionUnavailable)?;
-            Ok((detected as f64 * fraction) as usize)
+            Ok(floor_fraction_of(detected, fraction))
         }
         MemoryCapacity::Limit(bytes) => Ok(bytes),
     }
+}
+
+/// Multiplies an integer by a checked fraction without rounding above it.
+///
+/// A normal binary64 value is `significand * 2^(exponent - 1023 - 52)`.
+/// Multiplying the integer significand in `u128` and shifting right therefore
+/// computes the exact floor instead of rounding the intermediate `f64`.
+fn floor_fraction_of(total: usize, fraction: f64) -> usize {
+    debug_assert!(0.0 < fraction && fraction <= 1.0);
+
+    let bits = fraction.to_bits();
+    let exponent = ((bits >> F64_FRACTION_BITS) & 0x7ff) as u32;
+    let stored_fraction = bits & ((1_u64 << F64_FRACTION_BITS) - 1);
+    let (significand, shift) = if exponent == 0 {
+        (
+            u128::from(stored_fraction),
+            F64_EXPONENT_BIAS + F64_FRACTION_BITS - 1,
+        )
+    } else {
+        (
+            u128::from(stored_fraction | (1_u64 << F64_FRACTION_BITS)),
+            F64_EXPONENT_BIAS + F64_FRACTION_BITS - exponent,
+        )
+    };
+    let product = (total as u128) * significand;
+    if shift >= u128::BITS {
+        return 0;
+    }
+    (product >> shift) as usize
 }
 
 #[cfg(test)]
@@ -211,6 +246,22 @@ mod tests {
     }
 
     #[test]
+    fn test_fraction_rejects_zero_before_capacity_resolution() {
+        assert_eq!(
+            resolve_capacity_bytes(MemoryCapacity::Fraction(0.0), Some(GIB)),
+            Err(BufferPoolBuildError::InvalidCapacity)
+        );
+    }
+
+    #[test]
+    fn test_fraction_accepts_the_inclusive_upper_bound() {
+        assert_eq!(
+            resolve_capacity_bytes(MemoryCapacity::Fraction(1.0), Some(GIB)),
+            Ok(GIB)
+        );
+    }
+
+    #[test]
     fn test_fraction_rounds_down_to_complete_carriers() {
         let resolved = ResolvedPoolConfig::resolve_for_page(
             MemoryCapacity::Fraction(0.5),
@@ -219,6 +270,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.configured_capacity.get() * 64 * 1024, GIB / 2);
+    }
+
+    #[test]
+    fn test_fraction_does_not_round_above_the_exact_binary_fraction() {
+        let resolved = ResolvedPoolConfig::resolve_for_page(
+            MemoryCapacity::Fraction(0.3333333333333333),
+            Some(1_074_266_112),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(resolved.configured_capacity, CarrierCount::new(5463));
+    }
+
+    #[test]
+    fn test_tiny_fraction_resolves_below_one_carrier_without_panicking() {
+        let capacity = MemoryCapacity::Fraction(1e-30);
+        assert_eq!(resolve_capacity_bytes(capacity, Some(GIB)), Ok(0));
+        assert_eq!(
+            ResolvedPoolConfig::resolve_for_page(capacity, Some(GIB), 4096),
+            Err(BufferPoolBuildError::InvalidCapacity)
+        );
     }
 
     #[test]
@@ -251,6 +323,15 @@ mod tests {
         assert_eq!(resolved.geometry.carrier_size(), 128 * 1024);
         assert_eq!(resolved.geometry.block_size(), 8 * 1024 * 1024);
         assert_eq!(resolved.configured_capacity, CarrierCount::new(2));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_capacity_accepts_the_exact_packed_carrier_limit() {
+        let bytes = u32::MAX as usize * 64 * 1024;
+        let resolved =
+            ResolvedPoolConfig::resolve_for_page(MemoryCapacity::Limit(bytes), None, 4096).unwrap();
+        assert_eq!(resolved.configured_capacity, MAX_PACKED_CARRIERS);
     }
 
     #[cfg(target_pointer_width = "64")]

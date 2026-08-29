@@ -837,15 +837,22 @@ mod tests {
         let mut state = MaintenanceState::new();
         state.record_idle(start, IDLE);
         let action = state
-            .next_action(start + IDLE, carriers(256), carriers(64))
+            .next_action(start + IDLE, carriers(1024), carriers(64))
             .unwrap();
+        assert_eq!(
+            action,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: carriers(256),
+            }
+        );
         state.finish_action(action, MaintenanceOutcome::Retry, start + IDLE, RETRY);
 
         assert_eq!(
             state.next_action(start + IDLE + RETRY, carriers(64), carriers(64)),
             Some(MaintenanceAction::Reclaim {
                 epoch: 0,
-                target: carriers(64),
+                target: carriers(256),
             })
         );
     }
