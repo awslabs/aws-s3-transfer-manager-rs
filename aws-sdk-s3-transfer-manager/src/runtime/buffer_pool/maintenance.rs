@@ -14,9 +14,25 @@ use std::time::{Duration, Instant};
 use super::admission::AdmissionGuard;
 use super::arena::ArenaTrim;
 use super::{CarrierCount, PoolInner};
+use crate::runtime::sync::sync::{Arc, Condvar, Mutex};
+
+#[cfg(not(all(test, s3_tm_loom)))]
+use std::{io, sync::Weak};
+
+#[cfg(not(all(test, s3_tm_loom)))]
+use crate::runtime::sync::thread;
 
 /// Fraction of the configured block ceiling retained after an idle deadline.
 const IDLE_RETENTION_DIVISOR: usize = 4;
+
+/// Initial cache-hysteresis interval after scheduler-global idle.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Delay before retrying blocked reclamation or mapping cleanup.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Operating-system thread name used by the pool maintenance worker.
+const WORKER_NAME: &str = "s3-tm-memory";
 
 /// One maintenance operation authorized by the control state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +75,153 @@ impl MaintenancePass {
         Self {
             outcome,
             cleanup_pending: false,
+        }
+    }
+}
+
+/// Lazy worker owner embedded in the pool lifetime domain.
+pub(super) struct MaintenanceCoordinator {
+    /// State and wakeup primitive retained independently by the worker.
+    control: Arc<MaintenanceControl>,
+    /// Serialized worker creation and final join authority.
+    #[cfg(not(all(test, s3_tm_loom)))]
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl MaintenanceCoordinator {
+    /// Creates an idle coordinator without starting a thread.
+    pub(super) fn new() -> Self {
+        Self {
+            control: Arc::new(MaintenanceControl::new()),
+            #[cfg(not(all(test, s3_tm_loom)))]
+            worker: Mutex::new(None),
+        }
+    }
+
+    /// Invalidates a pending idle epoch without starting the worker.
+    pub(super) fn record_activity(&self) {
+        self.control.state.lock().record_activity();
+        self.control.wake.notify_all();
+    }
+
+    /// Arms reclamation after scheduler-global idle.
+    pub(super) fn record_idle(&self, pool: &Arc<PoolInner>) {
+        self.record_idle_after(pool, Instant::now(), IDLE_TIMEOUT);
+    }
+
+    /// Requests recovery for a failed mapping cleanup operation.
+    pub(super) fn request_cleanup(&self, pool: &Arc<PoolInner>) {
+        self.control.state.lock().request_cleanup(Instant::now());
+        self.ensure_worker(pool);
+        self.control.wake.notify_all();
+    }
+
+    /// Starts the worker at most once while maintenance remains enabled.
+    #[cfg(not(all(test, s3_tm_loom)))]
+    fn ensure_worker(&self, pool: &Arc<PoolInner>) {
+        let mut worker = self.worker.lock();
+        if worker.is_some() {
+            return;
+        }
+        {
+            let state = self.control.state.lock();
+            if state.is_stopping() || state.is_disabled() {
+                return;
+            }
+        }
+
+        let configured_capacity = pool.admission.lock().ledger.configured_capacity;
+        let block_capacity = pool.geometry.carriers_per_block();
+        let control = Arc::clone(&self.control);
+        let weak_pool = Arc::downgrade(pool);
+
+        #[cfg(test)]
+        pool.test_hooks.record_maintenance_spawn_attempt();
+        let spawned = if maintenance_spawn_failure_injected(pool) {
+            Err(io::Error::other("injected maintenance worker failure"))
+        } else {
+            thread::Builder::new()
+                .name(WORKER_NAME.to_owned())
+                .spawn(move || worker_loop(control, weak_pool, configured_capacity, block_capacity))
+        };
+
+        match spawned {
+            Ok(handle) => *worker = Some(handle),
+            Err(_) => self.control.state.lock().disable(),
+        }
+    }
+
+    /// Leaves wall-clock execution outside the Loom state model.
+    #[cfg(all(test, s3_tm_loom))]
+    fn ensure_worker(&self, _pool: &Arc<PoolInner>) {}
+
+    /// Cancels maintenance and joins a worker owned by another thread.
+    pub(super) fn shutdown(&mut self) {
+        self.control.state.lock().stop();
+        self.control.wake.notify_all();
+
+        #[cfg(not(all(test, s3_tm_loom)))]
+        let Some(worker) = self.worker.lock().take() else {
+            return;
+        };
+        #[cfg(not(all(test, s3_tm_loom)))]
+        if worker.thread().id() == thread::current().id() {
+            return;
+        }
+        #[cfg(not(all(test, s3_tm_loom)))]
+        let _ = worker.join();
+    }
+
+    /// Arms an idle deadline with explicit timing for deterministic tests.
+    fn record_idle_after(&self, pool: &Arc<PoolInner>, now: Instant, timeout: Duration) {
+        self.control.state.lock().record_idle(now, timeout);
+        self.ensure_worker(pool);
+        self.control.wake.notify_all();
+    }
+
+    /// Returns whether a worker handle has been published.
+    #[cfg(test)]
+    fn worker_started(&self) -> bool {
+        #[cfg(not(s3_tm_loom))]
+        {
+            self.worker.lock().is_some()
+        }
+        #[cfg(s3_tm_loom)]
+        {
+            false
+        }
+    }
+
+    /// Returns the published worker name.
+    #[cfg(all(test, not(s3_tm_loom)))]
+    fn worker_name(&self) -> Option<String> {
+        self.worker
+            .lock()
+            .as_ref()
+            .and_then(|worker| worker.thread().name().map(str::to_owned))
+    }
+
+    /// Returns whether thread creation permanently disabled maintenance.
+    #[cfg(test)]
+    fn is_disabled(&self) -> bool {
+        self.control.state.lock().is_disabled()
+    }
+}
+
+/// Wait state retained by the worker without retaining pool storage.
+struct MaintenanceControl {
+    /// Serialized policy state.
+    state: Mutex<MaintenanceState>,
+    /// Deadline, request, and shutdown wakeups.
+    wake: Condvar,
+}
+
+impl MaintenanceControl {
+    /// Creates control state with no pending work.
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(MaintenanceState::new()),
+            wake: Condvar::new(),
         }
     }
 }
@@ -275,6 +438,11 @@ impl MaintenanceState {
         self.stopping
     }
 
+    /// Returns whether worker creation permanently disabled maintenance.
+    pub(super) fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
     /// Returns the earliest time at which pending work can change state.
     pub(super) fn next_wake(&self) -> Option<Instant> {
         [
@@ -286,6 +454,85 @@ impl MaintenanceState {
         .flatten()
         .min()
     }
+}
+
+/// Runs due maintenance while retaining only control state between passes.
+#[cfg(not(all(test, s3_tm_loom)))]
+fn worker_loop(
+    control: Arc<MaintenanceControl>,
+    pool: Weak<PoolInner>,
+    configured_capacity: CarrierCount,
+    block_capacity: CarrierCount,
+) {
+    loop {
+        let Some(action) = wait_for_action(&control, configured_capacity, block_capacity) else {
+            return;
+        };
+        let Some(pool) = pool.upgrade() else {
+            return;
+        };
+
+        #[cfg(test)]
+        pool.test_hooks.wait_after_maintenance_upgrade();
+        let pass = pool.execute_maintenance(action);
+        drop(pool);
+
+        let now = Instant::now();
+        let mut state = control.state.lock();
+        if pass.cleanup_pending {
+            state.request_cleanup(now);
+        }
+        state.finish_action(action, pass.outcome, now, RETRY_DELAY);
+        let stopping = state.is_stopping();
+        drop(state);
+        control.wake.notify_all();
+        if stopping {
+            return;
+        }
+    }
+}
+
+/// Waits until one action is due or final destruction requests stop.
+#[cfg(not(all(test, s3_tm_loom)))]
+fn wait_for_action(
+    control: &MaintenanceControl,
+    configured_capacity: CarrierCount,
+    block_capacity: CarrierCount,
+) -> Option<MaintenanceAction> {
+    let mut state = control.state.lock();
+    loop {
+        if state.is_stopping() {
+            return None;
+        }
+
+        let now = Instant::now();
+        if let Some(action) = state.next_action(now, configured_capacity, block_capacity) {
+            return Some(action);
+        }
+
+        state = match state.next_wake() {
+            Some(deadline) => {
+                let timeout = deadline.saturating_duration_since(now);
+                if timeout.is_zero() {
+                    continue;
+                }
+                control.wake.wait_timeout(state, timeout).0
+            }
+            None => control.wake.wait(state),
+        };
+    }
+}
+
+/// Returns whether a test requested one worker-creation failure.
+#[cfg(all(test, not(s3_tm_loom)))]
+fn maintenance_spawn_failure_injected(pool: &PoolInner) -> bool {
+    pool.test_hooks.take_maintenance_spawn_failure()
+}
+
+/// Compiles worker failure injection out of production builds.
+#[cfg(not(test))]
+fn maintenance_spawn_failure_injected(_pool: &PoolInner) -> bool {
+    false
 }
 
 impl PoolInner {
@@ -358,9 +605,19 @@ mod tests {
     use super::*;
     use crate::runtime::buffer_pool::test_util::test_pool;
     use crate::runtime::buffer_pool::virtual_memory::VirtualMemoryOperation;
+    use std::sync::Barrier;
 
     const IDLE: Duration = Duration::from_secs(10);
     const RETRY: Duration = Duration::from_secs(2);
+
+    /// Waits for one worker-owned state transition without choosing its order.
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "maintenance worker timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     fn carriers(value: usize) -> CarrierCount {
         CarrierCount::new(value)
@@ -604,6 +861,104 @@ mod tests {
         let reused = pool.acquire_unreserved(carrier_size).unwrap();
         drop(reused);
     }
+
+    #[test]
+    fn test_cleanup_request_starts_one_named_worker_lazily() {
+        let (pool, _) = test_pool(1, 1);
+        assert!(!pool.inner.maintenance.worker_started());
+
+        pool.inner.maintenance.request_cleanup(&pool.inner);
+
+        assert!(pool.inner.maintenance.worker_started());
+        assert_eq!(
+            pool.inner.maintenance.worker_name().as_deref(),
+            Some(WORKER_NAME)
+        );
+        assert_eq!(pool.maintenance_spawn_attempts(), 1);
+    }
+
+    #[test]
+    fn test_idle_deadline_wakes_worker_and_reclaims() {
+        let (pool, carrier_size) = test_pool(1, 8);
+        let owned = pool.acquire_unreserved(carrier_size * 8).unwrap();
+        drop(owned);
+
+        pool.inner.maintenance.record_idle_after(
+            &pool.inner,
+            Instant::now(),
+            Duration::from_millis(10),
+        );
+
+        wait_until(|| pool.metrics().prepared_capacity_bytes() == (carrier_size * 2) as u64);
+        assert_eq!(pool.maintenance_spawn_attempts(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_requests_publish_one_worker() {
+        const CALLERS: usize = 8;
+
+        let (pool, _) = test_pool(1, 1);
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let mut callers = Vec::new();
+        for _ in 0..CALLERS {
+            let pool = pool.clone();
+            let barrier = Arc::clone(&barrier);
+            callers.push(std::thread::spawn(move || {
+                barrier.wait();
+                pool.inner.maintenance.request_cleanup(&pool.inner);
+            }));
+        }
+        for caller in callers {
+            caller.join().unwrap();
+        }
+
+        assert!(pool.inner.maintenance.worker_started());
+        assert_eq!(pool.maintenance_spawn_attempts(), 1);
+    }
+
+    #[test]
+    fn test_spawn_failure_disables_only_maintenance() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        pool.inject_maintenance_spawn_failure();
+
+        pool.inner.maintenance.request_cleanup(&pool.inner);
+
+        assert!(pool.inner.maintenance.is_disabled());
+        assert!(!pool.inner.maintenance.worker_started());
+        assert_eq!(pool.maintenance_spawn_attempts(), 1);
+
+        pool.inner.maintenance.record_idle(&pool.inner);
+        assert_eq!(pool.maintenance_spawn_attempts(), 1);
+        let owned = pool.acquire_unreserved(carrier_size).unwrap();
+        drop(owned);
+    }
+
+    #[test]
+    fn test_waiting_worker_does_not_retain_the_pool() {
+        let (pool, _) = test_pool(1, 1);
+        pool.inner.maintenance.request_cleanup(&pool.inner);
+        let weak = Arc::downgrade(&pool.inner);
+
+        drop(pool);
+
+        wait_until(|| weak.strong_count() == 0);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_worker_final_owner_does_not_join_itself() {
+        let (pool, _) = test_pool(1, 1);
+        let pause = pool.pause_maintenance_after_upgrade();
+        pool.inner.maintenance.request_cleanup(&pool.inner);
+        wait_until(|| pause.entered());
+        let weak = Arc::downgrade(&pool.inner);
+
+        drop(pool);
+        pause.release();
+
+        wait_until(|| weak.strong_count() == 0);
+        assert!(weak.upgrade().is_none());
+    }
 }
 
 #[cfg(all(test, s3_tm_loom))]
@@ -697,6 +1052,47 @@ mod loom_tests {
             let owned = claim.join().unwrap().unwrap();
             drop(owned);
             assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn test_stop_and_wait_share_the_control_mutex() {
+        loom::model(|| {
+            let control = Arc::new(MaintenanceControl::new());
+            let waiting = Arc::clone(&control);
+            let waiter = thread::spawn(move || {
+                let state = waiting.state.lock();
+                if state.is_stopping() {
+                    return;
+                }
+                let state = waiting.wake.wait(state);
+                assert!(state.is_stopping());
+            });
+
+            control.state.lock().stop();
+            control.wake.notify_all();
+            waiter.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_disable_cannot_publish_due_work() {
+        loom::model(|| {
+            let state = Arc::new(Mutex::new(MaintenanceState::new()));
+            let disabling = Arc::clone(&state);
+            let disable = thread::spawn(move || disabling.lock().disable());
+            let requesting = Arc::clone(&state);
+            let request = thread::spawn(move || {
+                requesting.lock().request_cleanup(Instant::now());
+            });
+
+            disable.join().unwrap();
+            request.join().unwrap();
+            let mut state = state.lock();
+            assert_eq!(
+                state.next_action(Instant::now(), CarrierCount::new(1), CarrierCount::new(1),),
+                None
+            );
         });
     }
 }

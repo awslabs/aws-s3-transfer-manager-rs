@@ -35,6 +35,7 @@ use block::BlockError;
 use config::ResolvedPoolConfig;
 pub(crate) use config::{BufferPoolBuildError, MemoryCapacity};
 use geometry::{GeometryError, PoolGeometry};
+use maintenance::MaintenanceCoordinator;
 use metrics::{MemoryMetricState, MemoryMetrics};
 use pooled_buf::GrowthAuthority;
 pub(crate) use pooled_buf::PooledBufMut;
@@ -195,6 +196,8 @@ struct PoolInner {
     coverage: CoverageState,
     /// Stable virtual ranges and physical carrier ownership.
     arena: Arena,
+    /// Lazy idle reclamation and mapping-cleanup worker.
+    maintenance: MaintenanceCoordinator,
     /// Per-pool failure injection and test-only observations.
     #[cfg(test)]
     test_hooks: TestHooks,
@@ -212,6 +215,7 @@ impl PoolInner {
             admission: Mutex::new(AdmissionState::new(configured_capacity)),
             coverage: CoverageState::new(),
             arena: Arena::new(geometry, optimistic_scan_words)?,
+            maintenance: MaintenanceCoordinator::new(),
             #[cfg(test)]
             test_hooks: TestHooks::new(),
         })
@@ -443,6 +447,12 @@ impl PoolInner {
             wakers
         };
         wake_all(wakers);
+    }
+}
+
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        self.maintenance.shutdown();
     }
 }
 

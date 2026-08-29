@@ -12,6 +12,7 @@
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // UnsafeCell — closure-based API matching loom::cell::UnsafeCell
@@ -129,6 +130,15 @@ impl Condvar {
         guard
     }
 
+    pub(crate) fn wait_timeout<'a, T>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> (MutexGuard<'a, T>, bool) {
+        let result = self.1.wait_for(&mut guard.1, timeout);
+        (guard, result.timed_out())
+    }
+
     pub(crate) fn notify_one(&self) {
         self.1.notify_one();
     }
@@ -149,6 +159,15 @@ impl Condvar {
 
     pub(crate) fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         MutexGuard(self.0.wait(guard.0).expect("poisoned"))
+    }
+
+    pub(crate) fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> (MutexGuard<'a, T>, bool) {
+        let (guard, result) = self.0.wait_timeout(guard.0, timeout).expect("poisoned");
+        (MutexGuard(guard), result.timed_out())
     }
 
     pub(crate) fn notify_one(&self) {
@@ -181,5 +200,5 @@ pub(crate) mod sync {
 }
 
 pub(crate) mod thread {
-    pub(crate) use std::thread::{spawn, JoinHandle};
+    pub(crate) use std::thread::{current, spawn, yield_now, Builder, JoinHandle};
 }
