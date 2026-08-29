@@ -5,19 +5,17 @@
 
 //! State machine for plural upload (`upload_objects`).
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::error;
+use crate::io::key::derive_object_key;
 use crate::io::walk::{DirEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
-use crate::operation::DEFAULT_DELIMITER;
 use crate::runtime::sync::Mutex;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedTransferPolicy, FailedUpload};
@@ -1248,46 +1246,6 @@ impl Transfer for UploadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
-/// Derive the S3 object key for a file at `relative_filename` inside the walk root.
-///
-/// The key is formed by optionally prepending a prefix and substituting the
-/// path separator with a custom delimiter if one is configured. When the
-/// custom delimiter appears inside `relative_filename`, derivation fails with
-/// an invalid-input error.
-pub(crate) fn derive_object_key<'a>(
-    relative_filename: &'a str,
-    object_key_prefix: Option<&str>,
-    object_key_delimiter: Option<&str>,
-) -> Result<Cow<'a, str>, error::Error> {
-    if let Some(delim) = object_key_delimiter {
-        if delim != DEFAULT_DELIMITER && relative_filename.contains(delim) {
-            return Err(error::invalid_input(format!(
-                "a custom delimiter `{delim}` should not appear in `{relative_filename}`"
-            )));
-        }
-    }
-
-    let delim = object_key_delimiter.unwrap_or(DEFAULT_DELIMITER);
-
-    let relative_filename = if delim == MAIN_SEPARATOR_STR {
-        Cow::Borrowed(relative_filename)
-    } else {
-        Cow::Owned(relative_filename.replace(MAIN_SEPARATOR, delim))
-    };
-
-    let object_key = if let Some(prefix) = object_key_prefix {
-        if prefix.ends_with(delim) {
-            Cow::Owned(format!("{prefix}{relative_filename}"))
-        } else {
-            Cow::Owned(format!("{prefix}{delim}{relative_filename}"))
-        }
-    } else {
-        relative_filename
-    };
-
-    Ok(object_key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,74 +1259,6 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::io::walk::{FsWalkContext, FsWalker};
-
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn test_derive_object_key() {
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", None, None).unwrap()
-        );
-        assert_eq!(
-            "foobar/2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar"), None).unwrap()
-        );
-        assert_eq!(
-            "foobar/2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar/"), None).unwrap()
-        );
-        assert_eq!(
-            "2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", None, Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar-"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar--2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar--"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "2023/MYLONGDELIMJan/MYLONGDELIM1.png",
-            derive_object_key("2023/Jan/1.png", None, Some("/MYLONGDELIM")).unwrap()
-        );
-        {
-            use std::error::Error as _;
-            let err = derive_object_key("2023/Jan-1.png", None, Some("-"))
-                .err()
-                .unwrap();
-            assert_eq!(
-                "a custom delimiter `-` should not appear in `2023/Jan-1.png`",
-                format!("{}", err.source().unwrap())
-            );
-        }
-
-        // Should not replace the path separator in prefix with a custom delimiter
-        assert_eq!(
-            "foo/bar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foo/bar"), Some("-")).unwrap()
-        );
-
-        // Should not fail if the user specifies the default delimiter as a custom delimiter
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", None, Some(DEFAULT_DELIMITER)).unwrap()
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn test_derive_object_key() {
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
-        );
-    }
 
     fn mock_s3_success() -> aws_sdk_s3::Client {
         let put = mock!(aws_sdk_s3::Client::put_object)

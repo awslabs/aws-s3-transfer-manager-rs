@@ -20,7 +20,6 @@ pub mod download_objects;
 pub mod upload_objects;
 
 // The default delimiter of the S3 object key
-pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
 /// Conservative per-transfer backstop on concurrently-materialized child
 /// transfers (shared by upload_objects and download_objects).
