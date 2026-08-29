@@ -6,6 +6,8 @@
 //! Loom-backed wrappers that present the same API surface as the sibling `std`
 //! module. Active only under `#[cfg(all(test, loom))]`.
 
+use std::time::Duration;
+
 // ---------------------------------------------------------------------------
 // Mutex / MutexGuard / Condvar — thin wrappers that unwrap poisoned locks
 // ---------------------------------------------------------------------------
@@ -33,6 +35,15 @@ impl Condvar {
 
     pub(crate) fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         self.0.wait(guard).unwrap()
+    }
+
+    pub(crate) fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> (MutexGuard<'a, T>, bool) {
+        let (guard, result) = self.0.wait_timeout(guard, timeout).unwrap();
+        (guard, result.timed_out())
     }
 
     pub(crate) fn notify_one(&self) {
@@ -65,5 +76,5 @@ pub(crate) mod sync {
 }
 
 pub(crate) mod thread {
-    pub(crate) use loom::thread::{spawn, JoinHandle};
+    pub(crate) use loom::thread::{current, spawn, yield_now, Builder, JoinHandle};
 }

@@ -13,8 +13,9 @@ use std::task::{Context, Poll, Waker};
 
 use bytes::BufMut;
 
-use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
-use crate::runtime::sync::sync::Arc;
+use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::runtime::sync::sync::{Arc, Mutex};
+use crate::runtime::sync::thread;
 
 use super::admission::{Reservation, ReserveError, ReserveFuture};
 use super::geometry::PoolGeometry;
@@ -40,6 +41,12 @@ impl Wake for CountingWake {
 pub(super) struct TestHooks {
     /// Remaining metadata boundaries before one acquisition failure.
     acquisition_allocation_failure: AtomicUsize,
+    /// Fails the next maintenance worker creation when set.
+    maintenance_spawn_failure: AtomicBool,
+    /// Number of maintenance worker creation attempts.
+    maintenance_spawn_attempts: AtomicUsize,
+    /// Optional one-shot pause after the worker upgrades its weak pool owner.
+    maintenance_pause: Mutex<Option<Arc<MaintenancePause>>>,
 }
 
 impl TestHooks {
@@ -47,6 +54,9 @@ impl TestHooks {
     pub(super) fn new() -> Self {
         Self {
             acquisition_allocation_failure: AtomicUsize::new(0),
+            maintenance_spawn_failure: AtomicBool::new(false),
+            maintenance_spawn_attempts: AtomicUsize::new(0),
+            maintenance_pause: Mutex::new(None),
         }
     }
 
@@ -72,6 +82,61 @@ impl TestHooks {
             )
             .is_ok_and(|previous| previous == 1)
     }
+
+    /// Records one serialized maintenance worker creation attempt.
+    pub(super) fn record_maintenance_spawn_attempt(&self) {
+        self.maintenance_spawn_attempts
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Consumes one injected maintenance worker creation failure.
+    pub(super) fn take_maintenance_spawn_failure(&self) -> bool {
+        self.maintenance_spawn_failure.swap(false, Ordering::AcqRel)
+    }
+
+    /// Pauses once after the worker obtains temporary strong pool ownership.
+    pub(super) fn wait_after_maintenance_upgrade(&self) {
+        let pause = self.maintenance_pause.lock().take();
+        if let Some(pause) = pause {
+            pause.wait();
+        }
+    }
+}
+
+/// Test-controlled pause in the worker's temporary ownership window.
+pub(super) struct MaintenancePause {
+    /// Set after the worker upgrades its weak pool owner.
+    entered: AtomicBool,
+    /// Set by the test to permit maintenance execution.
+    released: AtomicBool,
+}
+
+impl MaintenancePause {
+    /// Creates a closed pause gate.
+    fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Blocks the worker until the test releases the gate.
+    fn wait(&self) {
+        self.entered.store(true, Ordering::Release);
+        while !self.released.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
+
+    /// Returns whether the worker entered the temporary ownership window.
+    pub(super) fn entered(&self) -> bool {
+        self.entered.load(Ordering::Acquire)
+    }
+
+    /// Releases the worker.
+    pub(super) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
 }
 
 impl BufferPool {
@@ -89,6 +154,42 @@ impl BufferPool {
             .acquisition_allocation_failure
             .load(Ordering::Acquire)
             != 0
+    }
+
+    /// Fails the next maintenance worker creation.
+    pub(super) fn inject_maintenance_spawn_failure(&self) {
+        assert!(
+            !self
+                .inner
+                .test_hooks
+                .maintenance_spawn_failure
+                .swap(true, Ordering::AcqRel),
+            "a maintenance spawn failure is already pending"
+        );
+    }
+
+    /// Installs a one-shot pause after weak pool ownership is upgraded.
+    pub(super) fn pause_maintenance_after_upgrade(&self) -> Arc<MaintenancePause> {
+        let pause = Arc::new(MaintenancePause::new());
+        let previous = self
+            .inner
+            .test_hooks
+            .maintenance_pause
+            .lock()
+            .replace(Arc::clone(&pause));
+        assert!(
+            previous.is_none(),
+            "a maintenance pause is already installed"
+        );
+        pause
+    }
+
+    /// Returns maintenance worker creation attempts.
+    pub(super) fn maintenance_spawn_attempts(&self) -> usize {
+        self.inner
+            .test_hooks
+            .maintenance_spawn_attempts
+            .load(Ordering::Acquire)
     }
 }
 
