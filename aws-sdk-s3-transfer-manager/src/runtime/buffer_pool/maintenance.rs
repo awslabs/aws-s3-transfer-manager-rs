@@ -11,7 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::CarrierCount;
+use super::admission::AdmissionGuard;
+use super::arena::ArenaTrim;
+use super::{CarrierCount, PoolInner};
 
 /// Fraction of the configured block ceiling retained after an idle deadline.
 const IDLE_RETENTION_DIVISOR: usize = 4;
@@ -40,6 +42,25 @@ pub(super) enum MaintenanceOutcome {
     Complete,
     /// Eligible work may appear or recover after a bounded delay.
     Retry,
+}
+
+/// Result of executing one policy action against pool state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MaintenancePass {
+    /// Whether the action needs another bounded attempt.
+    pub(super) outcome: MaintenanceOutcome,
+    /// Whether mapping cleanup must run independently of reclamation.
+    pub(super) cleanup_pending: bool,
+}
+
+impl MaintenancePass {
+    /// Constructs a pass result without cleanup recovery.
+    fn new(outcome: MaintenanceOutcome) -> Self {
+        Self {
+            outcome,
+            cleanup_pending: false,
+        }
+    }
 }
 
 /// Deadline armed for one scheduler-idle interval.
@@ -267,6 +288,54 @@ impl MaintenanceState {
     }
 }
 
+impl PoolInner {
+    /// Executes one maintenance action without holding maintenance control.
+    pub(super) fn execute_maintenance(&self, action: MaintenanceAction) -> MaintenancePass {
+        match action {
+            MaintenanceAction::RetryCleanup { .. } => {
+                if self.arena.retry_cleanup() {
+                    MaintenancePass::new(MaintenanceOutcome::Complete)
+                } else {
+                    MaintenancePass::new(MaintenanceOutcome::Retry)
+                }
+            }
+            MaintenanceAction::Reclaim { target, .. } => self.reclaim_to(target),
+        }
+    }
+
+    /// Reclaims complete free blocks until the target or a blocker is reached.
+    fn reclaim_to(&self, target: CarrierCount) -> MaintenancePass {
+        let mut cleanup_pending = false;
+        loop {
+            let trim = {
+                let mut admission = AdmissionGuard::new(self.admission.lock());
+                if admission.prepared_capacity() <= target {
+                    return MaintenancePass {
+                        outcome: MaintenanceOutcome::Complete,
+                        cleanup_pending,
+                    };
+                }
+                let admission_floor = admission
+                    .acquisition_floor(&self.coverage)
+                    .unwrap_or_else(|_| super::invariant_violation("maintenance floor overflow"));
+                let floor = std::cmp::max(target, admission_floor);
+                self.arena.start_trim(&mut admission, floor)
+            };
+
+            let ArenaTrim::Started(cleanup) = trim else {
+                return MaintenancePass {
+                    outcome: MaintenanceOutcome::Retry,
+                    cleanup_pending,
+                };
+            };
+            match cleanup.finish() {
+                Ok(()) => self.arena.record_block_reclaimed(),
+                Err(_) => cleanup_pending = true,
+            }
+        }
+    }
+}
+
 /// Computes one whole-block retention target for an idle epoch.
 fn idle_retention_target(
     configured_capacity: CarrierCount,
@@ -287,6 +356,8 @@ fn idle_retention_target(
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
     use super::*;
+    use crate::runtime::buffer_pool::test_util::test_pool;
+    use crate::runtime::buffer_pool::virtual_memory::VirtualMemoryOperation;
 
     const IDLE: Duration = Duration::from_secs(10);
     const RETRY: Duration = Duration::from_secs(2);
@@ -429,11 +500,116 @@ mod tests {
             assert_eq!(state.next_action(start, carriers(1), carriers(1)), None);
         }
     }
+
+    #[test]
+    fn test_reclaim_trims_free_blocks_to_the_fixed_target() {
+        let (pool, carrier_size) = test_pool(2, 8);
+        let owned = pool.acquire_unreserved(carrier_size * 8).unwrap();
+        drop(owned);
+
+        let pass = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
+            epoch: 0,
+            target: carriers(2),
+        });
+
+        assert_eq!(pass, MaintenancePass::new(MaintenanceOutcome::Complete));
+        assert_eq!(
+            pool.inner.admission.lock().ledger.prepared_capacity,
+            carriers(2)
+        );
+        assert_eq!(pool.inner.arena.diagnostics().blocks_reclaimed, 3);
+    }
+
+    #[test]
+    fn test_reclaim_retries_while_live_ownership_blocks_trim() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let owned = pool.acquire_unreserved(carrier_size).unwrap();
+
+        let blocked = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
+            epoch: 0,
+            target: CarrierCount::ZERO,
+        });
+        assert_eq!(blocked, MaintenancePass::new(MaintenanceOutcome::Retry));
+
+        drop(owned);
+        let complete = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
+            epoch: 0,
+            target: CarrierCount::ZERO,
+        });
+        assert_eq!(complete, MaintenancePass::new(MaintenanceOutcome::Complete));
+        assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_reclaim_preserves_the_current_admission_floor() {
+        let (pool, carrier_size) = test_pool(2, 4);
+        let reservation = pool
+            .try_reserve(carrier_size * 3)
+            .unwrap()
+            .expect("reservation");
+
+        let blocked = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
+            epoch: 0,
+            target: CarrierCount::ZERO,
+        });
+        assert_eq!(blocked.outcome, MaintenanceOutcome::Retry);
+        assert_eq!(
+            pool.metrics().prepared_capacity_bytes(),
+            (carrier_size * 4) as u64
+        );
+
+        drop(reservation);
+        let complete = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
+            epoch: 0,
+            target: CarrierCount::ZERO,
+        });
+        assert_eq!(complete.outcome, MaintenanceOutcome::Complete);
+        assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_failed_trim_requests_cleanup_without_restoring_prepared_capacity() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let owned = pool.acquire_unreserved(carrier_size).unwrap();
+        drop(owned);
+        let slot = pool
+            .inner
+            .arena
+            .select_trim_candidate()
+            .expect("free prepared slot");
+        slot.inject_failure_once(VirtualMemoryOperation::Deactivate);
+
+        let trim = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
+            epoch: 0,
+            target: CarrierCount::ZERO,
+        });
+        assert_eq!(trim.outcome, MaintenanceOutcome::Complete);
+        assert!(trim.cleanup_pending);
+        assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
+
+        slot.inject_failure_once(VirtualMemoryOperation::Deactivate);
+        let retry = pool
+            .inner
+            .execute_maintenance(MaintenanceAction::RetryCleanup { generation: 1 });
+        assert_eq!(retry, MaintenancePass::new(MaintenanceOutcome::Retry));
+        assert_eq!(pool.inner.arena.diagnostics().cleanup_retries, 1);
+        assert_eq!(pool.inner.arena.diagnostics().cleanup_failures, 1);
+
+        let cleanup = pool
+            .inner
+            .execute_maintenance(MaintenanceAction::RetryCleanup { generation: 1 });
+        assert_eq!(cleanup, MaintenancePass::new(MaintenanceOutcome::Complete));
+        assert_eq!(pool.inner.arena.diagnostics().cleanup_retries, 2);
+        assert_eq!(pool.inner.arena.diagnostics().cleanup_failures, 1);
+        let reused = pool.acquire_unreserved(carrier_size).unwrap();
+        drop(reused);
+    }
 }
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
     use super::*;
+    use crate::runtime::buffer_pool::test_util::test_single_carrier_pool;
     use crate::runtime::sync::sync::{Arc, Mutex};
     use crate::runtime::sync::thread;
 
@@ -495,6 +671,32 @@ mod loom_tests {
                 .lock()
                 .next_action(start, CarrierCount::new(1), CarrierCount::new(1));
             assert!(next.is_some());
+        });
+    }
+
+    #[test]
+    fn test_claim_and_reclaim_compose_through_the_pool() {
+        loom::model(|| {
+            let (pool, carrier_size) = test_single_carrier_pool(1);
+            let initial = pool.acquire_unreserved(carrier_size).unwrap();
+            drop(initial);
+
+            let reclaiming = pool.clone();
+            let reclaim = thread::spawn(move || {
+                reclaiming
+                    .inner
+                    .execute_maintenance(MaintenanceAction::Reclaim {
+                        epoch: 0,
+                        target: CarrierCount::ZERO,
+                    })
+            });
+            let claiming = pool.clone();
+            let claim = thread::spawn(move || claiming.acquire_unreserved(carrier_size));
+
+            let _ = reclaim.join().unwrap();
+            let owned = claim.join().unwrap().unwrap();
+            drop(owned);
+            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
         });
     }
 }
