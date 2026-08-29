@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// Each kind has a deterministic fatality (see [`WalkErrorKind::is_fatal`]).
 /// Errors whose kind is fatal terminate the walk; non-fatal kinds report
 /// the affected entry and the walk continues.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
     /// Source root cannot be opened for reading (I/O or permission error
@@ -25,6 +26,14 @@ pub enum WalkErrorKind {
     /// Permission denied on a subdirectory or entry during the walk.
     /// Non-fatal.
     PermissionDenied,
+    /// A directory could not be read: the `read_dir` itself failed, or opening it
+    /// for cycle detection did. Non-fatal here — the walk continues with the rest
+    /// of the tree — but it means that subtree was never enumerated, so a
+    /// consumer that infers absence from the stream (a sync comparison, say)
+    /// must decide for itself whether to keep going. Distinct from an entry-level
+    /// failure so that decision is possible. The underlying `io::Error` remains
+    /// available via [`std::error::Error::source`].
+    DirectoryUnreadable,
     /// Symlink encountered with no valid target. Non-fatal.
     BrokenSymlink,
     /// Symlink whose target is a directory already on the current descent

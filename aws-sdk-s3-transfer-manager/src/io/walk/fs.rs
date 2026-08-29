@@ -82,6 +82,20 @@ fn name_bytes(path: &Path) -> &[u8] {
         .unwrap_or(b"")
 }
 
+// A directory that cannot be read. At the walk root this is fatal, since nothing
+// can be enumerated; deeper it is not, but it is kept distinct from entry-level
+// failures so consumers can tell that a subtree went unenumerated.
+fn dir_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
+    if depth == 0 {
+        match WalkError::classify_io(e) {
+            WalkErrorKind::NotADirectory => WalkErrorKind::NotADirectory,
+            _ => WalkErrorKind::SourceUnreadable,
+        }
+    } else {
+        WalkErrorKind::DirectoryUnreadable
+    }
+}
+
 // Order two children as `ListObjectsV2` orders the keys they produce: a
 // directory sorts as if its name ended in '/' (0x2F), so `a.txt` precedes
 // `a/c`. Names within a directory never contain '/', so one trailing byte
@@ -741,14 +755,7 @@ impl FsWalk {
         ancestor_handles: &[Arc<Handle>],
     ) -> Result<ReadDirResult, WalkError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
-            let kind = WalkError::classify_io(&e);
-            let kind = if depth == 0
-                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-            {
-                WalkErrorKind::SourceUnreadable
-            } else {
-                kind
-            };
+            let kind = dir_error_kind(&e, depth);
             WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
@@ -757,14 +764,7 @@ impl FsWalk {
         // chain is never consulted and the open()+fstat is pure cost.
         let next_ancestors = if self.config.follow_symlinks {
             let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-                let kind = WalkError::classify_io(&e);
-                let kind = if depth == 0
-                    && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-                {
-                    WalkErrorKind::SourceUnreadable
-                } else {
-                    kind
-                };
+                let kind = dir_error_kind(&e, depth);
                 WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
             })?);
             let mut chain = ancestor_handles.to_vec();
@@ -1306,6 +1306,45 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "expected permission-denied error for unreadable subdir"
+        );
+        // The subtree went unenumerated, which a consumer inferring absence from
+        // the stream has to be able to tell apart from an entry-level failure.
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind() == WalkErrorKind::DirectoryUnreadable),
+            "unreadable subdir must report DirectoryUnreadable, got {:?}",
+            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+        );
+        assert!(
+            errors.iter().all(|e| !e.is_fatal()),
+            "an unreadable subdir must not end the walk"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_entry_failure_is_not_directory_scoped() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("ok.txt"), "").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("broken")).unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .follow_symlinks(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert!(entries
+            .iter()
+            .any(|e| e.relative_path() == Path::new("ok.txt")));
+        assert!(!errors.is_empty(), "expected a broken-symlink error");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.kind() != WalkErrorKind::DirectoryUnreadable),
+            "an entry-level failure must not be reported as DirectoryUnreadable"
         );
     }
 
