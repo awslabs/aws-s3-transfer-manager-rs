@@ -16,7 +16,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as DiagnosticOrdering};
 
 use super::admission::AdmissionGuard;
-use super::block::{BlockError, BlockSlot, CarrierAllocation, ProvisionalBits};
+use super::block::{
+    BlockError, BlockSlot, CarrierAllocation, ProvisionalBits, TrimBlocked, TrimCleanup,
+};
 use super::geometry::PoolGeometry;
 use super::{invariant_violation, CarrierCount};
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
@@ -109,6 +111,64 @@ impl Arena {
         });
         self.diagnostics.record_trim_slots_scanned(scanned);
         candidate
+    }
+
+    /// Starts cleanup for one free block without crossing `floor`.
+    ///
+    /// Selection remains a hint. Each candidate is rechecked through the
+    /// claim-trim gate while admission owns prepared-capacity serialization.
+    pub(super) fn start_trim(
+        &self,
+        admission: &mut AdmissionGuard<'_>,
+        floor: CarrierCount,
+    ) -> ArenaTrim {
+        let generation = self.registry_generation();
+        let mut scanned = 0;
+        for slot in generation.slots_in_claim_order() {
+            scanned += 1;
+            if !slot.appears_free() {
+                continue;
+            }
+            match BlockSlot::start_trim(slot, admission.prepared_capacity_mut(), floor) {
+                Ok(cleanup) => {
+                    self.diagnostics.record_trim_slots_scanned(scanned);
+                    return ArenaTrim::Started(cleanup);
+                }
+                Err(TrimBlocked::FloorViolation) => {
+                    self.diagnostics.record_trim_slots_scanned(scanned);
+                    return ArenaTrim::Blocked;
+                }
+                Err(TrimBlocked::NotPrepared | TrimBlocked::Busy | TrimBlocked::CleanupPending) => {
+                }
+            }
+        }
+        self.diagnostics.record_trim_slots_scanned(scanned);
+        ArenaTrim::Blocked
+    }
+
+    /// Retries pending cleanup in the current registry generation.
+    ///
+    /// Returns `true` only when every slot reports no remaining cleanup work.
+    pub(super) fn retry_cleanup(&self) -> bool {
+        let generation = self.registry_generation();
+        let mut complete = true;
+        for slot in generation.slots_in_claim_order() {
+            match slot.retry_cleanup() {
+                Ok(false) => {}
+                Ok(true) => self.diagnostics.record_cleanup_retry(),
+                Err(_) => {
+                    self.diagnostics.record_cleanup_retry();
+                    self.diagnostics.record_cleanup_failure();
+                    complete = false;
+                }
+            }
+        }
+        complete
+    }
+
+    /// Records one block whose prepared capacity and backing were reclaimed.
+    pub(super) fn record_block_reclaimed(&self) {
+        self.diagnostics.record_block_reclaimed();
     }
 
     /// Returns one private arena diagnostic sample.
@@ -522,6 +582,12 @@ struct ArenaDiagnostics {
     rolled_back_carriers: AtomicU64,
     /// Slots inspected while selecting trim candidates.
     trim_slots_scanned: AtomicU64,
+    /// Blocks removed from prepared capacity and successfully reclaimed.
+    blocks_reclaimed: AtomicU64,
+    /// Pending mapping-cleanup operations retried.
+    cleanup_retries: AtomicU64,
+    /// Mapping-cleanup attempts that remain pending.
+    cleanup_failures: AtomicU64,
 }
 
 impl ArenaDiagnostics {
@@ -558,6 +624,21 @@ impl ArenaDiagnostics {
         saturating_add(&self.trim_slots_scanned, diagnostic_count(slots));
     }
 
+    /// Records one successfully reclaimed block.
+    fn record_block_reclaimed(&self) {
+        saturating_add(&self.blocks_reclaimed, 1);
+    }
+
+    /// Records one pending cleanup operation attempted by recovery.
+    fn record_cleanup_retry(&self) {
+        saturating_add(&self.cleanup_retries, 1);
+    }
+
+    /// Records one cleanup attempt that remains pending.
+    fn record_cleanup_failure(&self) {
+        saturating_add(&self.cleanup_failures, 1);
+    }
+
     /// Loads one relaxed diagnostic sample.
     fn snapshot(&self) -> ArenaDiagnosticSnapshot {
         ArenaDiagnosticSnapshot {
@@ -568,6 +649,9 @@ impl ArenaDiagnostics {
             block_ranges_reserved: self.block_ranges_reserved.load(DiagnosticOrdering::Relaxed),
             rolled_back_carriers: self.rolled_back_carriers.load(DiagnosticOrdering::Relaxed),
             trim_slots_scanned: self.trim_slots_scanned.load(DiagnosticOrdering::Relaxed),
+            blocks_reclaimed: self.blocks_reclaimed.load(DiagnosticOrdering::Relaxed),
+            cleanup_retries: self.cleanup_retries.load(DiagnosticOrdering::Relaxed),
+            cleanup_failures: self.cleanup_failures.load(DiagnosticOrdering::Relaxed),
         }
     }
 }
@@ -589,6 +673,20 @@ pub(super) struct ArenaDiagnosticSnapshot {
     pub(super) rolled_back_carriers: u64,
     /// Slots inspected while selecting trim candidates.
     pub(super) trim_slots_scanned: u64,
+    /// Blocks removed from prepared capacity and successfully reclaimed.
+    pub(super) blocks_reclaimed: u64,
+    /// Pending mapping-cleanup operations retried.
+    pub(super) cleanup_retries: u64,
+    /// Mapping-cleanup attempts that remain pending.
+    pub(super) cleanup_failures: u64,
+}
+
+/// Result of scanning the registry for one trim candidate.
+pub(super) enum ArenaTrim {
+    /// One block passed the claim-trim gate and owns cleanup authority.
+    Started(TrimCleanup),
+    /// No block could be removed without waiting for state to change.
+    Blocked,
 }
 
 /// Adds a diagnostic value without wrapping.

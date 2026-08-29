@@ -780,9 +780,10 @@ impl BlockSlot {
     ///
     /// Pool maintenance calls this after a cleanup operation records pending
     /// work. A slot with no pending work returns success without changing
-    /// state. Failure leaves the slot nonclaimable and identifies the required
+    /// state. The result is `true` when this call attempted pending platform
+    /// work. Failure leaves the slot nonclaimable and identifies the required
     /// retry.
-    pub(super) fn retry_cleanup(&self) -> Result<(), CleanupRetry> {
+    pub(super) fn retry_cleanup(&self) -> Result<bool, CleanupRetry> {
         let mut mapping = self.mapping.lock();
         match *mapping {
             MappingState::Prepared => {
@@ -791,7 +792,7 @@ impl BlockSlot {
                     invariant_violation("prepared mapping has no current incarnation");
                 };
                 match incarnation.state.load(Ordering::Acquire) {
-                    IncarnationState::Active | IncarnationState::Draining => return Ok(()),
+                    IncarnationState::Active | IncarnationState::Draining => return Ok(false),
                     IncarnationState::Dead => {
                         invariant_violation("prepared mapping has a dead current incarnation")
                     }
@@ -803,7 +804,7 @@ impl BlockSlot {
                 if self.current.load().as_ref().is_some() {
                     invariant_violation("inactive mapping has a current incarnation");
                 }
-                return Ok(());
+                return Ok(false);
             }
             MappingState::Reserved {
                 reclaim_pending: true,
@@ -816,7 +817,7 @@ impl BlockSlot {
                         *mapping = MappingState::Reserved {
                             reclaim_pending: false,
                         };
-                        Ok(())
+                        Ok(true)
                     }
                     Err(error) => Err(CleanupRetry::ReclaimPending(error)),
                 };
@@ -845,7 +846,7 @@ impl BlockSlot {
         *mapping = MappingState::Reserved {
             reclaim_pending: false,
         };
-        self.finish_inactive_cleanup(&mut mapping)
+        self.finish_inactive_cleanup(&mut mapping).map(|()| true)
     }
 
     /// Retires a draining incarnation after the range becomes inaccessible.
