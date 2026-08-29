@@ -1032,6 +1032,84 @@ impl BlockSlot {
     pub(super) fn inject_failure_once(&self, operation: VirtualMemoryOperation) {
         self.range.inject_failure_once(operation);
     }
+
+    /// Samples mapping, cleanup, and bitmap state for diagnostics.
+    pub(super) fn lifecycle_snapshot(&self) -> BlockLifecycleSnapshot {
+        let mapping = self.mapping.lock();
+        let current = self.current.load();
+        let live_carriers = current
+            .as_ref()
+            .map(|incarnation| {
+                incarnation
+                    .in_use
+                    .iter()
+                    .enumerate()
+                    .map(|(word_index, word)| {
+                        let valid = bitmap_word_mask(self.geometry, word_index);
+                        CarrierCount::new(
+                            (word.load(Ordering::Acquire) & valid).count_ones() as usize
+                        )
+                    })
+                    .fold(CarrierCount::ZERO, |total, count| {
+                        total.checked_add(count).unwrap_or_else(|| {
+                            invariant_violation("block live-carrier diagnostic overflow")
+                        })
+                    })
+            })
+            .unwrap_or(CarrierCount::ZERO);
+
+        let (prepared_capacity, cleanup_pending) = match *mapping {
+            MappingState::Prepared => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("prepared mapping has no current incarnation");
+                };
+                match incarnation.state.load(Ordering::Acquire) {
+                    IncarnationState::Active => (self.carrier_count(), false),
+                    IncarnationState::Draining => (CarrierCount::ZERO, true),
+                    IncarnationState::Dead => {
+                        invariant_violation("prepared mapping has a dead incarnation")
+                    }
+                }
+            }
+            MappingState::Reserved { reclaim_pending } => {
+                if current.as_ref().is_some() {
+                    invariant_violation("reserved mapping retains a current incarnation");
+                }
+                (CarrierCount::ZERO, reclaim_pending)
+            }
+            MappingState::ActivationRecoveryPending => {
+                if current.as_ref().is_some() {
+                    invariant_violation("activation recovery retains a current incarnation");
+                }
+                (CarrierCount::ZERO, true)
+            }
+            MappingState::DeactivationRecoveryPending => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("deactivation recovery lost its current incarnation");
+                };
+                if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
+                    invariant_violation("deactivation recovery has a non-draining incarnation");
+                }
+                (CarrierCount::ZERO, true)
+            }
+        };
+
+        BlockLifecycleSnapshot {
+            prepared_capacity,
+            live_carriers,
+            cleanup_pending,
+        }
+    }
+}
+
+/// One diagnostic sample from a block slot.
+pub(super) struct BlockLifecycleSnapshot {
+    /// Capacity represented by a prepared active incarnation.
+    pub(super) prepared_capacity: CarrierCount,
+    /// Valid bitmap bits currently owned by claims or carrier guards.
+    pub(super) live_carriers: CarrierCount,
+    /// Whether trim or mapping recovery keeps the slot nonclaimable.
+    pub(super) cleanup_pending: bool,
 }
 
 /// Result of one bounded block claim.

@@ -36,7 +36,7 @@ use config::ResolvedPoolConfig;
 pub(crate) use config::{BufferPoolBuildError, MemoryCapacity};
 use geometry::{GeometryError, PoolGeometry};
 use maintenance::MaintenanceCoordinator;
-use metrics::{MemoryMetricState, MemoryMetrics};
+use metrics::{MemoryDiagnostics, MemoryMetricState, MemoryMetrics};
 use pooled_buf::GrowthAuthority;
 pub(crate) use pooled_buf::PooledBufMut;
 pub(crate) use segmented_bytes::SegmentedBytes;
@@ -116,6 +116,25 @@ impl BufferPool {
     /// Returns one coherent sample of this pool's memory state.
     pub(crate) fn metrics(&self) -> MemoryMetrics {
         self.inner.memory_metrics()
+    }
+
+    /// Returns operational counters and a scanned lifecycle sample.
+    pub(crate) fn diagnostics(&self) -> MemoryDiagnostics {
+        MemoryDiagnostics::from_snapshots(
+            self.inner.arena.diagnostics(),
+            self.inner.arena.lifecycle_snapshot(),
+            self.inner.maintenance.diagnostics(),
+        )
+    }
+
+    /// Invalidates pending idle reclamation when managed work starts.
+    pub(crate) fn record_managed_activity(&self) {
+        self.inner.maintenance.record_activity();
+    }
+
+    /// Arms idle reclamation after the scheduler becomes globally idle.
+    pub(crate) fn record_global_idle(&self) {
+        self.inner.maintenance.record_idle(&self.inner);
     }
 
     /// Returns the fixed writable allocation unit in bytes.
@@ -215,7 +234,10 @@ impl PoolInner {
             admission: Mutex::new(AdmissionState::new(configured_capacity)),
             coverage: CoverageState::new(),
             arena: Arena::new(geometry, optimistic_scan_words)?,
-            maintenance: MaintenanceCoordinator::new(),
+            maintenance: MaintenanceCoordinator::new(
+                configured_capacity,
+                geometry.carriers_per_block(),
+            ),
             #[cfg(test)]
             test_hooks: TestHooks::new(),
         })
@@ -288,6 +310,7 @@ impl PoolInner {
         };
         if let Err(error) = pool.arena.prepare_to(admission, floor) {
             admission.rollback_acquisition(&pool.coverage, count);
+            Self::request_cleanup_after_arena_error(pool, &error);
             return Err(map_preparation_error(error));
         }
         Ok(())
@@ -374,9 +397,10 @@ impl PoolInner {
     ) -> Result<Reservation, ReserveError> {
         let coverage = pool.coverage.snapshot();
         let target = admission.grant_target(coverage, envelope)?;
-        pool.arena
-            .prepare_to(admission, target)
-            .map_err(map_preparation_error)?;
+        if let Err(error) = pool.arena.prepare_to(admission, target) {
+            Self::request_cleanup_after_arena_error(pool, &error);
+            return Err(map_preparation_error(error));
+        }
         admission.commit_grant(&pool.coverage, envelope)?;
         Ok(Reservation::new(Arc::clone(pool), envelope))
     }
@@ -447,6 +471,19 @@ impl PoolInner {
             wakers
         };
         wake_all(wakers);
+    }
+
+    /// Schedules recovery when block preparation leaves a slot nonclaimable.
+    fn request_cleanup_after_arena_error(pool: &Arc<Self>, error: &ArenaError) {
+        if !error.cleanup_required() {
+            return;
+        }
+        tracing::warn!(
+            target: crate::telemetry::TARGET_MEMORY,
+            error = %error,
+            "buffer-pool preparation failed; mapping cleanup was scheduled"
+        );
+        pool.maintenance.request_cleanup(pool);
     }
 }
 
