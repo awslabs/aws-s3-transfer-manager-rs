@@ -200,11 +200,15 @@ gate reacts to the free-buffer-space subtraction directly, which is both simpler
 
 ### Two composed issuance bounds
 
-The read-ahead window is one of two independent upper bounds on issuance; the other is the global
-memory budget — a single process-wide ceiling on resident transfer memory that every transfer
-reserves against, so it bounds one transfer's footprint and the aggregate across all of them at
-once (the budget's own admission accounting is its concern; see `memory-budget.md`). In `poll_work`
-the two compose in a fixed order — window first, budget second — so issuance takes their min:
+The read-ahead window limits speculative occupancy for one transfer. The buffer pool independently
+admits the planned memory envelope for each work item across its complete sharing domain. Configured
+capacity is the normal admission ceiling rather than a hard RSS limit; owned carriers remain
+accounted after reservation close, and the pool's idle-only rule preserves progress when retained
+ownership blocks normal admission. The [memory design](./memory.md#admission-and-accounting) defines
+that accounting.
+
+In `poll_work` the two compose in a fixed order — window first, budget second — so issuance takes
+their min:
 
 ```text
   try_issue(window)  ──closed──▶  park (consumer will wake us)
@@ -283,10 +287,10 @@ in an `AtomicU64` so the dynamic setter is a lock-free store the next gate read 
 otherwise fixed for the transfer. I/O controls live on a `DownloadIoCtl`, separate from scheduling
 controls — data movement versus scheduling.
 
-The window is a per-transfer prefetch-depth ceiling, not the memory bound. Resident memory — a
-transfer's own and the aggregate across all of them — is bounded by the global memory budget, which
-under concurrency typically binds a transfer well before its own window fills. The `Auto` window's
-job is only to keep a single uncontended transfer's pipeline full.
+The window is a per-transfer prefetch-depth ceiling, not pool-wide admission. Buffer-pool admission
+accounts planned demand and retained ownership across all users of the pool and under concurrency
+typically binds a transfer before its own window fills. The `Auto` window's job is only to keep a
+single uncontended transfer's pipeline full.
 
 ---
 
@@ -390,20 +394,20 @@ the interleaving that would lose a wake is unrepresentable rather than merely av
 release is visible to the issuer's gate check (so it does not park), or the issuer parks first and
 the release's post-unlock `try_wake` observes the pending flag and fires.
 
-### Budget-park deadlock avoidance
+### Admission-park progress
 
-**Invariant.** A transfer that parks on the memory budget must not do so while holding a drainable
-resident run it has no path to release.
+**Invariant.** A transfer waiting for a reservation does not hide a drainable resident run behind
+its admission wait.
 
-**What it rules out.** A cross-transfer deadlock: a disk transfer parks on the budget holding a
-resident run that is below the drain batch (so no fill-triggered drain frees it) and cannot reach
-terminal (its remaining part is the one blocked on the budget). Spread across concurrent disk
-transfers, none can release, so none is granted.
+**What it rules out.** The scheduler parking a transfer while that transfer already has runnable
+work that advances disk consumption and returns carrier ownership.
 
-**Mechanism.** Before parking on the budget, a transfer holding a drainable resident run emits a
-`DrainResident` work item to flush the run (releasing its budget), and parks only when there is
-nothing left to flush. The drain runs in `execute` — `poll_work` does no I/O — and its completion
-re-polls the transfer, so the freed budget re-grants in FIFO order.
+**Mechanism.** A transfer retains the pending `ReserveFuture` and its claimed empty slot. Before
+returning `Pending`, it emits a `DrainResident` work item when a resident run is drainable. The drain
+runs in `execute` — `poll_work` does no I/O — and its completion re-polls the transfer. Assignment of
+the queued reservation independently wakes the transfer. Buffer-pool liveness does not require
+resident bytes to return: once earlier active planned demand closes, idle-only admission can grant
+the FIFO head while existing byte owners remain charged.
 
 ### Caller obligation
 
@@ -417,16 +421,16 @@ here, the occupancy gate. Without such a bound, resident memory grows without li
 
 **`Auto`-mode resident-size adaptation.** The `Auto` window is a fixed per-transfer part count sized
 above a 100 Gbps BDP. It does not adapt to the actual object part size or to how much memory a
-transfer is truly resident. A window expressed in bytes, or adapted to observed part size, would bound
-small-part transfers more tightly and let large-part transfers keep fewer parts in flight. Today the
-global memory budget is what actually binds resident memory under concurrency; the per-transfer window
-only keeps a single uncontended transfer's pipeline full.
+transfer is truly resident. A window expressed in bytes, or adapted to observed part size, would
+bound small-part transfers more tightly and let large-part transfers keep fewer parts in flight.
+Buffer-pool admission typically binds first under concurrency; the per-transfer window keeps a
+single uncontended transfer's pipeline full.
 
-**Cross-transfer arbitration lives in the budget, not the window.** The window bounds one transfer.
-Fair division of a shared memory ceiling across many concurrent transfers is the memory budget's
-concern (see `memory-budget.md`), and the two compose as a min in `poll_work`. Whether any policy
-belongs at the window layer (e.g. per-transfer windows that shrink as concurrency rises) or all of it
-stays in the budget is open.
+**Cross-transfer arbitration stays in buffer-pool admission.** The window bounds one transfer.
+Reservations from every transfer sharing a pool enter the pool's FIFO. That preserves one configured
+admission domain and no-bypass order but does not provide per-transfer latency isolation; see the
+[memory design](./memory.md#share-one-accounting-domain-across-components). Whether per-transfer
+windows should shrink as concurrency rises remains open.
 
 ---
 
