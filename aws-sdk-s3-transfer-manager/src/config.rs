@@ -10,6 +10,7 @@ use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, ReadAhead, RuntimeMode};
 
 pub(crate) mod loader;
+pub(crate) mod user_agent;
 
 /// Minimum upload part size in bytes
 pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
