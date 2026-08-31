@@ -130,16 +130,15 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
 pub(crate) type BoxTransfer = Box<dyn Transfer>;
 
 /// Opaque work data carried by work items. Each state machine defines its own type.
-/// The scheduler never inspects this; it ferries it across the scheduling boundary
-/// for the transfer to reclaim via `IoRequest::data_mut::<T>()`.
+/// The scheduler does not interpret the payload; it ferries it across the scheduling
+/// boundary for the transfer to reclaim via `IoRequest::data_mut::<T>()`.
 pub(crate) trait WorkData: Any + Send + std::fmt::Debug {
     fn as_any_mut(&mut self) -> &mut dyn Any;
-}
 
-impl<T: Any + Send + std::fmt::Debug> WorkData for T {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
+    /// Which work this is, as a telemetry label. The `&'static str` return admits only
+    /// literals, so the field's cardinality stays bounded by the impl however large the
+    /// payload grows -- unlike a `Debug` rendering, which carries the payload with it.
+    fn kind(&self) -> &'static str;
 }
 
 /// Unique identifier for a transfer, with optional parent for hierarchy
@@ -171,6 +170,11 @@ impl IoRequest {
             .as_any_mut()
             .downcast_mut::<T>()
             .expect("work data type mismatch")
+    }
+
+    /// Telemetry label for the carried work, or `"none"` when it carries none.
+    pub(crate) fn kind(&self) -> &'static str {
+        self.data.as_deref().map_or("none", |data| data.kind())
     }
 }
 
@@ -527,6 +531,18 @@ impl TransferContext {
     /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
         Self::new_inner(handle, next_transfer_id())
+    }
+
+    /// Span covering one [`poll_work`](Transfer::poll_work) turn, entered for the
+    /// caller's scope. Every operation's poll opens the same span, so it is created
+    /// here rather than once per state machine.
+    pub(crate) fn poll_span(&self) -> tracing::span::EnteredSpan {
+        tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "poll-work",
+            tid = %self.id
+        )
+        .entered()
     }
 
     /// Returns a context + receiver for a child transfer linked to `parent_id`.

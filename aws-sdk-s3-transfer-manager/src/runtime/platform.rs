@@ -138,7 +138,7 @@ fn auto_budget(ram: Option<usize>) -> usize {
 /// [`MachineProfile`].
 pub(crate) fn mem_for_fraction(ram_bytes: Option<usize>, fraction: f64) -> usize {
     if !(fraction.is_finite() && fraction > 0.0) || fraction > 1.0 {
-        tracing::debug!(
+        tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING,
             requested = fraction,
             "memory budget fraction outside (0.0, 1.0]; clamping"
         );

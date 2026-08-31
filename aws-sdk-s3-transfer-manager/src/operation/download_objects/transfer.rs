@@ -66,6 +66,19 @@ pub(crate) enum DownloadObjectsWork {
     JoinChildren { batch: Option<ReapingBatch> },
 }
 
+impl crate::transfer::WorkData for DownloadObjectsWork {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::AdvanceWalker { .. } => "advance-walker",
+            Self::JoinChildren { .. } => "join-children",
+        }
+    }
+}
+
 impl std::fmt::Debug for DownloadObjectsWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -338,6 +351,7 @@ impl DownloadObjectsTransfer {
     /// accumulating. Walk and spawn are skipped when inactive, so cancel/fail
     /// stops new work while in-flight drains.
     pub(crate) fn poll_work(&self) -> PollWork {
+        let _span = self.inner.ctx.poll_span();
         let mut state = self.inner.state.lock();
 
         // 1: Walk (refill). `dispatch_walk` gates on the low-water mark, so it
@@ -716,14 +730,7 @@ impl DownloadObjectsTransfer {
     // -----------------------------------------------------------------------
 
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
-        let data = work
-            .data
-            .as_mut()
-            .expect("work data must be set")
-            .as_any_mut()
-            .downcast_mut::<DownloadObjectsWork>()
-            .expect("work data must be DownloadObjectsWork");
-
+        let data = work.data_mut::<DownloadObjectsWork>();
         match data {
             DownloadObjectsWork::AdvanceWalker { walk } => {
                 self.execute_advance_walker(*walk.take().unwrap()).await

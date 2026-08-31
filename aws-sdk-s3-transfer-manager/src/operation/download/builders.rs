@@ -22,11 +22,14 @@ impl DownloadFluentBuilder {
     }
 
     /// Initiate a download transfer for a single object
-    #[tracing::instrument(skip_all, level = "debug", name = "initiate-download", fields(
-        bucket = self.inner.bucket.as_deref().unwrap_or_default(),
-        key = self.inner.key.as_deref().unwrap_or_default(),
-    ))]
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
+        let _span = tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "initiate-download",
+            bucket = self.inner.bucket.as_deref().unwrap_or_default(),
+            key = self.inner.key.as_deref().unwrap_or_default(),
+        )
+        .entered();
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate(self.handle, input, false)
     }

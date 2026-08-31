@@ -60,6 +60,29 @@
 //! * [`upload`](crate::Client::upload) - upload a single object
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
+//!
+//! # Logging
+//!
+//! Logs and spans are emitted through `tracing`. Rather than one target per module,
+//! events and spans are grouped onto four targets by concern, so a filter can select a
+//! concern without naming internal module paths:
+//!
+//! | Target | Covers |
+//! |---|---|
+//! | `aws_sdk_s3_transfer_manager::transfer` | transfer lifecycle, per-request spans, directory walking |
+//! | `aws_sdk_s3_transfer_manager::execution` | work dispatch, completion, panics, submission handoff |
+//! | `aws_sdk_s3_transfer_manager::scheduling` | scheduler capacity, worker growth, memory-budget admission |
+//! | `aws_sdk_s3_transfer_manager::concurrency` | concurrency-controller decisions |
+//!
+//! To follow transfer activity without the scheduling and dispatch streams:
+//!
+//! ```text
+//! RUST_LOG=info,aws_sdk_s3_transfer_manager::transfer=debug
+//! ```
+//!
+//! Work executes on separate threads, so spans from one transfer do not nest under a
+//! single parent span. Where a line names a transfer it does so with a `tid` field rather
+//! than by nesting; the poll and execute spans that bracket every work item both carry one.
 
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;

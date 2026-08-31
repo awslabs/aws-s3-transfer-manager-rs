@@ -179,7 +179,10 @@ impl UploadHandle {
                             .bucket_partition_override(self.transfer.request().bucket()),
                     )
                     .send()
-                    .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                    .instrument(tracing::debug_span!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        "send-abort-multipart-upload"
+                    ))
                     .await?;
 
                     Ok(AbortedUpload {

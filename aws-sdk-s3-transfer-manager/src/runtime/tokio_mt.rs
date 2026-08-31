@@ -12,6 +12,7 @@ use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
+use tracing::Instrument;
 
 mod worker_pool;
 
@@ -173,22 +174,25 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
         h.scheduler.on_dispatch();
 
         let tid = work.descriptor.id();
+        let work_kind = work.item.kind();
         work.descriptor.work_started();
 
         // Skip execution if transfer already terminal (failed/cancelled by another work item)
         if work.descriptor.is_terminal() {
-            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "skipped (terminal)");
+            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = work_kind, "skipped (terminal)");
             pool.complete();
             h.scheduler
                 .on_completion(work, WorkOutcome::Cancelled, Duration::ZERO);
             continue;
         }
 
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "executing");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = work_kind, "executing");
         let transfer = work.descriptor.transfer();
         let started = Instant::now();
 
         let token = transfer.ctx().cancellation_token().clone();
+        // Not a child of the span that initiated the transfer: dispatch crosses a
+        // thread, so `tid` is what ties this span back to its transfer.
         let outcome = AssertUnwindSafe(async {
             tokio::select! {
                 biased;
@@ -197,19 +201,25 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
             }
         })
         .catch_unwind()
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_EXECUTION,
+            "execute",
+            tid = %tid,
+            work = work_kind
+        ))
         .await;
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(_panic) => {
-                tracing::error!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "panic in transfer execute");
+                tracing::error!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = work_kind, "panic in transfer execute");
                 pool.complete();
                 h.scheduler.on_panic(work);
                 continue;
             }
         };
 
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, ?outcome, "completed");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, work = work_kind, ?outcome, "completed");
 
         let elapsed = started.elapsed();
         pool.complete();

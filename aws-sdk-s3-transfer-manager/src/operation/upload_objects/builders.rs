@@ -34,12 +34,15 @@ impl UploadObjectsFluentBuilder {
     }
 
     /// Initiate upload of multiple objects.
-    #[tracing::instrument(skip_all, level = "debug", name = "initiate-upload-objects", fields(
-        bucket = self.inner.bucket.as_deref().unwrap_or_default(),
-        source = self.inner.source.as_deref().map(|p| p.to_str().unwrap_or_default()).unwrap_or_default(),
-        key_prefix = self.inner.key_prefix.as_deref().unwrap_or_default(),
-    ))]
     pub fn initiate(self) -> Result<UploadObjectsHandle, crate::error::Error> {
+        let _span = tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "initiate-upload-objects",
+            bucket = self.inner.bucket.as_deref().unwrap_or_default(),
+            source = self.inner.source.as_deref().map(|p| p.to_str().unwrap_or_default()).unwrap_or_default(),
+            key_prefix = self.inner.key_prefix.as_deref().unwrap_or_default(),
+        )
+        .entered();
         let input = self.inner.build()?;
         crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input)
     }
