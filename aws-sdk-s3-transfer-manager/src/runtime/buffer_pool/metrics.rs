@@ -3,9 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Stable memory-pressure metrics derived from one admission sample.
+//! Memory state and operational diagnostics for one pool.
+//!
+//! [`MemoryMetrics`] is one admission-serialized accounting sample suitable
+//! for capacity decisions. [`MemoryDiagnostics`] combines cumulative counters
+//! with a best-effort arena scan and is intended for operational explanation,
+//! tests, and rare tracing.
 
-use super::arena::{ArenaDiagnosticSnapshot, ArenaLifecycleSnapshot};
+use super::arena::{ArenaDiagnosticSnapshot, ArenaLifecycleSample};
 use super::maintenance::MaintenanceDiagnosticSnapshot;
 use super::CarrierCount;
 
@@ -50,51 +55,52 @@ pub(super) struct MemoryMetricState {
 /// and rare tracing rather than allocator decisions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryDiagnostics {
-    /// Bitmap-owned carriers observed across the arena.
+    /// Carrier bitmap bits owned by provisional claims or live guards.
+    ///
+    /// Concurrent claims and returns may change this value during the arena
+    /// scan. It is exact when the pool is externally quiescent.
     pub(crate) live_carriers: usize,
-    /// Prepared carriers reconstructed from active block incarnations.
+    /// Claimable carriers backed by prepared active block incarnations.
     pub(crate) prepared_carriers: usize,
-    /// Blocks unavailable while trim or mapping recovery remains pending.
+    /// Blocks unavailable until trim or mapping recovery completes.
     pub(crate) cleanup_pending_blocks: usize,
-    /// Bitmap words charged to completed optimistic scans.
+    /// Cumulative bitmap words inspected by optimistic acquisition.
     pub(crate) optimistic_scan_words: u64,
-    /// Optimistic scans that returned incomplete ownership.
+    /// Cumulative optimistic acquisitions that needed more carriers.
     pub(crate) optimistic_misses: u64,
-    /// Partial claims that entered serialized fallback.
+    /// Cumulative partial claims completed through serialized fallback.
     pub(crate) serialized_fallbacks: u64,
-    /// Blocks successfully prepared.
+    /// Cumulative blocks made claimable.
     pub(crate) blocks_prepared: u64,
-    /// Stable virtual ranges added to the registry.
+    /// Cumulative stable virtual ranges reserved for new block slots.
     pub(crate) block_ranges_reserved: u64,
-    /// Provisional carriers returned by incomplete claim batches.
+    /// Cumulative provisional carriers rolled back before ownership transfer.
     pub(crate) rolled_back_carriers: u64,
-    /// Slots inspected while selecting trim candidates.
+    /// Cumulative slots inspected by trim selection.
     pub(crate) trim_slots_scanned: u64,
-    /// Blocks successfully reclaimed.
+    /// Cumulative blocks removed from prepared capacity.
     pub(crate) blocks_reclaimed: u64,
-    /// Pending mapping cleanup operations retried.
+    /// Cumulative pending mapping transitions retried.
     pub(crate) cleanup_retries: u64,
-    /// Cleanup retry attempts that remained pending.
+    /// Cumulative cleanup retries that still failed.
     pub(crate) cleanup_failures: u64,
-    /// Scheduler-global idle intervals that armed a deadline.
+    /// Cumulative scheduler-global idle intervals that armed a deadline.
     pub(crate) idle_deadlines: u64,
-    /// Successfully created maintenance workers.
-    pub(crate) worker_starts: u64,
-    /// Worker creation failures that disabled maintenance.
-    pub(crate) worker_start_failures: u64,
-    /// Reclaim actions executed by the worker.
+    /// Whether worker creation failed and permanently disabled maintenance.
+    pub(crate) maintenance_disabled: bool,
+    /// Cumulative reclaim passes executed by maintenance.
     pub(crate) reclaim_passes: u64,
-    /// Reclaim actions that remained blocked after a pass.
+    /// Cumulative reclaim passes that remained blocked.
     pub(crate) reclaim_retries: u64,
-    /// Cleanup generations requested after mapping failures.
+    /// Cumulative cleanup generations requested after mapping failures.
     pub(crate) cleanup_requests: u64,
 }
 
 impl MemoryDiagnostics {
     /// Composes independent arena and maintenance diagnostic samples.
-    pub(super) fn from_snapshots(
+    pub(super) fn from_samples(
         arena: ArenaDiagnosticSnapshot,
-        lifecycle: ArenaLifecycleSnapshot,
+        lifecycle: ArenaLifecycleSample,
         maintenance: MaintenanceDiagnosticSnapshot,
     ) -> Self {
         Self {
@@ -112,8 +118,7 @@ impl MemoryDiagnostics {
             cleanup_retries: arena.cleanup_retries,
             cleanup_failures: arena.cleanup_failures,
             idle_deadlines: maintenance.idle_deadlines,
-            worker_starts: maintenance.worker_starts,
-            worker_start_failures: maintenance.worker_start_failures,
+            maintenance_disabled: maintenance.maintenance_disabled,
             reclaim_passes: maintenance.reclaim_passes,
             reclaim_retries: maintenance.reclaim_retries,
             cleanup_requests: maintenance.cleanup_requests,
@@ -167,6 +172,10 @@ impl MemoryMetrics {
     }
 
     /// Returns capacity whose physical preparation completed.
+    ///
+    /// Preparation rounds its current floor up to whole blocks and may exceed
+    /// that floor by less than one block. Idle-only admission overage may also
+    /// place prepared capacity above the normal configured ceiling.
     pub(crate) fn prepared_capacity_bytes(&self) -> u64 {
         self.prepared_capacity_bytes
     }

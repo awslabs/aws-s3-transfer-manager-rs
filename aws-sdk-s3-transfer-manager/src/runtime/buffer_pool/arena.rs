@@ -125,6 +125,7 @@ impl Arena {
     ) -> ArenaTrim {
         let generation = self.registry_generation();
         let mut scanned = 0;
+        let mut result = ArenaTrim::Blocked;
         for slot in generation.slots_in_claim_order() {
             scanned += 1;
             if !slot.appears_free() {
@@ -132,19 +133,16 @@ impl Arena {
             }
             match BlockSlot::start_trim(slot, admission.prepared_capacity_mut(), floor) {
                 Ok(cleanup) => {
-                    self.diagnostics.record_trim_slots_scanned(scanned);
-                    return ArenaTrim::Started(cleanup);
+                    result = ArenaTrim::Started(cleanup);
+                    break;
                 }
-                Err(TrimBlocked::FloorViolation) => {
-                    self.diagnostics.record_trim_slots_scanned(scanned);
-                    return ArenaTrim::Blocked;
-                }
+                Err(TrimBlocked::FloorViolation) => break,
                 Err(TrimBlocked::NotPrepared | TrimBlocked::Busy | TrimBlocked::CleanupPending) => {
                 }
             }
         }
         self.diagnostics.record_trim_slots_scanned(scanned);
-        ArenaTrim::Blocked
+        result
     }
 
     /// Retries pending cleanup in the current registry generation.
@@ -183,28 +181,32 @@ impl Arena {
         self.diagnostics.snapshot()
     }
 
-    /// Scans slot lifecycle state for private diagnostics and test audits.
-    pub(super) fn lifecycle_snapshot(&self) -> ArenaLifecycleSnapshot {
+    /// Reconstructs lifecycle state across the current registry generation.
+    ///
+    /// Concurrent claims and returns may span individual slot samples.
+    /// Operational diagnostics therefore use this as a best-effort view;
+    /// externally quiescent tests may use it for exact reconciliation.
+    pub(super) fn sample_lifecycle(&self) -> ArenaLifecycleSample {
         let generation = self.registry_generation();
-        let mut snapshot = ArenaLifecycleSnapshot::default();
+        let mut sample = ArenaLifecycleSample::default();
         for slot in generation.slots_in_claim_order() {
-            let block = slot.lifecycle_snapshot();
-            snapshot.prepared_capacity = snapshot
+            let block = slot.sample_lifecycle();
+            sample.prepared_capacity = sample
                 .prepared_capacity
                 .checked_add(block.prepared_capacity)
                 .unwrap_or_else(|| invariant_violation("arena prepared diagnostic overflow"));
-            snapshot.live_carriers = snapshot
+            sample.live_carriers = sample
                 .live_carriers
                 .checked_add(block.live_carriers)
                 .unwrap_or_else(|| invariant_violation("arena live diagnostic overflow"));
             if block.cleanup_pending {
-                snapshot.cleanup_pending_blocks = snapshot
+                sample.cleanup_pending_blocks = sample
                     .cleanup_pending_blocks
                     .checked_add(1)
                     .unwrap_or_else(|| invariant_violation("arena cleanup diagnostic overflow"));
             }
         }
-        snapshot
+        sample
     }
 
     /// Prepares capacity through `target` under admission serialization.
@@ -723,9 +725,12 @@ pub(super) struct ArenaDiagnosticSnapshot {
     pub(super) cleanup_failures: u64,
 }
 
-/// Slot state sampled independently of monotonic arena counters.
+/// Lifecycle state reconstructed across one arena registry generation.
+///
+/// Individual block samples need not represent one atomic instant while the
+/// pool is active.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ArenaLifecycleSnapshot {
+pub(super) struct ArenaLifecycleSample {
     /// Capacity represented by prepared active incarnations.
     pub(super) prepared_capacity: CarrierCount,
     /// Valid bitmap bits owned by claims or carrier guards.

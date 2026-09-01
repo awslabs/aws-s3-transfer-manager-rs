@@ -1632,8 +1632,12 @@ configured_block_ceiling =
     round_up_to_whole_blocks(configured_capacity)
 
 idle_retention_target =
-    round_up_to_whole_blocks(configured_block_ceiling * 25%)
+    round_down_to_whole_blocks(configured_block_ceiling * 25%)
 ```
+
+Pools whose configured ceiling spans fewer than four blocks retain no warm block after the idle
+deadline. This preserves reclamation for small pools instead of letting one block consume the
+complete retention allowance.
 
 Prepared capacity above `configured_block_ceiling` is aggregate excess. It is not attached to
 particular blocks. Any free block is eligible while both conditions remain true:
@@ -2082,7 +2086,7 @@ derived from the slot's `VirtualRange`. Owner boundaries need not be presentatio
 those direct pooled ranges:
 
 ```text
-one Segment, assuming 64 KiB carriers: contiguous presentation [0..192 KiB]
+one Segment, using 64 KiB carriers for illustration: contiguous presentation [0..192 KiB]
 
 +--------------------+--------------------+--------------------+
 |      0..64 KiB     |    64..128 KiB    |   128..192 KiB    |
@@ -2466,7 +2470,7 @@ The public capacity policy has three forms:
 
 ```rust
 #[non_exhaustive]
-pub enum MemoryCapacity {
+pub enum MemoryBudgetConfig {
     Auto,
     Fraction(f64),
     Limit(usize),
@@ -2481,7 +2485,7 @@ pub enum BufferPoolBuildError {
 }
 
 pub struct BufferPoolBuilder {
-    capacity: MemoryCapacity,
+    memory_budget: MemoryBudgetConfig,
 }
 
 impl BufferPool {
@@ -2492,10 +2496,17 @@ impl BufferPool {
 }
 
 impl BufferPoolBuilder {
-    pub fn capacity(self, capacity: MemoryCapacity) -> Self;
+    pub fn memory_budget(self, budget: MemoryBudgetConfig) -> Self;
     pub fn build(self) -> Result<BufferPool, BufferPoolBuildError>;
 }
 ```
+
+`MemoryBudgetConfig` is the only public automatic, fractional, or explicit byte policy. The
+transfer manager and an explicitly constructed pool accept the same type; pooled storage does not
+introduce a second capacity enum. Until pool integration, the existing transfer-manager path keeps
+its public clamping behavior while direct pool construction uses the checked rules below.
+Integration must select one documented resolution contract before both surfaces are public
+together.
 
 Pool construction resolves the policy after selecting carrier geometry. Effective memory is the
 smaller of physical memory and a process or container memory limit where the platform exposes one.
@@ -2570,13 +2581,13 @@ impl TransferManagerMetrics {
 }
 ```
 
-`MemoryConfig::Auto` is the default. It constructs a pool with `MemoryCapacity::Auto`. `Explicit`
+`MemoryConfig::Auto` is the default. It constructs a pool with `MemoryBudgetConfig::Auto`. `Explicit`
 installs the supplied handle in the transfer manager. The caller can retain another clone for a
 cache or another component:
 
 ```rust
 let pool = BufferPool::builder()
-    .capacity(MemoryCapacity::Limit(8 * 1024 * 1024 * 1024))
+    .memory_budget(MemoryBudgetConfig::Limit(8 * 1024 * 1024 * 1024))
     .build()?;
 
 let transfer_manager = TransferManager::builder()
@@ -2732,6 +2743,10 @@ impl MemoryMetrics {
     pub fn admission_overage_bytes(&self) -> u64;
 
     /// Capacity whose mapping, placement, and registration are complete.
+    ///
+    /// Preparation rounds its current floor up to whole blocks and may exceed
+    /// that floor by less than one block. Idle-only admission overage may also
+    /// place prepared capacity above the normal configured ceiling.
     pub fn prepared_capacity_bytes(&self) -> u64;
 
     /// Reservation requests retained in FIFO order.
@@ -2752,6 +2767,10 @@ Configured capacity, planned demand, charged capacity, overage, prepared capacit
 therefore form one coherent admission sample. It does not scan live bitmaps or add a carrier-return
 counter to the common path. Values are carrier-rounded bytes and exclude foreign `Bytes`, protocol
 scratch, copied contiguous output, and other process memory.
+
+Prepared capacity follows whole-block geometry and the current admission floor. Block rounding may
+raise it by less than one block beyond that floor. It can exceed configured capacity either through
+that rounding or because an idle-only grant raised admission above the normal ceiling.
 
 `parked_reservations_total` is copied from the admission state in the same sample. It increments
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
@@ -2925,6 +2944,11 @@ size, and block size must be a whole number of carriers. Smaller carriers reduce
 tail waste but increase bitmap operations, ownership transitions, scatter width, and carrier
 returns.
 
+The initial implementation uses a 16 KiB carrier before runtime page-size alignment and a 128 MiB
+target block. Pools configured below 128 MiB use their complete carrier-rounded capacity as one
+block. Block size is configured in bytes; carrier count and bitmap width are derived geometry, not
+policy inputs.
+
 Block size controls mapping amortization, all-free scan length, reclaim granularity, and how much
 capacity one long-lived carrier can keep prepared. Geometry selection must account for small
 objects, large multipart transfers, mixed upload and download traffic, intended core counts, and
@@ -2936,15 +2960,24 @@ contracts.
 ### Scan and reclamation constants
 
 The optimistic scan budget, idle timeout, and cleanup retry cadence are selected by measurement.
-The scan budget trades lock-free work against entry into serialized fallback. Because fallback
-holds admission serialization during its registry-wide scan, the budget also controls exposure to
-registry-sized admission stalls. Registry size bounds fallback scan work. The idle timeout trades
-retained RSS against repeated preparation across traffic bursts. Retry cadence trades cleanup
-latency against repeated platform calls while a block remains unavailable.
+The initial scan target covers 32 MiB at any carrier size, rounded up to a complete bitmap word. At
+the default geometry an 8 MiB part therefore occupies one quarter of the scan window rather than
+requiring every observed bit to be free. The scan budget trades lock-free work against entry into
+serialized fallback. Because fallback holds admission serialization during its registry-wide scan,
+the budget also controls exposure to registry-sized admission stalls. Registry size bounds fallback
+scan work. The idle timeout trades retained RSS against repeated preparation across traffic bursts.
+Retry cadence trades cleanup latency against repeated platform calls while a block remains
+unavailable.
 
 Measurements must include mixed object sizes, burst and sustained traffic, idle gaps, allocation
 failure, high core counts, and aggregate rates on target hardware. These constants do not change
 the exhaustive serialized fallback, idle-epoch invalidation, or fail-closed cleanup contracts.
+
+The baseline reclaims after scheduler-global idle. Sustained low demand that never reaches global
+idle may therefore retain peak prepared capacity. A later policy may arm reclamation when
+reservation demand remains below its recent peak without changing the worker, admission floor, or
+trim gate. That trigger belongs at scheduler or reservation frequency rather than on every carrier
+return.
 
 ## Future Work
 

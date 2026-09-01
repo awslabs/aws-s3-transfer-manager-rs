@@ -22,9 +22,12 @@ use super::geometry::PoolGeometry;
 use super::virtual_memory::page_size;
 use super::{BufferPool, CarrierCount, PoolInner, PooledBufMut};
 
-/// Independently reconstructed state for a quiescent pool.
+/// Result of reconciling externally stabilized pool state.
+///
+/// The pool may retain live reservations and owners. Quiescence means only
+/// that no operation mutates the state while the audit reconstructs it.
 #[derive(Debug, Eq, PartialEq)]
-pub(super) struct PoolAudit {
+pub(super) struct PoolAuditReport {
     /// Complete open reservation envelopes.
     pub(super) active_planned_demand: CarrierCount,
     /// Open-envelope capacity not occupied by an acquisition.
@@ -218,7 +221,7 @@ impl BufferPool {
     /// No claim, return, reservation, or maintenance operation may overlap
     /// this audit. Holding admission stabilizes planned demand and prepared
     /// capacity; external quiescence stabilizes lock-free bitmap ownership.
-    pub(super) fn audit_quiescent(&self) -> PoolAudit {
+    pub(super) fn audit_quiescent(&self) -> PoolAuditReport {
         let (
             active_planned_demand,
             available_coverage,
@@ -231,7 +234,7 @@ impl BufferPool {
             let admission = self.inner.admission.lock();
             let coverage = self.inner.coverage.snapshot();
             admission.ledger.assert_invariants(coverage);
-            let lifecycle = self.inner.arena.lifecycle_snapshot();
+            let lifecycle = self.inner.arena.sample_lifecycle();
 
             let covered_charges = admission
                 .ledger
@@ -261,7 +264,7 @@ impl BufferPool {
             "aggregate charges disagree with live carrier bits"
         );
 
-        PoolAudit {
+        PoolAuditReport {
             active_planned_demand,
             available_coverage,
             uncovered_charges,
@@ -277,7 +280,7 @@ impl BufferPool {
     pub(super) fn assert_quiescent_zero(&self) {
         assert_eq!(
             self.audit_quiescent(),
-            PoolAudit {
+            PoolAuditReport {
                 active_planned_demand: CarrierCount::ZERO,
                 available_coverage: CarrierCount::ZERO,
                 uncovered_charges: CarrierCount::ZERO,
@@ -385,10 +388,12 @@ pub(super) fn poll_reserve(
 }
 
 #[cfg(not(s3_tm_loom))]
-mod audit_tests {
+mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use super::super::admission::MAX_PACKED_CARRIERS;
+    use super::super::maintenance::{execute_maintenance, MaintenanceAction, MaintenanceOutcome};
+    use super::super::virtual_memory::VirtualMemoryOperation;
     use super::*;
 
     #[test]
@@ -402,7 +407,7 @@ mod audit_tests {
 
         assert_eq!(
             pool.audit_quiescent(),
-            PoolAudit {
+            PoolAuditReport {
                 active_planned_demand: CarrierCount::new(3),
                 available_coverage: CarrierCount::new(1),
                 uncovered_charges: CarrierCount::ZERO,
@@ -457,5 +462,65 @@ mod audit_tests {
             "audit accepted inconsistent ownership accounting"
         );
         drop(owned);
+    }
+
+    #[test]
+    fn test_audit_reports_a_queued_reservation() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let reservation = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("reservation");
+        let mut queued = pool.reserve(carrier_size);
+        let (waker, _) = counting_waker();
+        assert!(matches!(poll_reserve(&mut queued, &waker), Poll::Pending));
+
+        assert_eq!(
+            pool.audit_quiescent(),
+            PoolAuditReport {
+                active_planned_demand: CarrierCount::new(1),
+                available_coverage: CarrierCount::new(1),
+                uncovered_charges: CarrierCount::ZERO,
+                charged_capacity: CarrierCount::ZERO,
+                prepared_capacity: CarrierCount::new(1),
+                live_carriers: CarrierCount::ZERO,
+                queued_reservations: 1,
+                cleanup_pending_blocks: 0,
+            }
+        );
+
+        drop(queued);
+        drop(reservation);
+    }
+
+    #[test]
+    fn test_audit_reports_pending_mapping_cleanup() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let owned = pool.acquire_unreserved(carrier_size).unwrap();
+        drop(owned);
+        let slot = pool
+            .inner
+            .arena
+            .select_trim_candidate()
+            .expect("free prepared slot");
+        slot.inject_failure_once(VirtualMemoryOperation::Deactivate);
+
+        let pass = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
+        assert_eq!(pass.outcome, MaintenanceOutcome::Complete);
+        assert!(pass.cleanup_pending);
+        assert_eq!(pool.audit_quiescent().cleanup_pending_blocks, 1);
+
+        let retry = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::RetryCleanup { generation: 1 },
+        );
+        assert_eq!(retry.outcome, MaintenanceOutcome::Complete);
+        pool.assert_quiescent_zero();
     }
 }
