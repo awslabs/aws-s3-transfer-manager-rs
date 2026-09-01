@@ -780,9 +780,10 @@ impl BlockSlot {
     ///
     /// Pool maintenance calls this after a cleanup operation records pending
     /// work. A slot with no pending work returns success without changing
-    /// state. Failure leaves the slot nonclaimable and identifies the required
+    /// state. The result is `true` when this call attempted pending platform
+    /// work. Failure leaves the slot nonclaimable and identifies the required
     /// retry.
-    pub(super) fn retry_cleanup(&self) -> Result<(), CleanupRetry> {
+    pub(super) fn retry_cleanup(&self) -> Result<bool, CleanupRetry> {
         let mut mapping = self.mapping.lock();
         match *mapping {
             MappingState::Prepared => {
@@ -791,7 +792,7 @@ impl BlockSlot {
                     invariant_violation("prepared mapping has no current incarnation");
                 };
                 match incarnation.state.load(Ordering::Acquire) {
-                    IncarnationState::Active | IncarnationState::Draining => return Ok(()),
+                    IncarnationState::Active | IncarnationState::Draining => return Ok(false),
                     IncarnationState::Dead => {
                         invariant_violation("prepared mapping has a dead current incarnation")
                     }
@@ -803,7 +804,7 @@ impl BlockSlot {
                 if self.current.load().as_ref().is_some() {
                     invariant_violation("inactive mapping has a current incarnation");
                 }
-                return Ok(());
+                return Ok(false);
             }
             MappingState::Reserved {
                 reclaim_pending: true,
@@ -816,7 +817,7 @@ impl BlockSlot {
                         *mapping = MappingState::Reserved {
                             reclaim_pending: false,
                         };
-                        Ok(())
+                        Ok(true)
                     }
                     Err(error) => Err(CleanupRetry::ReclaimPending(error)),
                 };
@@ -845,7 +846,7 @@ impl BlockSlot {
         *mapping = MappingState::Reserved {
             reclaim_pending: false,
         };
-        self.finish_inactive_cleanup(&mut mapping)
+        self.finish_inactive_cleanup(&mut mapping).map(|()| true)
     }
 
     /// Retires a draining incarnation after the range becomes inaccessible.
@@ -1031,6 +1032,89 @@ impl BlockSlot {
     pub(super) fn inject_failure_once(&self, operation: VirtualMemoryOperation) {
         self.range.inject_failure_once(operation);
     }
+
+    /// Samples this slot's mapping, cleanup, and bitmap state.
+    ///
+    /// The mapping lock stabilizes lifecycle transitions, but claims and
+    /// returns may change bitmap ownership while it is counted. Consumers may
+    /// treat the result as authoritative only when the pool is externally
+    /// quiescent.
+    pub(super) fn sample_lifecycle(&self) -> BlockLifecycleSample {
+        let mapping = self.mapping.lock();
+        let current = self.current.load();
+        let live_carriers = current
+            .as_ref()
+            .map(|incarnation| {
+                incarnation
+                    .in_use
+                    .iter()
+                    .enumerate()
+                    .map(|(word_index, word)| {
+                        let valid = bitmap_word_mask(self.geometry, word_index);
+                        CarrierCount::new(
+                            (word.load(Ordering::Acquire) & valid).count_ones() as usize
+                        )
+                    })
+                    .fold(CarrierCount::ZERO, |total, count| {
+                        total.checked_add(count).unwrap_or_else(|| {
+                            invariant_violation("block live-carrier diagnostic overflow")
+                        })
+                    })
+            })
+            .unwrap_or(CarrierCount::ZERO);
+
+        let (prepared_capacity, cleanup_pending) = match *mapping {
+            MappingState::Prepared => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("prepared mapping has no current incarnation");
+                };
+                match incarnation.state.load(Ordering::Acquire) {
+                    IncarnationState::Active => (self.carrier_count(), false),
+                    IncarnationState::Draining => (CarrierCount::ZERO, true),
+                    IncarnationState::Dead => {
+                        invariant_violation("prepared mapping has a dead incarnation")
+                    }
+                }
+            }
+            MappingState::Reserved { reclaim_pending } => {
+                if current.as_ref().is_some() {
+                    invariant_violation("reserved mapping retains a current incarnation");
+                }
+                (CarrierCount::ZERO, reclaim_pending)
+            }
+            MappingState::ActivationRecoveryPending => {
+                if current.as_ref().is_some() {
+                    invariant_violation("activation recovery retains a current incarnation");
+                }
+                (CarrierCount::ZERO, true)
+            }
+            MappingState::DeactivationRecoveryPending => {
+                let Some(incarnation) = current.as_ref() else {
+                    invariant_violation("deactivation recovery lost its current incarnation");
+                };
+                if incarnation.state.load(Ordering::Acquire) != IncarnationState::Draining {
+                    invariant_violation("deactivation recovery has a non-draining incarnation");
+                }
+                (CarrierCount::ZERO, true)
+            }
+        };
+
+        BlockLifecycleSample {
+            prepared_capacity,
+            live_carriers,
+            cleanup_pending,
+        }
+    }
+}
+
+/// Independently reconstructed lifecycle state for one block slot.
+pub(super) struct BlockLifecycleSample {
+    /// Capacity represented by a prepared active incarnation.
+    pub(super) prepared_capacity: CarrierCount,
+    /// Valid bitmap bits currently owned by claims or carrier guards.
+    pub(super) live_carriers: CarrierCount,
+    /// Whether trim or mapping recovery keeps the slot nonclaimable.
+    pub(super) cleanup_pending: bool,
 }
 
 /// Result of one bounded block claim.

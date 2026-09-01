@@ -13,7 +13,9 @@ mod acquisition;
 mod admission;
 mod arena;
 mod block;
+mod config;
 mod geometry;
+mod maintenance;
 mod metrics;
 mod pooled_buf;
 mod segmented_bytes;
@@ -21,6 +23,7 @@ mod segmented_bytes;
 mod test_util;
 mod virtual_memory;
 
+use crate::types::MemoryBudgetConfig;
 use acquisition::acquire_count;
 pub(crate) use acquisition::AcquireError;
 use admission::{
@@ -30,8 +33,11 @@ use admission::{
 pub(crate) use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError};
 use block::BlockError;
+pub(crate) use config::BufferPoolBuildError;
+use config::PoolConfig;
 use geometry::{GeometryError, PoolGeometry};
-use metrics::{MemoryMetricState, MemoryMetrics};
+use maintenance::MaintenanceCoordinator;
+use metrics::{MemoryDiagnostics, MemoryMetricState, MemoryMetrics};
 use pooled_buf::GrowthAuthority;
 pub(crate) use pooled_buf::PooledBufMut;
 pub(crate) use segmented_bytes::SegmentedBytes;
@@ -46,6 +52,23 @@ pub(crate) struct BufferPool {
 }
 
 impl BufferPool {
+    /// Constructs an empty pool from capacity policy and detected memory.
+    ///
+    /// Capacity and geometry are fixed before publication. Construction does
+    /// not reserve virtual ranges, prepare backing, or start maintenance.
+    pub(crate) fn from_capacity(
+        capacity: MemoryBudgetConfig,
+        detected_memory: Option<usize>,
+    ) -> Result<Self, BufferPoolBuildError> {
+        let resolved = PoolConfig::resolve(capacity, detected_memory)?;
+        Ok(Self::from_parts(
+            resolved.geometry,
+            resolved.configured_capacity,
+            resolved.optimistic_scan_words,
+        )
+        .unwrap_or_else(|_| invariant_violation("validated pool configuration was rejected")))
+    }
+
     /// Constructs a pool from checked geometry and internal configuration.
     ///
     /// Invalid capacity indicates an internal configuration defect. Public
@@ -94,6 +117,25 @@ impl BufferPool {
     /// Returns one coherent sample of this pool's memory state.
     pub(crate) fn metrics(&self) -> MemoryMetrics {
         self.inner.memory_metrics()
+    }
+
+    /// Returns operational counters and a scanned lifecycle sample.
+    pub(crate) fn diagnostics(&self) -> MemoryDiagnostics {
+        MemoryDiagnostics::from_samples(
+            self.inner.arena.diagnostics(),
+            self.inner.arena.sample_lifecycle(),
+            self.inner.maintenance.diagnostics(),
+        )
+    }
+
+    /// Invalidates pending idle reclamation when managed work starts.
+    pub(crate) fn record_managed_activity(&self) {
+        self.inner.maintenance.record_activity();
+    }
+
+    /// Arms idle reclamation after the scheduler becomes globally idle.
+    pub(crate) fn record_global_idle(&self) {
+        self.inner.maintenance.record_idle(&self.inner);
     }
 
     /// Acquires at least `min_bytes` under one reservation.
@@ -169,6 +211,8 @@ struct PoolInner {
     coverage: CoverageState,
     /// Stable virtual ranges and physical carrier ownership.
     arena: Arena,
+    /// Lazy idle reclamation and mapping-cleanup worker.
+    maintenance: MaintenanceCoordinator,
     /// Per-pool failure injection and test-only observations.
     #[cfg(test)]
     test_hooks: TestHooks,
@@ -186,6 +230,10 @@ impl PoolInner {
             admission: Mutex::new(AdmissionState::new(configured_capacity)),
             coverage: CoverageState::new(),
             arena: Arena::new(geometry, optimistic_scan_words)?,
+            maintenance: MaintenanceCoordinator::new(
+                configured_capacity,
+                geometry.carriers_per_block(),
+            ),
             #[cfg(test)]
             test_hooks: TestHooks::new(),
         })
@@ -258,6 +306,7 @@ impl PoolInner {
         };
         if let Err(error) = pool.arena.prepare_to(admission, floor) {
             admission.rollback_acquisition(&pool.coverage, count);
+            Self::request_cleanup_after_arena_error(pool, &error);
             return Err(map_preparation_error(error));
         }
         Ok(())
@@ -344,9 +393,10 @@ impl PoolInner {
     ) -> Result<Reservation, ReserveError> {
         let coverage = pool.coverage.snapshot();
         let target = admission.grant_target(coverage, envelope)?;
-        pool.arena
-            .prepare_to(admission, target)
-            .map_err(map_preparation_error)?;
+        if let Err(error) = pool.arena.prepare_to(admission, target) {
+            Self::request_cleanup_after_arena_error(pool, &error);
+            return Err(map_preparation_error(error));
+        }
         admission.commit_grant(&pool.coverage, envelope)?;
         Ok(Reservation::new(Arc::clone(pool), envelope))
     }
@@ -417,6 +467,25 @@ impl PoolInner {
             wakers
         };
         wake_all(wakers);
+    }
+
+    /// Schedules recovery when block preparation leaves a slot nonclaimable.
+    fn request_cleanup_after_arena_error(pool: &Arc<Self>, error: &ArenaError) {
+        if !error.cleanup_required() {
+            return;
+        }
+        tracing::warn!(
+            target: crate::telemetry::TARGET_MEMORY,
+            error = %error,
+            "buffer-pool preparation failed; mapping cleanup was scheduled"
+        );
+        pool.maintenance.request_cleanup(pool);
+    }
+}
+
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        self.maintenance.shutdown();
     }
 }
 

@@ -49,6 +49,7 @@ jobs:
       - dial9-build
       - miri
       - loom
+      - freebsd-test
     steps:
       - run: exit 0
 
@@ -173,6 +174,30 @@ jobs:
         run: cargo check --workspace
         env:
           RUSTFLAGS: "" # remove -Dwarnings
+
+  freebsd-test:
+    name: Test FreeBSD 14.4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    steps:
+      - uses: actions/checkout@v4
+      - name: test transfer-manager on FreeBSD
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1.5.3
+        with:
+          release: '14.4'
+          envs: RUST_BACKTRACE RUSTFLAGS
+          usesh: true
+          copyback: false
+          prepare: |
+            pkg install -y cmake curl ninja perl5 pkgconf
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup.sh
+            sh rustup.sh -y --profile minimal --default-toolchain ${{ env.rust_stable }}
+          run: |
+            set -eux
+            . "$HOME/.cargo/env"
+            export CMAKE_GENERATOR=Ninja
+            cargo test -p aws-sdk-s3-transfer-manager --lib
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})
