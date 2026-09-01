@@ -2502,11 +2502,9 @@ impl BufferPoolBuilder {
 ```
 
 `MemoryBudgetConfig` is the only public automatic, fractional, or explicit byte policy. The
-transfer manager and an explicitly constructed pool accept the same type; pooled storage does not
-introduce a second capacity enum. Until pool integration, the existing transfer-manager path keeps
-its public clamping behavior while direct pool construction uses the checked rules below.
-Integration must select one documented resolution contract before both surfaces are public
-together.
+fallible pool builder is its only resolution boundary; pooled storage does not introduce a second
+capacity enum or preserve a second clamping path. A transfer-manager client either constructs its
+default pool with `Auto` or accepts an already validated explicit pool.
 
 Pool construction resolves the policy after selecting carrier geometry. Effective memory is the
 smaller of physical memory and a process or container memory limit where the platform exposes one.
@@ -2568,31 +2566,33 @@ pub enum MemoryConfig {
     Explicit(BufferPool),
 }
 
-impl TransferManagerBuilder {
+impl config::Builder {
     pub fn memory(self, config: MemoryConfig) -> Self;
 }
 
-impl TransferManager {
-    pub fn metrics(&self) -> TransferManagerMetrics;
+impl Client {
+    pub fn metrics(&self) -> ClientMetrics;
 }
 
-impl TransferManagerMetrics {
+impl ClientMetrics {
     pub fn memory(&self) -> &MemoryMetrics;
 }
 ```
 
-`MemoryConfig::Auto` is the default. It constructs a pool with `MemoryBudgetConfig::Auto`. `Explicit`
-installs the supplied handle in the transfer manager. The caller can retain another clone for a
-cache or another component:
+`MemoryConfig::Auto` is the default. It constructs a pool with `MemoryBudgetConfig::Auto`.
+`MemoryConfig::Explicit` installs the supplied handle in the client. The caller can retain another
+clone for a cache or another component:
 
 ```rust
 let pool = BufferPool::builder()
     .memory_budget(MemoryBudgetConfig::Limit(8 * 1024 * 1024 * 1024))
     .build()?;
 
-let transfer_manager = TransferManager::builder()
+let config = Config::builder()
     .memory(MemoryConfig::Explicit(pool.clone()))
-    .build()?;
+    // S3 client configuration omitted.
+    .build();
+let transfer_manager = Client::new(config);
 ```
 
 Another component enters the same bounded admission domain through reservation:
@@ -2604,7 +2604,7 @@ let buffer = pool.acquire(&reservation, writable_bytes)?;
 
 There is no separate transfer-manager memory-budget setting and no pool-global close operation.
 Every clone refers to the same admission, accounting, storage, maintenance, and metrics state.
-`TransferManager::metrics()` exposes read-only metrics for an automatically constructed pool without
+`Client::metrics().memory()` exposes read-only metrics for an automatically constructed pool without
 exposing a cloneable pool handle. An explicitly supplied pool exposes the same `MemoryMetrics`
 contract through `BufferPool::metrics()`.
 
@@ -2717,7 +2717,7 @@ lifecycle details:
 
 ```rust
 #[derive(Debug, Clone)]
-pub struct TransferManagerMetrics {
+pub struct ClientMetrics {
     // Private representation.
 }
 
@@ -2776,11 +2776,11 @@ that rounding or because an idle-only grant raised admission above the normal ce
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
 cancellation. It is monotonic for the lifetime of the pool and does not count an immediate grant.
 
-`TransferManager::metrics()` includes the same `MemoryMetrics` sample. When a caller supplies a pool
-shared with another manager or component, those values describe the complete shared memory domain,
-not only activity attributable to that transfer manager. Future manager-wide metric groups may be
-sampled independently; `TransferManagerMetrics` does not promise one atomic sample across memory,
-scheduling, connections, and other subsystems.
+`Client::metrics().memory()` returns the same `MemoryMetrics` sample. When a caller supplies a pool
+shared with another client or component, those values describe the complete shared memory domain,
+not only activity attributable to that client. `ClientMetrics` can add scheduling, connection,
+retry, or runtime groups without replacing the client metrics entry point. Those groups may be
+sampled independently and do not promise one atomic sample across subsystems.
 
 A crate-private diagnostic snapshot includes raw accounting fields, bitmap population, block
 lifecycle counts, pending cleanup, and scan-path counters for tests and tracing. It is not a public

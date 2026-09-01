@@ -668,7 +668,7 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
 /// re-wedges and the timeout fires.
 #[cfg(any(unix, windows))]
 async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: RuntimeMode) {
-    use aws_sdk_s3_transfer_manager::types::MemoryBudgetConfig;
+    use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, MemoryConfig};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -682,11 +682,15 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: Runt
     // below that, so no object can hold its full part count and the pre-fix wedge is
     // reachable, while leaving room for a few resident parts per transfer.
     let budget_bytes = 8 * 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let pool = BufferPool::builder()
+        .memory_budget(MemoryBudgetConfig::Limit(budget_bytes))
+        .build()
+        .expect("tight test pool");
 
-    let m = mock_tm_with(rt, |b| {
+    let m = mock_tm_with(rt, move |b| {
         b.part_size(PartSize::Target(part_size as u64))
             .concurrency(ConcurrencyMode::Explicit(transfers))
-            .memory_budget(MemoryBudgetConfig::Limit(budget_bytes))
+            .memory(MemoryConfig::Explicit(pool))
     })
     .await;
 

@@ -27,8 +27,8 @@ const DEFAULT_BLOCK_BYTES: usize = 128 * 1024 * 1024;
 /// The actual reach rounds up to a complete bitmap word.
 const DEFAULT_OPTIMISTIC_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
-/// Fraction of detected memory selected by automatic capacity.
-const AUTO_CAPACITY_DIVISOR: usize = 4;
+/// Denominator of the detected-memory share selected by automatic capacity.
+const AUTO_MEMORY_SHARE_DENOMINATOR: usize = 4;
 
 /// Maximum automatic capacity in bytes.
 const AUTO_CAPACITY_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -45,7 +45,7 @@ const F64_EXPONENT_BIAS: u32 = 1023;
 /// Failure to resolve capacity and geometry before pool publication.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BufferPoolBuildError {
+pub enum BufferPoolBuildError {
     /// Capacity is invalid or resolves below one carrier.
     InvalidCapacity,
     /// The selected capacity policy requires unavailable memory detection.
@@ -74,6 +74,31 @@ impl fmt::Display for BufferPoolBuildError {
 }
 
 impl std::error::Error for BufferPoolBuildError {}
+
+/// Builder for one shared buffer-pool domain.
+#[derive(Clone, Debug, Default)]
+pub struct BufferPoolBuilder {
+    memory_budget: MemoryBudgetConfig,
+}
+
+impl BufferPoolBuilder {
+    /// Sets the configured admission ceiling for the pool.
+    pub fn memory_budget(mut self, memory_budget: MemoryBudgetConfig) -> Self {
+        self.memory_budget = memory_budget;
+        self
+    }
+
+    /// Constructs an empty pool using the current machine memory snapshot.
+    ///
+    /// Construction fixes capacity and geometry but does not reserve virtual
+    /// ranges, prepare physical memory, or start the maintenance worker.
+    pub fn build(self) -> Result<super::BufferPool, BufferPoolBuildError> {
+        super::BufferPool::from_capacity(
+            self.memory_budget,
+            crate::runtime::platform::available_ram(),
+        )
+    }
+}
 
 /// Checked geometry and accounting inputs for constructing an empty pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,7 +169,7 @@ fn resolve_capacity_bytes(
         MemoryBudgetConfig::Auto => match detected_memory {
             Some(bytes) => {
                 let maximum = usize::try_from(AUTO_CAPACITY_MAX_BYTES).unwrap_or(usize::MAX);
-                Ok((bytes / AUTO_CAPACITY_DIVISOR).min(maximum))
+                Ok((bytes / AUTO_MEMORY_SHARE_DENOMINATOR).min(maximum))
             }
             None => usize::try_from(AUTO_CAPACITY_FALLBACK_BYTES)
                 .map_err(|_| BufferPoolBuildError::CapacityOverflow),
@@ -415,5 +440,35 @@ mod tests {
         assert_eq!(pool.inner.geometry.block_size(), DEFAULT_BLOCK_BYTES);
         assert_eq!(pool.metrics().configured_capacity_bytes(), GIB as u64);
         assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_public_builder_constructs_a_lazy_explicit_pool() {
+        let pool = BufferPool::builder()
+            .memory_budget(MemoryBudgetConfig::Limit(GIB))
+            .build()
+            .unwrap();
+
+        assert_eq!(pool.carrier_size(), DEFAULT_CARRIER_BYTES);
+        assert_eq!(pool.metrics().configured_capacity_bytes(), GIB as u64);
+        assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_public_builder_rejects_invalid_capacity() {
+        assert_eq!(
+            BufferPool::builder()
+                .memory_budget(MemoryBudgetConfig::Fraction(0.0))
+                .build()
+                .unwrap_err(),
+            BufferPoolBuildError::InvalidCapacity
+        );
+        assert_eq!(
+            BufferPool::builder()
+                .memory_budget(MemoryBudgetConfig::Limit(1))
+                .build()
+                .unwrap_err(),
+            BufferPoolBuildError::InvalidCapacity
+        );
     }
 }

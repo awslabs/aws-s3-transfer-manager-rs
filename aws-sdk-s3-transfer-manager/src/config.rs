@@ -7,7 +7,7 @@ use aws_runtime::user_agent::FrameworkMetadata;
 use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, ReadAhead, RuntimeMode};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead, RuntimeMode};
 
 pub(crate) mod loader;
 
@@ -72,7 +72,7 @@ pub struct Config {
     concurrency: ConcurrencyMode,
     runtime_mode: RuntimeMode,
     read_ahead: ReadAhead,
-    memory_budget: MemoryBudgetConfig,
+    memory: MemoryConfig,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
     /// Machine facts detected once by the async config loader, off the
@@ -122,9 +122,9 @@ impl Config {
         &self.read_ahead
     }
 
-    /// Returns the memory budget configuration.
-    pub fn memory_budget(&self) -> &MemoryBudgetConfig {
-        &self.memory_budget
+    /// Returns the payload-memory configuration.
+    pub fn memory(&self) -> &MemoryConfig {
+        &self.memory
     }
 
     /// Machine facts detected by the async config loader, if this config was
@@ -163,7 +163,7 @@ pub struct Builder {
     concurrency: ConcurrencyMode,
     runtime_mode: RuntimeMode,
     read_ahead: ReadAhead,
-    memory_budget: MemoryBudgetConfig,
+    memory: MemoryConfig,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
@@ -256,12 +256,11 @@ impl Builder {
         self
     }
 
-    /// Set the memory budget: an upper bound on memory used for in-flight and
-    /// buffered transfer data. At the limit transfers backpressure rather than
-    /// fail. Default is [`MemoryBudgetConfig::Auto`] (a safe fraction of detected
-    /// RAM).
-    pub fn memory_budget(mut self, budget: MemoryBudgetConfig) -> Self {
-        self.memory_budget = budget;
+    /// Set the payload-memory configuration.
+    ///
+    /// Default is [`MemoryConfig::Auto`].
+    pub fn memory(mut self, memory: MemoryConfig) -> Self {
+        self.memory = memory;
         self
     }
 
@@ -332,7 +331,7 @@ impl Builder {
             concurrency: self.concurrency,
             runtime_mode: self.runtime_mode,
             read_ahead: self.read_ahead,
-            memory_budget: self.memory_budget,
+            memory: self.memory,
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,
