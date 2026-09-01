@@ -79,6 +79,12 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// Payload-memory configuration and shared storage
+pub mod memory {
+    pub use crate::runtime::buffer_pool::{BufferPool, BufferPoolBuildError, BufferPoolBuilder};
+    pub use crate::types::{MemoryBudgetConfig, MemoryConfig};
+}
+
 /// HTTP related components and utils
 pub(crate) mod http;
 

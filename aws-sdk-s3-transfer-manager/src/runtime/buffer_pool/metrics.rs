@@ -19,7 +19,7 @@ use super::CarrierCount;
 /// The representation remains private so ledger changes do not become API
 /// compatibility constraints. Values are carrier-rounded bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MemoryMetrics {
+pub struct MemoryMetrics {
     configured_capacity_bytes: u64,
     admission_used_bytes: u64,
     active_planned_demand_bytes: u64,
@@ -147,27 +147,27 @@ impl MemoryMetrics {
     }
 
     /// Returns the normal admission ceiling after carrier rounding.
-    pub(crate) fn configured_capacity_bytes(&self) -> u64 {
+    pub fn configured_capacity_bytes(&self) -> u64 {
         self.configured_capacity_bytes
     }
 
     /// Returns active planned demand plus ownership outside active demand.
-    pub(crate) fn admission_used_bytes(&self) -> u64 {
+    pub fn admission_used_bytes(&self) -> u64 {
         self.admission_used_bytes
     }
 
     /// Returns complete envelopes whose acquisition authority remains open.
-    pub(crate) fn active_planned_demand_bytes(&self) -> u64 {
+    pub fn active_planned_demand_bytes(&self) -> u64 {
         self.active_planned_demand_bytes
     }
 
     /// Returns aggregate charges held by owners or in-flight acquisitions.
-    pub(crate) fn charged_capacity_bytes(&self) -> u64 {
+    pub fn charged_capacity_bytes(&self) -> u64 {
         self.charged_capacity_bytes
     }
 
     /// Returns admission use above the normal configured ceiling.
-    pub(crate) fn admission_overage_bytes(&self) -> u64 {
+    pub fn admission_overage_bytes(&self) -> u64 {
         self.admission_overage_bytes
     }
 
@@ -176,17 +176,17 @@ impl MemoryMetrics {
     /// Preparation rounds its current floor up to whole blocks and may exceed
     /// that floor by less than one block. Idle-only admission overage may also
     /// place prepared capacity above the normal configured ceiling.
-    pub(crate) fn prepared_capacity_bytes(&self) -> u64 {
+    pub fn prepared_capacity_bytes(&self) -> u64 {
         self.prepared_capacity_bytes
     }
 
     /// Returns reservation requests currently retained in FIFO order.
-    pub(crate) fn queued_reservations(&self) -> usize {
+    pub fn queued_reservations(&self) -> usize {
         self.queued_reservations
     }
 
     /// Returns the saturating count of requests that entered the FIFO.
-    pub(crate) fn parked_reservations_total(&self) -> u64 {
+    pub fn parked_reservations_total(&self) -> u64 {
         self.parked_reservations_total
     }
 }

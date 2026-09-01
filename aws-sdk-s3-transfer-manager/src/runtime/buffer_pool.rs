@@ -33,11 +33,12 @@ use admission::{
 pub(crate) use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError};
 use block::BlockError;
-pub(crate) use config::BufferPoolBuildError;
 use config::PoolConfig;
+pub use config::{BufferPoolBuildError, BufferPoolBuilder};
 use geometry::{GeometryError, PoolGeometry};
 use maintenance::MaintenanceCoordinator;
-use metrics::{MemoryDiagnostics, MemoryMetricState, MemoryMetrics};
+pub use metrics::MemoryMetrics;
+use metrics::{MemoryDiagnostics, MemoryMetricState};
 use pooled_buf::GrowthAuthority;
 pub(crate) use pooled_buf::PooledBufMut;
 pub(crate) use segmented_bytes::SegmentedBytes;
@@ -46,12 +47,36 @@ pub(crate) use segmented_bytes::SegmentedBytes;
 use test_util::TestHooks;
 
 /// A cloneable handle to one admission, accounting, and storage domain.
+///
+/// Every clone shares the configured capacity, reservation queue, ownership
+/// charges, prepared storage, maintenance state, and metrics. Constructing a
+/// pool is lazy: no virtual ranges or physical memory are prepared until the
+/// first admitted acquisition needs them.
 #[derive(Clone)]
-pub(crate) struct BufferPool {
+pub struct BufferPool {
     inner: Arc<PoolInner>,
 }
 
+impl std::fmt::Debug for BufferPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferPool").finish_non_exhaustive()
+    }
+}
+
 impl BufferPool {
+    /// Returns a builder for an empty shared memory pool.
+    pub fn builder() -> BufferPoolBuilder {
+        BufferPoolBuilder::default()
+    }
+
+    /// Returns the fixed writable allocation unit used by this pool.
+    ///
+    /// Reservations and acquisitions accept arbitrary byte counts and round
+    /// them to this page-aligned unit.
+    pub fn carrier_size(&self) -> usize {
+        self.inner.geometry.carrier_size()
+    }
+
     /// Constructs an empty pool from capacity policy and detected memory.
     ///
     /// Capacity and geometry are fixed before publication. Construction does
@@ -115,7 +140,7 @@ impl BufferPool {
     }
 
     /// Returns one coherent sample of this pool's memory state.
-    pub(crate) fn metrics(&self) -> MemoryMetrics {
+    pub fn metrics(&self) -> MemoryMetrics {
         self.inner.memory_metrics()
     }
 

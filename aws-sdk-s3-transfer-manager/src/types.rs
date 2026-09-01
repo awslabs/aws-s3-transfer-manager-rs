@@ -4,6 +4,7 @@
  */
 
 use crate::metrics::{unit::ByteUnit, Throughput};
+use crate::runtime::buffer_pool::BufferPool;
 
 /// The target part size for an upload or download request.
 #[non_exhaustive]
@@ -25,23 +26,38 @@ pub enum PartSize {
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum MemoryBudgetConfig {
-    /// Size the budget from the machine, leaving headroom for the OS page cache
-    /// and the rest of the process. Derived from detected RAM (cgroup-aware) and
-    /// bounded so a small box stays usable and a large one does not over-reserve;
-    /// expect a budget on the order of a quarter of RAM, in the low gigabytes for
-    /// a typical box. The exact policy is intentionally unspecified and may change.
+    /// Use up to one quarter of detected effective memory, capped at 32 GiB.
+    ///
+    /// Effective memory includes process or container limits where the platform
+    /// exposes them. The result is rounded down to complete carriers. If
+    /// detection is unavailable, the pool uses 2 GiB.
     #[default]
     Auto,
-    /// The given fraction of detected RAM, clamped to `(0.0, 1.0]`. A non-finite
-    /// or non-positive value falls back to the `Auto` fraction. The result is
-    /// floored at a minimum usable budget but, unlike `Auto`, is not capped.
+    /// Use the given fraction of detected effective memory.
+    ///
+    /// The fraction must be finite and in `(0.0, 1.0]`. This policy requires
+    /// memory detection and does not apply the automatic 32 GiB cap.
     Fraction(f64),
-    /// An explicit byte limit. Bypasses detection. A value below one accounting
-    /// chunk (8 MiB) is raised to a single chunk when the budget is built, since a
-    /// smaller budget would serialize transfers. Use the
-    /// [`ByteUnit`] helpers to express it, e.g.
+    /// An explicit byte limit that bypasses memory detection.
+    ///
+    /// The value must fund at least one carrier. Use the [`ByteUnit`] helpers,
+    /// for example
     /// `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
     Limit(usize),
+}
+
+/// Selects the payload-memory pool used by a transfer-manager client.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum MemoryConfig {
+    /// Construct an automatically sized pool when the client is created.
+    #[default]
+    Auto,
+    /// Use an existing pool.
+    ///
+    /// Every client or component using a clone of this pool shares one
+    /// admission ceiling, prepared-storage cache, and metrics domain.
+    Explicit(BufferPool),
 }
 
 /// Point-in-time view of the global memory budget's admission state.
@@ -65,21 +81,6 @@ pub struct MemoryBudgetSnapshot {
     /// Cumulative count of requests that ever parked. Distinguishes a budget that
     /// has bound at least once from one that never has.
     pub total_parked: u64,
-}
-
-impl MemoryBudgetConfig {
-    /// Resolve to the budget capacity in bytes. `ram_bytes` is the detected
-    /// usable RAM from the [`MachineProfile`](crate::runtime::platform::MachineProfile)
-    /// (`None` when undetectable), used only by the `Auto` and `Fraction` policies.
-    pub(crate) fn resolve(&self, ram_bytes: Option<usize>) -> usize {
-        match self {
-            MemoryBudgetConfig::Auto => crate::runtime::platform::machine_safe_mem(ram_bytes),
-            MemoryBudgetConfig::Fraction(f) => {
-                crate::runtime::platform::mem_for_fraction(ram_bytes, *f)
-            }
-            MemoryBudgetConfig::Limit(bytes) => *bytes,
-        }
-    }
 }
 
 /// Selects the execution runtime the transfer manager runs on.
