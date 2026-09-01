@@ -39,10 +39,10 @@ fastrand = "2.4"
 hdrhistogram = "7"
 http-body-1x = { package = "http-body", version = "1" }
 same-file = "1.0.6"
-dial9-tokio-telemetry = { version = "0.3", optional = true, features = ["cpu-profiling"] }
+dial9 = { version = "0.5", optional = true, features = ["tokio", "cpu-profiling"] }
 
 [features]
-dial9 = ["dep:dial9-tokio-telemetry"]
+dial9 = ["dep:dial9"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }

@@ -81,7 +81,7 @@ pub struct Config {
     /// (bypassing the loader); consumers then fall back to cheap local detection.
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
     #[cfg(feature = "dial9")]
-    pub(crate) telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+    pub(crate) dial9_handle: Option<dial9::Dial9Handle>,
 }
 
 impl Config {
@@ -147,12 +147,10 @@ impl Config {
             .expect("s3 client source already taken")
     }
 
-    /// Take the telemetry guard, if set.
+    /// Take the dial9 handle, if set.
     #[cfg(feature = "dial9")]
-    pub(crate) fn take_telemetry_guard(
-        &mut self,
-    ) -> Option<dial9_tokio_telemetry::telemetry::TelemetryGuard> {
-        self.telemetry_guard.take()
+    pub(crate) fn take_dial9_handle(&mut self) -> Option<dial9::Dial9Handle> {
+        self.dial9_handle.take()
     }
 }
 
@@ -170,7 +168,7 @@ pub struct Builder {
     s3_client_config: Option<S3ClientConfig>,
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
     #[cfg(feature = "dial9")]
-    telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+    dial9_handle: Option<dial9::Dial9Handle>,
 }
 
 impl Builder {
@@ -297,15 +295,18 @@ impl Builder {
         self
     }
 
-    /// Set a dial9 telemetry guard for runtime tracing.
+    /// Set a dial9 handle for runtime tracing.
     ///
-    /// When set, each managed worker runtime will be traced via dial9-tokio-telemetry.
+    /// When set, each managed worker runtime is attached to the handle's
+    /// recorder. The caller keeps the recorder itself, and should drop
+    /// this client before calling [`Recorder::graceful_shutdown`],
+    /// so the workers flush into the trace.
+    ///
+    /// [`Recorder::handle`]: dial9::Recorder::handle
+    /// [`Recorder::graceful_shutdown`]: dial9::Recorder::graceful_shutdown
     #[cfg(feature = "dial9")]
-    pub fn telemetry_guard(
-        mut self,
-        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
-    ) -> Self {
-        self.telemetry_guard = Some(guard);
+    pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
+        self.dial9_handle = Some(handle);
         self
     }
 
@@ -338,7 +339,7 @@ impl Builder {
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,
             #[cfg(feature = "dial9")]
-            telemetry_guard: self.telemetry_guard,
+            dial9_handle: self.dial9_handle,
         }
     }
 }
