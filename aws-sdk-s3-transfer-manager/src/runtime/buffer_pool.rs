@@ -23,6 +23,7 @@ mod segmented_bytes;
 mod test_util;
 mod virtual_memory;
 
+use crate::types::MemoryBudgetConfig;
 use acquisition::acquire_count;
 pub(crate) use acquisition::AcquireError;
 use admission::{
@@ -32,8 +33,8 @@ use admission::{
 pub(crate) use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError};
 use block::BlockError;
-use config::ResolvedPoolConfig;
-pub(crate) use config::{BufferPoolBuildError, MemoryCapacity};
+pub(crate) use config::BufferPoolBuildError;
+use config::PoolConfig;
 use geometry::{GeometryError, PoolGeometry};
 use maintenance::MaintenanceCoordinator;
 use metrics::{MemoryDiagnostics, MemoryMetricState, MemoryMetrics};
@@ -56,10 +57,10 @@ impl BufferPool {
     /// Capacity and geometry are fixed before publication. Construction does
     /// not reserve virtual ranges, prepare backing, or start maintenance.
     pub(crate) fn from_capacity(
-        capacity: MemoryCapacity,
+        capacity: MemoryBudgetConfig,
         detected_memory: Option<usize>,
     ) -> Result<Self, BufferPoolBuildError> {
-        let resolved = ResolvedPoolConfig::resolve(capacity, detected_memory)?;
+        let resolved = PoolConfig::resolve(capacity, detected_memory)?;
         Ok(Self::from_parts(
             resolved.geometry,
             resolved.configured_capacity,
@@ -120,9 +121,9 @@ impl BufferPool {
 
     /// Returns operational counters and a scanned lifecycle sample.
     pub(crate) fn diagnostics(&self) -> MemoryDiagnostics {
-        MemoryDiagnostics::from_snapshots(
+        MemoryDiagnostics::from_samples(
             self.inner.arena.diagnostics(),
-            self.inner.arena.lifecycle_snapshot(),
+            self.inner.arena.sample_lifecycle(),
             self.inner.maintenance.diagnostics(),
         )
     }
@@ -135,11 +136,6 @@ impl BufferPool {
     /// Arms idle reclamation after the scheduler becomes globally idle.
     pub(crate) fn record_global_idle(&self) {
         self.inner.maintenance.record_idle(&self.inner);
-    }
-
-    /// Returns the fixed writable allocation unit in bytes.
-    pub(crate) fn carrier_size(&self) -> usize {
-        self.inner.geometry.carrier_size()
     }
 
     /// Acquires at least `min_bytes` under one reservation.

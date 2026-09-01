@@ -24,7 +24,7 @@ use std::{io, sync::Weak};
 #[cfg(not(all(test, s3_tm_loom)))]
 use crate::runtime::sync::thread;
 
-/// Fraction of the configured block ceiling retained after an idle deadline.
+/// Divisor applied before retention rounds down to complete blocks.
 const IDLE_RETENTION_DIVISOR: usize = 4;
 
 /// Initial cache-hysteresis interval after scheduler-global idle.
@@ -33,8 +33,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before retrying blocked reclamation or mapping cleanup.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Operating-system thread name used by the pool maintenance worker.
-const WORKER_NAME: &str = "s3-tm-memory";
+/// Operating-system thread name used by pool maintenance.
+const MAINTENANCE_THREAD_NAME: &str = "s3-tm-memory";
 
 /// One maintenance operation authorized by the control state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +155,7 @@ impl MaintenanceCoordinator {
             Err(io::Error::other("injected maintenance worker failure"))
         } else {
             thread::Builder::new()
-                .name(WORKER_NAME.to_owned())
+                .name(MAINTENANCE_THREAD_NAME.to_owned())
                 .spawn(move || {
                     worker_loop(
                         control,
@@ -169,23 +169,21 @@ impl MaintenanceCoordinator {
 
         match spawned {
             Ok(handle) => {
-                self.diagnostics.record_worker_start();
                 tracing::debug!(
                     target: crate::telemetry::TARGET_MEMORY,
-                    worker = WORKER_NAME,
+                    worker = MAINTENANCE_THREAD_NAME,
                     "started buffer-pool maintenance worker"
                 );
                 *worker = Some(handle);
             }
             Err(error) => {
-                self.diagnostics.record_worker_start_failure();
+                self.control.state.lock().disable();
                 tracing::warn!(
                     target: crate::telemetry::TARGET_MEMORY,
-                    worker = WORKER_NAME,
+                    worker = MAINTENANCE_THREAD_NAME,
                     error = %error,
                     "buffer-pool maintenance is disabled after worker creation failed"
                 );
-                self.control.state.lock().disable();
             }
         }
     }
@@ -211,7 +209,7 @@ impl MaintenanceCoordinator {
         if worker.join().is_err() {
             tracing::warn!(
                 target: crate::telemetry::TARGET_MEMORY,
-                worker = WORKER_NAME,
+                worker = MAINTENANCE_THREAD_NAME,
                 "buffer-pool maintenance worker terminated unexpectedly"
             );
         }
@@ -231,9 +229,13 @@ impl MaintenanceCoordinator {
         self.control.wake.notify_all();
     }
 
-    /// Returns one relaxed operational diagnostic sample.
+    /// Returns one operational diagnostic sample.
+    ///
+    /// Cumulative counters use relaxed loads. Reading permanent-disable state
+    /// briefly acquires maintenance control.
     pub(super) fn diagnostics(&self) -> MaintenanceDiagnosticSnapshot {
-        self.diagnostics.snapshot()
+        self.diagnostics
+            .snapshot(self.control.state.lock().is_disabled())
     }
 
     /// Returns whether a worker handle has been published.
@@ -288,10 +290,6 @@ impl MaintenanceControl {
 struct MaintenanceDiagnostics {
     /// Scheduler-global idle intervals that armed a new deadline.
     idle_deadlines: AtomicU64,
-    /// Successfully created maintenance workers.
-    worker_starts: AtomicU64,
-    /// Worker creation failures that disabled maintenance.
-    worker_start_failures: AtomicU64,
     /// Reclaim actions executed by the worker.
     reclaim_passes: AtomicU64,
     /// Reclaim actions that remained blocked after a bounded pass.
@@ -304,16 +302,6 @@ impl MaintenanceDiagnostics {
     /// Records one newly armed idle deadline.
     fn record_idle_deadline(&self) {
         saturating_add(&self.idle_deadlines, 1);
-    }
-
-    /// Records successful worker creation.
-    fn record_worker_start(&self) {
-        saturating_add(&self.worker_starts, 1);
-    }
-
-    /// Records a worker creation failure.
-    fn record_worker_start_failure(&self) {
-        saturating_add(&self.worker_start_failures, 1);
     }
 
     /// Records one bounded reclaim action and whether it needs retry.
@@ -330,11 +318,10 @@ impl MaintenanceDiagnostics {
     }
 
     /// Loads one relaxed diagnostic sample.
-    fn snapshot(&self) -> MaintenanceDiagnosticSnapshot {
+    fn snapshot(&self, maintenance_disabled: bool) -> MaintenanceDiagnosticSnapshot {
         MaintenanceDiagnosticSnapshot {
             idle_deadlines: self.idle_deadlines.load(DiagnosticOrdering::Relaxed),
-            worker_starts: self.worker_starts.load(DiagnosticOrdering::Relaxed),
-            worker_start_failures: self.worker_start_failures.load(DiagnosticOrdering::Relaxed),
+            maintenance_disabled,
             reclaim_passes: self.reclaim_passes.load(DiagnosticOrdering::Relaxed),
             reclaim_retries: self.reclaim_retries.load(DiagnosticOrdering::Relaxed),
             cleanup_requests: self.cleanup_requests.load(DiagnosticOrdering::Relaxed),
@@ -347,10 +334,8 @@ impl MaintenanceDiagnostics {
 pub(super) struct MaintenanceDiagnosticSnapshot {
     /// Scheduler-global idle intervals that armed a new deadline.
     pub(super) idle_deadlines: u64,
-    /// Successfully created maintenance workers.
-    pub(super) worker_starts: u64,
-    /// Worker creation failures that disabled maintenance.
-    pub(super) worker_start_failures: u64,
+    /// Whether worker creation failed and permanently disabled maintenance.
+    pub(super) maintenance_disabled: bool,
     /// Reclaim actions executed by the worker.
     pub(super) reclaim_passes: u64,
     /// Reclaim actions that remained blocked after a bounded pass.
@@ -612,7 +597,7 @@ fn worker_loop(
 
         #[cfg(test)]
         pool.test_hooks.wait_after_maintenance_upgrade();
-        let pass = pool.execute_maintenance(action);
+        let pass = execute_maintenance(&pool, action);
         drop(pool);
 
         if matches!(action, MaintenanceAction::Reclaim { .. }) {
@@ -686,68 +671,66 @@ fn maintenance_spawn_failure_injected(_pool: &PoolInner) -> bool {
     false
 }
 
-impl PoolInner {
-    /// Executes one maintenance action without holding maintenance control.
-    pub(super) fn execute_maintenance(&self, action: MaintenanceAction) -> MaintenancePass {
-        match action {
-            MaintenanceAction::RetryCleanup { .. } => {
-                if self.arena.retry_cleanup() {
-                    MaintenancePass::new(MaintenanceOutcome::Complete)
-                } else {
-                    MaintenancePass::new(MaintenanceOutcome::Retry)
-                }
+/// Executes one maintenance action without holding maintenance control.
+pub(super) fn execute_maintenance(pool: &PoolInner, action: MaintenanceAction) -> MaintenancePass {
+    match action {
+        MaintenanceAction::RetryCleanup { .. } => {
+            if pool.arena.retry_cleanup() {
+                MaintenancePass::new(MaintenanceOutcome::Complete)
+            } else {
+                MaintenancePass::new(MaintenanceOutcome::Retry)
             }
-            MaintenanceAction::Reclaim { target, .. } => self.reclaim_to(target),
         }
+        MaintenanceAction::Reclaim { target, .. } => reclaim_to(pool, target),
     }
+}
 
-    /// Reclaims complete free blocks until the target or a blocker is reached.
-    fn reclaim_to(&self, target: CarrierCount) -> MaintenancePass {
-        let mut cleanup_pending = false;
-        loop {
-            let trim = {
-                let mut admission = AdmissionGuard::new(self.admission.lock());
-                if admission.prepared_capacity() <= target {
-                    return MaintenancePass {
-                        outcome: MaintenanceOutcome::Complete,
-                        cleanup_pending,
-                    };
-                }
-                let admission_floor = admission
-                    .acquisition_floor(&self.coverage)
-                    .unwrap_or_else(|_| super::invariant_violation("maintenance floor overflow"));
-                let floor = std::cmp::max(target, admission_floor);
-                self.arena.start_trim(&mut admission, floor)
-            };
-
-            let ArenaTrim::Started(cleanup) = trim else {
+/// Reclaims complete free blocks until the target or a blocker is reached.
+fn reclaim_to(pool: &PoolInner, target: CarrierCount) -> MaintenancePass {
+    let mut cleanup_pending = false;
+    loop {
+        let trim = {
+            let mut admission = AdmissionGuard::new(pool.admission.lock());
+            if admission.prepared_capacity() <= target {
                 return MaintenancePass {
-                    outcome: MaintenanceOutcome::Retry,
+                    outcome: MaintenanceOutcome::Complete,
                     cleanup_pending,
                 };
+            }
+            let admission_floor = admission
+                .acquisition_floor(&pool.coverage)
+                .unwrap_or_else(|_| super::invariant_violation("maintenance floor overflow"));
+            let floor = std::cmp::max(target, admission_floor);
+            pool.arena.start_trim(&mut admission, floor)
+        };
+
+        let ArenaTrim::Started(cleanup) = trim else {
+            return MaintenancePass {
+                outcome: MaintenanceOutcome::Retry,
+                cleanup_pending,
             };
-            match cleanup.finish() {
-                Ok(()) => {
-                    self.arena.record_block_reclaimed();
-                    tracing::debug!(
-                        target: crate::telemetry::TARGET_MEMORY,
-                        "reclaimed one buffer-pool block"
-                    );
-                }
-                Err(error) => {
-                    cleanup_pending = true;
-                    tracing::warn!(
-                        target: crate::telemetry::TARGET_MEMORY,
-                        error = ?error,
-                        "buffer-pool block cleanup remains pending"
-                    );
-                }
+        };
+        match cleanup.finish() {
+            Ok(()) => {
+                pool.arena.record_block_reclaimed();
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_MEMORY,
+                    "reclaimed one buffer-pool block"
+                );
+            }
+            Err(error) => {
+                cleanup_pending = true;
+                tracing::warn!(
+                    target: crate::telemetry::TARGET_MEMORY,
+                    error = ?error,
+                    "buffer-pool block cleanup remains pending"
+                );
             }
         }
     }
 }
 
-/// Computes one whole-block retention target for an idle epoch.
+/// Computes a whole-block target no greater than the configured retention fraction.
 fn idle_retention_target(
     configured_capacity: CarrierCount,
     block_capacity: CarrierCount,
@@ -756,7 +739,7 @@ fn idle_retention_target(
         return CarrierCount::ZERO;
     }
     let configured_blocks = configured_capacity.get().div_ceil(block_capacity.get());
-    let retained_blocks = configured_blocks.div_ceil(IDLE_RETENTION_DIVISOR);
+    let retained_blocks = configured_blocks / IDLE_RETENTION_DIVISOR;
     CarrierCount::new(
         retained_blocks
             .checked_mul(block_capacity.get())
@@ -767,8 +750,10 @@ fn idle_retention_target(
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
     use super::*;
+    use crate::runtime::buffer_pool::config::PoolConfig;
     use crate::runtime::buffer_pool::test_util::test_pool;
     use crate::runtime::buffer_pool::virtual_memory::VirtualMemoryOperation;
+    use crate::types::MemoryBudgetConfig;
     use std::sync::Barrier;
 
     const IDLE: Duration = Duration::from_secs(10);
@@ -817,18 +802,46 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_target_rounds_to_complete_blocks() {
+    fn test_idle_target_rounds_down_to_complete_blocks() {
         let start = Instant::now();
         let mut state = MaintenanceState::new();
         state.record_idle(start, IDLE);
 
         assert_eq!(
-            state.next_action(start + IDLE, carriers(70), carriers(64)),
+            state.next_action(start + IDLE, carriers(257), carriers(64)),
             Some(MaintenanceAction::Reclaim {
                 epoch: 0,
                 target: carriers(64),
             })
         );
+    }
+
+    #[test]
+    fn test_production_geometry_reclaims_small_pools_after_idle() {
+        const MIB: usize = 1024 * 1024;
+
+        for (capacity_bytes, retained_bytes) in [
+            (64 * MIB, 0),
+            (128 * MIB, 0),
+            (200 * MIB, 0),
+            (256 * MIB, 0),
+            (512 * MIB, 128 * MIB),
+            (1024 * MIB, 256 * MIB),
+        ] {
+            let config =
+                PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(capacity_bytes), None, 4096)
+                    .unwrap();
+            let target = idle_retention_target(
+                config.configured_capacity,
+                config.geometry.carriers_per_block(),
+            );
+
+            assert_eq!(
+                target.get() * config.geometry.carrier_size(),
+                retained_bytes,
+                "capacity {capacity_bytes}"
+            );
+        }
     }
 
     #[test]
@@ -935,10 +948,13 @@ mod tests {
         let owned = pool.acquire_unreserved(carrier_size * 8).unwrap();
         drop(owned);
 
-        let pass = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: carriers(2),
-        });
+        let pass = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: carriers(2),
+            },
+        );
 
         assert_eq!(pass, MaintenancePass::new(MaintenanceOutcome::Complete));
         assert_eq!(
@@ -953,17 +969,23 @@ mod tests {
         let (pool, carrier_size) = test_pool(2, 2);
         let owned = pool.acquire_unreserved(carrier_size).unwrap();
 
-        let blocked = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: CarrierCount::ZERO,
-        });
+        let blocked = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
         assert_eq!(blocked, MaintenancePass::new(MaintenanceOutcome::Retry));
 
         drop(owned);
-        let complete = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: CarrierCount::ZERO,
-        });
+        let complete = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
         assert_eq!(complete, MaintenancePass::new(MaintenanceOutcome::Complete));
         assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
     }
@@ -976,10 +998,13 @@ mod tests {
             .unwrap()
             .expect("reservation");
 
-        let blocked = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: CarrierCount::ZERO,
-        });
+        let blocked = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
         assert_eq!(blocked.outcome, MaintenanceOutcome::Retry);
         assert_eq!(
             pool.metrics().prepared_capacity_bytes(),
@@ -987,10 +1012,13 @@ mod tests {
         );
 
         drop(reservation);
-        let complete = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: CarrierCount::ZERO,
-        });
+        let complete = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
         assert_eq!(complete.outcome, MaintenanceOutcome::Complete);
         assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
     }
@@ -1007,25 +1035,30 @@ mod tests {
             .expect("free prepared slot");
         slot.inject_failure_once(VirtualMemoryOperation::Deactivate);
 
-        let trim = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: CarrierCount::ZERO,
-        });
+        let trim = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
         assert_eq!(trim.outcome, MaintenanceOutcome::Complete);
         assert!(trim.cleanup_pending);
         assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
 
         slot.inject_failure_once(VirtualMemoryOperation::Deactivate);
-        let retry = pool
-            .inner
-            .execute_maintenance(MaintenanceAction::RetryCleanup { generation: 1 });
+        let retry = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::RetryCleanup { generation: 1 },
+        );
         assert_eq!(retry, MaintenancePass::new(MaintenanceOutcome::Retry));
         assert_eq!(pool.inner.arena.diagnostics().cleanup_retries, 1);
         assert_eq!(pool.inner.arena.diagnostics().cleanup_failures, 1);
 
-        let cleanup = pool
-            .inner
-            .execute_maintenance(MaintenanceAction::RetryCleanup { generation: 1 });
+        let cleanup = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::RetryCleanup { generation: 1 },
+        );
         assert_eq!(cleanup, MaintenancePass::new(MaintenanceOutcome::Complete));
         assert_eq!(pool.inner.arena.diagnostics().cleanup_retries, 2);
         assert_eq!(pool.inner.arena.diagnostics().cleanup_failures, 1);
@@ -1044,11 +1077,11 @@ mod tests {
         assert!(pool.inner.maintenance.worker_started());
         assert_eq!(
             pool.inner.maintenance.worker_name().as_deref(),
-            Some(WORKER_NAME)
+            Some(MAINTENANCE_THREAD_NAME)
         );
         assert_eq!(pool.maintenance_spawn_attempts(), 1);
         let diagnostics = pool.diagnostics();
-        assert_eq!(diagnostics.worker_starts, 1);
+        assert!(!diagnostics.maintenance_disabled);
         assert_eq!(diagnostics.cleanup_requests, 1);
     }
 
@@ -1108,7 +1141,7 @@ mod tests {
         assert!(pool.inner.maintenance.is_disabled());
         assert!(!pool.inner.maintenance.worker_started());
         assert_eq!(pool.maintenance_spawn_attempts(), 1);
-        assert_eq!(pool.diagnostics().worker_start_failures, 1);
+        assert!(pool.diagnostics().maintenance_disabled);
 
         pool.inner.maintenance.record_idle(&pool.inner);
         assert_eq!(pool.maintenance_spawn_attempts(), 1);
@@ -1180,10 +1213,13 @@ mod tests {
             .arena
             .select_trim_candidate()
             .expect("free prepared slot");
-        let reclaimed = pool.inner.execute_maintenance(MaintenanceAction::Reclaim {
-            epoch: 0,
-            target: CarrierCount::ZERO,
-        });
+        let reclaimed = execute_maintenance(
+            &pool.inner,
+            MaintenanceAction::Reclaim {
+                epoch: 0,
+                target: CarrierCount::ZERO,
+            },
+        );
         assert_eq!(reclaimed.outcome, MaintenanceOutcome::Complete);
         pool.assert_quiescent_zero();
 
@@ -1279,12 +1315,13 @@ mod loom_tests {
 
             let reclaiming = pool.clone();
             let reclaim = thread::spawn(move || {
-                reclaiming
-                    .inner
-                    .execute_maintenance(MaintenanceAction::Reclaim {
+                execute_maintenance(
+                    &reclaiming.inner,
+                    MaintenanceAction::Reclaim {
                         epoch: 0,
                         target: CarrierCount::ZERO,
-                    })
+                    },
+                )
             });
             let claiming = pool.clone();
             let claim = thread::spawn(move || claiming.acquire_unreserved(carrier_size));

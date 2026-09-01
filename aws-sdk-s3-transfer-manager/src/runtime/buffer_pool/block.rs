@@ -1033,8 +1033,13 @@ impl BlockSlot {
         self.range.inject_failure_once(operation);
     }
 
-    /// Samples mapping, cleanup, and bitmap state for diagnostics.
-    pub(super) fn lifecycle_snapshot(&self) -> BlockLifecycleSnapshot {
+    /// Samples this slot's mapping, cleanup, and bitmap state.
+    ///
+    /// The mapping lock stabilizes lifecycle transitions, but claims and
+    /// returns may change bitmap ownership while it is counted. Consumers may
+    /// treat the result as authoritative only when the pool is externally
+    /// quiescent.
+    pub(super) fn sample_lifecycle(&self) -> BlockLifecycleSample {
         let mapping = self.mapping.lock();
         let current = self.current.load();
         let live_carriers = current
@@ -1094,7 +1099,7 @@ impl BlockSlot {
             }
         };
 
-        BlockLifecycleSnapshot {
+        BlockLifecycleSample {
             prepared_capacity,
             live_carriers,
             cleanup_pending,
@@ -1102,8 +1107,8 @@ impl BlockSlot {
     }
 }
 
-/// One diagnostic sample from a block slot.
-pub(super) struct BlockLifecycleSnapshot {
+/// Independently reconstructed lifecycle state for one block slot.
+pub(super) struct BlockLifecycleSample {
     /// Capacity represented by a prepared active incarnation.
     pub(super) prepared_capacity: CarrierCount,
     /// Valid bitmap bits currently owned by claims or carrier guards.

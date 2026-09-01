@@ -185,8 +185,11 @@ fn round_pow2(n: usize) -> usize {
     }
 }
 
-/// Usable RAM: the smaller of the process memory limit and physical RAM where
-/// the platform exposes both values. `None` reports detection failure.
+/// Usable RAM from Linux-compatible procfs and cgroup interfaces.
+///
+/// Android exposes the same kernel interfaces even though its runtime page
+/// size and userspace environment may differ from a conventional Linux host.
+/// The smaller of physical memory and the process limit wins when both exist.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub(crate) fn available_ram() -> Option<usize> {
     match (meminfo_total(), cgroup_mem_limit()) {
