@@ -77,13 +77,10 @@ impl ConfigLoader {
         self
     }
 
-    /// Set a dial9 telemetry guard for runtime tracing.
+    /// Set a dial9 handle for runtime tracing.
     #[cfg(feature = "dial9")]
-    pub fn telemetry_guard(
-        mut self,
-        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
-    ) -> Self {
-        self.builder = self.builder.telemetry_guard(guard);
+    pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
+        self.builder = self.builder.dial9_handle(handle);
         self
     }
 

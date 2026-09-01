@@ -464,28 +464,21 @@ async fn run(args: Args) -> Result<(), BoxError> {
         .trace_dir
         .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok());
     #[cfg(feature = "dial9")]
-    let telemetry_guard = if let Some(ref trace_dir) = trace_dir {
-        use dial9_tokio_telemetry::telemetry::{RotatingWriter, TelemetryCore};
+    let recorder = if let Some(ref trace_dir) = trace_dir {
+        use dial9::DiskBuffer;
         let _ = std::fs::create_dir_all(trace_dir);
-        let writer = RotatingWriter::builder()
-            .base_path(format!("{trace_dir}/trace.bin"))
+        let writer = DiskBuffer::builder()
+            .base_path(trace_dir)
             .max_file_size(64 * 1024 * 1024)
             .max_total_size(512 * 1024 * 1024)
             .build()
             .expect("failed to create trace writer");
-        let cpu_profiling = if args.cpu_profiling {
-            Some(dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig::default())
-        } else {
-            None
-        };
-        let guard = TelemetryCore::builder()
-            .writer(writer)
-            .trace_path(format!("{trace_dir}/trace.bin"))
-            .maybe_cpu_profiling(cpu_profiling)
-            .build()
-            .expect("failed to create telemetry session");
-        guard.enable();
-        Some(guard)
+        let mut builder = dial9::recorder(writer);
+        if args.cpu_profiling {
+            use dial9::RecorderPerfExt;
+            builder = builder.with_cpu_profiling(dial9::cpu::CpuProfilingConfig::default());
+        }
+        Some(builder.build())
     } else {
         None
     };
@@ -508,8 +501,8 @@ async fn run(args: Args) -> Result<(), BoxError> {
     }
 
     #[cfg(feature = "dial9")]
-    if let Some(guard) = telemetry_guard {
-        config_loader = config_loader.telemetry_guard(guard);
+    if let Some(ref recorder) = recorder {
+        config_loader = config_loader.dial9_handle(recorder.handle().clone());
     }
 
     let tm_config = config_loader.load().await;
@@ -585,6 +578,13 @@ async fn run(args: Args) -> Result<(), BoxError> {
         } else {
             println!("{json}");
         }
+    }
+
+    // Drop the client first so its worker runtimes flush, then drain.
+    #[cfg(feature = "dial9")]
+    if let Some(recorder) = recorder {
+        drop(tm);
+        recorder.graceful_shutdown(time::Duration::from_secs(10));
     }
 
     Ok(())

@@ -253,7 +253,7 @@ impl Client {
         // 2. Build Handle with Arc::new_cyclic so scheduler and runtime
         //    can hold Weak<Handle> without creating a reference cycle.
         #[cfg(feature = "dial9")]
-        let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
+        let dial9_handle = config.take_dial9_handle();
 
         // Resolve the budget once from the same detected RAM: it sizes the
         // Handle's MemoryBudget.
@@ -266,8 +266,8 @@ impl Client {
                     #[allow(unused_mut)]
                     let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
                     #[cfg(feature = "dial9")]
-                    if let Some(guard) = telemetry_guard {
-                        builder = builder.telemetry_guard(guard);
+                    if let Some(handle) = dial9_handle {
+                        builder = builder.dial9_handle(handle);
                     }
                     Arc::new(builder.build())
                 }

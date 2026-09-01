@@ -192,9 +192,7 @@ impl ManagedThreadRuntime {
         handle: Weak<crate::client::Handle>,
         topology: Topology,
         pin_threads: bool,
-        #[cfg(feature = "dial9")] telemetry_guard: Option<
-            std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
-        >,
+        #[cfg(feature = "dial9")] dial9_handle: Option<dial9::Dial9Handle>,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
 
@@ -209,7 +207,7 @@ impl ManagedThreadRuntime {
 
                 let resolver = dns_resolver.clone();
                 #[cfg(feature = "dial9")]
-                let telemetry_guard = telemetry_guard.clone();
+                let dial9_handle = dial9_handle.clone();
 
                 let join_handle = std::thread::Builder::new()
                     .name(format!("s3-tm-{}", id))
@@ -218,12 +216,16 @@ impl ManagedThreadRuntime {
                         builder.enable_all().max_blocking_threads(1);
 
                         #[cfg(feature = "dial9")]
-                        let rt = if let Some(ref guard) = telemetry_guard {
-                            let (rt, _handle) = guard
-                                .trace_runtime(format!("s3-tm-{}", cpu_index))
-                                .build(builder)
-                                .expect("failed to create traced tokio runtime");
-                            rt
+                        let rt = if let Some(ref handle) = dial9_handle {
+                            use dial9::{Dial9HandleTokioExt, TokioAttachOptions};
+                            handle
+                                .attach_tokio_runtime(
+                                    builder,
+                                    TokioAttachOptions::builder()
+                                        .runtime_name(format!("s3-tm-{}", cpu_index))
+                                        .build(),
+                                )
+                                .expect("failed to create traced tokio runtime")
                         } else {
                             builder
                                 .build()
@@ -303,7 +305,7 @@ pub(crate) struct ManagedThreadRuntimeBuilder {
     topology: Option<Topology>,
     pin_threads: bool,
     #[cfg(feature = "dial9")]
-    telemetry_guard: Option<std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>>,
+    dial9_handle: Option<dial9::Dial9Handle>,
 }
 
 impl ManagedThreadRuntimeBuilder {
@@ -313,17 +315,14 @@ impl ManagedThreadRuntimeBuilder {
             topology: None,
             pin_threads: false,
             #[cfg(feature = "dial9")]
-            telemetry_guard: None,
+            dial9_handle: None,
         }
     }
 
-    /// Set a dial9 telemetry guard for tracing per-thread runtimes.
+    /// Set the dial9 handle each per-thread runtime is attached to.
     #[cfg(feature = "dial9")]
-    pub(crate) fn telemetry_guard(
-        mut self,
-        guard: std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
-    ) -> Self {
-        self.telemetry_guard = Some(guard);
+    pub(crate) fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
+        self.dial9_handle = Some(handle);
         self
     }
 
@@ -357,7 +356,7 @@ impl ManagedThreadRuntimeBuilder {
             topology,
             self.pin_threads,
             #[cfg(feature = "dial9")]
-            self.telemetry_guard,
+            self.dial9_handle,
         )
     }
 }
