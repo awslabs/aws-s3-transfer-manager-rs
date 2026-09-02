@@ -88,15 +88,28 @@ impl BufferPoolBuilder {
         self
     }
 
-    /// Constructs an empty pool using the current machine memory snapshot.
+    /// Constructs an empty pool, detecting machine memory when the selected
+    /// capacity policy requires it.
     ///
     /// Construction fixes capacity and geometry but does not reserve virtual
     /// ranges, prepare physical memory, or start the maintenance worker.
     pub fn build(self) -> Result<super::BufferPool, BufferPoolBuildError> {
-        super::BufferPool::from_capacity(
-            self.memory_budget,
-            crate::runtime::platform::available_ram(),
-        )
+        let needs_memory_detection = match self.memory_budget {
+            MemoryBudgetConfig::Auto => true,
+            MemoryBudgetConfig::Fraction(fraction)
+                if fraction.is_finite() && 0.0 < fraction && fraction <= 1.0 =>
+            {
+                true
+            }
+            MemoryBudgetConfig::Fraction(_) => {
+                return Err(BufferPoolBuildError::InvalidCapacity);
+            }
+            MemoryBudgetConfig::Limit(_) => false,
+        };
+        let detected_memory = needs_memory_detection
+            .then(crate::runtime::platform::available_ram)
+            .flatten();
+        super::BufferPool::from_capacity(self.memory_budget, detected_memory)
     }
 }
 
@@ -456,13 +469,15 @@ mod tests {
 
     #[test]
     fn test_public_builder_rejects_invalid_capacity() {
-        assert_eq!(
-            BufferPool::builder()
-                .memory_budget(MemoryBudgetConfig::Fraction(0.0))
-                .build()
-                .unwrap_err(),
-            BufferPoolBuildError::InvalidCapacity
-        );
+        for fraction in [f64::NAN, f64::NEG_INFINITY, -0.1, 0.0, 1.1, f64::INFINITY] {
+            assert_eq!(
+                BufferPool::builder()
+                    .memory_budget(MemoryBudgetConfig::Fraction(fraction))
+                    .build()
+                    .unwrap_err(),
+                BufferPoolBuildError::InvalidCapacity
+            );
+        }
         assert_eq!(
             BufferPool::builder()
                 .memory_budget(MemoryBudgetConfig::Limit(1))

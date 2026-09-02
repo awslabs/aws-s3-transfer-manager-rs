@@ -11,7 +11,7 @@
 //! quantity `issued - released` is the transfer's resident occupancy in parts, so
 //! the gate bounds how far issuance runs ahead of consumption and nothing more.
 //! It is one of three independent upper bounds on issuance; the others — total
-//! in-flight concurrency and the aggregate memory budget — live elsewhere, and
+//! in-flight concurrency and the client's memory budget — live elsewhere, and
 //! issuance takes their min.
 //!
 //! The window is free buffer space, `window - occupancy`, an exact subtraction
@@ -29,9 +29,9 @@
 //!   gate does not bind, and the transfer runs at the concurrency limit.
 //! - Slow consumer: `released` lags, `issued - released` fills to the window, the
 //!   gate closes, and issuance pauses until the consumer drains. This transfer's
-//!   resident occupancy is then bounded at `window` parts; aggregate memory across
-//!   transfers is bounded separately by the global budget, which typically binds a
-//!   transfer before its window fills.
+//!   resident occupancy is then bounded at `window` parts. The client's shared
+//!   memory budget bounds aggregate demand across transfers and typically binds
+//!   a transfer before its read-ahead window fills.
 //! - Blocked consumer (a stalled or missing part): `released` cannot advance past
 //!   the hole, occupancy pins at the window, and issuance stops at `window`, leaving
 //!   a full window of slack to make progress around the hole rather than collapsing
@@ -45,9 +45,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Fixed read-ahead window, in parts. A per-transfer cap on how far speculative
 /// issuance runs ahead of consumption, set well above the bandwidth-delay product of
 /// a 100 Gbps link so the gate does not bind a consumer that keeps pace. It is a
-/// per-transfer prefetch-depth ceiling, not the memory bound: aggregate resident
-/// memory is bounded by the global [`MemoryBudget`](crate::runtime::memory), which
-/// under concurrency binds a transfer well before it reaches this window.
+/// per-transfer prefetch-depth ceiling, not the memory bound. The client's
+/// memory budget applies across transfers and usually binds concurrent work
+/// before one transfer reaches this window.
 ///
 /// The default for the public [`ReadAhead::Auto`](crate::types::ReadAhead) mode;
 /// [`window_parts_for`] resolves the knob to a window in parts.
