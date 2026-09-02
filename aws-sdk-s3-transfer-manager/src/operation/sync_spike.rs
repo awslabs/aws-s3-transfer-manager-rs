@@ -230,6 +230,92 @@ pub(crate) async fn sync_up(
     Ok((sent, destination_only))
 }
 
+/// What a run did, and how much of it happened at once.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Summary {
+    pub(crate) sent: usize,
+    pub(crate) destination_only: usize,
+    // The most transfers ever in flight together. Above one, the comparison kept
+    // advancing while bytes were moving; at one, everything took turns.
+    pub(crate) peak_in_flight: usize,
+}
+
+/// Keep up to `max_in_flight` transfers moving while the comparison continues.
+///
+/// The difference from `sync_up` is only where the waiting happens. `initiate` starts a
+/// transfer, `join` waits for it, and doing both on the spot means nothing is read or
+/// listed while bytes are on the wire. Here a started transfer is parked, the loop goes
+/// back for the next decision, and a slot is only waited for when all of them are busy.
+pub(crate) async fn sync_up_concurrent(
+    tm: &crate::Client,
+    s3: &aws_sdk_s3::Client,
+    root: &Path,
+    bucket: &str,
+    prefix: &str,
+    max_in_flight: usize,
+) -> Result<Summary, crate::error::Error> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let local = FsWalker::builder()
+        .recursive(true)
+        .key_order(true)
+        .build()
+        .walk(FsWalkContext::builder().root(root).build());
+    let remote = S3Walker::builder()
+        .prefix(prefix)
+        .filter(crate::io::walk::exclude_s3_folder_markers)
+        .build()
+        .walk(
+            S3WalkContext::builder()
+                .client(s3.clone())
+                .bucket(bucket)
+                .build(),
+        );
+
+    let mut compare = Compare::new(local, remote);
+    let mut in_flight = FuturesUnordered::new();
+    let mut summary = Summary::default();
+
+    while let Some(decision) = compare.next_decision().await {
+        let decision = decision?;
+        match decision.action {
+            Action::Delete => summary.destination_only += 1,
+            Action::Transfer => {
+                let path = root.join(&decision.key);
+                let key = if prefix.is_empty() {
+                    decision.key.clone()
+                } else {
+                    format!("{}/{}", prefix.trim_end_matches('/'), decision.key)
+                };
+                let stream = crate::io::InputStream::from_path(&path)?;
+                let handle = tm
+                    .upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(stream)
+                    .initiate()?;
+                in_flight.push(handle.join());
+                summary.peak_in_flight = summary.peak_in_flight.max(in_flight.len());
+
+                // Only wait once every slot is taken, so the comparison runs ahead of
+                // the wire rather than behind it.
+                if in_flight.len() >= max_in_flight {
+                    if let Some(result) = in_flight.next().await {
+                        result?;
+                        summary.sent += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some(result) = in_flight.next().await {
+        result?;
+        summary.sent += 1;
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +428,60 @@ mod tests {
         assert!(d.is_empty(), "{d:?}");
     }
 
+    // Overlap is a structural property, so assert it structurally rather than by
+    // timing: with several files to send and room for four at once, more than one must
+    // have been in flight together.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn transfers_overlap_the_comparison() {
+        let dir = tempdir().unwrap();
+        for i in 0..8 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| ListObjectsV2Output::builder().build());
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, put]);
+        let tm = crate::Client::new(crate::Config::builder().client(s3.clone()).build());
+
+        let summary = sync_up_concurrent(&tm, &s3, dir.path(), "bucket", "data", 4)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.sent, 8);
+        assert!(
+            summary.peak_in_flight > 1,
+            "expected overlapping transfers, peaked at {}",
+            summary.peak_in_flight
+        );
+    }
+
+    // One at a time is the old behavior, and it must still be expressible.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_limit_of_one_never_overlaps() {
+        let dir = tempdir().unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| ListObjectsV2Output::builder().build());
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, put]);
+        let tm = crate::Client::new(crate::Config::builder().client(s3.clone()).build());
+
+        let summary = sync_up_concurrent(&tm, &s3, dir.path(), "bucket", "data", 1)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.sent, 4);
+        assert_eq!(summary.peak_in_flight, 1);
+    }
+
     // --- the wiring, against a mocked service ---
     //
     // The comparison tests above never touch a key's prefix or its path on disk, and
@@ -427,6 +567,60 @@ mod tests {
 #[cfg(all(test, e2e_test))]
 mod real {
     use super::*;
+
+    // Many small files are the case where taking turns hurts: each one costs a round
+    // trip, and a single large file would hide it behind multipart concurrency.
+    #[tokio::test]
+    async fn overlapping_transfers_beat_taking_turns() {
+        let bucket = std::env::var("S3_TEST_BUCKET_NAME_RS")
+            .expect("set S3_TEST_BUCKET_NAME_RS to a bucket you can write to");
+        let count: usize = std::env::var("SYNC_SPIKE_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+
+        let sdk_config = aws_config::from_env().load().await;
+        let s3 = aws_sdk_s3::Client::new(&sdk_config);
+        let tm = crate::Client::new(crate::Config::builder().client(s3.clone()).build());
+
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("f{i:04}.txt")), b"small").unwrap();
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let one_at_a_time = format!("sync-spike/{stamp}-serial");
+        let started = std::time::Instant::now();
+        let serial = sync_up_concurrent(&tm, &s3, dir.path(), &bucket, &one_at_a_time, 1)
+            .await
+            .expect("serial run");
+        let serial_time = started.elapsed();
+
+        let overlapping = format!("sync-spike/{stamp}-concurrent");
+        let started = std::time::Instant::now();
+        let concurrent = sync_up_concurrent(&tm, &s3, dir.path(), &bucket, &overlapping, 64)
+            .await
+            .expect("concurrent run");
+        let concurrent_time = started.elapsed();
+
+        println!(
+            "{count} files\n  one at a time: {serial_time:?} (peak in flight {})\n  overlapping:   {concurrent_time:?} (peak in flight {})",
+            serial.peak_in_flight, concurrent.peak_in_flight
+        );
+
+        assert_eq!(serial.sent, count);
+        assert_eq!(concurrent.sent, count);
+        assert_eq!(serial.peak_in_flight, 1);
+        assert!(concurrent.peak_in_flight > 1);
+        assert!(
+            concurrent_time < serial_time,
+            "overlapping transfers should finish sooner: {concurrent_time:?} vs {serial_time:?}"
+        );
+    }
 
     #[tokio::test]
     async fn a_second_run_transfers_nothing() {
