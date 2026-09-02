@@ -39,14 +39,21 @@ pub(super) struct ObjectDiscovery {
     pub(super) chunk_meta: Option<ChunkMetadata>,
     pub(super) object_meta: ObjectMetadata,
 
-    /// the first chunk of data if fetched during discovery
-    pub(super) initial_chunk: Option<ByteStream>,
+    /// The nonempty first response body, if discovery fetched one.
+    pub(super) initial_chunk: Option<InitialChunk>,
 
     /// Per-chunk size the transfer should slice remaining ranges at. Normally the
     /// configured download part size; for a validated multipart object it is the
     /// object's stored part size so every range aligns to a stored part boundary
     /// (the precondition for per-part download validation).
     pub(super) effective_part_size: u64,
+}
+
+/// A discovery body paired with its validated byte length.
+#[derive(Debug)]
+pub(super) struct InitialChunk {
+    pub(super) body: ByteStream,
+    pub(super) expected_len: usize,
 }
 
 /// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
@@ -131,11 +138,9 @@ pub(super) async fn discover_obj(
     if validation_enabled && input.range().is_none() && is_multipart && !user_explicit_part_size {
         let mut aligned = discover_obj_with_get_first_part(transfer, input).await?;
         let stored_part_size = aligned
-            .chunk_meta
+            .initial_chunk
             .as_ref()
-            .and_then(|m| m.content_length)
-            .map(|len| len as u64)
-            .filter(|&len| len != 0)
+            .map(|chunk| chunk.expected_len as u64)
             .unwrap_or(configured_part_size);
         tracing::debug!(
             configured_part_size,
@@ -290,8 +295,11 @@ fn first_chunk_response_handler(
     let chunk_meta: ChunkMetadata = resp.into();
     let chunk_content_len = chunk_meta
         .content_length
-        .ok_or_else(|| error::discovery_failed("response missing content-length"))?
-        as u64;
+        .ok_or_else(|| error::discovery_failed("response missing content-length"))
+        .and_then(|length| {
+            u64::try_from(length)
+                .map_err(|_| error::discovery_failed("response has negative content-length"))
+        })?;
     let remaining = object_meta
         .total_object_size()
         .checked_sub(1)
@@ -305,9 +313,14 @@ fn first_chunk_response_handler(
             (start <= end).then_some(start..=end)
         });
 
-    let initial_chunk = match chunk_content_len == 0 {
-        true => None,
-        false => Some(body),
+    let initial_chunk = match chunk_content_len {
+        0 => None,
+        length => Some(InitialChunk {
+            body,
+            expected_len: usize::try_from(length).map_err(|_| {
+                error::discovery_failed("response content-length exceeds platform representation")
+            })?,
+        }),
     };
 
     Ok(ObjectDiscovery {
@@ -324,7 +337,7 @@ fn first_chunk_response_handler(
 mod tests {
     use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
-        discover_obj, discover_obj_with_head, ObjectDiscoveryStrategy,
+        discover_obj, discover_obj_with_head, first_chunk_response_handler, ObjectDiscoveryStrategy,
     };
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
@@ -402,6 +415,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_first_chunk_rejects_negative_content_length() {
+        let response = GetObjectOutput::builder().content_length(-1).build();
+
+        let error = first_chunk_response_handler(response, None)
+            .expect_err("negative content-length must not become an unsigned response length");
+
+        assert_eq!(
+            error.kind(),
+            &crate::error::ErrorKind::ObjectNotDiscoverable
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_head() {
@@ -463,6 +489,7 @@ mod tests {
         let initial_chunk = discovery
             .initial_chunk
             .expect("initial chunk")
+            .body
             .collect()
             .await
             .expect("valid body");
@@ -499,6 +526,7 @@ mod tests {
         let initial_chunk = discovery
             .initial_chunk
             .expect("initial chunk")
+            .body
             .collect()
             .await
             .expect("valid body");
@@ -621,6 +649,7 @@ mod tests {
         let initial_chunk = discovery
             .initial_chunk
             .expect("initial chunk")
+            .body
             .collect()
             .await
             .expect("valid body");
@@ -658,6 +687,7 @@ mod tests {
         let initial_chunk = discovery
             .initial_chunk
             .expect("initial chunk")
+            .body
             .collect()
             .await
             .expect("valid body");

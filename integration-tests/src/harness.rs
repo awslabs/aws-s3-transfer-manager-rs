@@ -393,7 +393,7 @@ impl TmTestClient {
         let mut data = Vec::new();
         while let Some(chunk) = handle.body_mut().next().await {
             match chunk {
-                Ok(chunk) => data.extend_from_slice(&chunk.data.into_bytes()),
+                Ok(chunk) => data.extend_from_slice(&chunk.data.into_contiguous()),
                 Err(e) => {
                     // Drive the transfer to terminal so join() surfaces the real error.
                     return Err(handle.join().await.err().unwrap_or(e));

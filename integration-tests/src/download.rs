@@ -33,7 +33,7 @@ async fn drain_body(
     let mut result = Vec::new();
     while let Some(chunk) = handle.body_mut().next().await {
         let chunk = chunk?;
-        result.extend_from_slice(&chunk.data.to_vec());
+        result.extend_from_slice(&chunk.data.into_contiguous());
     }
     Ok(result)
 }
@@ -477,7 +477,7 @@ async fn test_download_empty_object() {
     let body = handle.body_mut();
     let mut data = Vec::new();
     while let Some(chunk) = body.next().await {
-        data.extend_from_slice(&chunk.unwrap().data.into_bytes());
+        data.extend_from_slice(&chunk.unwrap().data.into_contiguous());
     }
 
     assert_eq!(data.len(), 0);
@@ -529,7 +529,7 @@ async fn test_download_slow_consumer_does_not_wedge() {
         let mut data = Vec::new();
         while let Some(chunk) = handle.body_mut().next().await {
             let chunk = chunk.expect("chunk");
-            data.extend_from_slice(&chunk.data.into_bytes());
+            data.extend_from_slice(&chunk.data.into_contiguous());
             // Slow consumer: pull, then pause, holding the in-order cursor back so
             // occupancy fills the window and the gate closes between pulls.
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -653,15 +653,16 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
 
 // ── Shared memory budget: concurrent disk transfers below the drain batch ─────
 //
-// Memory admission is shared across all transfers. A disk transfer's chunk
-// reservation releases only when the drain copies it out, and a non-terminal drain
-// fires only at the drain batch (16 parts) or a full segment. Concurrent multi-part
-// disk transfers each below that batch hold their parts resident until terminal —
-// which needs every part issued, which needs admission. Under a memory budget too tight
-// for all of them at once, none could finalize/drain/release: a global stall. The fix
-// flushes a transfer's resident run before it waits for memory. This drives the
-// exact wedge from the public API (real HTTP, real scheduler, real disk writes) and
-// asserts every transfer completes with bytes intact.
+// Memory admission is shared across all transfers. A disk chunk retains its
+// carrier charge until the drain copies it out, and a non-terminal drain fires
+// only at the drain batch (16 parts) or a full segment. Concurrent multi-part
+// disk transfers each below that batch hold their parts resident until terminal,
+// which needs every part issued and therefore memory admission. Under a memory
+// budget too tight for all of them at once, none could finalize, drain, or return
+// its carriers: a global stall. The fix flushes a transfer's resident run before
+// it waits for memory. This drives the exact wedge from the public API (real
+// HTTP, real scheduler, real disk writes) and asserts every transfer completes
+// with bytes intact.
 
 /// Several concurrent multi-part downloads to disk, each below the drain batch, sharing
 /// a memory budget too small to hold them all at once, must all complete. A regression

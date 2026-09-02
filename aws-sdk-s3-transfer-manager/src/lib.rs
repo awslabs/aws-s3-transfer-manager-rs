@@ -81,7 +81,9 @@ pub mod config;
 
 /// Payload-memory configuration and shared storage
 pub mod memory {
-    pub use crate::runtime::buffer_pool::{BufferPool, BufferPoolBuildError, BufferPoolBuilder};
+    pub use crate::runtime::buffer_pool::{
+        BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,
+    };
     pub use crate::types::{MemoryBudgetConfig, MemoryConfig};
 }
 

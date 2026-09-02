@@ -41,7 +41,7 @@ pub use metrics::MemoryMetrics;
 use metrics::{MemoryDiagnostics, MemoryMetricState};
 use pooled_buf::GrowthAuthority;
 pub(crate) use pooled_buf::PooledBufMut;
-pub(crate) use segmented_bytes::SegmentedBytes;
+pub use segmented_bytes::SegmentedBytes;
 
 #[cfg(test)]
 use test_util::TestHooks;
