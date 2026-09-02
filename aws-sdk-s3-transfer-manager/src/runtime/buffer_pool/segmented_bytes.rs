@@ -37,7 +37,7 @@ use crate::runtime::sync::sync::Arc;
 /// [`Self::into_contiguous`] is zero-copy for zero or one remaining segment.
 /// Multiple remaining segments are copied in logical order.
 #[derive(Clone)]
-pub(crate) struct SegmentedBytes {
+pub struct SegmentedBytes {
     /// Presentation ranges in logical byte order.
     segments: VecDeque<Segment>,
     /// Consumed bytes within the front segment.
@@ -48,12 +48,12 @@ pub(crate) struct SegmentedBytes {
 
 impl SegmentedBytes {
     /// Returns the number of bytes remaining from this cursor.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.remaining
     }
 
     /// Returns whether this cursor has no remaining bytes.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.remaining == 0
     }
 
@@ -62,7 +62,7 @@ impl SegmentedBytes {
     /// Empty and single-segment values do not copy. Multiple segments are
     /// copied in logical order while each source owner remains live until its
     /// bytes have been copied.
-    pub(crate) fn into_contiguous(mut self) -> Bytes {
+    pub fn into_contiguous(mut self) -> Bytes {
         match self.segments.len() {
             0 => Bytes::new(),
             1 => {
@@ -120,6 +120,16 @@ impl SegmentedBytes {
             invariant_violation("empty segmented value retained presentation ranges");
         }
         value
+    }
+}
+
+impl std::fmt::Debug for SegmentedBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentedBytes")
+            .field("segments", &self.segments.len())
+            .field("remaining", &self.remaining)
+            .finish()
     }
 }
 
@@ -235,8 +245,9 @@ impl Buf for SegmentedBytes {
 impl From<Bytes> for SegmentedBytes {
     /// Retains one opaque view without assuming that it belongs to a pool.
     ///
-    /// Pool-aware assembly uses [`SegmentedBytesBuilder::for_pool`] so
-    /// adjacent classified views can share one presentation segment.
+    /// This conversion preserves the input as one presentation segment.
+    /// Values assembled directly from pooled storage may coalesce adjacent
+    /// ranges while retaining their separate ownership boundaries.
     fn from(bytes: Bytes) -> Self {
         let mut builder = SegmentedBytesBuilder::new();
         builder.push_view(bytes);

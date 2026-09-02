@@ -11,13 +11,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use bytes_utils::SegmentedBuf;
+use bytes::BufMut;
 use futures_util::future::{select, Either};
 
 use super::input::copy_fields_to_get_object_request;
 
 use crate::error::{self, ChunkRef, Error};
-use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadState, PendingClaim};
@@ -26,7 +25,9 @@ use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
 use crate::operation::download::DownloadInput;
-use crate::runtime::buffer_pool::{Reservation, ReserveError};
+use crate::runtime::buffer_pool::{
+    AcquireError, BufferPool, PooledBufMut, Reservation, ReserveError, SegmentedBytes,
+};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
 use tracing::Instrument;
@@ -40,8 +41,8 @@ pub(crate) enum DownloadWork {
         slot: Option<BodySlot>,
         etag: Option<Arc<str>>,
     },
-    /// Memory-pressure relief: flush the resident filled run to disk, closing
-    /// its reservations before the transfer waits for more memory. Handled in
+    /// Memory-pressure relief: flush the resident filled run to disk, returning
+    /// its carrier charges before the transfer waits for more memory. Handled in
     /// `execute`; carries no data because it operates on the writer.
     DrainResident,
 }
@@ -53,6 +54,79 @@ fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize
     let end = *remaining.end();
     let chunk_end = cmp::min(start + part_size - 1, end);
     (chunk_end - start + 1) as usize
+}
+
+/// Copies one transport response into reserved pooled storage.
+///
+/// One mutable stream spans every foreign frame so writable carrier tails are
+/// reused. A failed attempt drops that stream before returning to the retry
+/// loop, restoring its direct acquisition authority to `reservation`.
+async fn collect_response_body(
+    pool: &BufferPool,
+    body: aws_sdk_s3::primitives::ByteStream,
+    reservation: &Reservation,
+    expected_len: usize,
+    is_active: impl Fn() -> bool,
+) -> Result<SegmentedBytes, Error> {
+    let mut pooled: Option<PooledBufMut> = None;
+    let mut bytes_received = 0usize;
+    let mut body_stream = body;
+
+    while let Some(result) = body_stream.next().await {
+        let data = result.map_err(|error| error::body_read_error(error, None))?;
+        let remaining = expected_len
+            .checked_sub(bytes_received)
+            .ok_or_else(|| response_length_error(expected_len, bytes_received))?;
+        if data.len() > remaining {
+            return Err(response_length_error(
+                expected_len,
+                bytes_received.saturating_add(data.len()),
+            ));
+        }
+
+        if !data.is_empty() {
+            let output = match &mut pooled {
+                Some(output) => output,
+                slot @ None => slot.insert(
+                    pool.acquire(reservation, data.len())
+                        .map_err(pool_acquisition_error)?,
+                ),
+            };
+            if output.remaining_mut() < data.len() {
+                output.reserve(data.len()).map_err(pool_acquisition_error)?;
+            }
+            output.put_slice(&data);
+            bytes_received += data.len();
+        }
+
+        if !is_active() {
+            return Err(Error::new(
+                error::ErrorKind::OperationCancelled,
+                "transfer cancelled during body read",
+            ));
+        }
+    }
+
+    if bytes_received != expected_len {
+        return Err(response_length_error(expected_len, bytes_received));
+    }
+
+    pooled
+        .map(PooledBufMut::freeze)
+        .ok_or_else(|| response_length_error(expected_len, bytes_received))
+}
+
+/// Maps a malformed response length to the body-read retry class.
+fn response_length_error(expected: usize, received: usize) -> Error {
+    Error::new(
+        error::ErrorKind::IOError,
+        format!("response body length mismatch: expected {expected} bytes, received {received}"),
+    )
+}
+
+/// Pool acquisition cannot be repaired by reissuing the network request.
+fn pool_acquisition_error(source: AcquireError) -> Error {
+    Error::new(error::ErrorKind::RuntimeError, source)
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -529,7 +603,7 @@ impl DownloadTransfer {
         }
     }
 
-    /// Flush the resident filled run to disk, closing its memory reservations,
+    /// Flush the resident filled run to disk, returning its pooled carriers,
     /// then release the freed read-ahead occupancy. Emitted when a transfer
     /// would otherwise wait for memory admission while retaining a resident run.
     ///
@@ -537,9 +611,9 @@ impl DownloadTransfer {
     /// untouched; only occupancy is released (matching the gate side of
     /// [`decrement_in_flight`](Self::decrement_in_flight), under the same state lock so
     /// the release is ordered against the issuer's park). Dropping the drained
-    /// `ChunkOutput`s frees their reservations, which memory admission re-grants
-    /// FIFO; the `on_completion -> generate_work` after this returns re-polls
-    /// this transfer.
+    /// `ChunkOutput`s returns their carrier charges, which memory admission
+    /// re-grants FIFO; the `on_completion -> generate_work` after this returns
+    /// re-polls this transfer.
     fn execute_drain_resident(&self) -> WorkOutcome {
         let freed = match self.inner.writer.flush_resident() {
             Ok(f) => f,
@@ -609,7 +683,8 @@ impl DownloadTransfer {
         let chunk_content_len = chunk_meta
             .as_ref()
             .and_then(|m| m.content_length)
-            .unwrap_or(0) as u64;
+            .and_then(|length| u64::try_from(length).ok())
+            .unwrap_or(0);
         let total_size =
             chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
         self.inner.writer.preallocate(total_size);
@@ -617,7 +692,8 @@ impl DownloadTransfer {
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
-        // Invariant: initial_chunk.is_some() == chunk_meta.is_some()
+        // A GET discovery always supplies metadata. A nonempty GET also
+        // supplies one body with its already-validated allocation length.
         //
         // Reserve the discovery chunk's memory here too: it is already resident (the
         // discovery GET fetched it), so it must be accounted before any read-ahead
@@ -627,12 +703,12 @@ impl DownloadTransfer {
         // returning `Pending` to the scheduler (discovery runs in async `execute`,
         // not `poll_work`).
         let initial_work = match (initial_chunk, chunk_meta) {
-            (Some(stream), Some(meta)) => {
+            (Some(initial), Some(meta)) => {
                 let mut slot = self.inner.writer.claim();
-                match self.reserve_chunk(chunk_content_len as usize).await {
+                match self.reserve_chunk(initial.expected_len).await {
                     Ok(Some(reservation)) => {
                         slot.attach_reservation(reservation);
-                        Some((stream, meta, slot))
+                        Some((initial.body, initial.expected_len, meta, slot))
                     }
                     // Terminal (cancel/fail by another path) while reserving the discovery
                     // chunk: the transfer is already in its terminal state, so drop the
@@ -677,8 +753,8 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, process it
         match initial_work {
-            Some((stream, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(stream, slot, chunk_meta, etag)
+            Some((stream, expected_len, chunk_meta, slot)) => {
+                self.execute_read_discovery_body(stream, expected_len, slot, chunk_meta, etag)
                     .await
             }
             None => WorkOutcome::Success { data: None },
@@ -688,6 +764,7 @@ impl DownloadTransfer {
     async fn execute_read_discovery_body(
         &self,
         stream: aws_sdk_s3::primitives::ByteStream,
+        expected_len: usize,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
@@ -713,6 +790,7 @@ impl DownloadTransfer {
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
         // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
         // goes through `guarded`, which times and records its TTFB.
+        let reservation = slot.reservation();
         let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
@@ -760,7 +838,13 @@ impl DownloadTransfer {
                     }
                 };
                 // Untimed: drain the body. Errors here are inner (retryable IO).
-                Self::read_body_stream(&ctx, body)
+                collect_response_body(
+                    &ctx.handle.buffer_pool,
+                    body,
+                    reservation,
+                    expected_len,
+                    || ctx.is_active(),
+                )
                     .await
                     .map_err(crate::retry::GuardError::Inner)
             }
@@ -772,7 +856,7 @@ impl DownloadTransfer {
         ))
         .await;
 
-        let (segmented, bytes_received) = match result {
+        let bytes = match result {
             Ok(val) => val,
             // Go terminal before any wake: fail() sets Terminal under the lock, so
             // a woken poll_work cannot observe ranges_in_flight==0 and complete()
@@ -792,10 +876,8 @@ impl DownloadTransfer {
                 .and_then(crate::http::header::parse_content_range)
                 .map(|r| *r.start())
                 .unwrap_or(0),
-            data: AggregatedBytes(segmented),
+            data: bytes,
             metadata: chunk_meta,
-            // The slot carries the reservation; fill() moves it into the chunk.
-            reservation: None,
         };
 
         // Edge-triggered disk write: a fill that brings the segment's filled count to
@@ -816,6 +898,8 @@ impl DownloadTransfer {
         // disk_write reflects bytes committed to the file sink buffer.
         // Actual disk flushes are batched; disk_write may lead physical
         // I/O at any snapshot but converges on transfer completion.
+        let bytes_received =
+            u64::try_from(expected_len).expect("validated discovery length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             disk_write: if self.inner.writer.has_sink() {
@@ -834,37 +918,6 @@ impl DownloadTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    /// Drain a chunk body stream into a buffer, returning the bytes and the count.
-    ///
-    /// Shared by the range-chunk and discovery-chunk paths. A stream error is
-    /// classified by [`error::body_read_error`]: a checksum mismatch becomes
-    /// [`ErrorKind::IntegrityError`] (which the retry classifier never re-issues,
-    /// to avoid masking corruption), any other stream failure becomes
-    /// [`ErrorKind::IOError`] (the body-read class the classifier re-issues). A
-    /// cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`].
-    async fn read_body_stream(
-        ctx: &TransferContext,
-        body: aws_sdk_s3::primitives::ByteStream,
-    ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
-        let mut segmented = SegmentedBuf::new();
-        let mut bytes_received: u64 = 0;
-        let mut body_stream = body;
-
-        while let Some(result) = body_stream.next().await {
-            let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
-            bytes_received += data.len() as u64;
-            segmented.push(data);
-            if !ctx.is_active() {
-                return Err(crate::error::Error::new(
-                    crate::error::ErrorKind::OperationCancelled,
-                    "transfer cancelled during body read",
-                ));
-            }
-        }
-
-        Ok((segmented, bytes_received))
-    }
-
     async fn execute_get_range(
         &self,
         range: std::ops::RangeInclusive<u64>,
@@ -874,6 +927,24 @@ impl DownloadTransfer {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
         let range_header = format!("bytes={}-{}", range.start(), range.end());
+        let expected_len = match range
+            .end()
+            .checked_sub(*range.start())
+            .and_then(|len| len.checked_add(1))
+            .and_then(|len| usize::try_from(len).ok())
+        {
+            Some(len) if len != 0 => len,
+            _ => {
+                return self.fail_range(
+                    ChunkRef::new(seq, Some(*range.start()..=*range.end())),
+                    error::Error::new(
+                        error::ErrorKind::RuntimeError,
+                        "download range length exceeds platform representation",
+                    ),
+                )
+            }
+        };
+        let reservation = slot.reservation();
 
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (send → headers ≈ TTFB): the
@@ -912,14 +983,16 @@ impl DownloadTransfer {
                     .await?;
                 // Untimed: drain the body. Errors here are inner (retryable IO).
                 let chunk_meta = ChunkMetadata::from(&resp);
-                let (segmented, bytes_received) = Self::read_body_stream(&ctx, resp.body)
-                    .await
-                    .map_err(crate::retry::GuardError::Inner)?;
-                Ok::<_, crate::retry::GuardError<crate::error::Error>>((
-                    chunk_meta,
-                    segmented,
-                    bytes_received,
-                ))
+                let bytes = collect_response_body(
+                    &ctx.handle.buffer_pool,
+                    resp.body,
+                    reservation,
+                    expected_len,
+                    || ctx.is_active(),
+                )
+                .await
+                .map_err(crate::retry::GuardError::Inner)?;
+                Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
             }
         })
         .instrument(tracing::debug_span!(
@@ -929,7 +1002,7 @@ impl DownloadTransfer {
         ))
         .await;
 
-        let (chunk_meta, segmented, bytes_received) = match result {
+        let (chunk_meta, bytes) = match result {
             Ok(val) => val,
             Err(e) => {
                 return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
@@ -940,10 +1013,8 @@ impl DownloadTransfer {
         let chunk = ChunkOutput {
             seq,
             offset: *range.start(),
-            data: AggregatedBytes(segmented),
+            data: bytes,
             metadata: chunk_meta,
-            // The slot carries the reservation; fill() moves it into the chunk.
-            reservation: None,
         };
 
         // Edge-triggered disk write: a fill that brings the segment's filled count to
@@ -966,6 +1037,8 @@ impl DownloadTransfer {
         // disk_write reflects bytes committed to the file sink buffer.
         // Actual disk flushes are batched; disk_write may lead physical
         // I/O at any snapshot but converges on transfer completion.
+        let bytes_received =
+            u64::try_from(expected_len).expect("validated range length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             disk_write: if self.inner.writer.has_sink() {
@@ -1043,7 +1116,7 @@ impl DownloadTransfer {
     }
 
     /// Finalize a transfer that reached its terminal completion in `execute`: flush the
-    /// tail to disk (releasing the last reservations as their `ChunkOutput`s drop), set the
+    /// tail to disk (returning the last carrier charges as `ChunkOutput`s drop), set the
     /// terminal status, and signal waiters. The state is already `Terminal` (claimed under
     /// the lock in `decrement_in_flight`); this runs after the lock is released so disk IO
     /// never happens under it. Symmetric with `fail`, which error paths already call from
@@ -1217,6 +1290,258 @@ fn build_integrity_checks(
         cm.and_then(|m| m.checksum_type.clone()),
         checksum_validation,
     )
+}
+
+#[cfg(all(test, not(s3_tm_loom)))]
+mod response_collection_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    use bytes::{Buf, Bytes};
+    use http_body_1x::{Body as HttpBody, Frame, SizeHint};
+
+    use super::*;
+
+    /// Deterministic multi-frame body separating transport frames from carriers.
+    struct TestFrameBody {
+        frames: std::collections::VecDeque<Bytes>,
+        remaining: usize,
+    }
+
+    impl TestFrameBody {
+        fn new(frames: impl IntoIterator<Item = Bytes>) -> Self {
+            let frames: std::collections::VecDeque<_> = frames.into_iter().collect();
+            let remaining = frames.iter().map(Bytes::len).sum();
+            Self { frames, remaining }
+        }
+
+        fn into_byte_stream(self) -> aws_sdk_s3::primitives::ByteStream {
+            aws_sdk_s3::primitives::ByteStream::from_body_1_x(self)
+        }
+    }
+
+    impl HttpBody for TestFrameBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let Some(frame) = self.frames.pop_front() else {
+                return Poll::Ready(None);
+            };
+            self.remaining = self
+                .remaining
+                .checked_sub(frame.len())
+                .expect("test frame accounting underflow");
+            Poll::Ready(Some(Ok(Frame::data(frame))))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frames.is_empty()
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.remaining as u64)
+        }
+    }
+
+    struct CountedFrame {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for CountedFrame {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for CountedFrame {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn test_pool() -> BufferPool {
+        crate::memory::BufferPool::builder()
+            .memory_budget(crate::types::MemoryBudgetConfig::Limit(128 * 1024))
+            .build()
+            .expect("response collector test pool")
+    }
+
+    fn collect_ready(
+        pool: &BufferPool,
+        body: aws_sdk_s3::primitives::ByteStream,
+        reservation: &Reservation,
+        expected_len: usize,
+    ) -> Result<SegmentedBytes, Error> {
+        collect_ready_with(pool, body, reservation, expected_len, || true)
+    }
+
+    fn collect_ready_with(
+        pool: &BufferPool,
+        body: aws_sdk_s3::primitives::ByteStream,
+        reservation: &Reservation,
+        expected_len: usize,
+        is_active: impl Fn() -> bool,
+    ) -> Result<SegmentedBytes, Error> {
+        let mut future = std::pin::pin!(collect_response_body(
+            pool,
+            body,
+            reservation,
+            expected_len,
+            is_active,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("in-memory test body unexpectedly yielded Pending"),
+        }
+    }
+
+    /// Three frames require more than half a carrier each. Reusing writable
+    /// tails fits them in a two-carrier reservation.
+    #[test]
+    fn test_collection_reuses_tail_and_releases_foreign_frames() {
+        const FRAME_LEN: usize = 9_000;
+        const EXPECTED_LEN: usize = FRAME_LEN * 3;
+
+        let pool = test_pool();
+        let reservation = pool
+            .try_reserve(EXPECTED_LEN)
+            .unwrap()
+            .expect("collector reservation");
+        let expected: Vec<u8> = (0..EXPECTED_LEN)
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = Bytes::from_owner(CountedFrame {
+            bytes: expected[..FRAME_LEN].to_vec(),
+            drops: Arc::clone(&drops),
+        });
+        let body = TestFrameBody::new([
+            Bytes::new(),
+            first,
+            Bytes::copy_from_slice(&expected[FRAME_LEN..FRAME_LEN * 2]),
+            Bytes::copy_from_slice(&expected[FRAME_LEN * 2..]),
+        ])
+        .into_byte_stream();
+
+        let mut output = collect_ready(&pool, body, &reservation, EXPECTED_LEN)
+            .expect("frames fit one reserved stream");
+
+        assert_eq!(output.len(), EXPECTED_LEN);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "transport owner must drop after its frame is copied"
+        );
+        assert_ne!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(output.copy_to_bytes(EXPECTED_LEN).as_ref(), expected);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_short_attempt_restores_reservation_authority_before_retry() {
+        const EXPECTED_LEN: usize = 20_000;
+
+        let pool = test_pool();
+        let reservation = pool
+            .try_reserve(EXPECTED_LEN)
+            .unwrap()
+            .expect("collector reservation");
+        let short = TestFrameBody::new([
+            Bytes::from(vec![0x11; 9_000]),
+            Bytes::from(vec![0x22; 9_000]),
+        ])
+        .into_byte_stream();
+
+        let error = collect_ready(&pool, short, &reservation, EXPECTED_LEN)
+            .expect_err("short attempt unexpectedly succeeded");
+        assert_eq!(error.kind(), &error::ErrorKind::IOError);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+
+        let expected: Vec<u8> = (0..EXPECTED_LEN)
+            .map(|index| (index.wrapping_mul(17) % 251) as u8)
+            .collect();
+        let retry = TestFrameBody::new([
+            Bytes::copy_from_slice(&expected[..7_000]),
+            Bytes::copy_from_slice(&expected[7_000..]),
+        ])
+        .into_byte_stream();
+        let output = collect_ready(&pool, retry, &reservation, EXPECTED_LEN)
+            .expect("retry reacquires returned authority");
+
+        assert_eq!(
+            output.clone().copy_to_bytes(EXPECTED_LEN).as_ref(),
+            expected
+        );
+        reservation.close_acquisition();
+        assert_ne!(
+            pool.metrics().charged_capacity_bytes(),
+            0,
+            "immutable output retains pooled owners after reservation close"
+        );
+        drop(output);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_collection_rejects_same_carrier_length_overrun() {
+        const EXPECTED_LEN: usize = 8;
+
+        let pool = test_pool();
+        let reservation = pool
+            .try_reserve(EXPECTED_LEN)
+            .unwrap()
+            .expect("collector reservation");
+        let body = TestFrameBody::new([Bytes::from_static(b"123456789")]).into_byte_stream();
+
+        let error = collect_ready(&pool, body, &reservation, EXPECTED_LEN)
+            .expect_err("oversized attempt unexpectedly succeeded");
+
+        assert_eq!(error.kind(), &error::ErrorKind::IOError);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_collection_observes_cancellation_after_an_empty_frame() {
+        let pool = test_pool();
+        let reservation = pool.try_reserve(4).unwrap().expect("collector reservation");
+        let body =
+            TestFrameBody::new([Bytes::new(), Bytes::from_static(b"data")]).into_byte_stream();
+
+        let error = collect_ready_with(&pool, body, &reservation, 4, || false)
+            .expect_err("cancelled attempt unexpectedly succeeded");
+
+        assert_eq!(error.kind(), &error::ErrorKind::OperationCancelled);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_collection_rejects_reservation_envelope_exhaustion() {
+        const RESPONSE_LEN: usize = 128 * 1024;
+
+        let pool = test_pool();
+        let reservation = pool.try_reserve(1).unwrap().expect("one-carrier envelope");
+        let body = TestFrameBody::new([Bytes::from(vec![0; RESPONSE_LEN])]).into_byte_stream();
+
+        let error = collect_ready(&pool, body, &reservation, RESPONSE_LEN)
+            .expect_err("acquisition escaped its reservation envelope");
+
+        assert_eq!(error.kind(), &error::ErrorKind::RuntimeError);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        drop(
+            pool.acquire(&reservation, 1)
+                .expect("failed acquisition did not consume direct authority"),
+        );
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -1635,7 +1960,7 @@ mod tests {
     /// Shared memory admission is the second issuance gate. With the read-ahead
     /// window open, a transfer still returns `Pending` when its memory budget is
     /// exhausted. It retains the claimed slot and resumes when a delivered chunk
-    /// closes a reservation and capacity is granted to the FIFO head.
+    /// returns its carrier charge and capacity is granted to the FIFO head.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_memory_admission_blocks_then_resumes_in_fifo_order() {
@@ -1649,13 +1974,19 @@ mod tests {
         let pool = transfer.ctx().handle.buffer_pool.clone();
         assert_eq!(
             pool.metrics().active_planned_demand_bytes(),
+            0,
+            "the completed discovery response has closed acquisition authority"
+        );
+        assert_eq!(
+            pool.metrics().admission_used_bytes(),
             part_size,
-            "discovery chunk is reserved"
+            "the delivered discovery payload remains charged"
         );
 
         // The discovery chunk plus one range exactly fill configured capacity.
         let _w1 = assert_ready(transfer.poll_work());
-        assert_eq!(pool.metrics().active_planned_demand_bytes(), 2 * part_size);
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), part_size);
+        assert_eq!(pool.metrics().admission_used_bytes(), 2 * part_size);
 
         // Part 2 cannot fit and waits in the memory-admission FIFO, holding
         // the claimed slot in `pending` until a chunk frees.
@@ -1671,11 +2002,11 @@ mod tests {
             }
         }
 
-        // Dropping the discovery chunk closes its reservation. Memory admission
+        // Dropping the discovery chunk returns its carrier. Memory admission
         // grants that capacity directly to the FIFO head.
         drop(consumer.try_take_next().expect("discovery chunk is filled"));
         assert_eq!(
-            pool.metrics().active_planned_demand_bytes(),
+            pool.metrics().admission_used_bytes(),
             2 * part_size,
             "freed capacity re-granted to the memory waiter"
         );
@@ -1730,14 +2061,18 @@ mod tests {
         let (transfer, _consumer) = create_download_for_gate_with_capacity(
             object_size,
             part_size,
-            Some(part_size as usize),
+            Some(2 * part_size as usize),
         );
 
         skip_discovery(&transfer).await;
 
-        // The transfer holds a filled seq-0 (resident on the stream surface) and
-        // waits for memory admission for part 1. Because it is stream mode, the
-        // relief path is off: poll_work returns Pending, not Ready(DrainResident).
+        // The completed discovery payload remains charged while part 1 retains
+        // open acquisition authority. Part 2 therefore waits normally rather
+        // than using idle-only admission.
+        let _part_1 = assert_ready(transfer.poll_work());
+
+        // Because this is stream mode, the relief path is off: poll_work
+        // returns Pending, not Ready(DrainResident).
         match transfer.poll_work() {
             PollWork::Pending => {}
             PollWork::Spawned => panic!("unexpected Spawned"),
@@ -1790,8 +2125,13 @@ mod tests {
         // No planned demand was granted to the cancelled waiter.
         assert_eq!(
             pool.metrics().active_planned_demand_bytes(),
+            part_size,
+            "only part 1 retains acquisition authority; the waiter was not granted"
+        );
+        assert_eq!(
+            pool.metrics().admission_used_bytes(),
             2 * part_size,
-            "exactly the discovery + part-1 reservations remain; none granted to the cancelled waiter"
+            "the discovery payload and part-1 reservation remain charged"
         );
 
         // The consumer is woken and sees terminal rather than hanging on seq.
@@ -1881,18 +2221,23 @@ mod tests {
         );
         assert_eq!(
             pool.metrics().active_planned_demand_bytes(),
+            part_size,
+            "only part 1 retains acquisition authority; the waiter was not granted"
+        );
+        assert_eq!(
+            pool.metrics().admission_used_bytes(),
             2 * part_size,
-            "exactly the discovery + part-1 reservations remain; none granted to the failed waiter"
+            "the discovery payload and part-1 reservation remain charged"
         );
 
         let _ = consumer.try_take_next();
     }
 
-    /// A single-chunk disk download must flush its tail and close its memory
-    /// reservation from `execute`, not from a later `poll_work`.
+    /// A single-chunk disk download must flush its tail and return its carrier
+    /// charge from `execute`, not from a later `poll_work`.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_terminal_drain_and_reservation_close_happen_in_execute() {
+    async fn test_terminal_drain_and_carrier_return_happen_in_execute() {
         let part_size = 8 * MB;
         // Single chunk: object_size == part_size. Discovery fetches the entire object in
         // one chunk; no range requests are generated. The terminal completion path runs
@@ -1928,7 +2273,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // Disk-mode body so finalize drains to a file, releasing reservations on drop.
+        // Disk-mode body so finalize drains to a file and returns carrier charges.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
@@ -1945,8 +2290,8 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         let outcome = execute(&transfer, &mut work).await;
 
-        // The terminal execute must have finalized (drained to disk) and released the
-        // reservation -- all without any subsequent poll_work.
+        // The terminal execute must have finalized and returned the carrier
+        // charge, all without any subsequent poll_work.
         assert!(
             matches!(outcome, WorkOutcome::Success { .. }),
             "expected Success, got {:?}",
@@ -1955,7 +2300,7 @@ mod tests {
         assert_eq!(
             pool.metrics().active_planned_demand_bytes(),
             0,
-            "terminal drain + reservation close must happen in execute, not a later poll_work"
+            "terminal drain + carrier return must happen in execute, not a later poll_work"
         );
         assert!(
             !transfer.ctx().is_active(),
@@ -2043,16 +2388,16 @@ mod tests {
     /// REGRESSION (PR #154 review, landonxjames): the shared-admission deadlock for
     /// concurrent multi-part disk transfers below the drain batch must NOT wedge.
     ///
-    /// Before the fix: a disk chunk's reservation released only on a drain (fires at the
+    /// Before the fix: a disk chunk's charge returned only on a drain (fires at the
     /// batch `min(SEG_SIZE=16, window)` or a full segment) or the terminal finalize. A
     /// multi-part object below a segment (2..15 parts) held ALL parts resident until
     /// terminal, which needs every part issued and therefore memory admission. Spread across
     /// concurrent transfers under tight shared admission, none could reach its part
-    /// count, so none finalized, drained, or released its reservation.
+    /// count, so none finalized, drained, or returned its carrier.
     ///
     /// The fix (`DownloadWork::DrainResident`): a transfer about to
-    /// wait for memory while holding a resident run flushes it first, closing
-    /// reservations for the FIFO. This test drives two 2-part transfers on a
+    /// wait for memory while holding a resident run flushes it first, returning
+    /// carriers for the FIFO. This test drives two 2-part transfers on a
     /// 2-part memory budget to completion.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -2198,9 +2543,9 @@ mod tests {
         fill_resident(&b, resident_per_transfer).await;
 
         assert_eq!(
-            pool.metrics().active_planned_demand_bytes(),
+            pool.metrics().admission_used_bytes(),
             capacity_bytes as u64,
-            "both transfers hold their resident parts; memory budget is exactly full"
+            "both transfers hold charged resident parts; memory budget is exactly full"
         );
 
         // Both are mid-stream (17 parts each remaining) with the budget full. Pre-fix

@@ -3,10 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::collections::VecDeque;
+use std::io::IoSlice;
+
 use bytes::Buf;
 
-use crate::io::AggregatedBytes;
-use crate::runtime::buffer_pool::Reservation;
+use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
 use crate::runtime::sync::sync::Arc;
 
 use super::chunk_meta::ChunkMetadata;
@@ -36,6 +38,70 @@ impl WakeNotify {
     async fn notified(&self) {}
 }
 
+/// One logical positioned write assembled from adjacent download chunks.
+///
+/// Each child keeps its own read cursor and owners. Advancing the run therefore
+/// releases crossed pooled owners without gathering them into opaque `Bytes`.
+#[derive(Debug, Default)]
+struct WriteBuffer {
+    buffers: VecDeque<SegmentedBytes>,
+    remaining: usize,
+}
+
+impl WriteBuffer {
+    fn push(&mut self, buffer: SegmentedBytes) {
+        if buffer.is_empty() {
+            return;
+        }
+        self.remaining = self
+            .remaining
+            .checked_add(buffer.remaining())
+            .expect("download write run length overflow");
+        self.buffers.push_back(buffer);
+    }
+}
+
+impl Buf for WriteBuffer {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.buffers.front().map(Buf::chunk).unwrap_or_default()
+    }
+
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        let mut written = 0;
+        for buffer in &self.buffers {
+            if written == dst.len() {
+                break;
+            }
+            written += buffer.chunks_vectored(&mut dst[written..]);
+        }
+        written
+    }
+
+    fn advance(&mut self, mut count: usize) {
+        assert!(
+            count <= self.remaining,
+            "advanced beyond download write run"
+        );
+        self.remaining -= count;
+        while count != 0 {
+            let front = self
+                .buffers
+                .front_mut()
+                .expect("download write run lost its front buffer");
+            let advanced = count.min(front.remaining());
+            front.advance(advanced);
+            count -= advanced;
+            if !front.has_remaining() {
+                self.buffers.pop_front();
+            }
+        }
+    }
+}
+
 /// Positioned-write target for download-to-file. Abstracts the file so the drain
 /// orchestration (run coalescing, offset translation) can be exercised against an
 /// in-memory capture, and so an alternative write strategy (e.g. O_DIRECT/io_uring)
@@ -44,13 +110,9 @@ impl WakeNotify {
 /// `write_all_at` writes the whole buffer at an absolute file position; `preallocate`
 /// is a best-effort size hint. Implementations are shared across the issuer and the
 /// drain task, hence `Send + Sync`.
-pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
+trait SinkWrite: Send + Sync + std::fmt::Debug {
     /// Write the entire buffer at `pos` bytes into the target.
-    fn write_all_at(
-        &self,
-        buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-        pos: u64,
-    ) -> std::io::Result<()>;
+    fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()>;
 
     /// Best-effort preallocation of `len` bytes. Default no-op.
     fn preallocate(&self, _len: u64) {}
@@ -71,11 +133,7 @@ impl std::fmt::Debug for FileSink {
 }
 
 impl SinkWrite for FileSink {
-    fn write_all_at(
-        &self,
-        buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-        pos: u64,
-    ) -> std::io::Result<()> {
+    fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()> {
         crate::io::fs::write_all_at(&self.file, buf, pos)
     }
 
@@ -119,17 +177,16 @@ impl std::fmt::Debug for BodyWriter {
 
 /// A claimed slot in the body buffer, produced by [`BodyWriter::claim`].
 /// Consuming [`fill`](Self::fill) publishes the payload and notifies the
-/// consumer. Drop without fill still wakes the consumer (lost-wake safety).
+/// consumer. Drop without fill still wakes the consumer and closes any
+/// attached reservation.
 pub(crate) struct BodySlot {
     handle: Option<SlotHandle<ChunkOutput>>,
     buffer: PagedRecvBuffer<ChunkOutput>,
     notify: Arc<WakeNotify>,
-    /// Memory reservation held from claim, moved into the chunk at
-    /// [`fill`](Self::fill). The reservation then rides the `ChunkOutput` through
-    /// the buffer and drops with it: on the stream surface when the consumer drops
-    /// the delivered chunk (its true residency), on the disk surface when the drain
-    /// frees the payload after copy-out. `None` until [`attach_reservation`], and on
-    /// paths that do not reserve (tests).
+    /// Memory reservation held from claim through response collection. A
+    /// successful fill closes acquisition authority; the immutable payload then
+    /// owns every live carrier charge directly. `None` until
+    /// [`attach_reservation`], and on paths that do not reserve (tests).
     reservation: Option<Reservation>,
 }
 
@@ -147,20 +204,32 @@ impl BodySlot {
         self.handle.as_ref().expect("slot already consumed").seq()
     }
 
-    /// Attach the memory reservation backing this chunk. Held on the slot
-    /// from claim until [`fill`](Self::fill) moves it into the `ChunkOutput`, so it
-    /// drops with the chunk's bytes rather than at the buffer boundary.
+    /// Returns the reservation attached before this slot was dispatched.
+    ///
+    /// Response attempts borrow this authority while copying transport-owned
+    /// frames into pooled carriers. A failed attempt drops its carriers but
+    /// leaves the reservation on the slot for the next attempt.
+    pub(crate) fn reservation(&self) -> &Reservation {
+        self.reservation
+            .as_ref()
+            .expect("body slot dispatched without a memory reservation")
+    }
+
+    /// Attach the memory reservation backing this chunk. It remains open while
+    /// response attempts may acquire carriers and closes on successful fill.
     pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
         self.reservation = Some(reservation);
     }
 
     /// Publish a completed chunk into this slot. Wakes the stream consumer
-    /// and returns the fill outcome (whether a segment was sealed). The slot's
-    /// reservation moves into the chunk so it rides through the buffer and drops
-    /// with the delivered bytes.
-    pub(crate) fn fill(mut self, mut chunk: ChunkOutput) -> FillOutcome {
+    /// and returns the fill outcome (whether a segment was sealed). Immutable
+    /// owners retain all acquired carriers, so no direct acquisition authority
+    /// is needed after this point.
+    pub(crate) fn fill(mut self, chunk: ChunkOutput) -> FillOutcome {
         let handle = self.handle.take().expect("slot already consumed");
-        chunk.reservation = self.reservation.take().map(Arc::new);
+        if let Some(reservation) = self.reservation.take() {
+            reservation.close_acquisition();
+        }
         let outcome = self.buffer.fill(handle, chunk);
         self.notify.notify_one();
         outcome
@@ -236,7 +305,7 @@ impl BodyWriter {
     /// Whether a forced eager drain would free at least one resident part right now:
     /// the disk surface holds a contiguous filled run at some segment's claim cursor.
     /// Stream mode returns false: its consumer drives release, so it never pins
-    /// reservations behind the drain batch. This gates memory-pressure relief.
+    /// carrier charges behind the drain batch. This gates memory-pressure relief.
     pub(crate) fn has_drainable_resident(&self) -> bool {
         matches!(&*self.mode, Mode::Disk { .. }) && self.buffer.has_drainable_prefix()
     }
@@ -283,7 +352,7 @@ fn write_run(
 ) -> std::io::Result<()> {
     let mut run_start_file_pos: Option<u64> = None;
     let mut run_end: u64 = 0;
-    let mut combined = bytes_utils::SegmentedBuf::<bytes::Bytes>::new();
+    let mut combined = WriteBuffer::default();
 
     for slot in sw.payloads() {
         let Some(chunk) = slot.get() else {
@@ -291,7 +360,7 @@ fn write_run(
             // and reset.
             if let Some(pos) = run_start_file_pos.take() {
                 sink.write_all_at(&mut combined, pos)?;
-                combined = bytes_utils::SegmentedBuf::new();
+                combined = WriteBuffer::default();
             }
             continue;
         };
@@ -303,7 +372,7 @@ fn write_run(
             if file_pos != run_end {
                 // Gap: flush the accumulated run and start a new one.
                 sink.write_all_at(&mut combined, start)?;
-                combined = bytes_utils::SegmentedBuf::new();
+                combined = WriteBuffer::default();
                 run_start_file_pos = Some(file_pos);
                 run_end = file_pos + chunk_len;
             } else {
@@ -314,10 +383,7 @@ fn write_run(
             run_end = file_pos + chunk_len;
         }
 
-        // Clone Bytes segments (refcount bump, zero data copy).
-        for seg in chunk.data.clone().into_segments() {
-            combined.push(seg);
-        }
+        combined.push(chunk.data.clone());
     }
 
     // Flush any remaining accumulated run.
@@ -425,17 +491,15 @@ pub struct ChunkOutput {
     pub(crate) seq: u64,
     /// Byte offset in the object where this chunk starts.
     pub(crate) offset: u64,
-    /// The content associated with this particular ranged GetObject request.
-    pub data: AggregatedBytes,
+    /// The content associated with this ranged `GetObject` request.
+    ///
+    /// The value implements [`bytes::Buf`] for incremental or vectored reads.
+    /// [`SegmentedBytes::into_contiguous`] avoids a copy when the remaining
+    /// payload has one presentation segment.
+    pub data: SegmentedBytes,
     /// The metadata associated with this particular ranged GetObject request. This contains all the
     /// metadata returned by the S3 GetObject operation.
     pub metadata: ChunkMetadata,
-    /// Memory-budget reservation admitting this chunk's planned demand. It rides
-    /// the chunk from fill through delivery and closes when the last clone drops.
-    /// `AggregatedBytes` clones share the same backing bytes, so one shared
-    /// reservation matches their ownership lifetime. `None` on test paths that
-    /// do not use memory admission.
-    pub(crate) reservation: Option<Arc<Reservation>>,
 }
 
 impl std::fmt::Debug for ChunkOutput {
@@ -514,21 +578,20 @@ impl Body {
 
 #[cfg(test)]
 mod tests {
+    use crate::memory::SegmentedBytes;
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::{error, operation::download::body::ChunkOutput};
-    use bytes::Bytes;
-    use bytes_utils::SegmentedBuf;
+    use bytes::{BufMut, Bytes};
     use std::sync::Arc;
 
-    use super::{new_recv_body, AggregatedBytes, Body, BodyWriter};
+    use super::{new_recv_body, Body, BodyWriter};
 
-    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
+    fn chunk_resp(seq: u64, data: SegmentedBytes) -> ChunkOutput {
         ChunkOutput {
             seq,
             offset: 0,
             data,
             metadata: Default::default(),
-            reservation: None,
         }
     }
 
@@ -568,20 +631,23 @@ mod tests {
             let s2 = writer.claim();
 
             // Fill out of order: 2, 0, 1
-            let mut seg2 = SegmentedBuf::new();
-            seg2.push(Bytes::from("chunk 2"));
             let seq2 = s2.seq();
-            s2.fill(chunk_resp(seq2, AggregatedBytes(seg2)));
+            s2.fill(chunk_resp(
+                seq2,
+                SegmentedBytes::from(Bytes::from("chunk 2")),
+            ));
 
-            let mut seg0 = SegmentedBuf::new();
-            seg0.push(Bytes::from("chunk 0"));
             let seq0 = s0.seq();
-            s0.fill(chunk_resp(seq0, AggregatedBytes(seg0)));
+            s0.fill(chunk_resp(
+                seq0,
+                SegmentedBytes::from(Bytes::from("chunk 0")),
+            ));
 
-            let mut seg1 = SegmentedBuf::new();
-            seg1.push(Bytes::from("chunk 1"));
             let seq1 = s1.seq();
-            s1.fill(chunk_resp(seq1, AggregatedBytes(seg1)));
+            s1.fill(chunk_resp(
+                seq1,
+                SegmentedBytes::from(Bytes::from("chunk 1")),
+            ));
 
             ctx_clone.ctx().set_completed();
         });
@@ -589,7 +655,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.into_contiguous().to_vec()).unwrap();
             received.push(data);
         }
 
@@ -605,10 +671,11 @@ mod tests {
 
         // Fill one chunk
         let s0 = writer.claim();
-        let mut seg = SegmentedBuf::new();
-        seg.push(Bytes::from("chunk 0"));
         let seq0 = s0.seq();
-        s0.fill(chunk_resp(seq0, AggregatedBytes(seg)));
+        s0.fill(chunk_resp(
+            seq0,
+            SegmentedBytes::from(Bytes::from("chunk 0")),
+        ));
 
         // Fail the transfer
         transfer.ctx().set_failed(error::Error::new(
@@ -672,22 +739,36 @@ mod tests {
 
     use super::{
         new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, DrainMode,
-        RecvBodyConsumer, SinkWrite,
+        RecvBodyConsumer, Reservation, SinkWrite, WriteBuffer,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
 
     fn chunk_at(seq: u64, offset: u64, data: &[u8]) -> ChunkOutput {
-        let mut seg = SegmentedBuf::new();
-        seg.push(Bytes::copy_from_slice(data));
         ChunkOutput {
             seq,
             offset,
-            data: AggregatedBytes(seg),
+            data: SegmentedBytes::from(Bytes::copy_from_slice(data)),
             metadata: Default::default(),
-            reservation: None,
         }
+    }
+
+    #[test]
+    fn write_buffer_vectors_and_advances_across_chunk_boundaries() {
+        let mut buffer = WriteBuffer::default();
+        buffer.push(SegmentedBytes::from(Bytes::from_static(b"ab")));
+        buffer.push(SegmentedBytes::from(Bytes::from_static(b"cdef")));
+
+        let mut slices = [std::io::IoSlice::new(&[]); 4];
+        let count = buffer.chunks_vectored(&mut slices);
+        assert_eq!(count, 2);
+        assert_eq!(slices[0].as_ref(), b"ab");
+        assert_eq!(slices[1].as_ref(), b"cdef");
+
+        buffer.advance(3);
+        assert_eq!(buffer.remaining(), 3);
+        assert_eq!(buffer.chunk(), b"def");
     }
 
     /// In-memory [`SinkWrite`] that records every positioned write, for asserting the
@@ -716,11 +797,7 @@ mod tests {
     }
 
     impl SinkWrite for CaptureSink {
-        fn write_all_at(
-            &self,
-            buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-            pos: u64,
-        ) -> std::io::Result<()> {
+        fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()> {
             let mut bytes = vec![0u8; buf.remaining()];
             buf.copy_to_slice(&mut bytes);
             self.writes.lock().unwrap().insert(pos, bytes);
@@ -737,11 +814,7 @@ mod tests {
         #[derive(Debug)]
         struct Shared(Arc<CaptureSink>);
         impl SinkWrite for Shared {
-            fn write_all_at(
-                &self,
-                buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-                pos: u64,
-            ) -> std::io::Result<()> {
+            fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()> {
                 self.0.write_all_at(buf, pos)
             }
         }
@@ -1082,12 +1155,11 @@ mod tests {
         );
     }
 
-    // --- Reservation lease-lifetime tests ---
+    // --- Admission and payload ownership tests ---
     //
-    // Memory admission follows the payload ownership lifetime. On the stream
-    // surface the bytes escape in `ChunkOutput`, so the reservation closes on
-    // final consumer drop. On the disk surface the drain copies the bytes out,
-    // so the reservation closes when the drained chunk is freed.
+    // Fill closes acquisition authority. The resulting charge follows immutable
+    // ownership: to final consumer drop on the stream surface, or through the
+    // positioned write on the disk surface.
 
     use crate::memory::{BufferPool, MemoryBudgetConfig};
 
@@ -1098,119 +1170,109 @@ mod tests {
         (pool, carrier_size)
     }
 
-    fn planned_demand(pool: &BufferPool) -> u64 {
-        pool.metrics().active_planned_demand_bytes()
+    fn pooled_data(pool: &BufferPool, reservation: &Reservation, data: &[u8]) -> SegmentedBytes {
+        let mut buffer = pool
+            .acquire(reservation, data.len())
+            .expect("reserved pooled buffer");
+        buffer.put_slice(data);
+        buffer.freeze()
     }
 
     #[test]
-    fn test_stream_reservation_rides_chunk_and_closes_on_consumer_drop() {
+    fn test_stream_fill_closes_reservation_while_payload_retains_charge() {
         let (pool, chunk_bytes) = test_reservation_pool();
         let (writer, mut consumer) = new_recv_body();
 
-        // Claim, reserve, fill: one carrier-rounded envelope is active.
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"hello");
         let mut slot = writer.claim();
-        slot.attach_reservation(
-            pool.try_reserve(chunk_bytes)
-                .unwrap()
-                .expect("has capacity"),
+        slot.attach_reservation(reservation);
+        assert_eq!(
+            pool.metrics().active_planned_demand_bytes(),
+            chunk_bytes as u64
         );
-        assert_eq!(planned_demand(&pool), chunk_bytes as u64);
-        slot.fill(chunk_resp(0, {
-            let mut seg = SegmentedBuf::new();
-            seg.push(Bytes::from("hello"));
-            AggregatedBytes(seg)
-        }));
+        slot.fill(chunk_resp(0, data));
 
-        // Planned demand remains active while the chunk sits in the buffer.
-        assert_eq!(planned_demand(&pool), chunk_bytes as u64);
+        let metrics = pool.metrics();
+        assert_eq!(metrics.active_planned_demand_bytes(), 0);
+        assert_eq!(metrics.charged_capacity_bytes(), chunk_bytes as u64);
+        assert_eq!(metrics.admission_used_bytes(), chunk_bytes as u64);
 
-        // Delivery transfers the reservation with the chunk.
         let chunk = consumer.try_take_next().expect("chunk delivered");
-        assert_eq!(chunk.data.clone().to_vec(), b"hello");
-        assert_eq!(
-            planned_demand(&pool),
-            chunk_bytes as u64,
-            "reservation must survive delivery: the bytes are resident in the consumer"
-        );
+        assert_eq!(chunk.data.clone().into_contiguous().as_ref(), b"hello");
+        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
 
-        // Final consumer drop closes the reservation.
         drop(chunk);
-        assert_eq!(
-            planned_demand(&pool),
-            0,
-            "reservation must close when the consumer drops the delivered chunk"
-        );
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
     }
 
     #[test]
-    fn test_stream_reservation_holds_until_last_chunk_clone_drops() {
-        // `ChunkOutput` is Clone and its `AggregatedBytes` clone shares the same backing
-        // `Bytes` (a refcount bump, no copy), so the bytes stay resident until the last
-        // clone drops. The `Arc<Reservation>` matches that: demand stays admitted
-        // until the final clone is gone, never double-charged for the shared buffer.
+    fn test_stream_charge_holds_until_last_chunk_clone_drops() {
         let (pool, chunk_bytes) = test_reservation_pool();
         let (writer, mut consumer) = new_recv_body();
 
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"shared");
         let mut slot = writer.claim();
-        slot.attach_reservation(
-            pool.try_reserve(chunk_bytes)
-                .unwrap()
-                .expect("has capacity"),
-        );
-        slot.fill(chunk_resp(0, {
-            let mut seg = SegmentedBuf::new();
-            seg.push(Bytes::from("shared"));
-            AggregatedBytes(seg)
-        }));
+        slot.attach_reservation(reservation);
+        slot.fill(chunk_resp(0, data));
 
         let chunk = consumer.try_take_next().expect("chunk delivered");
         let clone = chunk.clone();
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
         assert_eq!(
-            planned_demand(&pool),
+            pool.metrics().charged_capacity_bytes(),
             chunk_bytes as u64,
             "one physical buffer, charged once"
         );
 
-        // Dropping one clone does not release: the other still holds the bytes.
         drop(chunk);
         assert_eq!(
-            planned_demand(&pool),
+            pool.metrics().charged_capacity_bytes(),
             chunk_bytes as u64,
             "a surviving clone still holds the resident bytes"
         );
 
-        // The last clone drops: now the bytes are gone and the reservation releases.
         drop(clone);
-        assert_eq!(planned_demand(&pool), 0, "closed on last clone drop");
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
     }
 
     #[test]
-    fn test_disk_reservation_closes_on_drain() {
+    fn test_disk_payload_charge_returns_on_drain() {
         let (pool, chunk_bytes) = test_reservation_pool();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"flushed");
         let mut slot = writer.claim();
-        slot.attach_reservation(
-            pool.try_reserve(chunk_bytes)
-                .unwrap()
-                .expect("has capacity"),
-        );
-        slot.fill(chunk_at(0, 0, b"flushed"));
+        slot.attach_reservation(reservation);
+        slot.fill(ChunkOutput {
+            seq: 0,
+            offset: 0,
+            data,
+            metadata: Default::default(),
+        });
 
-        // Admitted while resident in the buffer, before the drain copies it out.
-        assert_eq!(planned_demand(&pool), chunk_bytes as u64);
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
 
-        // The drain writes the bytes to the sink and frees the buffer payload; the disk
-        // surface owns nothing after copy-out, so the reservation releases here.
         writer.finalize().unwrap();
-        assert_eq!(
-            planned_demand(&pool),
-            0,
-            "disk drain copies out and frees the bytes; the reservation closes at drain"
-        );
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
         assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");
     }
 }

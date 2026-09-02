@@ -2386,10 +2386,18 @@ frames and calls `reserve` only when the next copy does not fit. Concurrent rang
 attempts use separate buffers because their transport and terminal lifetimes are independent.
 Foreign input is released after its bytes have been copied.
 
-The reservation closes after the response reaches a terminal state and no transfer retry or reserved
-acquisition can begin. Download output may outlive the reservation, work item, HTTP client, public
-pool handle, or transfer manager. Each pooled byte owner retains its `CarrierGuard` and `PoolInner`
-until final drop.
+The dispatched range or discovery response supplies the exact expected byte length. The collector
+rejects a frame before copying if it would cross that boundary, and rejects end-of-stream before
+the boundary is reached. Carrier-rounded reservation capacity is not a substitute for this check:
+an oversized response can still fit in the same final carrier. Either failure drops the attempt's
+mutable buffer before retry, returning its direct acquisition authority to the reservation.
+
+After a successful attempt freezes the complete response, publication closes the reservation before
+placing the immutable payload in `ChunkOutput`; no later retry or acquisition can begin for that
+response. A failed retryable attempt keeps the reservation open after dropping its mutable buffer,
+while terminal failure drops the slot and closes the reservation. Download output may outlive the
+reservation, work item, HTTP client, public pool handle, or transfer manager. Each pooled byte owner
+retains its `CarrierGuard` and `PoolInner` until final drop.
 
 Error and control bodies have no guessed pre-dispatch allowance. They remain foreign unless a
 managed path deliberately copies them into reserved staging.
@@ -3433,6 +3441,7 @@ section; one property may discharge several contracts.
 | I3         | Upload retry retains exact bytes through the final consuming attempt   | Retry tests with partial body polling and source failure                  | Release staged bytes before the last retry                 |
 | I3         | Upload parts reuse one mutable stream across source reads              | Multipart tests with carrier-misaligned read completions                  | Allocate one buffer for every source read                  |
 | I3, I4     | Reserved staging preserves bytes and releases foreign input after copy | Download tests with frame and carrier boundary mismatch                   | Publish before copy completion or retain foreign input     |
+| I4         | A response publishes exactly its dispatched byte length                | Short, same-carrier overrun, and retry-authority collector tests          | Treat carrier-rounded capacity as response-length validation |
 | I4, I5     | Download and disk completion retain owners through final access        | Integration tests with partial reads, writes, and cancellation            | Drop byte owners immediately after submission              |
 | I4         | A download response reuses its suffix across response frames           | Collector tests spanning carrier and publication boundaries               | Acquire a new buffer for every response frame              |
 | C2         | A stale idle epoch cannot reclaim after new managed work               | Maintenance state-machine test with deadline races                        | Accept an expired epoch after activity                     |
