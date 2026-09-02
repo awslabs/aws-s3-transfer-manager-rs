@@ -107,7 +107,7 @@ use crate::scheduler::descriptor::{ClaimGuard, TransferDescriptor};
 use crate::scheduler::ready_set::{OrphanedChild, ReadySet};
 use std::collections::HashMap;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
@@ -137,6 +137,10 @@ struct SchedulerInner {
     ready_set: ReadySet,
     handle: Weak<crate::client::Handle>,
     dispatched: AtomicUsize,
+    /// Set when registry removal may leave only dispatched work keeping the
+    /// scheduler active. The final dispatch consumes this candidate after
+    /// verifying the registry is still empty.
+    idle_candidate: AtomicBool,
     submission_queue: SubmissionQueue<ScheduledWork>,
     /// Admits one work-generation runner and coalesces requests without losing
     /// a wake. See [`GenerateWorkGate`].
@@ -182,6 +186,7 @@ impl Scheduler {
             ready_set: ReadySet::new(),
             handle,
             dispatched: AtomicUsize::new(0),
+            idle_candidate: AtomicBool::new(false),
             submission_queue: SubmissionQueue::new(SUBMISSION_QUEUE_SIZE),
             generate_work_gate: GenerateWorkGate::new(),
         }))
@@ -248,6 +253,12 @@ impl Scheduler {
                 group_vruntime.clone(),
             );
             transfers.insert(desc.id(), desc.clone());
+            // Serialize activity publication with registry insertion. An idle
+            // observer holds this same lock while publishing, so either it
+            // reports idle first and this event supersedes it, or it observes
+            // this transfer and declines to publish idle.
+            self.0.idle_candidate.store(false, Ordering::SeqCst);
+            self.handle().scheduler_work_registered();
             (group_vruntime, desc)
         };
         let _ = group_vruntime; // returned by resolve_group_vruntime, retained inside desc
@@ -389,6 +400,18 @@ impl Scheduler {
         if target.is_some() && id.parent.is_none() {
             self.0.ready_set.remove_group(id.id);
         }
+        let registry_became_empty =
+            (target.is_some() || !children.is_empty()) && transfers.is_empty();
+        if registry_became_empty {
+            // Publish the candidate before dropping the registry lock. A
+            // racing final dispatch then either observes the candidate, or
+            // this thread observes that dispatch's decrement below.
+            self.0.idle_candidate.store(true, Ordering::SeqCst);
+        }
+        drop(transfers);
+        if registry_became_empty {
+            self.publish_global_idle_if_candidate();
+        }
         (target, children)
     }
 
@@ -403,7 +426,7 @@ impl Scheduler {
         ctx.signal_terminal();
         desc.transfer().on_terminal();
         let purged = self.handle().runtime.remove_pending_for_transfer(id);
-        self.0.dispatched.fetch_sub(purged, Ordering::Relaxed);
+        self.release_dispatched(purged);
         desc.work_purged(purged);
         desc.notify_idle();
         tracing::debug!(target: telemetry::TARGET_SCHEDULING, tid = %id, purged, "transfer cancelled");
@@ -443,7 +466,7 @@ impl Scheduler {
             outcome = outcome_tag,
             "work completed",
         );
-        self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
+        self.release_dispatched(1);
 
         // Report to concurrency controller
         let classification = match &outcome {
@@ -501,7 +524,7 @@ impl Scheduler {
     /// Handle a panic during work execution. The transfer's internal state is
     /// unknown, so the scheduler forces the terminal transition from outside.
     pub(crate) fn on_panic(&self, work: ScheduledWork) {
-        self.0.dispatched.fetch_sub(1, Ordering::Relaxed);
+        self.release_dispatched(1);
 
         let desc = &work.descriptor;
         let ctx = desc.transfer().ctx();
@@ -827,6 +850,44 @@ impl Scheduler {
             && self.0.dispatched.load(Ordering::Relaxed) == 0
     }
 
+    /// Release scheduler dispatch tickets and publish the final-dispatch edge.
+    ///
+    /// `SeqCst` pairs this decrement with registry removal's idle-candidate
+    /// publication. If those transitions race, at least one side observes the
+    /// other and checks the complete global-idle predicate.
+    fn release_dispatched(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.0.dispatched.fetch_sub(count, Ordering::SeqCst);
+        debug_assert!(
+            previous >= count,
+            "released more scheduler dispatch tickets than were outstanding"
+        );
+        if previous == count {
+            self.publish_global_idle_if_candidate();
+        }
+    }
+
+    /// Publish scheduler-global idle after both independent counters reach zero.
+    ///
+    /// Registry removal creates the candidate. If dispatched work remains, the
+    /// candidate stays armed until [`Self::release_dispatched`] releases the
+    /// final ticket. Holding the registry lock through the callback serializes
+    /// the event against new transfer registration.
+    fn publish_global_idle_if_candidate(&self) {
+        if !self.0.idle_candidate.load(Ordering::SeqCst) {
+            return;
+        }
+        let transfers = self.0.transfers.read().unwrap();
+        if transfers.is_empty()
+            && self.0.dispatched.fetch_add(0, Ordering::SeqCst) == 0
+            && self.0.idle_candidate.swap(false, Ordering::SeqCst)
+        {
+            self.handle().scheduler_became_idle();
+        }
+    }
+
     /// Pre-register an empty group for `group_id`. See
     /// [`crate::scheduler::ready_set::ReadySet::register_empty_group_for_test`].
     #[cfg(test)]
@@ -928,6 +989,142 @@ mod tests {
 
         assert!(sm.is_complete());
         assert_eq!(sm.completed_count(), 5);
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_idle_candidate_waits_for_the_final_dispatch() {
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            Arc::new(PendingForever),
+            Arc::clone(&handle),
+        )));
+        scheduler.0.dispatched.store(1, Ordering::SeqCst);
+
+        let cancellation = scheduler.cancel_transfer(id);
+
+        assert_eq!(scheduler.transfer_count(), 0);
+        assert!(scheduler.0.idle_candidate.load(Ordering::SeqCst));
+        assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 0);
+
+        scheduler.release_dispatched(1);
+
+        assert!(!scheduler.0.idle_candidate.load(Ordering::SeqCst));
+        assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 1);
+        drop(cancellation);
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_registry_removal_observes_an_already_completed_dispatch() {
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            Arc::new(PendingForever),
+            Arc::clone(&handle),
+        )));
+        scheduler.0.dispatched.store(1, Ordering::SeqCst);
+
+        scheduler.release_dispatched(1);
+        assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 0);
+
+        let cancellation = scheduler.cancel_transfer(id);
+
+        assert!(!scheduler.0.idle_candidate.load(Ordering::SeqCst));
+        assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 1);
+        drop(cancellation);
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_new_work_cancels_a_pending_idle_candidate() {
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let first_id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            first_id,
+            Arc::new(PendingForever),
+            Arc::clone(&handle),
+        )));
+        scheduler.0.dispatched.store(1, Ordering::SeqCst);
+        let first_cancellation = scheduler.cancel_transfer(first_id);
+        assert!(scheduler.0.idle_candidate.load(Ordering::SeqCst));
+
+        let second_id = TransferId {
+            id: 2,
+            parent: None,
+        };
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            second_id,
+            Arc::new(PendingForever),
+            Arc::clone(&handle),
+        )));
+        scheduler.release_dispatched(1);
+
+        assert!(!scheduler.0.idle_candidate.load(Ordering::SeqCst));
+        assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 0);
+
+        drop(first_cancellation);
+        drop(scheduler.cancel_transfer(second_id));
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_each_managed_work_interval_arms_one_idle_deadline() {
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        for expected_deadlines in 1..=2 {
+            let id = TransferId {
+                id: expected_deadlines,
+                parent: None,
+            };
+            scheduler.enqueue_transfer(Box::new(MockTransfer::new(
+                id,
+                Arc::new(FixedWorkCount::new(1)),
+            )));
+
+            let reached_idle = tokio::time::timeout(Duration::from_secs(5), async {
+                while !scheduler.is_idle()
+                    || handle.buffer_pool.diagnostics().idle_deadlines < expected_deadlines
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                reached_idle.is_ok(),
+                "completed managed work should arm idle reclamation: \
+                 registered={}, dispatched={}, diagnostics={:?}",
+                scheduler.transfer_count(),
+                scheduler.dispatched_for_test(),
+                handle.buffer_pool.diagnostics(),
+            );
+            assert_eq!(
+                handle.buffer_pool.diagnostics().idle_deadlines,
+                expected_deadlines,
+                "one deadline should be armed for each activity-to-idle interval"
+            );
+        }
+
         handle.runtime.shutdown();
     }
 
@@ -3459,8 +3656,12 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    //! Loom verification of the enqueue/cancel lock-ordering protocol used by
-    //! [`Scheduler::enqueue_transfer`] and [`Scheduler::cancel_transfer`].
+    //! Loom verification of the scheduler's registry lock protocols.
+    //!
+    //! The first protocol coordinates enqueue and cancellation across the
+    //! transfer registry and ready-set group registry. The second coordinates
+    //! transfer registration with buffer-pool idle epochs so active work cannot
+    //! leave reclamation armed.
     //! (The `generate_work` admission protocol is verified in
     //! [`super::super::gate`], co-located with its unit.)
     //!
@@ -3489,7 +3690,8 @@ mod loom_tests {
     //! participate in the lock-ordering protocol). When the production
     //! methods change, the shim must be kept in sync.
 
-    use loom::sync::{Arc, RwLock};
+    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use loom::sync::{Arc, Mutex, RwLock};
     use loom::thread;
     use std::collections::HashMap;
 
@@ -3498,6 +3700,99 @@ mod loom_tests {
     struct TidShim {
         id: u64,
         parent: Option<u64>,
+    }
+
+    #[derive(Default)]
+    struct IdleEpoch {
+        activity: u64,
+        deadline: Option<u64>,
+        publications: usize,
+    }
+
+    /// Mirrors scheduler lifecycle publication without descriptor machinery.
+    ///
+    /// `transfers`, `dispatched`, and `idle_candidate` use the same operations
+    /// and ordering as production. `idle` reduces the client callback and pool
+    /// maintenance state to the epoch fields needed to detect stale or missing
+    /// idle events.
+    struct LoomIdleScheduler {
+        transfers: RwLock<usize>,
+        dispatched: AtomicUsize,
+        idle_candidate: AtomicBool,
+        idle: Mutex<IdleEpoch>,
+    }
+
+    impl LoomIdleScheduler {
+        fn new(transfers: usize, dispatched: usize, idle_candidate: bool) -> Self {
+            Self {
+                transfers: RwLock::new(transfers),
+                dispatched: AtomicUsize::new(dispatched),
+                idle_candidate: AtomicBool::new(idle_candidate),
+                idle: Mutex::new(IdleEpoch::default()),
+            }
+        }
+
+        fn enqueue_transfer(&self) {
+            let mut transfers = self.transfers.write().unwrap();
+            *transfers += 1;
+            self.idle_candidate.store(false, Ordering::SeqCst);
+
+            let mut idle = self.idle.lock().unwrap();
+            idle.activity = idle.activity.wrapping_add(1);
+            idle.deadline = None;
+        }
+
+        fn remove_transfer(&self) {
+            let mut transfers = self.transfers.write().unwrap();
+            assert!(*transfers > 0);
+            *transfers -= 1;
+            let registry_became_empty = *transfers == 0;
+            if registry_became_empty {
+                self.idle_candidate.store(true, Ordering::SeqCst);
+            }
+            drop(transfers);
+            if registry_became_empty {
+                self.publish_global_idle_if_candidate();
+            }
+        }
+
+        fn release_dispatch(&self) {
+            let previous = self.dispatched.fetch_sub(1, Ordering::SeqCst);
+            assert!(previous > 0);
+            if previous == 1 {
+                self.publish_global_idle_if_candidate();
+            }
+        }
+
+        fn publish_global_idle_if_candidate(&self) {
+            if !self.idle_candidate.load(Ordering::SeqCst) {
+                return;
+            }
+            let transfers = self.transfers.read().unwrap();
+            if *transfers == 0
+                && self.dispatched.fetch_add(0, Ordering::SeqCst) == 0
+                && self.idle_candidate.swap(false, Ordering::SeqCst)
+            {
+                let mut idle = self.idle.lock().unwrap();
+                if idle.deadline.is_none() {
+                    idle.deadline = Some(idle.activity);
+                }
+                idle.publications += 1;
+            }
+        }
+
+        fn active_work_has_no_idle_deadline(&self) -> bool {
+            let transfers = self.transfers.read().unwrap();
+            let idle = self.idle.lock().unwrap();
+            *transfers == 0 || idle.deadline.is_none()
+        }
+
+        fn idle_was_published_once(&self) -> bool {
+            let transfers = self.transfers.read().unwrap();
+            let dispatched = self.dispatched.load(Ordering::SeqCst);
+            let idle = self.idle.lock().unwrap();
+            *transfers == 0 && dispatched == 0 && idle.deadline.is_some() && idle.publications == 1
+        }
     }
 
     /// Faithful shim of the FIXED `Scheduler` lock dance for loom
@@ -3633,6 +3928,74 @@ mod loom_tests {
             let by_group = self.by_group.read().unwrap();
             groups.keys().all(|gid| by_group.contains_key(gid))
         }
+    }
+
+    /// Enqueue and final registry removal serialize through the transfer
+    /// registry. After either order, registered work has invalidated any idle
+    /// event removal could publish.
+    #[test]
+    fn enqueue_cannot_leave_a_stale_pool_idle_epoch() {
+        loom::model(|| {
+            let scheduler = Arc::new(LoomIdleScheduler::new(1, 0, false));
+
+            let enqueueing = Arc::clone(&scheduler);
+            let enqueue = thread::spawn(move || enqueueing.enqueue_transfer());
+            let removing = Arc::clone(&scheduler);
+            let remove = thread::spawn(move || removing.remove_transfer());
+
+            enqueue.join().unwrap();
+            remove.join().unwrap();
+
+            assert!(
+                scheduler.active_work_has_no_idle_deadline(),
+                "active scheduler work retained a stale pool idle deadline"
+            );
+        });
+    }
+
+    /// Registry removal and final dispatch completion can reach zero in either
+    /// order. Their handshake must publish exactly one global-idle event.
+    #[test]
+    fn registry_and_dispatch_zero_edges_cannot_lose_idle() {
+        loom::model(|| {
+            let scheduler = Arc::new(LoomIdleScheduler::new(1, 1, false));
+
+            let removing = Arc::clone(&scheduler);
+            let remove = thread::spawn(move || removing.remove_transfer());
+            let completing = Arc::clone(&scheduler);
+            let complete = thread::spawn(move || completing.release_dispatch());
+
+            remove.join().unwrap();
+            complete.join().unwrap();
+
+            assert!(
+                scheduler.idle_was_published_once(),
+                "zero-edge race lost or duplicated scheduler-global idle"
+            );
+        });
+    }
+
+    /// New work racing the final dispatch from an already-empty registry must
+    /// invalidate the pending candidate or supersede an idle event published
+    /// immediately before registration.
+    #[test]
+    fn enqueue_cancels_a_pending_idle_candidate() {
+        loom::model(|| {
+            let scheduler = Arc::new(LoomIdleScheduler::new(0, 1, true));
+
+            let enqueueing = Arc::clone(&scheduler);
+            let enqueue = thread::spawn(move || enqueueing.enqueue_transfer());
+            let completing = Arc::clone(&scheduler);
+            let complete = thread::spawn(move || completing.release_dispatch());
+
+            enqueue.join().unwrap();
+            complete.join().unwrap();
+
+            assert!(
+                scheduler.active_work_has_no_idle_deadline(),
+                "new scheduler work retained an idle event from the prior interval"
+            );
+        });
     }
 
     /// Verification test: the fixed dance produces no orphan in any

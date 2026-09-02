@@ -13,13 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
-use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES};
 use crate::runtime::ExecutionRuntime;
-
-/// Non-binding budget for test handles, which size objects far below it, so the
-/// budget never gates in state-machine and mock-SDK tests.
-#[cfg(test)]
-const TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -29,7 +23,7 @@ pub struct Client {
 
 /// Shared state backing every transfer operation: configuration, the S3 client,
 /// the scheduler, the execution runtime, the concurrency controller, telemetry,
-/// and the memory budget.
+/// and the shared payload-memory pool.
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
@@ -39,8 +33,6 @@ pub(crate) struct Handle {
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
     pub(crate) buffer_pool: BufferPool,
-    /// Legacy admission used by download operations not yet backed by `buffer_pool`.
-    pub(crate) memory_budget: Arc<MemoryBudget>,
     /// Per-bucket retry token bucket, cached so all operations and retries to a
     /// given bucket share one live token bucket. The SDK does not share a bucket
     /// across custom retry partitions, and a partition built per operation would
@@ -55,6 +47,24 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// Reports newly registered scheduler work to client-owned subsystems.
+    ///
+    /// The callback runs while the scheduler holds its registry write lock.
+    /// Keeping the adaptation here lets the scheduler publish lifecycle events
+    /// without depending on the policy each client subsystem applies to them.
+    pub(crate) fn scheduler_work_registered(&self) {
+        self.buffer_pool.record_managed_activity();
+    }
+
+    /// Reports that the scheduler has no registered or dispatched work.
+    ///
+    /// The scheduler holds its registry read lock through this callback, so a
+    /// concurrent registration either precedes this event or invalidates it
+    /// through [`Self::scheduler_work_registered`].
+    pub(crate) fn scheduler_became_idle(&self) {
+        self.buffer_pool.record_global_idle();
+    }
+
     /// Get the concrete minimum upload size in bytes to use to determine whether multipart uploads
     /// are enabled for a given request.
     pub(crate) fn mpu_threshold_bytes(&self) -> u64 {
@@ -199,16 +209,18 @@ impl Handle {
         controller: Arc<dyn ConcurrencyController>,
         runtime_factory: impl FnOnce(std::sync::Weak<Handle>) -> Arc<dyn ExecutionRuntime>,
     ) -> Arc<Self> {
+        // Most client tests exercise scheduling rather than memory admission.
+        // Keep their automatic pool large enough not to become an incidental gate.
+        const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
+
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
-                crate::types::MemoryBudgetConfig::Limit(TEST_MEMORY_BUDGET_BYTES),
+                crate::types::MemoryBudgetConfig::Limit(DEFAULT_TEST_MEMORY_BUDGET_BYTES),
                 None,
             )
             .expect("test buffer-pool configuration must be valid"),
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
-        let budget_capacity = usize::try_from(buffer_pool.metrics().configured_capacity_bytes())
-            .expect("test buffer-pool capacity must fit usize");
         Arc::new_cyclic(|weak| {
             let scheduler = Scheduler::new(weak.clone());
             let runtime = runtime_factory(weak.clone());
@@ -226,7 +238,6 @@ impl Handle {
                 controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 buffer_pool,
-                memory_budget: MemoryBudget::new(budget_capacity, BUDGET_CHUNK_BYTES),
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         })
@@ -245,7 +256,7 @@ impl Client {
         // Machine facts for auto-sizing: use the loader-detected profile if the
         // config came through `ConfigLoader::load`, else detect locally (DMI +
         // vCPU + RAM — cheap pseudo-file reads, no network). Detected once and
-        // shared by both the concurrency seed and the memory budget.
+        // shared by both the concurrency seed and the buffer pool.
         let profile = config
             .machine_profile()
             .cloned()
@@ -272,13 +283,10 @@ impl Client {
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => {
                 BufferPool::from_capacity(crate::types::MemoryBudgetConfig::Auto, profile.ram_bytes)
-                    .expect("memory budget must resolve to supported buffer-pool geometry")
+                    .expect("memory configuration must resolve to supported pool geometry")
             }
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
-        let budget_capacity = usize::try_from(buffer_pool.metrics().configured_capacity_bytes())
-            .expect("buffer-pool capacity must fit usize");
-
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
@@ -317,7 +325,6 @@ impl Client {
                 controller,
                 telemetry,
                 buffer_pool,
-                memory_budget: MemoryBudget::new(budget_capacity, BUDGET_CHUNK_BYTES),
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         });
@@ -327,11 +334,6 @@ impl Client {
     /// Returns the client's configuration
     pub fn config(&self) -> &Config {
         &self.handle.config
-    }
-
-    /// Returns a compatibility view of download admission.
-    pub fn memory_budget(&self) -> crate::types::MemoryBudgetSnapshot {
-        self.handle.memory_budget.stats()
     }
 
     /// Returns point-in-time operational metrics for this client.
@@ -584,8 +586,8 @@ mod tests {
         let memory = client_metrics.memory();
         assert_eq!(memory.active_planned_demand_bytes(), carrier_size as u64);
         assert_eq!(
-            client.memory_budget().capacity_bytes,
-            memory.configured_capacity_bytes()
+            memory.configured_capacity_bytes(),
+            pool.metrics().configured_capacity_bytes()
         );
         drop(reservation);
     }
@@ -610,10 +612,6 @@ mod tests {
         assert!(memory.configured_capacity_bytes() > 0);
         assert_eq!(memory.admission_used_bytes(), 0);
         assert_eq!(memory.prepared_capacity_bytes(), 0);
-        assert_eq!(
-            client.memory_budget().capacity_bytes,
-            memory.configured_capacity_bytes()
-        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

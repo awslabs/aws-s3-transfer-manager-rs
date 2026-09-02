@@ -367,6 +367,10 @@ impl PoolInner {
         envelope: CarrierCount,
         waker: Waker,
     ) -> Result<ReservationPoll, ReserveError> {
+        #[cfg(test)]
+        if let Some(error) = pool.test_hooks.take_reservation_failure() {
+            return Err(error);
+        }
         if envelope == CarrierCount::ZERO {
             return Err(ReserveError::InvalidSize);
         }

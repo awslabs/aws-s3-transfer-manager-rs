@@ -65,6 +65,8 @@ impl Wake for CountingWake {
 pub(super) struct TestHooks {
     /// Remaining metadata boundaries before one acquisition failure.
     acquisition_allocation_failure: AtomicUsize,
+    /// One terminal reservation failure returned before admission work.
+    reservation_failure: Mutex<Option<ReserveError>>,
     /// Fails the next maintenance worker creation when set.
     maintenance_spawn_failure: AtomicBool,
     /// Number of maintenance worker creation attempts.
@@ -78,6 +80,7 @@ impl TestHooks {
     pub(super) fn new() -> Self {
         Self {
             acquisition_allocation_failure: AtomicUsize::new(0),
+            reservation_failure: Mutex::new(None),
             maintenance_spawn_failure: AtomicBool::new(false),
             maintenance_spawn_attempts: AtomicUsize::new(0),
             maintenance_pause: Mutex::new(None),
@@ -105,6 +108,20 @@ impl TestHooks {
                 },
             )
             .is_ok_and(|previous| previous == 1)
+    }
+
+    /// Installs one terminal reservation failure.
+    fn inject_reservation_failure(&self, error: ReserveError) {
+        let previous = self.reservation_failure.lock().replace(error);
+        assert!(
+            previous.is_none(),
+            "a reservation failure is already pending"
+        );
+    }
+
+    /// Consumes one terminal reservation failure.
+    pub(super) fn take_reservation_failure(&self) -> Option<ReserveError> {
+        self.reservation_failure.lock().take()
     }
 
     /// Records one serialized maintenance worker creation attempt.
@@ -178,6 +195,11 @@ impl BufferPool {
             .acquisition_allocation_failure
             .load(Ordering::Acquire)
             != 0
+    }
+
+    /// Makes the next reservation future resolve to `error`.
+    pub(crate) fn inject_reservation_failure(&self, error: ReserveError) {
+        self.inner.test_hooks.inject_reservation_failure(error);
     }
 
     /// Fails the next maintenance worker creation.

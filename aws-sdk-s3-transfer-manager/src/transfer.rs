@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Wake, Waker};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -507,6 +508,28 @@ pub(crate) struct TransferContext {
     pub(crate) metrics: Arc<MetricsState>,
 }
 
+/// Task wake adapter for futures polled from a transfer's synchronous state machine.
+///
+/// This deliberately enters the scheduler directly instead of using
+/// [`TransferContext::try_wake`]. The scheduler's descriptor claim records a wake
+/// that races the active `poll_work` call, so the future can register this waker
+/// before `poll_work` returns `Pending` without relying on the edge-triggered
+/// [`wake_flag::WakeFlag`].
+struct SchedulerWake {
+    scheduler: crate::scheduler::Scheduler,
+    id: TransferId,
+}
+
+impl Wake for SchedulerWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.scheduler.wake(self.id);
+    }
+}
+
 impl fmt::Display for TransferContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Transfer(id={}, status={})", self.id.id, self.status)
@@ -663,6 +686,20 @@ impl TransferContext {
                 "ctx.try_wake.skipped",
             );
         }
+    }
+
+    /// Returns a task waker that requeues this transfer in the scheduler.
+    ///
+    /// Use this for a `Future` polled inside `poll_work`. Its wake is level-like
+    /// at the scheduler boundary: a wake concurrent with the current poll is
+    /// retained by the descriptor's release-and-recheck protocol. Ordinary
+    /// state mutations should continue to use [`Self::set_pending`] and
+    /// [`Self::try_wake`] under their shared state lock.
+    pub(crate) fn scheduler_waker(&self) -> Waker {
+        Waker::from(Arc::new(SchedulerWake {
+            scheduler: self.handle.scheduler.clone(),
+            id: self.id,
+        }))
     }
 
     /// The S3 client to use for SDK operations
