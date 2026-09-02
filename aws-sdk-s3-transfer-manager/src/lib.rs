@@ -79,10 +79,17 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
-/// Payload-memory configuration and shared storage
+/// Payload-memory configuration and shared pooled storage.
+///
+/// Transfer-manager clients construct a pool automatically by default.
+/// Applications that need to share one memory budget across clients or another
+/// component can construct a [`BufferPool`](crate::memory::BufferPool) and
+/// install it through
+/// [`MemoryConfig::Explicit`](crate::memory::MemoryConfig::Explicit).
 pub mod memory {
     pub use crate::runtime::buffer_pool::{
-        BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,
+        AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut,
+        Reservation, ReserveError, ReserveFuture, SegmentedBytes,
     };
     pub use crate::types::{MemoryBudgetConfig, MemoryConfig};
 }

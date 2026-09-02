@@ -75,7 +75,11 @@ impl fmt::Display for BufferPoolBuildError {
 
 impl std::error::Error for BufferPoolBuildError {}
 
-/// Builder for one shared buffer-pool domain.
+/// Builder for one caller-owned shared payload-memory pool.
+///
+/// A constructed pool can be cloned and shared by several transfer-manager
+/// clients or other components. All clones use one admission ceiling,
+/// prepared-storage cache, reservation queue, and metrics domain.
 #[derive(Clone, Debug, Default)]
 pub struct BufferPoolBuilder {
     memory_budget: MemoryBudgetConfig,

@@ -27,7 +27,7 @@ pub struct MemoryMetrics {
     admission_overage_bytes: u64,
     prepared_capacity_bytes: u64,
     queued_reservations: usize,
-    parked_reservations_total: u64,
+    reservations_queued_total: u64,
 }
 
 /// Carrier-count inputs captured under admission serialization.
@@ -45,7 +45,7 @@ pub(super) struct MemoryMetricState {
     /// Requests currently retained in the FIFO.
     pub(super) queued_reservations: usize,
     /// Cumulative requests that entered the FIFO.
-    pub(super) parked_reservations_total: u64,
+    pub(super) reservations_queued_total: u64,
 }
 
 /// Operational counters and lifecycle state for one shared pool domain.
@@ -142,7 +142,7 @@ impl MemoryMetrics {
             admission_overage_bytes: admission_used_bytes.saturating_sub(configured_capacity_bytes),
             prepared_capacity_bytes: carriers_to_bytes(state.prepared_capacity, carrier_size),
             queued_reservations: state.queued_reservations,
-            parked_reservations_total: state.parked_reservations_total,
+            reservations_queued_total: state.reservations_queued_total,
         }
     }
 
@@ -185,9 +185,13 @@ impl MemoryMetrics {
         self.queued_reservations
     }
 
-    /// Returns the saturating count of requests that entered the FIFO.
-    pub fn parked_reservations_total(&self) -> u64 {
-        self.parked_reservations_total
+    /// Returns how many reservation requests have entered the FIFO.
+    ///
+    /// This pool-lifetime counter increments once per queued request and
+    /// saturates at `u64::MAX`. Unlike [`Self::queued_reservations`], it does
+    /// not decrease when a request is granted or cancelled.
+    pub fn reservations_queued_total(&self) -> u64 {
+        self.reservations_queued_total
     }
 }
 
@@ -218,7 +222,7 @@ mod tests {
         assert_eq!(initial.admission_overage_bytes(), 0);
         assert_eq!(initial.prepared_capacity_bytes(), 0);
         assert_eq!(initial.queued_reservations(), 0);
-        assert_eq!(initial.parked_reservations_total(), 0);
+        assert_eq!(initial.reservations_queued_total(), 0);
 
         let reservation = pool
             .try_reserve(carrier_size)
@@ -228,20 +232,26 @@ mod tests {
         let mut queued = pool.reserve(carrier_size);
         assert!(poll_reserve(&mut queued, &waker).is_pending());
 
-        let parked = pool.metrics();
-        assert_eq!(parked.admission_used_bytes(), carrier_size as u64);
-        assert_eq!(parked.active_planned_demand_bytes(), carrier_size as u64);
-        assert_eq!(parked.charged_capacity_bytes(), 0);
-        assert_eq!(parked.prepared_capacity_bytes(), carrier_size as u64);
-        assert_eq!(parked.queued_reservations(), 1);
-        assert_eq!(parked.parked_reservations_total(), 1);
+        let queued_metrics = pool.metrics();
+        assert_eq!(queued_metrics.admission_used_bytes(), carrier_size as u64);
+        assert_eq!(
+            queued_metrics.active_planned_demand_bytes(),
+            carrier_size as u64
+        );
+        assert_eq!(queued_metrics.charged_capacity_bytes(), 0);
+        assert_eq!(
+            queued_metrics.prepared_capacity_bytes(),
+            carrier_size as u64
+        );
+        assert_eq!(queued_metrics.queued_reservations(), 1);
+        assert_eq!(queued_metrics.reservations_queued_total(), 1);
 
         drop(queued);
         let acquired = pool.acquire(&reservation, carrier_size).unwrap();
         let charged = pool.metrics();
         assert_eq!(charged.charged_capacity_bytes(), carrier_size as u64);
         assert_eq!(charged.queued_reservations(), 0);
-        assert_eq!(charged.parked_reservations_total(), 1);
+        assert_eq!(charged.reservations_queued_total(), 1);
 
         reservation.close_acquisition();
         let closed = pool.metrics();

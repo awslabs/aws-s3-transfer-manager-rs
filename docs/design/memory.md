@@ -482,7 +482,7 @@ struct PoolInner {
 struct AdmissionState {
     ledger: AdmissionLedger,
     waiters: VecDeque<Waiter>,
-    parked_reservations_total: u64,
+    reservations_queued_total: u64,
 }
 
 struct AdmissionGuard<'a> {
@@ -502,7 +502,7 @@ struct CoverageState {
 ```
 
 `AdmissionState` serializes grant policy, physical preparation, FIFO state, planned-demand changes,
-and acquisition transitions that add uncovered charges. `parked_reservations_total` increments
+and acquisition transitions that add uncovered charges. `reservations_queued_total` increments
 saturating once when a reservation request first enters the FIFO. `CoverageState` linearizes
 per-carrier debit and return. A debit fully covered by available coverage and a return that
 only restores coverage complete with one compare-and-exchange loop. The containing acquisition
@@ -2412,25 +2412,31 @@ remains charged and pairs retention with its own admission and eviction policy.
 #### Disk writes
 
 Once decoded payload is in pooled carriers, the download sink writes the same storage without
-another staging copy. It consumes `SegmentedBytes` through `Buf`. Vectored writes call
-`chunks_vectored` and advance the cursor by the completed byte count, including on short writes:
+another staging copy. One claimed receive-buffer run contains object-offset-contiguous
+`SegmentedBytes` payloads. A private `DiskWriteCursor` borrows those payloads in place and presents
+their remaining ranges through `Buf`; it does not clone segmented values, owner metadata, or carrier
+references. The run becomes one positioned `write_all_at` operation:
 
 ```text
-SegmentedBytes
-  -> chunks_vectored
+claimed SegmentWrite<ChunkOutput>
+  -> validate contiguous object offsets
+  -> borrow payloads through DiskWriteCursor
+  -> chunks_vectored across payload boundaries
   -> submit [IoSlice A, IoSlice B, ...]
   -> complete N bytes
-  -> advance(N)
-  -> release every owner crossed by the new cursor
+  -> advance the borrowed cursor and retry any unwritten suffix
+  -> complete the claimed run and release its payload owners
 ```
 
-The buffer owner and all I/O metadata remain live until synchronous return or asynchronous terminal
-completion. Cancelling completion-based I/O does not release owners until cancellation or the
-original operation produces that completion.
+The claimed run and all of its owners remain live until synchronous return or asynchronous terminal
+completion. Short writes advance only the borrowed cursor; they do not mutate or partially release
+the source payloads. Cancelling completion-based I/O does not release owners until cancellation or
+the original operation produces that completion.
 
 Submission size is independent of carrier size. The I/O path may coalesce already available,
-file-offset-contiguous segments into a larger submission, but it does not retain carriers waiting
-for a preferred byte count. Buffered vectored writes accept any published segment layout.
+file-offset-contiguous chunks into a larger submission, but it does not retain carriers waiting for
+a preferred byte count. Gaps, overlaps, empty payloads, and offsets outside the requested object
+range are rejected as invalid receive-buffer state.
 
 Direct I/O adds address, length, and file-offset constraints. Page-aligned carrier bases alone do
 not satisfy them. The sink determines the required alignment for the selected file and device
@@ -2463,8 +2469,8 @@ primitives without defining the transport API.
 - **I4: Download ownership.** Reserved collection reuses one mutable stream per response, publishes
   only copied bytes, and releases foreign input after copy completion.
 - **I5: Disk completion.** Submitted byte owners remain live through terminal completion. Short
-  writes release exactly the completed prefix, and direct and buffered writes do not overlap file
-  pages.
+  writes advance a borrowed submission cursor without releasing the claimed run, and direct and
+  buffered writes do not overlap file pages.
 
 ## Configuration and operations
 
@@ -2513,6 +2519,11 @@ impl BufferPoolBuilder {
 fallible pool builder is its only resolution boundary; pooled storage does not introduce a second
 capacity enum or preserve a second clamping path. A transfer-manager client either constructs its
 default pool with `Auto` or accepts an already validated explicit pool.
+
+The crate's top-level `memory` module is the public facade for pool construction, reservation,
+acquisition, and pooled byte containers. Client and pool memory samples remain in the top-level
+`metrics` module with other observability types. The private implementation stays under
+`runtime::buffer_pool`; that layout is not part of the public API.
 
 Pool construction resolves the policy after selecting carrier geometry. Effective memory is the
 smaller of physical memory and a process or container memory limit where the platform exposes one.
@@ -2761,7 +2772,7 @@ impl MemoryMetrics {
     pub fn queued_reservations(&self) -> usize;
 
     /// Cumulative reservation requests that entered the FIFO.
-    pub fn parked_reservations_total(&self) -> u64;
+    pub fn reservations_queued_total(&self) -> u64;
 }
 ```
 
@@ -2780,7 +2791,7 @@ Prepared capacity follows whole-block geometry and the current admission floor. 
 raise it by less than one block beyond that floor. It can exceed configured capacity either through
 that rounding or because an idle-only grant raised admission above the normal ceiling.
 
-`parked_reservations_total` is copied from the admission state in the same sample. It increments
+`reservations_queued_total` is copied from the admission state in the same sample. It increments
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
 cancellation. It is monotonic for the lifetime of the pool and does not count an immediate grant.
 
@@ -2798,7 +2809,7 @@ Operational signals are organized by the failure they diagnose:
 
 | Symptom                                     | Signals                                                                   | Interpretation                                                              |
 | ------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Managed work remains queued                 | configured, admission used, queue depth, parked reservations total        | Admission is binding or an older FIFO request is ineligible                 |
+| Managed work remains queued                 | configured, admission used, queue depth, reservations queued total        | Admission is binding or an older FIFO request is ineligible                 |
 | Admission remains above configured capacity | admission overage, planned demand, charged capacity                       | Idle-only admission or ownership outside active planned demand remains live |
 | Memory remains prepared after global idle   | prepared capacity, charged capacity, reclaim retries                      | `idle_retention_target`, live owners, or cleanup prevents reclamation       |
 | Reuse repeatedly enters serialized fallback | serialized-acquisition count, prepared capacity, geometry                 | Optimistic scan work or placement is missing reusable capacity              |

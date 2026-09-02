@@ -87,6 +87,94 @@ impl SegmentedBytes {
         }
     }
 
+    /// Returns the contiguous bytes beginning at `offset` from this cursor.
+    ///
+    /// This borrowed traversal does not advance the cursor or clone owners.
+    pub(crate) fn chunk_from(&self, offset: usize) -> &[u8] {
+        assert!(
+            offset <= self.remaining,
+            "segmented byte offset exceeds remaining bytes"
+        );
+        if offset == self.remaining {
+            return &[];
+        }
+
+        let mut skipped = offset;
+        for (index, segment) in self.segments.iter().enumerate() {
+            let segment_offset = if index == 0 { self.front_offset } else { 0 };
+            let available = segment
+                .len
+                .checked_sub(segment_offset)
+                .unwrap_or_else(|| invariant_violation("segment cursor exceeds its range"));
+            if skipped >= available {
+                skipped -= available;
+                continue;
+            }
+            let start = segment_offset
+                .checked_add(skipped)
+                .unwrap_or_else(|| invariant_violation("segment offset overflow"));
+            let len = segment
+                .len
+                .checked_sub(start)
+                .unwrap_or_else(|| invariant_violation("segment offset exceeds its range"));
+            // SAFETY: owners cover this complete immutable initialized range,
+            // and `start` was checked within the segment.
+            return unsafe { std::slice::from_raw_parts(segment.ptr.as_ptr().add(start), len) };
+        }
+
+        invariant_violation("segmented byte offset has no presentation range")
+    }
+
+    /// Writes presentation ranges beginning at `offset` into `dst`.
+    ///
+    /// This is the non-advancing counterpart to [`Buf::chunks_vectored`].
+    pub(crate) fn chunks_vectored_from<'a>(
+        &'a self,
+        offset: usize,
+        dst: &mut [IoSlice<'a>],
+    ) -> usize {
+        assert!(
+            offset <= self.remaining,
+            "segmented byte offset exceeds remaining bytes"
+        );
+        if offset == self.remaining || dst.is_empty() {
+            return 0;
+        }
+
+        let mut skipped = offset;
+        let mut written = 0;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if written == dst.len() {
+                break;
+            }
+            let mut segment_offset = if index == 0 { self.front_offset } else { 0 };
+            let available = segment
+                .len
+                .checked_sub(segment_offset)
+                .unwrap_or_else(|| invariant_violation("segment cursor exceeds its range"));
+            if skipped >= available {
+                skipped -= available;
+                continue;
+            }
+            segment_offset = segment_offset
+                .checked_add(skipped)
+                .unwrap_or_else(|| invariant_violation("segment offset overflow"));
+            skipped = 0;
+            let len = segment
+                .len
+                .checked_sub(segment_offset)
+                .unwrap_or_else(|| invariant_violation("segment offset exceeds its range"));
+            // SAFETY: owners cover this complete immutable initialized range,
+            // and `segment_offset` was checked within the segment.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(segment.ptr.as_ptr().add(segment_offset), len)
+            };
+            dst[written] = IoSlice::new(bytes);
+            written += 1;
+        }
+        written
+    }
+
     /// Constructs one segmented value from its private builder.
     fn from_parts(segments: VecDeque<Segment>, remaining: usize) -> Self {
         let mut total = 0usize;
@@ -890,6 +978,34 @@ mod tests {
         assert_eq!(frozen.chunks_vectored(&mut two), 2);
         assert_eq!(&*two[0], &input[carrier_size - 2..carrier_size]);
         assert_eq!(&*two[1], &input[carrier_size..]);
+    }
+
+    #[test]
+    fn test_borrowed_offset_traversal_crosses_presentation_segments() {
+        let mut builder = SegmentedBytesBuilder::new();
+        builder.push_view(Bytes::from_static(b"ab"));
+        builder.push_view(Bytes::from_static(b"cdef"));
+        builder.push_view(Bytes::from_static(b"gh"));
+        let mut value = builder.finish();
+        value.advance(1);
+
+        assert_eq!(value.chunk_from(0), b"b");
+        assert_eq!(value.chunk_from(1), b"cdef");
+        assert_eq!(value.chunk_from(5), b"gh");
+        assert_eq!(value.chunk_from(7), b"");
+
+        let mut one = [IoSlice::new(&[])];
+        assert_eq!(value.chunks_vectored_from(1, &mut one), 1);
+        assert_eq!(&*one[0], b"cdef");
+
+        let mut all = [IoSlice::new(&[]); 3];
+        assert_eq!(value.chunks_vectored_from(0, &mut all), 3);
+        assert_eq!(&*all[0], b"b");
+        assert_eq!(&*all[1], b"cdef");
+        assert_eq!(&*all[2], b"gh");
+
+        let mut empty = [IoSlice::new(&[])];
+        assert_eq!(value.chunks_vectored_from(value.len(), &mut empty), 0);
     }
 
     #[test]

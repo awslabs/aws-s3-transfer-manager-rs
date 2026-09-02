@@ -5,6 +5,7 @@
 
 //! Reservation future and FIFO result-slot ownership.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -68,8 +69,22 @@ enum ReserveFutureState {
 /// future retires the transferred reservation. Invalid requests and physical
 /// preparation failures resolve to [`ReserveError`].
 #[must_use = "a reservation request does nothing unless polled or awaited"]
-pub(crate) struct ReserveFuture {
+pub struct ReserveFuture {
     state: ReserveFutureState,
+}
+
+impl fmt::Debug for ReserveFuture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match &self.state {
+            ReserveFutureState::New { .. } => "new",
+            ReserveFutureState::Queued { .. } => "queued",
+            ReserveFutureState::Complete => "complete",
+        };
+        formatter
+            .debug_struct("ReserveFuture")
+            .field("state", &state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WaitSlot {
@@ -199,7 +214,7 @@ mod tests {
         assert_eq!(admission.ledger.prepared_capacity, CarrierCount::ZERO);
         assert_eq!(admission.ledger.active_planned_demand, CarrierCount::ZERO);
         assert!(admission.waiters.is_empty());
-        assert_eq!(admission.parked_reservations_total, 0);
+        assert_eq!(admission.reservations_queued_total, 0);
         drop(admission);
         drop(future);
     }
@@ -216,7 +231,7 @@ mod tests {
         assert_eq!(admission.ledger.prepared_capacity, CarrierCount::new(1));
         assert_eq!(admission.ledger.active_planned_demand, CarrierCount::new(1));
         assert!(admission.waiters.is_empty());
-        assert_eq!(admission.parked_reservations_total, 0);
+        assert_eq!(admission.reservations_queued_total, 0);
         assert_eq!(wake_count(&wake_state), 0);
         drop(admission);
         drop(reservation);
@@ -250,7 +265,7 @@ mod tests {
         let second_reservation = take_ready(&mut second, &second_waker);
         let admission = pool.inner.admission.lock();
         assert!(admission.waiters.is_empty());
-        assert_eq!(admission.parked_reservations_total, 2);
+        assert_eq!(admission.reservations_queued_total, 2);
         drop(admission);
         drop(second_reservation);
     }
@@ -334,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repoll_replaces_waker_without_recounting_parked_request() {
+    fn test_repoll_replaces_waker_without_recounting_queued_request() {
         let (pool, carrier_size) = test_pool(1, 1);
         let holder = pool
             .try_reserve(carrier_size)
@@ -346,7 +361,7 @@ mod tests {
 
         assert_pending(&mut future, &first_waker);
         assert_pending(&mut future, &replacement_waker);
-        assert_eq!(pool.inner.admission.lock().parked_reservations_total, 1);
+        assert_eq!(pool.inner.admission.lock().reservations_queued_total, 1);
         drop(holder);
 
         assert_eq!(wake_count(&first_wakes), 0);
@@ -420,18 +435,18 @@ mod tests {
         ));
         let admission = pool.inner.admission.lock();
         assert!(admission.waiters.is_empty());
-        assert_eq!(admission.parked_reservations_total, 0);
+        assert_eq!(admission.reservations_queued_total, 0);
         assert_eq!(wake_count(&wake_state), 0);
     }
 
     #[test]
-    fn test_parked_counter_saturates_and_counts_one_fifo_entry_once() {
+    fn test_reservations_queued_counter_saturates_and_counts_one_fifo_entry_once() {
         let (pool, carrier_size) = test_pool(1, 1);
         let holder = pool
             .try_reserve(carrier_size)
             .unwrap()
             .expect("initial reservation");
-        pool.inner.admission.lock().parked_reservations_total = u64::MAX;
+        pool.inner.admission.lock().reservations_queued_total = u64::MAX;
         let (waker, _) = counting_waker();
         let mut future = pool.reserve(carrier_size);
 
@@ -439,7 +454,7 @@ mod tests {
         assert_pending(&mut future, &waker);
 
         let admission = pool.inner.admission.lock();
-        assert_eq!(admission.parked_reservations_total, u64::MAX);
+        assert_eq!(admission.reservations_queued_total, u64::MAX);
         assert_eq!(admission.waiters.len(), 1);
         drop(admission);
         drop(future);

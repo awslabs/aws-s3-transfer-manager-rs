@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::collections::VecDeque;
 use std::io::IoSlice;
 
 use bytes::Buf;
@@ -38,45 +37,120 @@ impl WakeNotify {
     async fn notified(&self) {}
 }
 
-/// One logical positioned write assembled from adjacent download chunks.
+/// Borrowed read position over one contiguous run being written to disk.
 ///
-/// Each child keeps its own read cursor and owners. Advancing the run therefore
-/// releases crossed pooled owners without gathering them into opaque `Bytes`.
-#[derive(Debug, Default)]
-struct WriteBuffer {
-    buffers: VecDeque<SegmentedBytes>,
+/// The claimed receive-buffer slots retain ownership until the write
+/// completes. This cursor presents their bytes without cloning owner metadata.
+struct DiskWriteCursor<'a> {
+    write: &'a SegmentWrite<ChunkOutput>,
+    payload_index: usize,
+    payload_offset: usize,
     remaining: usize,
 }
 
-impl WriteBuffer {
-    fn push(&mut self, buffer: SegmentedBytes) {
-        if buffer.is_empty() {
-            return;
+impl<'a> DiskWriteCursor<'a> {
+    /// Validates one claimed run and returns its object offset and read cursor.
+    fn new(write: &'a SegmentWrite<ChunkOutput>) -> std::io::Result<(u64, Self)> {
+        let mut object_offset = None;
+        let mut expected_offset = None;
+        let mut remaining = 0usize;
+
+        for slot in write.payloads() {
+            let chunk = slot.get().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "claimed disk-write run contains an unfilled slot",
+                )
+            })?;
+            let chunk_len = chunk.data.remaining();
+            if chunk_len == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "claimed disk-write run contains an empty payload",
+                ));
+            }
+            if let Some(expected) = expected_offset {
+                if chunk.offset != expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "claimed disk-write run has noncontiguous object offsets",
+                    ));
+                }
+            } else {
+                object_offset = Some(chunk.offset);
+            }
+
+            let chunk_len_u64 = u64::try_from(chunk_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write payload length exceeds object-offset representation",
+                )
+            })?;
+            expected_offset = Some(chunk.offset.checked_add(chunk_len_u64).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write object offset overflow",
+                )
+            })?);
+            remaining = remaining.checked_add(chunk_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write run length overflow",
+                )
+            })?;
         }
-        self.remaining = self
-            .remaining
-            .checked_add(buffer.remaining())
-            .expect("download write run length overflow");
-        self.buffers.push_back(buffer);
+
+        let object_offset = object_offset.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "claimed disk-write run contains no payloads",
+            )
+        })?;
+        Ok((
+            object_offset,
+            Self {
+                write,
+                payload_index: 0,
+                payload_offset: 0,
+                remaining,
+            },
+        ))
+    }
+
+    fn current(&self) -> &SegmentedBytes {
+        self.write.payloads()[self.payload_index]
+            .get()
+            .map(|chunk| &chunk.data)
+            .expect("validated disk-write payload disappeared")
     }
 }
 
-impl Buf for WriteBuffer {
+impl Buf for DiskWriteCursor<'_> {
     fn remaining(&self) -> usize {
         self.remaining
     }
 
     fn chunk(&self) -> &[u8] {
-        self.buffers.front().map(Buf::chunk).unwrap_or_default()
+        if self.remaining == 0 {
+            return &[];
+        }
+        self.current().chunk_from(self.payload_offset)
     }
 
     fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
         let mut written = 0;
-        for buffer in &self.buffers {
+        for (index, slot) in self.write.payloads()[self.payload_index..]
+            .iter()
+            .enumerate()
+        {
             if written == dst.len() {
                 break;
             }
-            written += buffer.chunks_vectored(&mut dst[written..]);
+            let chunk = slot
+                .get()
+                .expect("validated disk-write payload disappeared");
+            let offset = if index == 0 { self.payload_offset } else { 0 };
+            written += chunk.data.chunks_vectored_from(offset, &mut dst[written..]);
         }
         written
     }
@@ -88,15 +162,16 @@ impl Buf for WriteBuffer {
         );
         self.remaining -= count;
         while count != 0 {
-            let front = self
-                .buffers
-                .front_mut()
-                .expect("download write run lost its front buffer");
-            let advanced = count.min(front.remaining());
-            front.advance(advanced);
+            let current_len = self.current().remaining();
+            let available = current_len
+                .checked_sub(self.payload_offset)
+                .expect("disk-write cursor exceeds its payload");
+            let advanced = count.min(available);
+            self.payload_offset += advanced;
             count -= advanced;
-            if !front.has_remaining() {
-                self.buffers.pop_front();
+            if self.payload_offset == current_len {
+                self.payload_index += 1;
+                self.payload_offset = 0;
             }
         }
     }
@@ -112,7 +187,7 @@ impl Buf for WriteBuffer {
 /// drain task, hence `Send + Sync`.
 trait SinkWrite: Send + Sync + std::fmt::Debug {
     /// Write the entire buffer at `pos` bytes into the target.
-    fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()>;
+    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()>;
 
     /// Best-effort preallocation of `len` bytes. Default no-op.
     fn preallocate(&self, _len: u64) {}
@@ -133,7 +208,7 @@ impl std::fmt::Debug for FileSink {
 }
 
 impl SinkWrite for FileSink {
-    fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()> {
+    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
         crate::io::fs::write_all_at(&self.file, buf, pos)
     }
 
@@ -340,57 +415,25 @@ impl BodyWriter {
     }
 }
 
-/// Gather a claimed run's filled payloads and write them to the sink at the correct
-/// positions, coalescing offset-contiguous payloads into one positioned write. A
-/// payload at object offset `o` lands at sink position `o - object_range_start`. Reads
-/// payloads in place via `Slot::get()`; `complete()` (called by the caller after this
-/// returns) frees them.
+/// Write one claimed, contiguous payload run at its translated file position.
+///
+/// The cursor borrows payloads in place. `complete()` (called by the caller
+/// after this returns) frees their owners.
 fn write_run(
     sink: &dyn SinkWrite,
     object_range_start: u64,
     sw: &SegmentWrite<ChunkOutput>,
 ) -> std::io::Result<()> {
-    let mut run_start_file_pos: Option<u64> = None;
-    let mut run_end: u64 = 0;
-    let mut combined = WriteBuffer::default();
-
-    for slot in sw.payloads() {
-        let Some(chunk) = slot.get() else {
-            // Unfilled slot in a partial tail segment — flush accumulated run
-            // and reset.
-            if let Some(pos) = run_start_file_pos.take() {
-                sink.write_all_at(&mut combined, pos)?;
-                combined = WriteBuffer::default();
-            }
-            continue;
-        };
-
-        let file_pos = chunk.offset - object_range_start;
-        let chunk_len = chunk.data.remaining() as u64;
-
-        if let Some(start) = run_start_file_pos {
-            if file_pos != run_end {
-                // Gap: flush the accumulated run and start a new one.
-                sink.write_all_at(&mut combined, start)?;
-                combined = WriteBuffer::default();
-                run_start_file_pos = Some(file_pos);
-                run_end = file_pos + chunk_len;
-            } else {
-                run_end += chunk_len;
-            }
-        } else {
-            run_start_file_pos = Some(file_pos);
-            run_end = file_pos + chunk_len;
-        }
-
-        combined.push(chunk.data.clone());
-    }
-
-    // Flush any remaining accumulated run.
-    if let Some(pos) = run_start_file_pos {
-        sink.write_all_at(&mut combined, pos)?;
-    }
-    Ok(())
+    let (object_offset, mut cursor) = DiskWriteCursor::new(sw)?;
+    let file_pos = object_offset
+        .checked_sub(object_range_start)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "disk-write payload begins before the requested object range",
+            )
+        })?;
+    sink.write_all_at(&mut cursor, file_pos)
 }
 
 /// Consumer wrapper carrying the notify handle alongside the buffer consumer.
@@ -738,8 +781,8 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, DrainMode,
-        RecvBodyConsumer, Reservation, SinkWrite, WriteBuffer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        DiskWriteCursor, DrainMode, RecvBodyConsumer, Reservation, SinkWrite,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
@@ -755,20 +798,29 @@ mod tests {
     }
 
     #[test]
-    fn write_buffer_vectors_and_advances_across_chunk_boundaries() {
-        let mut buffer = WriteBuffer::default();
-        buffer.push(SegmentedBytes::from(Bytes::from_static(b"ab")));
-        buffer.push(SegmentedBytes::from(Bytes::from_static(b"cdef")));
+    fn disk_write_cursor_vectors_and_advances_across_chunk_boundaries() {
+        let (writer, _consumer, _sink) = new_recv_body_with_capture(0);
+        writer.claim().fill(chunk_at(0, 0, b"ab"));
+        writer.claim().fill(chunk_at(1, 2, b"cdef"));
+        let write = writer
+            .buffer
+            .take_drain_run(DrainMode::Eager)
+            .expect("two filled payloads");
+        {
+            let (object_offset, mut cursor) = DiskWriteCursor::new(&write).unwrap();
 
-        let mut slices = [std::io::IoSlice::new(&[]); 4];
-        let count = buffer.chunks_vectored(&mut slices);
-        assert_eq!(count, 2);
-        assert_eq!(slices[0].as_ref(), b"ab");
-        assert_eq!(slices[1].as_ref(), b"cdef");
+            let mut slices = [std::io::IoSlice::new(&[]); 4];
+            let count = cursor.chunks_vectored(&mut slices);
+            assert_eq!(object_offset, 0);
+            assert_eq!(count, 2);
+            assert_eq!(slices[0].as_ref(), b"ab");
+            assert_eq!(slices[1].as_ref(), b"cdef");
 
-        buffer.advance(3);
-        assert_eq!(buffer.remaining(), 3);
-        assert_eq!(buffer.chunk(), b"def");
+            cursor.advance(3);
+            assert_eq!(cursor.remaining(), 3);
+            assert_eq!(cursor.chunk(), b"def");
+        }
+        assert_eq!(write.complete(), 2);
     }
 
     /// In-memory [`SinkWrite`] that records every positioned write, for asserting the
@@ -794,10 +846,14 @@ mod tests {
             }
             out
         }
+
+        fn write_count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
     }
 
     impl SinkWrite for CaptureSink {
-        fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()> {
+        fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
             let mut bytes = vec![0u8; buf.remaining()];
             buf.copy_to_slice(&mut bytes);
             self.writes.lock().unwrap().insert(pos, bytes);
@@ -814,7 +870,7 @@ mod tests {
         #[derive(Debug)]
         struct Shared(Arc<CaptureSink>);
         impl SinkWrite for Shared {
-            fn write_all_at(&self, buf: &mut WriteBuffer, pos: u64) -> std::io::Result<()> {
+            fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
                 self.0.write_all_at(buf, pos)
             }
         }
@@ -851,133 +907,135 @@ mod tests {
     }
 
     #[test]
+    fn disk_submits_one_contiguous_run_as_one_positioned_write() {
+        let (writer, _consumer, sink) = new_recv_body_with_capture(100);
+        writer.claim().fill(chunk_at(0, 100, b"ab"));
+        writer.claim().fill(chunk_at(1, 102, b"cdef"));
+
+        assert_eq!(writer.finalize().unwrap(), 2);
+        assert_eq!(sink.write_count(), 1);
+        assert_eq!(sink.assembled(), b"abcdef");
+    }
+
+    #[test]
+    fn disk_rejects_gaps_and_overlaps_within_a_claimed_run() {
+        for second_offset in [1, 3] {
+            let (writer, _consumer, sink) = new_recv_body_with_capture(0);
+            writer.claim().fill(chunk_at(0, 0, b"ab"));
+            writer.claim().fill(chunk_at(1, second_offset, b"cd"));
+
+            let error = writer.finalize().expect_err("offsets are not contiguous");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(sink.write_count(), 0);
+        }
+    }
+
+    #[test]
+    fn disk_rejects_an_empty_claimed_payload() {
+        let (writer, _consumer, sink) = new_recv_body_with_capture(0);
+        writer.claim().fill(chunk_at(0, 0, b""));
+
+        let error = writer.finalize().expect_err("disk payload is empty");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(sink.write_count(), 0);
+    }
+
+    #[test]
     fn disk_writes_full_segment() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 4;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
-        // Fill a full segment's worth of slots
+        let mut expected = Vec::with_capacity(SEG_SIZE * CHUNK_LEN);
         for i in 0..SEG_SIZE as u64 {
             let slot = writer.claim();
-            let offset = i * 100;
-            let data = format!("d{i}xx");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
-        // The last fill sealed the segment; drain it.
         writer.drain(DrainMode::Batched).unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..SEG_SIZE as u64 {
-            let offset = (i * 100) as usize;
-            let expected = format!("d{i}xx");
-            assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn disk_eof_partial_tail() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
-        // Fill fewer than a segment's worth (partial)
         let partial = SEG_SIZE / 2;
+        let mut expected = Vec::with_capacity(partial * CHUNK_LEN);
         for i in 0..partial as u64 {
             let slot = writer.claim();
-            let offset = i * 100;
-            let data = format!("p{i}");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
-        // finalize drains the partial tail
         writer.finalize().unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..partial as u64 {
-            let offset = (i * 100) as usize;
-            let expected = format!("p{i}");
-            assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn disk_finalize_drains_full_and_tail() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
 
-        // Fill SEG_SIZE + 2 parts
         let total = SEG_SIZE + 2;
+        let mut expected = Vec::with_capacity(total * CHUNK_LEN);
         for i in 0..total as u64 {
             let slot = writer.claim();
-            let offset = i * 50;
-            let data = format!("x{i}");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
         writer.finalize().unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..total as u64 {
-            let offset = (i * 50) as usize;
-            let expected = format!("x{i}");
-            assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn disk_offset_translation() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, 1000, false);
 
         let n = SEG_SIZE;
+        let mut expected = Vec::with_capacity(n * CHUNK_LEN);
         for i in 0..n as u64 {
             let slot = writer.claim();
-            let offset = 1000 + i * 100;
-            let data = format!("r{i}");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = 1000 + i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
         writer.drain(DrainMode::Batched).unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..n as u64 {
-            let file_pos = (i * 100) as usize;
-            let expected = format!("r{i}");
-            assert_eq!(
-                &contents[file_pos..file_pos + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn disk_concurrent_fill() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 4;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
@@ -990,9 +1048,9 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 tokio::task::yield_now().await;
                 let seq = slot.seq();
-                let offset = seq * 100;
-                let data = format!("d{seq}");
-                slot.fill(chunk_at(seq, offset, data.as_bytes()));
+                let offset = seq * CHUNK_LEN as u64;
+                let data = [seq as u8; CHUNK_LEN];
+                slot.fill(chunk_at(seq, offset, &data));
             }));
         }
 
@@ -1004,11 +1062,10 @@ mod tests {
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..n as u64 {
-            let offset = (seq * 100) as usize;
-            let expected = format!("d{seq}");
+            let offset = seq as usize * CHUNK_LEN;
             assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
+                &contents[offset..offset + CHUNK_LEN],
+                &[seq as u8; CHUNK_LEN],
                 "mismatch at seq {seq}"
             );
         }
@@ -1037,7 +1094,7 @@ mod tests {
         let mut freed_total = 0u64;
         for i in 0..total {
             let slot = writer.claim();
-            let outcome = slot.fill(chunk_at(i, i * 100, format!("d{i}").as_bytes()));
+            let outcome = slot.fill(chunk_at(i, i, &[i as u8]));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
                 freed_total += writer.drain(DrainMode::Batched).unwrap();
