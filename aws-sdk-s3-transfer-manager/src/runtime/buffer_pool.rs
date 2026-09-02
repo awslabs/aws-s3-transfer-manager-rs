@@ -25,12 +25,12 @@ mod virtual_memory;
 
 use crate::types::MemoryBudgetConfig;
 use acquisition::acquire_count;
-pub(crate) use acquisition::AcquireError;
+pub use acquisition::AcquireError;
 use admission::{
     wake_all, AdmissionGuard, AdmissionState, CoverageState, ReservationPoll, WaitSlot, WaitState,
     Waiter, MAX_PACKED_CARRIERS,
 };
-pub(crate) use admission::{Reservation, ReserveError, ReserveFuture};
+pub use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError};
 use block::BlockError;
 use config::PoolConfig;
@@ -40,7 +40,7 @@ use maintenance::MaintenanceCoordinator;
 pub use metrics::MemoryMetrics;
 use metrics::{MemoryDiagnostics, MemoryMetricState};
 use pooled_buf::GrowthAuthority;
-pub(crate) use pooled_buf::PooledBufMut;
+pub use pooled_buf::PooledBufMut;
 pub use segmented_bytes::SegmentedBytes;
 
 #[cfg(test)]
@@ -125,7 +125,7 @@ impl BufferPool {
     /// `Ok(None)` reports an older FIFO request or current admission pressure.
     /// A successful grant has already prepared storage through its complete
     /// admission floor.
-    pub(crate) fn try_reserve(&self, bytes: usize) -> Result<Option<Reservation>, ReserveError> {
+    pub fn try_reserve(&self, bytes: usize) -> Result<Option<Reservation>, ReserveError> {
         let envelope = self.reservation_envelope(bytes)?;
         PoolInner::try_reserve_count(&self.inner, envelope)
     }
@@ -135,7 +135,7 @@ impl BufferPool {
     /// The first poll either returns an immediate result or enters the
     /// pool-wide FIFO. Invalid requests and physical preparation failures
     /// resolve through the future's `ReserveError`.
-    pub(crate) fn reserve(&self, bytes: usize) -> ReserveFuture {
+    pub fn reserve(&self, bytes: usize) -> ReserveFuture {
         ReserveFuture::new(self.clone(), bytes)
     }
 
@@ -169,7 +169,7 @@ impl BufferPool {
     /// belong to this pool, remain open, and retain enough direct-acquisition
     /// authority for the rounded request. Failure exposes no partial carrier
     /// ownership.
-    pub(crate) fn acquire(
+    pub fn acquire(
         &self,
         reservation: &Reservation,
         min_bytes: usize,
@@ -192,10 +192,7 @@ impl BufferPool {
     /// participates in aggregate accounting and may prepare physical capacity
     /// or raise admission above its normal configured ceiling. Failure exposes
     /// no partial carrier ownership.
-    pub(crate) fn acquire_unreserved(
-        &self,
-        min_bytes: usize,
-    ) -> Result<PooledBufMut, AcquireError> {
+    pub fn acquire_unreserved(&self, min_bytes: usize) -> Result<PooledBufMut, AcquireError> {
         let count = self.acquisition_count(min_bytes)?;
         let guards = acquire_count(&self.inner, None, count)?;
         PooledBufMut::try_new(GrowthAuthority::unreserved(Arc::clone(&self.inner)), guards)
@@ -294,7 +291,7 @@ impl PoolInner {
                 charged_capacity,
                 prepared_capacity: admission.ledger.prepared_capacity,
                 queued_reservations: admission.waiters.len(),
-                parked_reservations_total: admission.parked_reservations_total,
+                reservations_queued_total: admission.reservations_queued_total,
             },
         )
     }
@@ -395,8 +392,8 @@ impl PoolInner {
             envelope,
             slot: Arc::clone(&slot),
         });
-        admission.inner.parked_reservations_total =
-            admission.inner.parked_reservations_total.saturating_add(1);
+        admission.inner.reservations_queued_total =
+            admission.inner.reservations_queued_total.saturating_add(1);
         Ok(ReservationPoll::Queued(slot))
     }
 

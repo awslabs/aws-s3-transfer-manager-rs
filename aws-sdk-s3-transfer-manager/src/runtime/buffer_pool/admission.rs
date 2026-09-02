@@ -30,7 +30,7 @@ use coverage::CoverageSnapshot;
 pub(super) use coverage::{CoverageState, MAX_PACKED_CARRIERS};
 
 mod waiter;
-pub(crate) use waiter::ReserveFuture;
+pub use waiter::ReserveFuture;
 pub(super) use waiter::{ReservationPoll, WaitSlot, WaitState, Waiter};
 
 /// Planned-demand state protected by the pool admission mutex.
@@ -40,7 +40,7 @@ pub(super) struct AdmissionState {
     /// Reservation requests retained in strict arrival order.
     pub(super) waiters: VecDeque<Waiter>,
     /// Cumulative requests that entered the FIFO.
-    pub(super) parked_reservations_total: u64,
+    pub(super) reservations_queued_total: u64,
 }
 
 impl AdmissionState {
@@ -53,7 +53,7 @@ impl AdmissionState {
                 active_planned_demand: CarrierCount::ZERO,
             },
             waiters: VecDeque::new(),
-            parked_reservations_total: 0,
+            reservations_queued_total: 0,
         }
     }
 }
@@ -247,7 +247,7 @@ impl AdmissionLedger {
 /// Failure to create a new reservation.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReserveError {
+pub enum ReserveError {
     /// The byte request was zero.
     InvalidSize,
     /// Physical storage could not be prepared.
@@ -275,8 +275,12 @@ impl fmt::Display for ReserveError {
 
 impl std::error::Error for ReserveError {}
 
-/// Non-cloneable acquisition authority for one admitted envelope.
-pub(crate) struct Reservation {
+/// Non-cloneable acquisition authority for one admitted memory envelope.
+///
+/// Dropping the reservation closes it. Mutable buffers and immutable views
+/// already acquired through it remain valid and keep their memory charged
+/// until their final owners are dropped.
+pub struct Reservation {
     state: Option<Arc<ReservationState>>,
 }
 
@@ -302,8 +306,12 @@ impl Reservation {
         }
     }
 
-    /// Revokes acquisition of new carriers and retires planned demand.
-    pub(crate) fn close_acquisition(mut self) {
+    /// Revokes new acquisition and retires this reservation's planned demand.
+    ///
+    /// Buffers acquired before this call keep their existing capacity, but
+    /// attempts to grow them return
+    /// [`AcquireError::ReservationClosed`](super::AcquireError::ReservationClosed).
+    pub fn close_acquisition(mut self) {
         self.close();
     }
 
@@ -316,6 +324,15 @@ impl Reservation {
     /// Returns the private state retained by a direct acquisition.
     pub(super) fn acquisition_state(&self) -> Option<&Arc<ReservationState>> {
         self.state.as_ref()
+    }
+}
+
+impl fmt::Debug for Reservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Reservation")
+            .field("open", &self.state.is_some())
+            .finish_non_exhaustive()
     }
 }
 

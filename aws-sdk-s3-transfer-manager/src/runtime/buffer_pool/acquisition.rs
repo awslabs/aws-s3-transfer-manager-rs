@@ -20,7 +20,7 @@ use crate::runtime::sync::sync::Arc;
 /// Failure to acquire a complete mutable carrier batch.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AcquireError {
+pub enum AcquireError {
     /// The byte request was zero.
     InvalidSize,
     /// The reservation belongs to another pool.
