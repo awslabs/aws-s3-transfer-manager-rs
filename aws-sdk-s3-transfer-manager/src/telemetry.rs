@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! RUST_LOG=aws_sdk_s3_transfer_manager::concurrency=debug   # adaptive algorithm decisions
-//! RUST_LOG=aws_sdk_s3_transfer_manager::scheduling=debug    # scheduler + memory-budget capacity
+//! RUST_LOG=aws_sdk_s3_transfer_manager::scheduling=debug    # scheduler, submission, memory budget
 //! RUST_LOG=aws_sdk_s3_transfer_manager::execution=trace     # per-work-item execute/complete
 //! RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug      # transfer lifecycle events
 //! ```
@@ -22,8 +22,9 @@ use std::time::Duration;
 /// Adaptive concurrency controller: phase transitions, target changes, probe results.
 pub(crate) const TARGET_CONCURRENCY: &str = "aws_sdk_s3_transfer_manager::concurrency";
 
-/// Scheduler capacity decisions, worker pool growth, and memory-budget admission
-/// (reserve/grant/release flow, and saturation edges where a reserve parks).
+/// Scheduler capacity decisions, worker pool growth, the batched submission handoff to the
+/// runtime, and memory-budget admission (reserve/grant/release flow, and saturation edges
+/// where a reserve parks). Batch-scoped, unlike [`TARGET_EXECUTION`].
 pub(crate) const TARGET_SCHEDULING: &str = "aws_sdk_s3_transfer_manager::scheduling";
 
 /// Per-work-item execution: dispatch, complete, skip, panic.

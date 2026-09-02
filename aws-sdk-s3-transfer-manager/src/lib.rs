@@ -70,8 +70,8 @@
 //! | Target | Covers |
 //! |---|---|
 //! | `aws_sdk_s3_transfer_manager::transfer` | transfer lifecycle, per-request spans, directory walking |
-//! | `aws_sdk_s3_transfer_manager::execution` | work dispatch, completion, panics, submission handoff |
-//! | `aws_sdk_s3_transfer_manager::scheduling` | scheduler capacity, worker growth, memory-budget admission |
+//! | `aws_sdk_s3_transfer_manager::execution` | per-work-item dispatch, completion, and panics |
+//! | `aws_sdk_s3_transfer_manager::scheduling` | scheduler capacity, worker growth, submission handoff, memory-budget admission |
 //! | `aws_sdk_s3_transfer_manager::concurrency` | concurrency-controller decisions |
 //!
 //! To follow transfer activity without the scheduling and dispatch streams:
