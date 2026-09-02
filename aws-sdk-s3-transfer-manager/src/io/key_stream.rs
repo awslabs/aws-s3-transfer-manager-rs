@@ -11,12 +11,16 @@
 //! each.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::types::Object;
 
 use crate::io::key::{derive_object_key, strip_key_prefix};
-use crate::io::walk::{DirEntry, FsWalk, S3Walk, WalkError, WalkErrorKind};
+use crate::io::key_filter::KeyFilter;
+use crate::io::walk::{
+    exclude_s3_folder_markers, DirEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
+};
 
 // Whole seconds, because that is the granularity S3 reports last-modified at.
 // Keeping finer local precision would make an identical pair differ every run.
@@ -74,10 +78,44 @@ fn secs_since_epoch(modified: std::io::Result<SystemTime>) -> i64 {
 // differing only in invalid bytes collapse to one key, and `Entry::source` still
 // holds each true path.
 fn local_key(entry: &DirEntry) -> String {
-    let relative = entry.relative_path().to_string_lossy();
+    key_for_relative_path(entry.relative_path())
+}
+
+fn key_for_relative_path(relative: &std::path::Path) -> String {
+    let relative = relative.to_string_lossy();
     derive_object_key(&relative, None, None)
         .expect("key derivation cannot fail without a custom delimiter")
         .into_owned()
+}
+
+// Predicates that apply one rule set to both sides.
+//
+// Both derive the key the same way the streams do, so a rule cannot decide one thing
+// for a local file and another for the object it corresponds to. That symmetry is what
+// keeps an excluded key from being read as a missing one: it is absent from both
+// sides, so nothing compares it and nothing deletes it.
+//
+// The destination side is built here too, in one place, because the deferred
+// `--delete-excluded` behavior inverts exactly this decision.
+pub(crate) fn local_predicate(
+    filter: Arc<KeyFilter>,
+) -> impl Fn(&std::path::Path) -> bool + Send + Sync + 'static {
+    move |relative| filter.allows(&key_for_relative_path(relative))
+}
+
+pub(crate) fn s3_predicate(
+    filter: Arc<KeyFilter>,
+    prefix: Option<String>,
+) -> impl Fn(&Object) -> bool + Send + Sync + 'static {
+    move |obj| {
+        // Folder markers are dropped by the walker's own default, which setting a
+        // filter would otherwise replace.
+        if !exclude_s3_folder_markers(obj) {
+            return false;
+        }
+        let key = obj.key().unwrap_or_default();
+        filter.allows(strip_key_prefix(key, prefix.as_deref(), None))
+    }
 }
 
 impl KeyStream for FsWalk {
@@ -314,6 +352,179 @@ mod tests {
                 .is_restore_in_progress(),
             Some(true)
         );
+    }
+
+    // --- filters ---
+
+    use crate::io::key_filter::Rule;
+
+    fn filtered_local(root: &std::path::Path, rules: Vec<Rule>) -> FsWalk {
+        let filter = Arc::new(KeyFilter::new(rules));
+        FsWalker::builder()
+            .recursive(true)
+            .key_order(true)
+            .path_filter(local_predicate(filter))
+            .build()
+            .walk(FsWalkContext::builder().root(root).build())
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_excluded_file_is_not_yielded() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        fs::write(dir.path().join("logs/a.txt"), "").unwrap();
+        fs::write(dir.path().join("keep.txt"), "").unwrap();
+
+        let mut walk = filtered_local(dir.path(), vec![Rule::exclude("logs/*")]);
+        assert_eq!(keys(&mut walk).await, vec!["keep.txt"]);
+    }
+
+    // FR-Filter-5. An excluded entry must not warn even when it cannot be read, which
+    // means the rules have to be consulted before the metadata is.
+    // A directory that can be listed but whose children cannot be stat'd: readable,
+    // not searchable. Returns `None` when the mode has no effect, as for root.
+    fn unstattable_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("secret.txt"), "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let listable = fs::read_dir(&locked).is_ok();
+        let stattable = fs::metadata(locked.join("secret.txt")).is_ok();
+        if listable && !stattable {
+            Some(locked)
+        } else {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            None
+        }
+    }
+
+    fn unlock(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_excluded_unreadable_file_warns_about_nothing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("keep.txt"), "").unwrap();
+        let Some(locked) = unstattable_dir(dir.path()) else {
+            return; // running as root, or a filesystem that ignores the mode
+        };
+
+        let mut walk = filtered_local(dir.path(), vec![Rule::exclude("locked/*")]);
+        let mut seen = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            match next {
+                Ok(entry) => seen.push(entry.key),
+                Err(err) => errors.push(err),
+            }
+        }
+        unlock(&locked);
+
+        assert_eq!(seen, vec!["keep.txt"]);
+        assert!(
+            errors.is_empty(),
+            "an excluded entry must not warn: {:?}",
+            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+        );
+    }
+
+    // The control for the test above: without the rule, the same file does warn, so
+    // the silence there comes from the filter and not from swallowing errors.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_unreadable_file_that_is_not_excluded_still_warns() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("keep.txt"), "").unwrap();
+        let Some(locked) = unstattable_dir(dir.path()) else {
+            return; // running as root, or a filesystem that ignores the mode
+        };
+
+        let mut walk = filtered_local(dir.path(), vec![Rule::exclude("nothing/*")]);
+        let mut errors = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            if let Err(err) = next {
+                errors.push(err);
+            }
+        }
+        unlock(&locked);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind() == WalkErrorKind::PermissionDenied),
+            "expected a per-entry permission warning, got {:?}",
+            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+        );
+    }
+
+    // A named pipe is skipped without a warning whether or not a rule excludes it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_excluded_special_file_warns_about_nothing() {
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        if !status.success() {
+            return;
+        }
+        fs::write(dir.path().join("keep.txt"), "").unwrap();
+
+        let mut walk = filtered_local(dir.path(), vec![Rule::exclude("pipe")]);
+        let mut seen = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            match next {
+                Ok(entry) => seen.push(entry.key),
+                Err(err) => errors.push(err),
+            }
+        }
+        assert_eq!(seen, vec!["keep.txt"]);
+        assert!(errors.is_empty());
+    }
+
+    // One rule set, two sides, same answers — the property that keeps an excluded key
+    // from looking like a deleted one.
+    #[test]
+    fn both_sides_decide_alike_for_the_same_key() {
+        let rules = vec![
+            Rule::exclude("*"),
+            Rule::include("logs/*"),
+            Rule::exclude("logs/secret/*"),
+        ];
+        let filter = Arc::new(KeyFilter::new(rules));
+        let local = local_predicate(filter.clone());
+        let remote = s3_predicate(filter, Some("data/".to_string()));
+
+        for key in [
+            "a.txt",
+            "logs/a.txt",
+            "logs/secret/a.txt",
+            "logs/inner/b.log",
+            "other/c",
+        ] {
+            let local_says = local(std::path::Path::new(key));
+            let remote_says = remote(&object(&format!("data/{key}"), 1));
+            assert_eq!(local_says, remote_says, "disagreed about {key:?}");
+        }
+    }
+
+    // Setting a filter replaces the walker's default, so the marker exclusion has to
+    // be carried explicitly or folder markers reappear as entries.
+    #[test]
+    fn folder_markers_stay_excluded_when_a_filter_is_set() {
+        let remote = s3_predicate(Arc::new(KeyFilter::default()), None);
+        assert!(!remote(&object("data/", 0)));
+        assert!(remote(&object("data/a.txt", 1)));
     }
 
     #[cfg_attr(miri, ignore)]
