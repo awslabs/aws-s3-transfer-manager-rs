@@ -20,6 +20,7 @@ use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
 use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient, SharedHttpClient};
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::topology::Cpu;
 use super::Topology;
@@ -120,18 +121,21 @@ enum ExecuteResult {
 async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> ExecuteResult {
     scheduler.on_dispatch();
     let tid = work.descriptor.id();
+    let work_kind = work.item.kind();
     work.descriptor.work_started();
 
     if work.descriptor.is_terminal() {
-        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "skipped (terminal)");
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, work = work_kind, "skipped (terminal)");
         return ExecuteResult::Completed(WorkOutcome::Cancelled, Duration::ZERO);
     }
 
-    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "executing");
+    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, work = work_kind, "executing");
     let transfer = work.descriptor.transfer();
     let started = Instant::now();
 
     let token = transfer.ctx().cancellation_token().clone();
+    // Not a child of the span that initiated the transfer: dispatch crosses a
+    // thread, so `tid` is what ties this span back to its transfer.
     let outcome = AssertUnwindSafe(async {
         tokio::select! {
             biased;
@@ -140,15 +144,21 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
         }
     })
     .catch_unwind()
+    .instrument(tracing::debug_span!(
+        target: crate::telemetry::TARGET_EXECUTION,
+        "execute",
+        tid = %tid,
+        work = work_kind
+    ))
     .await;
 
     match outcome {
         Ok(outcome) => {
-            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, ?outcome, "completed");
+            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, work = work_kind, ?outcome, "completed");
             ExecuteResult::Completed(outcome, started.elapsed())
         }
         Err(_panic) => {
-            tracing::error!(target: crate::telemetry::TARGET_EXECUTION, %tid, "panic in transfer execute");
+            tracing::error!(target: crate::telemetry::TARGET_EXECUTION, %tid, work = work_kind, "panic in transfer execute");
             ExecuteResult::Panicked
         }
     }

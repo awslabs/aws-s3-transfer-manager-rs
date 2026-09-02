@@ -74,6 +74,19 @@ pub(crate) enum UploadObjectsWork {
     JoinChildren { batch: Option<ReapingBatch> },
 }
 
+impl crate::transfer::WorkData for UploadObjectsWork {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::AdvanceWalker { .. } => "advance-walker",
+            Self::JoinChildren { .. } => "join-children",
+        }
+    }
+}
+
 pub(crate) struct ChildTransfer {
     source_path: PathBuf,
     key: String,
@@ -484,6 +497,7 @@ impl UploadObjectsTransfer {
     /// accumulating. Walk and spawn are skipped when inactive so cancel/fail
     /// stops new work while in-flight drains.
     pub(crate) fn poll_work(&self) -> PollWork {
+        let _span = self.inner.ctx.poll_span();
         let active = self.inner.ctx.is_active();
         let mut state = self.inner.state.lock();
 

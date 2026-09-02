@@ -189,13 +189,13 @@ impl MemoryBudget {
         assert!(chunk_bytes > 0, "chunk_bytes must be > 0");
         let capacity = (capacity_bytes / chunk_bytes).max(1) as u64;
         if capacity_bytes < chunk_bytes {
-            tracing::debug!(
+            tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING,
                 requested_bytes = capacity_bytes,
                 chunk_bytes,
                 "memory budget below one chunk; raised to a single chunk"
             );
         }
-        tracing::debug!(
+        tracing::debug!(target: crate::telemetry::TARGET_SCHEDULING,
             capacity_chunks = capacity,
             chunk_bytes,
             "memory budget resolved"

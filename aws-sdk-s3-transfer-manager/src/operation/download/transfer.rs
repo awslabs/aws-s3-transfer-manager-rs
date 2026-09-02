@@ -45,6 +45,20 @@ pub(crate) enum DownloadWork {
     DrainResident,
 }
 
+impl crate::transfer::WorkData for DownloadWork {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::GetObjectRange { .. } => "get-object-range",
+            Self::DrainResident => "drain-resident",
+        }
+    }
+}
+
 /// Bytes in the next chunk sliced from `remaining` at `part_size`: the reservation
 /// size for that chunk. Peek only — does not advance `remaining`.
 fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize {
@@ -237,10 +251,10 @@ impl DownloadTransfer {
     /// - `PollWork::Ready { .. }` - work available to execute
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
-    #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
     pub(crate) fn poll_work(&self) -> PollWork {
+        let _span = self.inner.ctx.poll_span();
         if !self.inner.ctx.is_active() {
-            tracing::debug!("not active, returning Done");
+            tracing::debug!(target: crate::telemetry::TARGET_TRANSFER, "not active, returning Done");
             return PollWork::Done;
         }
 
@@ -525,7 +539,6 @@ impl DownloadTransfer {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = ?work.data))]
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<DownloadWork>();
         match data {
@@ -1072,6 +1085,8 @@ impl DownloadTransfer {
     ) -> WorkOutcome {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
+            tid = %self.inner.ctx.id,
+            %error,
             "download failed",
         );
         let classification = crate::scheduler::classify_error(&error);

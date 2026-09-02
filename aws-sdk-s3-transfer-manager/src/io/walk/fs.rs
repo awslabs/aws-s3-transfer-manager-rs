@@ -203,7 +203,7 @@ impl FsWalker {
             });
         }
 
-        tracing::debug!(
+        tracing::debug!(target: crate::telemetry::TARGET_TRANSFER,
             ?root,
             follow_symlinks = self.follow_symlinks,
             max_depth = self.max_depth,
@@ -465,7 +465,7 @@ impl FsWalk {
             }
             if let Some(err) = self.pending_errors.pop_front() {
                 if !err.is_fatal() {
-                    tracing::warn!(
+                    tracing::warn!(target: crate::telemetry::TARGET_TRANSFER,
                         path = ?err.path(),
                         kind = ?err.kind(),
                         "skipping entry",
@@ -705,7 +705,7 @@ impl FsWalk {
             result.subdirs.sort_by(|a, b| a.path.cmp(&b.path));
         }
 
-        tracing::trace!(
+        tracing::trace!(target: crate::telemetry::TARGET_TRANSFER,
             ?dir,
             files = result.files.len(),
             subdirs = result.subdirs.len(),

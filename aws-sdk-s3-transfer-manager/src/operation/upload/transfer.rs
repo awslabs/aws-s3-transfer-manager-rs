@@ -60,6 +60,21 @@ pub(crate) enum UploadWork {
     PutObject { stream: Option<InputStream> },
 }
 
+impl crate::transfer::WorkData for UploadWork {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::CreateMPU => "create-mpu",
+            Self::UploadPart => "upload-part",
+            Self::CompleteMPU => "complete-mpu",
+            Self::PutObject { .. } => "put-object",
+        }
+    }
+}
+
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
@@ -181,6 +196,7 @@ impl UploadTransfer {
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
     pub(crate) fn poll_work(&self) -> PollWork {
+        let _span = self.inner.ctx.poll_span();
         if !self.inner.ctx.is_active() {
             return PollWork::Done;
         }
@@ -302,7 +318,10 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!("send-create-multipart-upload"))
+            .instrument(tracing::debug_span!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "send-create-multipart-upload"
+            ))
             .await
         {
             Ok(resp) => resp,
@@ -346,7 +365,7 @@ impl UploadTransfer {
             None => PartPlan::Unknown,
         };
 
-        tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
+        tracing::trace!(target: crate::telemetry::TARGET_TRANSFER, "upload request using multipart upload with part size: {part_size} bytes");
 
         let part_reader = Arc::new(
             match PartReaderBuilder::new()
@@ -405,12 +424,15 @@ impl UploadTransfer {
 
         let data = match part_reader
             .next_part()
-            .instrument(tracing::debug_span!("read-upload-body"))
+            .instrument(tracing::debug_span!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "read-upload-body"
+            ))
             .await
         {
             Ok(Some(data)) => data,
             Ok(None) => {
-                tracing::trace!("part_reader exhausted");
+                tracing::trace!(target: crate::telemetry::TARGET_TRANSFER, "part_reader exhausted");
                 return self.on_end_of_stream(&part_reader).await;
             }
             Err(e) => return self.fail(e.into()),
@@ -530,7 +552,11 @@ impl UploadTransfer {
                     )
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!("send-upload-part", part_number))
+                    .instrument(tracing::debug_span!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        "send-upload-part",
+                        part_number
+                    ))
                     .await
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
@@ -669,7 +695,10 @@ impl UploadTransfer {
                     )
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!("send-put-object"))
+                    .instrument(tracing::debug_span!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        "send-put-object"
+                    ))
                     .await
                     .map_err(|e| crate::retry::GuardError::Inner(e.into()))
             }
@@ -814,11 +843,28 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!("send-complete-multipart-upload"))
+            .instrument(tracing::debug_span!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "send-complete-multipart-upload"
+            ))
             .await
         {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => {
+                // Carries the upload id, which is in scope only here: without it the
+                // operator has no handle on the upload S3 is still holding parts for.
+                // `Error: Display` renders its own context only, so the reason is taken
+                // through the source chain -- a transport failure carries no service
+                // code and would otherwise log no reason at all.
+                let error = Error::from(e);
+                tracing::warn!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    %upload_id,
+                    reason = %aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "complete multipart upload failed",
+                );
+                return self.fail(error);
+            }
         };
 
         let result = response_builder
@@ -837,6 +883,7 @@ impl UploadTransfer {
     fn fail(&self, error: Error) -> WorkOutcome {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
+            tid = %self.inner.ctx.id,
             %error,
             "upload failed",
         );
