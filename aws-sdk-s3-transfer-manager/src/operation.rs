@@ -18,6 +18,9 @@ pub mod download_objects;
 
 /// Types for multiple object upload operation
 pub mod upload_objects;
+// THROWAWAY: feasibility spike, see the module docs.
+#[allow(dead_code)]
+pub(crate) mod sync_spike;
 
 // The default delimiter of the S3 object key
 
