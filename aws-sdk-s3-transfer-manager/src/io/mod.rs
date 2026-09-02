@@ -16,6 +16,9 @@ mod stream;
 pub mod error;
 pub(crate) mod fs;
 pub(crate) mod key;
+// Unimplemented until S1-T11/S1-T12; its tests define the API.
+#[allow(dead_code)]
+pub(crate) mod key_filter;
 // Nothing outside this module's own tests calls it until the comparison lands.
 #[allow(dead_code)]
 pub(crate) mod key_stream;
