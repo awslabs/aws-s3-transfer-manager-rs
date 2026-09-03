@@ -543,6 +543,25 @@ mod tests {
         mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, put])
     }
 
+    // Every scheduled run goes through this. A missed wake parks the transfer forever, and
+    // a test that hangs reports nothing at all — so the bound is part of the harness, not
+    // an afterthought.
+    async fn run(
+        tm: &crate::Client,
+        root: &std::path::Path,
+        bucket: &str,
+        prefix: &str,
+        max_children: usize,
+    ) -> (usize, usize, usize) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            sync_up_scheduled(tm, root, bucket, prefix, max_children),
+        )
+        .await
+        .expect("sync never finished: a Pending with no matching wake")
+        .expect("sync failed")
+    }
+
     // The whole point: driven entirely by the scheduler, with both walks advanced as
     // dispatched work rather than awaited inline.
     #[cfg_attr(miri, ignore)]
@@ -568,10 +587,7 @@ mod tests {
         let s3 = client_with(vec![already_there], seen.clone());
         let tm = crate::Client::new(crate::Config::builder().client(s3).build());
 
-        let (sent, destination_only, peak) =
-            sync_up_scheduled(&tm, dir.path(), "bucket", "data", 8)
-                .await
-                .unwrap();
+        let (sent, destination_only, peak) = run(&tm, dir.path(), "bucket", "data", 8).await;
 
         assert_eq!(sent, 1, "only the missing file should be sent");
         assert_eq!(destination_only, 0);
@@ -603,6 +619,114 @@ mod tests {
         assert_eq!(destination_only, 1, "the key only at the destination");
     }
 
+    // --- starvation ---
+    //
+    // Every `PollWork::Pending` owes a future wake, and sync parks in exactly one place:
+    // waiting on children or on an advance it dispatched. Advances wake themselves when
+    // they finish; children are woken for us, because `signal_terminal` on a child wakes
+    // its parent — which only works because they were created through
+    // `orchestrate_child` with the parent id rather than as top-level transfers.
+    //
+    // A missed wake shows up as a hang, so every test here is wrapped in a timeout: the
+    // failure mode is "never finishes", and an assertion that never runs proves nothing.
+
+    fn client_with_concurrency(
+        objects: Vec<Object>,
+        seen: Arc<StdMutex<Vec<String>>>,
+        concurrency: usize,
+    ) -> crate::Client {
+        let s3 = client_with(objects, seen);
+        crate::Client::new(
+            crate::Config::builder()
+                .client(s3)
+                .concurrency(crate::types::ConcurrencyMode::Explicit(concurrency))
+                .build(),
+        )
+    }
+
+    // One dispatch slot for everything: both walks, every child, and every join have to
+    // take turns through the same eye of a needle.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn finishes_with_a_single_dispatch_slot() {
+        let dir = tempdir().unwrap();
+        for i in 0..60 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let tm = client_with_concurrency(vec![], seen.clone(), 1);
+
+        let (sent, _, peak) = run(&tm, dir.path(), "bucket", "", 4).await;
+        assert_eq!(sent, 60);
+        assert!(peak <= 4);
+        assert_eq!(seen.lock().unwrap().len(), 60);
+    }
+
+    // A child cap of one means the transfer parks on a single child over and over, so
+    // every one of those parks depends on the parent being woken when that child ends.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn finishes_with_one_child_at_a_time() {
+        let dir = tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let tm = client_with_concurrency(vec![], seen.clone(), 2);
+
+        let (sent, _, peak) = run(&tm, dir.path(), "bucket", "", 1).await;
+        assert_eq!(sent, 20);
+        assert_eq!(peak, 1);
+    }
+
+    // Other transfers competing for the same slot. Sync must not be starved indefinitely,
+    // and must not starve them either.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn finishes_while_other_transfers_compete() {
+        let dir = tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let tm = client_with_concurrency(vec![], seen.clone(), 1);
+
+        // Outside the synced directory, or the sync would pick it up as another file.
+        let elsewhere = tempdir().unwrap();
+        let other = elsewhere.path().join("other.bin");
+        std::fs::write(&other, vec![1u8; 4096]).unwrap();
+
+        let competing = {
+            let tm = tm.clone();
+            let other = other.clone();
+            tokio::spawn(async move {
+                for i in 0..20 {
+                    let stream = crate::io::InputStream::from_path(&other).unwrap();
+                    tm.upload()
+                        .bucket("bucket")
+                        .key(format!("unrelated/{i}"))
+                        .body(stream)
+                        .initiate()
+                        .unwrap()
+                        .join()
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+
+        let (sent, _, _) = run(&tm, dir.path(), "bucket", "", 4).await;
+        assert_eq!(sent, 30);
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), competing)
+            .await
+            .expect("competing transfers starved by sync")
+            .unwrap();
+    }
+
     // More files than child slots, so the cap has to hold and the run still finishes.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -616,9 +740,7 @@ mod tests {
         let s3 = client_with(vec![], seen.clone());
         let tm = crate::Client::new(crate::Config::builder().client(s3).build());
 
-        let (sent, _, peak) = sync_up_scheduled(&tm, dir.path(), "bucket", "", 4)
-            .await
-            .unwrap();
+        let (sent, _, peak) = run(&tm, dir.path(), "bucket", "", 4).await;
 
         assert_eq!(sent, 40);
         assert!(peak <= 4, "child cap exceeded: {peak}");
