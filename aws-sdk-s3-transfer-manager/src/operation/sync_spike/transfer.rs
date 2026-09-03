@@ -216,6 +216,10 @@ where
         }
     }
 
+    pub(crate) fn id(&self) -> crate::transfer::TransferId {
+        self.inner.ctx.id
+    }
+
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
         let state = self.inner.state.lock();
         (
@@ -443,15 +447,21 @@ where
     }
 }
 
-/// Run a local-to-S3 sync as a scheduled transfer and wait for it. Returns files sent,
-/// destination-only keys seen, and the most children ever in flight.
-pub(crate) async fn sync_up_scheduled(
+/// Start a local-to-S3 sync as a scheduled transfer, without waiting for it.
+///
+/// Separate from waiting so a caller can cancel a run in progress — which is also the
+/// shape a real operation would take, where initiating and joining are distinct.
+#[allow(clippy::type_complexity)]
+pub(crate) fn start_sync_up(
     tm: &crate::Client,
     root: &std::path::Path,
     bucket: &str,
     prefix: &str,
     max_children: usize,
-) -> Result<(usize, usize, usize), Error> {
+) -> (
+    SyncTransfer<crate::io::walk::FsWalk, crate::io::walk::S3Walk>,
+    crate::transfer::StateMachineTerminalReceiver,
+) {
     use crate::io::walk::{FsWalkContext, FsWalker, S3WalkContext, S3Walker};
     use crate::operation::upload::{Upload, UploadInput};
 
@@ -475,8 +485,8 @@ pub(crate) async fn sync_up_scheduled(
     let bucket_owned = bucket.to_string();
     let prefix_owned = prefix.to_string();
     let spawn: SpawnFn<crate::io::walk::DirEntry> = Box::new(move |handle, parent_id, entry| {
-        // The entry's own path, not one rebuilt from the key, which would fail to open
-        // a name that is not valid UTF-8.
+        // The entry's own path, not one rebuilt from the key, which would fail to open a
+        // name that is not valid UTF-8.
         let stream = crate::io::InputStream::from_path(entry.source.path())?;
         let key = if prefix_owned.is_empty() {
             entry.key.clone()
@@ -505,9 +515,21 @@ pub(crate) async fn sync_up_scheduled(
     handle
         .scheduler
         .enqueue_transfer(Box::new(transfer.clone()));
+    (transfer, completion_rx)
+}
 
-    // The sender is dropped only when the transfer signals terminal, so a receive error
-    // means the scheduler dropped it — treated the same as any other terminal.
+/// Run a local-to-S3 sync as a scheduled transfer and wait for it. Returns files sent,
+/// destination-only keys seen, and the most children ever in flight.
+pub(crate) async fn sync_up_scheduled(
+    tm: &crate::Client,
+    root: &std::path::Path,
+    bucket: &str,
+    prefix: &str,
+    max_children: usize,
+) -> Result<(usize, usize, usize), Error> {
+    let (transfer, completion_rx) = start_sync_up(tm, root, bucket, prefix, max_children);
+    // The sender drops only when the transfer signals terminal, so a receive error means
+    // the scheduler dropped it — treated the same as any other terminal.
     let _ = completion_rx.await;
     if let Some(err) = transfer.inner.ctx.take_error() {
         return Err(err);
@@ -617,6 +639,93 @@ mod tests {
 
         assert_eq!(sent, 1);
         assert_eq!(destination_only, 1, "the key only at the destination");
+    }
+
+    // --- cancellation ---
+    //
+    // Cancelling is triggered from inside the mock, on the fifth upload, so it always
+    // lands with children genuinely in flight. Starting it and then cancelling from the
+    // test would race the run to completion, and a test that sometimes cancels an
+    // already-finished sync would pass while proving nothing.
+
+    // Set after the transfer starts; the mock reads it and cancels once enough uploads have
+    // gone through.
+    type CancelAt = Arc<StdMutex<Option<(Arc<Handle>, crate::transfer::TransferId)>>>;
+
+    fn client_cancelling_on_fifth_put(
+        seen: Arc<StdMutex<Vec<String>>>,
+        cancel: CancelAt,
+    ) -> aws_sdk_s3::Client {
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(|| ListObjectsV2Output::builder().build());
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |req| {
+                let mut seen = seen.lock().unwrap();
+                seen.push(req.key().unwrap().to_string());
+                if seen.len() == 5 {
+                    if let Some((handle, id)) = cancel.lock().unwrap().as_ref() {
+                        handle.scheduler.cancel_transfer(*id);
+                    }
+                }
+                true
+            })
+            .then_output(|| PutObjectOutput::builder().build());
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, put])
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancelling_stops_the_run() {
+        let dir = tempdir().unwrap();
+        for i in 0..200 {
+            std::fs::write(dir.path().join(format!("f{i:03}.txt")), "x").unwrap();
+        }
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let cancel: CancelAt = Arc::default();
+        let s3 = client_cancelling_on_fifth_put(seen.clone(), cancel.clone());
+        let tm = crate::Client::new(crate::Config::builder().client(s3).build());
+
+        let (transfer, completion_rx) = start_sync_up(&tm, dir.path(), "bucket", "", 4);
+        *cancel.lock().unwrap() = Some((tm.handle.clone(), transfer.id()));
+
+        // Must resolve, not hang: a cancelled transfer still owes its waiter an answer.
+        tokio::time::timeout(std::time::Duration::from_secs(20), completion_rx)
+            .await
+            .expect("cancelled sync never resolved")
+            .ok();
+
+        let issued = seen.lock().unwrap().len();
+        assert!(
+            issued < 200,
+            "cancel did not stop the run: {issued} of 200 uploaded"
+        );
+        assert!(
+            transfer.ctx().is_cancelled() || !transfer.ctx().is_active(),
+            "transfer should not still be active after cancellation"
+        );
+        println!("cancelled after {issued} uploads of 200");
+    }
+
+    // Control for the test above: without the cancel, the same setup sends everything. So
+    // "few uploads happened" cannot pass for some unrelated reason.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn without_cancelling_the_same_run_sends_everything() {
+        let dir = tempdir().unwrap();
+        for i in 0..200 {
+            std::fs::write(dir.path().join(format!("f{i:03}.txt")), "x").unwrap();
+        }
+
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::default();
+        // Cell left empty, so the mock never cancels.
+        let cancel: CancelAt = Arc::default();
+        let s3 = client_cancelling_on_fifth_put(seen.clone(), cancel);
+        let tm = crate::Client::new(crate::Config::builder().client(s3).build());
+
+        let (sent, _, _) = run(&tm, dir.path(), "bucket", "", 4).await;
+        assert_eq!(sent, 200);
+        assert_eq!(seen.lock().unwrap().len(), 200);
     }
 
     // --- starvation ---
