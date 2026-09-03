@@ -16,6 +16,8 @@
 //! "destination is newer, leave it" rule makes the re-run a no-op. The download
 //! direction cannot say the same until local timestamps are written back.
 
+pub(crate) mod transfer;
+
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -567,6 +569,49 @@ mod tests {
 #[cfg(all(test, e2e_test))]
 mod real {
     use super::*;
+
+    // The scheduler-driven version, against the real service. Same assertions as the
+    // inline one, so a difference in outcome means the work-item shape changed behaviour.
+    #[tokio::test]
+    async fn scheduled_sync_matches_the_inline_one() {
+        let bucket = std::env::var("S3_TEST_BUCKET_NAME_RS")
+            .expect("set S3_TEST_BUCKET_NAME_RS to a bucket you can write to");
+        let sdk_config = aws_config::from_env().load().await;
+        let s3 = aws_sdk_s3::Client::new(&sdk_config);
+        let tm = crate::Client::new(crate::Config::builder().client(s3.clone()).build());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+        std::fs::write(dir.path().join("a/inner.txt"), "two").unwrap();
+        std::fs::write(dir.path().join("with space.txt"), "three").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+
+        let prefix = format!(
+            "sync-spike/{}-scheduled",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+
+        let started = std::time::Instant::now();
+        let (sent, extra, peak) =
+            super::transfer::sync_up_scheduled(&tm, dir.path(), &bucket, &prefix, 32)
+                .await
+                .expect("first run");
+        println!("scheduled first run: sent {sent}, destination-only {extra}, peak children {peak} in {:?}", started.elapsed());
+        assert_eq!(sent, 4);
+        assert_eq!(extra, 0);
+
+        let (sent_again, extra_again, _) =
+            super::transfer::sync_up_scheduled(&tm, dir.path(), &bucket, &prefix, 32)
+                .await
+                .expect("second run");
+        println!("scheduled second run: sent {sent_again}, destination-only {extra_again}");
+        assert_eq!(sent_again, 0, "a re-run must transfer nothing");
+        assert_eq!(extra_again, 0);
+    }
 
     // Many small files are the case where taking turns hurts: each one costs a round
     // trip, and a single large file would hide it behind multipart concurrency.
