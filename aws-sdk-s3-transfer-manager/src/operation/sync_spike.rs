@@ -613,6 +613,72 @@ mod real {
         assert_eq!(extra_again, 0);
     }
 
+    // The other direction against the real service: upload a tree, then sync it down to an
+    // empty directory. Asserts the round trip, and then asserts the *non*-idempotence —
+    // because without writing the object's timestamp onto the downloaded file, the local
+    // copy is newer than the object, and the reference download rule pulls a newer local
+    // file back every single run.
+    #[tokio::test]
+    async fn downloading_round_trips_but_does_not_settle() {
+        let bucket = std::env::var("S3_TEST_BUCKET_NAME_RS")
+            .expect("set S3_TEST_BUCKET_NAME_RS to a bucket you can write to");
+        let sdk_config = aws_config::from_env().load().await;
+        let s3 = aws_sdk_s3::Client::new(&sdk_config);
+        let tm = crate::Client::new(crate::Config::builder().client(s3.clone()).build());
+
+        let prefix = format!(
+            "sync-spike/{}-down",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("nested")).unwrap();
+        std::fs::write(source.path().join("a.txt"), "one").unwrap();
+        std::fs::write(source.path().join("nested/b.txt"), "two").unwrap();
+        std::fs::write(source.path().join("empty.txt"), "").unwrap();
+
+        let (uploaded, _, _) =
+            super::transfer::sync_up_scheduled(&tm, source.path(), &bucket, &prefix, 16)
+                .await
+                .expect("seeding upload");
+        assert_eq!(uploaded, 3);
+
+        // The comparison is at whole-second granularity, so upload and download landing in
+        // the same second would hide any difference between them.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let dest = tempfile::tempdir().unwrap();
+        let (downloaded, extra, peak) =
+            super::transfer::sync_down_scheduled(&tm, &bucket, &prefix, dest.path(), 16)
+                .await
+                .expect("download run");
+        println!("download: {downloaded} files, destination-only {extra}, peak children {peak}");
+        assert_eq!(downloaded, 3);
+        assert_eq!(extra, 0);
+        assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), b"one");
+        assert_eq!(
+            std::fs::read(dest.path().join("nested/b.txt")).unwrap(),
+            b"two"
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("empty.txt")).unwrap().len(),
+            0
+        );
+
+        let (again, _, _) =
+            super::transfer::sync_down_scheduled(&tm, &bucket, &prefix, dest.path(), 16)
+                .await
+                .expect("second download run");
+        println!("second download run: {again} files");
+        assert_eq!(
+            again, 3,
+            "expected the download direction to re-transfer without timestamp write-back"
+        );
+    }
+
     // Many small files are the case where taking turns hurts: each one costs a round
     // trip, and a single large file would hide it behind multipart concurrency.
     #[tokio::test]

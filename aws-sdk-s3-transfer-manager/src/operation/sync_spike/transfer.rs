@@ -537,6 +537,116 @@ pub(crate) async fn sync_up_scheduled(
     Ok(transfer.counts())
 }
 
+/// Start an S3-to-local sync as a scheduled transfer, without waiting for it.
+///
+/// The other direction, to check the shape is genuinely direction-agnostic rather than
+/// upload-shaped. Source and destination swap types — a listing becomes the source, the
+/// filesystem walk the destination — and both direction-specific pieces differ: a child is
+/// a download writing to a temp file, and the comparison rule is not the mirror image of
+/// the upload one.
+#[allow(clippy::type_complexity)]
+pub(crate) fn start_sync_down(
+    tm: &crate::Client,
+    bucket: &str,
+    prefix: &str,
+    root: &std::path::Path,
+    max_children: usize,
+) -> (
+    SyncTransfer<crate::io::walk::S3Walk, crate::io::walk::FsWalk>,
+    crate::transfer::StateMachineTerminalReceiver,
+) {
+    use crate::io::walk::{FsWalkContext, FsWalker, S3WalkContext, S3Walker};
+    use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
+    use crate::operation::download_objects::transfer::local_key_path;
+
+    let handle = tm.handle.clone();
+    let source = S3Walker::builder()
+        .prefix(prefix)
+        .filter(crate::io::walk::exclude_s3_folder_markers)
+        .build()
+        .walk(
+            S3WalkContext::builder()
+                .client(handle.s3_client.clone())
+                .bucket(bucket)
+                .build(),
+        );
+    let dest = FsWalker::builder()
+        .recursive(true)
+        .key_order(true)
+        .build()
+        .walk(FsWalkContext::builder().root(root).build());
+
+    let bucket_owned = bucket.to_string();
+    let prefix_owned = prefix.to_string();
+    let root_owned = root.to_path_buf();
+    let spawn: SpawnFn<aws_sdk_s3::types::Object> = Box::new(move |handle, parent_id, entry| {
+        let key = entry.source.key().ok_or_else(|| {
+            Error::new(crate::error::ErrorKind::InputInvalid, "object has no key")
+        })?;
+        // Reuses the traversal guard and delimiter handling the download operation already
+        // has, rather than joining paths by hand.
+        let dest_path = local_key_path(
+            &root_owned,
+            key,
+            Some(prefix_owned.as_str()).filter(|p| !p.is_empty()),
+            None,
+        )?;
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let input = DownloadInput::builder()
+            .bucket(bucket_owned.clone())
+            .key(key)
+            .build()
+            .expect("bucket and key are set");
+        // Written to a temp file and renamed on success, which is what makes a partial
+        // download unobservable at the destination.
+        let temp_path = dest_path.with_file_name(format!(
+            "{}.s3tmp.{:08x}",
+            dest_path.file_name().unwrap_or_default().to_string_lossy(),
+            fastrand::u32(..)
+        ));
+        let file = std::fs::File::create(&temp_path)?;
+        let inner =
+            Download::orchestrate_with_sink(handle.clone(), input, file, 0, true, Some(parent_id))?;
+        Ok(ChildHandle::Download(ManagedDownloadHandle::new(
+            inner, temp_path, dest_path,
+        )))
+    });
+
+    // Downloading, per the reference: transfer when the sizes differ, or when the *local*
+    // file is newer than the object. Not the mirror image of the upload rule — the remote
+    // is treated as authority, so a locally modified file is pulled back. A consequence is
+    // that a same-size remote update is skipped, which is the silent-skip hole FR-Cmp-10
+    // exists to close.
+    let differs: DiffersFn = Box::new(|source: &EntryMeta, dest: &EntryMeta| {
+        source.size != dest.size || dest.last_modified_secs > source.last_modified_secs
+    });
+
+    let (ctx, completion_rx) = TransferContext::new(handle.clone());
+    let transfer = SyncTransfer::new(ctx, source, dest, spawn, differs, max_children);
+    handle
+        .scheduler
+        .enqueue_transfer(Box::new(transfer.clone()));
+    (transfer, completion_rx)
+}
+
+/// Run an S3-to-local sync and wait for it.
+pub(crate) async fn sync_down_scheduled(
+    tm: &crate::Client,
+    bucket: &str,
+    prefix: &str,
+    root: &std::path::Path,
+    max_children: usize,
+) -> Result<(usize, usize, usize), Error> {
+    let (transfer, completion_rx) = start_sync_down(tm, bucket, prefix, root, max_children);
+    let _ = completion_rx.await;
+    if let Some(err) = transfer.inner.ctx.take_error() {
+        return Err(err);
+    }
+    Ok(transfer.counts())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +836,183 @@ mod tests {
         let (sent, _, _) = run(&tm, dir.path(), "bucket", "", 4).await;
         assert_eq!(sent, 200);
         assert_eq!(seen.lock().unwrap().len(), 200);
+    }
+
+    // --- the other direction ---
+    //
+    // Same machinery with the streams swapped: a listing is the source, the filesystem walk
+    // the destination. The point is that nothing in the transfer needed changing.
+
+    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::primitives::ByteStream;
+
+    fn client_serving(objects: Vec<Object>, body: &'static [u8]) -> aws_sdk_s3::Client {
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            let mut out = ListObjectsV2Output::builder();
+            for obj in &objects {
+                out = out.contents(obj.clone());
+            }
+            out.build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(body.len() as i64)
+                .body(ByteStream::from_static(body))
+                .build()
+        });
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get])
+    }
+
+    async fn run_down(
+        tm: &crate::Client,
+        bucket: &str,
+        prefix: &str,
+        root: &std::path::Path,
+        max_children: usize,
+    ) -> (usize, usize, usize) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            sync_down_scheduled(tm, bucket, prefix, root, max_children),
+        )
+        .await
+        .expect("sync never finished: a Pending with no matching wake")
+        .expect("sync failed")
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn downloads_what_is_missing_locally() {
+        let dir = tempdir().unwrap();
+        let objects = vec![
+            Object::builder()
+                .key("data/a.txt")
+                .size(5)
+                .last_modified(DateTime::from_secs(1_700_000_000))
+                .build(),
+            Object::builder()
+                .key("data/nested/b.txt")
+                .size(5)
+                .last_modified(DateTime::from_secs(1_700_000_000))
+                .build(),
+        ];
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .client(client_serving(objects, b"hello"))
+                .build(),
+        );
+
+        let (sent, destination_only, _) = run_down(&tm, "bucket", "data", dir.path(), 4).await;
+
+        assert_eq!(sent, 2);
+        assert_eq!(destination_only, 0);
+        // Landed at the right paths, with content, and the temp files renamed away.
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(dir.path().join("nested/b.txt")).unwrap(),
+            b"hello"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("s3tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "temp files left behind: {leftover:?}");
+    }
+
+    // A local file with no counterpart in the listing is destination-only here — the same
+    // role the S3 key played in the upload direction.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_local_file_absent_from_the_listing_is_destination_only() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("zz-extra.txt"), "x").unwrap();
+
+        let objects = vec![Object::builder()
+            .key("data/a.txt")
+            .size(5)
+            .last_modified(DateTime::from_secs(1_700_000_000))
+            .build()];
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .client(client_serving(objects, b"hello"))
+                .build(),
+        );
+
+        let (sent, destination_only, _) = run_down(&tm, "bucket", "data", dir.path(), 4).await;
+        assert_eq!(sent, 1);
+        assert_eq!(destination_only, 1);
+    }
+
+    // The download rule is not the mirror of the upload one: the remote is authority, so a
+    // matching size with an older-or-equal local file is left alone, and a *newer* local
+    // file is pulled back.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_download_rule_treats_the_remote_as_authority() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let local_secs = std::fs::metadata(dir.path().join("a.txt"))
+            .unwrap()
+            .modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+            .unwrap();
+
+        // Object newer than the local copy, same size: left alone.
+        let newer_remote = vec![Object::builder()
+            .key("data/a.txt")
+            .size(5)
+            .last_modified(DateTime::from_secs(local_secs + 100))
+            .build()];
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .client(client_serving(newer_remote, b"hello"))
+                .build(),
+        );
+        let (sent, _, _) = run_down(&tm, "bucket", "data", dir.path(), 4).await;
+        assert_eq!(sent, 0, "a newer object of the same size is skipped");
+
+        // Local copy newer, same size: pulled back.
+        let older_remote = vec![Object::builder()
+            .key("data/a.txt")
+            .size(5)
+            .last_modified(DateTime::from_secs(local_secs - 100))
+            .build()];
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .client(client_serving(older_remote, b"hello"))
+                .build(),
+        );
+        let (sent, _, _) = run_down(&tm, "bucket", "data", dir.path(), 4).await;
+        assert_eq!(
+            sent, 1,
+            "a locally modified file is restored from the remote"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn downloads_finish_with_a_single_dispatch_slot() {
+        let dir = tempdir().unwrap();
+        let objects: Vec<Object> = (0..40)
+            .map(|i| {
+                Object::builder()
+                    .key(format!("data/f{i:02}.txt"))
+                    .size(5)
+                    .last_modified(DateTime::from_secs(1_700_000_000))
+                    .build()
+            })
+            .collect();
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .client(client_serving(objects, b"hello"))
+                .concurrency(crate::types::ConcurrencyMode::Explicit(1))
+                .build(),
+        );
+
+        let (sent, _, peak) = run_down(&tm, "bucket", "data", dir.path(), 4).await;
+        assert_eq!(sent, 40);
+        assert!(peak <= 4);
     }
 
     // --- starvation ---
