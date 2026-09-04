@@ -60,6 +60,43 @@
 //! * [`upload`](crate::Client::upload) - upload a single object
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
+//!
+//! # Diagnostics
+//!
+//! `AWS_S3_TM_DIAGNOSTICS` enables opt-in runtime diagnostics. Its value is a
+//! comma-separated list of `key=value` settings resolved when a client
+//! configuration or standalone [`memory::BufferPool`] is built:
+//!
+//! ```text
+//! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms,memory.detail=1
+//! ```
+//!
+//! The supported memory settings are:
+//!
+//! - `memory.snapshot=off` disables periodic reports. A positive integer
+//!   followed by `ms` enables reports; values below `100ms` use `100ms`.
+//! - `memory.detail=0` keeps the default low-frequency counters.
+//! - `memory.detail=1` also counts every optimistic allocation attempt and
+//!   bitmap word inspected, adding relaxed atomic updates to the acquisition
+//!   path.
+//!
+//! Settings are case-sensitive. Whitespace around entries, keys, and values is
+//! ignored. Later valid assignments replace earlier ones. Unknown keys are
+//! ignored for forward compatibility; malformed recognized settings produce a
+//! warning and retain the preceding value. Unsupported detail levels use the
+//! highest level understood by this version and produce a warning.
+//!
+//! Periodic reports use the `aws_sdk_s3_transfer_manager::memory` tracing target
+//! at `DEBUG`. For example, enable one-second baseline snapshots with:
+//!
+//! ```text
+//! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms
+//! RUST_LOG=aws_sdk_s3_transfer_manager::memory=debug
+//! ```
+//!
+//! Snapshot reporting reuses the memory pool's maintenance thread. It does not
+//! create a diagnostics-only thread. Detailed counters and periodic reporting
+//! are independent; both are disabled by default.
 
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
@@ -86,6 +123,10 @@ pub mod config;
 /// component can construct a [`BufferPool`](crate::memory::BufferPool) and
 /// install it through
 /// [`MemoryConfig::Explicit`](crate::memory::MemoryConfig::Explicit).
+///
+/// [`BufferPool::metrics`](crate::memory::BufferPool::metrics) returns current
+/// accounting gauges without enabling diagnostic sampling. Buffer-pool events
+/// use the `aws_sdk_s3_transfer_manager::memory` tracing target.
 pub mod memory {
     pub use crate::runtime::buffer_pool::{
         AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut,

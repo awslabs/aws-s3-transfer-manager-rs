@@ -481,8 +481,13 @@ struct PoolInner {
 
 struct AdmissionState {
     ledger: AdmissionLedger,
+    queue: ReservationQueue,
+}
+
+struct ReservationQueue {
     waiters: VecDeque<Waiter>,
-    reservations_queued_total: u64,
+    diagnostics: ReservationQueueDiagnostics,
+    reservation_enqueues_total: u64,
 }
 
 struct AdmissionGuard<'a> {
@@ -502,8 +507,10 @@ struct CoverageState {
 ```
 
 `AdmissionState` serializes grant policy, physical preparation, FIFO state, planned-demand changes,
-and acquisition transitions that add uncovered charges. `reservations_queued_total` increments
-saturating once when a reservation request first enters the FIFO. `CoverageState` linearizes
+and acquisition transitions that add uncovered charges. The queue reserves metadata, links the
+request, increments `reservation_enqueues_total`, and records the empty-boundary transition as one
+operation. The counter saturates and increments once when a reservation request first enters the
+FIFO. `CoverageState` linearizes
 per-carrier debit and return. A debit fully covered by available coverage and a return that
 only restores coverage complete with one compare-and-exchange loop. The containing acquisition
 enters admission serialization to publish and prepare a shortfall, or before serialized fallback
@@ -2629,16 +2636,24 @@ contract through `BufferPool::metrics()`.
 
 ### Maintenance coordinator
 
-Reclamation and cleanup recovery run on a lazy pool-owned thread rather than an async runtime
-worker:
+Reclamation, cleanup recovery, and optional periodic diagnostics share one pool-owned thread rather
+than an async runtime worker:
 
 ```rust
 struct MaintenanceCoordinator {
-    configured_capacity: CarrierCount,
-    block_capacity: CarrierCount,
+    policy: MaintenancePolicy,
     control: Arc<MaintenanceControl>,
     diagnostics: Arc<MaintenanceDiagnostics>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    diagnostic_interval: Option<Duration>,
+}
+
+struct MaintenanceWorker {
+    control: Arc<MaintenanceControl>,
+    diagnostics: Arc<MaintenanceDiagnostics>,
+    pool: Weak<PoolInner>,
+    policy: MaintenancePolicy,
+    reporter: Option<PeriodicDiagnosticReporter>,
 }
 
 struct MaintenanceControl {
@@ -2667,16 +2682,19 @@ The scheduler's global-idle transition and mapping cleanup failures signal the c
 eligibility. [Mapping and revival](#mapping-and-revival) defines protection and discard recovery.
 The coordinator executes those operations without changing their safety conditions.
 
-The first deadline or cleanup request starts the thread. The worker owns
-`Arc<MaintenanceControl>` and `Weak<PoolInner>`. It waits without retaining the pool. When work is
-due, it releases the control mutex, upgrades the weak pool reference for one pass, and drops that
-strong reference before waiting again. The control block contains no admission, arena, slot, or
-mapping state.
+Without periodic diagnostics, the first deadline or cleanup request starts the thread. Configuring
+a diagnostic interval starts it during pool construction so the worker can capture a complete first
+interval. The worker owns `Arc<MaintenanceControl>` and `Weak<PoolInner>`. It waits without retaining
+the pool. When work is due, it releases the control mutex, upgrades the weak pool reference for one
+pass, and drops that strong reference before waiting again. The control block contains no admission,
+arena, slot, or mapping state.
 
 The coordinator copies immutable configured and block capacity at construction, so worker startup
 does not enter admission. Its worker mutex serializes concurrent first signals and lets final
-destruction take the join handle exactly once. Diagnostics are atomic observations and do not
-participate in policy or lifecycle decisions.
+destruction take the join handle exactly once. Periodic diagnostics contribute a wake deadline but
+do not enter `MaintenanceState`. Due maintenance takes priority over reporting, and a delayed report
+schedules its next interval from completion instead of emitting catch-up samples. Diagnostics are
+observations and do not participate in policy or lifecycle decisions.
 
 After releasing the temporary strong reference, the worker accesses no pool state. A thread-creation
 failure disables maintenance and reports degraded reclamation. Admission, acquisition, and owner
@@ -2719,6 +2737,7 @@ Recoverable resource failures remain local:
 | Whole-range protection                            | The block enters its nonclaimable recovery state outside prepared capacity            |
 | Backing discard                                   | The inactive block records `reclaim_pending`; other blocks remain usable              |
 | Maintenance-thread creation                       | Maintenance is disabled; ordinary paths continue and affected blocks stay unavailable |
+| Diagnostic configuration or sample inconsistency  | Periodic reporting is disabled; ordinary paths and maintenance continue                |
 | Ownership, identity, or address-reservation check | The non-returning fail-stop handler aborts without continuing allocator mutation      |
 
 The pool returns no unaccounted fallback memory after acquisition failure. Temporary growth remains
@@ -2772,7 +2791,7 @@ impl MemoryMetrics {
     pub fn queued_reservations(&self) -> usize;
 
     /// Cumulative reservation requests that entered the FIFO.
-    pub fn reservations_queued_total(&self) -> u64;
+    pub fn reservation_enqueues_total(&self) -> u64;
 }
 ```
 
@@ -2791,7 +2810,7 @@ Prepared capacity follows whole-block geometry and the current admission floor. 
 raise it by less than one block beyond that floor. It can exceed configured capacity either through
 that rounding or because an idle-only grant raised admission above the normal ceiling.
 
-`reservations_queued_total` is copied from the admission state in the same sample. It increments
+`reservation_enqueues_total` is copied from the admission state in the same sample. It increments
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
 cancellation. It is monotonic for the lifetime of the pool and does not count an immediate grant.
 
@@ -2809,7 +2828,7 @@ Operational signals are organized by the failure they diagnose:
 
 | Symptom                                     | Signals                                                                   | Interpretation                                                              |
 | ------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Managed work remains queued                 | configured, admission used, queue depth, reservations queued total        | Admission is binding or an older FIFO request is ineligible                 |
+| Managed work remains queued                 | configured, admission used, queue depth, reservation enqueues total        | Admission is binding or an older FIFO request is ineligible                 |
 | Admission remains above configured capacity | admission overage, planned demand, charged capacity                       | Idle-only admission or ownership outside active planned demand remains live |
 | Memory remains prepared after global idle   | prepared capacity, charged capacity, reclaim retries                      | `idle_retention_target`, live owners, or cleanup prevents reclamation       |
 | Reuse repeatedly enters serialized fallback | serialized-acquisition count, prepared capacity, geometry                 | Optimistic scan work or placement is missing reusable capacity              |
@@ -2817,16 +2836,37 @@ Operational signals are organized by the failure they diagnose:
 | A block remains unavailable                 | protection-pending and reclaim-pending capacity, retry and failure counts | Platform cleanup is degraded but isolated to named blocks                   |
 | Allocation or preparation fails             | operation error, requested capacity, prepared capacity, platform error    | The caller encountered a physical resource failure                          |
 
-Normal reservation transitions are `trace`. Per-carrier successful acquisition and return
-require no event. Reservation parking and serialized fallback are `trace` with monotonic diagnostic
-counters. Block preparation, idle deadline changes, and successful reclamation are `debug`.
-Allocation, protection, discard, maintenance-thread, and fail-stop precursor events are `warn` or
-higher. Rare failure records include the operation, requested capacity, block identity where
+Per-carrier successful acquisition and return require no event. Reservation FIFO empty-boundary
+transitions, pool geometry, successful reclamation, and periodic snapshots are `debug`. Allocation,
+protection,
+discard, maintenance-thread, diagnostic-configuration, and fail-stop precursor events are `warn`
+or higher. Rare failure records include the operation, requested capacity, block identity where
 applicable, platform error, and resulting pool state.
 
-Metrics are pull-only, and event records are emitted by existing paths. The pool starts no
-reporting task and maintains no rate window. Diagnostic counters saturate at `u64::MAX` and never
-participate in control decisions.
+Public metrics are pull-only. `AWS_S3_TM_DIAGNOSTICS` configures diagnostics before a client or
+standalone pool is constructed. `memory.snapshot=off` is the default; a positive integer followed
+by `ms` enables periodic `debug` snapshots, with values below `100ms` raised to `100ms`.
+`memory.detail=0` is the default collection level. `memory.detail=1` additionally counts every
+optimistic acquisition attempt and bitmap word inspected. Snapshot cadence and detail level are
+independent.
+
+The value is a comma-separated list of case-sensitive `key=value` entries. Whitespace around
+entries, keys, and values is ignored, and the last valid assignment wins. Unknown keys are ignored
+for forward compatibility. Malformed recognized settings warn and preserve the previous value;
+unsupported detail levels warn and clamp to the highest level understood by this version.
+
+Periodic reporting uses the maintenance worker rather than creating another thread. Each sample
+contains current accounting gauges, reservation-queue interval state, and cumulative allocator and
+maintenance counters with changes since the preceding sample. Queue depth, peak depth, interval
+non-empty duration, and continuous non-empty duration are maintained with the FIFO under admission
+serialization. Counter deltas and report deadlines are diagnostic state only. An unrepresentable
+future deadline stops reporting without changing admission, allocation, ownership, or maintenance.
+
+Always-on diagnostic counters update only on queueing, optimistic misses, serialized fallback,
+preparation, rollback, trim, reclaim, cleanup, or maintenance transitions. Successful optimistic
+attempts and words inspected are absent unless `memory.detail=1` is enabled. Periodic reporting at
+detail level 0 still includes stable gauges and low-frequency counters. All counters saturate at
+`u64::MAX` and never participate in control decisions.
 
 **Obligations.**
 
@@ -2844,6 +2884,8 @@ participate in control decisions.
   participate in admission.
 - **C5: Failure reporting.** Rare resource failures and degraded reclamation produce an operation
   result or diagnostic signal.
+- **C6: Diagnostic isolation.** Missing or inconsistent diagnostic state can suppress reporting but
+  cannot reject admission, fail acquisition, alter ownership, or terminate the process.
 
 ## Correctness invariants
 

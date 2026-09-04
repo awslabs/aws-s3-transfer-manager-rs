@@ -113,7 +113,8 @@ impl BufferPoolBuilder {
         let detected_memory = needs_memory_detection
             .then(crate::runtime::platform::available_ram)
             .flatten();
-        super::BufferPool::from_capacity(self.memory_budget, detected_memory)
+        let diagnostics = crate::config::DiagnosticsConfig::from_env().memory();
+        super::BufferPool::from_capacity(self.memory_budget, detected_memory, diagnostics)
     }
 }
 
@@ -404,7 +405,12 @@ mod tests {
     fn test_eight_mibibyte_claim_uses_optimistic_path_after_preparation() {
         const PART_BYTES: usize = 8 * 1024 * 1024;
 
-        let pool = BufferPool::from_capacity(MemoryBudgetConfig::Limit(GIB), None).unwrap();
+        let pool = BufferPool::from_capacity(
+            MemoryBudgetConfig::Limit(GIB),
+            None,
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .unwrap();
         let prepared = pool
             .acquire_unreserved(pool.inner.geometry.carrier_size())
             .unwrap();
@@ -451,8 +457,12 @@ mod tests {
 
     #[test]
     fn test_pool_construction_prepares_no_capacity() {
-        let pool =
-            BufferPool::from_capacity(MemoryBudgetConfig::Limit(GIB), Some(8 * GIB)).unwrap();
+        let pool = BufferPool::from_capacity(
+            MemoryBudgetConfig::Limit(GIB),
+            Some(8 * GIB),
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(pool.inner.geometry.carrier_size(), DEFAULT_CARRIER_BYTES);
         assert_eq!(pool.inner.geometry.block_size(), DEFAULT_BLOCK_BYTES);
         assert_eq!(pool.metrics().configured_capacity_bytes(), GIB as u64);

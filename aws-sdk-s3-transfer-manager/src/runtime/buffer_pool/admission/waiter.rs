@@ -213,8 +213,8 @@ mod tests {
         let admission = pool.inner.admission.lock();
         assert_eq!(admission.ledger.prepared_capacity, CarrierCount::ZERO);
         assert_eq!(admission.ledger.active_planned_demand, CarrierCount::ZERO);
-        assert!(admission.waiters.is_empty());
-        assert_eq!(admission.reservations_queued_total, 0);
+        assert!(admission.waiters_is_empty());
+        assert_eq!(admission.reservation_enqueues_total(), 0);
         drop(admission);
         drop(future);
     }
@@ -230,8 +230,8 @@ mod tests {
         let admission = pool.inner.admission.lock();
         assert_eq!(admission.ledger.prepared_capacity, CarrierCount::new(1));
         assert_eq!(admission.ledger.active_planned_demand, CarrierCount::new(1));
-        assert!(admission.waiters.is_empty());
-        assert_eq!(admission.reservations_queued_total, 0);
+        assert!(admission.waiters_is_empty());
+        assert_eq!(admission.reservation_enqueues_total(), 0);
         assert_eq!(wake_count(&wake_state), 0);
         drop(admission);
         drop(reservation);
@@ -252,20 +252,20 @@ mod tests {
         assert_pending(&mut second, &second_waker);
 
         assert!(pool.try_reserve(carrier_size).unwrap().is_none());
-        assert_eq!(pool.inner.admission.lock().waiters.len(), 2);
+        assert_eq!(pool.inner.admission.lock().waiter_count(), 2);
         drop(holder);
 
         assert_eq!(wake_count(&first_wakes), 1);
         assert_eq!(wake_count(&second_wakes), 0);
         let first_reservation = take_ready(&mut first, &first_waker);
-        assert_eq!(pool.inner.admission.lock().waiters.len(), 1);
+        assert_eq!(pool.inner.admission.lock().waiter_count(), 1);
 
         drop(first_reservation);
         assert_eq!(wake_count(&second_wakes), 1);
         let second_reservation = take_ready(&mut second, &second_waker);
         let admission = pool.inner.admission.lock();
-        assert!(admission.waiters.is_empty());
-        assert_eq!(admission.reservations_queued_total, 2);
+        assert!(admission.waiters_is_empty());
+        assert_eq!(admission.reservation_enqueues_total(), 2);
         drop(admission);
         drop(second_reservation);
     }
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(wake_count(&large_wakes), 1);
         assert_eq!(wake_count(&small_wakes), 0);
         let large_reservation = take_ready(&mut large, &large_waker);
-        assert_eq!(pool.inner.admission.lock().waiters.len(), 1);
+        assert_eq!(pool.inner.admission.lock().waiter_count(), 1);
 
         drop(large_reservation);
         assert_eq!(wake_count(&small_wakes), 1);
@@ -314,7 +314,7 @@ mod tests {
 
         assert_eq!(wake_count(&front_wakes), 0);
         assert_eq!(wake_count(&next_wakes), 1);
-        assert!(pool.inner.admission.lock().waiters.is_empty());
+        assert!(pool.inner.admission.lock().waiters_is_empty());
         drop(take_ready(&mut next, &next_waker));
         drop(holder);
     }
@@ -361,7 +361,7 @@ mod tests {
 
         assert_pending(&mut future, &first_waker);
         assert_pending(&mut future, &replacement_waker);
-        assert_eq!(pool.inner.admission.lock().reservations_queued_total, 1);
+        assert_eq!(pool.inner.admission.lock().reservation_enqueues_total(), 1);
         drop(holder);
 
         assert_eq!(wake_count(&first_wakes), 0);
@@ -434,19 +434,22 @@ mod tests {
             Poll::Ready(Err(ReserveError::InvalidSize))
         ));
         let admission = pool.inner.admission.lock();
-        assert!(admission.waiters.is_empty());
-        assert_eq!(admission.reservations_queued_total, 0);
+        assert!(admission.waiters_is_empty());
+        assert_eq!(admission.reservation_enqueues_total(), 0);
         assert_eq!(wake_count(&wake_state), 0);
     }
 
     #[test]
-    fn test_reservations_queued_counter_saturates_and_counts_one_fifo_entry_once() {
+    fn test_reservation_enqueue_counter_saturates_and_counts_one_fifo_entry_once() {
         let (pool, carrier_size) = test_pool(1, 1);
         let holder = pool
             .try_reserve(carrier_size)
             .unwrap()
             .expect("initial reservation");
-        pool.inner.admission.lock().reservations_queued_total = u64::MAX;
+        pool.inner
+            .admission
+            .lock()
+            .set_reservation_enqueues_total_for_test(u64::MAX);
         let (waker, _) = counting_waker();
         let mut future = pool.reserve(carrier_size);
 
@@ -454,8 +457,8 @@ mod tests {
         assert_pending(&mut future, &waker);
 
         let admission = pool.inner.admission.lock();
-        assert_eq!(admission.reservations_queued_total, u64::MAX);
-        assert_eq!(admission.waiters.len(), 1);
+        assert_eq!(admission.reservation_enqueues_total(), u64::MAX);
+        assert_eq!(admission.waiter_count(), 1);
         drop(admission);
         drop(future);
         drop(holder);
@@ -556,7 +559,7 @@ mod loom_tests {
 
             let admission = pool.inner.admission.lock();
             assert_eq!(admission.ledger.active_planned_demand, CarrierCount::ZERO);
-            assert!(admission.waiters.is_empty());
+            assert!(admission.waiters_is_empty());
         });
     }
 

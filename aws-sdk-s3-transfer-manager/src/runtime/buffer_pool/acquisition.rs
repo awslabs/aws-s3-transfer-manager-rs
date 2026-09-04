@@ -261,6 +261,8 @@ pub(super) fn acquire_count(
     count: CarrierCount,
 ) -> Result<Vec<Arc<CarrierGuard>>, AcquireError> {
     let debit = AcquisitionDebit::install(pool, direct, count)?;
+    #[cfg(test)]
+    pool.test_hooks.record_acquisition_attempt();
     let mut pending = PendingAcquisition::new(debit);
     pending.claim = Some(
         pool.arena

@@ -13,6 +13,7 @@ use std::task::{Context, Poll, Waker};
 
 use bytes::BufMut;
 
+use crate::config::MemoryDiagnosticsConfig;
 use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 use crate::runtime::sync::thread;
@@ -63,6 +64,8 @@ impl Wake for CountingWake {
 
 /// Per-pool hooks that keep parallel and Loom tests isolated.
 pub(super) struct TestHooks {
+    /// Acquisition calls that reached the physical allocator.
+    acquisition_attempts: AtomicUsize,
     /// Remaining metadata boundaries before one acquisition failure.
     acquisition_allocation_failure: AtomicUsize,
     /// One terminal reservation failure returned before admission work.
@@ -79,12 +82,18 @@ impl TestHooks {
     /// Creates a pool with every test hook disabled.
     pub(super) fn new() -> Self {
         Self {
+            acquisition_attempts: AtomicUsize::new(0),
             acquisition_allocation_failure: AtomicUsize::new(0),
             reservation_failure: Mutex::new(None),
             maintenance_spawn_failure: AtomicBool::new(false),
             maintenance_spawn_attempts: AtomicUsize::new(0),
             maintenance_pause: Mutex::new(None),
         }
+    }
+
+    /// Records one physical acquisition attempt.
+    pub(super) fn record_acquisition_attempt(&self) {
+        self.acquisition_attempts.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Fails the `boundary`th subsequent acquisition metadata reservation.
@@ -181,6 +190,14 @@ impl MaintenancePause {
 }
 
 impl BufferPool {
+    /// Returns physical acquisition attempts observed by this pool.
+    pub(crate) fn acquisition_attempts(&self) -> usize {
+        self.inner
+            .test_hooks
+            .acquisition_attempts
+            .load(Ordering::Acquire)
+    }
+
     /// Injects one acquisition metadata allocation failure.
     pub(super) fn inject_acquisition_allocation_failure(&self, boundary: usize) {
         self.inner
@@ -272,7 +289,7 @@ impl BufferPool {
                 coverage.uncovered,
                 charged_capacity,
                 admission.ledger.prepared_capacity,
-                admission.waiters.len(),
+                admission.waiter_count(),
                 lifecycle,
             )
         };
@@ -334,7 +351,7 @@ impl PoolInner {
             admission.ledger.active_planned_demand,
             coverage.available,
             coverage.uncovered,
-            admission.waiters.len(),
+            admission.waiter_count(),
         )
     }
 }
@@ -364,6 +381,21 @@ pub(super) fn test_pool_with_scan(
     configured: usize,
     optimistic_scan_words: usize,
 ) -> (BufferPool, usize) {
+    test_pool_with_scan_and_diagnostics(
+        block_carriers,
+        configured,
+        optimistic_scan_words,
+        MemoryDiagnosticsConfig::for_test(None, 1),
+    )
+}
+
+/// Constructs a pool with explicit scan geometry and diagnostic policy.
+pub(super) fn test_pool_with_scan_and_diagnostics(
+    block_carriers: usize,
+    configured: usize,
+    optimistic_scan_words: usize,
+    diagnostics: MemoryDiagnosticsConfig,
+) -> (BufferPool, usize) {
     let page_size = page_size().unwrap().get();
     let geometry = PoolGeometry::new(
         page_size,
@@ -371,10 +403,11 @@ pub(super) fn test_pool_with_scan(
         page_size,
     )
     .unwrap();
-    let pool = BufferPool::from_parts(
+    let pool = BufferPool::from_parts_with_diagnostics(
         geometry,
         CarrierCount::new(configured),
         optimistic_scan_words,
+        diagnostics,
     )
     .unwrap();
     (pool, page_size)

@@ -26,7 +26,7 @@ use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
 use crate::operation::download::DownloadInput;
 use crate::runtime::buffer_pool::{
-    AcquireError, BufferPool, PooledBufMut, Reservation, ReserveError, SegmentedBytes,
+    AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
@@ -58,9 +58,13 @@ fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize
 
 /// Copies one transport response into reserved pooled storage.
 ///
-/// One mutable stream spans every foreign frame so writable carrier tails are
-/// reused. A failed attempt drops that stream before returning to the retry
-/// loop, restoring its direct acquisition authority to `reservation`.
+/// The complete validated response length is acquired before reading frames.
+/// Transport framing therefore does not determine carrier acquisition or
+/// immutable segmentation. A failed attempt drops the complete mutable buffer
+/// before returning to the retry loop, restoring its authority to `reservation`.
+///
+/// A zero expected length is invalid. Empty objects complete without issuing a
+/// response-collection operation.
 async fn collect_response_body(
     pool: &BufferPool,
     body: aws_sdk_s3::primitives::ByteStream,
@@ -68,7 +72,12 @@ async fn collect_response_body(
     expected_len: usize,
     is_active: impl Fn() -> bool,
 ) -> Result<SegmentedBytes, Error> {
-    let mut pooled: Option<PooledBufMut> = None;
+    if expected_len == 0 {
+        return Err(response_length_error(0, 0));
+    }
+    let mut pooled = pool
+        .acquire(reservation, expected_len)
+        .map_err(pool_acquisition_error)?;
     let mut bytes_received = 0usize;
     let mut body_stream = body;
 
@@ -85,17 +94,8 @@ async fn collect_response_body(
         }
 
         if !data.is_empty() {
-            let output = match &mut pooled {
-                Some(output) => output,
-                slot @ None => slot.insert(
-                    pool.acquire(reservation, data.len())
-                        .map_err(pool_acquisition_error)?,
-                ),
-            };
-            if output.remaining_mut() < data.len() {
-                output.reserve(data.len()).map_err(pool_acquisition_error)?;
-            }
-            output.put_slice(&data);
+            debug_assert!(pooled.remaining_mut() >= data.len());
+            pooled.put_slice(&data);
             bytes_received += data.len();
         }
 
@@ -111,9 +111,7 @@ async fn collect_response_body(
         return Err(response_length_error(expected_len, bytes_received));
     }
 
-    pooled
-        .map(PooledBufMut::freeze)
-        .ok_or_else(|| response_length_error(expected_len, bytes_received))
+    Ok(pooled.freeze())
 }
 
 /// Maps a malformed response length to the body-read retry class.
@@ -387,7 +385,6 @@ impl DownloadTransfer {
                         );
                         return self.park();
                     }
-
                     // Gate admitted (and counted) the slot. Claim it from the buffer and
                     // reserve its backing memory against the shared budget. A grant issues now;
                     // a queued reservation stashes the claimed slot in `pending` and
@@ -616,7 +613,7 @@ impl DownloadTransfer {
     /// re-polls this transfer.
     fn execute_drain_resident(&self) -> WorkOutcome {
         let freed = match self.inner.writer.flush_resident() {
-            Ok(f) => f,
+            Ok(freed) => freed,
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
@@ -886,7 +883,7 @@ impl DownloadTransfer {
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
             match self.inner.writer.drain(DrainMode::Batched) {
-                Ok(f) => freed = f,
+                Ok(parts) => freed = parts,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
                     let guard = self.inner.state.lock().unwrap();
@@ -1025,7 +1022,7 @@ impl DownloadTransfer {
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
             match self.inner.writer.drain(DrainMode::Batched) {
-                Ok(f) => freed = f,
+                Ok(parts) => freed = parts,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
                     let guard = self.inner.state.lock().unwrap();
@@ -1404,10 +1401,10 @@ mod response_collection_tests {
         }
     }
 
-    /// Three frames require more than half a carrier each. Reusing writable
-    /// tails fits them in a two-carrier reservation.
+    /// Transport frame boundaries do not become acquisition or segment
+    /// boundaries when the complete response length is known.
     #[test]
-    fn test_collection_reuses_tail_and_releases_foreign_frames() {
+    fn test_collection_acquires_response_once_and_releases_foreign_frames() {
         const FRAME_LEN: usize = 9_000;
         const EXPECTED_LEN: usize = FRAME_LEN * 3;
 
@@ -1432,10 +1429,22 @@ mod response_collection_tests {
         ])
         .into_byte_stream();
 
+        let acquisitions_before = pool.acquisition_attempts();
         let mut output = collect_ready(&pool, body, &reservation, EXPECTED_LEN)
-            .expect("frames fit one reserved stream");
+            .expect("response fits its reserved envelope");
 
+        assert_eq!(
+            pool.acquisition_attempts() - acquisitions_before,
+            1,
+            "one response must perform one carrier acquisition"
+        );
         assert_eq!(output.len(), EXPECTED_LEN);
+        let mut slices = [std::io::IoSlice::new(&[]); 4];
+        assert_eq!(
+            output.chunks_vectored(&mut slices),
+            1,
+            "adjacent carriers from one acquisition should form one segment"
+        );
         assert_eq!(
             drops.load(Ordering::Relaxed),
             1,
@@ -1443,6 +1452,28 @@ mod response_collection_tests {
         );
         assert_ne!(pool.metrics().charged_capacity_bytes(), 0);
         assert_eq!(output.copy_to_bytes(EXPECTED_LEN).as_ref(), expected);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_collection_rejects_zero_length_without_acquiring_storage() {
+        let pool = test_pool();
+        let reservation = pool
+            .try_reserve(pool.carrier_size())
+            .unwrap()
+            .expect("collector reservation");
+        let acquisitions_before = pool.acquisition_attempts();
+
+        let error = collect_ready(
+            &pool,
+            TestFrameBody::new([]).into_byte_stream(),
+            &reservation,
+            0,
+        )
+        .expect_err("zero-length collection unexpectedly succeeded");
+
+        assert_eq!(error.kind(), &error::ErrorKind::IOError);
+        assert_eq!(pool.acquisition_attempts(), acquisitions_before);
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 

@@ -44,7 +44,7 @@ fn explicit_pool_supports_the_public_reservation_and_buffer_flow() {
 
     let unpolled: ReserveFuture = pool.reserve(carrier_size);
     drop(unpolled);
-    assert_eq!(pool.metrics().reservations_queued_total(), 0);
+    assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
 }
 
 #[test]

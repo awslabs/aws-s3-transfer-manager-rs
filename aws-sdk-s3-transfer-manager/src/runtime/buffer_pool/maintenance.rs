@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Idle reclamation policy and maintenance-worker coordination.
+//! Idle reclamation policy and shared background-worker coordination.
 //!
 //! [`MaintenanceState`] converts explicit activity, deadline, and completion
 //! events into serialized maintenance actions. Pool and platform operations
-//! execute outside this state machine. The worker retains only control state
-//! and a weak pool reference while waiting.
+//! execute outside this state machine. Periodic diagnostics contribute only a
+//! worker wake deadline and do not enter the maintenance state machine. The
+//! worker retains only control state and a weak pool reference while waiting.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ use crate::runtime::sync::sync::{Arc, Condvar, Mutex};
 #[cfg(not(all(test, s3_tm_loom)))]
 use std::{io, sync::Weak};
 
+#[cfg(not(all(test, s3_tm_loom)))]
+use super::diagnostics::PeriodicDiagnosticReporter;
 #[cfg(not(all(test, s3_tm_loom)))]
 use crate::runtime::sync::thread;
 
@@ -35,6 +38,15 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Operating-system thread name used by pool maintenance.
 const MAINTENANCE_THREAD_NAME: &str = "s3-tm-memory";
+
+/// Immutable geometry inputs used by maintenance policy.
+#[derive(Clone, Copy)]
+struct MaintenancePolicy {
+    /// Normal admission ceiling.
+    configured_capacity: CarrierCount,
+    /// Carriers reclaimed as one whole block.
+    block_capacity: CarrierCount,
+}
 
 /// One maintenance operation authorized by the control state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,29 +93,36 @@ impl MaintenancePass {
     }
 }
 
-/// Lazy worker owner embedded in the pool lifetime domain.
+/// Background-worker owner embedded in the pool lifetime domain.
 pub(super) struct MaintenanceCoordinator {
-    /// Immutable normal admission ceiling copied at pool construction.
-    configured_capacity: CarrierCount,
-    /// Immutable whole-block carrier count copied from pool geometry.
-    block_capacity: CarrierCount,
+    /// Immutable capacity and block geometry used by reclamation.
+    policy: MaintenancePolicy,
     /// State and wakeup primitive retained independently by the worker.
     control: Arc<MaintenanceControl>,
     /// Counters that observe worker behavior without controlling it.
     diagnostics: Arc<MaintenanceDiagnostics>,
+    /// Optional periodic reporting interval handled by the same worker.
+    diagnostic_interval: Option<Duration>,
     /// Serialized worker creation and final join authority.
     #[cfg(not(all(test, s3_tm_loom)))]
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl MaintenanceCoordinator {
-    /// Creates an idle coordinator without starting a thread.
-    pub(super) fn new(configured_capacity: CarrierCount, block_capacity: CarrierCount) -> Self {
+    /// Creates a coordinator without starting its worker.
+    pub(super) fn new(
+        configured_capacity: CarrierCount,
+        block_capacity: CarrierCount,
+        diagnostic_interval: Option<Duration>,
+    ) -> Self {
         Self {
-            configured_capacity,
-            block_capacity,
+            policy: MaintenancePolicy {
+                configured_capacity,
+                block_capacity,
+            },
             control: Arc::new(MaintenanceControl::new()),
             diagnostics: Arc::new(MaintenanceDiagnostics::default()),
+            diagnostic_interval,
             #[cfg(not(all(test, s3_tm_loom)))]
             worker: Mutex::new(None),
         }
@@ -129,7 +148,14 @@ impl MaintenanceCoordinator {
         self.control.wake.notify_all();
     }
 
-    /// Starts the worker at most once while maintenance remains enabled.
+    /// Starts the shared worker eagerly only for periodic diagnostics.
+    pub(super) fn start_periodic_diagnostics(&self, pool: &Arc<PoolInner>) {
+        if self.diagnostic_interval.is_some() {
+            self.ensure_worker(pool);
+        }
+    }
+
+    /// Starts the worker at most once while background work remains enabled.
     #[cfg(not(all(test, s3_tm_loom)))]
     fn ensure_worker(&self, pool: &Arc<PoolInner>) {
         let mut worker = self.worker.lock();
@@ -143,11 +169,11 @@ impl MaintenanceCoordinator {
             }
         }
 
-        let configured_capacity = self.configured_capacity;
-        let block_capacity = self.block_capacity;
+        let policy = self.policy;
         let control = Arc::clone(&self.control);
         let diagnostics = Arc::clone(&self.diagnostics);
         let weak_pool = Arc::downgrade(pool);
+        let diagnostic_interval = self.diagnostic_interval;
 
         #[cfg(test)]
         pool.test_hooks.record_maintenance_spawn_attempt();
@@ -157,13 +183,14 @@ impl MaintenanceCoordinator {
             thread::Builder::new()
                 .name(MAINTENANCE_THREAD_NAME.to_owned())
                 .spawn(move || {
-                    worker_loop(
+                    MaintenanceWorker::new(
                         control,
                         diagnostics,
                         weak_pool,
-                        configured_capacity,
-                        block_capacity,
+                        policy,
+                        diagnostic_interval,
                     )
+                    .run()
                 })
         };
 
@@ -172,7 +199,9 @@ impl MaintenanceCoordinator {
                 tracing::debug!(
                     target: crate::telemetry::TARGET_MEMORY,
                     worker = MAINTENANCE_THREAD_NAME,
-                    "started buffer-pool maintenance worker"
+                    diagnostic_snapshot_interval_ms =
+                        diagnostic_interval.map(|interval| interval.as_millis()).unwrap_or(0),
+                    "started buffer-pool background worker"
                 );
                 *worker = Some(handle);
             }
@@ -182,7 +211,7 @@ impl MaintenanceCoordinator {
                     target: crate::telemetry::TARGET_MEMORY,
                     worker = MAINTENANCE_THREAD_NAME,
                     error = %error,
-                    "buffer-pool maintenance is disabled after worker creation failed"
+                    "buffer-pool background work is disabled after worker creation failed"
                 );
             }
         }
@@ -192,7 +221,7 @@ impl MaintenanceCoordinator {
     #[cfg(all(test, s3_tm_loom))]
     fn ensure_worker(&self, _pool: &Arc<PoolInner>) {}
 
-    /// Cancels maintenance and joins a worker owned by another thread.
+    /// Cancels background work and joins a worker owned by another thread.
     pub(super) fn shutdown(&mut self) {
         self.control.state.lock().stop();
         self.control.wake.notify_all();
@@ -578,43 +607,148 @@ impl MaintenanceState {
     }
 }
 
-/// Runs due maintenance while retaining only control state between passes.
+/// Work selected by the shared pool background thread.
 #[cfg(not(all(test, s3_tm_loom)))]
-fn worker_loop(
+enum WorkerTask {
+    /// One state-machine action is ready.
+    Maintenance(MaintenanceAction),
+    /// One diagnostic reporting interval elapsed.
+    Diagnostics,
+}
+
+/// Pool-owned background worker for reclamation, cleanup, and diagnostics.
+///
+/// The weak pool reference prevents an idle worker from extending pool
+/// lifetime. Each task upgrades it only for the duration of that task.
+#[cfg(not(all(test, s3_tm_loom)))]
+struct MaintenanceWorker {
     control: Arc<MaintenanceControl>,
     diagnostics: Arc<MaintenanceDiagnostics>,
     pool: Weak<PoolInner>,
-    configured_capacity: CarrierCount,
-    block_capacity: CarrierCount,
-) {
-    loop {
-        let Some(action) = wait_for_action(&control, configured_capacity, block_capacity) else {
-            return;
-        };
-        let Some(pool) = pool.upgrade() else {
-            return;
-        };
+    policy: MaintenancePolicy,
+    reporter: Option<PeriodicDiagnosticReporter>,
+}
 
-        #[cfg(test)]
-        pool.test_hooks.wait_after_maintenance_upgrade();
-        let pass = execute_maintenance(&pool, action);
-        drop(pool);
-
-        if matches!(action, MaintenanceAction::Reclaim { .. }) {
-            diagnostics.record_reclaim_pass(pass.outcome);
+#[cfg(not(all(test, s3_tm_loom)))]
+impl MaintenanceWorker {
+    /// Creates a worker and captures the optional reporting baseline.
+    fn new(
+        control: Arc<MaintenanceControl>,
+        diagnostics: Arc<MaintenanceDiagnostics>,
+        pool: Weak<PoolInner>,
+        policy: MaintenancePolicy,
+        diagnostic_interval: Option<Duration>,
+    ) -> Self {
+        let reporter = diagnostic_interval.and_then(|interval| {
+            let pool = pool.upgrade()?;
+            PeriodicDiagnosticReporter::new(&pool, interval)
+        });
+        Self {
+            control,
+            diagnostics,
+            pool,
+            policy,
+            reporter,
         }
+    }
 
-        let now = Instant::now();
-        let mut state = control.state.lock();
-        if pass.cleanup_pending && state.request_cleanup(now) {
-            diagnostics.record_cleanup_request();
+    /// Runs due work until shutdown or final pool destruction.
+    fn run(&mut self) {
+        loop {
+            let Some(task) = self.wait_for_task() else {
+                return;
+            };
+            let Some(pool) = self.pool.upgrade() else {
+                return;
+            };
+
+            let action = match task {
+                WorkerTask::Diagnostics => {
+                    self.report(&pool, Instant::now);
+                    drop(pool);
+                    continue;
+                }
+                WorkerTask::Maintenance(action) => action,
+            };
+
+            #[cfg(test)]
+            pool.test_hooks.wait_after_maintenance_upgrade();
+            let pass = execute_maintenance(&pool, action);
+            drop(pool);
+
+            if matches!(action, MaintenanceAction::Reclaim { .. }) {
+                self.diagnostics.record_reclaim_pass(pass.outcome);
+            }
+
+            let now = Instant::now();
+            let mut state = self.control.state.lock();
+            if pass.cleanup_pending && state.request_cleanup(now) {
+                self.diagnostics.record_cleanup_request();
+            }
+            state.finish_action(action, pass.outcome, now, RETRY_DELAY);
+            let stopping = state.is_stopping();
+            drop(state);
+            self.control.wake.notify_all();
+            if stopping {
+                return;
+            }
         }
-        state.finish_action(action, pass.outcome, now, RETRY_DELAY);
-        let stopping = state.is_stopping();
-        drop(state);
-        control.wake.notify_all();
-        if stopping {
-            return;
+    }
+
+    /// Emits one diagnostic sample and schedules from reporting completion.
+    fn report(&mut self, pool: &PoolInner, completed_at: impl FnOnce() -> Instant) {
+        let keep_reporting = {
+            let Some(reporter) = self.reporter.as_mut() else {
+                return;
+            };
+            reporter.emit(pool);
+            reporter.schedule_next(completed_at())
+        };
+        if !keep_reporting {
+            self.reporter = None;
+        }
+    }
+
+    /// Waits until maintenance or diagnostic work is due.
+    fn wait_for_task(&self) -> Option<WorkerTask> {
+        let diagnostic_deadline = self
+            .reporter
+            .as_ref()
+            .map(PeriodicDiagnosticReporter::next_snapshot);
+        let mut state = self.control.state.lock();
+        loop {
+            if state.is_stopping() {
+                return None;
+            }
+
+            let now = Instant::now();
+            if let Some(action) = state.next_action(
+                now,
+                self.policy.configured_capacity,
+                self.policy.block_capacity,
+            ) {
+                return Some(WorkerTask::Maintenance(action));
+            }
+            if diagnostic_deadline.is_some_and(|deadline| now >= deadline) {
+                return Some(WorkerTask::Diagnostics);
+            }
+
+            let next_wake = match (state.next_wake(), diagnostic_deadline) {
+                (Some(maintenance), Some(diagnostics)) => Some(maintenance.min(diagnostics)),
+                (Some(maintenance), None) => Some(maintenance),
+                (None, Some(diagnostics)) => Some(diagnostics),
+                (None, None) => None,
+            };
+            state = match next_wake {
+                Some(deadline) => {
+                    let timeout = deadline.saturating_duration_since(now);
+                    if timeout.is_zero() {
+                        continue;
+                    }
+                    self.control.wake.wait_timeout(state, timeout).0
+                }
+                None => self.control.wake.wait(state),
+            };
         }
     }
 }
@@ -626,37 +760,6 @@ fn saturating_add(counter: &AtomicU64, value: u64) {
         DiagnosticOrdering::Relaxed,
         |current| Some(current.saturating_add(value)),
     );
-}
-
-/// Waits until one action is due or final destruction requests stop.
-#[cfg(not(all(test, s3_tm_loom)))]
-fn wait_for_action(
-    control: &MaintenanceControl,
-    configured_capacity: CarrierCount,
-    block_capacity: CarrierCount,
-) -> Option<MaintenanceAction> {
-    let mut state = control.state.lock();
-    loop {
-        if state.is_stopping() {
-            return None;
-        }
-
-        let now = Instant::now();
-        if let Some(action) = state.next_action(now, configured_capacity, block_capacity) {
-            return Some(action);
-        }
-
-        state = match state.next_wake() {
-            Some(deadline) => {
-                let timeout = deadline.saturating_duration_since(now);
-                if timeout.is_zero() {
-                    continue;
-                }
-                control.wake.wait_timeout(state, timeout).0
-            }
-            None => control.wake.wait(state),
-        };
-    }
 }
 
 /// Returns whether a test requested one worker-creation failure.
@@ -750,8 +853,9 @@ fn idle_retention_target(
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
     use super::*;
+    use crate::config::MemoryDiagnosticsConfig;
     use crate::runtime::buffer_pool::config::PoolConfig;
-    use crate::runtime::buffer_pool::test_util::test_pool;
+    use crate::runtime::buffer_pool::test_util::{test_pool, test_pool_with_scan_and_diagnostics};
     use crate::runtime::buffer_pool::virtual_memory::VirtualMemoryOperation;
     use crate::types::MemoryBudgetConfig;
     use std::sync::Barrier;
@@ -1083,6 +1187,83 @@ mod tests {
         let diagnostics = pool.diagnostics();
         assert!(!diagnostics.maintenance_disabled);
         assert_eq!(diagnostics.cleanup_requests, 1);
+    }
+
+    #[test]
+    fn test_periodic_diagnostics_use_the_maintenance_worker() {
+        let (pool, _) = test_pool_with_scan_and_diagnostics(
+            1,
+            1,
+            1,
+            MemoryDiagnosticsConfig::for_test(Some(Duration::from_secs(60)), 1),
+        );
+
+        assert!(pool.inner.maintenance.worker_started());
+        assert_eq!(
+            pool.inner.maintenance.worker_name().as_deref(),
+            Some(MAINTENANCE_THREAD_NAME)
+        );
+        assert_eq!(pool.maintenance_spawn_attempts(), 1);
+    }
+
+    #[test]
+    fn test_due_maintenance_precedes_a_diagnostic_deadline() {
+        let (pool, _) = test_pool(1, 4);
+        let control = Arc::new(MaintenanceControl::new());
+        control
+            .state
+            .lock()
+            .record_idle(Instant::now(), Duration::ZERO);
+        let worker = MaintenanceWorker::new(
+            control,
+            Arc::new(MaintenanceDiagnostics::default()),
+            Arc::downgrade(&pool.inner),
+            MaintenancePolicy {
+                configured_capacity: carriers(4),
+                block_capacity: carriers(1),
+            },
+            Some(Duration::ZERO),
+        );
+
+        let task = worker.wait_for_task();
+
+        assert!(matches!(
+            task,
+            Some(WorkerTask::Maintenance(MaintenanceAction::Reclaim { .. }))
+        ));
+    }
+
+    #[test]
+    fn test_delayed_diagnostic_report_schedules_from_completion() {
+        let (pool, _) = test_pool(1, 1);
+        let interval = Duration::from_secs(1);
+        let mut worker = MaintenanceWorker::new(
+            Arc::new(MaintenanceControl::new()),
+            Arc::new(MaintenanceDiagnostics::default()),
+            Arc::downgrade(&pool.inner),
+            MaintenancePolicy {
+                configured_capacity: carriers(1),
+                block_capacity: carriers(1),
+            },
+            Some(interval),
+        );
+        let previous_deadline = worker
+            .reporter
+            .as_ref()
+            .expect("diagnostic reporter")
+            .next_snapshot();
+        let completed_at = previous_deadline + Duration::from_secs(10);
+
+        worker.report(&pool.inner, || completed_at);
+
+        assert_eq!(
+            worker
+                .reporter
+                .as_ref()
+                .expect("diagnostic reporter")
+                .next_snapshot(),
+            completed_at + interval
+        );
     }
 
     #[test]
