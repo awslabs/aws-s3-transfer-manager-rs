@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::admission::AdmissionGuard;
 use super::arena::ArenaTrim;
+use super::geometry::PoolGeometry;
 use super::{CarrierCount, PoolInner};
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering as DiagnosticOrdering};
 use crate::runtime::sync::sync::{Arc, Condvar, Mutex};
@@ -39,9 +40,9 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Operating-system thread name used by pool maintenance.
 const MAINTENANCE_THREAD_NAME: &str = "s3-tm-memory";
 
-/// Immutable geometry inputs used by maintenance policy.
+/// Immutable inputs used to choose one idle reclamation target.
 #[derive(Clone, Copy)]
-struct MaintenancePolicy {
+struct IdleReclaimPolicy {
     /// Normal admission ceiling.
     configured_capacity: CarrierCount,
     /// Carriers reclaimed as one whole block.
@@ -95,8 +96,8 @@ impl MaintenancePass {
 
 /// Background-worker owner embedded in the pool lifetime domain.
 pub(super) struct MaintenanceCoordinator {
-    /// Immutable capacity and block geometry used by reclamation.
-    policy: MaintenancePolicy,
+    /// Capacity and block geometry used by idle reclamation.
+    reclaim_policy: IdleReclaimPolicy,
     /// State and wakeup primitive retained independently by the worker.
     control: Arc<MaintenanceControl>,
     /// Counters that observe worker behavior without controlling it.
@@ -112,13 +113,13 @@ impl MaintenanceCoordinator {
     /// Creates a coordinator without starting its worker.
     pub(super) fn new(
         configured_capacity: CarrierCount,
-        block_capacity: CarrierCount,
+        geometry: PoolGeometry,
         diagnostic_interval: Option<Duration>,
     ) -> Self {
         Self {
-            policy: MaintenancePolicy {
+            reclaim_policy: IdleReclaimPolicy {
                 configured_capacity,
-                block_capacity,
+                block_capacity: geometry.carriers_per_block(),
             },
             control: Arc::new(MaintenanceControl::new()),
             diagnostics: Arc::new(MaintenanceDiagnostics::default()),
@@ -169,7 +170,7 @@ impl MaintenanceCoordinator {
             }
         }
 
-        let policy = self.policy;
+        let reclaim_policy = self.reclaim_policy;
         let control = Arc::clone(&self.control);
         let diagnostics = Arc::clone(&self.diagnostics);
         let weak_pool = Arc::downgrade(pool);
@@ -187,7 +188,7 @@ impl MaintenanceCoordinator {
                         control,
                         diagnostics,
                         weak_pool,
-                        policy,
+                        reclaim_policy,
                         diagnostic_interval,
                     )
                     .run()
@@ -625,7 +626,7 @@ struct MaintenanceWorker {
     control: Arc<MaintenanceControl>,
     diagnostics: Arc<MaintenanceDiagnostics>,
     pool: Weak<PoolInner>,
-    policy: MaintenancePolicy,
+    reclaim_policy: IdleReclaimPolicy,
     reporter: Option<PeriodicDiagnosticReporter>,
 }
 
@@ -636,7 +637,7 @@ impl MaintenanceWorker {
         control: Arc<MaintenanceControl>,
         diagnostics: Arc<MaintenanceDiagnostics>,
         pool: Weak<PoolInner>,
-        policy: MaintenancePolicy,
+        reclaim_policy: IdleReclaimPolicy,
         diagnostic_interval: Option<Duration>,
     ) -> Self {
         let reporter = diagnostic_interval.and_then(|interval| {
@@ -647,7 +648,7 @@ impl MaintenanceWorker {
             control,
             diagnostics,
             pool,
-            policy,
+            reclaim_policy,
             reporter,
         }
     }
@@ -724,8 +725,8 @@ impl MaintenanceWorker {
             let now = Instant::now();
             if let Some(action) = state.next_action(
                 now,
-                self.policy.configured_capacity,
-                self.policy.block_capacity,
+                self.reclaim_policy.configured_capacity,
+                self.reclaim_policy.block_capacity,
             ) {
                 return Some(WorkerTask::Maintenance(action));
             }
@@ -1218,7 +1219,7 @@ mod tests {
             control,
             Arc::new(MaintenanceDiagnostics::default()),
             Arc::downgrade(&pool.inner),
-            MaintenancePolicy {
+            IdleReclaimPolicy {
                 configured_capacity: carriers(4),
                 block_capacity: carriers(1),
             },
@@ -1241,7 +1242,7 @@ mod tests {
             Arc::new(MaintenanceControl::new()),
             Arc::new(MaintenanceDiagnostics::default()),
             Arc::downgrade(&pool.inner),
-            MaintenancePolicy {
+            IdleReclaimPolicy {
                 configured_capacity: carriers(1),
                 block_capacity: carriers(1),
             },

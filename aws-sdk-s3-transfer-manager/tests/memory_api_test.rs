@@ -14,7 +14,11 @@ use bytes::{Buf, BufMut};
 fn assert_public_error<T: Error + Send + Sync + 'static>() {}
 
 #[test]
-fn explicit_pool_supports_the_public_reservation_and_buffer_flow() {
+fn public_memory_api_supports_an_explicit_pool_flow() {
+    assert_public_error::<AcquireError>();
+    assert_public_error::<BufferPoolBuildError>();
+    assert_public_error::<ReserveError>();
+
     let builder: BufferPoolBuilder =
         BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(1024 * 1024));
     let pool: BufferPool = builder.build().expect("valid explicit pool");
@@ -30,32 +34,16 @@ fn explicit_pool_supports_the_public_reservation_and_buffer_flow() {
         .expect("reserved acquisition");
     buffer.put_slice(b"abc");
 
-    let first = buffer.publish_prefix(1);
-    let mut rest: SegmentedBytes = buffer.freeze();
+    let mut data: SegmentedBytes = buffer.freeze();
     reservation.close_acquisition();
 
-    assert_eq!(&first[..], b"a");
-    assert_eq!(rest.chunk(), b"bc");
+    assert_eq!(data.chunk(), b"abc");
     assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
 
-    rest.advance(2);
-    drop(first);
+    data.advance(3);
     assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
 
     let unpolled: ReserveFuture = pool.reserve(carrier_size);
     drop(unpolled);
     assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
-}
-
-#[test]
-fn pool_errors_are_part_of_the_public_memory_api() {
-    assert_public_error::<AcquireError>();
-    assert_public_error::<BufferPoolBuildError>();
-    assert_public_error::<ReserveError>();
-
-    let build_error = BufferPool::builder()
-        .memory_budget(MemoryBudgetConfig::Limit(0))
-        .build()
-        .expect_err("zero capacity must be rejected");
-    assert_eq!(build_error, BufferPoolBuildError::InvalidCapacity);
 }

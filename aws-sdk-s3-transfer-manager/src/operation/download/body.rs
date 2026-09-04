@@ -535,10 +535,6 @@ pub struct ChunkOutput {
     /// Byte offset in the object where this chunk starts.
     pub(crate) offset: u64,
     /// The content associated with this ranged `GetObject` request.
-    ///
-    /// The value implements [`bytes::Buf`] for incremental or vectored reads.
-    /// [`SegmentedBytes::into_contiguous`] avoids a copy when the remaining
-    /// payload has one presentation segment.
     pub data: SegmentedBytes,
     /// The metadata associated with this particular ranged GetObject request. This contains all the
     /// metadata returned by the S3 GetObject operation.
