@@ -26,6 +26,7 @@ mod admission;
 mod arena;
 mod block;
 mod config;
+#[cfg(not(all(test, s3_tm_loom)))]
 mod diagnostics;
 mod geometry;
 mod maintenance;
@@ -320,7 +321,7 @@ impl PoolInner {
             )?,
             maintenance: MaintenanceCoordinator::new(
                 configured_capacity,
-                geometry.carriers_per_block(),
+                geometry,
                 diagnostics.snapshot_interval(),
             ),
             #[cfg(test)]

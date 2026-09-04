@@ -32,113 +32,6 @@ use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId
 use crate::types::BucketType;
 use tracing::Instrument;
 
-/// Download-specific work data.
-#[derive(Debug)]
-pub(crate) enum DownloadWork {
-    Discovery,
-    GetObjectRange {
-        range: std::ops::RangeInclusive<u64>,
-        slot: Option<BodySlot>,
-        etag: Option<Arc<str>>,
-    },
-    /// Memory-pressure relief: flush the resident filled run to disk, returning
-    /// its carrier charges before the transfer waits for more memory. Handled in
-    /// `execute`; carries no data because it operates on the writer.
-    DrainResident,
-}
-
-/// Bytes in the next chunk sliced from `remaining` at `part_size`: the reservation
-/// size for that chunk. Peek only — does not advance `remaining`.
-fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize {
-    let start = *remaining.start();
-    let end = *remaining.end();
-    let chunk_end = cmp::min(start + part_size - 1, end);
-    (chunk_end - start + 1) as usize
-}
-
-/// Copies one transport response into reserved pooled storage.
-///
-/// The complete validated response length is acquired before reading frames.
-/// Transport framing therefore does not determine carrier acquisition or
-/// immutable segmentation. A failed attempt drops the complete mutable buffer
-/// before returning to the retry loop, restoring its authority to `reservation`.
-///
-/// A zero expected length is invalid. Empty objects complete without issuing a
-/// response-collection operation.
-async fn collect_response_body(
-    pool: &BufferPool,
-    body: aws_sdk_s3::primitives::ByteStream,
-    reservation: &Reservation,
-    expected_len: usize,
-    is_active: impl Fn() -> bool,
-) -> Result<SegmentedBytes, Error> {
-    if expected_len == 0 {
-        return Err(response_length_error(0, 0));
-    }
-    let mut pooled = pool
-        .acquire(reservation, expected_len)
-        .map_err(pool_acquisition_error)?;
-    let mut bytes_received = 0usize;
-    let mut body_stream = body;
-
-    while let Some(result) = body_stream.next().await {
-        let data = result.map_err(|error| error::body_read_error(error, None))?;
-        let remaining = expected_len
-            .checked_sub(bytes_received)
-            .ok_or_else(|| response_length_error(expected_len, bytes_received))?;
-        if data.len() > remaining {
-            return Err(response_length_error(
-                expected_len,
-                bytes_received.saturating_add(data.len()),
-            ));
-        }
-
-        if !data.is_empty() {
-            debug_assert!(pooled.remaining_mut() >= data.len());
-            pooled.put_slice(&data);
-            bytes_received += data.len();
-        }
-
-        if !is_active() {
-            return Err(Error::new(
-                error::ErrorKind::OperationCancelled,
-                "transfer cancelled during body read",
-            ));
-        }
-    }
-
-    if bytes_received != expected_len {
-        return Err(response_length_error(expected_len, bytes_received));
-    }
-
-    Ok(pooled.freeze())
-}
-
-/// Maps a malformed response length to the body-read retry class.
-fn response_length_error(expected: usize, received: usize) -> Error {
-    Error::new(
-        error::ErrorKind::IOError,
-        format!("response body length mismatch: expected {expected} bytes, received {received}"),
-    )
-}
-
-/// Pool acquisition cannot be repaired by reissuing the network request.
-fn pool_acquisition_error(source: AcquireError) -> Error {
-    Error::new(error::ErrorKind::RuntimeError, source)
-}
-
-/// Early return if transfer is terminal (failed/cancelled by another work item).
-macro_rules! bail_if_terminal {
-    ($self:expr) => {
-        if !$self.inner.ctx.is_active() {
-            // Bailing before any drain: no occupancy freed on this path. The transfer is
-            // already terminal so `decrement_in_flight` will find `Terminal` and return false.
-            let _ = $self.decrement_in_flight(0);
-            return WorkOutcome::Cancelled;
-        }
-    };
-}
-
 /// Download transfer that generates and executes download work.
 ///
 /// Clone shares all state via `Arc`.
@@ -171,6 +64,33 @@ struct DownloadTransferInner {
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+}
+
+/// Download-specific work data.
+#[derive(Debug)]
+pub(crate) enum DownloadWork {
+    Discovery,
+    GetObjectRange {
+        range: std::ops::RangeInclusive<u64>,
+        slot: Option<BodySlot>,
+        etag: Option<Arc<str>>,
+    },
+    /// Memory-pressure relief: flush the resident filled run to disk, returning
+    /// its carrier charges before the transfer waits for more memory. Handled in
+    /// `execute`; carries no data because it operates on the writer.
+    DrainResident,
+}
+
+/// Early return if transfer is terminal (failed/cancelled by another work item).
+macro_rules! bail_if_terminal {
+    ($self:expr) => {
+        if !$self.inner.ctx.is_active() {
+            // Bailing before any drain: no occupancy freed on this path. The transfer is
+            // already terminal so `decrement_in_flight` will find `Terminal` and return false.
+            let _ = $self.decrement_in_flight(0);
+            return WorkOutcome::Cancelled;
+        }
+    };
 }
 
 impl DownloadTransfer {
@@ -546,7 +466,10 @@ impl DownloadTransfer {
     /// The terminal notification future is registered before checking status:
     /// `notify_waiters` stores no permit, so reversing those operations can lose
     /// a cancellation between the check and polling both futures.
-    async fn reserve_chunk(&self, len: usize) -> Result<Option<Reservation>, ReserveError> {
+    async fn reserve_discovery_chunk(
+        &self,
+        len: usize,
+    ) -> Result<Option<Reservation>, ReserveError> {
         let mut reservation = std::pin::pin!(self.inner.ctx.handle.buffer_pool.reserve(len));
 
         loop {
@@ -702,7 +625,7 @@ impl DownloadTransfer {
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(initial), Some(meta)) => {
                 let mut slot = self.inner.writer.claim();
-                match self.reserve_chunk(initial.expected_len).await {
+                match self.reserve_discovery_chunk(initial.expected_len).await {
                     Ok(Some(reservation)) => {
                         slot.attach_reservation(reservation);
                         Some((initial.body, initial.expected_len, meta, slot))
@@ -1204,6 +1127,86 @@ impl Transfer for DownloadTransfer {
     }
 }
 
+/// Bytes in the next chunk sliced from `remaining` at `part_size`: the reservation
+/// size for that chunk. Peek only — does not advance `remaining`.
+fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize {
+    let start = *remaining.start();
+    let end = *remaining.end();
+    let chunk_end = cmp::min(start + part_size - 1, end);
+    (chunk_end - start + 1) as usize
+}
+
+/// Copies one transport response into reserved pooled storage.
+///
+/// The complete validated response length is acquired before reading frames.
+/// Transport framing therefore does not determine carrier acquisition or
+/// immutable segmentation. A failed attempt drops the complete mutable buffer
+/// before returning to the retry loop, restoring its authority to `reservation`.
+///
+/// A zero expected length is invalid. Empty objects complete without issuing a
+/// response-collection operation.
+async fn collect_response_body(
+    pool: &BufferPool,
+    body: aws_sdk_s3::primitives::ByteStream,
+    reservation: &Reservation,
+    expected_len: usize,
+    is_active: impl Fn() -> bool,
+) -> Result<SegmentedBytes, Error> {
+    if expected_len == 0 {
+        return Err(response_length_error(0, 0));
+    }
+    let mut pooled = pool
+        .acquire(reservation, expected_len)
+        .map_err(pool_acquisition_error)?;
+    let mut bytes_received = 0usize;
+    let mut body_stream = body;
+
+    while let Some(result) = body_stream.next().await {
+        let data = result.map_err(|error| error::body_read_error(error, None))?;
+        let remaining = expected_len
+            .checked_sub(bytes_received)
+            .ok_or_else(|| response_length_error(expected_len, bytes_received))?;
+        if data.len() > remaining {
+            return Err(response_length_error(
+                expected_len,
+                bytes_received.saturating_add(data.len()),
+            ));
+        }
+
+        if !data.is_empty() {
+            debug_assert!(pooled.remaining_mut() >= data.len());
+            pooled.put_slice(&data);
+            bytes_received += data.len();
+        }
+
+        if !is_active() {
+            return Err(Error::new(
+                error::ErrorKind::OperationCancelled,
+                "transfer cancelled during body read",
+            ));
+        }
+    }
+
+    if bytes_received != expected_len {
+        return Err(response_length_error(expected_len, bytes_received));
+    }
+
+    Ok(pooled.freeze())
+}
+
+/// Maps a malformed response length to the body-read retry class.
+fn response_length_error(expected: usize, received: usize) -> Error {
+    Error::new(
+        error::ErrorKind::IOError,
+        format!("response body length mismatch: expected {expected} bytes, received {received}"),
+    )
+}
+
+/// Pool acquisition cannot be repaired by reissuing the network request.
+fn pool_acquisition_error(source: AcquireError) -> Error {
+    Error::new(error::ErrorKind::RuntimeError, source)
+}
+
 /// Parse a byte range from either the request format (`bytes=START-END`) or the
 /// response format (`bytes START-END/TOTAL` or `bytes START-END/*`).
 ///
@@ -1289,8 +1292,8 @@ fn build_integrity_checks(
     )
 }
 
-#[cfg(all(test, not(s3_tm_loom)))]
-mod response_collection_tests {
+#[cfg(test)]
+mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1301,6 +1304,18 @@ mod response_collection_tests {
     use http_body_1x::{Body as HttpBody, Frame, SizeHint};
 
     use super::*;
+    use crate::operation::download::chunk_meta::ChunkMetadata;
+    use crate::operation::download::DownloadInput;
+    use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
+    use crate::transfer::TransferContext;
+    use crate::transfer::{IoRequest, WorkOutcome};
+    use crate::types::{BucketType, ChecksumValidation, NotValidatedReason};
+    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::ChecksumType;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+
+    const MB: u64 = 1024 * 1024;
 
     /// Deterministic multi-frame body separating transport frames from carriers.
     struct TestFrameBody {
@@ -1573,25 +1588,6 @@ mod response_collection_tests {
         );
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::operation::download::DownloadInput;
-    use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
-    use crate::transfer::TransferContext;
-    use crate::transfer::{IoRequest, WorkOutcome};
-    use crate::types::BucketType;
-    use aws_sdk_s3::operation::get_object::GetObjectOutput;
-    use aws_sdk_s3::primitives::ByteStream;
-    use aws_smithy_mocks::{mock, mock_client, RuleMode};
-
-    const MB: u64 = 1024 * 1024;
-
-    use crate::operation::download::chunk_meta::ChunkMetadata;
-    use crate::types::{ChecksumValidation, NotValidatedReason};
-    use aws_sdk_s3::types::ChecksumType;
 
     fn chunk_with_crc32(value: &str) -> ChunkMetadata {
         let mut m = ChunkMetadata::default();
