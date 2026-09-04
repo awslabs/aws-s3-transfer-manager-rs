@@ -213,10 +213,12 @@ impl Handle {
         // Keep their automatic pool large enough not to become an incidental gate.
         const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
+        let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
                 crate::types::MemoryBudgetConfig::Limit(DEFAULT_TEST_MEMORY_BUDGET_BYTES),
                 None,
+                memory_diagnostics,
             )
             .expect("test buffer-pool configuration must be valid"),
             MemoryConfig::Explicit(pool) => pool.clone(),
@@ -280,11 +282,14 @@ impl Client {
         #[cfg(feature = "dial9")]
         let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
 
+        let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
-            MemoryConfig::Auto => {
-                BufferPool::from_capacity(crate::types::MemoryBudgetConfig::Auto, profile.ram_bytes)
-                    .expect("memory configuration must resolve to supported pool geometry")
-            }
+            MemoryConfig::Auto => BufferPool::from_capacity(
+                crate::types::MemoryBudgetConfig::Auto,
+                profile.ram_bytes,
+                memory_diagnostics,
+            )
+            .expect("memory configuration must resolve to supported pool geometry"),
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
         let handle = Arc::new_cyclic(|weak_handle| {
@@ -567,6 +572,7 @@ mod tests {
         let pool = BufferPool::from_capacity(
             crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
             None,
+            crate::config::MemoryDiagnosticsConfig::default(),
         )
         .unwrap();
         let carrier_size = pool.carrier_size();
@@ -621,6 +627,7 @@ mod tests {
         let pool = BufferPool::from_capacity(
             crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
             None,
+            crate::config::MemoryDiagnosticsConfig::default(),
         )
         .unwrap();
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);

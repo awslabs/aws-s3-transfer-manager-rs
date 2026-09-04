@@ -342,9 +342,9 @@ impl BodyWriter {
     /// edge from execute tasks. A non-terminal drain claims only runs that reach the
     /// drain batch, coalescing each into one positioned write. Stream mode: no-op.
     ///
-    /// Returns the number of parts freed across the runs drained by this call — the
-    /// read-ahead occupancy the caller releases. The buffer does not track a running
-    /// total; the download layer accounts for the freed count under its state lock.
+    /// Returns the number of parts freed across the runs drained by this call.
+    /// The download layer releases that read-ahead occupancy under its state
+    /// lock.
     pub(crate) fn drain(&self, mode: DrainMode) -> Result<u64, std::io::Error> {
         let mut freed = 0u64;
         if let Mode::Disk {
@@ -354,7 +354,7 @@ impl BodyWriter {
         {
             while let Some(sw) = self.buffer.take_drain_run(mode) {
                 write_run(sink.as_ref(), *object_range_start, &sw)?;
-                freed += sw.complete();
+                freed = freed.saturating_add(sw.complete());
             }
         }
         Ok(freed)
@@ -1221,8 +1221,12 @@ mod tests {
     use crate::memory::{BufferPool, MemoryBudgetConfig};
 
     fn test_reservation_pool() -> (BufferPool, usize) {
-        let pool = BufferPool::from_capacity(MemoryBudgetConfig::Limit(1024 * 1024), None)
-            .expect("test pool");
+        let pool = BufferPool::from_capacity(
+            MemoryBudgetConfig::Limit(1024 * 1024),
+            None,
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .expect("test pool");
         let carrier_size = pool.carrier_size();
         (pool, carrier_size)
     }

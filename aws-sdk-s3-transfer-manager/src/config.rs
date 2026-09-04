@@ -9,6 +9,9 @@ use std::cmp;
 use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead, RuntimeMode};
 
+mod diagnostics;
+pub(crate) use diagnostics::{DiagnosticsConfig, MemoryDiagnosticsConfig};
+
 pub(crate) mod loader;
 
 /// Minimum upload part size in bytes
@@ -73,6 +76,7 @@ pub struct Config {
     runtime_mode: RuntimeMode,
     read_ahead: ReadAhead,
     memory: MemoryConfig,
+    diagnostics: DiagnosticsConfig,
     framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
     /// Machine facts detected once by the async config loader, off the
@@ -127,6 +131,11 @@ impl Config {
         &self.memory
     }
 
+    /// Returns the diagnostic policy fixed when this configuration was built.
+    pub(crate) fn diagnostics(&self) -> DiagnosticsConfig {
+        self.diagnostics
+    }
+
     /// Machine facts detected by the async config loader, if this config was
     /// built through it. `None` when built directly.
     pub(crate) fn machine_profile(&self) -> Option<&crate::runtime::platform::MachineProfile> {
@@ -164,6 +173,7 @@ pub struct Builder {
     runtime_mode: RuntimeMode,
     read_ahead: ReadAhead,
     memory: MemoryConfig,
+    diagnostics: Option<DiagnosticsConfig>,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
@@ -332,6 +342,7 @@ impl Builder {
             runtime_mode: self.runtime_mode,
             read_ahead: self.read_ahead,
             memory: self.memory,
+            diagnostics: self.diagnostics.unwrap_or_else(DiagnosticsConfig::from_env),
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,

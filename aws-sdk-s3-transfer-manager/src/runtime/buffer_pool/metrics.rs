@@ -7,8 +7,7 @@
 //!
 //! [`MemoryMetrics`] is one admission-serialized accounting sample suitable
 //! for capacity decisions. [`MemoryDiagnostics`] combines cumulative counters
-//! with a best-effort arena scan and is intended for operational explanation,
-//! tests, and rare tracing.
+//! with a best-effort arena scan for tests and diagnostic explanation.
 
 use super::arena::{ArenaDiagnosticSnapshot, ArenaLifecycleSample};
 use super::maintenance::MaintenanceDiagnosticSnapshot;
@@ -27,7 +26,7 @@ pub struct MemoryMetrics {
     admission_overage_bytes: u64,
     prepared_capacity_bytes: u64,
     queued_reservations: usize,
-    reservations_queued_total: u64,
+    reservation_enqueues_total: u64,
 }
 
 /// Carrier-count inputs captured under admission serialization.
@@ -45,7 +44,7 @@ pub(super) struct MemoryMetricState {
     /// Requests currently retained in the FIFO.
     pub(super) queued_reservations: usize,
     /// Cumulative requests that entered the FIFO.
-    pub(super) reservations_queued_total: u64,
+    pub(super) reservation_enqueues_total: u64,
 }
 
 /// Operational counters and lifecycle state for one shared pool domain.
@@ -64,12 +63,14 @@ pub(crate) struct MemoryDiagnostics {
     pub(crate) prepared_carriers: usize,
     /// Blocks unavailable until trim or mapping recovery completes.
     pub(crate) cleanup_pending_blocks: usize,
-    /// Cumulative bitmap words inspected by optimistic acquisition.
-    pub(crate) optimistic_scan_words: u64,
+    /// Per-acquisition allocator work, when detailed diagnostics were enabled.
+    pub(crate) detailed_allocator: Option<DetailedAllocatorDiagnostics>,
     /// Cumulative optimistic acquisitions that needed more carriers.
     pub(crate) optimistic_misses: u64,
     /// Cumulative partial claims completed through serialized fallback.
     pub(crate) serialized_fallbacks: u64,
+    /// Cumulative existing slots inspected by serialized fallback.
+    pub(crate) serialized_slots_inspected: u64,
     /// Cumulative blocks made claimable.
     pub(crate) blocks_prepared: u64,
     /// Cumulative stable virtual ranges reserved for new block slots.
@@ -96,6 +97,15 @@ pub(crate) struct MemoryDiagnostics {
     pub(crate) cleanup_requests: u64,
 }
 
+/// Per-acquisition allocator work collected only in detailed diagnostic mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DetailedAllocatorDiagnostics {
+    /// Cumulative optimistic acquisition attempts.
+    pub(crate) optimistic_scans: u64,
+    /// Cumulative bitmap words inspected by optimistic acquisition.
+    pub(crate) optimistic_scan_words: u64,
+}
+
 impl MemoryDiagnostics {
     /// Composes independent arena and maintenance diagnostic samples.
     pub(super) fn from_samples(
@@ -107,9 +117,13 @@ impl MemoryDiagnostics {
             live_carriers: lifecycle.live_carriers.get(),
             prepared_carriers: lifecycle.prepared_capacity.get(),
             cleanup_pending_blocks: lifecycle.cleanup_pending_blocks,
-            optimistic_scan_words: arena.optimistic_scan_words,
+            detailed_allocator: arena.detailed.map(|detailed| DetailedAllocatorDiagnostics {
+                optimistic_scans: detailed.optimistic_scans,
+                optimistic_scan_words: detailed.optimistic_scan_words,
+            }),
             optimistic_misses: arena.optimistic_misses,
             serialized_fallbacks: arena.serialized_fallbacks,
+            serialized_slots_inspected: arena.serialized_slots_inspected,
             blocks_prepared: arena.blocks_prepared,
             block_ranges_reserved: arena.block_ranges_reserved,
             rolled_back_carriers: arena.rolled_back_carriers,
@@ -142,7 +156,7 @@ impl MemoryMetrics {
             admission_overage_bytes: admission_used_bytes.saturating_sub(configured_capacity_bytes),
             prepared_capacity_bytes: carriers_to_bytes(state.prepared_capacity, carrier_size),
             queued_reservations: state.queued_reservations,
-            reservations_queued_total: state.reservations_queued_total,
+            reservation_enqueues_total: state.reservation_enqueues_total,
         }
     }
 
@@ -190,8 +204,8 @@ impl MemoryMetrics {
     /// This pool-lifetime counter increments once per queued request and
     /// saturates at `u64::MAX`. Unlike [`Self::queued_reservations`], it does
     /// not decrease when a request is granted or cancelled.
-    pub fn reservations_queued_total(&self) -> u64 {
-        self.reservations_queued_total
+    pub fn reservation_enqueues_total(&self) -> u64 {
+        self.reservation_enqueues_total
     }
 }
 
@@ -222,7 +236,7 @@ mod tests {
         assert_eq!(initial.admission_overage_bytes(), 0);
         assert_eq!(initial.prepared_capacity_bytes(), 0);
         assert_eq!(initial.queued_reservations(), 0);
-        assert_eq!(initial.reservations_queued_total(), 0);
+        assert_eq!(initial.reservation_enqueues_total(), 0);
 
         let reservation = pool
             .try_reserve(carrier_size)
@@ -244,14 +258,14 @@ mod tests {
             carrier_size as u64
         );
         assert_eq!(queued_metrics.queued_reservations(), 1);
-        assert_eq!(queued_metrics.reservations_queued_total(), 1);
+        assert_eq!(queued_metrics.reservation_enqueues_total(), 1);
 
         drop(queued);
         let acquired = pool.acquire(&reservation, carrier_size).unwrap();
         let charged = pool.metrics();
         assert_eq!(charged.charged_capacity_bytes(), carrier_size as u64);
         assert_eq!(charged.queued_reservations(), 0);
-        assert_eq!(charged.reservations_queued_total(), 1);
+        assert_eq!(charged.reservation_enqueues_total(), 1);
 
         reservation.close_acquisition();
         let closed = pool.metrics();
