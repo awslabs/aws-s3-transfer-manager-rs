@@ -7,18 +7,13 @@ use crate::metrics::unit::ByteUnit;
 use crate::runtime::ManagedThreadRuntime;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
-use crate::types::{ConcurrencyMode, PartSize, RuntimeMode};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
 use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::runtime::memory::{MemoryBudget, BUDGET_CHUNK_BYTES};
+use crate::memory::BufferPool;
 use crate::runtime::ExecutionRuntime;
-
-/// Non-binding budget for test handles, which size objects far below it, so the
-/// budget never gates in state-machine and mock-SDK tests.
-#[cfg(test)]
-const TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -28,7 +23,7 @@ pub struct Client {
 
 /// Shared state backing every transfer operation: configuration, the S3 client,
 /// the scheduler, the execution runtime, the concurrency controller, telemetry,
-/// and the memory budget.
+/// and the shared payload-memory pool.
 #[derive(Debug)]
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
@@ -37,7 +32,7 @@ pub(crate) struct Handle {
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
-    pub(crate) memory_budget: Arc<MemoryBudget>,
+    pub(crate) buffer_pool: BufferPool,
     /// Per-bucket retry token bucket, cached so all operations and retries to a
     /// given bucket share one live token bucket. The SDK does not share a bucket
     /// across custom retry partitions, and a partition built per operation would
@@ -52,6 +47,24 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// Reports newly registered scheduler work to client-owned subsystems.
+    ///
+    /// The callback runs while the scheduler holds its registry write lock.
+    /// Keeping the adaptation here lets the scheduler publish lifecycle events
+    /// without depending on the policy each client subsystem applies to them.
+    pub(crate) fn scheduler_work_registered(&self) {
+        self.buffer_pool.record_managed_activity();
+    }
+
+    /// Reports that the scheduler has no registered or dispatched work.
+    ///
+    /// The scheduler holds its registry read lock through this callback, so a
+    /// concurrent registration either precedes this event or invalidates it
+    /// through [`Self::scheduler_work_registered`].
+    pub(crate) fn scheduler_became_idle(&self) {
+        self.buffer_pool.record_global_idle();
+    }
+
     /// Get the concrete minimum upload size in bytes to use to determine whether multipart uploads
     /// are enabled for a given request.
     pub(crate) fn mpu_threshold_bytes(&self) -> u64 {
@@ -196,6 +209,20 @@ impl Handle {
         controller: Arc<dyn ConcurrencyController>,
         runtime_factory: impl FnOnce(std::sync::Weak<Handle>) -> Arc<dyn ExecutionRuntime>,
     ) -> Arc<Self> {
+        // Most client tests exercise scheduling rather than memory admission.
+        // Keep their automatic pool large enough not to become an incidental gate.
+        const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
+
+        let memory_diagnostics = config.diagnostics().memory();
+        let buffer_pool = match config.memory() {
+            MemoryConfig::Auto => BufferPool::from_capacity(
+                crate::types::MemoryBudgetConfig::Limit(DEFAULT_TEST_MEMORY_BUDGET_BYTES),
+                None,
+                memory_diagnostics,
+            )
+            .expect("test buffer-pool configuration must be valid"),
+            MemoryConfig::Explicit(pool) => pool.clone(),
+        };
         Arc::new_cyclic(|weak| {
             let scheduler = Scheduler::new(weak.clone());
             let runtime = runtime_factory(weak.clone());
@@ -212,7 +239,7 @@ impl Handle {
                 runtime,
                 controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
-                memory_budget: MemoryBudget::new(TEST_MEMORY_BUDGET_BYTES, BUDGET_CHUNK_BYTES),
+                buffer_pool,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         })
@@ -231,7 +258,7 @@ impl Client {
         // Machine facts for auto-sizing: use the loader-detected profile if the
         // config came through `ConfigLoader::load`, else detect locally (DMI +
         // vCPU + RAM — cheap pseudo-file reads, no network). Detected once and
-        // shared by both the concurrency seed and the memory budget.
+        // shared by both the concurrency seed and the buffer pool.
         let profile = config
             .machine_profile()
             .cloned()
@@ -255,10 +282,16 @@ impl Client {
         #[cfg(feature = "dial9")]
         let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
 
-        // Resolve the budget once from the same detected RAM: it sizes the
-        // Handle's MemoryBudget.
-        let budget_capacity = config.memory_budget().resolve(profile.ram_bytes);
-
+        let memory_diagnostics = config.diagnostics().memory();
+        let buffer_pool = match config.memory() {
+            MemoryConfig::Auto => BufferPool::from_capacity(
+                crate::types::MemoryBudgetConfig::Auto,
+                profile.ram_bytes,
+                memory_diagnostics,
+            )
+            .expect("memory configuration must resolve to supported pool geometry"),
+            MemoryConfig::Explicit(pool) => pool.clone(),
+        };
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
@@ -296,7 +329,7 @@ impl Client {
                 runtime,
                 controller,
                 telemetry,
-                memory_budget: MemoryBudget::new(budget_capacity, BUDGET_CHUNK_BYTES),
+                buffer_pool,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         });
@@ -308,11 +341,9 @@ impl Client {
         &self.handle.config
     }
 
-    /// Snapshot the global memory budget's resolved ceiling and current admission
-    /// state. For the configured intent (before resolution), see
-    /// [`config().memory_budget()`](Config::memory_budget).
-    pub fn memory_budget(&self) -> crate::types::MemoryBudgetSnapshot {
-        self.handle.memory_budget.stats()
+    /// Returns point-in-time operational metrics for this client.
+    pub fn metrics(&self) -> crate::metrics::ClientMetrics {
+        crate::metrics::ClientMetrics::new(self.handle.buffer_pool.metrics())
     }
 
     /// Upload a single object to S3.
@@ -532,6 +563,90 @@ mod tests {
         let client = Client::new(test_config());
         let client2 = client.clone();
         assert!(Arc::ptr_eq(&client.handle, &client2.handle));
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_client_uses_the_explicit_buffer_pool() {
+        let pool = BufferPool::from_capacity(
+            crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
+            None,
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .unwrap();
+        let carrier_size = pool.carrier_size();
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .memory(MemoryConfig::Explicit(pool.clone()))
+            .build();
+
+        let client = Client::new(config);
+        let reservation = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("explicit pool reservation");
+
+        let client_metrics = client.metrics();
+        let memory = client_metrics.memory();
+        assert_eq!(memory.active_planned_demand_bytes(), carrier_size as u64);
+        assert_eq!(
+            memory.configured_capacity_bytes(),
+            pool.metrics().configured_capacity_bytes()
+        );
+        drop(reservation);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_client_automatic_pool_starts_unprepared() {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .machine_profile(Some(crate::runtime::platform::MachineProfile {
+                instance_type: None,
+                vcpus: 4,
+                ram_bytes: Some(512 * ByteUnit::Mebibyte.as_bytes_usize()),
+            }))
+            .build();
+        let client = Client::new(config);
+        let client_metrics = client.metrics();
+        let memory = client_metrics.memory();
+
+        assert!(memory.configured_capacity_bytes() > 0);
+        assert_eq!(memory.admission_used_bytes(), 0);
+        assert_eq!(memory.prepared_capacity_bytes(), 0);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_handle_test_constructor_preserves_an_explicit_pool() {
+        let pool = BufferPool::from_capacity(
+            crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
+            None,
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .unwrap();
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .memory(MemoryConfig::Explicit(pool.clone()))
+            .build();
+
+        let handle = Handle::new_for_test(config, 2);
+        let reservation = pool
+            .try_reserve(pool.carrier_size())
+            .unwrap()
+            .expect("explicit pool reservation");
+
+        assert_eq!(
+            handle.buffer_pool.metrics().active_planned_demand_bytes(),
+            pool.carrier_size() as u64
+        );
+        drop(reservation);
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

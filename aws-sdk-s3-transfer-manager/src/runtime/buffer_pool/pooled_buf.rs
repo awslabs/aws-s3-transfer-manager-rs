@@ -60,7 +60,7 @@ type CarrierRuns = SmallVec<[CarrierRun; INLINE_CARRIER_RUNS]>;
 /// reservation's carrier allowance even when their initialized byte lengths
 /// fit within the reservation. The allowance returns when each final immutable
 /// owner drops.
-pub(crate) struct PooledBufMut {
+pub struct PooledBufMut {
     /// Selects reserved or unreserved acquisition for every later growth.
     growth: GrowthAuthority,
     /// Preserves logical byte order across physical runs.
@@ -101,7 +101,7 @@ impl PooledBufMut {
     ///
     /// This is `len() + remaining_mut()`, not the original allocation size.
     /// Publishing removes capacity from the mutable buffer.
-    pub(crate) fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.retained_capacity
     }
 
@@ -109,12 +109,12 @@ impl PooledBufMut {
     ///
     /// The bytes may span multiple carriers and therefore may not be
     /// contiguous in memory.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.initialized
     }
 
     /// Returns whether no initialized unpublished bytes remain.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.initialized == 0
     }
 
@@ -138,7 +138,7 @@ impl PooledBufMut {
     ///
     /// The result is empty exactly when [`Self::len`] is zero. A nonempty
     /// result never crosses a carrier boundary.
-    pub(crate) fn initialized_chunk(&self) -> &[u8] {
+    pub fn initialized_chunk(&self) -> &[u8] {
         if self.initialized == 0 {
             return &[];
         }
@@ -165,7 +165,7 @@ impl PooledBufMut {
     /// complete carriers. Only capacity retained by this buffer can satisfy
     /// the guarantee; unused tails discarded by other buffers are not shared.
     /// Failure leaves this buffer unchanged.
-    pub(crate) fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError> {
+    pub fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError> {
         let remaining = self.remaining_mut();
         if min_writable <= remaining {
             return Ok(());
@@ -192,7 +192,7 @@ impl PooledBufMut {
     ///
     /// Panics unless `count` is nonzero and no larger than
     /// `initialized_chunk().len()`.
-    pub(crate) fn publish_prefix(&mut self, count: usize) -> Bytes {
+    pub fn publish_prefix(&mut self, count: usize) -> Bytes {
         self.normalize_publish_cursor();
         let available = self.initialized_chunk().len();
         assert!(
@@ -241,7 +241,7 @@ impl PooledBufMut {
     /// Wholly unused carriers return immediately. An initialized prefix in a
     /// partially used carrier retains that carrier and discards its writable
     /// suffix. The operation does not copy initialized bytes.
-    pub(crate) fn freeze(self) -> SegmentedBytes {
+    pub fn freeze(self) -> SegmentedBytes {
         let pool = Arc::clone(self.growth.pool());
         let Self { runs, .. } = self;
         let mut builder = SegmentedBytesBuilder::for_pool(pool);
@@ -445,6 +445,16 @@ impl PooledBufMut {
                 self.normalize_write_cursor();
             }
         }
+    }
+}
+
+impl std::fmt::Debug for PooledBufMut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PooledBufMut")
+            .field("initialized", &self.initialized)
+            .field("retained_capacity", &self.retained_capacity)
+            .finish_non_exhaustive()
     }
 }
 

@@ -481,8 +481,13 @@ struct PoolInner {
 
 struct AdmissionState {
     ledger: AdmissionLedger,
+    queue: ReservationQueue,
+}
+
+struct ReservationQueue {
     waiters: VecDeque<Waiter>,
-    parked_reservations_total: u64,
+    diagnostics: ReservationQueueDiagnostics,
+    reservation_enqueues_total: u64,
 }
 
 struct AdmissionGuard<'a> {
@@ -502,8 +507,10 @@ struct CoverageState {
 ```
 
 `AdmissionState` serializes grant policy, physical preparation, FIFO state, planned-demand changes,
-and acquisition transitions that add uncovered charges. `parked_reservations_total` increments
-saturating once when a reservation request first enters the FIFO. `CoverageState` linearizes
+and acquisition transitions that add uncovered charges. The queue reserves metadata, links the
+request, increments `reservation_enqueues_total`, and records the empty-boundary transition as one
+operation. The counter saturates and increments once when a reservation request first enters the
+FIFO. `CoverageState` linearizes
 per-carrier debit and return. A debit fully covered by available coverage and a return that
 only restores coverage complete with one compare-and-exchange loop. The containing acquisition
 enters admission serialization to publish and prepare a shortfall, or before serialized fallback
@@ -2386,10 +2393,18 @@ frames and calls `reserve` only when the next copy does not fit. Concurrent rang
 attempts use separate buffers because their transport and terminal lifetimes are independent.
 Foreign input is released after its bytes have been copied.
 
-The reservation closes after the response reaches a terminal state and no transfer retry or reserved
-acquisition can begin. Download output may outlive the reservation, work item, HTTP client, public
-pool handle, or transfer manager. Each pooled byte owner retains its `CarrierGuard` and `PoolInner`
-until final drop.
+The dispatched range or discovery response supplies the exact expected byte length. The collector
+rejects a frame before copying if it would cross that boundary, and rejects end-of-stream before
+the boundary is reached. Carrier-rounded reservation capacity is not a substitute for this check:
+an oversized response can still fit in the same final carrier. Either failure drops the attempt's
+mutable buffer before retry, returning its direct acquisition authority to the reservation.
+
+After a successful attempt freezes the complete response, publication closes the reservation before
+placing the immutable payload in `ChunkOutput`; no later retry or acquisition can begin for that
+response. A failed retryable attempt keeps the reservation open after dropping its mutable buffer,
+while terminal failure drops the slot and closes the reservation. Download output may outlive the
+reservation, work item, HTTP client, public pool handle, or transfer manager. Each pooled byte owner
+retains its `CarrierGuard` and `PoolInner` until final drop.
 
 Error and control bodies have no guessed pre-dispatch allowance. They remain foreign unless a
 managed path deliberately copies them into reserved staging.
@@ -2404,25 +2419,31 @@ remains charged and pairs retention with its own admission and eviction policy.
 #### Disk writes
 
 Once decoded payload is in pooled carriers, the download sink writes the same storage without
-another staging copy. It consumes `SegmentedBytes` through `Buf`. Vectored writes call
-`chunks_vectored` and advance the cursor by the completed byte count, including on short writes:
+another staging copy. One claimed receive-buffer run contains object-offset-contiguous
+`SegmentedBytes` payloads. A private `DiskWriteCursor` borrows those payloads in place and presents
+their remaining ranges through `Buf`; it does not clone segmented values, owner metadata, or carrier
+references. The run becomes one positioned `write_all_at` operation:
 
 ```text
-SegmentedBytes
-  -> chunks_vectored
+claimed SegmentWrite<ChunkOutput>
+  -> validate contiguous object offsets
+  -> borrow payloads through DiskWriteCursor
+  -> chunks_vectored across payload boundaries
   -> submit [IoSlice A, IoSlice B, ...]
   -> complete N bytes
-  -> advance(N)
-  -> release every owner crossed by the new cursor
+  -> advance the borrowed cursor and retry any unwritten suffix
+  -> complete the claimed run and release its payload owners
 ```
 
-The buffer owner and all I/O metadata remain live until synchronous return or asynchronous terminal
-completion. Cancelling completion-based I/O does not release owners until cancellation or the
-original operation produces that completion.
+The claimed run and all of its owners remain live until synchronous return or asynchronous terminal
+completion. Short writes advance only the borrowed cursor; they do not mutate or partially release
+the source payloads. Cancelling completion-based I/O does not release owners until cancellation or
+the original operation produces that completion.
 
 Submission size is independent of carrier size. The I/O path may coalesce already available,
-file-offset-contiguous segments into a larger submission, but it does not retain carriers waiting
-for a preferred byte count. Buffered vectored writes accept any published segment layout.
+file-offset-contiguous chunks into a larger submission, but it does not retain carriers waiting for
+a preferred byte count. Gaps, overlaps, empty payloads, and offsets outside the requested object
+range are rejected as invalid receive-buffer state.
 
 Direct I/O adds address, length, and file-offset constraints. Page-aligned carrier bases alone do
 not satisfy them. The sink determines the required alignment for the selected file and device
@@ -2455,8 +2476,8 @@ primitives without defining the transport API.
 - **I4: Download ownership.** Reserved collection reuses one mutable stream per response, publishes
   only copied bytes, and releases foreign input after copy completion.
 - **I5: Disk completion.** Submitted byte owners remain live through terminal completion. Short
-  writes release exactly the completed prefix, and direct and buffered writes do not overlap file
-  pages.
+  writes advance a borrowed submission cursor without releasing the claimed run, and direct and
+  buffered writes do not overlap file pages.
 
 ## Configuration and operations
 
@@ -2502,11 +2523,14 @@ impl BufferPoolBuilder {
 ```
 
 `MemoryBudgetConfig` is the only public automatic, fractional, or explicit byte policy. The
-transfer manager and an explicitly constructed pool accept the same type; pooled storage does not
-introduce a second capacity enum. Until pool integration, the existing transfer-manager path keeps
-its public clamping behavior while direct pool construction uses the checked rules below.
-Integration must select one documented resolution contract before both surfaces are public
-together.
+fallible pool builder is its only resolution boundary; pooled storage does not introduce a second
+capacity enum or preserve a second clamping path. A transfer-manager client either constructs its
+default pool with `Auto` or accepts an already validated explicit pool.
+
+The crate's top-level `memory` module is the public facade for pool construction, reservation,
+acquisition, and pooled byte containers. Client and pool memory samples remain in the top-level
+`metrics` module with other observability types. The private implementation stays under
+`runtime::buffer_pool`; that layout is not part of the public API.
 
 Pool construction resolves the policy after selecting carrier geometry. Effective memory is the
 smaller of physical memory and a process or container memory limit where the platform exposes one.
@@ -2568,31 +2592,33 @@ pub enum MemoryConfig {
     Explicit(BufferPool),
 }
 
-impl TransferManagerBuilder {
+impl config::Builder {
     pub fn memory(self, config: MemoryConfig) -> Self;
 }
 
-impl TransferManager {
-    pub fn metrics(&self) -> TransferManagerMetrics;
+impl Client {
+    pub fn metrics(&self) -> ClientMetrics;
 }
 
-impl TransferManagerMetrics {
+impl ClientMetrics {
     pub fn memory(&self) -> &MemoryMetrics;
 }
 ```
 
-`MemoryConfig::Auto` is the default. It constructs a pool with `MemoryBudgetConfig::Auto`. `Explicit`
-installs the supplied handle in the transfer manager. The caller can retain another clone for a
-cache or another component:
+`MemoryConfig::Auto` is the default. It constructs a pool with `MemoryBudgetConfig::Auto`.
+`MemoryConfig::Explicit` installs the supplied handle in the client. The caller can retain another
+clone for a cache or another component:
 
 ```rust
 let pool = BufferPool::builder()
     .memory_budget(MemoryBudgetConfig::Limit(8 * 1024 * 1024 * 1024))
     .build()?;
 
-let transfer_manager = TransferManager::builder()
+let config = Config::builder()
     .memory(MemoryConfig::Explicit(pool.clone()))
-    .build()?;
+    // S3 client configuration omitted.
+    .build();
+let transfer_manager = Client::new(config);
 ```
 
 Another component enters the same bounded admission domain through reservation:
@@ -2604,22 +2630,30 @@ let buffer = pool.acquire(&reservation, writable_bytes)?;
 
 There is no separate transfer-manager memory-budget setting and no pool-global close operation.
 Every clone refers to the same admission, accounting, storage, maintenance, and metrics state.
-`TransferManager::metrics()` exposes read-only metrics for an automatically constructed pool without
+`Client::metrics().memory()` exposes read-only metrics for an automatically constructed pool without
 exposing a cloneable pool handle. An explicitly supplied pool exposes the same `MemoryMetrics`
 contract through `BufferPool::metrics()`.
 
 ### Maintenance coordinator
 
-Reclamation and cleanup recovery run on a lazy pool-owned thread rather than an async runtime
-worker:
+Reclamation, cleanup recovery, and optional periodic diagnostics share one pool-owned thread rather
+than an async runtime worker:
 
 ```rust
 struct MaintenanceCoordinator {
-    configured_capacity: CarrierCount,
-    block_capacity: CarrierCount,
+    policy: MaintenancePolicy,
     control: Arc<MaintenanceControl>,
     diagnostics: Arc<MaintenanceDiagnostics>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    diagnostic_interval: Option<Duration>,
+}
+
+struct MaintenanceWorker {
+    control: Arc<MaintenanceControl>,
+    diagnostics: Arc<MaintenanceDiagnostics>,
+    pool: Weak<PoolInner>,
+    policy: MaintenancePolicy,
+    reporter: Option<PeriodicDiagnosticReporter>,
 }
 
 struct MaintenanceControl {
@@ -2648,16 +2682,19 @@ The scheduler's global-idle transition and mapping cleanup failures signal the c
 eligibility. [Mapping and revival](#mapping-and-revival) defines protection and discard recovery.
 The coordinator executes those operations without changing their safety conditions.
 
-The first deadline or cleanup request starts the thread. The worker owns
-`Arc<MaintenanceControl>` and `Weak<PoolInner>`. It waits without retaining the pool. When work is
-due, it releases the control mutex, upgrades the weak pool reference for one pass, and drops that
-strong reference before waiting again. The control block contains no admission, arena, slot, or
-mapping state.
+Without periodic diagnostics, the first deadline or cleanup request starts the thread. Configuring
+a diagnostic interval starts it during pool construction so the worker can capture a complete first
+interval. The worker owns `Arc<MaintenanceControl>` and `Weak<PoolInner>`. It waits without retaining
+the pool. When work is due, it releases the control mutex, upgrades the weak pool reference for one
+pass, and drops that strong reference before waiting again. The control block contains no admission,
+arena, slot, or mapping state.
 
 The coordinator copies immutable configured and block capacity at construction, so worker startup
 does not enter admission. Its worker mutex serializes concurrent first signals and lets final
-destruction take the join handle exactly once. Diagnostics are atomic observations and do not
-participate in policy or lifecycle decisions.
+destruction take the join handle exactly once. Periodic diagnostics contribute a wake deadline but
+do not enter `MaintenanceState`. Due maintenance takes priority over reporting, and a delayed report
+schedules its next interval from completion instead of emitting catch-up samples. Diagnostics are
+observations and do not participate in policy or lifecycle decisions.
 
 After releasing the temporary strong reference, the worker accesses no pool state. A thread-creation
 failure disables maintenance and reports degraded reclamation. Admission, acquisition, and owner
@@ -2700,6 +2737,7 @@ Recoverable resource failures remain local:
 | Whole-range protection                            | The block enters its nonclaimable recovery state outside prepared capacity            |
 | Backing discard                                   | The inactive block records `reclaim_pending`; other blocks remain usable              |
 | Maintenance-thread creation                       | Maintenance is disabled; ordinary paths continue and affected blocks stay unavailable |
+| Diagnostic configuration or sample inconsistency  | Periodic reporting is disabled; ordinary paths and maintenance continue                |
 | Ownership, identity, or address-reservation check | The non-returning fail-stop handler aborts without continuing allocator mutation      |
 
 The pool returns no unaccounted fallback memory after acquisition failure. Temporary growth remains
@@ -2717,7 +2755,7 @@ lifecycle details:
 
 ```rust
 #[derive(Debug, Clone)]
-pub struct TransferManagerMetrics {
+pub struct ClientMetrics {
     // Private representation.
 }
 
@@ -2753,7 +2791,7 @@ impl MemoryMetrics {
     pub fn queued_reservations(&self) -> usize;
 
     /// Cumulative reservation requests that entered the FIFO.
-    pub fn parked_reservations_total(&self) -> u64;
+    pub fn reservation_enqueues_total(&self) -> u64;
 }
 ```
 
@@ -2772,15 +2810,15 @@ Prepared capacity follows whole-block geometry and the current admission floor. 
 raise it by less than one block beyond that floor. It can exceed configured capacity either through
 that rounding or because an idle-only grant raised admission above the normal ceiling.
 
-`parked_reservations_total` is copied from the admission state in the same sample. It increments
+`reservation_enqueues_total` is copied from the admission state in the same sample. It increments
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
 cancellation. It is monotonic for the lifetime of the pool and does not count an immediate grant.
 
-`TransferManager::metrics()` includes the same `MemoryMetrics` sample. When a caller supplies a pool
-shared with another manager or component, those values describe the complete shared memory domain,
-not only activity attributable to that transfer manager. Future manager-wide metric groups may be
-sampled independently; `TransferManagerMetrics` does not promise one atomic sample across memory,
-scheduling, connections, and other subsystems.
+`Client::metrics().memory()` returns the same `MemoryMetrics` sample. When a caller supplies a pool
+shared with another client or component, those values describe the complete shared memory domain,
+not only activity attributable to that client. `ClientMetrics` can add scheduling, connection,
+retry, or runtime groups without replacing the client metrics entry point. Those groups may be
+sampled independently and do not promise one atomic sample across subsystems.
 
 A crate-private diagnostic snapshot includes raw accounting fields, bitmap population, block
 lifecycle counts, pending cleanup, and scan-path counters for tests and tracing. It is not a public
@@ -2790,7 +2828,7 @@ Operational signals are organized by the failure they diagnose:
 
 | Symptom                                     | Signals                                                                   | Interpretation                                                              |
 | ------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Managed work remains queued                 | configured, admission used, queue depth, parked reservations total        | Admission is binding or an older FIFO request is ineligible                 |
+| Managed work remains queued                 | configured, admission used, queue depth, reservation enqueues total        | Admission is binding or an older FIFO request is ineligible                 |
 | Admission remains above configured capacity | admission overage, planned demand, charged capacity                       | Idle-only admission or ownership outside active planned demand remains live |
 | Memory remains prepared after global idle   | prepared capacity, charged capacity, reclaim retries                      | `idle_retention_target`, live owners, or cleanup prevents reclamation       |
 | Reuse repeatedly enters serialized fallback | serialized-acquisition count, prepared capacity, geometry                 | Optimistic scan work or placement is missing reusable capacity              |
@@ -2798,16 +2836,37 @@ Operational signals are organized by the failure they diagnose:
 | A block remains unavailable                 | protection-pending and reclaim-pending capacity, retry and failure counts | Platform cleanup is degraded but isolated to named blocks                   |
 | Allocation or preparation fails             | operation error, requested capacity, prepared capacity, platform error    | The caller encountered a physical resource failure                          |
 
-Normal reservation transitions are `trace`. Per-carrier successful acquisition and return
-require no event. Reservation parking and serialized fallback are `trace` with monotonic diagnostic
-counters. Block preparation, idle deadline changes, and successful reclamation are `debug`.
-Allocation, protection, discard, maintenance-thread, and fail-stop precursor events are `warn` or
-higher. Rare failure records include the operation, requested capacity, block identity where
+Per-carrier successful acquisition and return require no event. Reservation FIFO empty-boundary
+transitions, pool geometry, successful reclamation, and periodic snapshots are `debug`. Allocation,
+protection,
+discard, maintenance-thread, diagnostic-configuration, and fail-stop precursor events are `warn`
+or higher. Rare failure records include the operation, requested capacity, block identity where
 applicable, platform error, and resulting pool state.
 
-Metrics are pull-only, and event records are emitted by existing paths. The pool starts no
-reporting task and maintains no rate window. Diagnostic counters saturate at `u64::MAX` and never
-participate in control decisions.
+Public metrics are pull-only. `AWS_S3_TM_DIAGNOSTICS` configures diagnostics before a client or
+standalone pool is constructed. `memory.snapshot=off` is the default; a positive integer followed
+by `ms` enables periodic `debug` snapshots, with values below `100ms` raised to `100ms`.
+`memory.detail=0` is the default collection level. `memory.detail=1` additionally counts every
+optimistic acquisition attempt and bitmap word inspected. Snapshot cadence and detail level are
+independent.
+
+The value is a comma-separated list of case-sensitive `key=value` entries. Whitespace around
+entries, keys, and values is ignored, and the last valid assignment wins. Unknown keys are ignored
+for forward compatibility. Malformed recognized settings warn and preserve the previous value;
+unsupported detail levels warn and clamp to the highest level understood by this version.
+
+Periodic reporting uses the maintenance worker rather than creating another thread. Each sample
+contains current accounting gauges, reservation-queue interval state, and cumulative allocator and
+maintenance counters with changes since the preceding sample. Queue depth, peak depth, interval
+non-empty duration, and continuous non-empty duration are maintained with the FIFO under admission
+serialization. Counter deltas and report deadlines are diagnostic state only. An unrepresentable
+future deadline stops reporting without changing admission, allocation, ownership, or maintenance.
+
+Always-on diagnostic counters update only on queueing, optimistic misses, serialized fallback,
+preparation, rollback, trim, reclaim, cleanup, or maintenance transitions. Successful optimistic
+attempts and words inspected are absent unless `memory.detail=1` is enabled. Periodic reporting at
+detail level 0 still includes stable gauges and low-frequency counters. All counters saturate at
+`u64::MAX` and never participate in control decisions.
 
 **Obligations.**
 
@@ -2825,6 +2884,8 @@ participate in control decisions.
   participate in admission.
 - **C5: Failure reporting.** Rare resource failures and degraded reclamation produce an operation
   result or diagnostic signal.
+- **C6: Diagnostic isolation.** Missing or inconsistent diagnostic state can suppress reporting but
+  cannot reject admission, fail acquisition, alter ownership, or terminate the process.
 
 ## Correctness invariants
 
@@ -3433,6 +3494,7 @@ section; one property may discharge several contracts.
 | I3         | Upload retry retains exact bytes through the final consuming attempt   | Retry tests with partial body polling and source failure                  | Release staged bytes before the last retry                 |
 | I3         | Upload parts reuse one mutable stream across source reads              | Multipart tests with carrier-misaligned read completions                  | Allocate one buffer for every source read                  |
 | I3, I4     | Reserved staging preserves bytes and releases foreign input after copy | Download tests with frame and carrier boundary mismatch                   | Publish before copy completion or retain foreign input     |
+| I4         | A response publishes exactly its dispatched byte length                | Short, same-carrier overrun, and retry-authority collector tests          | Treat carrier-rounded capacity as response-length validation |
 | I4, I5     | Download and disk completion retain owners through final access        | Integration tests with partial reads, writes, and cancellation            | Drop byte owners immediately after submission              |
 | I4         | A download response reuses its suffix across response frames           | Collector tests spanning carrier and publication boundaries               | Acquire a new buffer for every response frame              |
 | C2         | A stale idle epoch cannot reclaim after new managed work               | Maintenance state-machine test with deadline races                        | Accept an expired epoch after activity                     |

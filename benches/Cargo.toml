@@ -12,6 +12,11 @@ name = "throughput"
 path = "throughput.rs"
 harness = false
 
+[[bench]]
+name = "buffer_pool"
+path = "buffer_pool.rs"
+harness = false
+
 [dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }

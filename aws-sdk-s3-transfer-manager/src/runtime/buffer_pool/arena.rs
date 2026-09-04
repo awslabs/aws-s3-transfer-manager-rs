@@ -41,12 +41,29 @@ pub(super) struct Arena {
     state: Mutex<ArenaState>,
 }
 
+/// Construction policy for one arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ArenaOptions {
+    /// Maximum bitmap words inspected by one optimistic claim.
+    optimistic_scan_words: usize,
+    /// Whether successful optimistic claims update per-acquisition counters.
+    enable_detailed_counters: bool,
+}
+
+impl ArenaOptions {
+    /// Creates allocator options with an explicit diagnostic cost level.
+    pub(super) fn new(optimistic_scan_words: usize, enable_detailed_counters: bool) -> Self {
+        Self {
+            optimistic_scan_words,
+            enable_detailed_counters,
+        }
+    }
+}
+
 impl Arena {
-    /// Creates an empty arena with fixed block geometry.
-    pub(super) fn new(
-        geometry: PoolGeometry,
-        optimistic_scan_words: usize,
-    ) -> Result<Self, ArenaError> {
+    /// Creates an empty arena with fixed geometry and allocator policy.
+    pub(super) fn new(geometry: PoolGeometry, options: ArenaOptions) -> Result<Self, ArenaError> {
+        let optimistic_scan_words = options.optimistic_scan_words;
         if optimistic_scan_words == 0 {
             return Err(ArenaError::InvalidScanBudget);
         }
@@ -54,7 +71,7 @@ impl Arena {
             geometry,
             optimistic_scan_words,
             scan_origin: AtomicUsize::new(0),
-            diagnostics: Arc::new(ArenaDiagnostics::default()),
+            diagnostics: Arc::new(ArenaDiagnostics::new(options.enable_detailed_counters)),
             registry: BlockRegistry::new(),
             state: Mutex::new(ArenaState {
                 slots: Vec::new(),
@@ -318,12 +335,14 @@ impl Arena {
             return Ok(());
         }
         self.diagnostics.record_serialized_fallback();
+        let mut tracker = SerializedFallbackTracker::new(self.diagnostics.as_ref());
 
         let mut state = self.state.lock();
         for slot in &state.slots {
             if batch.is_complete() {
                 return Ok(());
             }
+            tracker.record_slot_inspected();
             if let Some(provisional) = BlockSlot::try_claim_exhaustive(slot, batch.remaining())? {
                 batch.push(provisional)?;
             }
@@ -333,6 +352,7 @@ impl Arena {
             if batch.is_complete() {
                 return Ok(());
             }
+            tracker.record_slot_inspected();
             let count = std::cmp::min(batch.remaining(), slot.carrier_count());
             if let Some(provisional) = BlockSlot::prepare_and_claim_if_inactive(
                 slot,
@@ -609,15 +629,19 @@ impl Drop for ClaimBatch {
     }
 }
 
-/// Internal arena counters that never participate in allocator decisions.
-#[derive(Default)]
+/// Cumulative allocator-work observations that never authorize allocator decisions.
+///
+/// Basic counters update only on misses, fallback, lifecycle work, rollback, or
+/// failure. Detailed counters add relaxed atomic updates to every optimistic
+/// acquisition when enabled. Counters saturate at `u64::MAX`; fields loaded in
+/// one snapshot are individually valid but need not describe one atomic instant.
 struct ArenaDiagnostics {
-    /// Bitmap words charged to completed optimistic scans.
-    optimistic_scan_words: AtomicU64,
     /// Optimistic scans that returned incomplete ownership.
     optimistic_misses: AtomicU64,
     /// Partial batches that entered serialized fallback.
     serialized_fallbacks: AtomicU64,
+    /// Existing slots inspected while serialized fallback searched for reuse.
+    serialized_slots_inspected: AtomicU64,
     /// Successful whole-block preparation operations in fallback.
     blocks_prepared: AtomicU64,
     /// Stable virtual ranges added to the registry.
@@ -632,12 +656,43 @@ struct ArenaDiagnostics {
     cleanup_retries: AtomicU64,
     /// Mapping-cleanup attempts that remain pending.
     cleanup_failures: AtomicU64,
+    /// Per-acquisition work counters enabled only for detailed diagnostics.
+    detailed: Option<DetailedScanCounters>,
+}
+
+/// Work charged to every optimistic acquisition when detailed diagnostics are enabled.
+#[derive(Default)]
+struct DetailedScanCounters {
+    /// Completed optimistic acquisition attempts.
+    optimistic_scans: AtomicU64,
+    /// Bitmap words charged to completed optimistic scans.
+    optimistic_scan_words: AtomicU64,
 }
 
 impl ArenaDiagnostics {
+    /// Creates counters with optional per-acquisition scan accounting.
+    fn new(enable_detailed_counters: bool) -> Self {
+        Self {
+            optimistic_misses: AtomicU64::new(0),
+            serialized_fallbacks: AtomicU64::new(0),
+            serialized_slots_inspected: AtomicU64::new(0),
+            blocks_prepared: AtomicU64::new(0),
+            block_ranges_reserved: AtomicU64::new(0),
+            rolled_back_carriers: AtomicU64::new(0),
+            trim_slots_scanned: AtomicU64::new(0),
+            blocks_reclaimed: AtomicU64::new(0),
+            cleanup_retries: AtomicU64::new(0),
+            cleanup_failures: AtomicU64::new(0),
+            detailed: enable_detailed_counters.then(DetailedScanCounters::default),
+        }
+    }
+
     /// Records one completed optimistic scan.
     fn record_optimistic_scan(&self, words: usize, missed: bool) {
-        saturating_add(&self.optimistic_scan_words, diagnostic_count(words));
+        if let Some(detailed) = &self.detailed {
+            saturating_add(&detailed.optimistic_scans, 1);
+            saturating_add(&detailed.optimistic_scan_words, diagnostic_count(words));
+        }
         if missed {
             saturating_add(&self.optimistic_misses, 1);
         }
@@ -646,6 +701,11 @@ impl ArenaDiagnostics {
     /// Records one serialized fallback entry.
     fn record_serialized_fallback(&self) {
         saturating_add(&self.serialized_fallbacks, 1);
+    }
+
+    /// Records existing-slot work completed by one serialized fallback.
+    fn record_serialized_slots_inspected(&self, slots: usize) {
+        saturating_add(&self.serialized_slots_inspected, diagnostic_count(slots));
     }
 
     /// Records one successful block preparation.
@@ -686,9 +746,11 @@ impl ArenaDiagnostics {
     /// Loads one relaxed diagnostic sample.
     fn snapshot(&self) -> ArenaDiagnosticSnapshot {
         ArenaDiagnosticSnapshot {
-            optimistic_scan_words: self.optimistic_scan_words.load(DiagnosticOrdering::Relaxed),
             optimistic_misses: self.optimistic_misses.load(DiagnosticOrdering::Relaxed),
             serialized_fallbacks: self.serialized_fallbacks.load(DiagnosticOrdering::Relaxed),
+            serialized_slots_inspected: self
+                .serialized_slots_inspected
+                .load(DiagnosticOrdering::Relaxed),
             blocks_prepared: self.blocks_prepared.load(DiagnosticOrdering::Relaxed),
             block_ranges_reserved: self.block_ranges_reserved.load(DiagnosticOrdering::Relaxed),
             rolled_back_carriers: self.rolled_back_carriers.load(DiagnosticOrdering::Relaxed),
@@ -696,6 +758,17 @@ impl ArenaDiagnostics {
             blocks_reclaimed: self.blocks_reclaimed.load(DiagnosticOrdering::Relaxed),
             cleanup_retries: self.cleanup_retries.load(DiagnosticOrdering::Relaxed),
             cleanup_failures: self.cleanup_failures.load(DiagnosticOrdering::Relaxed),
+            detailed: self.detailed.as_ref().map(DetailedScanCounters::snapshot),
+        }
+    }
+}
+
+impl DetailedScanCounters {
+    /// Loads one relaxed per-acquisition work sample.
+    fn snapshot(&self) -> DetailedScanSnapshot {
+        DetailedScanSnapshot {
+            optimistic_scans: self.optimistic_scans.load(DiagnosticOrdering::Relaxed),
+            optimistic_scan_words: self.optimistic_scan_words.load(DiagnosticOrdering::Relaxed),
         }
     }
 }
@@ -703,12 +776,12 @@ impl ArenaDiagnostics {
 /// Private snapshot of arena work and fallback behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ArenaDiagnosticSnapshot {
-    /// Bitmap words charged to completed optimistic scans.
-    pub(super) optimistic_scan_words: u64,
     /// Optimistic scans that returned incomplete ownership.
     pub(super) optimistic_misses: u64,
     /// Partial batches that entered serialized fallback.
     pub(super) serialized_fallbacks: u64,
+    /// Existing slots inspected while serialized fallback searched for reuse.
+    pub(super) serialized_slots_inspected: u64,
     /// Successful whole-block preparation operations in fallback.
     pub(super) blocks_prepared: u64,
     /// Stable virtual ranges added to the registry.
@@ -723,6 +796,48 @@ pub(super) struct ArenaDiagnosticSnapshot {
     pub(super) cleanup_retries: u64,
     /// Mapping-cleanup attempts that remain pending.
     pub(super) cleanup_failures: u64,
+    /// Per-acquisition work omitted unless detailed diagnostics were enabled.
+    pub(super) detailed: Option<DetailedScanSnapshot>,
+}
+
+/// Per-acquisition allocator work collected only in detailed diagnostic mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DetailedScanSnapshot {
+    /// Completed optimistic acquisition attempts.
+    pub(super) optimistic_scans: u64,
+    /// Bitmap words charged to completed optimistic scans.
+    pub(super) optimistic_scan_words: u64,
+}
+
+/// Publishes aggregate serialized work on every completion or error path.
+struct SerializedFallbackTracker<'a> {
+    diagnostics: &'a ArenaDiagnostics,
+    slots_inspected: usize,
+}
+
+impl<'a> SerializedFallbackTracker<'a> {
+    /// Starts one fallback work sample.
+    fn new(diagnostics: &'a ArenaDiagnostics) -> SerializedFallbackTracker<'a> {
+        Self {
+            diagnostics,
+            slots_inspected: 0,
+        }
+    }
+
+    /// Records one existing slot visited while fallback searches for reuse.
+    fn record_slot_inspected(&mut self) {
+        self.slots_inspected = self
+            .slots_inspected
+            .checked_add(1)
+            .unwrap_or_else(|| invariant_violation("serialized slot count overflowed"));
+    }
+}
+
+impl Drop for SerializedFallbackTracker<'_> {
+    fn drop(&mut self) {
+        self.diagnostics
+            .record_serialized_slots_inspected(self.slots_inspected);
+    }
 }
 
 /// Lifecycle state reconstructed across one arena registry generation.
@@ -1094,6 +1209,13 @@ mod tests {
         .unwrap()
     }
 
+    fn test_arena(
+        geometry: PoolGeometry,
+        optimistic_scan_words: usize,
+    ) -> Result<Arena, ArenaError> {
+        Arena::new(geometry, ArenaOptions::new(optimistic_scan_words, true))
+    }
+
     fn admission_with_prepared(prepared: CarrierCount) -> Mutex<AdmissionState> {
         let state = Mutex::new(AdmissionState::new(MAX_PACKED_CARRIERS));
         {
@@ -1124,7 +1246,7 @@ mod tests {
 
     #[test]
     fn empty_registry_classifies_no_range() {
-        let arena = Arena::new(geometry(), 4).unwrap();
+        let arena = test_arena(geometry(), 4).unwrap();
 
         assert!(arena.classify_range(1, 1).is_none());
         assert!(arena
@@ -1135,7 +1257,7 @@ mod tests {
 
     #[test]
     fn slot_reservation_publishes_one_coherent_generation() {
-        let arena = Arena::new(geometry(), 4).unwrap();
+        let arena = test_arena(geometry(), 4).unwrap();
         let first = arena.reserve_slot().unwrap();
         let second = arena.reserve_slot().unwrap();
         let generation = arena.registry_generation();
@@ -1167,7 +1289,7 @@ mod tests {
 
     #[test]
     fn production_registry_guard_survives_concurrent_publication() {
-        let arena = Arc::new(Arena::new(geometry(), 4).unwrap());
+        let arena = Arc::new(test_arena(geometry(), 4).unwrap());
         let first = arena.reserve_slot().unwrap();
         let old_generation = arena.registry_generation();
 
@@ -1194,7 +1316,7 @@ mod tests {
 
     #[test]
     fn classification_requires_one_complete_nonempty_slot_range() {
-        let arena = Arena::new(geometry(), 4).unwrap();
+        let arena = test_arena(geometry(), 4).unwrap();
         let slot = arena.reserve_slot().unwrap();
         let range = slot.address_range().unwrap();
 
@@ -1247,7 +1369,7 @@ mod tests {
 
     #[test]
     fn classification_survives_trimmed_block_backing() {
-        let arena = Arena::new(geometry(), 4).unwrap();
+        let arena = test_arena(geometry(), 4).unwrap();
         let slot = arena.reserve_slot().unwrap();
         let range = slot.address_range().unwrap();
         let mut prepared = CarrierCount::ZERO;
@@ -1293,7 +1415,7 @@ mod tests {
 
     #[test]
     fn exhausted_slot_ids_leave_the_registry_unchanged() {
-        let arena = Arena::new(geometry(), 4).unwrap();
+        let arena = test_arena(geometry(), 4).unwrap();
         arena.state.lock().next_slot = None;
 
         assert!(matches!(
@@ -1309,11 +1431,11 @@ mod tests {
     #[test]
     fn rejects_zero_scan_budget_and_zero_claim_count() {
         assert!(matches!(
-            Arena::new(geometry(), 0),
+            test_arena(geometry(), 0),
             Err(ArenaError::InvalidScanBudget)
         ));
 
-        let arena = Arena::new(geometry(), 1).unwrap();
+        let arena = test_arena(geometry(), 1).unwrap();
         assert!(matches!(
             arena.claim_optimistic(CarrierCount::ZERO),
             Err(ArenaError::InvalidClaimCount)
@@ -1322,7 +1444,7 @@ mod tests {
 
     #[test]
     fn empty_registry_returns_an_empty_partial_batch() {
-        let arena = Arena::new(geometry(), 2).unwrap();
+        let arena = test_arena(geometry(), 2).unwrap();
 
         let batch = arena.claim_optimistic(CarrierCount::new(2)).unwrap();
 
@@ -1335,7 +1457,7 @@ mod tests {
 
     #[test]
     fn incomplete_scan_charges_the_exact_budget() {
-        let arena = Arena::new(geometry_with_carriers(130), 2).unwrap();
+        let arena = test_arena(geometry_with_carriers(130), 2).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let occupied = BlockSlot::try_claim(&slot, slot.carrier_count())
             .unwrap()
@@ -1352,7 +1474,7 @@ mod tests {
 
     #[test]
     fn inactive_slots_consume_scan_positions() {
-        let arena = Arena::new(geometry_with_carriers(1), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(1), 1).unwrap();
         let inactive = arena.reserve_slot().unwrap();
         let active = prepare_slots(&arena, 1).pop().unwrap();
 
@@ -1369,7 +1491,7 @@ mod tests {
 
     #[test]
     fn scan_origin_rotates_by_the_charged_budget() {
-        let arena = Arena::new(geometry_with_carriers(130), 2).unwrap();
+        let arena = test_arena(geometry_with_carriers(130), 2).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let mut indices = Vec::new();
 
@@ -1389,7 +1511,7 @@ mod tests {
 
     #[test]
     fn scan_wraps_across_slot_and_bitmap_boundaries() {
-        let arena = Arena::new(geometry_with_carriers(65), 3).unwrap();
+        let arena = test_arena(geometry_with_carriers(65), 3).unwrap();
         let slots = prepare_slots(&arena, 2);
         arena.scan_origin.store(3, Ordering::Relaxed);
 
@@ -1414,7 +1536,7 @@ mod tests {
 
     #[test]
     fn one_batch_accumulates_carriers_across_blocks() {
-        let arena = Arena::new(geometry_with_carriers(2), 2).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 2).unwrap();
         let slots = prepare_slots(&arena, 2);
 
         let batch = arena.claim_optimistic(CarrierCount::new(3)).unwrap();
@@ -1443,7 +1565,7 @@ mod tests {
 
     #[test]
     fn incomplete_finish_returns_all_provisional_bits() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let batch = arena.claim_optimistic(CarrierCount::new(3)).unwrap();
         assert_eq!(batch.claimed(), CarrierCount::new(2));
@@ -1465,7 +1587,7 @@ mod tests {
 
     #[test]
     fn dropping_partial_batch_returns_all_provisional_bits() {
-        let arena = Arena::new(geometry_with_carriers(65), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(65), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let batch = arena.claim_optimistic(CarrierCount::new(66)).unwrap();
         assert_eq!(batch.claimed(), CarrierCount::new(64));
@@ -1477,7 +1599,7 @@ mod tests {
 
     #[test]
     fn complete_batch_converts_exactly_the_requested_carriers() {
-        let arena = Arena::new(geometry_with_carriers(70), 2).unwrap();
+        let arena = test_arena(geometry_with_carriers(70), 2).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
 
         let carriers = arena
@@ -1495,7 +1617,7 @@ mod tests {
 
     #[test]
     fn concurrent_optimistic_claimants_cannot_share_a_carrier() {
-        let arena = Arc::new(Arena::new(geometry_with_carriers(2), 1).unwrap());
+        let arena = Arc::new(test_arena(geometry_with_carriers(2), 1).unwrap());
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let start = Arc::new(Barrier::new(2));
         let live = Arc::new(Barrier::new(2));
@@ -1525,7 +1647,7 @@ mod tests {
 
     #[test]
     fn test_prepare_to_rounds_to_blocks_and_is_idempotent() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let admission = admission_with_prepared(CarrierCount::ZERO);
         let mut admission = AdmissionGuard::new(admission.lock());
 
@@ -1545,7 +1667,7 @@ mod tests {
 
     #[test]
     fn test_prepare_to_reuses_an_inactive_slot_before_reserving() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let slot = arena.reserve_slot().unwrap();
         let admission = admission_with_prepared(CarrierCount::ZERO);
         let mut admission = AdmissionGuard::new(admission.lock());
@@ -1561,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_prepare_to_failure_retains_earlier_preparation() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let first = arena.reserve_slot().unwrap();
         let second = arena.reserve_slot().unwrap();
         second.inject_failure_once(VirtualMemoryOperation::Prepare);
@@ -1592,7 +1714,7 @@ mod tests {
 
     #[test]
     fn serialized_fallback_rechecks_active_capacity_before_growth() {
-        let arena = Arena::new(geometry_with_carriers(65), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(65), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let occupied = BlockSlot::try_claim_words(&slot, 0, 1, CarrierCount::new(64))
             .unwrap()
@@ -1619,7 +1741,7 @@ mod tests {
 
     #[test]
     fn serialized_fallback_exhausts_fragmented_capacity_before_growth() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let slots = prepare_slots(&arena, 3);
         let occupied = slots
             .iter()
@@ -1658,7 +1780,7 @@ mod tests {
 
     #[test]
     fn serialized_fallback_reuses_inactive_slot_before_reserving() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let inactive = arena.reserve_slot().unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
         let admission = admission_with_prepared(CarrierCount::ZERO);
@@ -1678,7 +1800,7 @@ mod tests {
 
     #[test]
     fn serialized_fallback_grows_whole_blocks_until_complete() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(5)).unwrap();
         let admission = admission_with_prepared(CarrierCount::ZERO);
         let mut admission = AdmissionGuard::new(admission.lock());
@@ -1704,7 +1826,7 @@ mod tests {
 
     #[test]
     fn later_preparation_failure_preserves_earlier_capacity() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let first = arena.reserve_slot().unwrap();
         let second = arena.reserve_slot().unwrap();
         second.inject_failure_once(VirtualMemoryOperation::Prepare);
@@ -1734,7 +1856,7 @@ mod tests {
 
     #[test]
     fn serialized_growth_rejects_prepared_capacity_overflow() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
         let admission = admission_with_prepared(CarrierCount::new(usize::MAX));
         let mut admission = AdmissionGuard::new(admission.lock());
@@ -1760,7 +1882,7 @@ mod tests {
 
     #[test]
     fn concurrent_serialized_fallbacks_retain_private_growth() {
-        let arena = Arc::new(Arena::new(geometry_with_carriers(2), 1).unwrap());
+        let arena = Arc::new(test_arena(geometry_with_carriers(2), 1).unwrap());
         let admission = Arc::new(admission_with_prepared(CarrierCount::ZERO));
         let start = Arc::new(Barrier::new(2));
 
@@ -1802,7 +1924,7 @@ mod tests {
 
     #[test]
     fn trim_selection_skips_inactive_and_occupied_slots() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let inactive = arena.reserve_slot().unwrap();
         let active = prepare_slots(&arena, 2);
         let occupied = BlockSlot::try_claim(&active[0], CarrierCount::new(1))
@@ -1821,7 +1943,7 @@ mod tests {
 
     #[test]
     fn trim_candidate_is_rechecked_after_selection() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let candidate = arena
             .select_trim_candidate()
@@ -1841,7 +1963,7 @@ mod tests {
 
     #[test]
     fn trim_selection_skips_cleanup_owned_slot() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
         let mut prepared = CarrierCount::new(2);
         let cleanup = BlockSlot::start_trim(&slot, &mut prepared, CarrierCount::ZERO).unwrap();
@@ -1854,7 +1976,7 @@ mod tests {
 
     #[test]
     fn arena_diagnostics_record_scan_growth_and_rollback() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         arena.reserve_slot().unwrap();
         let mut batch = arena.claim_optimistic(CarrierCount::new(3)).unwrap();
         let admission = admission_with_prepared(CarrierCount::ZERO);
@@ -1865,9 +1987,14 @@ mod tests {
             .unwrap();
         let before_rollback = arena.diagnostics();
 
-        assert_eq!(before_rollback.optimistic_scan_words, 1);
+        let detailed = before_rollback
+            .detailed
+            .expect("test arena must collect detailed scan counters");
+        assert_eq!(detailed.optimistic_scans, 1);
+        assert_eq!(detailed.optimistic_scan_words, 1);
         assert_eq!(before_rollback.optimistic_misses, 1);
         assert_eq!(before_rollback.serialized_fallbacks, 1);
+        assert_eq!(before_rollback.serialized_slots_inspected, 2);
         assert_eq!(before_rollback.blocks_prepared, 2);
         assert_eq!(before_rollback.block_ranges_reserved, 2);
         assert_eq!(before_rollback.rolled_back_carriers, 0);
@@ -1877,8 +2004,113 @@ mod tests {
     }
 
     #[test]
+    fn serialized_completion_is_a_noop_for_an_already_complete_batch() {
+        let arena = test_arena(geometry_with_carriers(1), 1).unwrap();
+        prepare_slots(&arena, 1);
+        let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
+        assert!(batch.is_complete());
+        let admission = admission_with_prepared(CarrierCount::new(1));
+        let mut admission = AdmissionGuard::new(admission.lock());
+        let before = arena.diagnostics();
+
+        arena
+            .complete_claim_serialized(&mut admission, &mut batch)
+            .unwrap();
+
+        assert_eq!(
+            arena.diagnostics().serialized_fallbacks,
+            before.serialized_fallbacks
+        );
+        drop(batch);
+    }
+
+    /// Asserts exact fallback frequency and registry work for one packed topology.
+    fn assert_packed_fallback_work(
+        block_counts: &[usize],
+        carriers_per_block: usize,
+        optimistic_scan_words: usize,
+        iterations: u64,
+    ) {
+        for &blocks in block_counts {
+            let full_blocks = blocks * 7 / 8;
+            let arena = test_arena(
+                geometry_with_carriers(carriers_per_block),
+                optimistic_scan_words,
+            )
+            .unwrap();
+            let slots = prepare_slots(&arena, blocks);
+            let occupied = slots
+                .iter()
+                .take(full_blocks)
+                .map(|slot| {
+                    BlockSlot::try_claim(slot, slot.carrier_count())
+                        .unwrap()
+                        .expect("packed block should be free")
+                })
+                .collect::<Vec<_>>();
+            let prepared = CarrierCount::new(blocks * carriers_per_block);
+            let admission = admission_with_prepared(prepared);
+            let before = arena.diagnostics();
+
+            for _ in 0..iterations {
+                let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
+                if !batch.is_complete() {
+                    let mut admission = AdmissionGuard::new(admission.lock());
+                    arena
+                        .complete_claim_serialized(&mut admission, &mut batch)
+                        .unwrap();
+                }
+                drop(batch);
+            }
+
+            let after = arena.diagnostics();
+            let fallbacks = after.serialized_fallbacks - before.serialized_fallbacks;
+            let before_detailed = before
+                .detailed
+                .expect("test arena must collect detailed scan counters");
+            let after_detailed = after
+                .detailed
+                .expect("test arena must collect detailed scan counters");
+            let optimistic_scans =
+                after_detailed.optimistic_scans - before_detailed.optimistic_scans;
+            let recorded_slots =
+                after.serialized_slots_inspected - before.serialized_slots_inspected;
+            let expected_fallbacks = iterations * 7 / 8;
+            let expected_slots = usize::try_from(expected_fallbacks)
+                .unwrap()
+                .checked_mul(full_blocks + 1)
+                .unwrap();
+            eprintln!(
+                "blocks={blocks} full_blocks={full_blocks} \
+                 iterations={iterations} fallbacks={fallbacks} \
+                 serialized_slots_inspected={recorded_slots}"
+            );
+
+            assert_eq!(optimistic_scans, iterations);
+            assert_eq!(fallbacks, expected_fallbacks);
+            assert_eq!(recorded_slots, expected_slots as u64);
+            drop(occupied);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "registry-size work counting is covered by native suites; focused Miri tests cover allocator pointer safety"
+    )]
+    fn packed_fallback_work_has_an_exact_ci_regression_barrier() {
+        assert_packed_fallback_work(&[8, 16, 32, 64, 128, 256], 64, 1, 256);
+    }
+
+    #[test]
+    #[ignore = "manual allocator work probe"]
+    fn test_packed_fallback_work_scales_with_registry() {
+        assert_packed_fallback_work(&[8, 16, 32, 64, 128, 256], 8_192, 32, 8_192);
+    }
+
+    #[test]
     fn completed_batch_is_not_recorded_as_rollback() {
-        let arena = Arena::new(geometry_with_carriers(2), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(2), 1).unwrap();
         let slot = prepare_slots(&arena, 1).pop().unwrap();
 
         let carriers = arena
@@ -1895,7 +2127,7 @@ mod tests {
 
     #[test]
     fn arena_diagnostics_saturate() {
-        let diagnostics = ArenaDiagnostics::default();
+        let diagnostics = ArenaDiagnostics::new(true);
         diagnostics
             .rolled_back_carriers
             .store(u64::MAX - 1, DiagnosticOrdering::Relaxed);
@@ -1904,6 +2136,24 @@ mod tests {
         diagnostics.record_rolled_back_carriers(1);
 
         assert_eq!(diagnostics.snapshot().rolled_back_carriers, u64::MAX);
+    }
+
+    #[test]
+    fn basic_diagnostics_omit_success_path_scan_counters() {
+        let arena = Arena::new(geometry_with_carriers(2), ArenaOptions::new(1, false)).unwrap();
+        let mut batch = arena.claim_optimistic(CarrierCount::new(1)).unwrap();
+        let admission = admission_with_prepared(CarrierCount::ZERO);
+        let mut admission = AdmissionGuard::new(admission.lock());
+
+        arena
+            .complete_claim_serialized(&mut admission, &mut batch)
+            .unwrap();
+        let diagnostics = arena.diagnostics();
+
+        assert_eq!(diagnostics.optimistic_misses, 1);
+        assert_eq!(diagnostics.serialized_fallbacks, 1);
+        assert_eq!(diagnostics.serialized_slots_inspected, 0);
+        assert_eq!(diagnostics.detailed, None);
     }
 
     #[test]
@@ -1921,6 +2171,13 @@ mod loom_tests {
     use super::super::virtual_memory::page_size;
     use super::*;
     use crate::runtime::sync::thread;
+
+    fn test_arena(
+        geometry: PoolGeometry,
+        optimistic_scan_words: usize,
+    ) -> Result<Arena, ArenaError> {
+        Arena::new(geometry, ArenaOptions::new(optimistic_scan_words, true))
+    }
 
     fn admission_with_prepared(prepared: CarrierCount) -> Mutex<AdmissionState> {
         let state = Mutex::new(AdmissionState::new(MAX_PACKED_CARRIERS));
@@ -1948,7 +2205,7 @@ mod loom_tests {
         loom::model(|| {
             let page_size = page_size().unwrap().get();
             let geometry = PoolGeometry::new(page_size, page_size, page_size).unwrap();
-            let arena = Arc::new(Arena::new(geometry, 1).unwrap());
+            let arena = Arc::new(test_arena(geometry, 1).unwrap());
             arena.reserve_slot().unwrap();
 
             let writer_arena = Arc::clone(&arena);
@@ -1974,7 +2231,7 @@ mod loom_tests {
         loom::model(|| {
             let page_size = page_size().unwrap().get();
             let geometry = PoolGeometry::new(page_size, page_size * 2, page_size).unwrap();
-            let arena = Arc::new(Arena::new(geometry, 1).unwrap());
+            let arena = Arc::new(test_arena(geometry, 1).unwrap());
             let slot = arena.reserve_slot().unwrap();
             let mut prepared = CarrierCount::ZERO;
             slot.prepare(&mut prepared).unwrap();
@@ -2006,7 +2263,7 @@ mod loom_tests {
         loom::model(|| {
             let page_size = page_size().unwrap().get();
             let geometry = PoolGeometry::new(page_size, page_size * 65, page_size).unwrap();
-            let arena = Arc::new(Arena::new(geometry, 1).unwrap());
+            let arena = Arc::new(test_arena(geometry, 1).unwrap());
             let slot = arena.reserve_slot().unwrap();
             let mut prepared = CarrierCount::ZERO;
             slot.prepare(&mut prepared).unwrap();
@@ -2043,7 +2300,7 @@ mod loom_tests {
         loom::model(|| {
             let page_size = page_size().unwrap().get();
             let geometry = PoolGeometry::new(page_size, page_size * 2, page_size).unwrap();
-            let arena = Arc::new(Arena::new(geometry, 1).unwrap());
+            let arena = Arc::new(test_arena(geometry, 1).unwrap());
 
             let fallback_arena = Arc::clone(&arena);
             let fallback = thread::spawn(move || {

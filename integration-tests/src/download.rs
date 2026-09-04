@@ -33,7 +33,7 @@ async fn drain_body(
     let mut result = Vec::new();
     while let Some(chunk) = handle.body_mut().next().await {
         let chunk = chunk?;
-        result.extend_from_slice(&chunk.data.to_vec());
+        result.extend_from_slice(&chunk.data.into_contiguous());
     }
     Ok(result)
 }
@@ -477,7 +477,7 @@ async fn test_download_empty_object() {
     let body = handle.body_mut();
     let mut data = Vec::new();
     while let Some(chunk) = body.next().await {
-        data.extend_from_slice(&chunk.unwrap().data.into_bytes());
+        data.extend_from_slice(&chunk.unwrap().data.into_contiguous());
     }
 
     assert_eq!(data.len(), 0);
@@ -529,7 +529,7 @@ async fn test_download_slow_consumer_does_not_wedge() {
         let mut data = Vec::new();
         while let Some(chunk) = handle.body_mut().next().await {
             let chunk = chunk.expect("chunk");
-            data.extend_from_slice(&chunk.data.into_bytes());
+            data.extend_from_slice(&chunk.data.into_contiguous());
             // Slow consumer: pull, then pause, holding the in-order cursor back so
             // occupancy fills the window and the gate closes between pulls.
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -651,24 +651,25 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
-// ── Global memory budget: concurrent disk transfers below the drain batch ─────
+// ── Shared memory budget: concurrent disk transfers below the drain batch ─────
 //
-// The memory budget is fungible across all transfers. A disk transfer's chunk
-// reservation releases only when the drain copies it out, and a non-terminal drain
-// fires only at the drain batch (16 parts) or a full segment. Concurrent multi-part
-// disk transfers each below that batch hold their parts resident until terminal —
-// which needs every part issued, which needs budget. Under a shared budget too tight
-// for all of them at once, none could finalize/drain/release: a global stall. The fix
-// flushes a transfer's resident run before it parks on the budget. This drives the
-// exact wedge from the public API (real HTTP, real scheduler, real disk writes) and
-// asserts every transfer completes with bytes intact.
+// Memory admission is shared across all transfers. A disk chunk retains its
+// carrier charge until the drain copies it out, and a non-terminal drain fires
+// only at the drain batch (16 parts) or a full segment. Concurrent multi-part
+// disk transfers each below that batch hold their parts resident until terminal,
+// which needs every part issued and therefore memory admission. Under a memory
+// budget too tight for all of them at once, none could finalize, drain, or return
+// its carriers: a global stall. The fix flushes a transfer's resident run before
+// it waits for memory. This drives the exact wedge from the public API (real
+// HTTP, real scheduler, real disk writes) and asserts every transfer completes
+// with bytes intact.
 
 /// Several concurrent multi-part downloads to disk, each below the drain batch, sharing
-/// a budget too small to hold them all at once, must all complete. A regression
+/// a memory budget too small to hold them all at once, must all complete. A regression
 /// re-wedges and the timeout fires.
 #[cfg(any(unix, windows))]
-async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: RuntimeMode) {
-    use aws_sdk_s3_transfer_manager::types::MemoryBudgetConfig;
+async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(rt: RuntimeMode) {
+    use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, MemoryConfig};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -677,16 +678,19 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: Runt
     let object_size = parts_per_object * part_size;
     let transfers = 4;
 
-    // The budget accounting chunk is 8 MiB, so a 5 MiB part costs one chunk. The four
-    // objects together need `transfers * parts_per_object` = 24 chunks; cap at 8 — far
-    // below that, so no object can hold its full part count and the pre-fix wedge is
-    // reachable, while leaving room for a few resident parts per transfer.
-    let budget_bytes = 8 * 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    // The four objects together need 120 MiB of planned demand. A 64 MiB
+    // carrier-rounded pool cannot admit every part, while leaving enough room
+    // for several resident parts across transfers.
+    let pool_capacity_bytes = 64 * ByteUnit::Mebibyte.as_bytes_usize();
+    let pool = BufferPool::builder()
+        .memory_budget(MemoryBudgetConfig::Limit(pool_capacity_bytes))
+        .build()
+        .expect("tight test pool");
 
-    let m = mock_tm_with(rt, |b| {
+    let m = mock_tm_with(rt, move |b| {
         b.part_size(PartSize::Target(part_size as u64))
             .concurrency(ConcurrencyMode::Explicit(transfers))
-            .memory_budget(MemoryBudgetConfig::Limit(budget_bytes))
+            .memory(MemoryConfig::Explicit(pool))
     })
     .await;
 
@@ -727,7 +731,7 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: Runt
     .await
     .expect(
         "concurrent disk downloads did not complete within 30s \
-         (budget deadlock: resident parts pinned across transfers)",
+         (memory-admission deadlock: resident parts pinned across transfers)",
     );
 
     for (i, (got, want)) in results.iter().zip(expected.iter()).enumerate() {
@@ -739,13 +743,16 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(rt: Runt
 
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_mock_gp() {
-    test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::Managed).await;
+async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_mock_gp() {
+    test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(RuntimeMode::Managed)
+        .await;
 }
 
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_tokio_mt() {
-    test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::MultiThreadTokio)
-        .await;
+async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_tokio_mt() {
+    test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(
+        RuntimeMode::MultiThreadTokio,
+    )
+    .await;
 }
