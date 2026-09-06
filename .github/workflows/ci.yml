@@ -190,7 +190,7 @@ jobs:
           usesh: true
           copyback: false
           prepare: |
-            pkg install -y cmake curl ninja perl5 pkgconf
+            pkg install -y cmake curl gmake ninja perl5 pkgconf
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup.sh
             sh rustup.sh -y --profile minimal --default-toolchain ${{ env.rust_stable }}
           run: |
