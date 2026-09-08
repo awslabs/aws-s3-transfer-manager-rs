@@ -4,11 +4,15 @@
  */
 use std::cmp;
 use std::fs::File;
+use std::future::Future;
 use std::ops::DerefMut;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
+use tokio::sync::Notify;
 
 use crate::io::error::Error;
 use crate::io::path_body::PathBody;
@@ -86,10 +90,17 @@ impl Builder {
     }
 }
 
+/// Produces numbered upload parts from memory, files, or a custom [`PartStream`].
+///
+/// Each started read is independent work owned by [`NextPartFuture`]. Custom streams remain
+/// logically single-owner because [`PartStreamGate`] hands their mutable stream value to exactly one
+/// future at a time.
+///
+/// [`PartStream`]: crate::io::PartStream
 #[derive(Debug)]
 pub(crate) struct PartReader {
     inner: Inner,
-    stream_cx: StreamContext,
+    stream_cx: Arc<StreamContext>,
 }
 
 impl PartReader {
@@ -102,11 +113,13 @@ impl PartReader {
     ) -> Result<Self, Error> {
         let inner = match raw {
             RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
-            RawInputStream::Fs(path_body) => Inner::Fs(PathBodyPartReader::new(path_body)?),
-            RawInputStream::Dyn(box_body) => Inner::Dyn(DynPartReader::new(box_body)),
+            RawInputStream::Fs(path_body) => {
+                Inner::Fs(Arc::new(PathBodyPartReader::new(path_body)?))
+            }
+            RawInputStream::Dyn(box_body) => Inner::Dyn(Arc::new(DynPartReader::new(box_body))),
         };
 
-        let stream_cx = StreamContext::new(part_size, direct_io, metrics, telemetry);
+        let stream_cx = Arc::new(StreamContext::new(part_size, direct_io, metrics, telemetry));
         Ok(Self { inner, stream_cx })
     }
 
@@ -115,39 +128,57 @@ impl PartReader {
         self.stream_cx.part_size()
     }
 
+    /// Starts one owned source operation.
+    ///
+    /// In-memory reads are completed synchronously. File reads retain their asynchronous operation.
+    /// Custom streams serialize mutable polling through a private gate: callers arriving while a
+    /// poll is actively making progress wait for direct handoff, while callers arriving after the
+    /// source reports `Poll::Pending` receive [`PartReadStart::Blocked`] without creating another
+    /// source future.
+    pub(crate) async fn start_part_read(self: &Arc<Self>) -> PartReadStart {
+        match &self.inner {
+            Inner::Bytes(bytes) => {
+                PartReadStart::Ready(NextPartFuture::ready(bytes.next_part(&self.stream_cx)))
+            }
+            Inner::Fs(path_body) => {
+                let path_body = Arc::clone(path_body);
+                let stream_cx = Arc::clone(&self.stream_cx);
+                PartReadStart::Ready(NextPartFuture::file(async move {
+                    path_body.next_part(&stream_cx).await
+                }))
+            }
+            Inner::Dyn(part_stream) => match part_stream.gate.acquire().await {
+                SourceAccess::Acquired(stream) => {
+                    let future = DynNextPartFuture {
+                        part_stream: Arc::clone(part_stream),
+                        stream_cx: Arc::clone(&self.stream_cx),
+                        stream: Some(stream),
+                    };
+                    PartReadStart::Ready(NextPartFuture::dynamic(future))
+                }
+                SourceAccess::Blocked => PartReadStart::Blocked,
+                SourceAccess::Finished => PartReadStart::Finished,
+            },
+        }
+    }
+
+    /// Returns whether a custom stream cannot start another source operation.
+    pub(crate) fn source_unavailable(&self) -> bool {
+        match &self.inner {
+            Inner::Dyn(part_stream) => part_stream.gate.is_unavailable(),
+            Inner::Bytes(_) | Inner::Fs(_) => false,
+        }
+    }
+
     /// Number of parts this reader has produced.
     ///
-    /// Exact for `Dyn`, and bumped inside the lock that produces the part: end-of-stream
-    /// (`Ok(None)`) is only observed once every part the stream will yield is counted, so a caller
-    /// driving speculative, concurrent reads can test emptiness (`0` at end-of-stream) without a
-    /// second lock of its own to race against. Only `Dyn` can have an unknown length, so only `Dyn`
-    /// needs that.
-    ///
-    /// `Bytes` and `Fs` derive it from their part-number cursor. `Fs` advances that cursor when it
-    /// reserves a part, so its count can lead the parts actually returned by an in-flight or failed
-    /// read.
+    /// Exact for custom streams because the count is advanced before the gate returns the stream.
+    /// File readers count claimed ranges, so their value may lead an in-flight or failed read.
     pub(crate) fn parts_yielded(&self) -> u64 {
         match &self.inner {
             Inner::Bytes(bytes) => bytes.parts_yielded(),
             Inner::Fs(path_body) => path_body.parts_yielded(),
-            Inner::Dyn(part_stream) => part_stream.parts_yielded(),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Inner {
-    Bytes(BytesPartReader),
-    Fs(PathBodyPartReader),
-    Dyn(DynPartReader),
-}
-
-impl PartReader {
-    pub(crate) async fn next_part(&self) -> Result<Option<PartData>, Error> {
-        match &self.inner {
-            Inner::Bytes(bytes) => bytes.next_part(&self.stream_cx).await,
-            Inner::Fs(path_body) => path_body.next_part(&self.stream_cx).await,
-            Inner::Dyn(part_stream) => part_stream.next_part(&self.stream_cx).await,
+            Inner::Dyn(part_stream) => part_stream.parts_yielded.load(Ordering::Acquire),
         }
     }
 
@@ -156,6 +187,89 @@ impl PartReader {
             Inner::Dyn(part_stream) => part_stream.full_object_checksum().await,
             _ => None,
         }
+    }
+}
+
+#[derive(Debug)]
+enum Inner {
+    Bytes(BytesPartReader),
+    Fs(Arc<PathBodyPartReader>),
+    Dyn(Arc<DynPartReader>),
+}
+
+/// Result of obtaining authority to start one part read.
+pub(crate) enum PartReadStart {
+    /// The exact source operation to poll and retain if it blocks.
+    Ready(NextPartFuture),
+    /// A custom stream already has one externally blocked operation.
+    Blocked,
+    /// The source has already reported end-of-stream.
+    Finished,
+}
+
+/// Owned source operation that may move between scheduler executions.
+pub(crate) struct NextPartFuture {
+    inner: NextPartFutureInner,
+}
+
+enum NextPartFutureInner {
+    /// In-memory reads complete while the operation is created.
+    Ready(Option<Result<Option<PartData>, Error>>),
+    /// File reads remain boxed until the pooled file-read path supplies a concrete future.
+    File(Pin<Box<dyn Future<Output = Result<Option<PartData>, Error>> + Send + 'static>>),
+    /// A custom stream poll that owns the stream gate until completion or drop.
+    Dynamic(DynNextPartFuture),
+}
+
+impl NextPartFuture {
+    fn ready(result: Result<Option<PartData>, Error>) -> Self {
+        Self {
+            inner: NextPartFutureInner::Ready(Some(result)),
+        }
+    }
+
+    fn file(
+        future: impl Future<Output = Result<Option<PartData>, Error>> + Send + 'static,
+    ) -> Self {
+        Self {
+            inner: NextPartFutureInner::File(Box::pin(future)),
+        }
+    }
+
+    fn dynamic(future: DynNextPartFuture) -> Self {
+        Self {
+            inner: NextPartFutureInner::Dynamic(future),
+        }
+    }
+}
+
+impl Future for NextPartFuture {
+    type Output = Result<Option<PartData>, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.get_mut().inner {
+            NextPartFutureInner::Ready(result) => Poll::Ready(
+                result
+                    .take()
+                    .expect("completed part-read future polled again"),
+            ),
+            NextPartFutureInner::File(future) => future.as_mut().poll(cx),
+            NextPartFutureInner::Dynamic(future) => Pin::new(future).poll(cx),
+        }
+    }
+}
+
+impl std::fmt::Debug for NextPartFuture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match &self.inner {
+            NextPartFutureInner::Ready(_) => "memory",
+            NextPartFutureInner::File(_) => "file",
+            NextPartFutureInner::Dynamic(_) => "custom",
+        };
+        formatter
+            .debug_struct("NextPartFuture")
+            .field("source", &source)
+            .finish_non_exhaustive()
     }
 }
 
@@ -211,7 +325,7 @@ impl BytesPartReader {
         self.state.lock().expect("lock valid").part_number - 1
     }
 
-    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
+    fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
             return Ok(None);
@@ -399,58 +513,223 @@ pub(crate) mod file_util {
     }
 }
 
+/// Custom-stream reader state shared by the reader and its currently active future.
 #[derive(Debug)]
 struct DynPartReader {
-    inner: tokio::sync::Mutex<BoxStream>,
-    /// Counted explicitly: unlike the buffer and file variants, a `PartStream` carries no
-    /// part-number cursor to derive it from.
+    gate: PartStreamGate,
+    /// Counted explicitly because a custom stream has no internal part cursor.
     parts_yielded: AtomicU64,
 }
 
 impl DynPartReader {
     fn new(inner: BoxStream) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(inner),
+            gate: PartStreamGate::new(inner),
             parts_yielded: AtomicU64::new(0),
         }
     }
 
-    fn parts_yielded(&self) -> u64 {
-        self.parts_yielded.load(Ordering::Acquire)
-    }
-
-    async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
-        // TODO - can we do better than a mutex here? should we spawn a dedicated task and use channels instead
-        let mut stream = self.inner.lock().await;
-        match stream.next(stream_cx).await {
-            Some(Ok(part)) => {
-                // Counted inside the lock that produces the part: a concurrent end-of-stream read
-                // must not be able to observe a stale count.
-                self.parts_yielded.fetch_add(1, Ordering::Release);
-                Ok(Some(part))
+    async fn full_object_checksum(&self) -> Option<String> {
+        let state = self.gate.state.lock().expect("part stream gate poisoned");
+        match &*state {
+            GateState::Available(stream) | GateState::Finished(stream) => {
+                stream.full_object_checksum()
             }
-            Some(Err(err)) => Err(err.into()),
-            None => Ok(None),
+            GateState::Polling | GateState::Blocked => {
+                panic!("part stream checksum requested while a source operation remained")
+            }
+        }
+    }
+}
+
+/// Transfers exclusive ownership of a custom stream between part-read futures.
+///
+/// `Polling` is a short handoff state while the active future has not reported whether it can make
+/// progress. Once that future observes `Poll::Pending`, `Blocked` lets later executions return
+/// immediately instead of waiting behind the same external dependency.
+#[derive(Debug)]
+struct PartStreamGate {
+    state: Mutex<GateState>,
+    changed: Notify,
+}
+
+/// Ownership state for one custom [`PartStream`].
+///
+/// [`PartStream`]: crate::io::PartStream
+#[derive(Debug)]
+enum GateState {
+    /// No source operation is active; the next caller may take the stream.
+    Available(BoxStream),
+    /// One future owns the stream and has not yet reported source blockage.
+    Polling,
+    /// The owning future returned `Poll::Pending` and is retained by transfer state.
+    Blocked,
+    /// End-of-stream was observed; the stream is retained only for final metadata.
+    Finished(BoxStream),
+}
+
+/// Result of trying to take custom-stream polling authority.
+enum SourceAccess {
+    /// The caller owns the stream until it releases, finishes, or drops the operation.
+    Acquired(BoxStream),
+    /// A retained future is waiting on the external source.
+    Blocked,
+    /// End-of-stream was already observed.
+    Finished,
+}
+
+impl PartStreamGate {
+    fn new(stream: BoxStream) -> Self {
+        Self {
+            state: Mutex::new(GateState::Available(stream)),
+            changed: Notify::new(),
         }
     }
 
-    // this is only async because it locks a Tokio Mutex
-    async fn full_object_checksum(&self) -> Option<String> {
-        let stream = self.inner.lock().await;
-        stream.full_object_checksum()
+    async fn acquire(&self) -> SourceAccess {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().expect("part stream gate poisoned");
+                match &*state {
+                    GateState::Blocked => return SourceAccess::Blocked,
+                    GateState::Polling => {}
+                    GateState::Finished(_) => return SourceAccess::Finished,
+                    GateState::Available(_) => {
+                        let GateState::Available(stream) =
+                            std::mem::replace(&mut *state, GateState::Polling)
+                        else {
+                            unreachable!("available state changed under lock");
+                        };
+                        return SourceAccess::Acquired(stream);
+                    }
+                }
+            }
+            changed.await;
+        }
+    }
+
+    fn is_unavailable(&self) -> bool {
+        matches!(
+            &*self.state.lock().expect("part stream gate poisoned"),
+            GateState::Blocked | GateState::Finished(_)
+        )
+    }
+
+    fn mark_blocked(&self) {
+        let notify = {
+            let mut state = self.state.lock().expect("part stream gate poisoned");
+            match &*state {
+                GateState::Polling => {
+                    *state = GateState::Blocked;
+                    true
+                }
+                GateState::Blocked => false,
+                GateState::Available(_) | GateState::Finished(_) => {
+                    panic!("part stream became blocked without polling authority")
+                }
+            }
+        };
+        if notify {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn release(&self, stream: BoxStream) {
+        {
+            let mut state = self.state.lock().expect("part stream gate poisoned");
+            assert!(
+                matches!(&*state, GateState::Polling | GateState::Blocked),
+                "part stream released without polling authority"
+            );
+            *state = GateState::Available(stream);
+        }
+        self.changed.notify_one();
+    }
+
+    fn finish(&self, stream: BoxStream) {
+        {
+            let mut state = self.state.lock().expect("part stream gate poisoned");
+            assert!(
+                matches!(&*state, GateState::Polling | GateState::Blocked),
+                "part stream finished without polling authority"
+            );
+            *state = GateState::Finished(stream);
+        }
+        self.changed.notify_waiters();
+    }
+}
+
+/// Exact custom-stream operation retained across scheduler executions.
+struct DynNextPartFuture {
+    part_stream: Arc<DynPartReader>,
+    stream_cx: Arc<StreamContext>,
+    stream: Option<BoxStream>,
+}
+
+impl Future for DynNextPartFuture {
+    type Output = Result<Option<PartData>, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let stream = this
+            .stream
+            .as_mut()
+            .expect("custom stream future polled after completion");
+
+        match stream.poll_next(cx, &this.stream_cx) {
+            Poll::Pending => {
+                this.part_stream.gate.mark_blocked();
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                let stream = this
+                    .stream
+                    .take()
+                    .expect("custom stream disappeared at completion");
+                if result.is_none() {
+                    this.part_stream.gate.finish(stream);
+                } else {
+                    this.part_stream.gate.release(stream);
+                }
+                match result {
+                    Some(Ok(part)) => {
+                        this.part_stream
+                            .parts_yielded
+                            .fetch_add(1, Ordering::Release);
+                        Poll::Ready(Ok(Some(part)))
+                    }
+                    Some(Err(error)) => Poll::Ready(Err(error.into())),
+                    None => Poll::Ready(Ok(None)),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DynNextPartFuture {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        self.part_stream.gate.release(stream);
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::future::Future;
     use std::io::Write;
-    use std::task::Poll;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
 
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
     use crate::io::part_reader::{
-        Builder, BytesPartReader, PartData, PartReader, PathBodyPartReader,
+        Builder, BytesPartReader, PartData, PartReadStart, PartReader, PathBodyPartReader,
     };
     use crate::io::path_body::PathBody;
     use crate::io::stream::{PartStream, StreamContext};
@@ -471,9 +750,16 @@ mod test {
     }
 
     async fn collect_parts(reader: PartReader) -> Vec<PartData> {
+        let reader = Arc::new(reader);
         let mut parts = Vec::new();
         let mut expected_part_number = 1;
-        while let Some(part) = reader.next_part().await.unwrap() {
+        loop {
+            let PartReadStart::Ready(future) = reader.start_part_read().await else {
+                panic!("test source unexpectedly blocked");
+            };
+            let Some(part) = future.await.unwrap() else {
+                break;
+            };
             assert_eq!(expected_part_number, part.part_number);
             expected_part_number += 1;
             parts.push(part);
@@ -614,6 +900,199 @@ mod test {
         assert_eq!(expected, actual);
     }
 
+    #[derive(Debug)]
+    struct BlockingStream {
+        ready: Arc<AtomicBool>,
+        source_waker: Arc<Mutex<Option<Waker>>>,
+        yielded: bool,
+    }
+
+    impl PartStream for BlockingStream {
+        fn poll_part(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _stream_cx: &StreamContext,
+        ) -> Poll<Option<std::io::Result<PartData>>> {
+            if self.yielded {
+                return Poll::Ready(None);
+            }
+            if self.ready.load(Ordering::Acquire) {
+                self.yielded = true;
+                return Poll::Ready(Some(Ok(PartData::new(1, Bytes::from_static(b"ready")))));
+            }
+            *self.source_waker.lock().expect("source waker poisoned") = Some(cx.waker().clone());
+            Poll::Pending
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            crate::io::SizeHint::exact(5)
+        }
+    }
+
+    fn blocking_reader() -> (Arc<PartReader>, Arc<AtomicBool>, Arc<Mutex<Option<Waker>>>) {
+        let ready = Arc::new(AtomicBool::new(false));
+        let source_waker = Arc::new(Mutex::new(None));
+        let stream = BlockingStream {
+            ready: Arc::clone(&ready),
+            source_waker: Arc::clone(&source_waker),
+            yielded: false,
+        };
+        let reader = Builder::new()
+            .part_size(5)
+            .stream(InputStream::from_part_stream(stream))
+            .metrics(test_metrics())
+            .telemetry(test_telemetry())
+            .build()
+            .unwrap();
+        (Arc::new(reader), ready, source_waker)
+    }
+
+    // Tokio's test runtime initializes kqueue, which Miri cannot execute.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn custom_stream_pending_blocks_waiters_until_exact_future_resumes() {
+        let (reader, ready, source_waker) = blocking_reader();
+        let PartReadStart::Ready(mut first) = reader.start_part_read().await else {
+            panic!("fresh custom stream was blocked");
+        };
+
+        let waiter_reader = Arc::clone(&reader);
+        let waiter = tokio::spawn(async move { waiter_reader.start_part_read().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "waiter bypassed active stream poll");
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(Pin::new(&mut first).poll(&mut cx).is_pending());
+        assert!(reader.source_unavailable());
+
+        assert!(matches!(waiter.await.unwrap(), PartReadStart::Blocked));
+
+        ready.store(true, Ordering::Release);
+        source_waker
+            .lock()
+            .expect("source waker poisoned")
+            .take()
+            .expect("source did not register a waker")
+            .wake();
+
+        let part = first.await.unwrap().expect("source should yield a part");
+        assert_eq!(part.data, Bytes::from_static(b"ready"));
+        assert!(!reader.source_unavailable());
+        assert_eq!(reader.parts_yielded(), 1);
+    }
+
+    // Tokio's test runtime initializes kqueue, which Miri cannot execute.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn custom_stream_ready_completion_hands_gate_to_one_waiter() {
+        let data = vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")];
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(6)
+                .stream(InputStream::from_part_stream(TestStream::new(data)))
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+
+        let PartReadStart::Ready(first) = reader.start_part_read().await else {
+            panic!("fresh custom stream was blocked");
+        };
+        let waiter_reader = Arc::clone(&reader);
+        let waiter = tokio::spawn(async move { waiter_reader.start_part_read().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "waiter bypassed active stream poll");
+
+        assert_eq!(
+            first.await.unwrap().unwrap().data,
+            Bytes::from_static(b"first")
+        );
+        let PartReadStart::Ready(second) = waiter.await.unwrap() else {
+            panic!("ready handoff reported source blockage");
+        };
+        assert_eq!(
+            second.await.unwrap().unwrap().data,
+            Bytes::from_static(b"second")
+        );
+        assert!(!reader.source_unavailable());
+    }
+
+    #[derive(Debug)]
+    struct EofOnceStream {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl PartStream for EofOnceStream {
+        fn poll_part(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _stream_cx: &StreamContext,
+        ) -> Poll<Option<std::io::Result<PartData>>> {
+            assert_eq!(
+                self.polls.fetch_add(1, Ordering::Relaxed),
+                0,
+                "custom stream was polled after end-of-stream"
+            );
+            Poll::Ready(None)
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            crate::io::SizeHint::default()
+        }
+    }
+
+    // Tokio's test runtime initializes kqueue, which Miri cannot execute.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn custom_stream_eof_retires_waiters_without_another_poll() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(5)
+                .stream(InputStream::from_part_stream(EofOnceStream {
+                    polls: Arc::clone(&polls),
+                }))
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+        let PartReadStart::Ready(eof) = reader.start_part_read().await else {
+            panic!("fresh custom stream was unavailable");
+        };
+        let waiter_reader = Arc::clone(&reader);
+        let waiter = tokio::spawn(async move { waiter_reader.start_part_read().await });
+        tokio::task::yield_now().await;
+
+        assert!(eof.await.unwrap().is_none());
+        assert!(matches!(waiter.await.unwrap(), PartReadStart::Finished));
+        assert!(reader.source_unavailable());
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+    }
+
+    // Tokio's test runtime initializes kqueue, which Miri cannot execute.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn dropping_blocked_custom_future_restores_stream_authority() {
+        let (reader, _ready, _source_waker) = blocking_reader();
+        let PartReadStart::Ready(mut first) = reader.start_part_read().await else {
+            panic!("fresh custom stream was blocked");
+        };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(Pin::new(&mut first).poll(&mut cx).is_pending());
+        assert!(reader.source_unavailable());
+
+        drop(first);
+        assert!(!reader.source_unavailable());
+        assert!(matches!(
+            reader.start_part_read().await,
+            PartReadStart::Ready(_)
+        ));
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_bytes_part_reader_offset_not_aligned_error() {
@@ -622,7 +1101,7 @@ mod test {
         let stream_cx = test_stream_cx(5);
 
         // First call should succeed
-        let result = reader.next_part(&stream_cx).await;
+        let result = reader.next_part(&stream_cx);
         assert!(result.is_ok());
 
         // Manually corrupt the offset to create misalignment
@@ -632,7 +1111,7 @@ mod test {
         }
 
         // Second call should fail with offset_not_aligned_with_part_number error
-        let result = reader.next_part(&stream_cx).await;
+        let result = reader.next_part(&stream_cx);
         assert!(result.is_err());
     }
 
@@ -643,7 +1122,7 @@ mod test {
         let reader = BytesPartReader::new(data);
         let stream_cx = test_stream_cx(10);
 
-        let result = reader.next_part(&stream_cx).await.unwrap().unwrap();
+        let result = reader.next_part(&stream_cx).unwrap().unwrap();
         assert!(result.is_last.unwrap());
     }
 

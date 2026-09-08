@@ -133,6 +133,99 @@ impl PartStream for UnknownLengthStream {
     }
 }
 
+pin_project! {
+    /// Collects caller writes into one complete part while preserving source backpressure.
+    #[derive(Debug)]
+    struct AccumulatingPartStream {
+        rx: mpsc::Receiver<Bytes>,
+        expected_len: usize,
+        buffered: Vec<u8>,
+        emitted: bool,
+    }
+}
+
+impl AccumulatingPartStream {
+    fn new(rx: mpsc::Receiver<Bytes>, expected_len: usize) -> Self {
+        Self {
+            rx,
+            expected_len,
+            buffered: Vec::with_capacity(expected_len),
+            emitted: false,
+        }
+    }
+}
+
+impl PartStream for AccumulatingPartStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        if *this.emitted {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(bytes)) => {
+                    this.buffered.extend_from_slice(&bytes);
+                    if this.buffered.len() > *this.expected_len {
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "test stream received more bytes than declared",
+                        ))));
+                    }
+                    if this.buffered.len() == *this.expected_len {
+                        *this.emitted = true;
+                        return Poll::Ready(Some(Ok(PartData::new(
+                            1,
+                            std::mem::take(this.buffered),
+                        ))));
+                    }
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "test stream ended before the complete part arrived",
+                    ))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(self.expected_len as u64)
+    }
+}
+
+#[derive(Debug)]
+struct WakeBeforePendingStream {
+    polls: Arc<AtomicUsize>,
+}
+
+impl PartStream for WakeBeforePendingStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        match self.polls.fetch_add(1, Ordering::Relaxed) {
+            0 => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            1 => Poll::Ready(Some(Ok(PartData::new(1, Bytes::from_static(b"ready"))))),
+            _ => panic!("single-part stream was polled after yielding its part"),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(5)
+    }
+}
+
 fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
     let upload_id = "test-upload-id".to_owned();
 
@@ -166,6 +259,32 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
     )
 }
 
+#[tokio::test]
+async fn test_source_wake_before_read_parking_is_retained() {
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let polls = Arc::new(AtomicUsize::new(0));
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("wake-before-park")
+        .body(InputStream::from_part_stream(WakeBeforePendingStream {
+            polls: Arc::clone(&polls),
+        }))
+        .initiate()
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), handle.join())
+        .await
+        .expect("source wake was lost before the retained read was parked")
+        .unwrap();
+    assert_eq!(polls.load(Ordering::Relaxed), 2);
+}
+
 // Regression test for deadlock discovered by a user of Mountpoint
 // The user opens MANY files at once. The user wrote data to some of the later files they opened,
 // and waited for those writes to complete.
@@ -177,9 +296,8 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
 // If the test times out, then we suffer from deadlock.
 //
 // See https://github.com/awslabs/aws-c-s3/blob/5d8d4205e7de4e152bf26bb27d86f3acf8cd5d2/tests/s3_many_async_uploads_without_data_test.c
-// PartStream deadlock: 200 uploads consume all concurrency slots blocking on poll_part(),
-// starving transfers that have data ready.
-#[ignore = "PartStream deadlock — workers block in execute waiting for user data, consuming all slots"]
+// Each source retains one in-progress part while its channel is empty. A pending source read must
+// release its scheduler slot so reverse-order writers can wake and complete.
 #[tokio::test]
 async fn test_many_uploads_no_deadlock() {
     let (_guard, _rx) = capture_test_logs();
@@ -193,11 +311,7 @@ async fn test_many_uploads_no_deadlock() {
     let mut transfers = Vec::with_capacity(MANY_ASYNC_UPLOADS_CNT);
     for i in 0..MANY_ASYNC_UPLOADS_CNT {
         let (tx, rx) = mpsc::channel(1);
-        let stream = TestStream::new(
-            rx,
-            MANY_ASYNC_UPLOADS_OBJECT_SIZE,
-            MANY_ASYNC_UPLOADS_OBJECT_SIZE as u64,
-        );
+        let stream = AccumulatingPartStream::new(rx, MANY_ASYNC_UPLOADS_OBJECT_SIZE);
 
         let handle = tm
             .upload()

@@ -57,7 +57,11 @@ pub(crate) trait ConcurrencyController: Send + Sync + fmt::Debug {
     fn target(&self) -> usize;
     /// Called when a work item is dispatched to a worker.
     fn on_dispatch(&self) {}
-    fn on_completion(&self, _sample: &CompletionSample) {}
+    /// Called once for every dispatched work item.
+    ///
+    /// `None` retires dispatch accounting without contributing an I/O
+    /// observation, as when a retained continuation yields its execution slot.
+    fn on_completion(&self, _sample: Option<&CompletionSample>) {}
 }
 
 /// Fixed concurrency target that never changes.

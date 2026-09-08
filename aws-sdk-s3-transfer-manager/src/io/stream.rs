@@ -5,7 +5,6 @@
 
 use std::default::Default;
 use std::fmt;
-use std::future::poll_fn;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -314,17 +313,21 @@ impl PartData {
 
 /// Trait representing a stream of object parts (streaming body).
 ///
-/// Individual parts are streamed via the `poll_part` function, which asynchronously yields
-/// instances of `PartData`. When `Poll::Ready(None)` is returned the stream is assumed to have
-/// reached EOF and is finished.
+/// Individual parts are streamed via [`PartStream::poll_part`]. The transfer manager polls one
+/// operation at a time with exclusive access to the stream, but a pending operation may resume on
+/// a different thread. Implementations must retain any partial progress in `Self`, arrange for the
+/// task waker to be notified before returning [`Poll::Pending`](std::task::Poll::Pending), and
+/// return promptly rather than block the executor thread.
+///
+/// [`Poll::Ready(None)`](std::task::Poll::Ready) marks end-of-stream. The transfer manager does not
+/// poll the stream again after that result.
 ///
 /// The `size_hint` function provides insight into the total number of bytes that will be streamed.
 pub trait PartStream {
     /// Attempt to pull the next part from the stream.
     ///
-    /// The `stream_cx` will have the part size that should be utilized. Implementations should be
-    /// careful to only yield full parts for every part except the last one, which _may_ be less
-    /// than the full part size.
+    /// `stream_cx` reports the part size selected for this upload. Implementations should yield
+    /// full-sized parts except for the final part, which may be smaller.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -363,11 +366,12 @@ impl BoxStream {
         }
     }
 
-    pub(crate) async fn next(
+    pub(crate) fn poll_next(
         &mut self,
+        cx: &mut std::task::Context<'_>,
         stream_cx: &StreamContext,
-    ) -> Option<std::io::Result<PartData>> {
-        poll_fn(|cx| self.inner.as_mut().poll_part(cx, stream_cx)).await
+    ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+        self.inner.as_mut().poll_part(cx, stream_cx)
     }
 
     pub(crate) fn full_object_checksum(&self) -> Option<String> {

@@ -229,6 +229,8 @@ impl PollWork {
 ///
 /// Contract between transfer state machines and the scheduler:
 /// - `Success`: Work completed. Scheduler continues polling the transfer for more work.
+/// - `Pending`: Work retained its continuation and released the execution slot without completing
+///   an I/O operation. Scheduler continues polling only when the transfer's wake path fires.
 /// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
 ///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
 /// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
@@ -236,6 +238,11 @@ impl PollWork {
 pub(crate) enum WorkOutcome {
     /// Work completed successfully.
     Success { data: Option<Box<dyn WorkData>> },
+    /// Work retained its continuation without completing an I/O operation.
+    ///
+    /// The transfer must arrange a wake before returning this result. The scheduler releases the
+    /// execution slot but does not report a completion sample to the concurrency controller.
+    Pending,
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
@@ -249,6 +256,7 @@ impl std::fmt::Debug for WorkOutcome {
                 .debug_struct("Success")
                 .field("has_data", &data.is_some())
                 .finish(),
+            WorkOutcome::Pending => write!(f, "Pending"),
             WorkOutcome::Failed { classification } => f
                 .debug_struct("Failed")
                 .field("classification", classification)

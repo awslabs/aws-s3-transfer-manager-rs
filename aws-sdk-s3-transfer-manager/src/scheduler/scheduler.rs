@@ -456,6 +456,7 @@ impl Scheduler {
     ) {
         let outcome_tag = match &outcome {
             WorkOutcome::Success { .. } => "success",
+            WorkOutcome::Pending => "pending",
             WorkOutcome::Failed { .. } => "failed",
             WorkOutcome::Cancelled => "cancelled",
         };
@@ -468,15 +469,22 @@ impl Scheduler {
         );
         self.release_dispatched(1);
 
-        // Report to concurrency controller
-        let classification = match &outcome {
-            WorkOutcome::Failed { classification } => *classification,
-            _ => None,
+        // Report to the concurrency controller. Pending work retires the dispatch slot without
+        // contributing an I/O observation because its source operation has not completed.
+        let completion_sample = if matches!(outcome, WorkOutcome::Pending) {
+            None
+        } else {
+            let classification = match &outcome {
+                WorkOutcome::Failed { classification } => *classification,
+                _ => None,
+            };
+            Some(CompletionSample {
+                error: classification,
+            })
         };
-        let sample = CompletionSample {
-            error: classification,
-        };
-        self.handle().controller.on_completion(&sample);
+        self.handle()
+            .controller
+            .on_completion(completion_sample.as_ref());
 
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
@@ -940,6 +948,60 @@ mod tests {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
         Handle::new_for_test(config, concurrency)
+    }
+
+    #[derive(Debug)]
+    struct CountingCompletionController {
+        completions: AtomicUsize,
+        samples: AtomicUsize,
+    }
+
+    impl crate::scheduler::ConcurrencyController for CountingCompletionController {
+        fn target(&self) -> usize {
+            1
+        }
+
+        fn on_completion(&self, sample: Option<&crate::scheduler::CompletionSample>) {
+            self.completions.fetch_add(1, Ordering::Relaxed);
+            if sample.is_some() {
+                self.samples.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn pending_work_releases_capacity_without_reporting_completion() {
+        let controller = Arc::new(CountingCompletionController {
+            completions: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+        });
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder().client(s3_client).build();
+        let handle = Handle::new_for_test_with_runtime(config, controller.clone(), |weak| {
+            Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
+        });
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
+            WorkOutcome::Pending
+        }));
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(id, state)));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.scheduler.is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler did not drain pending work");
+
+        assert_eq!(controller.completions.load(Ordering::Relaxed), 1);
+        assert_eq!(controller.samples.load(Ordering::Relaxed), 0);
     }
 
     // TODO(vnext): tests built on this helper are gated out under asan
