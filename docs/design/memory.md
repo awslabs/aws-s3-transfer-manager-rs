@@ -2317,70 +2317,92 @@ complete.
 
 ### Upload staging and retry
 
-An upload that stages part data in the pool uses one `PooledBufMut` for each concurrently staged
-part. A known part length may be acquired in one request. An incremental source retains the same
-buffer and calls `reserve` before each fill, so the part's writable tail remains available across
-reads. A source read advances initialization only by its completed byte count; short completion,
-error, or cancellation leaves the remaining range uninitialized and unpublishable. The completed
-part freezes into `SegmentedBytes`:
+Each in-flight upload part has two memory lifetimes:
+
+1. mutable storage while the source produces bytes; and
+2. immutable storage retained until every network attempt using those bytes completes.
+
+`PartBuffer` joins those lifetimes without copying between them. Custom streams and adapters create
+one through `StreamContext::part_buffer`, retain it with their source state, and poll
+`PartBuffer::poll_acquire` before writing through `BufMut`. Creating the facade itself does not
+reserve or allocate payload memory.
+
+An acquisition request admits one logical envelope. The first envelope supplied while admission is
+pending remains fixed until the request completes. A producer normally requests the complete
+effective part size, but may use smaller envelopes when its source is incrementally available to
+limit the shared pool capacity held by one input stream while it waits for more data.
+`BufMut::remaining_mut` exposes only writable bytes covered by the active envelope;
+carrier-rounded padding is not part of the logical allowance.
 
 ```text
-Reservation
+source state
     |
     v
-pool.acquire(part capacity)
+PartBuffer::poll_acquire(envelope)
     |
-    v
-PooledBufMut
+    +-- Pending: retain PartBuffer and source progress
     |
-    +-- PooledBufMut::reserve(min_writable) --> source read --+
-    |                                                        |
-    +<-------------------------------------------------------+
-    |
-    `-- freeze --> SegmentedBytes
-                         |
-            +------------+------------+
-            |                         |
-       attempt 1 cursor           retry cursor
-            |                         |
-            +------ same holds -------+
+    `-- Ready: write initialized bytes through BufMut
+                   |
+                   +-- envelope has capacity: continue filling
+                   |
+                   +-- envelope full: publish prefix and acquire next envelope
+                   |
+                   `-- part complete: freeze into SegmentedBytes
 ```
 
-Parallel parts use separate buffers because their fill, retry, publication, and ownership lifetimes
-are independent. A final partial carrier belongs to that part and may remain retained by its final
-immutable segment.
+When an envelope becomes full, `PartBuffer` publishes its initialized prefix into a private
+`SegmentedBytes` accumulator and closes that envelope. Publication retains any writable tail in the
+current carrier. The next envelope consumes that tail before requesting another reservation, so
+carrier rounding does not strand usable capacity. Pool-aware classification may coalesce adjacent
+published views from the same concrete slot into one presentation segment; each view keeps its
+original immutable owner and accounting lifetime.
 
-Each SDK attempt receives a fresh body and cursor over the same immutable holds. The retained
-`SegmentedBytes` remains live through SDK retries and any transfer-manager retry checkpoint that can
-replay the part. `SdkBody::retryable` rebuilds a body for each clone attempt, and
-`SdkBody::try_clone` succeeds only when such a rebuild operation exists
-([`SdkBody` retry support][sdk-body-retry]).
+`PartBuffer::len` reports initialized bytes across published and mutable storage.
+`PartBuffer::remaining` reports bytes left before the part-size limit. A source advances
+initialization only for bytes it has actually written. Dropping the facade cancels queued admission
+and releases all transfer-manager-owned storage. Freezing closes active acquisition authority,
+returns wholly unused carriers, and transfers every initialized byte into `SegmentedBytes`.
 
-Retry requires either a source that can be read again or immutable bytes retained through the retry
-window. An addressable file or range source can rebuild an attempt by rereading its input. A
-forward-only source retains the staged `SegmentedBytes` or supplies another replay layer.
-Caller-owned `Bytes` and other already-resident upload memory remain outside pool accounting unless
-copied into pooled storage.
+The facade is `Send + Sync` because a `PartStream` can be retained in shared request state before
+polling obtains exclusive access. Mutable storage remains available only through `&mut PartBuffer`;
+shared access cannot expose or modify `PooledBufMut` ranges. Parallel parts use separate facades
+because their source progress, publication, retry, and release lifetimes are independent.
 
-The body reports its exact remaining length through `size_hint`; segmentation does not make the
-length unknown. The SDK body adapter forwards each `Bytes` frame and its size bounds without
-requiring one contiguous value ([`SdkBody` HTTP body adapter][sdk-body-http]).
+#### Request bodies
 
-Segmentation does not require a gather copy for checksum calculation, signing, or aws-chunked
-framing. The body adapters consume frames in order. A streaming checksum body updates the checksum
-per data frame and emits the value in trailers ([checksum body][sdk-checksum-body]). A segmented
-streaming `SdkBody` therefore selects a different wire shape from a single in-memory `Bytes` when
-SDK-owned checksum calculation is enabled: the checksum is carried in an aws-chunked trailer rather
-than an HTTP header ([S3 checksum selection][s3-checksum-selection],
-[aws-chunked selection][s3-chunked-selection]). The upload path may preserve header placement by
-calculating the checksum while filling and setting the header before transmit. Both paths retain a
-segmented body; neither requires a gather copy.
+`PartData` owns the immutable payload for one part. Caller-owned `Bytes` remain outside pool
+accounting. Pooled and mixed payloads use `SegmentedBytes`, whose owners keep every carrier charged
+and mapped until the final body, retry cursor, and payload clone releases it.
 
-The upload calls `Reservation::close_acquisition` or drops the reservation after no staging buffer
-may require another carrier. Replaying an existing `SegmentedBytes` does not require open
-direct-acquisition authority. Closing does not release carriers retained by the retry body. A
-staging buffer that survives close may consume its existing writable tail but receives
-`ReservationClosed` if it attempts to grow.
+Empty and single-segment payloads use the SDK's contiguous `SdkBody::from(Bytes)` representation.
+Multi-segment payloads use an exact-length retryable body. Each attempt receives a fresh cursor over
+the same ordered immutable segments and emits one owner-backed `Bytes` frame per presentation
+segment. The body reports its exact remaining length through `size_hint`; segmentation does not
+make the content length unknown ([`SdkBody` HTTP body adapter][sdk-body-http]).
+
+`SdkBody::retryable` rebuilds the cursor for SDK retries, so `SdkBody::try_clone` succeeds without
+gathering the payload ([`SdkBody` retry support][sdk-body-retry]). An addressable source may instead
+rebuild an attempt by reading the same range again. A forward-only source must retain its immutable
+part data through the retry window.
+
+Direct-acquisition authority closes once no staging buffer can require another carrier. Closing a
+reservation does not release immutable carriers held by `PartData` or a request body. Replaying
+existing `SegmentedBytes` therefore requires no open reservation.
+
+#### Checksum framing
+
+With SDK-owned request checksums enabled, a contiguous in-memory body can be checksummed before
+signing and carry the checksum in a header. A segmented body is presented as a streaming body, so
+the SDK updates the checksum from its frames and emits the result in an aws-chunked trailer
+([checksum body][sdk-checksum-body], [S3 checksum selection][s3-checksum-selection],
+[aws-chunked selection][s3-chunked-selection]).
+
+The aws-chunked encoder allocates encoded chunks and copies payload bytes between framing data. An
+encoded chunk that spans several input frames may gather those frames before the encoding copy.
+This preserves replay and bounded ownership but is not a zero-copy transmission path. Eliminating
+that copy requires either a non-contiguous in-memory SDK body and checksum interface or checksum
+calculation before transmission with the result supplied as a header.
 
 ### Download receive and delivery
 

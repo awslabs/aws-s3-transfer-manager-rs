@@ -15,8 +15,12 @@ use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3_transfer_manager::error::ErrorKind;
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::memory::SegmentedBytes;
+use aws_sdk_s3_transfer_manager::io::{
+    InputStream, PartBuffer, PartData, PartStream, SizeHint, StreamContext,
+};
+use aws_sdk_s3_transfer_manager::memory::{
+    BufferPool, MemoryBudgetConfig, MemoryConfig, SegmentedBytes,
+};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -25,7 +29,7 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use pin_project_lite::pin_project;
 
 use tokio::sync::mpsc;
@@ -233,6 +237,46 @@ struct SegmentedPartStream {
     size: u64,
 }
 
+#[derive(Debug)]
+struct PooledPartStream {
+    data: Option<Bytes>,
+    buffer: Option<PartBuffer>,
+}
+
+impl PartStream for PooledPartStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let Some(data_len) = self.data.as_ref().map(Bytes::len) else {
+            return Poll::Ready(None);
+        };
+        let buffer = self.buffer.get_or_insert_with(|| stream_cx.part_buffer());
+        match buffer.poll_acquire(cx, data_len) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
+            Poll::Ready(Ok(())) => {}
+        }
+
+        let data = self.data.take().expect("pooled stream data disappeared");
+        self.buffer
+            .as_mut()
+            .expect("pooled stream buffer disappeared")
+            .put_slice(&data);
+        let data = self
+            .buffer
+            .take()
+            .expect("pooled stream buffer disappeared")
+            .freeze();
+        Poll::Ready(Some(Ok(PartData::from_segmented(1, data))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(self.data.as_ref().map_or(0, |data| data.len() as u64))
+    }
+}
+
 impl PartStream for SegmentedPartStream {
     fn poll_part(
         mut self: std::pin::Pin<&mut Self>,
@@ -304,6 +348,54 @@ async fn test_custom_stream_uploads_segmented_part_data() {
         .unwrap();
 
     handle.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_custom_stream_resumes_after_part_buffer_admission() {
+    const CAPACITY: usize = 1024 * 1024;
+
+    let pool = BufferPool::builder()
+        .memory_budget(MemoryBudgetConfig::Limit(CAPACITY))
+        .build()
+        .unwrap();
+    let holder = pool.try_reserve(CAPACITY).unwrap().unwrap();
+    let held = pool.acquire(&holder, CAPACITY).unwrap();
+
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .memory(MemoryConfig::Explicit(pool.clone()))
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("pooled-part")
+        .body(InputStream::from_part_stream(PooledPartStream {
+            data: Some(Bytes::from_static(b"pooled payload")),
+            buffer: None,
+        }))
+        .initiate()
+        .unwrap();
+    let join = tokio::spawn(async move { handle.join().await });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.metrics().queued_reservations() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("custom stream did not wait for pool admission");
+
+    drop(held);
+    holder.close_acquisition();
+
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("custom stream did not resume after pool admission")
+        .expect("upload task panicked")
+        .unwrap();
+    assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
 }
 
 #[tokio::test]

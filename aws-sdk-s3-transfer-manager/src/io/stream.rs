@@ -14,6 +14,8 @@ use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
 use crate::io::Buffer;
+use crate::io::PartBuffer;
+use crate::memory::BufferPool;
 use crate::memory::SegmentedBytes;
 
 /// Source of binary data.
@@ -197,6 +199,8 @@ pub(super) enum RawInputStream {
 #[derive(Debug)]
 pub struct StreamContext {
     part_size: usize,
+    /// Shared payload-memory pool used by this client.
+    buffer_pool: BufferPool,
     /// When true, file I/O runs directly on the calling thread.
     direct_io: bool,
     /// Per-transfer cumulative metrics.
@@ -208,12 +212,14 @@ pub struct StreamContext {
 impl StreamContext {
     pub(super) fn new(
         part_size: usize,
+        buffer_pool: BufferPool,
         direct_io: bool,
         metrics: std::sync::Arc<crate::transfer::MetricsState>,
         telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
     ) -> Self {
         Self {
             part_size,
+            buffer_pool,
             direct_io,
             metrics,
             telemetry,
@@ -225,6 +231,15 @@ impl StreamContext {
     /// result in exceeding the maximum number of parts allowed).
     pub fn part_size(&self) -> usize {
         self.part_size
+    }
+
+    /// Creates empty pooled storage for one part produced by this stream.
+    ///
+    /// Creating the buffer does not reserve memory. The stream must retain the
+    /// [`PartBuffer`] across `Poll::Pending` and call
+    /// [`PartBuffer::poll_acquire`] before writing.
+    pub fn part_buffer(&self) -> PartBuffer {
+        PartBuffer::new(self.buffer_pool.clone(), self.part_size)
     }
 
     /// Whether file I/O should run directly on the calling thread.
@@ -340,10 +355,24 @@ impl PartData {
 ///
 /// The `size_hint` function provides insight into the total number of bytes that will be streamed.
 pub trait PartStream {
-    /// Attempt to pull the next part from the stream.
+    /// Polls for the next complete upload part.
     ///
-    /// `stream_cx` reports the part size selected for this upload. Implementations should yield
-    /// full-sized parts except for the final part, which may be smaller.
+    /// Returns [`Poll::Ready(Some(Ok(part)))`](std::task::Poll::Ready) when one part is available.
+    /// Parts should contain [`StreamContext::part_size`] bytes except for the final part, which may
+    /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
+    /// transfer manager does not poll the stream again after end-of-stream or an error.
+    ///
+    /// Returns [`Poll::Pending`](std::task::Poll::Pending) when the next part is not ready. Before
+    /// returning `Pending`, the implementation must arrange for `cx.waker()` to be notified when
+    /// polling may make progress. Partial reads, pending futures, and acquired storage must be
+    /// retained in `Self`; dropping them and recreating the operation on the next poll can lose
+    /// progress or notification. A later poll may use a different thread and a different waker.
+    ///
+    /// Implementations must return promptly and must not block the executor thread. Sources that
+    /// need transfer-manager-owned storage can create a [`PartBuffer`] through
+    /// [`StreamContext::part_buffer`]. Creating the buffer does not reserve memory. Retain it in
+    /// `Self` across `Pending`, poll its admission before writing, and freeze it only after the
+    /// complete part is available.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

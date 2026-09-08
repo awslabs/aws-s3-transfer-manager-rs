@@ -19,6 +19,7 @@ use crate::io::path_body::PathBody;
 use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
 use crate::io::PartData;
+use crate::memory::BufferPool;
 use crate::metrics::unit::ByteUnit;
 
 use super::stream::{BoxStream, StreamContext};
@@ -29,6 +30,7 @@ pub(crate) struct Builder {
     stream: Option<RawInputStream>,
     part_size: usize,
     direct_io: bool,
+    buffer_pool: Option<BufferPool>,
     metrics: Option<std::sync::Arc<crate::transfer::MetricsState>>,
     telemetry: Option<std::sync::Arc<crate::telemetry::Telemetry>>,
 }
@@ -39,6 +41,7 @@ impl Builder {
             stream: None,
             part_size: 5 * ByteUnit::Mebibyte.as_bytes_u64() as usize,
             direct_io: false,
+            buffer_pool: None,
             metrics: None,
             telemetry: None,
         }
@@ -64,6 +67,12 @@ impl Builder {
         self
     }
 
+    /// Sets the shared pool available to stream producers.
+    pub(crate) fn buffer_pool(mut self, buffer_pool: BufferPool) -> Self {
+        self.buffer_pool = Some(buffer_pool);
+        self
+    }
+
     /// Set the metrics state for recording I/O metrics.
     pub(crate) fn metrics(
         mut self,
@@ -84,9 +93,17 @@ impl Builder {
 
     pub(crate) fn build(self) -> Result<PartReader, Error> {
         let stream = self.stream.expect("input stream set");
+        let buffer_pool = self.buffer_pool.expect("buffer pool set");
         let metrics = self.metrics.expect("metrics set");
         let telemetry = self.telemetry.expect("telemetry set");
-        PartReader::new(stream, self.part_size, self.direct_io, metrics, telemetry)
+        PartReader::new(
+            stream,
+            self.part_size,
+            self.direct_io,
+            buffer_pool,
+            metrics,
+            telemetry,
+        )
     }
 }
 
@@ -108,6 +125,7 @@ impl PartReader {
         raw: RawInputStream,
         part_size: usize,
         direct_io: bool,
+        buffer_pool: BufferPool,
         metrics: std::sync::Arc<crate::transfer::MetricsState>,
         telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
     ) -> Result<Self, Error> {
@@ -119,7 +137,13 @@ impl PartReader {
             RawInputStream::Dyn(box_body) => Inner::Dyn(Arc::new(DynPartReader::new(box_body))),
         };
 
-        let stream_cx = Arc::new(StreamContext::new(part_size, direct_io, metrics, telemetry));
+        let stream_cx = Arc::new(StreamContext::new(
+            part_size,
+            buffer_pool,
+            direct_io,
+            metrics,
+            telemetry,
+        ));
         Ok(Self { inner, stream_cx })
     }
 
@@ -734,9 +758,24 @@ mod test {
     use crate::io::path_body::PathBody;
     use crate::io::stream::{PartStream, StreamContext};
     use crate::io::InputStream;
+    use crate::memory::BufferPool;
+    use crate::types::MemoryBudgetConfig;
 
     fn test_stream_cx(part_size: usize) -> StreamContext {
-        StreamContext::new(part_size, false, test_metrics(), test_telemetry())
+        StreamContext::new(
+            part_size,
+            test_pool(),
+            false,
+            test_metrics(),
+            test_telemetry(),
+        )
+    }
+
+    fn test_pool() -> BufferPool {
+        BufferPool::builder()
+            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .build()
+            .unwrap()
     }
 
     fn test_metrics() -> std::sync::Arc<crate::transfer::MetricsState> {
@@ -776,6 +815,7 @@ mod test {
         let reader = Builder::new()
             .part_size(5)
             .stream(stream)
+            .buffer_pool(test_pool())
             .metrics(test_metrics())
             .telemetry(test_telemetry())
             .build()
@@ -809,6 +849,7 @@ mod test {
         let reader = Builder::new()
             .part_size(part_size)
             .stream(stream)
+            .buffer_pool(test_pool())
             .metrics(test_metrics())
             .telemetry(test_telemetry())
             .build()
@@ -891,6 +932,7 @@ mod test {
         let reader = Builder::new()
             .part_size(5)
             .stream(stream)
+            .buffer_pool(test_pool())
             .metrics(test_metrics())
             .telemetry(test_telemetry())
             .build()
@@ -940,6 +982,7 @@ mod test {
         let reader = Builder::new()
             .part_size(5)
             .stream(InputStream::from_part_stream(stream))
+            .buffer_pool(test_pool())
             .metrics(test_metrics())
             .telemetry(test_telemetry())
             .build()
@@ -991,6 +1034,7 @@ mod test {
             Builder::new()
                 .part_size(6)
                 .stream(InputStream::from_part_stream(TestStream::new(data)))
+                .buffer_pool(test_pool())
                 .metrics(test_metrics())
                 .telemetry(test_telemetry())
                 .build()
@@ -1054,6 +1098,7 @@ mod test {
                 .stream(InputStream::from_part_stream(EofOnceStream {
                     polls: Arc::clone(&polls),
                 }))
+                .buffer_pool(test_pool())
                 .metrics(test_metrics())
                 .telemetry(test_telemetry())
                 .build()

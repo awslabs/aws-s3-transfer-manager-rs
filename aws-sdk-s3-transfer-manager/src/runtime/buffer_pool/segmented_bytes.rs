@@ -25,6 +25,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use super::acquisition::CarrierGuard;
 use super::block::BlockSlot;
 use super::invariant_violation;
+use super::BufferPool;
 use super::PoolInner;
 use crate::runtime::sync::sync::Arc;
 
@@ -66,6 +67,21 @@ impl SegmentedBytes {
         let mut builder = SegmentedBytesBuilder::new();
         builder.push_segmented(current);
         builder.push_segmented(other);
+        *self = builder.finish();
+    }
+
+    /// Appends `view` after classifying its complete range against `pool`.
+    ///
+    /// Classification permits adjacent views from the same concrete block slot
+    /// to share one presentation segment. The view retains all lifetime and
+    /// accounting ownership; classification does not recover mutable or return
+    /// authority. A foreign or otherwise unclassified view remains a separate
+    /// segment.
+    pub(crate) fn append_pool_view(&mut self, pool: &BufferPool, view: Bytes) {
+        let current = std::mem::replace(self, Self::empty());
+        let mut builder = SegmentedBytesBuilder::for_pool(Arc::clone(&pool.inner));
+        builder.push_segmented(current);
+        builder.push_view(view);
         *self = builder.finish();
     }
 
