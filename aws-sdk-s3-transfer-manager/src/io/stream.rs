@@ -14,6 +14,7 @@ use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
 use crate::io::Buffer;
+use crate::memory::SegmentedBytes;
 
 /// Source of binary data.
 ///
@@ -247,12 +248,16 @@ impl StreamContext {
 
 /// Contents and (optional) metadata for a single part of a [multipart upload].
 ///
+/// [`PartData::new`] accepts one contiguous [`Bytes`] value.
+/// [`PartData::from_segmented`] accepts an existing [`SegmentedBytes`] value
+/// without gathering its immutable segments.
+///
 /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
 #[derive(Clone, PartialEq, Eq)]
 pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
-    pub(crate) data: Bytes,
+    pub(crate) data: SegmentedBytes,
     pub(crate) checksum: Option<String>,
     pub(crate) is_last: Option<bool>,
 }
@@ -278,15 +283,26 @@ impl PartData {
         self.is_last
     }
 
-    /// Create a new part
+    /// Creates a part from contiguous immutable data.
+    ///
+    /// The data is retained without copying and uses the SDK's native
+    /// contiguous request-body path.
     pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+        Self::from_segmented(part_number, SegmentedBytes::from(data.into()))
+    }
+
+    /// Creates a part from an existing segmented payload.
+    ///
+    /// The transfer manager retains the payload's immutable owners through
+    /// request retries without gathering its presentation segments.
+    pub fn from_segmented(part_number: u64, data: SegmentedBytes) -> Self {
         debug_assert!(
             part_number > 0,
             "part numbers are 1-indexed and must be greater than zero"
         );
         Self {
             part_number,
-            data: data.into(),
+            data,
             checksum: None,
             is_last: None,
         }

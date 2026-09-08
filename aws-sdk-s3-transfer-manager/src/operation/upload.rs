@@ -12,6 +12,7 @@ mod output;
 mod context;
 pub(crate) mod file_body;
 mod handle;
+mod part_body;
 mod transfer;
 
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};

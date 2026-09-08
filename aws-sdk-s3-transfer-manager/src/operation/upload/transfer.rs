@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use tracing::Instrument;
 
 use std::future::Future;
@@ -50,6 +50,7 @@ use crate::operation::upload::context::{
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
+use crate::operation::upload::part_body;
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
@@ -497,10 +498,10 @@ impl UploadTransfer {
 
         let part_number = data.part_number;
         let part_num_i32 = part_number as i32;
-        let content_length = data.data.remaining() as i64;
+        let content_length = data.data.len() as i64;
         let bytes_sent = content_length as u64;
 
-        let data_bytes = data.data;
+        let sdk_body = part_body::sdk_body(data.data);
         let checksum = data.checksum;
 
         // Retry transient transport errors and throttles (the classifier picks
@@ -517,6 +518,9 @@ impl UploadTransfer {
         // body is fully sent is not bounded here (see the module docs on the
         // response-first-byte gap).
         let result = crate::retry::retry(crate::retry::classify_upload_part_retry, |_hedge| {
+            let body = sdk_body
+                .try_clone()
+                .expect("UploadPart SdkBody must be retryable");
             let req = copy_fields_to_upload_part_request(
                 &self.inner.request,
                 self.inner
@@ -526,7 +530,7 @@ impl UploadTransfer {
                     .upload_id(&upload_id)
                     .part_number(part_num_i32)
                     .content_length(content_length)
-                    .body(ByteStream::from(data_bytes.clone())),
+                    .body(ByteStream::new(body)),
                 checksum.as_ref(),
             );
             async move {

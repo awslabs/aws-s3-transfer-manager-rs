@@ -57,34 +57,86 @@ impl SegmentedBytes {
         self.remaining == 0
     }
 
+    /// Appends the remaining bytes from `other`.
+    ///
+    /// This preserves existing owner boundaries and coalesces presentation
+    /// segments only when both ranges have the same pooled slot provenance.
+    pub fn append(&mut self, other: Self) {
+        let current = std::mem::replace(self, Self::empty());
+        let mut builder = SegmentedBytesBuilder::new();
+        builder.push_segmented(current);
+        builder.push_segmented(other);
+        *self = builder.finish();
+    }
+
+    /// Consumes this value and returns its remaining presentation segments.
+    ///
+    /// Each returned [`Bytes`] retains the owners for that complete segment.
+    /// No payload bytes are copied.
+    pub fn into_segments(mut self) -> Vec<Bytes> {
+        let mut segments = Vec::with_capacity(self.segments.len());
+        while let Some(segment) = self.take_front_segment() {
+            segments.push(segment);
+        }
+        segments
+    }
+
+    /// Returns one contiguous immutable buffer when no gathering is required.
+    ///
+    /// Empty and single-segment values return `Ok` without copying. A
+    /// multi-segment value is returned unchanged in `Err`.
+    pub fn try_into_contiguous(self) -> Result<Bytes, Self> {
+        if self.segments.len() > 1 {
+            return Err(self);
+        }
+
+        let mut value = self;
+        Ok(value.take_front_segment().unwrap_or_default())
+    }
+
     /// Consumes this value and returns one contiguous immutable buffer.
     ///
     /// Empty and single-segment values do not copy. Multiple segments are
     /// copied in logical order while each source owner remains live until its
     /// bytes have been copied.
-    pub fn into_contiguous(mut self) -> Bytes {
-        match self.segments.len() {
-            0 => Bytes::new(),
-            1 => {
-                let segment = self
-                    .segments
-                    .pop_front()
-                    .unwrap_or_else(|| invariant_violation("single segment disappeared"))
-                    .trim_prefix(self.front_offset);
-                self.front_offset = 0;
-                self.remaining = 0;
-                Bytes::from_owner(ContiguousOwner::new(segment))
-            }
-            _ => {
-                let mut contiguous = BytesMut::with_capacity(self.remaining);
-                while self.has_remaining() {
-                    let copied = self.chunk().len();
-                    contiguous.extend_from_slice(self.chunk());
-                    self.advance(copied);
+    pub fn into_contiguous(self) -> Bytes {
+        match self.try_into_contiguous() {
+            Ok(contiguous) => contiguous,
+            Err(mut segmented) => {
+                let mut contiguous = BytesMut::with_capacity(segmented.remaining);
+                while let Some(segment) = segmented.take_front_segment() {
+                    contiguous.extend_from_slice(&segment);
                 }
                 contiguous.freeze()
             }
         }
+    }
+
+    /// Removes and returns the front presentation segment without copying.
+    pub(crate) fn take_front_segment(&mut self) -> Option<Bytes> {
+        if self.remaining == 0 {
+            if !self.segments.is_empty() {
+                invariant_violation("empty segmented value retained presentation ranges");
+            }
+            return None;
+        }
+
+        let mut segment = self
+            .segments
+            .pop_front()
+            .unwrap_or_else(|| invariant_violation("remaining bytes have no front segment"));
+        if self.front_offset != 0 {
+            segment = segment.trim_prefix(self.front_offset);
+            self.front_offset = 0;
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(segment.len)
+            .unwrap_or_else(|| invariant_violation("segment exceeds remaining byte length"));
+        if self.remaining == 0 && !self.segments.is_empty() {
+            invariant_violation("exhausted segmented value retained segments");
+        }
+        Some(Bytes::from_owner(ContiguousOwner::new(segment)))
     }
 
     /// Returns the contiguous bytes beginning at `offset` from this cursor.
@@ -209,6 +261,15 @@ impl SegmentedBytes {
         }
         value
     }
+
+    /// Constructs an empty segmented value.
+    fn empty() -> Self {
+        Self {
+            segments: VecDeque::new(),
+            front_offset: 0,
+            remaining: 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for SegmentedBytes {
@@ -218,6 +279,20 @@ impl std::fmt::Debug for SegmentedBytes {
             .field("segments", &self.segments.len())
             .field("remaining", &self.remaining)
             .finish()
+    }
+}
+
+impl PartialEq for SegmentedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        buffers_equal(self.clone(), other.clone())
+    }
+}
+
+impl Eq for SegmentedBytes {}
+
+impl PartialEq<Bytes> for SegmentedBytes {
+    fn eq(&self, other: &Bytes) -> bool {
+        buffers_equal(self.clone(), other.clone())
     }
 }
 
@@ -341,6 +416,23 @@ impl From<Bytes> for SegmentedBytes {
         builder.push_view(bytes);
         builder.finish()
     }
+}
+
+/// Compares two byte cursors without gathering either value.
+fn buffers_equal(mut left: impl Buf, mut right: impl Buf) -> bool {
+    if left.remaining() != right.remaining() {
+        return false;
+    }
+
+    while left.has_remaining() {
+        let compared = left.chunk().len().min(right.chunk().len());
+        if left.chunk()[..compared] != right.chunk()[..compared] {
+            return false;
+        }
+        left.advance(compared);
+        right.advance(compared);
+    }
+    true
 }
 
 /// One contiguous initialized presentation range.
@@ -1122,6 +1214,61 @@ mod tests {
 
         assert_eq!(contiguous, input[advanced..]);
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_try_into_contiguous_returns_multisegment_value_unchanged() {
+        let left = Bytes::from_static(b"left");
+        let right = Bytes::from_static(b"right");
+        let mut segmented = SegmentedBytes::from(left);
+        segmented.append(SegmentedBytes::from(right));
+
+        let segmented = segmented
+            .try_into_contiguous()
+            .expect_err("foreign segments must not be gathered");
+
+        assert_eq!(segmented.len(), 9);
+        assert_eq!(segmented.into_contiguous(), b"leftright"[..]);
+    }
+
+    #[test]
+    fn test_into_segments_preserves_partial_cursor_and_releases_each_owner() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let input: Vec<u8> = (0..carrier_size * 2)
+            .map(|index| (index.wrapping_mul(17) % 251) as u8)
+            .collect();
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        frozen.advance(carrier_size - 3);
+        assert_eq!(frozen.segments.len(), 2);
+
+        let mut segments = frozen.into_segments().into_iter();
+        let first = segments.next().expect("partial front segment");
+        let second = segments.next().expect("second segment");
+
+        assert_eq!(first, input[carrier_size - 3..carrier_size]);
+        assert_eq!(second, input[carrier_size..]);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 2) as u64
+        );
+        drop(first);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        drop(second);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_append_preserves_unconsumed_bytes_and_segmentation_independent_equality() {
+        let mut left = SegmentedBytes::from(Bytes::from_static(b"abcd"));
+        left.advance(2);
+        left.append(SegmentedBytes::from(Bytes::from_static(b"efgh")));
+
+        let right = SegmentedBytes::from(Bytes::from_static(b"cdefgh"));
+
+        assert_eq!(left, right);
+        assert_eq!(left, Bytes::from_static(b"cdefgh"));
     }
 
     #[test]

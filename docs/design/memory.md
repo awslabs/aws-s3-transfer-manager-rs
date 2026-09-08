@@ -2152,6 +2152,9 @@ impl Buf for SegmentedBytes {
 impl SegmentedBytes {
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
+    pub fn append(&mut self, other: SegmentedBytes);
+    pub fn into_segments(self) -> Vec<Bytes>;
+    pub fn try_into_contiguous(self) -> Result<Bytes, SegmentedBytes>;
     pub fn into_contiguous(self) -> Bytes;
 }
 
@@ -2174,6 +2177,17 @@ carrier guard; dropping one range returns the carrier only when no other range o
 Cloning `SegmentedBytes` clones its current cursor state and remaining holds. Each clone advances
 independently. Advancing one clone cannot release backing still reachable through another. `len`
 and `is_empty` report the state of that clone's cursor.
+
+`append` consumes another value's remaining ranges and preserves their owner boundaries. The join
+coalesces only when the same slot-identity and adjacency checks used during initial construction
+hold. `into_segments` consumes the cursor and returns one owner-backed `Bytes` for each remaining
+presentation segment without copying payload bytes. Each result retains every owner covering that
+segment, so owner release through an extracted segment occurs when that complete `Bytes` is
+released rather than at an interior owner boundary.
+
+`try_into_contiguous` distinguishes the zero-copy cases from a value that would require gathering.
+It returns an empty or one-segment `Bytes` in `Ok`; a multi-segment value is returned unchanged in
+`Err`.
 
 `into_contiguous` consumes the remaining data:
 
@@ -2207,9 +2221,10 @@ impl AsRef<[u8]> for ContiguousOwner {
 unsafe impl Send for ContiguousOwner {}
 ```
 
-The public contract does not expose segment iterators. Borrowed reads use `Buf`; callers that need
-one independently owned contiguous value use `into_contiguous`. `From<Bytes>` constructs a
-pool-independent one-segment value and retains the supplied `Bytes` as its owner.
+Borrowed reads use `Buf`. Callers that can transmit or store several immutable buffers use
+`into_segments`; callers that require one independently owned contiguous value use
+`try_into_contiguous` or `into_contiguous`. `From<Bytes>` constructs a pool-independent one-segment
+value and retains the supplied `Bytes` as its owner.
 
 **Obligations.**
 

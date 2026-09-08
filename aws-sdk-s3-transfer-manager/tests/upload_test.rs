@@ -16,6 +16,7 @@ use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3_transfer_manager::error::ErrorKind;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_sdk_s3_transfer_manager::memory::SegmentedBytes;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -226,6 +227,26 @@ impl PartStream for WakeBeforePendingStream {
     }
 }
 
+#[derive(Debug)]
+struct SegmentedPartStream {
+    part: Option<PartData>,
+    size: u64,
+}
+
+impl PartStream for SegmentedPartStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        Poll::Ready(self.part.take().map(Ok))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(self.size)
+    }
+}
+
 fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
     let upload_id = "test-upload-id".to_owned();
 
@@ -257,6 +278,32 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
         RuleMode::MatchAny,
         &[create_mpu, upload_part, complete_mpu]
     )
+}
+
+#[tokio::test]
+async fn test_custom_stream_uploads_segmented_part_data() {
+    let mut data = SegmentedBytes::from(Bytes::from_static(b"left"));
+    data.append(SegmentedBytes::from(Bytes::from_static(b"-right")));
+    let size = data.len() as u64;
+    let stream = SegmentedPartStream {
+        part: Some(PartData::from_segmented(1, data)),
+        size,
+    };
+    let client = mock_s3_client_for_multipart_upload();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("segmented-part")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    handle.join().await.unwrap();
 }
 
 #[tokio::test]
