@@ -5,7 +5,6 @@
 
 /// Adapters for other IO library traits to map to `InputStream`
 pub mod adapters;
-mod buffer;
 mod part_buffer;
 pub(crate) mod part_reader;
 mod path_body;
@@ -18,7 +17,6 @@ mod size_hint;
 /// Walker types for traversing filesystems and S3 buckets.
 pub mod walk;
 
-pub(crate) use self::buffer::Buffer;
 pub use self::part_buffer::PartBuffer;
 pub use self::path_body::PathBodyBuilder;
 pub use self::size_hint::SizeHint;

@@ -3,39 +3,113 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Platform-specific filesystem operations.
+//! Positioned filesystem operations used by transfer data paths.
+//!
+//! Reads and writes operate at explicit offsets without changing the file
+//! cursor, allowing disjoint ranges of one open file to progress concurrently.
+//! The read facade initializes pooled writable runs, while the write facade
+//! preserves segmented buffers for vectored I/O where the platform supports
+//! it. Preallocation prepares an output file for later writes but does not
+//! flush data or provide a durability boundary.
 
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 use std::fs::File;
 use std::io;
 
-/// Write all data from `buf` to `file` at the given byte `offset`.
+use crate::io::PartBuffer;
+
+/// Reads exactly enough bytes to fill every writable run in `dst`.
 ///
-/// Uses positioned writes — the file's cursor position is not affected.
-/// Multiple concurrent calls with different offsets are safe.
+/// The first byte is read from `offset`; subsequent runs continue from the end
+/// of the preceding run. The file cursor is unchanged.
+///
+/// A run is published to [`PartBuffer`] only after the positioned read has
+/// initialized that complete run. If a later read fails, earlier completed
+/// runs remain initialized, but the failing run remains unpublished. Callers
+/// must discard the complete buffer on error rather than freezing a partial
+/// upload payload.
+///
+/// Returns [`io::ErrorKind::UnexpectedEof`] when the requested range extends
+/// beyond the file and an error when the range offset cannot be represented.
+pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) -> io::Result<()> {
+    while dst.remaining_mut() != 0 {
+        // SAFETY: the returned slice remains `MaybeUninit<u8>` until the
+        // positioned read initializes the complete range.
+        let uninitialized = unsafe { dst.chunk_mut().as_uninit_slice_mut() };
+        let count = uninitialized.len();
+        if count == 0 {
+            return Err(io::Error::other(
+                "pooled file buffer exposed no writable range",
+            ));
+        }
+
+        // SAFETY: `uninitialized` is the exclusive writable range returned by
+        // `BufMut`. `sys::read_exact_at` initializes the complete slice on
+        // success, after which `advance_mut` publishes exactly that range.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                uninitialized.as_mut_ptr().cast::<u8>(),
+                uninitialized.len(),
+            )
+        };
+        sys::read_exact_at(file, bytes, offset)?;
+        // SAFETY: the positioned read initialized every byte in `bytes`.
+        unsafe {
+            dst.advance_mut(count);
+        }
+        offset = offset
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
+    }
+    Ok(())
+}
+
+/// Writes all remaining bytes from `buf` beginning at `offset`.
+///
+/// The file cursor is unchanged. Disjoint calls may therefore write the same
+/// open file concurrently without serializing on cursor position. The buffer
+/// is advanced after each successful write; an error leaves it positioned
+/// after the bytes already written so the caller can observe partial progress.
+///
+/// Unix uses vectored positioned writes to preserve segment boundaries.
+/// Platforms without positioned-write support return
+/// [`io::ErrorKind::Unsupported`].
 pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
     sys::write_all_at(file, buf, offset)
 }
 
-/// Pre-allocate disk space for `file` so that at least `len` bytes can be
-/// written without triggering per-write metadata updates or late ENOSPC.
+/// Prepares `file` for an expected final length of `len` bytes.
 ///
-/// This is best-effort: on platforms without fallocate support the call is a
-/// no-op.
+/// Linux reserves the range with `posix_fallocate`, allowing allocation
+/// failures to surface before transfer writes begin. Other Unix systems and
+/// Windows set the logical file length without guaranteeing physical space;
+/// unsupported platforms treat the request as a no-op.
+///
+/// This operation does not flush file data or metadata. Successful return is
+/// not a durability guarantee.
 pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     sys::preallocate(file, len)
 }
 
 #[cfg(all(unix, not(miri)))]
 mod sys {
+    //! Native Unix positioned I/O.
+
     use bytes::Buf;
     use std::fs::File;
     use std::io::{self, IoSlice};
+    use std::os::unix::fs::FileExt;
     use std::os::unix::io::AsFd;
 
     /// Maximum number of I/O vector entries per system call.
     const MAX_IO_SLICES: usize = 128;
 
+    /// Fills one contiguous destination range without changing the file cursor.
+    pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
+        file.read_exact_at(dst, offset)
+    }
+
+    /// Drains segmented input with as few positioned writes as the iovec limit permits.
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
         let fd = file.as_fd();
         let mut pos = offset as i64;
@@ -61,14 +135,21 @@ mod sys {
     }
 }
 
-// Under miri, use simple seek+pwrite to avoid unsupported pwritev FFI.
-// The buffer chunking logic is still exercised by the same tests.
 #[cfg(all(unix, miri))]
 mod sys {
+    //! Miri-compatible Unix operations.
+    //!
+    //! Scalar positioned writes replace unsupported `pwritev` FFI while
+    //! retaining the same buffer advancement and offset behavior.
+
     use bytes::Buf;
     use std::fs::File;
     use std::io;
     use std::os::unix::fs::FileExt;
+
+    pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
+        file.read_exact_at(dst, offset)
+    }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
         let mut pos = offset;
@@ -88,10 +169,31 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
+    //! Windows positioned I/O.
+    //!
+    //! `seek_read` and `seek_write` do not mutate the shared file cursor.
+
     use bytes::Buf;
     use std::fs::File;
     use std::io;
     use std::os::windows::fs::FileExt;
+
+    pub(super) fn read_exact_at(file: &File, dst: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !dst.is_empty() {
+            let count = file.seek_read(dst, offset)?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected end of file",
+                ));
+            }
+            dst = &mut dst[count..];
+            offset = offset
+                .checked_add(count as u64)
+                .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
+        }
+        Ok(())
+    }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
         let mut pos = offset;
@@ -117,9 +219,18 @@ mod sys {
 
 #[cfg(not(any(unix, windows)))]
 mod sys {
+    //! Fallbacks for platforms without positioned filesystem operations.
+
     use bytes::Buf;
     use std::fs::File;
     use std::io;
+
+    pub(super) fn read_exact_at(_file: &File, _dst: &mut [u8], _offset: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positioned reads not supported on this platform",
+        ))
+    }
 
     pub(super) fn write_all_at(_file: &File, _buf: &mut impl Buf, _offset: u64) -> io::Result<()> {
         Err(io::Error::new(
@@ -136,8 +247,41 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::{Context, Waker};
+
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
+
+    use crate::io::PartBuffer;
+    use crate::memory::BufferPool;
+    use crate::types::MemoryBudgetConfig;
+
+    fn test_pool() -> BufferPool {
+        BufferPool::builder()
+            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn read_exact_at_initializes_pooled_runs() {
+        let pool = test_pool();
+        let part_size = pool.carrier_size() * 2 + 37;
+        let data = (0..part_size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, &data).unwrap();
+        let mut buffer = PartBuffer::new(pool.clone(), part_size);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(buffer.poll_acquire(&mut cx, part_size).is_ready());
+
+        read_exact_at(tmp.as_file(), &mut buffer, 0).unwrap();
+        let mut frozen = buffer.freeze();
+        assert_eq!(frozen.copy_to_bytes(frozen.remaining()).as_ref(), data);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
 
     #[test]
     fn write_all_at_single_segment() {

@@ -2369,6 +2369,37 @@ polling obtains exclusive access. Mutable storage remains available only through
 shared access cannot expose or modify `PooledBufMut` ranges. Parallel parts use separate facades
 because their source progress, publication, retry, and release lifetimes are independent.
 
+#### Multipart file staging
+
+A multipart file reader claims one disjoint file range, admits an envelope for that range's complete
+length, and reads directly into the `PartBuffer`'s contiguous writable runs. Each positioned read
+uses the claimed object offset plus the bytes already filled for that part. A run is marked
+initialized only after the operating-system read fills the complete range; a short read or error
+leaves it unpublished and releases the buffer when the operation is dropped.
+
+The source is opened before transmission and retained across attempts. Positional reads do not
+mutate a shared file cursor, so disjoint part ranges can execute concurrently without changing
+their offsets or source identity.
+
+After the final run is initialized, freezing publishes the part as `SegmentedBytes` without
+gathering. The immutable payload, rather than the file-read future or reservation, retains its
+carrier charges through network transmission and retries.
+
+#### File-backed PutObject
+
+A file-backed single-request upload remains a bounded streaming body. The transfer manager opens
+the file once before constructing the retryable SDK body. Every attempt starts a new positional
+cursor over the same open source, so replacing the path after transmission begins cannot redirect
+a retry to a different file. Mutation of that source during an upload remains part of the
+file-source integrity contract rather than a property provided by retry reconstruction.
+
+The body admits and reads bounded pooled chunks instead of staging the complete object. Exact
+positioned reads initialize each chunk before publication, and the resulting `SegmentedBytes`
+cursor emits owner-backed frames without gathering. Pool charges remain live while immutable
+chunks are waiting in the body, retained by downstream HTTP processing, or owned by an
+in-progress read. Cancellation prevents further staging and releases ownership as outstanding
+operations complete.
+
 #### Request bodies
 
 `PartData` owns the immutable payload for one part. Caller-owned `Bytes` remain outside pool

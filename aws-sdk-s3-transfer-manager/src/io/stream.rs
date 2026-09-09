@@ -13,7 +13,6 @@ use bytes::{Buf, Bytes};
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
-use crate::io::Buffer;
 use crate::io::PartBuffer;
 use crate::memory::BufferPool;
 use crate::memory::SegmentedBytes;
@@ -106,13 +105,20 @@ impl InputStream {
     ///   path is a cheap `Bytes` clone. Keeping the native in-memory body (rather
     ///   than a custom wrapper) is what lets the SDK take its inline-checksum
     ///   path; wrapping would force aws-chunked trailer encoding.
-    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each retry
-    ///   constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`] with its
-    ///   own open file descriptor and read cursor.
+    /// * File-backed (`Fs`) streams open the file once, then go through
+    ///   [`SdkBody::retryable`]. Each retry constructs a fresh
+    ///   [`DirectFileBody`] or [`OffloadedFileBody`] with an independent cursor
+    ///   over the same open file identity.
     ///
     /// `direct_io` selects between the two file-body implementations: `true`
     /// when the caller owns the polling thread (managed-thread direct I/O),
     /// `false` when the body may be polled by the shared tokio runtime.
+    ///
+    /// File-backed bodies acquire bounded chunks from `buffer_pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file-backed stream cannot open its path.
     ///
     /// # Panics
     ///
@@ -124,23 +130,33 @@ impl InputStream {
     /// [`SdkBody::retryable`]: aws_smithy_types::body::SdkBody::retryable
     /// [`DirectFileBody`]: crate::operation::upload::file_body::DirectFileBody
     /// [`OffloadedFileBody`]: crate::operation::upload::file_body::OffloadedFileBody
-    pub(crate) fn into_sdk_body(self, direct_io: bool) -> aws_smithy_types::body::SdkBody {
-        use crate::operation::upload::file_body::{DirectFileBody, OffloadedFileBody};
+    pub(crate) fn into_sdk_body(
+        self,
+        direct_io: bool,
+        buffer_pool: BufferPool,
+    ) -> std::io::Result<aws_smithy_types::body::SdkBody> {
+        use crate::operation::upload::file_body::{
+            DirectFileBody, FileBodySource, OffloadedFileBody,
+        };
         use aws_smithy_types::body::SdkBody;
         match self.inner {
-            RawInputStream::Buf(bytes) => SdkBody::from(bytes),
+            RawInputStream::Buf(bytes) => Ok(SdkBody::from(bytes)),
             RawInputStream::Fs(path_body) => {
-                let path = path_body.path;
+                let source = FileBodySource::open(&path_body.path, buffer_pool)?;
                 let offset = path_body.offset;
                 let length = path_body.length;
                 if direct_io {
-                    SdkBody::retryable(move || {
-                        SdkBody::from_body_1_x(DirectFileBody::new(path.clone(), offset, length))
-                    })
+                    Ok(SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(DirectFileBody::new(source.clone(), offset, length))
+                    }))
                 } else {
-                    SdkBody::retryable(move || {
-                        SdkBody::from_body_1_x(OffloadedFileBody::new(path.clone(), offset, length))
-                    })
+                    Ok(SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(OffloadedFileBody::new(
+                            source.clone(),
+                            offset,
+                            length,
+                        ))
+                    }))
                 }
             }
             RawInputStream::Dyn(_) => panic!(
@@ -251,13 +267,6 @@ impl StreamContext {
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
         self.metrics.record_io(sample);
         self.telemetry.io_counters.record(sample);
-    }
-
-    // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.
-    /// Request a new buffer to fill
-    pub(crate) fn new_buffer(&self, capacity: usize) -> Buffer {
-        // TODO - replace allocation with memory pool
-        Buffer::new(capacity)
     }
 }
 

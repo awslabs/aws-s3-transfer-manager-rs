@@ -630,11 +630,16 @@ impl UploadTransfer {
         // Hand the request body off to the SDK as a retryable `SdkBody`:
         // in-memory sources ride `SdkBody::from(Bytes)`'s built-in rebuild path;
         // file-backed sources go through `DirectFileBody` / `OffloadedFileBody`
-        // (fresh fd + cursor per retry, TM I/O machinery, bounded peak memory).
+        // (one stable file identity, a fresh cursor per retry, and pooled
+        // bounded chunks).
         // The body must stay a native `SdkBody` (not a custom wrapper) so the SDK
         // keeps its in-memory checksum path — wrapping would force aws-chunked
         // trailer encoding and change the checksum framing.
-        let sdk_body = stream.into_sdk_body(direct_io);
+        let sdk_body =
+            match stream.into_sdk_body(direct_io, self.inner.ctx.handle.buffer_pool.clone()) {
+                Ok(body) => body,
+                Err(error) => return self.fail(error.into()),
+            };
 
         let transfer_id = self.inner.ctx.id;
         tracing::debug!(

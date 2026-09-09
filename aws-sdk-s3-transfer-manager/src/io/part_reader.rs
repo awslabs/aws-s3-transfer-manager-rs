@@ -4,8 +4,7 @@
  */
 use std::cmp;
 use std::fs::File;
-use std::future::Future;
-use std::ops::DerefMut;
+use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +14,7 @@ use bytes::{Buf, Bytes};
 use tokio::sync::Notify;
 
 use crate::io::error::Error;
+use crate::io::fs::read_exact_at;
 use crate::io::path_body::PathBody;
 use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
@@ -375,7 +375,10 @@ impl BytesPartReader {
     }
 }
 
-/// Implementation for path based input streams
+/// Produces pooled multipart payloads from disjoint ranges of one open file.
+///
+/// Range claims are serialized, but the resulting positional reads may complete
+/// concurrently and out of part-number order.
 #[derive(Debug)]
 struct PathBodyPartReader {
     body: PathBody,
@@ -411,6 +414,10 @@ impl PathBodyPartReader {
         self.state.lock().expect("lock valid").part_number - 1
     }
 
+    /// Claims and reads the next file range.
+    ///
+    /// The complete range is admitted before file I/O begins. The returned
+    /// payload retains its pooled storage independently of this reader.
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let (offset, part_number, part_size, is_last) = match self.advance(stream_cx)? {
             Some(PathBodyReadCursor {
@@ -421,37 +428,37 @@ impl PathBodyPartReader {
             }) => (offset, part_number, part_size, is_last),
             None => return Ok(None),
         };
-        // grab a buffer to fill from the context
-        let mut dst = stream_cx.new_buffer(part_size as usize);
-        // SAFETY: We set the length to capacity so the read has a full slice to fill.
-        // read_file_chunk reads exactly part_size bytes on success, so the buffer
-        // will be fully initialized after a successful read.
-        unsafe { dst.set_len(dst.capacity()) }
+        let part_size = part_size as usize;
+        let mut dst = stream_cx.part_buffer();
+        poll_fn(|cx| dst.poll_acquire(cx, part_size)).await?;
 
         if stream_cx.direct_io() {
             // Managed threads: read directly, no thread pool hop.
-            file_util::read_file_chunk(&self.file, dst.deref_mut(), offset)?;
+            read_exact_at(&self.file, &mut dst, offset)?;
         } else {
             // Shared runtime: offload to blocking thread pool.
             let fd = Arc::clone(&self.file);
             dst = tokio::task::spawn_blocking(move || {
-                file_util::read_file_chunk(&fd, dst.deref_mut(), offset)?;
+                read_exact_at(&fd, &mut dst, offset)?;
                 Ok::<_, std::io::Error>(dst)
             })
             .await??;
         }
 
         stream_cx.record_io(&crate::metrics::IoSample {
-            disk_read: part_size,
+            disk_read: part_size as u64,
             ..Default::default()
         });
 
-        Ok(Some(PartData::new(part_number, dst).mark_last(is_last)))
+        Ok(Some(
+            PartData::from_segmented(part_number, dst.freeze()).mark_last(is_last),
+        ))
     }
 
-    // Advances the `PartReaderState` to the next state and returns `PathBodyReadCursor`
-    // (offset, part_number, part_size, is_last), which will be used in the upcoming
-    // `read_file_chunk` execution.
+    /// Claims the next disjoint file range without performing I/O.
+    ///
+    /// A successful claim advances the shared cursor exactly once. Completion
+    /// order does not affect later range offsets or part numbers.
     fn advance(&self, stream_cx: &StreamContext) -> Result<Option<PathBodyReadCursor>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
@@ -481,60 +488,13 @@ impl PathBodyPartReader {
     }
 }
 
+/// One claimed file range and its multipart metadata.
 #[derive(Debug, Clone, Copy)]
 struct PathBodyReadCursor {
     offset: u64,
     part_number: u64,
     part_size: u64,
     is_last: bool,
-}
-
-pub(crate) mod file_util {
-    #[cfg(unix)]
-    pub(crate) use unix::read_file_chunk;
-    #[cfg(windows)]
-    pub(crate) use windows::read_file_chunk;
-
-    #[cfg(unix)]
-    mod unix {
-        use std::fs::File;
-        use std::io;
-        use std::os::unix::fs::FileExt;
-
-        pub(crate) fn read_file_chunk(
-            file: &File,
-            dst: &mut [u8],
-            offset: u64,
-        ) -> Result<(), io::Error> {
-            file.read_exact_at(dst, offset)
-        }
-    }
-
-    #[cfg(windows)]
-    mod windows {
-        use std::fs::File;
-        use std::io;
-        use std::os::windows::fs::FileExt;
-
-        pub(crate) fn read_file_chunk(
-            file: &File,
-            dst: &mut [u8],
-            offset: u64,
-        ) -> Result<(), io::Error> {
-            let mut pos = 0;
-            while pos < dst.len() {
-                let n = file.seek_read(&mut dst[pos..], offset + pos as u64)?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "unexpected end of file",
-                    ));
-                }
-                pos += n;
-            }
-            Ok(())
-        }
-    }
 }
 
 /// Custom-stream reader state shared by the reader and its currently active future.
@@ -831,6 +791,7 @@ mod test {
         let mut tmp = NamedTempFile::new().unwrap();
         let mut data = Bytes::from("a lep is a ball, a tay is a hammer, a flix is a comb");
         tmp.write_all(data.chunk()).unwrap();
+        let pool = test_pool();
 
         let mut builder = InputStream::read_from().path(tmp.path());
         if let Some(limit) = limit {
@@ -849,16 +810,23 @@ mod test {
         let reader = Builder::new()
             .part_size(part_size)
             .stream(stream)
-            .buffer_pool(test_pool())
+            .buffer_pool(pool.clone())
             .metrics(test_metrics())
             .telemetry(test_telemetry())
             .build()
             .unwrap();
 
         let parts = collect_parts(reader).await;
-        let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
-
-        assert_eq!(expected, actual);
+        {
+            let actual = parts.iter().map(|p| p.data.chunk()).collect::<Vec<_>>();
+            assert_eq!(expected, actual);
+        }
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (parts.len() * pool.carrier_size()) as u64
+        );
+        drop(parts);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -883,6 +851,112 @@ mod test {
     #[tokio::test]
     async fn test_path_part_reader_with_length_and_offset() {
         path_reader_test(Some(23), Some(4)).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn path_reader_fills_multiple_pooled_runs_without_gathering() {
+        let pool = test_pool();
+        let carrier_size = pool.carrier_size();
+        let part_size = carrier_size * 2 + 37;
+        let data = (0..part_size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&data).unwrap();
+
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(part_size)
+                .direct_io(true)
+                .stream(InputStream::read_from().path(tmp.path()).build().unwrap())
+                .buffer_pool(pool.clone())
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+        let PartReadStart::Ready(future) = reader.start_part_read().await else {
+            panic!("file source unexpectedly blocked");
+        };
+        let part = future.await.unwrap().unwrap();
+        assert_eq!(part.data.len(), part_size);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 3) as u64
+        );
+
+        let segments = part.data.into_segments();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].as_ref(), data);
+        drop(segments);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn dropping_file_read_waiting_for_admission_cancels_its_request() {
+        let pool = test_pool();
+        let carrier_size = pool.carrier_size();
+        let capacity = pool.metrics().configured_capacity_bytes() as usize;
+        let reservation = pool.try_reserve(capacity).unwrap().unwrap();
+        let holder = pool.acquire(&reservation, capacity).unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0x5a; carrier_size]).unwrap();
+
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(carrier_size)
+                .stream(InputStream::read_from().path(tmp.path()).build().unwrap())
+                .buffer_pool(pool.clone())
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+        let PartReadStart::Ready(mut future) = reader.start_part_read().await else {
+            panic!("file source unexpectedly blocked");
+        };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        assert_eq!(pool.metrics().queued_reservations(), 1);
+
+        drop(future);
+        assert_eq!(pool.metrics().queued_reservations(), 0);
+        drop(holder);
+        drop(reservation);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn short_file_read_releases_pooled_storage() {
+        let pool = test_pool();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"short").unwrap();
+        let stream = InputStream::read_from()
+            .path(tmp.path())
+            .length(10)
+            .build()
+            .unwrap();
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(10)
+                .stream(stream)
+                .buffer_pool(pool.clone())
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+        let PartReadStart::Ready(future) = reader.start_part_read().await else {
+            panic!("file source unexpectedly blocked");
+        };
+
+        assert!(future.await.is_err());
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
     #[derive(Debug)]
