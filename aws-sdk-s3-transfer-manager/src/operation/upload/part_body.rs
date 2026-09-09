@@ -137,6 +137,23 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_partial_polling_restarts_from_the_first_segment() {
+        let mut body = sdk_body(segmented(
+            Bytes::from_static(b"first"),
+            Bytes::from_static(b"-second"),
+        ));
+
+        let first = poll_frame(&mut body).unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first, b"first"[..]);
+
+        let retry = body
+            .try_clone()
+            .expect("partially consumed segmented body must remain retryable");
+        assert_eq!(collect(body), b"-second"[..]);
+        assert_eq!(collect(retry), b"first-second"[..]);
+    }
+
+    #[test]
     fn contiguous_sdk_body_preserves_native_in_memory_representation() {
         let source = Bytes::from_static(b"contiguous");
         let source_ptr = source.as_ptr();

@@ -147,11 +147,6 @@ impl PartReader {
         Ok(Self { inner, stream_cx })
     }
 
-    #[allow(dead_code)] // TODO: re-wire upload part validation
-    pub(crate) fn part_size(&self) -> usize {
-        self.stream_cx.part_size()
-    }
-
     /// Starts one owned source operation.
     ///
     /// In-memory reads are completed synchronously. File reads retain their asynchronous operation.

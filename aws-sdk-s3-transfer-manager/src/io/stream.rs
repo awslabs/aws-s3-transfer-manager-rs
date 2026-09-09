@@ -298,15 +298,6 @@ impl std::fmt::Debug for PartData {
 }
 
 impl PartData {
-    // Check if this is the last part
-    //
-    // It is `Option` because it's not always possible to determine
-    // whether the just-yielded part is the last one, e.g., streaming cases.
-    #[allow(dead_code)] // TODO: re-wire upload part validation
-    pub(crate) fn is_last(&self) -> Option<bool> {
-        self.is_last
-    }
-
     /// Creates a part from contiguous immutable data.
     ///
     /// The data is retained without copying and uses the SDK's native
