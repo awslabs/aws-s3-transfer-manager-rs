@@ -354,7 +354,7 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
 /// figure (`100 / 250`).
-const GBPS_PER_CONN: f64 = 0.4;
+pub(crate) const GBPS_PER_CONN: f64 = 0.4;
 
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without
@@ -571,17 +571,56 @@ pub(crate) fn seed_from_gbps(gbps: f64) -> usize {
     (n as usize).clamp(MIN_CONN, ABSOLUTE_MAX_CONN)
 }
 
-/// Resolve the `Auto` concurrency seed from detected machine facts.
+/// Source used to resolve [`ConcurrencyMode::Auto`].
 ///
-/// Recognized family -> bandwidth estimate (`per_vcpu x vcpus`) -> connection
-/// derivation, clamped `[MIN_CONN, ABSOLUTE_MAX_CONN]`. Unknown/undetected ->
-/// `FALLBACK_INFLIGHT_PER_VCPU x vcpus` (a concurrency heuristic, not a bandwidth
-/// estimate), clamped `[FALLBACK_MIN, ABSOLUTE_MAX_CONN]` so an unknown box gets a
-/// usable default. Pure function of its inputs.
-pub(crate) fn auto_concurrency_seed(instance_type: Option<&str>, vcpus: usize) -> usize {
+/// [`ConcurrencyMode::Auto`]: crate::types::ConcurrencyMode::Auto
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AutoConcurrencySource {
+    /// The detected EC2 family supplied a network-bandwidth estimate.
+    InstanceFamily,
+    /// No family estimate was available, so the target scales with usable vCPUs.
+    VcpuFallback,
+}
+
+impl AutoConcurrencySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::InstanceFamily => "instance_family",
+            Self::VcpuFallback => "vcpu_fallback",
+        }
+    }
+}
+
+/// Result of resolving automatic concurrency from one detected machine profile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedAutoConcurrency {
+    /// Fixed in-flight work target installed in the scheduler.
+    pub(crate) target: usize,
+    /// Estimated network bandwidth when the instance family was recognized.
+    pub(crate) estimated_gbps: Option<f64>,
+    /// Machine signal from which the target was derived.
+    pub(crate) source: AutoConcurrencySource,
+}
+
+/// Resolve automatic concurrency while retaining its diagnostic inputs.
+pub(crate) fn resolve_auto_concurrency(
+    instance_type: Option<&str>,
+    vcpus: usize,
+) -> ResolvedAutoConcurrency {
     match instance_type.and_then(family_gbps_per_vcpu) {
-        Some(per_vcpu) => seed_from_gbps(per_vcpu * vcpus as f64),
-        None => (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(FALLBACK_MIN, ABSOLUTE_MAX_CONN),
+        Some(per_vcpu) => {
+            let estimated_gbps = per_vcpu * vcpus as f64;
+            ResolvedAutoConcurrency {
+                target: seed_from_gbps(estimated_gbps),
+                estimated_gbps: Some(estimated_gbps),
+                source: AutoConcurrencySource::InstanceFamily,
+            }
+        }
+        None => ResolvedAutoConcurrency {
+            target: (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(FALLBACK_MIN, ABSOLUTE_MAX_CONN),
+            estimated_gbps: None,
+            source: AutoConcurrencySource::VcpuFallback,
+        },
     }
 }
 
@@ -746,6 +785,10 @@ mod tests {
 
     // --- concurrency seeding ---
 
+    fn auto_concurrency_seed(instance_type: Option<&str>, vcpus: usize) -> usize {
+        resolve_auto_concurrency(instance_type, vcpus).target
+    }
+
     #[test]
     fn test_family_lookup_parses_family_from_type() {
         // Family is the prefix before the first '.'; size-independent.
@@ -768,6 +811,34 @@ mod tests {
         assert_eq!(auto_concurrency_seed(Some("m6idn.32xlarge"), 128), 500);
         // c8gn: 3.125 Gbps/vCPU. 16xlarge = 64 vCPU -> 200 Gbps -> 500.
         assert_eq!(auto_concurrency_seed(Some("c8gn.16xlarge"), 64), 500);
+    }
+
+    #[test]
+    fn test_auto_resolution_reports_family_estimate() {
+        let resolved = resolve_auto_concurrency(Some("m6idn.16xlarge"), 64);
+        assert_eq!(
+            resolved,
+            ResolvedAutoConcurrency {
+                target: 250,
+                estimated_gbps: Some(100.0),
+                source: AutoConcurrencySource::InstanceFamily,
+            }
+        );
+        assert_eq!(resolved.source.as_str(), "instance_family");
+    }
+
+    #[test]
+    fn test_auto_resolution_reports_vcpu_fallback() {
+        let resolved = resolve_auto_concurrency(Some("unknown.16xlarge"), 64);
+        assert_eq!(
+            resolved,
+            ResolvedAutoConcurrency {
+                target: 320,
+                estimated_gbps: None,
+                source: AutoConcurrencySource::VcpuFallback,
+            }
+        );
+        assert_eq!(resolved.source.as_str(), "vcpu_fallback");
     }
 
     #[test]
