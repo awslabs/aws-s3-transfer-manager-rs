@@ -31,9 +31,10 @@ receives.
 ## Conventions
 
 **Requirement IDs** — `FR-<Category>-<n>` for functional requirements, `NFR-<Category>-<n>` for
-non-functional ones, numbered from 1 within each category: `Root`, `Enum`, `Cmp`, `Filter`, `Exec`, `Fail`,
-`Dry`, `Obs`, and for NFRs `Cost`, `Lat`, `Mem`, `Tput`. Numbering stays contiguous while this is a draft
-and freezes on approval.
+non-functional ones, numbered from 1 within each category: roots (`Root`), enumeration (`Enum`), comparison
+(`Cmp`), filtering (`Filter`), execution (`Exec`), failures (`Fail`), dry run (`Dry`), observability (`Obs`),
+and for NFRs cost, latency, memory and throughput (`Cost`, `Lat`, `Mem`, `Tput`). Numbering stays contiguous
+while this is a draft and freezes on approval.
 
 **MUST**, **MUST NOT**, **SHOULD** and **MAY** carry their RFC 2119 meanings.
 
@@ -74,6 +75,8 @@ low-traffic but valid requests may be missing. Reaction counts are point-in-time
 ---
 
 ## 2. Directions and roots (`FR-Root-*`)
+
+What a run is pointed at, which way bytes move, and which configurations sync refuses.
 
 **FR-Root-1** Sync MUST support `Upload`, `Download`, and `Copy`. Local → local is out of scope.
 *`[CLI]` `subcommands.py` → `CommandArchitecture.run`, `cmd_translation = {'locals3': 'upload', 's3s3': 'copy', 's3local': 'download'}`; `SyncCommand.USAGE` lists exactly those three path pairs.*
@@ -126,6 +129,9 @@ so it MUST refuse.
 *`[CLI]` `subcommands.py` → `CommandParameters._validate_not_s3_express_bucket_for_sync` ("Cannot use sync command with a directory bucket" — directory buckets do not list lexicographically, which the comparison depends on), plus `_validate_path_args`, `_validate_sse_c_args`. `[ISSUE]` [#8470](https://github.com/aws/aws-cli/issues/8470) — before that validation existed, syncing to a directory bucket silently produced wrong results: "some files that do exist in the source are not recognized".*
 
 ## 3. Enumeration (`FR-Enum-*`)
+
+Producing the list of entries under each root: what counts as an entry, what order they arrive in, and
+what happens to the ones that cannot be read.
 
 **FR-Enum-1** A run MUST list both roots all the way through. Only filters (§5) reduce what gets listed.
 *`[CLI]` `subcommands.py` → `CommandArchitecture.run`: `'file_generator': [file_generator, rev_generator]`, where `rev_files = FileFormat().format(dest, src, ...)`.*
@@ -235,6 +241,8 @@ the comparison depends on and multiplies the number of requests.
 
 ## 4. Comparison (`FR-Cmp-*`)
 
+Deciding, for each relative key, whether to transfer it, delete it, or leave it alone.
+
 For a relative key present on both sides, let `delta = dest.last_modified − src.last_modified`.
 
 **FR-Cmp-1 (default mode)** Transfer when the key is on the source side only, or when it is on both sides
@@ -341,6 +349,8 @@ MUST NOT add a single per-entry request (FR-Cmp-5).
 
 ## 5. Filtering (`FR-Filter-*`)
 
+Narrowing which entries take part, on both sides.
+
 **FR-Filter-1** Sync MUST support an ordered list of include and exclude patterns. Every entry starts out
 included, the rules are applied in the order given, and the last rule that matches decides.
 
@@ -386,6 +396,8 @@ destination stay there forever, because FR-Filter-3 stops any sync from removing
 *`[ISSUE]` [#4923](https://github.com/aws/aws-cli/issues/4923) (9 reactions) — the reporter's use case is syncing only a recent window while still pruning older objects at the destination.*
 
 ## 6. Execution (`FR-Exec-*`)
+
+Carrying out the decisions: transfers, deletes, and the object properties that go with them.
 
 **FR-Exec-1** Every entry sync decides to transfer MUST get exactly what a single-object transfer would
 get: the same integrity checks, the same retries, the same splitting of large objects into parts. Sync MUST
@@ -544,6 +556,8 @@ half-written destination entry looking like a finished one, and MUST report what
 
 ## 7. Skips, warnings, failures (`FR-Fail-*`)
 
+What happens when an entry, a directory, or a listing cannot be handled, and what the caller is told.
+
 **FR-Fail-1** An object sitting in an archival storage class, not currently restored, MUST be skipped with
 a warning on `Download` and `Copy` — its bytes are not retrievable, so trying is a guaranteed failure. Two
 separate switches MUST exist: one to attempt the transfer anyway, one to stop warning about it. `Upload` is
@@ -617,6 +631,8 @@ One policy, so a caller reasons about failure once. Two things sit outside it:
 
 ## 8. Dry run (`FR-Dry-*`)
 
+Producing the plan without acting on it.
+
 **FR-Dry-1** A dry run MUST produce the whole plan — every transfer and every delete that would happen —
 and MUST NOT issue a single request that changes anything. Listing, filtering and comparing all still
 happen; only the acting is withheld.
@@ -627,6 +643,8 @@ truthful prediction of what a real run would do, given the two sides do not chan
 *`[CLI]` the dry-run branch sits downstream of the comparator in the same generator chain (`subcommands.py` → `CommandArchitecture.run`), so no separate decision logic exists.*
 
 ## 9. Observability (`FR-Obs-*`)
+
+What the caller can see while a run is going, and what the result carries when it finishes.
 
 **FR-Obs-1** For every entry, sync MUST hand the caller a value carrying the direction, the relative key,
 the source, the destination, the action taken and the reason for it. Log output does not satisfy this: the
