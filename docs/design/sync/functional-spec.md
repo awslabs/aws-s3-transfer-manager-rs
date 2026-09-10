@@ -66,7 +66,8 @@ low-traffic but valid requests may be missing. Reaction counts are point-in-time
 | **root** | A source or destination location: a local directory, or a bucket plus key prefix. |
 | **entry** | One comparable unit under a root: a local file, or an S3 object. |
 | **relative key** | An entry's name relative to its own root, as a **sequence of bytes** with `/` as the separator. The join key between the two sides. Bytes rather than text because a local filename need not be valid UTF-8, and deriving a text form from one that is not loses information. |
-| **pair state** | For a relative key: `SrcOnly`, `DestOnly`, or `Both`. |
+| **side state** | What enumeration established for a key on one side: **present** (it produced the entry), **absent** (it passed the key's position in key order without producing one), or **unknown** (enumeration failed somewhere covering the key). |
+| **pair state** | For a relative key that is present or absent on both sides: `SrcOnly`, `DestOnly`, or `Both`. |
 | **action** | The decision for a relative key: `Transfer`, `Delete`, or `Skip`. |
 | **direction** | `Upload` (local → S3), `Download` (S3 → local), `Copy` (S3 → S3). |
 | **plan** | The complete set of (relative key, action) decisions for a run. |
@@ -224,12 +225,13 @@ not readable.` and then plans `delete: s3://.../locked/b.txt`. It could not see 
 concluded the object was orphaned. The run may continue, but every key under `locked/` must be treated as
 unknown.
 
-The consequence is asymmetric:
+The exposure differs by direction (FR-Fail-7):
 
 - Local tree as **source** (`Upload`) — the source looks emptier than it is, so destination counterparts
-  appear orphaned. Continuing is legitimate; continuing *and* deleting is not.
+  appear orphaned. Continuing is legitimate; deleting them is not.
 - Local tree as **destination** (`Download`) — the failure hides local files, so delete mode can only
-  under-delete, which is safe.
+  under-delete. The exposure moves to transfers: a hidden local file looks absent, and writing over it
+  skips the comparison.
 *`[CLI]` `filegenerator.py` → `list_files` calls `should_ignore_file` on the directory before `listdir`, so `aws s3 sync` warns and skips rather than raising, continues, and exits 2. Verified by execution: with `locked/` at mode `000` and the destination mirroring the full tree, `aws s3 sync --delete --dryrun` warned about the directory and then planned to delete the object beneath it.*
 
 **FR-Enum-13** Listing MUST send an empty delimiter, so S3 returns every key in one flat, alphabetical
@@ -604,14 +606,27 @@ individual entry failing. One entry failing leaves a usable run; a root that can
 never knew what was there.
 *`[CLI]` `filegenerator.py` → `list_objects` / `_list_single_object` let `ClientError` propagate out of the generator, failing the command rather than producing an empty side.*
 
-**FR-Fail-7** A key MUST NOT be deleted unless sync actually saw the source side and saw that the
-source no longer has it. Only "nothing is there" justifies deleting; "I could not look" does not.
+**FR-Fail-7** A key whose side state is unknown on either side MUST get no action, and MUST be reported as
+`skipped-unknown`. Two cases follow:
 
-- One entry skipped for any FR-Enum-3 reason holds back the delete for **that one key**.
-- A directory that could not be read (FR-Enum-12) holds back deletes for **every key under its prefix**,
-  since those keys form one unbroken run in alphabetical order.
-- Both MUST be reported distinguishably: an unreadable entry as `skipped-unknown`, a device, FIFO or socket
-  as `skipped-with-warning`. Only the first means the run was incomplete.
+- **Unknown source, present destination** — MUST NOT delete. "Nothing is there" justifies deleting; "I
+  could not look" does not.
+- **Present source, unknown destination** — MUST NOT transfer. Treating an unknown destination as absent
+  skips the comparison, which can overwrite a newer destination entry and defeats no-overwrite mode
+  (FR-Cmp-4) outright.
+
+A failure makes a range of keys unknown on the side that failed:
+
+| Failure | Keys it makes unknown |
+|---|---|
+| an entry that could not be read (FR-Enum-3) | that one key |
+| a directory that could not be read (FR-Enum-12) | every key under its prefix, one unbroken run in key order |
+| a listing page that could not be fetched | every key from the last one observed to the end of that listing, since pagination cannot resume past a page that never arrived |
+| a root that could not be listed (FR-Fail-6) | the whole key space, which is why that failure ends the run: no key has a known state on both sides, so nothing anywhere is licensed |
+
+An entry that cannot be transferred at all — device, FIFO, socket — is **present**. Its delete is held back
+because the source has something at that key, and it MUST be reported as `skipped-with-warning`. Only
+`skipped-unknown` means the run could not see.
 *`[NEW]` — a strengthening. In the CLI a skipped local file is never yielded (`filegenerator.py` → `triggers_warning`), so the comparator sees a destination-only key and deletes it: a local permissions glitch causes remote deletion on a run reporting success-with-warning. The delete has been observed for the directory case: with a local directory at mode `000` and the destination mirroring the full tree, `aws s3 sync --delete --dryrun` warned that the directory was unreadable and then planned to delete the object beneath it. The single-file case runs through the same not-yielded path and was read from the code, not executed. `Upload`-only exposure; no public issue found.*
 
 **FR-Fail-8** For `Download`, two keys that differ only in case — `Report.pdf` and `report.pdf` — land on
@@ -699,5 +714,5 @@ set directly. Listing and comparing MUST NOT become a ceiling on how many transf
 
 **NFR-Tput-2** Deciding one key MUST cost the same whether the run has skipped nothing or skipped a
 million entries.
-*`[DERIVED]` — a skip records a non-observation that later delete decisions must consult (FR-Fail-7). Scanning all of them measures 48k decisions/sec at ten thousand skips against 376M at one, which makes the delete decision the run's ceiling instead of the network, reachable from one unreadable subtree. Correctness tests cannot catch this: the degrading scan returns the same answers.*
+*`[DERIVED]` — a skip records a non-observation that later decisions must consult (FR-Fail-7). Scanning all of them measures 48k decisions/sec at ten thousand skips against 376M at one, which makes the delete decision the run's ceiling instead of the network, reachable from one unreadable subtree. Correctness tests cannot catch this: the degrading scan returns the same answers.*
 
