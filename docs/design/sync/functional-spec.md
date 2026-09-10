@@ -561,9 +561,13 @@ What happens when an entry, a directory, or a listing cannot be handled, and wha
 **FR-Fail-1** An object sitting in an archival storage class, not currently restored, MUST be skipped with
 a warning on `Download` and `Copy` — its bytes are not retrievable, so trying is a guaranteed failure. Two
 separate switches MUST exist: one to attempt the transfer anyway, one to stop warning about it. `Upload` is
-unaffected. Storage class and restore state both come back in the listing, so this MUST NOT cost a
-per-entry request (FR-Cmp-5).
-*`[CLI]` `s3handler.py` → `_warn_glacier` (checked in `DownloadRequestSubmitter` and `CopyRequestSubmitter` warning handlers); `fileinfo.py` → `is_glacier_compatible` / `_is_glacier_object` (`GLACIER`, `DEEP_ARCHIVE`, restored iff `ongoing-request="false"` in `Restore`). `[DOC]` `--force-glacier-transfer`, `--ignore-glacier-warnings` (including its effect on the exit code).*
+unaffected.
+
+Storage class comes back in a listing. Restore state only comes back when the listing asks for it, so sync
+MUST request `RestoreStatus` on every listing — which keeps the check free of per-entry requests
+(FR-Cmp-5). It has to be every listing: leave the header off and the field is simply missing, which looks
+identical to an object that was never restored.
+*`[CLI]` `s3handler.py` → `_warn_glacier` (checked in `DownloadRequestSubmitter` and `CopyRequestSubmitter` warning handlers); `fileinfo.py` → `is_glacier_compatible` / `_is_glacier_object` (`GLACIER`, `DEEP_ARCHIVE`). The restore half is a departure: `_is_restored` tests for `ongoing-request="false"` in `Restore`, a HeadObject header, against data that came from a listing, and the CLI never sends `OptionalObjectAttributes`. So the test always fails during a sync and a restored object is skipped with a warning even though its bytes are available. `[DOC]` `--force-glacier-transfer`, `--ignore-glacier-warnings` (including its effect on the exit code); `ListObjectsV2` carries `RestoreStatus` (`IsRestoreInProgress`, `RestoreExpiryDate`) when the request sends `x-amz-optional-object-attributes: RestoreStatus`.*
 
 **FR-Fail-2** Sync MUST offer two failure policies, continue and abort, and MUST default to continue.
 
