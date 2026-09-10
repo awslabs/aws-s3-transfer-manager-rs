@@ -636,6 +636,12 @@ Producing the plan without acting on it.
 **FR-Dry-1** A dry run MUST produce the whole plan — every transfer and every delete that would happen —
 and MUST NOT issue a single request that changes anything. Listing, filtering and comparing all still
 happen; only the acting is withheld.
+
+"The whole plan" means every decision reaches the caller, not that the plan is held anywhere. Decisions MUST
+be delivered as they are produced, and when a caller stops reading, sync MUST stop enumerating.
+
+If listing fails part-way — a page that never arrives, a local directory it cannot read — the plan is then
+missing decisions (FR-Fail-7), and the result MUST say so.
 *`[CLI]` `s3handler.py` → `BaseTransferRequestSubmitter.submit`: `if not self._cli_params.get('dryrun') ... else self._submit_dryrun(fileinfo)`, emitting `results.DryRunResult`. `[DOC]` `--dryrun`.*
 
 **FR-Dry-2** A dry run MUST go through the same comparison code as a real run, so the plan it prints is a
