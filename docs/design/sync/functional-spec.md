@@ -65,7 +65,7 @@ low-traffic but valid requests may be missing. Reaction counts are point-in-time
 |---|---|
 | **root** | A source or destination location: a local directory, or a bucket plus key prefix. |
 | **entry** | One comparable unit under a root: a local file, or an S3 object. |
-| **relative key** | An entry's name relative to its own root, as a **sequence of bytes** with `/` as the separator. The join key between the two sides. Bytes rather than text because a local filename need not be valid UTF-8, and deriving a text form from one that is not loses information. |
+| **relative key** | An entry's name relative to its own root, with `/` as the separator. The join key between the two sides. An S3 object key is Unicode encoded as UTF-8, so a relative key is too, and a local name that is not valid UTF-8 has no key it could take (FR-Enum-3). |
 | **side state** | What enumeration established for a key on one side: **present** (it produced the entry), **absent** (it passed the key's position in key order without producing one), or **unknown** (enumeration failed somewhere covering the key). |
 | **pair state** | For a relative key that is present or absent on both sides: `SrcOnly`, `DestOnly`, or `Both`. |
 | **action** | The decision for a relative key: `Transfer`, `Delete`, or `Skip`. |
@@ -151,7 +151,12 @@ that entry cannot be transferred or cannot be read, and the two cases MUST be to
 
 - **Nothing to transfer** — a device (`/dev/null`), a FIFO, or a socket. No setting makes these
   transferable, and reading one may never finish. A warning under either policy. A symlink sync was told
-  not to follow belongs here too (FR-Enum-4).
+  not to follow belongs here too (FR-Enum-4), as does a local name that is not valid UTF-8: an S3 object
+  key is Unicode encoded as UTF-8, so there is no key such a name could take.
+
+  Such a name MUST NOT be converted lossily to make a key. Two names differing only in invalid bytes would
+  collapse onto one key, and sync would then treat two files as one. The entry MUST be skipped and named,
+  so a caller can see which file it was.
 - **Should have been readable and was not** — missing, deleted mid-run, unreadable, or a symlink pointing
   at nothing: a failure, following the global policy (FR-Fail-9).
 
@@ -162,7 +167,7 @@ stop the destination object from being deleted.
 
 This is about one entry at a time. Failing to read an entire directory is a different problem
 (FR-Enum-12).
-*`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`.*
+*`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not.*
 
 **FR-Enum-4** Following symlinks MUST be a setting, and MUST default to **not** following them. With
 following turned on, sync transfers what the link points at, filed under the link's own name rather than
