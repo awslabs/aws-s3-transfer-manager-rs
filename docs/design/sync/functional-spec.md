@@ -591,9 +591,15 @@ first failed entry throws away progress that the next run has to repeat.
   stopped.
 *`[NEW]` — the two policies are the same pair the transfer manager's other directory operations expose, so a caller can compose them without learning a second model.*
 
-**FR-Fail-4** The result MUST report at least: how many entries and bytes were transferred, deleted,
-skipped as unchanged, skipped with a warning, and skipped as unknown (FR-Fail-7); the list of per-entry
-errors; and the outcome of each individual delete.
+**FR-Fail-4** The result MUST report how many entries and bytes were transferred, deleted, skipped as
+unchanged, skipped with a warning, and skipped as unknown (FR-Fail-7). None of it MUST grow with the number
+of entries.
+
+Failures MUST be grouped by cause and common prefix — "247,000 AccessDenied under `logs/2019/`" — which
+bounds them by the number of distinct causes.
+
+Per-entry detail, including the outcome of each delete, reaches the caller as events while the run is going
+(FR-Obs-1).
 
 `skipped-unknown` MUST be distinguishable from `skipped-unchanged`. They look similar and mean opposite
 things: the first says sync could not see what was there and held a delete back, so the destination may
@@ -682,6 +688,10 @@ dry runs included.
 
 They MUST carry enough that a caller can print the familiar `upload:` / `download:` / `copy:` / `delete:`
 lines from them alone.
+
+Delivery MUST be bounded, so a caller that reads slowly MAY miss events and the run MUST NOT slow down
+waiting. The result stays complete either way (FR-Fail-4). A dry run is the exception, where the events are
+the output and none may be missed (FR-Dry-1).
 
 - The reason MUST distinguish at least these: not present at the destination, sizes differ, times differ,
   forced, excluded by a filter, in an archival storage class, a case conflict, untransferable (device, FIFO,
