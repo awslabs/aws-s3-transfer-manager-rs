@@ -10,7 +10,9 @@ use crate::metrics::unit::ByteUnit;
 use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead, RuntimeMode};
 
 mod diagnostics;
-pub(crate) use diagnostics::{DiagnosticsConfig, MemoryDiagnosticsConfig};
+pub(crate) use diagnostics::{
+    DiagnosticsConfig, MemoryDiagnosticsConfig, TransferDiagnosticsConfig,
+};
 
 pub(crate) mod loader;
 pub(crate) mod user_agent;
@@ -272,6 +274,17 @@ impl Builder {
     /// Default is [`MemoryConfig::Auto`].
     pub fn memory(mut self, memory: MemoryConfig) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Installs deterministic diagnostics for internal tests.
+    #[cfg(test)]
+    pub(crate) fn diagnostics_for_test(
+        mut self,
+        memory: MemoryDiagnosticsConfig,
+        transfer_detail_level: u64,
+    ) -> Self {
+        self.diagnostics = Some(DiagnosticsConfig::for_test(memory, transfer_detail_level));
         self
     }
 

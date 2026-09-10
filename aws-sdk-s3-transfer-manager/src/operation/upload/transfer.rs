@@ -30,22 +30,25 @@
 //!   measured from send completion (a signal the SDK does not currently expose).
 
 use std::cmp;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use tracing::Instrument;
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart, PartReader};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{
     PartPlan, PartReadWake, PartTransferState, PendingPartRead, UploadPartWork, UploadState,
+};
+use crate::operation::upload::diagnostics::{
+    self, PartTransferSnapshot, PartTransferTransition, UploadDiagnosticTimer,
+    UploadTransferDiagnostics,
 };
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
@@ -138,6 +141,14 @@ impl UploadTransfer {
         &self.inner.ctx
     }
 
+    fn emit_part_pipeline(
+        &self,
+        transition: PartTransferTransition,
+        snapshot: Option<PartTransferSnapshot>,
+    ) {
+        diagnostics::emit_pipeline_transition(self.inner.ctx.id, transition, snapshot);
+    }
+
     /// Get the transfer ID.
     /// The original request (sans the body as it will have been taken for processing)
     pub(crate) fn request(&self) -> &UploadInput {
@@ -225,13 +236,28 @@ impl UploadTransfer {
                 }
                 UploadState::Transferring { parts, .. } => {
                     if let Some(work) = parts.schedule_part() {
+                        let transition = if work.is_resumed() {
+                            PartTransferTransition::SourceWakeScheduled
+                        } else {
+                            PartTransferTransition::NewPartScheduled
+                        };
+                        self.emit_part_pipeline(transition, parts.transition_snapshot());
                         return PollWork::ready(IoRequest {
                             data: Some(Box::new(UploadWork::UploadPart(work))),
                         });
                     }
+                    let snapshot = parts.transition_snapshot();
+                    let pending_reason = parts.pending_reason();
+                    if parts.is_complete() {
+                        self.emit_part_pipeline(PartTransferTransition::CompletionReady, snapshot);
+                    }
                     if try_begin_completing(&mut state) {
                         continue;
                     }
+                    self.emit_part_pipeline(
+                        PartTransferTransition::Pending(pending_reason),
+                        snapshot,
+                    );
                     self.inner.ctx.set_pending();
                     return PollWork::Pending;
                 }
@@ -281,6 +307,8 @@ impl UploadTransfer {
         let mpu_req =
             copy_fields_to_mpu_request(&self.inner.request, client.create_multipart_upload());
 
+        let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
+        let create_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
         let resp = match mpu_req
             .customize()
             .config_override(
@@ -296,6 +324,7 @@ impl UploadTransfer {
             Ok(resp) => resp,
             Err(e) => return self.fail(e.into()),
         };
+        let create_elapsed = create_timer.elapsed();
 
         let upload_id = resp.upload_id().expect("upload_id present").to_string();
         let response_builder = UploadOutputBuilder::from(resp);
@@ -358,7 +387,12 @@ impl UploadTransfer {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             *state = UploadState::Transferring {
                 upload_id,
-                parts: PartTransferState::new(part_reader, plan, completed_parts_capacity),
+                parts: PartTransferState::new(
+                    part_reader,
+                    plan,
+                    completed_parts_capacity,
+                    UploadTransferDiagnostics::new(transfer_diagnostics, create_elapsed),
+                ),
                 response_builder,
             };
         }
@@ -385,8 +419,8 @@ impl UploadTransfer {
             }
         };
 
-        let (mut future, wake) = match work.take_pending_read() {
-            Some(read) => (read.future, read.wake),
+        let (mut future, wake, mut timing) = match work.take_pending_read() {
+            Some(read) => (read.future, read.wake, read.timing),
             None => {
                 let future = match part_reader
                     .start_part_read()
@@ -400,6 +434,12 @@ impl UploadTransfer {
                             panic!("unexpected state while retracting upload part");
                         };
                         parts.retract_scheduled_part();
+                        let snapshot = parts.transition_snapshot();
+                        drop(state);
+                        self.emit_part_pipeline(
+                            PartTransferTransition::CustomSourceBlocked,
+                            snapshot,
+                        );
                         return WorkOutcome::Pending;
                     }
                     PartReadStart::Finished => {
@@ -407,7 +447,11 @@ impl UploadTransfer {
                         return WorkOutcome::Pending;
                     }
                 };
-                (future, PartReadWake::new(self.inner.ctx.scheduler_waker()))
+                (
+                    future,
+                    PartReadWake::new(self.inner.ctx.scheduler_waker()),
+                    work.take_timing(),
+                )
             }
         };
 
@@ -422,16 +466,24 @@ impl UploadTransfer {
                 let UploadState::Transferring { parts, .. } = &mut *state else {
                     panic!("unexpected state while parking upload part read");
                 };
+                parts.record_read_pending(&mut timing);
                 let parked_wake = Arc::clone(&wake);
-                parts.park_read(PendingPartRead { future, wake });
+                let observation = timing.observation();
+                parts.park_read(PendingPartRead {
+                    future,
+                    wake,
+                    timing,
+                });
+                let snapshot = parts.transition_snapshot();
                 drop(state);
+                diagnostics::emit_source_pending(self.inner.ctx.id, observation, snapshot);
                 parked_wake.requeue_if_notified();
                 return WorkOutcome::Pending;
             }
             Poll::Ready(Ok(Some(data))) => data,
             Poll::Ready(Ok(None)) => {
                 tracing::trace!("part_reader exhausted");
-                return self.on_end_of_stream(&part_reader).await;
+                return self.on_end_of_stream(&part_reader, timing).await;
             }
             Poll::Ready(Err(error)) => return self.fail(error.into()),
         };
@@ -453,7 +505,7 @@ impl UploadTransfer {
             ));
         }
 
-        self.send_part(data).await
+        self.send_part(data, timing).await
     }
 
     /// Records source end-of-stream and synthesizes the empty part S3 requires when necessary.
@@ -461,7 +513,11 @@ impl UploadTransfer {
     /// Exactly one caller owns empty-stream synthesis because [`PartTransferState`] records the
     /// first end-of-stream observation. A declared length never takes this path: inventing a part
     /// would contradict the source's independent size declaration.
-    async fn on_end_of_stream(&self, part_reader: &PartReader) -> WorkOutcome {
+    async fn on_end_of_stream(
+        &self,
+        part_reader: &PartReader,
+        timing: diagnostics::UploadPartTiming,
+    ) -> WorkOutcome {
         let empty_and_owned = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
@@ -477,7 +533,7 @@ impl UploadTransfer {
                 target: crate::telemetry::TARGET_TRANSFER,
                 "empty unknown-length stream; uploading a single empty part",
             );
-            return self.send_part(PartData::new(1, Bytes::new())).await;
+            return self.send_part(PartData::new(1, Bytes::new()), timing).await;
         }
 
         self.finish_read_without_part();
@@ -488,19 +544,42 @@ impl UploadTransfer {
     ///
     /// This is shared by ordinary source output and the synthesized empty part, keeping request
     /// retries, accounting, and completion transitions identical.
-    async fn send_part(&self, data: PartData) -> WorkOutcome {
-        let upload_id = {
-            let state = self.inner.state.lock().expect("lock poisoned");
-            match &*state {
-                UploadState::Transferring { upload_id, .. } => upload_id.clone(),
+    async fn send_part(
+        &self,
+        data: PartData,
+        timing: diagnostics::UploadPartTiming,
+    ) -> WorkOutcome {
+        let part_number = data.part_number;
+        let presentation_segments = data.data.segment_count();
+        let content_length = data.data.len() as i64;
+        let bytes_sent = content_length as u64;
+
+        let (upload_id, source_observation, request_start_snapshot) = {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
+                UploadState::Transferring {
+                    upload_id, parts, ..
+                } => {
+                    let source_observation = parts.begin_upload(presentation_segments, timing);
+                    (
+                        upload_id.clone(),
+                        source_observation,
+                        parts.transition_snapshot(),
+                    )
+                }
                 _ => panic!("unexpected state for send_part"),
             }
         };
 
-        let part_number = data.part_number;
         let part_num_i32 = part_number as i32;
-        let content_length = data.data.len() as i64;
-        let bytes_sent = content_length as u64;
+        diagnostics::emit_part_started(
+            self.inner.ctx.id,
+            part_number,
+            bytes_sent,
+            presentation_segments,
+            source_observation,
+            request_start_snapshot,
+        );
 
         let sdk_body = part_body::sdk_body(data.data);
         let checksum = data.checksum;
@@ -518,6 +597,8 @@ impl UploadTransfer {
         // bounds a mid-upload-body stall; a response that never arrives after the
         // body is fully sent is not bounded here (see the module docs on the
         // response-first-byte gap).
+        let request_timer =
+            UploadDiagnosticTimer::start(self.inner.ctx.handle.config.diagnostics().transfer());
         let result = crate::retry::retry(crate::retry::classify_upload_part_retry, |_hedge| {
             let body = sdk_body
                 .try_clone()
@@ -556,9 +637,27 @@ impl UploadTransfer {
             part_number
         ))
         .await;
+        let request_elapsed = request_timer.elapsed();
         let resp = match result {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e),
+            Err(e) => {
+                let snapshot = {
+                    let state = self.inner.state.lock().expect("lock poisoned");
+                    let UploadState::Transferring { parts, .. } = &*state else {
+                        panic!("unexpected state while reporting failed upload part");
+                    };
+                    parts.transition_snapshot()
+                };
+                diagnostics::emit_part_failed(
+                    self.inner.ctx.id,
+                    part_number,
+                    bytes_sent,
+                    presentation_segments,
+                    request_elapsed,
+                    snapshot,
+                );
+                return self.fail(e);
+            }
         };
 
         let completed = CompletedPart::builder()
@@ -571,20 +670,23 @@ impl UploadTransfer {
             .set_checksum_sha256(resp.checksum_sha256.clone())
             .build();
 
-        let should_wake = {
+        let (should_wake, completion_snapshot) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
                 panic!("unexpected state while completing upload part");
             };
-            parts.complete_part(completed, bytes_sent);
-            try_begin_completing(&mut state)
+            parts.complete_part(completed, bytes_sent, request_elapsed);
+            let snapshot = parts.transition_snapshot();
+            (try_begin_completing(&mut state), snapshot)
         };
 
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        diagnostics::emit_part_completed(
+            self.inner.ctx.id,
             part_number,
             bytes_sent,
-            "part uploaded",
+            presentation_segments,
+            request_elapsed,
+            completion_snapshot,
         );
 
         self.inner.ctx.record_io(&crate::metrics::IoSample {
@@ -736,6 +838,8 @@ impl UploadTransfer {
     }
 
     async fn execute_complete_mpu(&self) -> WorkOutcome {
+        let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
+        let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
         let (upload_id, response_builder, parts) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             match &mut *state {
@@ -755,7 +859,8 @@ impl UploadTransfer {
             }
         };
 
-        let (part_reader, plan, mut completed_parts, bytes_uploaded) = parts.into_completion();
+        let (part_reader, plan, mut completed_parts, bytes_uploaded, final_snapshot, diagnostics) =
+            parts.into_completion();
         completed_parts.sort_by_key(|p| p.part_number);
 
         let object_size = match plan {
@@ -794,6 +899,7 @@ impl UploadTransfer {
         )
         .await;
 
+        let request_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
         let resp = match complete_req
             .customize()
             .config_override(
@@ -809,6 +915,12 @@ impl UploadTransfer {
             Ok(resp) => resp,
             Err(e) => return self.fail(e.into()),
         };
+        let summary = diagnostics.finish(
+            final_snapshot,
+            request_timer.elapsed(),
+            completion_timer.elapsed(),
+        );
+        diagnostics::emit_summary(self.inner.ctx.id, summary);
 
         let result = response_builder
             .update_from_complete_mpu(&resp)
@@ -902,7 +1014,10 @@ mod tests {
         stream: InputStream,
     ) -> UploadTransfer {
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().client(s3_client).build(),
+            crate::Config::builder()
+                .client(s3_client)
+                .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 2)
+                .build(),
         );
 
         let input = UploadInput::builder()
@@ -1087,6 +1202,19 @@ mod tests {
                 panic!("upload left transferring state");
             };
             assert_eq!(parts.test_counts(), (3, 3, 1));
+            assert_eq!(
+                parts.snapshot(),
+                PartTransferSnapshot {
+                    parts_dispatched: 3,
+                    parts_in_flight: 3,
+                    uploads_in_flight: 0,
+                    pending_reads: 1,
+                    completed_parts: 0,
+                    bytes_uploaded: 0,
+                    eof: false,
+                    dispatch_closed: false,
+                }
+            );
         }
 
         assert!(matches!(
@@ -1103,6 +1231,9 @@ mod tests {
                 panic!("upload left transferring state");
             };
             assert_eq!(parts.test_counts(), (1, 1, 1));
+            let summary = parts.test_summary();
+            assert_eq!(summary.read_pending_polls, 1);
+            assert_eq!(summary.read_pending_parts, 0);
         }
         assert_pending(transfer.poll_work());
 
@@ -1125,6 +1256,13 @@ mod tests {
                 panic!("upload left transferring state");
             };
             assert_eq!(parts.test_counts(), (1, 0, 0));
+            let summary = parts.test_summary();
+            assert_eq!(summary.snapshot.completed_parts, 1);
+            assert_eq!(summary.snapshot.bytes_uploaded, 5);
+            assert_eq!(summary.read_pending_polls, 1);
+            assert_eq!(summary.read_pending_parts, 1);
+            assert_eq!(summary.presentation_segments, 1);
+            assert_eq!(summary.max_presentation_segments, 1);
         }
 
         let mut next = assert_ready(transfer.poll_work());
@@ -1215,6 +1353,26 @@ mod tests {
         // 3. UploadPart 2 (read+send in one call)
         let mut work = assert_ready(transfer.poll_work());
         transfer.execute(&mut work).await;
+
+        {
+            let state = transfer.inner.state.lock().expect("lock poisoned");
+            let UploadState::Completing {
+                parts: Some(parts), ..
+            } = &*state
+            else {
+                panic!("upload did not enter completing state");
+            };
+            let summary = parts.test_summary();
+            assert_eq!(summary.snapshot.completed_parts, 2);
+            assert_eq!(summary.snapshot.parts_in_flight, 0);
+            assert_eq!(summary.snapshot.uploads_in_flight, 0);
+            assert_eq!(summary.snapshot.pending_reads, 0);
+            assert_eq!(summary.segmented_parts, 0);
+            assert_eq!(summary.presentation_segments, 2);
+            assert_eq!(summary.max_presentation_segments, 1);
+            assert_eq!(summary.read_pending_polls, 0);
+            assert_eq!(summary.read_pending_parts, 0);
+        }
 
         // 4. CompleteMPU
         let mut work = assert_ready(transfer.poll_work());

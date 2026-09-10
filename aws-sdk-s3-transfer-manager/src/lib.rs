@@ -61,33 +61,43 @@
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
 //!
-//! # Diagnostics
+//! # Runtime diagnostics
 //!
-//! `AWS_S3_TM_DIAGNOSTICS` enables opt-in runtime diagnostics. Its value is a
-//! comma-separated list of `key=value` settings resolved when a client
-//! configuration or standalone [`memory::BufferPool`] is built:
+//! `AWS_S3_TM_DIAGNOSTICS` enables optional diagnostic collection without
+//! changing the client configuration API. Settings are namespaced by subsystem
+//! and resolved once when a client configuration is built. A standalone
+//! [`memory::BufferPool`] resolves only the memory settings.
+//!
+//! The value is a comma-separated list of case-sensitive `key=value` settings:
 //!
 //! ```text
-//! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms,memory.detail=1
+//! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms,memory.detail=1,transfer.detail=1
 //! ```
 //!
-//! The supported memory settings are:
+//! Whitespace around entries, keys, and values is ignored. Later valid
+//! assignments replace earlier ones. Unknown keys are ignored for forward
+//! compatibility. A malformed recognized setting produces a warning and keeps
+//! the preceding value. Unsupported detail levels use the highest level
+//! understood by this version and produce a warning.
+//!
+//! The environment variable controls collection cost. Tracing filters
+//! independently control whether collected records are emitted.
+//!
+//! ## Memory pool
+//!
+//! Memory diagnostics report pool capacity, admission pressure, allocation
+//! fallback, preparation, and reclamation.
 //!
 //! - `memory.snapshot=off` disables periodic reports. A positive integer
 //!   followed by `ms` enables reports; values below `100ms` use `100ms`.
-//! - `memory.detail=0` keeps the default low-frequency counters.
+//! - `memory.detail=0` uses counters updated only at pressure and lifecycle
+//!   boundaries.
 //! - `memory.detail=1` also counts every optimistic allocation attempt and
 //!   bitmap word inspected, adding relaxed atomic updates to the acquisition
 //!   path.
 //!
-//! Settings are case-sensitive. Whitespace around entries, keys, and values is
-//! ignored. Later valid assignments replace earlier ones. Unknown keys are
-//! ignored for forward compatibility; malformed recognized settings produce a
-//! warning and retain the preceding value. Unsupported detail levels use the
-//! highest level understood by this version and produce a warning.
-//!
-//! Periodic reports use the `aws_sdk_s3_transfer_manager::memory` tracing target
-//! at `DEBUG`. For example, enable one-second baseline snapshots with:
+//! Memory snapshots use the `aws_sdk_s3_transfer_manager::memory` tracing target
+//! at `DEBUG`:
 //!
 //! ```text
 //! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms
@@ -97,6 +107,24 @@
 //! Snapshot reporting reuses the memory pool's maintenance thread. It does not
 //! create a diagnostics-only thread. Detailed counters and periodic reporting
 //! are independent; both are disabled by default.
+//!
+//! ## Transfer state machines
+//!
+//! Transfer diagnostics report where an operation spends time and how work
+//! moves through its direction-specific state machine.
+//!
+//! - `transfer.detail=0` disables optional transfer-state collection.
+//! - `transfer.detail=1` collects aggregate summaries from supported transfer
+//!   state machines. Multipart uploads currently provide this summary.
+//! - `transfer.detail=2` also collects individual state transitions.
+//!
+//! Transfer summaries use the `aws_sdk_s3_transfer_manager::transfer` tracing
+//! target at `DEBUG`; level-2 transitions use the same target at `TRACE`:
+//!
+//! ```text
+//! AWS_S3_TM_DIAGNOSTICS=transfer.detail=1
+//! RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug
+//! ```
 
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;

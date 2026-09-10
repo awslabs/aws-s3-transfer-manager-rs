@@ -12,6 +12,12 @@ use smallvec::SmallVec;
 
 use crate::io::part_reader::{NextPartFuture, PartReader};
 use crate::io::InputStream;
+#[cfg(test)]
+use crate::operation::upload::diagnostics::PartTransferSummary;
+use crate::operation::upload::diagnostics::{
+    PartTransferPendingReason, PartTransferSnapshot, SourceReadObservation, UploadPartTiming,
+    UploadTransferDiagnostics,
+};
 use crate::operation::upload::UploadOutputBuilder;
 
 /// How the `Transferring` phase decides it has dispatched every part.
@@ -114,6 +120,7 @@ impl std::fmt::Debug for PartReadWake {
 pub(crate) struct PendingPartRead {
     pub(crate) future: NextPartFuture,
     pub(crate) wake: Arc<PartReadWake>,
+    pub(crate) timing: UploadPartTiming,
 }
 
 /// Pending source operations waiting for their registered wake.
@@ -151,21 +158,36 @@ impl PendingPartReads {
 #[derive(Debug)]
 pub(crate) struct UploadPartWork {
     pending_read: Option<PendingPartRead>,
+    timing: Option<UploadPartTiming>,
 }
 
 impl UploadPartWork {
-    fn fresh() -> Self {
-        Self { pending_read: None }
+    fn fresh(timing: UploadPartTiming) -> Self {
+        Self {
+            pending_read: None,
+            timing: Some(timing),
+        }
     }
 
     fn resumed(read: PendingPartRead) -> Self {
         Self {
             pending_read: Some(read),
+            timing: None,
         }
     }
 
     pub(crate) fn take_pending_read(&mut self) -> Option<PendingPartRead> {
         self.pending_read.take()
+    }
+
+    pub(crate) fn take_timing(&mut self) -> UploadPartTiming {
+        self.timing
+            .take()
+            .expect("fresh upload work should retain diagnostic timing")
+    }
+
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.pending_read.is_some()
     }
 }
 
@@ -196,6 +218,8 @@ pub(crate) struct PartTransferState {
     completed_parts: Vec<CompletedPart>,
     /// Bytes accepted by completed UploadPart requests.
     bytes_uploaded: u64,
+    /// Optional aggregate collection and transition-reporting policy.
+    diagnostics: UploadTransferDiagnostics,
 }
 
 impl PartTransferState {
@@ -203,6 +227,7 @@ impl PartTransferState {
         part_reader: Arc<PartReader>,
         plan: PartPlan,
         completed_parts_capacity: usize,
+        diagnostics: UploadTransferDiagnostics,
     ) -> Self {
         Self {
             part_reader,
@@ -213,6 +238,7 @@ impl PartTransferState {
             pending_reads: PendingPartReads::default(),
             completed_parts: Vec::with_capacity(completed_parts_capacity),
             bytes_uploaded: 0,
+            diagnostics,
         }
     }
 
@@ -235,7 +261,8 @@ impl PartTransferState {
             .parts_in_flight
             .checked_add(1)
             .expect("multipart in-flight count overflow");
-        Some(UploadPartWork::fresh())
+        self.record_dispatch_closed();
+        Some(UploadPartWork::fresh(self.diagnostics.part_scheduled()))
     }
 
     /// Retracts a fresh dispatch that could not begin a source operation.
@@ -248,11 +275,26 @@ impl PartTransferState {
             .parts_in_flight
             .checked_sub(1)
             .expect("retracted multipart in-flight underflow");
+        self.record_dispatch_closed();
     }
 
     /// Retains one exact source operation without changing its in-flight accounting.
     pub(crate) fn park_read(&mut self, read: PendingPartRead) {
         self.pending_reads.push(read);
+    }
+
+    /// Records one source-future poll that could not yet produce a part.
+    pub(crate) fn record_read_pending(&mut self, timing: &mut UploadPartTiming) {
+        self.diagnostics.record_read_pending(timing);
+    }
+
+    /// Moves one active part from source preparation to UploadPart transmission.
+    pub(crate) fn begin_upload(
+        &mut self,
+        presentation_segments: usize,
+        timing: UploadPartTiming,
+    ) -> SourceReadObservation {
+        self.diagnostics.begin_upload(presentation_segments, timing)
     }
 
     /// Records end-of-stream and returns whether this caller owns empty-stream synthesis.
@@ -265,6 +307,7 @@ impl PartTransferState {
             return false;
         }
         self.eof = true;
+        self.record_dispatch_closed();
         matches!(self.plan, PartPlan::Unknown) && parts_yielded == 0
     }
 
@@ -277,7 +320,12 @@ impl PartTransferState {
     }
 
     /// Records one successfully uploaded part.
-    pub(crate) fn complete_part(&mut self, part: CompletedPart, bytes_uploaded: u64) {
+    pub(crate) fn complete_part(
+        &mut self,
+        part: CompletedPart,
+        bytes_uploaded: u64,
+        request_elapsed: Option<std::time::Duration>,
+    ) {
         self.completed_parts.push(part);
         self.bytes_uploaded = self
             .bytes_uploaded
@@ -287,6 +335,7 @@ impl PartTransferState {
             .parts_in_flight
             .checked_sub(1)
             .expect("multipart in-flight completion underflow");
+        self.diagnostics.complete_upload(request_elapsed);
     }
 
     /// Returns whether the source declared no content-length upper bound.
@@ -302,17 +351,65 @@ impl PartTransferState {
     }
 
     /// Consumes a drained state and returns the fields needed by CompleteMultipartUpload.
-    pub(crate) fn into_completion(self) -> (Arc<PartReader>, PartPlan, Vec<CompletedPart>, u64) {
+    pub(crate) fn into_completion(
+        mut self,
+    ) -> (
+        Arc<PartReader>,
+        PartPlan,
+        Vec<CompletedPart>,
+        u64,
+        PartTransferSnapshot,
+        UploadTransferDiagnostics,
+    ) {
         assert!(
             self.is_complete(),
             "multipart state completed while work remained"
         );
+        let snapshot = self.snapshot();
+        self.diagnostics.finish_body();
         (
             self.part_reader,
             self.plan,
             self.completed_parts,
             self.bytes_uploaded,
+            snapshot,
+            self.diagnostics,
         )
+    }
+
+    /// Returns a coherent view while the caller holds the upload-state lock.
+    pub(crate) fn snapshot(&self) -> PartTransferSnapshot {
+        PartTransferSnapshot {
+            parts_dispatched: self.parts_dispatched,
+            parts_in_flight: self.parts_in_flight,
+            uploads_in_flight: self.diagnostics.uploads_in_flight(),
+            pending_reads: self.pending_reads.entries.len(),
+            completed_parts: self.completed_parts.len(),
+            bytes_uploaded: self.bytes_uploaded,
+            eof: self.eof,
+            dispatch_closed: self.plan.all_dispatched(self.parts_dispatched, self.eof),
+        }
+    }
+
+    /// Returns a coherent snapshot only when transition reporting is enabled.
+    pub(crate) fn transition_snapshot(&self) -> Option<PartTransferSnapshot> {
+        self.diagnostics.transition_snapshot(self.snapshot())
+    }
+
+    /// Classifies why `poll_work` cannot schedule another part from this state.
+    pub(crate) fn pending_reason(&self) -> PartTransferPendingReason {
+        if self.part_reader.source_unavailable() {
+            PartTransferPendingReason::SourceUnavailable
+        } else if self.plan.all_dispatched(self.parts_dispatched, self.eof) {
+            PartTransferPendingReason::DispatchClosed
+        } else {
+            PartTransferPendingReason::NoReadyPart
+        }
+    }
+
+    fn record_dispatch_closed(&mut self) {
+        self.diagnostics
+            .set_dispatch_closed(self.plan.all_dispatched(self.parts_dispatched, self.eof));
     }
 
     #[cfg(test)]
@@ -322,6 +419,13 @@ impl PartTransferState {
             self.parts_in_flight,
             self.pending_reads.entries.len(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_summary(&self) -> PartTransferSummary {
+        self.diagnostics
+            .test_summary(self.snapshot())
+            .expect("test transfer diagnostics should be enabled")
     }
 }
 

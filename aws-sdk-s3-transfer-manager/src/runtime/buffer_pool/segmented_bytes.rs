@@ -58,6 +58,11 @@ impl SegmentedBytes {
         self.remaining == 0
     }
 
+    /// Returns the number of presentation segments remaining from this cursor.
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
     /// Appends the remaining bytes from `other`.
     ///
     /// This preserves existing owner boundaries and coalesces presentation
