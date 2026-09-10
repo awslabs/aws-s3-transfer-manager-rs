@@ -129,6 +129,10 @@ comparison depends on both sides arriving in the same order. Sync cannot produce
 so it MUST refuse.
 *`[CLI]` `subcommands.py` → `CommandParameters._validate_not_s3_express_bucket_for_sync` ("Cannot use sync command with a directory bucket" — directory buckets do not list lexicographically, which the comparison depends on), plus `_validate_path_args`, `_validate_sse_c_args`. `[ISSUE]` [#8470](https://github.com/aws/aws-cli/issues/8470) — before that validation existed, syncing to a directory bucket silently produced wrong results: "some files that do exist in the source are not recognized".*
 
+**FR-Root-8** A relative key can resolve to a location outside the destination root. Sync MUST account for
+that, and the design MUST NOT preclude whatever behavior is settled on for it.
+*`[NEW]` — the behavior is an open cross-SDK decision; recorded here so that settling it needs no rework of the design.*
+
 ## 3. Enumeration (`FR-Enum-*`)
 
 Producing the list of entries under each root: what counts as an entry, what order they arrive in, and
