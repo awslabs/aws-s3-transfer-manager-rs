@@ -19,6 +19,7 @@ use crate::runtime::sync::sync::{Arc, Mutex};
 use crate::runtime::sync::thread;
 
 use super::admission::{Reservation, ReserveError, ReserveFuture};
+use super::block::BlockSlot;
 use super::geometry::PoolGeometry;
 use super::virtual_memory::page_size;
 use super::{BufferPool, CarrierCount, PoolInner, PooledBufMut};
@@ -62,10 +63,70 @@ impl Wake for CountingWake {
     }
 }
 
+/// Waker state that probes physical carrier reuse before recording a wake.
+pub(super) struct ClaimingWakeState {
+    /// Number of wake calls observed.
+    wakes: AtomicUsize,
+    /// Whether the wake-time claim obtained one complete carrier.
+    claimed: AtomicBool,
+}
+
+impl ClaimingWakeState {
+    /// Returns the number of observed wake calls.
+    pub(super) fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::Acquire)
+    }
+
+    /// Returns whether physical storage was reusable when the waker ran.
+    pub(super) fn claimed(&self) -> bool {
+        self.claimed.load(Ordering::Acquire)
+    }
+}
+
+/// Physical location probed by a claiming waker.
+enum ClaimTarget {
+    /// Any complete carrier returned to one pool.
+    Pool(BufferPool),
+    /// One carrier returned to this exact slot.
+    Slot(Arc<BlockSlot>),
+}
+
+/// Waker that attempts one physical claim before recording notification.
+struct ClaimingWake {
+    /// Physical ownership that must already be reusable.
+    target: ClaimTarget,
+    /// Shared observations for the test.
+    state: Arc<ClaimingWakeState>,
+}
+
+impl Wake for ClaimingWake {
+    fn wake(self: StdArc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+        let claimed = match &self.target {
+            ClaimTarget::Pool(pool) => pool
+                .inner
+                .arena
+                .claim_optimistic(CarrierCount::new(1))
+                .expect("wake-time claim")
+                .is_complete(),
+            ClaimTarget::Slot(slot) => BlockSlot::try_claim_exhaustive(slot, CarrierCount::new(1))
+                .expect("wake-time slot claim")
+                .is_some(),
+        };
+        self.state.claimed.store(claimed, Ordering::Release);
+        self.state.wakes.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Per-pool hooks that keep parallel and Loom tests isolated.
 pub(super) struct TestHooks {
     /// Acquisition calls that reached the physical allocator.
     acquisition_attempts: AtomicUsize,
+    /// Uncovered returns that entered serialized reservation admission.
+    return_admission_entries: AtomicUsize,
     /// Remaining metadata boundaries before one acquisition failure.
     acquisition_allocation_failure: AtomicUsize,
     /// One terminal reservation failure returned before admission work.
@@ -83,6 +144,7 @@ impl TestHooks {
     pub(super) fn new() -> Self {
         Self {
             acquisition_attempts: AtomicUsize::new(0),
+            return_admission_entries: AtomicUsize::new(0),
             acquisition_allocation_failure: AtomicUsize::new(0),
             reservation_failure: Mutex::new(None),
             maintenance_spawn_failure: AtomicBool::new(false),
@@ -94,6 +156,11 @@ impl TestHooks {
     /// Records one physical acquisition attempt.
     pub(super) fn record_acquisition_attempt(&self) {
         self.acquisition_attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records one uncovered return entering reservation admission.
+    pub(super) fn record_return_admission_entry(&self) {
+        self.return_admission_entries.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Fails the `boundary`th subsequent acquisition metadata reservation.
@@ -195,6 +262,14 @@ impl BufferPool {
         self.inner
             .test_hooks
             .acquisition_attempts
+            .load(Ordering::Acquire)
+    }
+
+    /// Returns uncovered returns that entered reservation admission.
+    pub(super) fn return_admission_entries(&self) -> usize {
+        self.inner
+            .test_hooks
+            .return_admission_entries
             .load(Ordering::Acquire)
     }
 
@@ -363,6 +438,32 @@ pub(super) fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
         count: Arc::clone(&count),
     };
     (Waker::from(StdArc::new(state)), count)
+}
+
+/// Constructs a waker that verifies one carrier is reusable on notification.
+pub(super) fn claiming_waker(pool: BufferPool) -> (Waker, Arc<ClaimingWakeState>) {
+    let state = Arc::new(ClaimingWakeState {
+        wakes: AtomicUsize::new(0),
+        claimed: AtomicBool::new(false),
+    });
+    let waker = ClaimingWake {
+        target: ClaimTarget::Pool(pool),
+        state: Arc::clone(&state),
+    };
+    (Waker::from(StdArc::new(waker)), state)
+}
+
+/// Constructs a waker that verifies one exact slot is reusable on notification.
+pub(super) fn slot_claiming_waker(slot: Arc<BlockSlot>) -> (Waker, Arc<ClaimingWakeState>) {
+    let state = Arc::new(ClaimingWakeState {
+        wakes: AtomicUsize::new(0),
+        claimed: AtomicBool::new(false),
+    });
+    let waker = ClaimingWake {
+        target: ClaimTarget::Slot(slot),
+        state: Arc::clone(&state),
+    };
+    (Waker::from(StdArc::new(waker)), state)
 }
 
 /// Loads a counting waker's observed wake count.

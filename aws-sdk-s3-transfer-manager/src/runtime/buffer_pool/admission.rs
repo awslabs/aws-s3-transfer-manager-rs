@@ -26,6 +26,12 @@ const RESERVATION_CLOSED: u64 = 1 << 63;
 /// Direct owners and in-flight debits in [`ReservationOwnerState::packed`].
 const DIRECT_OUTSTANDING_MASK: u64 = !RESERVATION_CLOSED;
 
+/// Whether a repayment must reconsider reservation admission.
+const RESERVATION_DRAIN_ARMED: u64 = 1;
+
+/// Repayment epoch bit, toggled without changing the armed bit.
+const RESERVATION_REPAYMENT_EPOCH: u64 = 2;
+
 mod coverage;
 use coverage::CoverageSnapshot;
 pub(super) use coverage::{CoverageState, MAX_PACKED_CARRIERS};
@@ -33,6 +39,61 @@ pub(super) use coverage::{CoverageState, MAX_PACKED_CARRIERS};
 mod waiter;
 pub use waiter::ReserveFuture;
 pub(super) use waiter::{ReservationPoll, WaitSlot, WaitState, Waiter};
+
+/// Orders uncovered repayment against reservation-queue publication.
+///
+/// A reservation poll arms the signal while holding admission and before it
+/// samples coverage. An uncovered return updates coverage first, then advances
+/// the epoch. If the return observes an unarmed signal, a later poll acquires
+/// that epoch before sampling coverage and cannot enqueue from a stale sample.
+/// If the signal was already armed, the return takes admission and drains the
+/// FIFO through the authoritative state.
+pub(super) struct ReservationDrainSignal {
+    /// Packed queue-presence bit and uncovered-repayment epoch.
+    state: AtomicU64,
+}
+
+impl ReservationDrainSignal {
+    /// Creates an unarmed signal before any repayment.
+    pub(super) fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+        }
+    }
+
+    /// Announces a reservation decision before its coverage sample.
+    pub(super) fn arm(&self) {
+        self.state
+            .fetch_or(RESERVATION_DRAIN_ARMED, Ordering::AcqRel);
+    }
+
+    /// Publishes whether admission retains a queued reservation.
+    ///
+    /// The caller holds admission, so no other queue mutation can race this
+    /// publication. A waiting poll that has not acquired admission yet will
+    /// arm the signal before taking its own coverage sample.
+    pub(super) fn publish_waiter_state(&self, waiters_present: bool) {
+        if waiters_present {
+            self.arm();
+        } else {
+            self.state
+                .fetch_and(!RESERVATION_DRAIN_ARMED, Ordering::AcqRel);
+        }
+    }
+
+    /// Advances repayment ordering and reports whether the FIFO needs a drain.
+    pub(super) fn repayment_requires_drain(&self) -> bool {
+        self.state
+            .fetch_xor(RESERVATION_REPAYMENT_EPOCH, Ordering::AcqRel)
+            & RESERVATION_DRAIN_ARMED
+            != 0
+    }
+
+    /// Returns whether a queued poll may require repayment work.
+    pub(super) fn is_armed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & RESERVATION_DRAIN_ARMED != 0
+    }
+}
 
 /// Planned-demand state protected by the pool admission mutex.
 pub(super) struct AdmissionState {

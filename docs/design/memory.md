@@ -955,22 +955,34 @@ coverage for close to withdraw. If close linearizes first, close records uncover
 return to remove. Packing coverage and uncovered charges makes both orders produce the same final
 accounting state.
 
-Final `CarrierGuard` drop performs these operations in order:
+Final owner return performs these operations in order:
 
-1. Return the physical carrier to the arena.
-2. Decrement the originating reservation's outstanding direct-carrier count when direct provenance
-   exists.
-3. Remove one uncovered charge, or restore one unit of available coverage when no uncovered charge
-   remains.
+1. Return physical carrier ownership to the arena.
+2. Decrement originating reservations' outstanding direct-carrier counts.
+3. Remove uncovered charges, then restore any remaining units as available coverage.
 
 Physical return precedes accounting release. Reversing the order can admit a waiter that finds no
 reusable carrier and grows the arena while the responsible carrier is still unavailable.
 
-A return first applies one packed accounting transition. If it restores only available coverage,
-the return is complete without admission serialization. If it removes an uncovered charge, the
-return then enters admission serialization and drains the FIFO. A reservation request that acquired
-the mutex before the accounting transition is reconsidered by that drain; one that acquires it
-afterward observes the reduced `admission_used` during its own eligibility check.
+One owner may return independently, or several uniquely held owners with the same pool and direct
+reservation provenance may return as one batch. A batch groups physical bits by concrete slot
+incarnation and bitmap word before releasing aggregate owner counts. Shared owners and owners with
+different accounting provenance retain independent return authority and use the granular path.
+
+Reservation admission and uncovered repayment are ordered by a drain signal containing a queue bit
+and a repayment epoch. A reservation poll arms the signal while admission is held and before
+sampling coverage. Every uncovered repayment updates coverage and then unconditionally advances the
+epoch with acquire-release ordering.
+
+If repayment observes an armed signal, it enters admission serialization and drains every newly
+eligible FIFO head. If it observes an unarmed signal, a later poll's arm operation acquires the
+repayment epoch before that poll samples coverage. Each acquire-release repayment RMW acquires from
+the preceding RMW in the atomic's modification order, carrying earlier coverage updates through the
+chain. A poll therefore cannot enqueue from a coverage state older than any preceding repayment.
+The queue bit is cleared only while admission is held and the FIFO is empty.
+
+A return that restores only available coverage does not affect reservation eligibility and does not
+publish a repayment epoch.
 
 FIFO drain runs on the thread performing the final carrier return. It may wait for admission
 serialization, process multiple queue heads, prepare blocks for eligible grants, and invoke
@@ -978,9 +990,10 @@ registered wakers after releasing all pool locks. The path has no latency bound.
 that a return which must prepare additional storage is uncommon; it does not assume that returns
 removing uncovered charges are uncommon.
 
-An uncovered-charge return may wait behind a serialized acquisition performing a registry-wide
-fallback scan. Return latency in that regime can therefore depend on registry size; the
-pool-size-independent guarantee applies to coverage-restoring return.
+An uncovered-charge return that observes an armed signal may wait behind a serialized acquisition
+performing a registry-wide fallback scan. Return latency in that regime can therefore depend on
+registry size. Coverage-restoring returns and uncovered returns that observe an unarmed signal do
+not enter admission serialization.
 
 A direct return restores direct-acquisition authority while the reservation remains open. Return
 and growth rollback cannot reopen a closed reservation.
@@ -1002,10 +1015,12 @@ and delivery, `I` for integration, and `C` for configuration and operations.
   either authorizes the complete debit or rejects it.
 - **A5: Close reclassification.** Close removes the complete envelope without removing surviving
   owner charges. A later grant does not reclassify those charges.
-- **A6: Return ordering.** Physical return precedes charge release. A return or post-unlock
-  rollback that removes an uncovered charge reconsiders the FIFO.
-- **A7: FIFO transfer.** Fresh requests do not bypass waiters. Each waiter receives one terminal
-  result, made visible before its registered waker runs after admission unlock.
+- **A6: Return ordering.** Physical return precedes direct and aggregate charge release. Every
+  uncovered repayment publishes its epoch; repayment that observes an armed queue reconsiders the
+  FIFO.
+- **A7: FIFO transfer.** A reservation poll arms repayment ordering before sampling coverage.
+  Fresh requests do not bypass waiters. Each waiter receives one terminal result, made visible
+  before its registered waker runs after admission unlock.
 - **A8: Admission lifetime.** Dropping one pool handle does not invalidate reservations, waiters,
   carrier owners, or other handles.
 
@@ -3500,10 +3515,10 @@ section; one property may discharge several contracts.
 | A7         | Grant, cancellation, and poll produce one terminal waiter result                  | Loom over FIFO and wait slot                           | Release the slot during preparation and publish after `Taken`     |
 | A7         | Waker reentry observes the terminal result without lock nesting                   | Loom with waker reentry                                | Invoke the waker before publication or while admission is locked  |
 | A7         | Idle-only admission grants at most one request at a time                          | State-machine property test                            | Gate idle escape on configured headroom instead of planned demand |
-| A6         | Uncovered-charge return cannot strand an eligible waiter                          | Loom over packed return, enqueue, and FIFO drain       | Skip admission drain after repaying an uncovered charge           |
+| A6         | Uncovered-charge return cannot strand an eligible waiter                          | Loom over drain signal, packed return, enqueue, and FIFO | Skip an unarmed repayment epoch or weaken poll-arm ordering        |
 | A2         | Published shortfall preserves the floor during unlocked claim                     | Composed Loom over debit, trim, claim, and rollback    | Unlock before charge publication or floor preparation             |
 | A3, A6     | Post-unlock shortfall rollback cannot strand an eligible waiter                   | Loom over rollback, enqueue, and FIFO drain            | Skip admission drain after rollback repays an uncovered charge    |
-| A6         | Physical return precedes a newly eligible waiter's acquisition                    | Composed pool-level Loom model                         | Release accounting before clearing the physical bit               |
+| A6         | Granular and batched physical return precede a newly eligible waiter acquisition  | Real return paths in pool-level Loom models            | Release accounting before clearing the physical bit               |
 | A3         | Partial acquisition failure restores every debit and direct-acquisition authority | Failure injection after each claim and conversion      | Drop the debit before provisional and completed carriers          |
 | A4         | Close racing buffer growth has one complete outcome                               | Loom over authority, debit, rollback, and close        | Split `CLOSED` from the direct-authority debit                    |
 | A4         | Concurrent acquisitions consume direct-acquisition authority exactly once         | Loom over packed reservation owner state               | Load and store authority without compare-and-exchange             |

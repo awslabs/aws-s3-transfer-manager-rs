@@ -787,6 +787,25 @@ impl PartReleaseOrder {
     }
 }
 
+/// Whether replacement claims begin after or during owner return.
+#[derive(Clone, Copy)]
+enum PartReplacementSchedule {
+    /// Return the complete selected cohort before starting any claim.
+    ReleasedFirst,
+    /// Let each worker return one part and immediately claim its replacement.
+    Overlapped,
+}
+
+impl PartReplacementSchedule {
+    /// Returns a stable name while preserving the established control names.
+    fn benchmark_name(self, order: PartReleaseOrder) -> String {
+        match self {
+            Self::ReleasedFirst => order.name().to_owned(),
+            Self::Overlapped => format!("overlap_{}", order.name()),
+        }
+    }
+}
+
 /// Measurements accumulated while replacing one batch of live parts.
 #[derive(Default)]
 struct PartChurnMeasurements {
@@ -812,10 +831,10 @@ impl PartChurnMeasurements {
 
 /// A full pool whose immutable part owners are replaced in completion batches.
 ///
-/// The capacity spans four production blocks. Half of the cohort is released
-/// before each concurrent refill, leaving enough simultaneous holes and
-/// competing claims for placement to choose between one contiguous run and
-/// several disjoint runs.
+/// The capacity spans four production blocks. The released-first control
+/// exposes the complete free cohort before concurrent refill. The overlapped
+/// schedule gives each worker one live part to return immediately before its
+/// claim, allowing claims to observe physical return publication in progress.
 ///
 /// One long-lived reservation spans the pool so admission remains stable. The
 /// fixture measures physical placement and immutable topology, not reservation
@@ -907,30 +926,47 @@ impl WholePartChurn {
         value
     }
 
-    /// Releases one batch and replaces every owner through competing claims.
+    /// Replaces one batch under the selected return/claim schedule.
     ///
     /// `acquisition_time` is the sum of independently measured worker
     /// latencies, not the wall-clock duration of the concurrent batch.
-    fn replace_batch(&mut self, order: PartReleaseOrder) -> PartChurnMeasurements {
+    fn replace_batch(
+        &mut self,
+        order: PartReleaseOrder,
+        schedule: PartReplacementSchedule,
+    ) -> PartChurnMeasurements {
         self.select_release_indices(order);
+        let mut released = Vec::with_capacity(self.release_indices.len());
         for &index in &self.release_indices {
-            drop(
-                self.parts[index]
-                    .take()
-                    .expect("selected benchmark part should be live"),
-            );
+            released.push((
+                index,
+                Some(
+                    self.parts[index]
+                        .take()
+                        .expect("selected benchmark part should be live"),
+                ),
+            ));
+        }
+        if matches!(schedule, PartReplacementSchedule::ReleasedFirst) {
+            for (_, part) in &mut released {
+                drop(
+                    part.take()
+                        .expect("released-first benchmark part should be live"),
+                );
+            }
         }
 
         let ready = Barrier::new(self.release_indices.len());
         let replacements = thread::scope(|scope| {
             let mut handles = Vec::with_capacity(self.release_indices.len());
-            for &index in &self.release_indices {
+            for (index, part) in released {
                 let ready = &ready;
                 let pool = &self.state.pool;
                 let reservation = &self.state.reservation;
                 let part_bytes = self.part_bytes;
                 handles.push(scope.spawn(move || {
                     ready.wait();
+                    drop(part);
                     let started = Instant::now();
                     let mut buffer = pool
                         .acquire(reservation, part_bytes)
@@ -974,20 +1010,22 @@ impl WholePartChurn {
 fn report_whole_part_preflight(
     churn: &mut WholePartChurn,
     order: PartReleaseOrder,
+    schedule: PartReplacementSchedule,
     part_name: &str,
 ) {
     let mut preflight = PartChurnMeasurements::default();
     for _ in 0..CHURN_PREFLIGHT_BATCHES {
-        preflight.add(churn.replace_batch(order));
+        preflight.add(churn.replace_batch(order, schedule));
     }
     let total = preflight.contiguous + preflight.segmented;
     assert!(total != 0, "whole-part preflight produced no acquisitions");
     let contiguous_percent = preflight.contiguous as f64 * 100.0 / total as f64;
     let acquisition_ns = preflight.acquisition_time.as_nanos() / u128::from(preflight.acquisitions);
     eprintln!(
-        "buffer-pool whole-part topology: part={part_name} order={} \
+        "buffer-pool whole-part topology: part={part_name} schedule={} order={} \
          acquisitions={} acquisition_mean_ns={acquisition_ns} \
          contiguous={} segmented={} contiguous_percent={contiguous_percent:.2}",
+        schedule.benchmark_name(order),
         order.name(),
         preflight.acquisitions,
         preflight.contiguous,
@@ -997,13 +1035,14 @@ fn report_whole_part_preflight(
 
 /// Measures sustained whole-part reuse and the topology it produces.
 ///
-/// Ordered completion is the low-fragmentation control. Fixed-seed shuffled
-/// selection models concurrent uploads returning parts out of order. Each
-/// iteration replaces half of a four-block cohort concurrently. Criterion
-/// reports the complete release, fill, freeze, and owner-replacement cost; the
-/// summary printed before timing reports mean per-worker acquisition latency
-/// and the fraction of replacements that can enter the SDK as one contiguous
-/// in-memory body.
+/// Ordered and fixed-seed shuffled selection vary which owners complete. The
+/// released-first schedule isolates competing claims after a stable free-space
+/// publication. The overlapped schedule pairs each return with its replacement
+/// claim, exposing transient holes and return-accounting contention. Each
+/// iteration replaces half of a four-block cohort. Criterion reports the
+/// complete release, fill, freeze, and owner-replacement cost; the summary
+/// printed before timing reports mean per-worker acquisition latency and the
+/// fraction of replacements that can enter the SDK as one contiguous body.
 ///
 /// Shuffled selection does not require a segmented result. Placement depends on
 /// concurrent execution and host scheduling, so contiguity is measured output
@@ -1018,28 +1057,33 @@ fn benchmark_whole_part_churn(c: &mut Criterion) {
         let replacement_bytes = CHURN_CAPACITY_BYTES / 2;
         group.throughput(Throughput::Bytes(replacement_bytes as u64));
 
-        for order in [PartReleaseOrder::Ordered, PartReleaseOrder::Shuffled] {
-            let mut preflight_reported = false;
-            group.bench_with_input(
-                BenchmarkId::new(order.name(), part_name),
-                &part_bytes,
-                |b, &part_bytes| {
-                    if !preflight_reported {
-                        let mut preflight = WholePartChurn::new(part_bytes);
-                        report_whole_part_preflight(&mut preflight, order, part_name);
-                        preflight_reported = true;
-                    }
-
-                    let mut churn = WholePartChurn::new(part_bytes);
-                    b.iter_custom(|iterations| {
-                        let started = Instant::now();
-                        for _ in 0..iterations {
-                            black_box(churn.replace_batch(order));
+        for schedule in [
+            PartReplacementSchedule::ReleasedFirst,
+            PartReplacementSchedule::Overlapped,
+        ] {
+            for order in [PartReleaseOrder::Ordered, PartReleaseOrder::Shuffled] {
+                let mut preflight_reported = false;
+                group.bench_with_input(
+                    BenchmarkId::new(schedule.benchmark_name(order), part_name),
+                    &part_bytes,
+                    |b, &part_bytes| {
+                        if !preflight_reported {
+                            let mut preflight = WholePartChurn::new(part_bytes);
+                            report_whole_part_preflight(&mut preflight, order, schedule, part_name);
+                            preflight_reported = true;
                         }
-                        started.elapsed()
-                    });
-                },
-            );
+
+                        let mut churn = WholePartChurn::new(part_bytes);
+                        b.iter_custom(|iterations| {
+                            let started = Instant::now();
+                            for _ in 0..iterations {
+                                black_box(churn.replace_batch(order, schedule));
+                            }
+                            started.elapsed()
+                        });
+                    },
+                );
+            }
         }
     }
     group.finish();
