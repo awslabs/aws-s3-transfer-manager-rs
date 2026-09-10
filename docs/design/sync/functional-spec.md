@@ -305,8 +305,9 @@ the fraction of a second a local filesystem records and S3 does not. Once a file
 MUST keep agreeing: repeated runs over an unchanged pair MUST NOT flip between transferring and skipping.
 *`[CLI]` `subscribers.py` → `ProvideLastModifiedTimeSubscriber` writes back `int(time.mktime(last_modified.timetuple()))` — whole seconds — via `utils.set_file_utime`; `syncstrategy/base.py` → `total_seconds` yields float seconds, so `ExactTimestampsSync` demands exact equality. `[DERIVED]` non-oscillation follows only because S3 `LastModified` is second-granular and the write-back matches it.*
 
-**FR-Cmp-8** The same two sides and the same options MUST always produce the same plan. It MUST NOT matter
-what order entries were listed in, or what order earlier transfers happened to finish in.
+**FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides arrive
+in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on the order
+in which earlier transfers finished.
 *`[DERIVED]` from `comparator.py` → `Comparator.call`, whose merge join requires both sides "listed in the same order, least to greatest in collation order", and `filegenerator.py` → `list_files` + `normalize_sort`, which emulate S3 byte order locally by suffixing directory names with the path separator before sorting.*
 
 **FR-Cmp-9 (checksum mode)** Sync MUST offer an opt-in mode that compares the checksums both sides have
