@@ -792,6 +792,9 @@ fn map_geometry_error(error: GeometryError) -> AcquireError {
 
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
     use bytes::{Buf, BufMut, BytesMut};
 
     use super::super::test_util::{test_pool, write_pooled};
@@ -1210,6 +1213,47 @@ mod tests {
         assert_eq!(buffer.initialized_chunk(), b"defXYZ");
         let second = buffer.publish_prefix(6);
         assert_eq!(second, b"defXYZ"[..]);
+    }
+
+    #[test]
+    fn test_published_prefix_read_races_retained_suffix_write() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let prefix_len = carrier_size.min(64);
+        let prefix = vec![0x5a; prefix_len];
+        let mut buffer = pool.acquire_unreserved(carrier_size).unwrap();
+        write_pooled(&mut buffer, &prefix);
+        let published = buffer.publish_prefix(prefix_len);
+        let suffix = vec![0xa5; buffer.remaining_mut()];
+        let reader_expected = prefix.clone();
+        let writer_input = suffix.clone();
+        let start = Arc::new(Barrier::new(2));
+
+        let reader_start = Arc::clone(&start);
+        let reading = thread::spawn(move || {
+            reader_start.wait();
+            for _ in 0..8 {
+                assert_eq!(published, reader_expected);
+            }
+            published
+        });
+
+        let writer_start = Arc::clone(&start);
+        let writing = thread::spawn(move || {
+            writer_start.wait();
+            write_pooled(&mut buffer, &writer_input);
+            buffer
+        });
+
+        let published = reading.join().unwrap();
+        let buffer = writing.join().unwrap();
+        assert_eq!(published, prefix);
+        assert_eq!(buffer.initialized_chunk(), suffix);
+
+        let frozen = buffer.freeze();
+        assert_eq!(frozen.chunk(), suffix);
+        drop(published);
+        drop(frozen);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
     #[test]

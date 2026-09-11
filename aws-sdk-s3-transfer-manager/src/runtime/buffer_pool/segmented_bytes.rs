@@ -1810,7 +1810,10 @@ mod tests {
 mod loom_tests {
     use std::task::Poll;
 
-    use super::super::block::BlockSlot;
+    use bytes::Buf;
+
+    use super::super::admission::AdmissionGuard;
+    use super::super::block::{BlockSlot, TrimBlocked};
     use super::super::test_util::{
         poll_reserve, slot_claiming_waker, test_pool, test_single_carrier_pool, write_pooled,
     };
@@ -1892,6 +1895,123 @@ mod loom_tests {
             right.join().unwrap();
 
             assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn test_advance_racing_sibling_drop_releases_crossed_owner_once() {
+        loom::model(|| {
+            let (pool, carrier_size) = test_pool(2, 2);
+            let mut mutable = pool.acquire_unreserved(carrier_size * 2).unwrap();
+            write_pooled(&mut mutable, &vec![0x5a; carrier_size]);
+            write_pooled(&mut mutable, &vec![0xa5; carrier_size]);
+            let mut advanced = mutable.freeze();
+            let sibling = advanced.clone();
+
+            let advancing = thread::spawn(move || {
+                advanced.advance(carrier_size);
+                advanced
+            });
+            let dropping = thread::spawn(move || drop(sibling));
+
+            let advanced = advancing.join().unwrap();
+            dropping.join().unwrap();
+
+            assert_eq!(advanced.len(), carrier_size);
+            assert_eq!(advanced.chunk(), vec![0xa5; carrier_size]);
+            assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+            drop(advanced);
+            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn test_shared_read_racing_sibling_drop_retains_immutable_storage() {
+        loom::model(|| {
+            let (pool, carrier_size) = test_single_carrier_pool(1);
+            let mut mutable = pool.acquire_unreserved(carrier_size).unwrap();
+            write_pooled(&mut mutable, b"immutable");
+            let reader = mutable.freeze();
+            let sibling = reader.clone();
+
+            let reading = thread::spawn(move || {
+                assert_eq!(reader.chunk(), b"immutable");
+                reader
+            });
+            let dropping = thread::spawn(move || drop(sibling));
+
+            let reader = reading.join().unwrap();
+            dropping.join().unwrap();
+
+            assert_eq!(reader.chunk(), b"immutable");
+            assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+            drop(reader);
+            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn test_batched_return_racing_trim_never_trims_live_ownership() {
+        loom::model(|| {
+            let (pool, carrier_size) = test_pool(2, 2);
+            let mut mutable = pool.acquire_unreserved(carrier_size * 2).unwrap();
+            write_pooled(&mut mutable, &vec![0x5a; carrier_size * 2]);
+            let frozen = mutable.freeze();
+            let slot = Arc::clone(
+                frozen.segments[0]
+                    .slot
+                    .as_ref()
+                    .expect("pooled segment slot"),
+            );
+            assert_eq!(slot.carrier_count(), CarrierCount::new(2));
+            assert_eq!(slot.bitmap_words(), 1);
+
+            // Queue behavior is modeled separately. Arm its real signal here
+            // to isolate batched bitmap publication from FIFO permutations.
+            pool.inner.reservation_drain.arm();
+
+            let returning = thread::spawn(move || drop(frozen));
+            let trim_pool = pool.clone();
+            let trim_slot = Arc::clone(&slot);
+            let trimming = thread::spawn(move || {
+                let result = {
+                    let mut admission = AdmissionGuard::new(trim_pool.inner.admission.lock());
+                    BlockSlot::start_trim(
+                        &trim_slot,
+                        admission.prepared_capacity_mut(),
+                        CarrierCount::ZERO,
+                    )
+                };
+                match result {
+                    Ok(cleanup) => {
+                        assert_eq!(
+                            trim_slot.live_carriers(),
+                            0,
+                            "trim started while batched owners were still live"
+                        );
+                        cleanup.finish().expect("trim cleanup");
+                        true
+                    }
+                    Err(TrimBlocked::Busy) => false,
+                    Err(other) => panic!("unexpected trim result: {other:?}"),
+                }
+            });
+
+            returning.join().unwrap();
+            let trimmed = trimming.join().unwrap();
+            assert_eq!(slot.live_carriers(), 0);
+            if !trimmed {
+                assert!(
+                    slot.appears_free(),
+                    "blocked trim did not leave the returned slot reusable"
+                );
+            }
+
+            let audit = pool.audit_quiescent();
+            assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+            assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+            assert_eq!(audit.queued_reservations, 0);
+            assert_eq!(audit.cleanup_pending_blocks, 0);
         });
     }
 
