@@ -46,4 +46,14 @@ fn public_memory_api_supports_an_explicit_pool_flow() {
     let unpolled: ReserveFuture = pool.reserve(carrier_size);
     drop(unpolled);
     assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
+
+    let oversized = usize::try_from(pool.metrics().configured_capacity_bytes())
+        .expect("configured capacity fits usize")
+        .checked_add(carrier_size)
+        .expect("oversized request fits usize");
+    assert!(matches!(
+        pool.try_reserve(oversized),
+        Err(ReserveError::ExceedsCapacity)
+    ));
+    assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
 }

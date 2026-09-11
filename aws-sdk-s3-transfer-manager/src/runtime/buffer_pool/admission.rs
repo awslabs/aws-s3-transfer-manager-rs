@@ -362,6 +362,11 @@ impl<'a> AdmissionGuard<'a> {
         self.inner.ledger.can_grant(coverage, envelope)
     }
 
+    /// Rejects an envelope larger than the configured admission ceiling.
+    pub(super) fn validate_envelope(&self, envelope: CarrierCount) -> Result<(), ReserveError> {
+        self.inner.ledger.validate_envelope(envelope)
+    }
+
     /// Computes and validates the post-grant admission floor.
     pub(super) fn grant_target(
         &self,
@@ -438,18 +443,20 @@ impl AdmissionLedger {
             .ok_or(ReserveError::CapacityOverflow)
     }
 
-    /// Returns whether one envelope may be granted now.
-    ///
-    /// A request normally fits below the configured ceiling. If no reservation
-    /// remains active, one request may exceed that ceiling so retained
-    /// uncovered ownership cannot prevent all future progress.
+    /// Returns whether one envelope fits the current admission state.
     fn can_grant(&self, coverage: CoverageSnapshot, envelope: CarrierCount) -> bool {
-        let normal = self
-            .admission_used(coverage)
+        self.admission_used(coverage)
             .ok()
             .and_then(|used| used.checked_add(envelope))
-            .is_some_and(|next| next <= self.configured_capacity);
-        normal || self.active_planned_demand == CarrierCount::ZERO
+            .is_some_and(|next| next <= self.configured_capacity)
+    }
+
+    /// Rejects an envelope that can never fit under normal admission.
+    fn validate_envelope(&self, envelope: CarrierCount) -> Result<(), ReserveError> {
+        if envelope > self.configured_capacity {
+            return Err(ReserveError::ExceedsCapacity);
+        }
+        Ok(())
     }
 
     /// Returns the prepared-capacity floor required after one grant.
@@ -528,6 +535,8 @@ impl AdmissionLedger {
 pub enum ReserveError {
     /// The byte request was zero.
     InvalidSize,
+    /// The requested envelope exceeds the pool's configured capacity.
+    ExceedsCapacity,
     /// Physical storage could not be prepared.
     PhysicalPreparationFailed,
     /// Queue or ownership metadata could not reserve the required capacity.
@@ -540,6 +549,9 @@ impl fmt::Display for ReserveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSize => f.write_str("reservation size must be nonzero"),
+            Self::ExceedsCapacity => {
+                f.write_str("reservation exceeds configured buffer-pool capacity")
+            }
             Self::PhysicalPreparationFailed => {
                 f.write_str("physical buffer-pool preparation failed")
             }
@@ -933,46 +945,60 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_only_grant_can_exceed_configured_capacity() {
+    fn test_reservation_larger_than_configured_capacity_is_rejected() {
         let (pool, carrier_size) = test_pool(2, 1);
 
-        let reservation = pool.try_reserve(carrier_size * 3).unwrap().unwrap();
+        assert!(matches!(
+            pool.try_reserve(carrier_size * 2),
+            Err(ReserveError::ExceedsCapacity)
+        ));
 
         let admission = pool.inner.admission.lock();
-        assert_eq!(admission.ledger.active_planned_demand, CarrierCount::new(3));
-        assert_eq!(admission.ledger.prepared_capacity, CarrierCount::new(4));
-        drop(admission);
-        drop(reservation);
+        assert_eq!(admission.ledger.active_planned_demand, CarrierCount::ZERO);
+        assert_eq!(admission.ledger.prepared_capacity, CarrierCount::ZERO);
+        assert_eq!(
+            pool.inner.coverage.snapshot(),
+            CoverageSnapshot {
+                available: CarrierCount::ZERO,
+                uncovered: CarrierCount::ZERO,
+            }
+        );
     }
 
     #[test]
-    fn test_idle_only_grant_can_progress_past_uncovered_ownership() {
+    fn test_retained_ownership_applies_reservation_backpressure() {
         let (pool, carrier_size) = test_pool(1, 1);
-        {
-            let mut admission = AdmissionGuard::new(pool.inner.admission.lock());
-            pool.inner
-                .coverage
-                .debit(CarrierCount::new(1), MAX_PACKED_CARRIERS)
-                .unwrap();
-            pool.inner
-                .arena
-                .prepare_to(&mut admission, CarrierCount::new(1))
-                .unwrap();
+        let reservation = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("initial reservation");
+        let retained = pool.acquire(&reservation, carrier_size).unwrap();
+        reservation.close_acquisition();
+
+        for _ in 0..4 {
+            assert!(pool.try_reserve(carrier_size).unwrap().is_none());
+            let metrics = pool.metrics();
+            assert_eq!(metrics.active_planned_demand_bytes(), 0);
+            assert_eq!(metrics.admission_used_bytes(), carrier_size as u64);
+            assert_eq!(metrics.charged_capacity_bytes(), carrier_size as u64);
+            assert_eq!(metrics.admission_overage_bytes(), 0);
         }
 
-        let reservation = pool.try_reserve(carrier_size).unwrap().unwrap();
-
-        {
-            let admission = pool.inner.admission.lock();
-            assert_eq!(admission.ledger.active_planned_demand, CarrierCount::new(1));
-            assert_eq!(admission.ledger.prepared_capacity, CarrierCount::new(2));
-            assert_eq!(
-                pool.inner.coverage.snapshot().uncovered,
-                CarrierCount::new(1)
-            );
-        }
-        drop(reservation);
-        pool.inner.coverage.release(CarrierCount::new(1));
+        drop(retained);
+        let next = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("returned ownership restores admission");
+        drop(next);
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.active_planned_demand, CarrierCount::ZERO);
+        assert_eq!(audit.available_coverage, CarrierCount::ZERO);
+        assert_eq!(audit.uncovered_charges, CarrierCount::ZERO);
+        assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        assert_eq!(audit.queued_reservations, 0);
+        assert_eq!(audit.cleanup_pending_blocks, 0);
+        assert_eq!(audit.prepared_capacity, CarrierCount::new(1));
     }
 
     #[test]
@@ -1165,27 +1191,23 @@ mod loom_tests {
     }
 
     #[test]
-    fn test_concurrent_idle_only_grants_do_not_compound_overage() {
+    fn test_concurrent_oversized_requests_do_not_enter_admission() {
         loom::model(|| {
             let (pool, carrier_size) = test_pool(1);
 
             let first_pool = pool.clone();
-            let first = thread::spawn(move || first_pool.try_reserve(carrier_size * 2).unwrap());
+            let first = thread::spawn(move || first_pool.try_reserve(carrier_size * 2));
             let second_pool = pool.clone();
-            let second = thread::spawn(move || second_pool.try_reserve(carrier_size * 2).unwrap());
+            let second = thread::spawn(move || second_pool.try_reserve(carrier_size * 2));
 
             let first = first.join().unwrap();
             let second = second.join().unwrap();
-            assert_eq!(
-                usize::from(first.is_some()) + usize::from(second.is_some()),
-                1
-            );
-            drop(first);
-            drop(second);
-            assert_eq!(
-                pool.inner.admission.lock().ledger.active_planned_demand,
-                CarrierCount::ZERO
-            );
+            assert!(matches!(first, Err(ReserveError::ExceedsCapacity)));
+            assert!(matches!(second, Err(ReserveError::ExceedsCapacity)));
+            let admission = pool.inner.admission.lock();
+            assert_eq!(admission.ledger.active_planned_demand, CarrierCount::ZERO);
+            assert_eq!(admission.ledger.prepared_capacity, CarrierCount::ZERO);
+            assert!(admission.waiters_is_empty());
         });
     }
 
