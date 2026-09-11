@@ -18,16 +18,16 @@ scratch and clients without the pool remain outside its accounting.
 
 ### Bound admission and account overage
 
-Configured capacity is the normal ceiling for managed admission. Uploads, downloads, retry bodies,
-completed output awaiting consumption, and pooled response frames share that ceiling rather than
-independent direction, connection, or transfer limits.
+Configured capacity is the ceiling for reservation-based admission. Uploads, downloads, retry
+bodies, completed output awaiting consumption, and pooled response frames share that ceiling rather
+than independent direction, connection, or transfer limits.
 
 Configured capacity does not preallocate memory and is not a hard limit on process RSS or mapped
 address space.
 
-Pooled ownership acquired without an open envelope, or retained after its envelope closes, may put
-admission above configured capacity. That ownership remains accounted and delays later managed work
-until its owners release it.
+Pooled ownership retained after its envelope closes remains accounted and delays later managed work
+until its owners release it. Explicit unreserved acquisition may put admission above configured
+capacity and requires independent caller backpressure.
 
 ### Share one accounting domain across components
 
@@ -38,8 +38,8 @@ configured capacity.
 A component that requires bounded admission reserves before acquisition. Unreserved acquisition
 does not become bounded merely because its caller shares the pool.
 
-FIFO order and idle-only eligibility are pool-wide. One component's head request may block later
-requests from every component; the shared domain provides no per-component latency isolation.
+FIFO order and eligibility are pool-wide. One component's head request may block later requests
+from every component; the shared domain provides no per-component latency isolation.
 
 Transfer-manager shutdown releases only that manager's state. It does not close a pool retained by
 another caller.
@@ -80,15 +80,14 @@ Physical memory becomes reusable before its capacity is credited to later admiss
 Pooled upload memory preserves exact content length and replays the same immutable bytes across
 attempts.
 
-### Preserve admission order and oversized progress
+### Preserve admission order and bounded backpressure
 
 Admission pressure delays managed work instead of rejecting it. FIFO order prevents a stream of
 small requests from indefinitely deferring an earlier large request.
 
-When no active planned demand remains, the FIFO head may be admitted even if its envelope exceeds
-configured capacity or retained ownership would otherwise block it. This idle-only exception admits
-at most one managed request at a time. Progress assumes earlier reservations close and physical
-preparation succeeds.
+An envelope larger than configured capacity cannot become eligible and is rejected before entering
+the FIFO. A legal request blocked by retained ownership remains queued until that ownership returns.
+Granting more memory cannot force an independently retained owner to make progress.
 
 Cancellation removes delayed demand or closes future direct-acquisition authority. Memory already
 owned remains accounted until final return.
@@ -648,30 +647,18 @@ fn try_reserve_count(
 ```
 
 A fresh request cannot bypass an existing waiter. With an empty FIFO, or when examining its head,
-an envelope is eligible for a normal grant when:
+an envelope is eligible when:
 
 ```text
 admission_used + envelope <= configured_capacity
 ```
 
-An idle-only grant is also eligible when:
-
-```text
-active_planned_demand == 0
-```
-
-Idle here means that no reservation retains direct-acquisition authority; carriers may remain
-owned. The idle-only rule permits one envelope larger than configured capacity and one envelope
-blocked only by uncovered charges. Admission cannot force independently driven owners to return.
-Granting the envelope makes `active_planned_demand` nonzero and disables another idle-only grant
-until it closes.
-
-Strict FIFO provides the liveness argument. While an ineligible oversized request remains at the
-head, no fresh request or later waiter can be granted. Earlier reservations therefore close without
-replacement, and `active_planned_demand` eventually reaches zero. The head then satisfies the
-idle-only predicate. Unreserved acquisition may continue during this interval, but it does not add
-active planned demand and cannot prevent the idle-only grant. Permitting bypass would remove this
-progress guarantee.
+Requests whose complete envelope exceeds configured capacity fail before queue insertion or
+physical preparation. Legal requests that do not currently fit remain in strict FIFO order.
+Reservation close reclassifies retained ownership rather than releasing it, so a blocked head
+becomes eligible only when enough active demand closes or enough retained ownership returns.
+Explicit unreserved acquisition may delay reservation progress because it participates in
+`admission_used` without obeying the reservation ceiling.
 
 Before publishing a grant, admission prepares physical capacity for the post-grant
 `admission_used`. Preparation does not assign carriers to the reservation. Success adds the complete
@@ -1227,10 +1214,9 @@ grant. Existing prepared capacity satisfies part or all of that floor; every new
 completes target-specific preparation before it is counted.
 
 On a commit-accounting target, preparation consumes commit capacity for every newly required block.
-A grant, including an idle-only oversized grant, can therefore fail before work is dispatched. On a
-target where making a range writable does not establish resident backing, a successful grant does
-not prove later residency. The exact target operations are defined by the
-[platform contract](#platform-contract).
+A grant can therefore fail before work is dispatched. On a target where making a range writable
+does not establish resident backing, a successful grant does not prove later residency. The exact
+target operations are defined by the [platform contract](#platform-contract).
 
 Preparation may run synchronously. Mapping, placement, registration, or operating-system commit can
 fail and return an acquisition or reservation error. No progress guarantee places a time bound on
@@ -2842,8 +2828,8 @@ impl MemoryMetrics {
     /// Capacity whose mapping, placement, and registration are complete.
     ///
     /// Preparation rounds its current floor up to whole blocks and may exceed
-    /// that floor by less than one block. Idle-only admission overage may also
-    /// place prepared capacity above the normal configured ceiling.
+    /// that floor by less than one block. Explicit unreserved acquisition may
+    /// also place prepared capacity above the configured ceiling.
     pub fn prepared_capacity_bytes(&self) -> u64;
 
     /// Reservation requests retained in FIFO order.
@@ -2866,8 +2852,8 @@ counter to the common path. Values are carrier-rounded bytes and exclude foreign
 scratch, copied contiguous output, and other process memory.
 
 Prepared capacity follows whole-block geometry and the current admission floor. Block rounding may
-raise it by less than one block beyond that floor. It can exceed configured capacity either through
-that rounding or because an idle-only grant raised admission above the normal ceiling.
+raise it by less than one block beyond that floor. It can exceed configured capacity through that
+rounding or because explicit unreserved acquisition raised the admission floor.
 
 `reservation_enqueues_total` is copied from the admission state in the same sample. It increments
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
@@ -2972,8 +2958,9 @@ admission floor before removing prepared capacity.
 
 This prevents writable memory from escaping accounting, admission from relying on inaccessible
 storage, and accounting release from admitting work before the corresponding carrier is reusable.
-Configured capacity is absent from the chain because idle-only admission and uncovered acquisition
-may exceed it.
+Configured capacity is absent from the chain because explicit unreserved acquisition may exceed it.
+Reservation grants separately require their complete post-grant admission use to remain within
+configured capacity.
 
 ### Admitted work does not wait for another owner
 
@@ -2988,7 +2975,7 @@ that cannot run. The guarantee excludes mutex scheduling and operating-system ma
 registration, or commit latency. Failure to obtain physical storage remains an explicit operation
 error.
 
-### Admission preserves order and idle progress
+### Admission preserves order and backpressure
 
 A queued reservation request cannot be bypassed by a fresh request or a later waiter. Capacity
 released for the FIFO is transferred directly into the head waiter's terminal result before its
@@ -2996,12 +2983,11 @@ waker runs. The waiter lifecycle and slot-lock interleaving under
 [Wait queue](#wait-queue) establish that cancellation produces either one caller-owned grant or one
 retired grant, never both.
 
-When no reservation retains active planned demand, the FIFO head may receive an idle-only grant
-even when its envelope exceeds configured capacity or uncovered charges prevent a normal grant.
-Every admitted envelope is nonzero, so that grant makes active planned demand nonzero and a second
-idle-only grant cannot compound the overshoot. Strict no-bypass ordering ensures active planned
-demand can fall to zero while an oversized head waits. Progress requires earlier reservations to
-close and physical preparation to succeed; FIFO order does not impose a time bound on either.
+An envelope larger than configured capacity fails before entering the FIFO. A legal head request
+blocked by active demand or retained ownership remains queued. Closing an earlier reservation can
+reduce active planned demand, but retained ownership continues to consume admission until its final
+owner returns. That return publishes physical reuse and releases accounting before reconsidering
+the FIFO. Cancellation removes an ineligible head and immediately reconsiders the next request.
 
 ### Reservation close does not release owned bytes
 

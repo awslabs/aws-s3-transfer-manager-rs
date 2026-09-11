@@ -474,6 +474,7 @@ fn map_direct_debit_error(error: DirectDebitError) -> AcquireError {
 fn map_reserve_error(error: ReserveError) -> AcquireError {
     match error {
         ReserveError::InvalidSize => AcquireError::InvalidSize,
+        ReserveError::ExceedsCapacity => AcquireError::CapacityOverflow,
         ReserveError::PhysicalPreparationFailed => AcquireError::PhysicalAllocationFailed,
         ReserveError::MetadataAllocationFailed => AcquireError::MetadataAllocationFailed,
         ReserveError::CapacityOverflow => AcquireError::CapacityOverflow,
@@ -783,7 +784,7 @@ mod tests {
         let second = pool
             .try_reserve(carrier_size)
             .unwrap()
-            .expect("idle-only reservation");
+            .expect("second reservation");
         let second_acquired = pool.acquire(&second, carrier_size).unwrap();
         let (waker, wake_state) = claiming_waker(pool.clone());
         let mut queued = pool.reserve(carrier_size);
@@ -921,18 +922,6 @@ mod tests {
             for _ in 0..STEPS {
                 match next(&mut state) % 4 {
                     0 => {
-                        let active: usize = actors
-                            .iter()
-                            .filter_map(|actor| actor.reservation.as_ref().map(|_| actor.envelope))
-                            .sum();
-                        let live: usize = owners.iter().map(|owner| owner.carriers).sum();
-
-                        // When no reservation is active, one request may exceed
-                        // the normal ceiling so retained owners cannot stop
-                        // progress. This model covers normal-ceiling admission.
-                        if active == 0 && live != 0 {
-                            continue;
-                        }
                         let Some(actor) = actors.iter_mut().find(|actor| !actor.used) else {
                             continue;
                         };
@@ -1236,7 +1225,7 @@ mod loom_tests {
             let holder = pool
                 .try_reserve(carrier_size)
                 .unwrap()
-                .expect("idle-only reservation");
+                .expect("reservation within configured capacity");
             let (waker, wake_count) = counting_waker();
             let mut future = pool.reserve(carrier_size);
 
@@ -1318,7 +1307,7 @@ mod loom_tests {
             let holder = pool
                 .try_reserve(carrier_size)
                 .unwrap()
-                .expect("idle-only reservation");
+                .expect("reservation within configured capacity");
             let (waker, wake_count) = counting_waker();
             let mut future = pool.reserve(carrier_size);
 

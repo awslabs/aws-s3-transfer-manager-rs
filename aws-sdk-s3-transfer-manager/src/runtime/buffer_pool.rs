@@ -156,7 +156,8 @@ impl BufferPool {
     ///
     /// `Ok(None)` reports an older FIFO request or current admission pressure.
     /// A successful grant has already prepared storage through its complete
-    /// admission floor.
+    /// admission floor. A request whose carrier-rounded envelope exceeds the
+    /// configured pool capacity returns [`ReserveError::ExceedsCapacity`].
     pub fn try_reserve(&self, bytes: usize) -> Result<Option<Reservation>, ReserveError> {
         let envelope = self.reservation_envelope(bytes)?;
         PoolInner::try_reserve_count(&self.inner, envelope)
@@ -166,7 +167,8 @@ impl BufferPool {
     ///
     /// The first poll either returns an immediate result or enters the
     /// pool-wide FIFO. Invalid requests and physical preparation failures
-    /// resolve through the future's `ReserveError`.
+    /// resolve through the future's `ReserveError`. A request larger than the
+    /// configured pool capacity fails without entering the FIFO.
     pub fn reserve(&self, bytes: usize) -> ReserveFuture {
         ReserveFuture::new(self.clone(), bytes)
     }
@@ -441,6 +443,7 @@ impl PoolInner {
         }
 
         let mut admission = AdmissionGuard::new(pool.admission.lock());
+        admission.validate_envelope(envelope)?;
         if !admission.inner.waiters_is_empty() {
             return Ok(None);
         }
@@ -470,6 +473,7 @@ impl PoolInner {
         }
 
         let mut admission = AdmissionGuard::new(pool.admission.lock());
+        admission.validate_envelope(envelope)?;
         pool.reservation_drain.arm();
         let coverage = pool.coverage.snapshot();
         if admission.inner.waiters_is_empty() && admission.can_grant(coverage, envelope) {

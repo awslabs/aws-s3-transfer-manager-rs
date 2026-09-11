@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn test_whole_value_drop_batches_physical_and_accounting_return() {
-        let (pool, carrier_size) = test_pool(8, 8);
+        let (pool, carrier_size) = test_pool(8, 9);
         let reservation = pool
             .try_reserve(carrier_size * 8)
             .unwrap()
@@ -907,7 +907,7 @@ mod tests {
         let holder = pool
             .try_reserve(carrier_size)
             .unwrap()
-            .expect("idle-progress reservation");
+            .expect("reservation within configured capacity");
         let (waker, wake_state) = slot_claiming_waker(Arc::clone(&slot));
         let mut queued = pool.reserve(carrier_size * 7);
         assert!(poll_reserve(&mut queued, &waker).is_pending());
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn test_contiguous_owner_batches_before_waking_waiter() {
-        let (pool, carrier_size) = test_pool(2, 2);
+        let (pool, carrier_size) = test_pool(2, 3);
         let reservation = pool
             .try_reserve(carrier_size * 2)
             .unwrap()
@@ -1071,7 +1071,7 @@ mod tests {
         let holder = pool
             .try_reserve(carrier_size)
             .unwrap()
-            .expect("idle-progress reservation");
+            .expect("reservation within configured capacity");
         let (waker, wake_state) = slot_claiming_waker(Arc::clone(&slot));
         let mut queued = pool.reserve(carrier_size);
         assert!(poll_reserve(&mut queued, &waker).is_pending());
@@ -1821,7 +1821,7 @@ mod loom_tests {
     #[test]
     fn test_batched_return_races_claim_and_publishes_before_wake() {
         loom::model(|| {
-            let (pool, carrier_size) = test_pool(2, 2);
+            let (pool, carrier_size) = test_pool(2, 3);
             let reservation = pool
                 .try_reserve(carrier_size * 2)
                 .unwrap()
@@ -1845,7 +1845,7 @@ mod loom_tests {
             let holder = pool
                 .try_reserve(carrier_size)
                 .unwrap()
-                .expect("idle-progress reservation");
+                .expect("reservation within configured capacity");
             let (waker, wake_state) = slot_claiming_waker(Arc::clone(&slot));
             let mut queued = pool.reserve(carrier_size);
             assert!(poll_reserve(&mut queued, &waker).is_pending());

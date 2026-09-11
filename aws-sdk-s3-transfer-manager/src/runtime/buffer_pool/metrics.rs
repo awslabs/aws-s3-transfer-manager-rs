@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_report_idle_only_overage_without_exposing_ledger_fields() {
+    fn test_metrics_report_unreserved_overage_without_exposing_ledger_fields() {
         let (pool, carrier_size) = test_pool(2, 1);
 
         let acquired = pool.acquire_unreserved(carrier_size * 2).unwrap();
