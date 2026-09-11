@@ -129,6 +129,8 @@ pub(super) struct TestHooks {
     return_admission_entries: AtomicUsize,
     /// Remaining metadata boundaries before one acquisition failure.
     acquisition_allocation_failure: AtomicUsize,
+    /// Fails the next reservation FIFO metadata allocation when set.
+    reservation_queue_allocation_failure: AtomicBool,
     /// One terminal reservation failure returned before admission work.
     reservation_failure: Mutex<Option<ReserveError>>,
     /// Fails the next maintenance worker creation when set.
@@ -146,6 +148,7 @@ impl TestHooks {
             acquisition_attempts: AtomicUsize::new(0),
             return_admission_entries: AtomicUsize::new(0),
             acquisition_allocation_failure: AtomicUsize::new(0),
+            reservation_queue_allocation_failure: AtomicBool::new(false),
             reservation_failure: Mutex::new(None),
             maintenance_spawn_failure: AtomicBool::new(false),
             maintenance_spawn_attempts: AtomicUsize::new(0),
@@ -184,6 +187,22 @@ impl TestHooks {
                 },
             )
             .is_ok_and(|previous| previous == 1)
+    }
+
+    /// Fails the next reservation FIFO metadata allocation.
+    fn inject_reservation_queue_allocation_failure(&self) {
+        assert!(
+            !self
+                .reservation_queue_allocation_failure
+                .swap(true, Ordering::AcqRel),
+            "a reservation queue allocation failure is already pending"
+        );
+    }
+
+    /// Consumes one injected reservation FIFO metadata failure.
+    pub(super) fn take_reservation_queue_allocation_failure(&self) -> bool {
+        self.reservation_queue_allocation_failure
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Installs one terminal reservation failure.
@@ -289,6 +308,13 @@ impl BufferPool {
             != 0
     }
 
+    /// Injects one reservation FIFO metadata allocation failure.
+    pub(super) fn inject_reservation_queue_allocation_failure(&self) {
+        self.inner
+            .test_hooks
+            .inject_reservation_queue_allocation_failure();
+    }
+
     /// Makes the next reservation future resolve to `error`.
     pub(crate) fn inject_reservation_failure(&self, error: ReserveError) {
         self.inner.test_hooks.inject_reservation_failure(error);
@@ -390,6 +416,11 @@ impl BufferPool {
         }
     }
 
+    /// Runs the internal accounting and ownership reconciliation.
+    pub(crate) fn validate_quiescent_for_test(&self) {
+        let _ = self.audit_quiescent();
+    }
+
     /// Asserts that no accounting, physical ownership, or cleanup remains.
     pub(super) fn assert_quiescent_zero(&self) {
         assert_eq!(
@@ -472,7 +503,7 @@ pub(super) fn wake_count(count: &AtomicUsize) -> usize {
 }
 
 /// Constructs a pool with a one-word optimistic scan budget.
-pub(super) fn test_pool(block_carriers: usize, configured: usize) -> (BufferPool, usize) {
+pub(crate) fn test_pool(block_carriers: usize, configured: usize) -> (BufferPool, usize) {
     test_pool_with_scan(block_carriers, configured, 1)
 }
 

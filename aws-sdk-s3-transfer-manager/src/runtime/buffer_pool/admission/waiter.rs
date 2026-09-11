@@ -462,6 +462,34 @@ mod tests {
     }
 
     #[test]
+    fn test_queue_metadata_failure_publishes_no_waiter_and_pool_remains_usable() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let holder = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("initial reservation");
+        pool.inject_reservation_queue_allocation_failure();
+        let (waker, wake_state) = counting_waker();
+        let mut future = pool.reserve(carrier_size);
+
+        assert!(matches!(
+            poll_reserve(&mut future, &waker),
+            Poll::Ready(Err(ReserveError::MetadataAllocationFailed))
+        ));
+        assert_eq!(wake_count(&wake_state), 0);
+        assert_eq!(pool.metrics().queued_reservations(), 0);
+        assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
+        assert!(!pool.inner.reservation_drain.is_armed());
+
+        drop(holder);
+        let retry = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("pool remains usable after queue metadata failure");
+        drop(retry);
+    }
+
+    #[test]
     fn test_reservation_enqueue_counter_saturates_and_counts_one_fifo_entry_once() {
         let (pool, carrier_size) = test_pool(1, 1);
         let holder = pool
