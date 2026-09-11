@@ -107,21 +107,25 @@ impl BufferPool {
         diagnostics: MemoryDiagnosticsConfig,
     ) -> Result<Self, BufferPoolBuildError> {
         let resolved = PoolConfig::resolve(capacity, detected_memory)?;
-        Ok(Self::from_parts_with_diagnostics(
+        let arena_options = ArenaOptions::new(
+            resolved.optimistic_scan_words,
+            diagnostics.enable_detailed_counters(),
+        );
+        Ok(Self::from_parts_with_arena_options(
             resolved.geometry,
             resolved.configured_capacity,
-            resolved.optimistic_scan_words,
             diagnostics,
+            arena_options,
         )
         .unwrap_or_else(|_| invariant_violation("validated pool configuration was rejected")))
     }
 
-    /// Constructs a pool with one already resolved diagnostic policy.
-    fn from_parts_with_diagnostics(
+    /// Constructs a pool with explicit internal arena policy.
+    fn from_parts_with_arena_options(
         geometry: PoolGeometry,
         configured_capacity: CarrierCount,
-        optimistic_scan_words: usize,
         diagnostics: MemoryDiagnosticsConfig,
+        arena_options: ArenaOptions,
     ) -> Result<Self, ArenaError> {
         if configured_capacity == CarrierCount::ZERO {
             invariant_violation("configured capacity must be nonzero");
@@ -134,11 +138,12 @@ impl BufferPool {
             .get()
             .checked_mul(geometry.carrier_size())
             .unwrap_or_else(|| invariant_violation("configured byte capacity overflowed"));
+        let optimistic_scan_words = arena_options.optimistic_scan_words();
         let inner = Arc::new(PoolInner::new(
             geometry,
             configured_capacity,
-            optimistic_scan_words,
             diagnostics,
+            arena_options,
         )?);
         inner.maintenance.start_periodic_diagnostics(&inner);
         tracing::debug!(
@@ -318,8 +323,8 @@ impl PoolInner {
     fn new(
         geometry: PoolGeometry,
         configured_capacity: CarrierCount,
-        optimistic_scan_words: usize,
         diagnostics: MemoryDiagnosticsConfig,
+        arena_options: ArenaOptions,
     ) -> Result<Self, ArenaError> {
         Ok(Self {
             geometry,
@@ -328,13 +333,7 @@ impl PoolInner {
             #[cfg(not(all(test, s3_tm_loom)))]
             active_owner_returns: AtomicUsize::new(0),
             coverage: CoverageState::new(),
-            arena: Arena::new(
-                geometry,
-                ArenaOptions::new(
-                    optimistic_scan_words,
-                    diagnostics.enable_detailed_counters(),
-                ),
-            )?,
+            arena: Arena::new(geometry, arena_options)?,
             maintenance: MaintenanceCoordinator::new(
                 configured_capacity,
                 geometry,

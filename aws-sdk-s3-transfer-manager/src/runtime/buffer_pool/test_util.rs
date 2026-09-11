@@ -19,6 +19,7 @@ use crate::runtime::sync::sync::{Arc, Mutex};
 use crate::runtime::sync::thread;
 
 use super::admission::{Reservation, ReserveError, ReserveFuture};
+use super::arena::ArenaOptions;
 use super::block::BlockSlot;
 use super::geometry::PoolGeometry;
 use super::virtual_memory::page_size;
@@ -535,11 +536,15 @@ pub(super) fn test_pool_with_scan_and_diagnostics(
         page_size,
     )
     .unwrap();
-    let pool = BufferPool::from_parts_with_diagnostics(
+    let options = ArenaOptions::new(
+        optimistic_scan_words,
+        diagnostics.enable_detailed_counters(),
+    );
+    let pool = BufferPool::from_parts_with_arena_options(
         geometry,
         CarrierCount::new(configured),
-        optimistic_scan_words,
         diagnostics,
+        options,
     )
     .unwrap();
     (pool, page_size)
@@ -548,6 +553,27 @@ pub(super) fn test_pool_with_scan_and_diagnostics(
 /// Constructs a pool whose block and carrier are one runtime page.
 pub(super) fn test_single_carrier_pool(configured: usize) -> (BufferPool, usize) {
     test_pool(1, configured)
+}
+
+/// Constructs a pool whose complete block ranges have native guard pages.
+#[cfg(not(any(miri, s3_tm_loom)))]
+pub(super) fn test_guarded_pool(block_carriers: usize, configured: usize) -> (BufferPool, usize) {
+    let page_size = page_size().unwrap().get();
+    let geometry = PoolGeometry::new(
+        page_size,
+        page_size.checked_mul(block_carriers).unwrap(),
+        page_size,
+    )
+    .unwrap();
+    let options = ArenaOptions::new(1, true).enable_guard_pages();
+    let pool = BufferPool::from_parts_with_arena_options(
+        geometry,
+        CarrierCount::new(configured),
+        MemoryDiagnosticsConfig::for_test(None, 1),
+        options,
+    )
+    .unwrap();
+    (pool, page_size)
 }
 
 /// Initializes bytes through the pooled buffer's `BufMut` boundary.
