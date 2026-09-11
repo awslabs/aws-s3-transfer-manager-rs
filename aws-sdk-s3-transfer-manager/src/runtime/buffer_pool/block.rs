@@ -1025,7 +1025,7 @@ impl BlockSlot {
 
     /// Counts set valid bits in the current incarnation.
     #[cfg(test)]
-    fn live_carriers(&self) -> usize {
+    pub(super) fn live_carriers(&self) -> usize {
         self.current
             .load()
             .as_ref()
