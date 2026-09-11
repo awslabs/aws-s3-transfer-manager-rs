@@ -66,6 +66,7 @@ http-body-1x = { package = "http-body", version = "1" }
 fastrand = "2.4"
 futures-test = "0.3.30"
 md5 = "0.7.0"
+proptest = "1"
 tempfile = "3.12.0"
 test-common = { path = "./test-common" }
 tokio-test = "0.4.4"

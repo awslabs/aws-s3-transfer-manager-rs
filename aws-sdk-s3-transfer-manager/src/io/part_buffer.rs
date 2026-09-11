@@ -482,3 +482,6 @@ mod tests {
         assert_send_sync::<PartBuffer>();
     }
 }
+
+#[cfg(all(test, not(s3_tm_loom)))]
+mod prop_tests;

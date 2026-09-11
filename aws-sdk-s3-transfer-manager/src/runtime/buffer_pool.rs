@@ -34,6 +34,8 @@ mod geometry;
 mod maintenance;
 mod metrics;
 mod pooled_buf;
+#[cfg(all(test, not(s3_tm_loom)))]
+mod prop_tests;
 mod segmented_bytes;
 #[cfg(test)]
 mod test_util;
@@ -59,6 +61,8 @@ use pooled_buf::GrowthAuthority;
 pub use pooled_buf::PooledBufMut;
 pub use segmented_bytes::SegmentedBytes;
 
+#[cfg(all(test, not(s3_tm_loom)))]
+pub(crate) use test_util::test_pool;
 #[cfg(test)]
 use test_util::TestHooks;
 
@@ -485,6 +489,12 @@ impl PoolInner {
         }
 
         let slot = Arc::new(WaitSlot::new(waker));
+        #[cfg(test)]
+        if pool.test_hooks.take_reservation_queue_allocation_failure() {
+            pool.reservation_drain
+                .publish_waiter_state(!admission.inner.waiters_is_empty());
+            return Err(ReserveError::MetadataAllocationFailed);
+        }
         let queue_became_nonempty = match admission.inner.enqueue_waiter(
             Waiter {
                 envelope,
