@@ -466,7 +466,22 @@ impl BlockSlot {
             geometry.block_size(),
             NonZeroUsize::new(geometry.page_size()).expect("geometry has a nonzero page size"),
         )?;
-        Ok(Self {
+        Ok(Self::from_range(id, geometry, range))
+    }
+
+    /// Reserves one block range with an inaccessible page on each side.
+    #[cfg(test)]
+    pub(super) fn new_guarded(id: u32, geometry: PoolGeometry) -> Result<Self, BlockError> {
+        let range = VirtualRange::reserve_guarded(
+            geometry.block_size(),
+            NonZeroUsize::new(geometry.page_size()).expect("geometry has a nonzero page size"),
+        )?;
+        Ok(Self::from_range(id, geometry, range))
+    }
+
+    /// Constructs one stable slot around an already reserved block range.
+    fn from_range(id: u32, geometry: PoolGeometry, range: VirtualRange) -> Self {
+        Self {
             id,
             range,
             geometry,
@@ -476,7 +491,7 @@ impl BlockSlot {
             current: IncarnationCell::new(),
             #[cfg(test)]
             release_batches: AtomicU64::new(0),
-        })
+        }
     }
 
     /// Returns the number of carriers in this slot.

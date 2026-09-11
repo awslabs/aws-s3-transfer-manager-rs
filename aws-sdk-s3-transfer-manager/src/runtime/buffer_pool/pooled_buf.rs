@@ -1256,6 +1256,133 @@ mod tests {
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
+    #[cfg(all(
+        not(miri),
+        any(
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )
+    ))]
+    mod guard_page_tests {
+        //! Native mapping-boundary tests for pooled mutable buffers.
+        //!
+        //! Guarded fixtures reserve one inaccessible page on each side of the
+        //! range managed by a block:
+        //!
+        //! ```text
+        //! reservation base             block base                  reservation end
+        //!       | guard page | one-carrier block range | guard page |
+        //!       | inaccessible | prepared as one unit  | inaccessible |
+        //! ```
+        //!
+        //! A block contains one carrier in these fixtures. A one-byte carrier
+        //! underflow or overflow therefore lands directly in a guard page,
+        //! while normal block preparation never changes either guard.
+        //!
+        //! The lifecycle test uses two guarded blocks and exercises ordinary
+        //! acquisition, writing, prefix publication, freeze, owner return, and
+        //! the global audit. The fault test launches this test binary as a
+        //! child for each boundary write. The child is expected to fault, so
+        //! the parent can verify the native signal without terminating the
+        //! complete test process.
+
+        use std::process::Command;
+
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+
+        use super::super::super::test_util::{test_guarded_pool, write_pooled};
+        use super::super::super::CarrierCount;
+        use super::*;
+
+        const PROBE_ENV: &str = "AWS_S3_TM_GUARD_PAGE_PROBE";
+        const PROBE_TEST: &str = concat!(
+            "runtime::buffer_pool::pooled_buf::tests::guard_page_tests::",
+            "test_guard_pages_reject_out_of_bounds_writes"
+        );
+
+        /// Exercises the ordinary mutable-to-immutable lifecycle across guarded blocks.
+        #[test]
+        fn test_guarded_blocks_preserve_buffer_lifecycle() {
+            let (pool, carrier_size) = test_guarded_pool(1, 2);
+            let input: Vec<u8> = (0..carrier_size * 2)
+                .map(|index| (index.wrapping_mul(17) % 251) as u8)
+                .collect();
+            let mut buffer = pool.acquire_unreserved(input.len()).unwrap();
+            write_pooled(&mut buffer, &input);
+
+            let first = buffer.publish_prefix(carrier_size);
+            let second = buffer.freeze();
+            assert_eq!(first, input[..carrier_size]);
+            assert_eq!(second.chunk(), &input[carrier_size..]);
+
+            drop(first);
+            drop(second);
+            let audit = pool.audit_quiescent();
+            assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+            assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        }
+
+        /// Verifies that writes immediately outside a block fault in child processes.
+        #[test]
+        fn test_guard_pages_reject_out_of_bounds_writes() {
+            if let Some(probe) = std::env::var_os(PROBE_ENV) {
+                run_guard_page_probe(
+                    probe
+                        .to_str()
+                        .unwrap_or_else(|| panic!("{PROBE_ENV} is not valid UTF-8")),
+                );
+                return;
+            }
+
+            assert_guard_page_fault("underflow");
+            assert_guard_page_fault("overflow");
+        }
+
+        /// Runs one faulting probe in a child test process.
+        fn assert_guard_page_fault(probe: &str) {
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg(PROBE_TEST)
+                .arg("--nocapture")
+                .env(PROBE_ENV, probe)
+                .status()
+                .expect("guard-page child process");
+
+            assert!(
+                !status.success(),
+                "{probe} unexpectedly remained accessible"
+            );
+            #[cfg(unix)]
+            {
+                let signal = status.signal();
+                assert!(
+                    signal == Some(libc::SIGSEGV) || signal == Some(libc::SIGBUS),
+                    "{probe} failed without a guard-page signal: {status:?}"
+                );
+            }
+        }
+
+        /// Writes one byte immediately outside a guarded one-carrier block.
+        fn run_guard_page_probe(probe: &str) {
+            let (pool, carrier_size) = test_guarded_pool(1, 1);
+            let mut buffer = pool.acquire_unreserved(carrier_size).unwrap();
+            let ptr = buffer.chunk_mut().as_mut_ptr();
+            let fault = match probe {
+                "underflow" => ptr.wrapping_sub(1),
+                // SAFETY: the one-past pointer remains within the complete
+                // guarded virtual reservation.
+                "overflow" => unsafe { ptr.add(carrier_size) },
+                other => panic!("unknown guard-page probe {other}"),
+            };
+            // SAFETY: the child process deliberately verifies that this
+            // inaccessible address terminates execution.
+            unsafe { fault.write_volatile(0x5a) };
+        }
+    }
+
     #[test]
     fn test_growth_skips_a_fully_published_carrier_entry() {
         let (pool, carrier_size) = test_pool(1, 2);
