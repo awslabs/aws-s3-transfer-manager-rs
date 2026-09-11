@@ -37,10 +37,12 @@
 //!
 //! # Backpressure
 //!
-//! Transfers that cannot acquire resources (sequence window full, memory budget
-//! exhausted) return `Pending` from `poll_work()`. The scheduler stops polling them
-//! until `wake()` is called, which re-inserts the transfer into the ready set and
-//! triggers work generation.
+//! Transfers that cannot produce dispatchable work return `Pending` from
+//! `poll_work()`. The scheduler stops polling them until `wake()` is called. Work
+//! whose readiness is discovered only after dispatch may instead return
+//! [`WorkOutcome::Yielded`]. That retires its execution slot without reporting an
+//! I/O operation or failure to the concurrency controller; transfer state must
+//! already have retained any continuation or retracted the speculative operation.
 //!
 //! # Threading and Cost
 //!
@@ -84,10 +86,14 @@
 //! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
 //! - **Failed lifecycle**: record the error and signal termination before returning
 //!   a failure outcome.
-//! - **Pending/wake obligation**: every `Pending` must have a future wake path.
-//!   The wake primitive is edge-triggered; the mutator pattern is
+//! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must have a
+//!   future wake path. The wake primitive is edge-triggered; the mutator pattern is
 //!   `lock → mutate → unlock → try_wake`. See [`crate::transfer::TransferContext`]
 //!   for the protocol.
+//! - **Execution-yield obligation**: before returning `WorkOutcome::Yielded`, a
+//!   transfer must reconcile the dispatched work exactly once. A retained
+//!   continuation keeps its progress and wake state; retracted work leaves no
+//!   continuation behind.
 //! - **Panic safety**: `execute` panics are caught by the runtime's
 //!   `catch_unwind` wrapper and converted to a terminal transition.
 //!   `poll_work` panics are caught by the scheduler itself inside
@@ -456,7 +462,7 @@ impl Scheduler {
     ) {
         let outcome_tag = match &outcome {
             WorkOutcome::Success { .. } => "success",
-            WorkOutcome::Pending => "pending",
+            WorkOutcome::Yielded => "yielded",
             WorkOutcome::Failed { .. } => "failed",
             WorkOutcome::Cancelled => "cancelled",
         };
@@ -465,13 +471,13 @@ impl Scheduler {
             tid = %work.descriptor.id(),
             ?elapsed,
             outcome = outcome_tag,
-            "work completed",
+            "work execution finished",
         );
         self.release_dispatched(1);
 
-        // Report to the concurrency controller. Pending work retires the dispatch slot without
-        // contributing an I/O observation because its source operation has not completed.
-        let completion_sample = if matches!(outcome, WorkOutcome::Pending) {
+        // Report to the concurrency controller. Yielded work retires the dispatch slot without
+        // contributing an I/O operation or failure observation.
+        let completion_sample = if matches!(outcome, WorkOutcome::Yielded) {
             None
         } else {
             let classification = match &outcome {
@@ -971,7 +977,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn pending_work_releases_capacity_without_reporting_completion() {
+    async fn yielded_work_releases_capacity_without_reporting_completion() {
         let controller = Arc::new(CountingCompletionController {
             completions: AtomicUsize::new(0),
             samples: AtomicUsize::new(0),
@@ -986,7 +992,7 @@ mod tests {
             parent: None,
         };
         let state = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
-            WorkOutcome::Pending
+            WorkOutcome::Yielded
         }));
         handle
             .scheduler
@@ -998,7 +1004,7 @@ mod tests {
             }
         })
         .await
-        .expect("scheduler did not drain pending work");
+        .expect("scheduler did not drain yielded work");
 
         assert_eq!(controller.completions.load(Ordering::Relaxed), 1);
         assert_eq!(controller.samples.load(Ordering::Relaxed), 0);

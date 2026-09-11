@@ -229,8 +229,10 @@ impl PollWork {
 ///
 /// Contract between transfer state machines and the scheduler:
 /// - `Success`: Work completed. Scheduler continues polling the transfer for more work.
-/// - `Pending`: Work retained its continuation and released the execution slot without completing
-///   an I/O operation. Scheduler continues polling only when the transfer's wake path fires.
+/// - `Yielded`: Dispatched execution retired without completing a reportable I/O operation or
+///   reporting a failure. Transfer state has retained any continuation or has retracted or retired
+///   the speculative operation. The scheduler releases the execution slot without producing a
+///   concurrency-controller sample.
 /// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
 ///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
 /// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
@@ -238,11 +240,13 @@ impl PollWork {
 pub(crate) enum WorkOutcome {
     /// Work completed successfully.
     Success { data: Option<Box<dyn WorkData>> },
-    /// Work retained its continuation without completing an I/O operation.
+    /// Dispatched execution retired without completing an I/O operation or reporting a failure.
     ///
-    /// The transfer must arrange a wake before returning this result. The scheduler releases the
-    /// execution slot but does not report a completion sample to the concurrency controller.
-    Pending,
+    /// Before returning, transfer state must reconcile the work exactly once. If it retains a
+    /// continuation, that continuation must retain its progress and future wake path. The scheduler
+    /// releases the execution slot but does not report a completion sample to the concurrency
+    /// controller.
+    Yielded,
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
@@ -256,7 +260,7 @@ impl std::fmt::Debug for WorkOutcome {
                 .debug_struct("Success")
                 .field("has_data", &data.is_some())
                 .finish(),
-            WorkOutcome::Pending => write!(f, "Pending"),
+            WorkOutcome::Yielded => write!(f, "Yielded"),
             WorkOutcome::Failed { classification } => f
                 .debug_struct("Failed")
                 .field("classification", classification)

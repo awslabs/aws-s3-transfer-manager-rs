@@ -60,7 +60,8 @@ pub(crate) trait ConcurrencyController: Send + Sync + fmt::Debug {
     /// Called once for every dispatched work item.
     ///
     /// `None` retires dispatch accounting without contributing an I/O
-    /// observation, as when a retained continuation yields its execution slot.
+    /// operation or failure observation, as when execution yields after retaining
+    /// or retracting source work.
     fn on_completion(&self, _sample: Option<&CompletionSample>) {}
 }
 

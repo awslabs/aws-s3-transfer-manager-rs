@@ -440,11 +440,11 @@ impl UploadTransfer {
                             PartTransferTransition::CustomSourceBlocked,
                             snapshot,
                         );
-                        return WorkOutcome::Pending;
+                        return WorkOutcome::Yielded;
                     }
                     PartReadStart::Finished => {
                         self.finish_read_without_part();
-                        return WorkOutcome::Pending;
+                        return WorkOutcome::Yielded;
                     }
                 };
                 (
@@ -478,7 +478,7 @@ impl UploadTransfer {
                 drop(state);
                 diagnostics::emit_source_pending(self.inner.ctx.id, observation, snapshot);
                 parked_wake.requeue_if_notified();
-                return WorkOutcome::Pending;
+                return WorkOutcome::Yielded;
             }
             Poll::Ready(Ok(Some(data))) => data,
             Poll::Ready(Ok(None)) => {
@@ -1194,7 +1194,7 @@ mod tests {
 
         assert!(matches!(
             transfer.execute(&mut first).await,
-            WorkOutcome::Pending
+            WorkOutcome::Yielded
         ));
         {
             let state = transfer.inner.state.lock().expect("lock poisoned");
@@ -1219,11 +1219,11 @@ mod tests {
 
         assert!(matches!(
             transfer.execute(&mut second).await,
-            WorkOutcome::Pending
+            WorkOutcome::Yielded
         ));
         assert!(matches!(
             transfer.execute(&mut third).await,
-            WorkOutcome::Pending
+            WorkOutcome::Yielded
         ));
         {
             let state = transfer.inner.state.lock().expect("lock poisoned");

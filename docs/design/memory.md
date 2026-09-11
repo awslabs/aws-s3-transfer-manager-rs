@@ -2271,58 +2271,33 @@ value and retains the supplied `Bytes` as its owner.
 
 ## Integration
 
-Transfer-manager work that can present a `Reservation` uses reserved acquisition. Upload staging and
-the default download path both follow this rule. Hyper returns foreign `Bytes`; the transfer manager
-copies decoded payload into reserved pooled storage before retaining or delivering it. The copy
-transiently holds transport memory outside pool accounting but requires no transport modification.
+Transfer-manager work uses reserved acquisition whenever it can express the maximum writable
+envelope that may be live at once. Reserved acquisition is the normal path for managed staging.
 
 An integration boundary that cannot carry a reservation may use unreserved acquisition. It accounts
 writable storage before use and publishes through the same `Bytes` and `SegmentedBytes` ownership
-types. The baseline Hyper integration does not use this path.
+types.
 
-### Scheduler admission and dispatch
+### Reservation handoff
 
-Each work item reserves its memory envelope from `poll_work()` before becoming dispatchable. The
-transfer stores a `ReserveFuture` with the candidate work while admission is pending. A ready future
-moves the `Reservation` into the `IoRequest`; a pending future remains in transfer state and causes
-`PollWork::Pending`.
+Admission placement is an integration policy, not pool behavior. A caller may obtain a reservation
+before dispatch or while dispatched work is resolving its storage requirements. Both placements use
+the same memory contract:
 
-`PollWork` and `IoRequest` are transfer-manager scheduler types, not pool types. The memory contract
-requires only that the ready variant's `io` work data owns the granted `Reservation`.
+- the caller retains one `ReserveFuture` across `Poll::Pending` and supplies a wake path;
+- pooled acquisition begins only after that future yields a granted, prepared `Reservation`;
+- the reservation remains live while direct acquisition authority or unpublished mutable storage
+  depends on its envelope; and
+- dropping a pending future or an unused grant cancels that demand without publishing storage.
 
-`poll_work()` has no `Context` parameter. A crate-private scheduler adapter supplies one:
+The scheduler defines how blocked work releases and later reacquires execution capacity. The pool
+requires only that the admission future and resulting reservation remain owned across that handoff;
+see the [scheduler design](./scheduler.md#backpressure).
 
-```rust
-pub(crate) struct SchedulerWake {
-    scheduler: Scheduler,
-    transfer_id: TransferId,
-}
-
-impl Wake for SchedulerWake {
-    fn wake(self: Arc<Self>) {
-        self.scheduler.wake(self.transfer_id);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.scheduler.wake(self.transfer_id);
-    }
-}
-```
-
-The transfer polls its stored future with a `Waker` built from `SchedulerWake`. The scheduler
-records every wake request even while the transfer descriptor is claimed for `poll_work()`. If
-the future is granted after registering its waker but before `poll_work()` returns `Pending`, the
-scheduler observes that mark when it releases the claim and reinserts the transfer. No notification
-is lost in the poll-to-pending interval.
-
-Reservation or preparation failure produces no `IoRequest`. Cancellation removes queued admission
-by dropping the stored future, or consumes an already granted reservation before dispatch.
-Cancellation after dispatch stops producers, closes direct-acquisition authority, and drops
+Reservation or preparation failure grants no acquisition authority. Cancellation removes queued
+admission by dropping the stored future, or closes an already granted reservation before use.
+Cancellation after acquisition stops producers, closes direct-acquisition authority, and drops
 unpublished mutable buffers. Immutable bytes already published retain their carriers and charges.
-
-Execution code uses `pool.acquire(&reservation, min_bytes)`. The download collector uses the same
-reservation when copying foreign transport bytes into pooled staging. Scheduler admission remains
-independent of the transport's request and connection lifecycle.
 
 The reservation envelope includes the carrier-rounded shape of every independent buffer that can be
 live at once. `ReservationCapacityExceeded` while completing a part or range indicates an
@@ -2548,8 +2523,9 @@ primitives without defining the transport API.
 
 **Obligations.**
 
-- **I1: Scheduler handoff.** `poll_work()` dispatches only a granted, prepared reservation. A
-  terminal future result is visible before wake, and a wake racing `Pending` schedules another poll.
+- **I1: Reservation handoff.** Pooled acquisition starts only under a granted, prepared
+  reservation. Pending admission retains the same future and a wake path until grant, cancellation,
+  or failure.
 - **I2: Cancellation ownership.** Cancellation closes direct-acquisition authority and releases
   transfer-manager-owned mutable buffers and clones unless their lifetime was transferred to active
   retry, delivery, I/O, or caller ownership. Published bytes remain valid.
@@ -3571,8 +3547,8 @@ section; one property may discharge several contracts.
 
 | Obligation | Property                                                               | Evidence                                                                  | Negative control                                           |
 | ---------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| I1         | `poll_work()` dispatches only a granted, prepared reservation          | Scheduler integration test with parking and cancellation                  | Dispatch while the reservation future is pending           |
-| I1         | Wake racing `poll_work()` pending cannot strand a granted reservation  | Scheduler state-machine test across registration and claim release        | Ignore a wake recorded while the transfer is claimed       |
+| I1         | Pooled acquisition owns a granted, prepared reservation                | Integration tests with immediate, pending, and cancelled admission        | Acquire while the reservation future is pending             |
+| I1         | Pending admission retains one future and its wake path                 | Admission state-machine tests across registration and grant               | Drop and reconstruct the future after `Poll::Pending`       |
 | I2         | Cancellation releases manager holds without invalidating escaped bytes | Integration tests across queued, dispatched, and published states         | Release published bytes or retain unpublished buffers      |
 | I3         | Upload retry retains exact bytes through the final consuming attempt   | Retry tests with partial body polling and source failure                  | Release staged bytes before the last retry                 |
 | I3         | Upload parts reuse one mutable stream across source reads              | Multipart tests with carrier-misaligned read completions                  | Allocate one buffer for every source read                  |
