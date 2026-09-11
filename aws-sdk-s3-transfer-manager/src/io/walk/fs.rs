@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -24,18 +25,78 @@ struct PendingDir {
     ancestor_handles: Vec<Arc<Handle>>,
 }
 
-/// Result of reading a single directory.
-///
-/// Contains all files discovered in the directory (after filter application),
-/// subdirectories to recurse into (subject to `max_depth`), and any non-fatal
-/// non-fatal errors encountered during the read.
+// Result of reading a single directory: its entries in emission order, plus any
+// non-fatal errors from reading them.
 struct ReadDirResult {
-    /// Files discovered in the directory, after filter application.
-    files: Vec<DirEntry>,
-    /// Subdirectories to recurse into. Empty if `depth >= max_depth`.
-    subdirs: Vec<PendingDir>,
-    /// Non-fatal errors encountered reading individual entries.
+    // Files and subdirectories interleaved, in emission order.
+    children: Vec<Child>,
+    // Non-fatal errors encountered reading individual entries.
     errors: Vec<WalkError>,
+}
+
+// How the walk is positioned. The two traversals serve different callers, so each
+// keeps its own state.
+enum Cursor {
+    // Files of a directory are emitted before descending. Subdirectories wait
+    // in a queue, which is what makes them claimable.
+    Breadth {
+        pending_dirs: VecDeque<PendingDir>,
+        ready_files: VecDeque<DirEntry>,
+    },
+    // Emission follows key order, so a subtree is descended at the position
+    // where it sorts. Each frame is a partially consumed directory.
+    KeyOrder {
+        stack: Vec<VecDeque<Child>>,
+    },
+}
+
+// One entry of a directory: a file to yield, or a subdirectory to descend
+// into. Kept in a single list so sorting interleaves them, which is what
+// lets a nested key be emitted between two sibling files.
+enum Child {
+    File(DirEntry),
+    Dir(PendingDir),
+}
+
+impl Child {
+    fn path(&self) -> &Path {
+        match self {
+            Child::File(e) => &e.path,
+            Child::Dir(d) => &d.path,
+        }
+    }
+
+    // Name bytes plus whether this is a directory, for `cmp_key_form`.
+    fn sort_name(&self) -> (&[u8], bool) {
+        match self {
+            Child::File(e) => (name_bytes(&e.path), false),
+            Child::Dir(d) => (name_bytes(&d.path), true),
+        }
+    }
+}
+
+fn name_bytes(path: &Path) -> &[u8] {
+    path.file_name()
+        .map(|n| n.as_encoded_bytes())
+        .unwrap_or(b"")
+}
+
+// Order two children as `ListObjectsV2` orders the keys they produce: a
+// directory sorts as if its name ended in '/' (0x2F), so `a.txt` precedes
+// `a/c`. Names within a directory never contain '/', so one trailing byte
+// decides it.
+fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
+    let (an, ad) = a.sort_name();
+    let (bn, bd) = b.sort_name();
+    let n = an.len().min(bn.len());
+    match an[..n].cmp(&bn[..n]) {
+        Ordering::Equal => {
+            let at = an.get(n).copied().or(ad.then_some(b'/'));
+            let bt = bn.get(n).copied().or(bd.then_some(b'/'));
+            at.cmp(&bt)
+        }
+        ord => ord,
+    }
 }
 
 /// A file entry discovered during a filesystem walk.
@@ -130,6 +191,7 @@ pub struct FsWalker {
     follow_symlinks: bool,
     max_depth: usize,
     sort: bool,
+    key_order: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
 }
@@ -140,6 +202,7 @@ impl std::fmt::Debug for FsWalker {
             .field("follow_symlinks", &self.follow_symlinks)
             .field("max_depth", &self.max_depth)
             .field("sort", &self.sort)
+            .field("key_order", &self.key_order)
             .field("canonicalize_root", &self.canonicalize_root)
             .finish()
     }
@@ -163,7 +226,6 @@ impl FsWalker {
         let mut root = ctx.root;
         let mut pending_errors = VecDeque::new();
         let mut done = false;
-        let mut pending_dirs = VecDeque::new();
 
         if self.canonicalize_root {
             match std::fs::canonicalize(&root) {
@@ -195,13 +257,25 @@ impl FsWalker {
             }
         }
 
-        if !done {
-            pending_dirs.push_back(PendingDir {
-                path: root.clone(),
-                depth: 0,
-                ancestor_handles: Vec::new(),
-            });
-        }
+        let root_dir = PendingDir {
+            path: root.clone(),
+            depth: 0,
+            ancestor_handles: Vec::new(),
+        };
+        let cursor = match (done, self.key_order) {
+            (true, true) => Cursor::KeyOrder { stack: Vec::new() },
+            (true, false) => Cursor::Breadth {
+                pending_dirs: VecDeque::new(),
+                ready_files: VecDeque::new(),
+            },
+            (false, true) => Cursor::KeyOrder {
+                stack: vec![VecDeque::from([Child::Dir(root_dir)])],
+            },
+            (false, false) => Cursor::Breadth {
+                pending_dirs: VecDeque::from([root_dir]),
+                ready_files: VecDeque::new(),
+            },
+        };
 
         tracing::debug!(
             ?root,
@@ -216,8 +290,7 @@ impl FsWalker {
         FsWalk {
             config: Arc::new(self),
             root,
-            pending_dirs,
-            ready_files: VecDeque::new(),
+            cursor,
             pending_errors,
             done,
         }
@@ -233,6 +306,7 @@ pub struct FsWalkerBuilder {
     follow_symlinks: bool,
     max_depth: usize,
     sort: bool,
+    key_order: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
 }
@@ -305,18 +379,35 @@ impl FsWalkerBuilder {
 
     /// Enable lexicographic sorting of entries within each directory.
     ///
-    /// When `true`, files and subdirectories from each directory read are
-    /// sorted by full path. Entries are sorted *within* a directory level
-    /// but not globally. Depth-first traversal produces entries
-    /// level-by-level.
+    /// When `true`, each directory's entries are sorted by full path. Sorting is
+    /// per directory, not global: the traversal is breadth-first, so a
+    /// directory's files are emitted before its subdirectories are descended.
+    /// For a globally ordered walk see [`key_order`](Self::key_order).
     ///
     /// When `false` (default), entries are returned in OS-native order.
-    ///
-    /// Sort is required for `sync`-style operations that merge-join against
-    /// `ListObjectsV2` results (which are UTF-8 binary sorted by key).
     #[must_use]
     pub fn sort(mut self, sort: bool) -> Self {
         self.sort = sort;
+        self
+    }
+
+    /// Emit entries in `ListObjectsV2` key order, so the walk can be merge-joined
+    /// against a bucket listing. Defaults to `false`.
+    ///
+    /// This selects a depth-first traversal and compares a directory as if its
+    /// name ended in `/`, which is what places `a.txt` before `a/c`. Sorting
+    /// alone is not sufficient: a breadth-first walk emits every file of a
+    /// directory before descending, so it can never place a nested key between
+    /// two siblings.
+    ///
+    /// Implies [`sort`](Self::sort). Two costs come with it:
+    /// [`try_claim_subtree`](FsWalk::try_claim_subtree) is unavailable, since
+    /// ordered emission has to descend before it can know what comes next, and
+    /// time-to-first-entry grows because subtrees sorting ahead of a sibling file
+    /// must be read first.
+    #[must_use]
+    pub fn key_order(mut self, key_order: bool) -> Self {
+        self.key_order = key_order;
         self
     }
 
@@ -361,6 +452,7 @@ impl FsWalkerBuilder {
             follow_symlinks: self.follow_symlinks,
             max_depth: self.max_depth,
             sort: self.sort,
+            key_order: self.key_order,
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
         }
@@ -434,8 +526,7 @@ impl FsWalkContextBuilder {
 pub struct FsWalk {
     config: Arc<FsWalker>,
     root: Arc<Path>,
-    pending_dirs: VecDeque<PendingDir>,
-    ready_files: VecDeque<DirEntry>,
+    cursor: Cursor,
     pending_errors: VecDeque<WalkError>,
     done: bool,
 }
@@ -460,9 +551,6 @@ impl FsWalk {
     /// - `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<DirEntry, WalkError>> {
         loop {
-            if let Some(entry) = self.ready_files.pop_front() {
-                return Some(Ok(entry));
-            }
             if let Some(err) = self.pending_errors.pop_front() {
                 if !err.is_fatal() {
                     tracing::warn!(
@@ -477,19 +565,64 @@ impl FsWalk {
                 return None;
             }
 
-            let pending = match self.pending_dirs.pop_front() {
-                Some(d) => d,
-                None => {
-                    self.done = true;
-                    return None;
+            let dir = match &mut self.cursor {
+                Cursor::Breadth {
+                    pending_dirs,
+                    ready_files,
+                } => {
+                    if let Some(entry) = ready_files.pop_front() {
+                        return Some(Ok(entry));
+                    }
+                    match pending_dirs.pop_front() {
+                        Some(dir) => dir,
+                        None => {
+                            self.done = true;
+                            return None;
+                        }
+                    }
+                }
+                Cursor::KeyOrder { stack } => {
+                    // Work the newest frame, so a subtree is emitted where it
+                    // sorts rather than after its parent's files.
+                    let child = loop {
+                        match stack.last_mut() {
+                            None => break None,
+                            Some(frame) => match frame.pop_front() {
+                                Some(child) => break Some(child),
+                                None => {
+                                    stack.pop();
+                                }
+                            },
+                        }
+                    };
+                    match child {
+                        None => {
+                            self.done = true;
+                            return None;
+                        }
+                        Some(Child::File(entry)) => return Some(Ok(entry)),
+                        Some(Child::Dir(dir)) => dir,
+                    }
                 }
             };
 
-            match self.read_dir(&pending.path, pending.depth, &pending.ancestor_handles) {
+            match self.read_dir(&dir.path, dir.depth, &dir.ancestor_handles) {
                 Ok(result) => {
-                    self.ready_files.extend(result.files);
                     self.pending_errors.extend(result.errors);
-                    self.pending_dirs.extend(result.subdirs);
+                    match &mut self.cursor {
+                        Cursor::Breadth {
+                            pending_dirs,
+                            ready_files,
+                        } => {
+                            for child in result.children {
+                                match child {
+                                    Child::File(entry) => ready_files.push_back(entry),
+                                    Child::Dir(dir) => pending_dirs.push_back(dir),
+                                }
+                            }
+                        }
+                        Cursor::KeyOrder { stack } => stack.push(result.children.into()),
+                    }
                 }
                 Err(err) => {
                     if err.is_fatal() {
@@ -528,18 +661,30 @@ impl FsWalk {
     /// The claimed subtree and the parent walk can be advanced concurrently on
     /// different threads. There is no shared mutable state between them.
     ///
-    /// Subtrees are claimed in BFS order (front of the pending queue), matching
-    /// the order that [`next`](Self::next) would have visited them.
+    /// Subtrees are claimed in the order [`next`](Self::next) would have visited
+    /// them.
+    ///
+    /// Always returns `None` for a [`key_order`](FsWalkerBuilder::key_order)
+    /// walk: emitting in key order requires descending into a subtree before a
+    /// sibling that sorts after it can be emitted, so by the time entries come
+    /// out there is little left to hand off, and handing off the next-needed
+    /// subtree would stall the consumer waiting for it.
     pub fn try_claim_subtree(&mut self) -> Option<FsWalk> {
-        if self.done || self.pending_dirs.len() < 2 {
+        let pending_dirs = match &mut self.cursor {
+            Cursor::Breadth { pending_dirs, .. } => pending_dirs,
+            Cursor::KeyOrder { .. } => return None,
+        };
+        if self.done || pending_dirs.len() < 2 {
             return None;
         }
-        let claimed = self.pending_dirs.pop_front()?;
+        let claimed = pending_dirs.pop_front()?;
         Some(FsWalk {
             config: Arc::clone(&self.config),
             root: Arc::clone(&self.root),
-            pending_dirs: VecDeque::from([claimed]),
-            ready_files: VecDeque::new(),
+            cursor: Cursor::Breadth {
+                pending_dirs: VecDeque::from([claimed]),
+                ready_files: VecDeque::new(),
+            },
             pending_errors: VecDeque::new(),
             done: false,
         })
@@ -551,20 +696,41 @@ impl FsWalk {
     /// and no buffered errors. Equivalent to `next()` having returned (or being
     /// about to return) `None`.
     pub fn is_exhausted(&self) -> bool {
-        self.done
-            || (self.pending_dirs.is_empty()
-                && self.ready_files.is_empty()
-                && self.pending_errors.is_empty())
+        if self.done {
+            return true;
+        }
+        let cursor_empty = match &self.cursor {
+            Cursor::Breadth {
+                pending_dirs,
+                ready_files,
+            } => pending_dirs.is_empty() && ready_files.is_empty(),
+            Cursor::KeyOrder { stack } => stack.iter().all(|f| f.is_empty()),
+        };
+        cursor_empty && self.pending_errors.is_empty()
     }
 
     /// Number of files already read and queued for yield. Diagnostic accessor.
     pub(crate) fn ready_files_len(&self) -> usize {
-        self.ready_files.len()
+        match &self.cursor {
+            Cursor::Breadth { ready_files, .. } => ready_files.len(),
+            Cursor::KeyOrder { stack } => stack
+                .iter()
+                .flatten()
+                .filter(|c| matches!(c, Child::File(_)))
+                .count(),
+        }
     }
 
     /// Number of directories queued for read. Diagnostic accessor.
     pub(crate) fn pending_dirs_len(&self) -> usize {
-        self.pending_dirs.len()
+        match &self.cursor {
+            Cursor::Breadth { pending_dirs, .. } => pending_dirs.len(),
+            Cursor::KeyOrder { stack } => stack
+                .iter()
+                .flatten()
+                .filter(|c| matches!(c, Child::Dir(_)))
+                .count(),
+        }
     }
 
     fn read_dir(
@@ -585,24 +751,30 @@ impl FsWalk {
             WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
-        // Build the ancestor chain for children of this directory.
-        let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-            let kind = WalkError::classify_io(&e);
-            let kind = if depth == 0
-                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-            {
-                WalkErrorKind::SourceUnreadable
-            } else {
-                kind
-            };
-            WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
-        })?);
-        let mut next_ancestors = ancestor_handles.to_vec();
-        next_ancestors.push(Arc::clone(&self_handle));
+        // Ancestor chain for children of this directory. Only symlinked
+        // directories can form a cycle, so when symlinks are not followed the
+        // chain is never consulted and the open()+fstat is pure cost.
+        let next_ancestors = if self.config.follow_symlinks {
+            let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
+                let kind = WalkError::classify_io(&e);
+                let kind = if depth == 0
+                    && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
+                {
+                    WalkErrorKind::SourceUnreadable
+                } else {
+                    kind
+                };
+                WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
+            })?);
+            let mut chain = ancestor_handles.to_vec();
+            chain.push(self_handle);
+            chain
+        } else {
+            Vec::new()
+        };
 
         let mut result = ReadDirResult {
-            files: Vec::new(),
-            subdirs: Vec::new(),
+            children: Vec::new(),
             errors: Vec::new(),
         };
 
@@ -662,11 +834,11 @@ impl FsWalk {
                                 continue;
                             }
                             if depth < self.config.max_depth {
-                                result.subdirs.push(PendingDir {
+                                result.children.push(Child::Dir(PendingDir {
                                     path,
                                     depth: depth + 1,
                                     ancestor_handles: next_ancestors.clone(),
-                                });
+                                }));
                             }
                         }
                         Err(e) => {
@@ -677,7 +849,7 @@ impl FsWalk {
                         }
                     }
                 } else if metadata.is_file() {
-                    self.push_file(&mut result.files, path, &metadata);
+                    self.push_file(&mut result.children, path, &metadata);
                 }
             } else if file_type.is_file() {
                 let metadata = match std::fs::metadata(&path) {
@@ -690,25 +862,25 @@ impl FsWalk {
                         continue;
                     }
                 };
-                self.push_file(&mut result.files, path, &metadata);
+                self.push_file(&mut result.children, path, &metadata);
             } else if file_type.is_dir() && depth < self.config.max_depth {
-                result.subdirs.push(PendingDir {
+                result.children.push(Child::Dir(PendingDir {
                     path,
                     depth: depth + 1,
                     ancestor_handles: next_ancestors.clone(),
-                });
+                }));
             }
         }
 
-        if self.config.sort {
-            result.files.sort_by(|a, b| a.path.cmp(&b.path));
-            result.subdirs.sort_by(|a, b| a.path.cmp(&b.path));
+        if self.config.key_order {
+            result.children.sort_by(cmp_key_form);
+        } else if self.config.sort {
+            result.children.sort_by(|a, b| a.path().cmp(b.path()));
         }
 
         tracing::trace!(
             ?dir,
-            files = result.files.len(),
-            subdirs = result.subdirs.len(),
+            children = result.children.len(),
             errors = result.errors.len(),
             "directory read",
         );
@@ -716,7 +888,7 @@ impl FsWalk {
         Ok(result)
     }
 
-    fn push_file(&self, files: &mut Vec<DirEntry>, path: PathBuf, metadata: &Metadata) {
+    fn push_file(&self, children: &mut Vec<Child>, path: PathBuf, metadata: &Metadata) {
         let relative_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
         let entry = DirEntry {
             path,
@@ -724,7 +896,7 @@ impl FsWalk {
             metadata: metadata.clone(),
         };
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {
-            files.push(entry);
+            children.push(Child::File(entry));
         }
     }
 }
@@ -1210,7 +1382,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_walk_recursive_sort_is_depth_first_per_dir() {
+    async fn test_walk_recursive_sort_is_breadth_first_per_dir() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("c-file.txt"), "").unwrap();
         fs::write(dir.path().join("b-file.txt"), "").unwrap();
@@ -2560,5 +2732,173 @@ mod tests {
             parallel_set, serial_set,
             "concurrent walks must yield the same entries as serial walk"
         );
+    }
+
+    // --- S3 key-order tests ---
+
+    // Entries must be emitted in UTF-8 byte order, as ListObjectsV2 returns keys.
+    fn assert_s3_key_order(entries: &[DirEntry]) {
+        let emitted: Vec<String> = entries.iter().map(|e| norm(e.relative_path())).collect();
+        let mut expected = emitted.clone();
+        expected.sort();
+        assert_eq!(emitted, expected, "walk must emit keys in UTF-8 byte order");
+    }
+
+    fn emitted(entries: &[DirEntry]) -> Vec<String> {
+        entries.iter().map(|e| norm(e.relative_path())).collect()
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_nested_before_sibling() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/c"), "").unwrap();
+        fs::write(dir.path().join("az.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .key_order(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // 'z' (0x7A) > '/' (0x2F), so the nested key comes first.
+        assert_eq!(emitted(&entries), vec!["a/c", "az.txt"]);
+        assert_s3_key_order(&entries);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_shared_prefix() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("test")).unwrap();
+        fs::write(dir.path().join("test/inner.txt"), "").unwrap();
+        fs::write(dir.path().join("test-123.txt"), "").unwrap();
+        fs::write(dir.path().join("test.txt"), "").unwrap();
+        fs::write(dir.path().join("test0.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .key_order(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // Divergent bytes: '-' 0x2D, '.' 0x2E, '/' 0x2F, '0' 0x30.
+        assert_eq!(
+            emitted(&entries),
+            vec!["test-123.txt", "test.txt", "test/inner.txt", "test0.txt"]
+        );
+        assert_s3_key_order(&entries);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_across_depths() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("b/c")).unwrap();
+        fs::write(dir.path().join("b/c/d.txt"), "").unwrap();
+        fs::write(dir.path().join("b/z.txt"), "").unwrap();
+        fs::write(dir.path().join("b.txt"), "").unwrap();
+        fs::write(dir.path().join("ba.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .key_order(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        assert_eq!(
+            emitted(&entries),
+            vec!["b.txt", "b/c/d.txt", "b/z.txt", "ba.txt"]
+        );
+        assert_s3_key_order(&entries);
+    }
+
+    // Random tree; returns the file count. Fragments bracket '/' (0x2F) in byte
+    // order, where interleaving matters. ASCII only until NFC/NFD is settled.
+    fn build_random_tree(rng: &mut fastrand::Rng, root: &Path, depth: usize) -> usize {
+        const FRAGMENTS: &[&str] = &[
+            "a", "a.txt", "a-1", "a+1", "a 1", "a%1", "a#1", "a0", "az", "b", "b.dat", "bz",
+        ];
+        let mut files = 0;
+        for _ in 0..rng.usize(1..=6) {
+            let path = root.join(FRAGMENTS[rng.usize(..FRAGMENTS.len())]);
+            if path.exists() {
+                continue;
+            }
+            if depth > 0 && rng.bool() {
+                fs::create_dir(&path).unwrap();
+                files += build_random_tree(rng, &path, depth - 1);
+            } else {
+                fs::write(&path, "").unwrap();
+                files += 1;
+            }
+        }
+        files
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_sorted_walk_key_order_property() {
+        for seed in 0..32u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let dir = tempdir().unwrap();
+            let expected = build_random_tree(&mut rng, dir.path(), 3);
+
+            let walk = walker()
+                .recursive(true)
+                .key_order(true)
+                .build()
+                .walk(ctx(dir.path()));
+            let (entries, errors) = collect_entries(walk).await;
+            assert!(
+                errors.is_empty(),
+                "seed {seed}: unexpected errors: {errors:?}"
+            );
+            assert_eq!(entries.len(), expected, "seed {seed}: wrong entry count");
+
+            let keys = emitted(&entries);
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted, "seed {seed}: emitted out of key order");
+        }
+    }
+
+    // Directories are read on demand, so removing an entry from a directory the
+    // walk has not reached yet must not disturb it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_entry_removed_before_its_directory_is_read() {
+        let dir = tempdir().unwrap();
+        for sub in ["a", "b"] {
+            fs::create_dir(dir.path().join(sub)).unwrap();
+            for name in ["1", "2", "3"] {
+                fs::write(dir.path().join(sub).join(name), "").unwrap();
+            }
+        }
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(true)
+            .build()
+            .walk(ctx(dir.path()));
+
+        // The first entry comes from `a`, so `b` is still unread.
+        let first = walk.next().await.unwrap().unwrap();
+        assert!(norm(first.relative_path()).starts_with("a/"));
+        fs::remove_file(dir.path().join("b/2")).unwrap();
+
+        let mut keys = vec![norm(first.relative_path())];
+        while let Some(result) = walk.next().await {
+            keys.push(norm(result.expect("walk must not fail").relative_path()));
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["a/1", "a/2", "a/3", "b/1", "b/3"]);
     }
 }
