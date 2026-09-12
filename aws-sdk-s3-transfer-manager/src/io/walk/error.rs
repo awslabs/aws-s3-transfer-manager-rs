@@ -5,11 +5,26 @@
 
 use std::path::{Path, PathBuf};
 
+/// How a [`WalkError`] bears on the walk and on whoever consumes it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkErrorSeverity {
+    /// The walk cannot proceed and produces no further entries.
+    Fatal,
+    /// One entry could not be read. Whether this ends the caller's work is the
+    /// caller's decision; the walk itself continues.
+    EntryFailure,
+    /// Something occupies this path that a walk can never yield — a socket, a
+    /// device, a directory reached by a link that loops back on itself. Nothing
+    /// failed, and no retry or setting would produce an entry here. Reported so a
+    /// consumer knows the path is occupied even though no entry describes it.
+    EntryWarning,
+}
+
 /// Classifies a [`WalkError`].
 ///
-/// Each kind has a deterministic fatality (see [`WalkErrorKind::is_fatal`]).
-/// Errors whose kind is fatal terminate the walk; non-fatal kinds report
-/// the affected entry and the walk continues.
+/// Each kind has a fixed severity; see [`WalkErrorKind::severity`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
     /// Source root cannot be opened for reading (I/O or permission error
@@ -20,27 +35,52 @@ pub enum WalkErrorKind {
     /// S3 service error from `ListObjectsV2` or related call. Fatal.
     Service,
     /// I/O error reading a subdirectory or entry during the walk.
-    /// Non-fatal: the affected entry is skipped and the walk continues.
+    /// The affected entry is skipped and the walk continues.
     Io,
     /// Permission denied on a subdirectory or entry during the walk.
-    /// Non-fatal.
     PermissionDenied,
-    /// Symlink encountered with no valid target. Non-fatal.
+    /// A directory could not be read: the `read_dir` itself failed, or opening it
+    /// for cycle detection did. The walk continues with the rest of the tree, but
+    /// that subtree was never enumerated, so a consumer that infers absence from
+    /// the stream must decide for itself whether to keep going. Distinct from an
+    /// entry-level failure so that decision is possible. The underlying
+    /// `io::Error` remains available via [`std::error::Error::source`].
+    DirectoryUnreadable,
+    /// Symlink encountered with no valid target.
     BrokenSymlink,
     /// Symlink whose target is a directory already on the current descent
     /// path (a cycle). Non-cyclic duplicate symlinks (two different symlinks
     /// to the same target) are not reported as cycles and are traversed
-    /// normally. Non-fatal.
+    /// normally.
     SymlinkCycle,
+    /// A socket, FIFO, or block or character device. A walk yields regular files,
+    /// so there is no entry this path could produce.
+    SpecialFile,
+    /// A symlink found while `follow_symlinks` is disabled. No entry is yielded for
+    /// it. Without this report the name would look unused.
+    SymlinkNotFollowed,
 }
 
 impl WalkErrorKind {
+    /// How an error of this kind bears on the walk.
+    pub fn severity(&self) -> WalkErrorSeverity {
+        match self {
+            WalkErrorKind::SourceUnreadable
+            | WalkErrorKind::NotADirectory
+            | WalkErrorKind::Service => WalkErrorSeverity::Fatal,
+            WalkErrorKind::Io
+            | WalkErrorKind::PermissionDenied
+            | WalkErrorKind::DirectoryUnreadable
+            | WalkErrorKind::BrokenSymlink => WalkErrorSeverity::EntryFailure,
+            WalkErrorKind::SymlinkCycle
+            | WalkErrorKind::SpecialFile
+            | WalkErrorKind::SymlinkNotFollowed => WalkErrorSeverity::EntryWarning,
+        }
+    }
+
     /// Whether an error of this kind terminates the walk.
     pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory | WalkErrorKind::Service
-        )
+        self.severity() == WalkErrorSeverity::Fatal
     }
 }
 
@@ -70,6 +110,11 @@ impl WalkError {
     /// The classification of this error.
     pub fn kind(&self) -> WalkErrorKind {
         self.kind
+    }
+
+    /// How this error bears on the walk. Equivalent to `self.kind().severity()`.
+    pub fn severity(&self) -> WalkErrorSeverity {
+        self.kind.severity()
     }
 
     /// Whether this error terminates the walk.
@@ -165,5 +210,28 @@ mod tests {
         assert!(!WalkErrorKind::PermissionDenied.is_fatal());
         assert!(!WalkErrorKind::BrokenSymlink.is_fatal());
         assert!(!WalkErrorKind::SymlinkCycle.is_fatal());
+    }
+
+    #[test]
+    fn test_severity_by_kind() {
+        use WalkErrorSeverity::*;
+        let cases = [
+            (WalkErrorKind::SourceUnreadable, Fatal),
+            (WalkErrorKind::NotADirectory, Fatal),
+            (WalkErrorKind::Service, Fatal),
+            (WalkErrorKind::Io, EntryFailure),
+            (WalkErrorKind::PermissionDenied, EntryFailure),
+            (WalkErrorKind::DirectoryUnreadable, EntryFailure),
+            // A link with no target should have been readable and was not.
+            (WalkErrorKind::BrokenSymlink, EntryFailure),
+            // A loop and a socket are paths a walk can never yield.
+            (WalkErrorKind::SymlinkCycle, EntryWarning),
+            (WalkErrorKind::SpecialFile, EntryWarning),
+            (WalkErrorKind::SymlinkNotFollowed, EntryWarning),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.severity(), expected, "kind={kind:?}");
+            assert_eq!(kind.is_fatal(), expected == Fatal, "kind={kind:?}");
+        }
     }
 }

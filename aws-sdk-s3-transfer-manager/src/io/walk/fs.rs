@@ -81,6 +81,20 @@ fn name_bytes(path: &Path) -> &[u8] {
         .unwrap_or(b"")
 }
 
+// A directory that cannot be read. At the walk root this is fatal, since nothing
+// can be enumerated; deeper it is not, but it is kept distinct from entry-level
+// failures so consumers can tell that a subtree went unenumerated.
+fn dir_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
+    if depth == 0 {
+        match WalkError::classify_io(e) {
+            WalkErrorKind::NotADirectory => WalkErrorKind::NotADirectory,
+            _ => WalkErrorKind::SourceUnreadable,
+        }
+    } else {
+        WalkErrorKind::DirectoryUnreadable
+    }
+}
+
 // Order two children as `ListObjectsV2` orders the keys they produce: a
 // directory sorts as if its name ended in '/' (0x2F), so `a.txt` precedes
 // `a/c`. Names within a directory never contain '/', so one trailing byte
@@ -192,6 +206,7 @@ pub struct FsWalker {
     max_depth: usize,
     sort: bool,
     key_order: bool,
+    report_untransferable: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
 }
@@ -307,6 +322,7 @@ pub struct FsWalkerBuilder {
     max_depth: usize,
     sort: bool,
     key_order: bool,
+    report_untransferable: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
 }
@@ -411,6 +427,19 @@ impl FsWalkerBuilder {
         self
     }
 
+    // Report a path the walk cannot yield an entry for: a socket, a FIFO, a device, a
+    // symlink left unfollowed. Off by default, because a caller that only uploads what
+    // it finds has no use for them, and a tree can hold thousands. A consumer that
+    // infers absence from the stream needs them, since a name it never hears about
+    // reads as a name that is free.
+    //
+    // Only tests call this until the comparison lands.
+    #[allow(dead_code)]
+    pub(crate) fn report_untransferable(mut self, report: bool) -> Self {
+        self.report_untransferable = report;
+        self
+    }
+
     /// Resolve the walk root via `std::fs::canonicalize` before walking.
     ///
     /// When `true`, the root path is canonicalized (symlinks resolved,
@@ -452,6 +481,7 @@ impl FsWalkerBuilder {
             follow_symlinks: self.follow_symlinks,
             max_depth: self.max_depth,
             sort: self.sort,
+            report_untransferable: self.report_untransferable,
             key_order: self.key_order,
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
@@ -740,14 +770,7 @@ impl FsWalk {
         ancestor_handles: &[Arc<Handle>],
     ) -> Result<ReadDirResult, WalkError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
-            let kind = WalkError::classify_io(&e);
-            let kind = if depth == 0
-                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-            {
-                WalkErrorKind::SourceUnreadable
-            } else {
-                kind
-            };
+            let kind = dir_error_kind(&e, depth);
             WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
@@ -756,14 +779,7 @@ impl FsWalk {
         // chain is never consulted and the open()+fstat is pure cost.
         let next_ancestors = if self.config.follow_symlinks {
             let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-                let kind = WalkError::classify_io(&e);
-                let kind = if depth == 0
-                    && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-                {
-                    WalkErrorKind::SourceUnreadable
-                } else {
-                    kind
-                };
+                let kind = dir_error_kind(&e, depth);
                 WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
             })?);
             let mut chain = ancestor_handles.to_vec();
@@ -804,6 +820,13 @@ impl FsWalk {
 
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
+                    if self.config.report_untransferable {
+                        result.errors.push(WalkError::new(
+                            Some(path),
+                            WalkErrorKind::SymlinkNotFollowed,
+                            Box::from("following symlinks is disabled"),
+                        ));
+                    }
                     continue;
                 }
                 let metadata = match std::fs::metadata(&path) {
@@ -850,6 +873,12 @@ impl FsWalk {
                     }
                 } else if metadata.is_file() {
                     self.push_file(&mut result.children, path, &metadata);
+                } else if self.config.report_untransferable {
+                    result.errors.push(WalkError::new(
+                        Some(path),
+                        WalkErrorKind::SpecialFile,
+                        Box::from("symlink target is neither a regular file nor a directory"),
+                    ));
                 }
             } else if file_type.is_file() {
                 let metadata = match std::fs::metadata(&path) {
@@ -863,12 +892,23 @@ impl FsWalk {
                     }
                 };
                 self.push_file(&mut result.children, path, &metadata);
-            } else if file_type.is_dir() && depth < self.config.max_depth {
-                result.children.push(Child::Dir(PendingDir {
-                    path,
-                    depth: depth + 1,
-                    ancestor_handles: next_ancestors.clone(),
-                }));
+            } else if file_type.is_dir() {
+                if depth < self.config.max_depth {
+                    result.children.push(Child::Dir(PendingDir {
+                        path,
+                        depth: depth + 1,
+                        ancestor_handles: next_ancestors.clone(),
+                    }));
+                }
+            } else if self.config.report_untransferable {
+                // A socket, FIFO, or device. Reported so a consumer knows the name
+                // is taken: a name absent from the stream reads as nothing being
+                // there, which is a different fact.
+                result.errors.push(WalkError::new(
+                    Some(path),
+                    WalkErrorKind::SpecialFile,
+                    Box::from("not a regular file or directory"),
+                ));
             }
         }
 
@@ -903,6 +943,7 @@ impl FsWalk {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::WalkErrorSeverity;
     use super::*;
     use std::fs;
     use tempfile::tempdir;
@@ -1103,6 +1144,34 @@ mod tests {
         assert_eq!(entries[0].relative_path(), Path::new("real.txt"));
     }
 
+    // Opting in names the link, so a consumer that reads absence from the stream does
+    // not take the name for free.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_reports_an_unfollowed_symlink_when_asked() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), "content").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+
+        let walk = walker()
+            .follow_symlinks(false)
+            .report_untransferable(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), WalkErrorKind::SymlinkNotFollowed);
+        assert_eq!(errors[0].severity(), WalkErrorSeverity::EntryWarning);
+        assert_eq!(
+            errors[0].path().unwrap(),
+            dir.path().join("link.txt").as_path()
+        );
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1275,6 +1344,36 @@ mod tests {
         assert!(errors.is_empty());
     }
 
+    // Opting in names the socket. It yields no entry either way, and a consumer that
+    // reads absence from the stream would otherwise take the name for free.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_reports_special_files_when_asked() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("regular.txt"), "").unwrap();
+        let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
+
+        let walk = walker()
+            .report_untransferable(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path(), Path::new("regular.txt"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), WalkErrorKind::SpecialFile);
+        assert_eq!(errors[0].severity(), WalkErrorSeverity::EntryWarning);
+        assert_eq!(
+            errors[0].path().unwrap(),
+            dir.path().join("socket.sock").as_path()
+        );
+        assert!(!errors[0].is_fatal());
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1305,6 +1404,45 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "expected permission-denied error for unreadable subdir"
+        );
+        // The subtree went unenumerated, which a consumer inferring absence from
+        // the stream has to be able to tell apart from an entry-level failure.
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind() == WalkErrorKind::DirectoryUnreadable),
+            "unreadable subdir must report DirectoryUnreadable, got {:?}",
+            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+        );
+        assert!(
+            errors.iter().all(|e| !e.is_fatal()),
+            "an unreadable subdir must not end the walk"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_entry_failure_is_not_directory_scoped() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("ok.txt"), "").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("broken")).unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .follow_symlinks(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert!(entries
+            .iter()
+            .any(|e| e.relative_path() == Path::new("ok.txt")));
+        assert!(!errors.is_empty(), "expected a broken-symlink error");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.kind() != WalkErrorKind::DirectoryUnreadable),
+            "an entry-level failure must not be reported as DirectoryUnreadable"
         );
     }
 
