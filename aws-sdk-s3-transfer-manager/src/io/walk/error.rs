@@ -59,6 +59,9 @@ pub enum WalkErrorKind {
     /// A symlink found while `follow_symlinks` is disabled. No entry is yielded for
     /// it. Without this report the name would look unused.
     SymlinkNotFollowed,
+    /// A local name that is not valid UTF-8. An S3 object key is Unicode encoded as
+    /// UTF-8, so no key could carry this name.
+    NonUtf8Name,
 }
 
 impl WalkErrorKind {
@@ -74,7 +77,8 @@ impl WalkErrorKind {
             | WalkErrorKind::BrokenSymlink => WalkErrorSeverity::EntryFailure,
             WalkErrorKind::SymlinkCycle
             | WalkErrorKind::SpecialFile
-            | WalkErrorKind::SymlinkNotFollowed => WalkErrorSeverity::EntryWarning,
+            | WalkErrorKind::SymlinkNotFollowed
+            | WalkErrorKind::NonUtf8Name => WalkErrorSeverity::EntryWarning,
         }
     }
 
@@ -228,6 +232,7 @@ mod tests {
             (WalkErrorKind::SymlinkCycle, EntryWarning),
             (WalkErrorKind::SpecialFile, EntryWarning),
             (WalkErrorKind::SymlinkNotFollowed, EntryWarning),
+            (WalkErrorKind::NonUtf8Name, EntryWarning),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.severity(), expected, "kind={kind:?}");
