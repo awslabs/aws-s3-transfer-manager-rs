@@ -197,12 +197,19 @@ impl KeyStream for S3Walk {
     }
 }
 
-// `Ok(None)` is the prefix itself. `Err` means the listing was not what the API
-// documents.
+// `Ok(None)` is the prefix itself, or a folder marker. `Err` means the listing was
+// not what the API documents.
+//
+// Markers are dropped here, so they are invisible whether or not a filter is
+// configured. The walker's own default filter is replaced by any filter a caller
+// sets, which would otherwise make an entry out of a key holding nothing.
 fn key_and_meta(
     obj: &Object,
     prefix: Option<&str>,
 ) -> Result<Option<(String, EntryMeta)>, &'static str> {
+    if !exclude_s3_folder_markers(obj) {
+        return Ok(None);
+    }
     let key = obj.key().ok_or("listing returned an object with no key")?;
     let relative = strip_key_prefix(key, prefix, None);
     if relative.is_empty() {
@@ -827,6 +834,37 @@ mod tests {
 
     // Setting a filter replaces the walker's default, so the marker exclusion has to
     // be carried explicitly or folder markers reappear as entries.
+    // A marker has to be invisible whether or not rules are configured: it is a
+    // key with no content, and treating it as an entry makes the destination look
+    // like it holds something the source does not.
+    #[tokio::test]
+    async fn folder_markers_are_not_entries_without_any_filter() {
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .set_contents(Some(vec![
+                Object::builder()
+                    .key("data/dir/")
+                    .size(0)
+                    .last_modified(DateTime::from_secs(1))
+                    .build(),
+                Object::builder()
+                    .key("data/dir/f.txt")
+                    .size(3)
+                    .last_modified(DateTime::from_secs(1))
+                    .build(),
+            ]))
+            .build();
+        let rule = aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(move || output.clone());
+        let client = aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            &[rule]
+        );
+
+        let mut stream = s3(client, Some("data/"));
+        assert_eq!(keys(&mut stream).await, vec!["dir/f.txt"]);
+    }
+
     #[test]
     fn folder_markers_stay_excluded_when_a_filter_is_set() {
         let remote = s3_predicate(Arc::new(KeyFilter::default()), None);
