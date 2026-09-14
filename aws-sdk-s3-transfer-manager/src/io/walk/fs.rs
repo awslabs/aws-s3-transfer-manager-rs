@@ -151,6 +151,8 @@ impl DirEntry {
 }
 
 type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
+// Consulted with a path relative to the root, before any metadata is read.
+type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
 /// Configuration for walking a local filesystem directory.
 ///
@@ -209,6 +211,7 @@ pub struct FsWalker {
     report_untransferable: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
+    path_filter: Option<PathFilterFn>,
 }
 
 impl std::fmt::Debug for FsWalker {
@@ -325,6 +328,7 @@ pub struct FsWalkerBuilder {
     report_untransferable: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
+    path_filter: Option<PathFilterFn>,
 }
 
 impl std::fmt::Debug for FsWalkerBuilder {
@@ -474,6 +478,22 @@ impl FsWalkerBuilder {
         self
     }
 
+    // Reject entries by relative path, before their metadata is read.
+    //
+    // Unlike `filter`, which sees a fully built `DirEntry`, this is consulted first,
+    // so a rejected file is never stat'd and anything that went wrong reading it is
+    // never reported. That is the difference between "excluded" and "excluded but it
+    // still warned about a file the caller said to ignore".
+    //
+    // Directories are not offered to it: skipping one would skip everything beneath,
+    // and a rule written for a file's key says nothing about the keys under a folder
+    // of a similar name.
+    #[allow(dead_code)]
+    pub(crate) fn path_filter(mut self, f: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+        self.path_filter = Some(Arc::new(f));
+        self
+    }
+
     /// Build the [`FsWalker`] configuration.
     #[must_use]
     pub fn build(self) -> FsWalker {
@@ -485,6 +505,7 @@ impl FsWalkerBuilder {
             key_order: self.key_order,
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
+            path_filter: self.path_filter,
         }
     }
 }
@@ -807,20 +828,23 @@ impl FsWalk {
             };
 
             let path = entry.path();
+            let rejected = self.rejects_path(&path);
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(e) => {
-                    let kind = WalkError::classify_io(&e);
-                    result
-                        .errors
-                        .push(WalkError::new(Some(path), kind, Box::new(e)));
+                    if !rejected {
+                        let kind = WalkError::classify_io(&e);
+                        result
+                            .errors
+                            .push(WalkError::new(Some(path), kind, Box::new(e)));
+                    }
                     continue;
                 }
             };
 
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
-                    if self.config.report_untransferable {
+                    if !rejected && self.config.report_untransferable {
                         result.errors.push(WalkError::new(
                             Some(path),
                             WalkErrorKind::SymlinkNotFollowed,
@@ -832,13 +856,15 @@ impl FsWalk {
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
-                        let kind = match e.kind() {
-                            std::io::ErrorKind::NotFound => WalkErrorKind::BrokenSymlink,
-                            _ => WalkError::classify_io(&e),
-                        };
-                        result
-                            .errors
-                            .push(WalkError::new(Some(path), kind, Box::new(e)));
+                        if !rejected {
+                            let kind = match e.kind() {
+                                std::io::ErrorKind::NotFound => WalkErrorKind::BrokenSymlink,
+                                _ => WalkError::classify_io(&e),
+                            };
+                            result
+                                .errors
+                                .push(WalkError::new(Some(path), kind, Box::new(e)));
+                        }
                         continue;
                     }
                 };
@@ -873,7 +899,7 @@ impl FsWalk {
                     }
                 } else if metadata.is_file() {
                     self.push_file(&mut result.children, path, &metadata);
-                } else if self.config.report_untransferable {
+                } else if !rejected && self.config.report_untransferable {
                     result.errors.push(WalkError::new(
                         Some(path),
                         WalkErrorKind::SpecialFile,
@@ -881,6 +907,9 @@ impl FsWalk {
                     ));
                 }
             } else if file_type.is_file() {
+                if rejected {
+                    continue;
+                }
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
@@ -900,10 +929,11 @@ impl FsWalk {
                         ancestor_handles: next_ancestors.clone(),
                     }));
                 }
-            } else if self.config.report_untransferable {
+            } else if !rejected && self.config.report_untransferable {
                 // A socket, FIFO, or device. Reported so a consumer knows the name
                 // is taken: a name absent from the stream reads as nothing being
-                // there, which is a different fact.
+                // there, which is a different fact. An excluded name is different
+                // again — nothing is going to look at it, so it stays quiet.
                 result.errors.push(WalkError::new(
                     Some(path),
                     WalkErrorKind::SpecialFile,
@@ -930,6 +960,14 @@ impl FsWalk {
 
     fn push_file(&self, children: &mut Vec<Child>, path: PathBuf, metadata: &Metadata) {
         let relative_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
+        if self
+            .config
+            .path_filter
+            .as_ref()
+            .is_some_and(|f| !f(&relative_path))
+        {
+            return;
+        }
         let entry = DirEntry {
             path,
             relative_path,
@@ -938,6 +976,16 @@ impl FsWalk {
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {
             children.push(Child::File(entry));
         }
+    }
+
+    // Whether the path filter rejects this entry. `push_file` is where rejection is
+    // enforced; this is what lets the read path skip the `stat` first and stay quiet
+    // about anything that failed on the way.
+    fn rejects_path(&self, path: &Path) -> bool {
+        self.config.path_filter.as_ref().is_some_and(|f| {
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            !f(relative)
+        })
     }
 }
 
