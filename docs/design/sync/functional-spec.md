@@ -724,8 +724,13 @@ zero per-entry requests, unless the caller opted into one of the modes FR-Cmp-5 
 total. A run over a million keys MUST begin transferring as promptly as a run over ten.
 *`[CLI]` satisfied by the generator chain (FR-Enum-7).*
 
-**NFR-Mem-1** Peak memory MUST NOT grow with the number of entries a run covers. Measured over the same
-roots at a thousand, a hundred thousand and a million entries per side, peak usage MUST stay flat.
+**NFR-Mem-1** Peak memory MUST be bounded by what a run holds at one moment: the entries of each directory
+on the current descent path, one listing page per side, and the transfers in flight. The total number of
+entries MUST NOT enter that bound. Measured over trees whose directories each hold a bounded number of
+entries, peak usage at a thousand, a hundred thousand and a million entries per side MUST stay flat.
+
+A single directory holding a million entries costs a million entries of memory. Producing key order means
+sorting that directory's children, and sorting means holding them.
 *`[NEW]`.*
 
 **NFR-Tput-1** Transferring a given set of entries through sync MUST be as fast as transferring that same

@@ -122,7 +122,11 @@ fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
 #[derive(Debug)]
 pub struct DirEntry {
     path: PathBuf,
-    relative_path: PathBuf,
+    // The walk root, shared by every entry it produces. `relative_path` is a suffix of
+    // `path`, so storing it separately would put a second copy of the whole path in
+    // memory for every entry held — and a key-ordered walk holds the unconsumed
+    // children of every directory on its descent path at once.
+    root: Arc<Path>,
     metadata: Metadata,
 }
 
@@ -138,7 +142,7 @@ impl DirEntry {
     /// the relative path is `a/b.txt`. Useful for deriving destination keys
     /// for uploads.
     pub fn relative_path(&self) -> &Path {
-        &self.relative_path
+        self.path.strip_prefix(&self.root).unwrap_or(&self.path)
     }
 
     /// File metadata.
@@ -959,18 +963,18 @@ impl FsWalk {
     }
 
     fn push_file(&self, children: &mut Vec<Child>, path: PathBuf, metadata: &Metadata) {
-        let relative_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
+        let relative_path = path.strip_prefix(&self.root).unwrap_or(&path);
         if self
             .config
             .path_filter
             .as_ref()
-            .is_some_and(|f| !f(&relative_path))
+            .is_some_and(|f| !f(relative_path))
         {
             return;
         }
         let entry = DirEntry {
             path,
-            relative_path,
+            root: Arc::clone(&self.root),
             metadata: metadata.clone(),
         };
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {

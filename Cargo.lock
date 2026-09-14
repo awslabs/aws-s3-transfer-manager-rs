@@ -840,6 +840,7 @@ dependencies = [
  "bytes",
  "criterion",
  "s3-mock-server",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]
