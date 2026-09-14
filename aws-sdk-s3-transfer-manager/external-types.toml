@@ -8,8 +8,4 @@ allowed_external_types = [
     "bytes::bytes::Bytes",
     "tokio::io::async_read::AsyncRead",
     "tokio::runtime::task::error::JoinError",
-
-    # TODO(create an issue in cargo-check-external-types): false positives since `RetryPolicy` is `pub(crate)`
-    "futures_util::future::ready::Ready",
-    "tower::retry::policy::Policy",
 ]

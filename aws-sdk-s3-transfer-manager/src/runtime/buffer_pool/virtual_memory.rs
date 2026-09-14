@@ -286,6 +286,13 @@ impl VirtualRange {
         self.base.as_ptr().addr()
     }
 
+    /// Returns the complete address reservation retained by this range.
+    #[cfg(test)]
+    pub(super) fn reservation_address_range(&self) -> std::ops::Range<usize> {
+        let start = self.reservation_base.as_ptr().addr();
+        start..start + self.reservation_len
+    }
+
     /// Makes the complete managed range readable and writable.
     ///
     /// Failure preserves exclusive address ownership but leaves protection

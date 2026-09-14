@@ -12,12 +12,14 @@ concurrency:
 env:
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
+  # FIXME: Remove nightly `-Adeprecated` overrides when MSRV reaches 1.95 and
+  # Atomic*::fetch_update can be replaced by try_update.
   # Change to specific Rust release to pin
   rust_stable: stable
-  rust_nightly: nightly-2026-03-31
-  rust_clippy: '1.92.0'
+  rust_nightly: nightly-2026-09-10
+  rust_clippy: '1.94.1'
   # When updating this, also update relevant docs
-  rust_min: '1.92.0'
+  rust_min: '1.94.1'
   CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
   AWS_REGION: us-west-2
 
@@ -28,7 +30,6 @@ defaults:
 
 permissions:
   contents: read
-  id-token: write # This is required for requesting the JWT
 
 jobs:
   # depends on all actions required for a "successful" CI run
@@ -36,6 +37,7 @@ jobs:
     name: Required checks pass
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    if: ${{ always() && !cancelled() }}
     needs:
       - test-hll
       - fmt
@@ -45,31 +47,54 @@ jobs:
       - check-external-types
       - check-deny
       - sanitizers
+      - fuzz
       - features
       - dial9-build
       - miri
       - loom
       - freebsd-test
     steps:
-      - run: exit 0
+      - name: Verify required results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON"; then
+            echo "one or more required CI jobs did not succeed" >&2
+            jq 'to_entries | map({job: .key, result: .value.result}) | sort_by(.job)' \
+              <<<"$NEEDS_JSON" >&2
+            exit 1
+          fi
 
  # Basic actions that must pass before we kick off more expensive tests.
   basics:
     name: basic checks
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    if: ${{ always() && !cancelled() }}
     needs:
       - fmt
       - clippy
       - docs
       - minrust
     steps:
-      - run: exit 0
+      - name: Verify prerequisite results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON"; then
+            echo "one or more basic CI prerequisite jobs did not succeed" >&2
+            jq 'to_entries | map({job: .key, result: .value.result}) | sort_by(.job)' \
+              <<<"$NEEDS_JSON" >&2
+            exit 1
+          fi
 
   test-hll:
     name: Test S3 transfer manager HLL
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # Required to request the AWS credentials JWT.
     strategy:
       fail-fast: false
       matrix:
@@ -126,6 +151,10 @@ jobs:
             printf "Please run \`cargo fmt\` to fix rustfmt errors.\nSee CONTRIBUTING.md for more details.\n" >&2
             exit 1
           fi
+          if ! cargo fmt --manifest-path fuzz/Cargo.toml -- --check; then
+            printf "Please run \`cargo fmt --manifest-path fuzz/Cargo.toml\` to fix fuzz-target formatting.\n" >&2
+            exit 1
+          fi
 
   clippy:
     name: clippy
@@ -157,6 +186,7 @@ jobs:
         run: |
           cargo doc --lib --no-deps --document-private-items
         env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
           RUSTDOCFLAGS: --cfg docsrs
 
   minrust:
@@ -213,8 +243,8 @@ jobs:
         rust:
           # `check-external-types` requires a specific Rust nightly version. See
           # the README for details: https://github.com/awslabs/cargo-check-external-types
-          # v0.4.0 needs rustdoc JSON format v56 (rustdoc-types 0.56.0)
-          - nightly-2025-10-18
+          # v0.5.0 uses rustdoc-types 0.57 and was tested with this nightly.
+          - nightly-2026-03-20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -225,7 +255,7 @@ jobs:
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v2
         with:
-          tool: cargo-check-external-types@0.4.0
+          tool: cargo-check-external-types@0.5.0
       - name: check-external-types
         run: cargo check-external-types --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
@@ -252,28 +282,30 @@ jobs:
         run: cargo deny --all-features --config .cargo-deny-config.toml check --hide-inclusion-graph licenses bans sources
 
   sanitizers:
-    name: saniters (${{ matrix.sanitizer }})
+    name: sanitizers (${{ matrix.sanitizer }})
     needs: basics
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         include:
           # ASAN: leak detection + use-after-free + heap/stack buffer overflow.
+          # The dedicated target instruments the standard library as well as
+          # this workspace. Frame pointers improve native stack unwinding; they
+          # do not change which accesses ASan diagnoses.
           # `--test-threads 1` keeps leak attribution readable when something
           # panics mid-test and leaves Arc cycles behind.
           - sanitizer: address
-            rustflags: -Z sanitizer=address --cfg s3_tm_asan
-            cargo_args: ""
+            target: x86_64-unknown-linux-gnuasan
+            cfg: s3_tm_asan
             test_args: --test-threads 1 --nocapture
-          # TSan is parked: requires `-Z build-std` for correct happens-before
-          # modeling against std synchronization (the alternative
-          # `-Cunsafe-allow-abi-mismatch=sanitizer` produces both false
-          # positives and missed races); build-std currently fails to
-          # compile transitive `tower 0.4` against `indexmap 1.9` due to
-          # feature-resolution differences. Re-evaluate when the dep
-          # graph picks up tower 0.5+.
+          # TSan uses the pre-instrumented standard-library target so happens-
+          # before edges inside std synchronization remain visible.
+          - sanitizer: thread
+            target: x86_64-unknown-linux-gnutsan
+            cfg: s3_tm_tsan
+            test_args: --test-threads 1 --nocapture
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
@@ -283,13 +315,75 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_nightly }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
-        run: cargo test ${{ matrix.cargo_args }} --workspace --target x86_64-unknown-linux-gnu --tests -- ${{ matrix.test_args }}
+        run: cargo test --workspace --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
+          RUSTFLAGS: -Dwarnings -Adeprecated -C force-frame-pointers=yes --cfg ${{ matrix.cfg }}
+          # Detect leaked ownership and stack lifetime errors, stop at the
+          # first report, and reject invalid C-string operations.
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
+          # Retain additional access history for race reports and stop at the
+          # first diagnostic. Deadlock detection is not enabled.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
+
+  fuzz:
+    name: fuzz harnesses
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install llvm
+        run: sudo apt-get install -y llvm
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check locked fuzz target
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Lint locked fuzz target
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --locked --all-targets --no-deps
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Run optimized model and corpus replay
+        run: cargo nextest run --release -p aws-sdk-s3-transfer-manager --lib
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
+      - name: Build native fuzz targets
+        run: .github/scripts/run-fuzz-targets.sh build
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Run deterministic fuzz smoke tests
+        run: .github/scripts/run-fuzz-targets.sh smoke
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Check fuzz lock is unchanged
+        run: git diff --exit-code -- fuzz/Cargo.lock
+      - name: Upload fuzz crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: required-fuzz-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30
 
   # TODO - re-enable semver check once released
   # semver:
@@ -322,6 +416,8 @@ jobs:
         # Exclude dial9: it requires RUSTFLAGS=--cfg tokio_unstable (see the
         # dial9-build job for dedicated coverage).
         run: cargo hack check --all --feature-powerset --exclude-features dial9
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
 
   dial9-build:
     # Verifies the optional `dial9` feature compiles. dial9-tokio-telemetry
@@ -369,6 +465,7 @@ jobs:
           cargo miri test -p aws-sdk-s3-transfer-manager --lib
         env:
           MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+          RUSTFLAGS: -Dwarnings -Adeprecated
 
   loom:
     name: loom
@@ -384,7 +481,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: loom
         run: |
-          RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
+          test_list=$(RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' \
+            cargo test -p aws-sdk-s3-transfer-manager --lib --release -- --list)
+          if ! grep -q 'loom_tests::.*: test' <<<"$test_list"; then
+            echo "no Loom tests were registered" >&2
+            exit 1
+          fi
+          RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
             --lib --release -- loom_tests --nocapture
         env:
           # Three preemption points catches three-way interleaving bugs that

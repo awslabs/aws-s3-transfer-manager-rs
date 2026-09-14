@@ -34,11 +34,11 @@ mod geometry;
 mod maintenance;
 mod metrics;
 mod pooled_buf;
-#[cfg(all(test, not(s3_tm_loom)))]
-mod prop_tests;
 mod segmented_bytes;
-#[cfg(test)]
+#[cfg(any(test, s3_tm_fuzz))]
 mod test_util;
+#[cfg(all(test, not(s3_tm_loom)))]
+mod tests;
 mod virtual_memory;
 
 use crate::types::MemoryBudgetConfig;
@@ -60,6 +60,11 @@ use metrics::{MemoryDiagnostics, MemoryMetricState};
 use pooled_buf::GrowthAuthority;
 pub use pooled_buf::PooledBufMut;
 pub use segmented_bytes::SegmentedBytes;
+
+#[cfg(s3_tm_fuzz)]
+pub(crate) fn run_fuzz_input(data: &[u8]) {
+    let _ = test_util::model_harness::run_fuzz_input(data);
+}
 
 #[cfg(all(test, not(s3_tm_loom)))]
 pub(crate) use test_util::test_pool;
