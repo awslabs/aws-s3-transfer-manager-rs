@@ -1,0 +1,19 @@
+[package]
+name = "aws-s3-transfer-manager-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "buffer-pool-operations"
+path = "fuzz_targets/buffer_pool_operations.rs"
+test = false
+doc = false
+bench = false

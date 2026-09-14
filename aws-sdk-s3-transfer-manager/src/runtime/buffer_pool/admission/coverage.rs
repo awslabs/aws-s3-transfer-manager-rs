@@ -397,6 +397,25 @@ mod tests {
     }
 
     #[test]
+    fn test_close_removes_coverage_restored_after_the_direct_snapshot() {
+        let state = state_with(1, 0);
+
+        state.remove_coverage(
+            CarrierCount::new(1),
+            CarrierCount::new(1),
+            CarrierCount::ZERO,
+        );
+
+        assert_eq!(
+            state.snapshot(),
+            CoverageSnapshot {
+                available: CarrierCount::ZERO,
+                uncovered: CarrierCount::ZERO,
+            }
+        );
+    }
+
+    #[test]
     fn test_small_debit_space_matches_transition_equations() {
         for available in 0..=4 {
             for uncovered in 0..=4 {
@@ -452,7 +471,7 @@ mod tests {
                 for envelope in 0..=6 {
                     for direct_outstanding in 0..=envelope {
                         for remaining_active in 0..=4 {
-                            if available + direct_outstanding > remaining_active + envelope {
+                            if available > remaining_active + envelope {
                                 continue;
                             }
                             let state = state_with(available, uncovered);
@@ -461,16 +480,20 @@ mod tests {
                                 CarrierCount::new(direct_outstanding),
                                 CarrierCount::new(remaining_active),
                             );
-                            let potentially_unused = envelope - direct_outstanding;
-                            let nominally_unused = potentially_unused.min(available);
-                            let required_for_active = available.saturating_sub(remaining_active);
-                            let removed = nominally_unused.max(required_for_active);
+                            let active = remaining_active + envelope;
+                            let charged = active + uncovered - available;
+                            let removable_unused = envelope - direct_outstanding;
+                            let expected_available = available
+                                .saturating_sub(removable_unused)
+                                .min(remaining_active);
+                            let expected_covered = remaining_active - expected_available;
+                            let expected_uncovered = charged - expected_covered;
 
                             assert_eq!(
                                 state.snapshot(),
                                 CoverageSnapshot {
-                                    available: CarrierCount::new(available - removed),
-                                    uncovered: CarrierCount::new(uncovered + envelope - removed),
+                                    available: CarrierCount::new(expected_available),
+                                    uncovered: CarrierCount::new(expected_uncovered),
                                 }
                             );
                         }

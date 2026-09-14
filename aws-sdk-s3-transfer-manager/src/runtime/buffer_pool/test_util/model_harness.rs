@@ -3,120 +3,38 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Property tests for public buffer-pool ownership and accounting.
+//! Applies operation sequences to a real pool and an independent logical model.
 //!
-//! Each case creates a four-carrier pool and fixed slots for reservation futures, granted
-//! reservations, mutable buffers, and immutable values. A generated [`Operation`] may reserve or
-//! queue memory, poll or cancel a request, acquire or grow a buffer, write or publish bytes, create
-//! immutable aliases, consume a value, or drop an owner. [`Runner`] applies the operation to both
-//! the real public API and an independent [`PoolModel`].
+//! After each operation, the runner compares mutable bytes, immutable values,
+//! admission accounting, ownership, and the complete pool audit. Teardown
+//! requires all demand, ownership, and queued work to drain to zero.
 //!
-//! The model represents carrier ownership with opaque logical tokens and tracks bytes, reservation
-//! coverage, sticky uncovered charges, prepared capacity, and FIFO order without reproducing the
-//! pool's bitmap or synchronization implementation. After every operation, the runner compares
-//! mutable buffers, immutable payloads, public metrics, live ownership, and the complete pool audit.
-//! It then drops every remaining handle and requires demand, ownership, and queued work to reach
-//! zero.
-//!
-//! Operation arguments are selectors mapped into the state that exists when they execute.
-//! Inapplicable operations deliberately become no-ops, allowing shrinking to remove setup without
-//! invalidating the rest of a sequence. Deterministic sequences exercise the same runner under
-//! Miri; synchronization schedules remain covered by the pool's Loom tests.
+//! Operations selecting an absent or incompatible handle leave both states
+//! unchanged. This preserves validity when a generator removes setup steps.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Poll, Waker};
 
 use bytes::{Buf, BufMut, Bytes};
-#[cfg(not(miri))]
-use proptest::prelude::*;
 
-use super::test_util::PoolAuditReport;
-use super::{
-    test_pool, AcquireError, BufferPool, CarrierCount, PooledBufMut, Reservation, ReserveError,
-    ReserveFuture, SegmentedBytes,
+use super::super::{
+    AcquireError, BufferPool, CarrierCount, PooledBufMut, Reservation, ReserveError, ReserveFuture,
+    SegmentedBytes,
 };
+use super::audit::PoolAuditReport;
+use super::operation_sequence::{
+    decode_fuzz_input, Operation, ALL_REMAINING_SELECTOR, CONFIGURED_CARRIERS,
+    GROW_ONE_CARRIER_SELECTOR,
+};
+use super::pool::test_pool;
+#[cfg(test)]
+use super::pool::test_pool_with_carrier_size;
 
 const BLOCK_CARRIERS: usize = 2;
-const CONFIGURED_CARRIERS: usize = 4;
 const RESERVATION_SLOTS: usize = 4;
 const REQUEST_SLOTS: usize = 4;
 const BUFFER_SLOTS: usize = 4;
 const VALUE_SLOTS: usize = 6;
-
-/// One state transition attempted through the public pool and buffer interfaces.
-///
-/// Slot and length fields are selectors normalized by [`Runner`] against its fixed handle tables
-/// and the state present when the operation executes.
-#[derive(Clone, Debug)]
-enum Operation {
-    TryReserve {
-        slot: u8,
-        envelope: u8,
-    },
-    StartReserve {
-        slot: u8,
-        envelope: u8,
-    },
-    PollReserve {
-        request: u8,
-        reservation: u8,
-    },
-    CancelReserve {
-        slot: u8,
-    },
-    CloseReservation {
-        slot: u8,
-    },
-    Acquire {
-        reservation: u8,
-        buffer: u8,
-        carriers: u8,
-    },
-    Grow {
-        buffer: u8,
-        writable: u16,
-    },
-    Write {
-        buffer: u8,
-        count: u16,
-        byte: u8,
-    },
-    Publish {
-        buffer: u8,
-        value: u8,
-        count: u16,
-    },
-    Freeze {
-        buffer: u8,
-        value: u8,
-    },
-    CloneValue {
-        source: u8,
-        output: u8,
-    },
-    SliceView {
-        source: u8,
-        output: u8,
-        start: u16,
-        len: u16,
-    },
-    AdvanceValue {
-        value: u8,
-        count: u16,
-    },
-    AppendValue {
-        target: u8,
-        source: u8,
-    },
-    DropBuffer {
-        slot: u8,
-    },
-    DropValue {
-        slot: u8,
-    },
-}
 
 /// Real immutable handle retained by the generated runner.
 enum ValueHandle {
@@ -183,7 +101,7 @@ struct ModelCarrier {
 /// Mutable buffer state independent of `PooledBufMut` internals.
 #[derive(Clone, Debug)]
 struct ModelBuffer {
-    reservation: usize,
+    authority: Option<usize>,
     carriers: Vec<ModelCarrier>,
 }
 
@@ -368,7 +286,7 @@ struct PoolModel {
     requests: Vec<Option<ModelRequest>>,
     buffers: Vec<Option<ModelBuffer>>,
     values: Vec<Option<ModelValue>>,
-    token_reservations: HashMap<u64, usize>,
+    token_authorities: HashMap<u64, Option<usize>>,
     next_token: u64,
 }
 
@@ -386,7 +304,7 @@ impl PoolModel {
             requests: empty_slots(REQUEST_SLOTS),
             buffers: empty_slots(BUFFER_SLOTS),
             values: empty_slots(VALUE_SLOTS),
-            token_reservations: HashMap::new(),
+            token_authorities: HashMap::new(),
             next_token: 0,
         }
     }
@@ -425,33 +343,38 @@ impl PoolModel {
     }
 
     fn close_reservation(&mut self, reservation: usize) {
-        let state = &mut self.reservations[reservation];
+        let state = &self.reservations[reservation];
         if !state.open {
             return;
         }
+        let envelope = state.envelope;
+        let direct_outstanding = state.direct_outstanding;
+        let charged = self.charged();
         let remaining_active = self
             .active
-            .checked_sub(state.envelope)
+            .checked_sub(envelope)
             .expect("model reservation close exceeds active demand");
-        let potentially_unused = state
-            .envelope
-            .checked_sub(state.direct_outstanding)
+        let removable_unused = envelope
+            .checked_sub(direct_outstanding)
             .expect("model direct ownership exceeds its envelope");
-        let nominally_unused = potentially_unused.min(self.available);
-        let required_for_active = self.available.saturating_sub(remaining_active);
-        let removed = nominally_unused.max(required_for_active);
-        let reclassified = state
-            .envelope
-            .checked_sub(removed)
-            .expect("model reservation removal exceeds its envelope");
+
         self.active = remaining_active;
-        self.available -= removed;
-        self.uncovered += reclassified;
-        state.open = false;
+        self.available = self
+            .available
+            .saturating_sub(removable_unused)
+            .min(self.active);
+        let covered = self
+            .active
+            .checked_sub(self.available)
+            .expect("model available coverage exceeds active demand");
+        self.uncovered = charged
+            .checked_sub(covered)
+            .expect("model close lost live charges");
+        self.reservations[reservation].open = false;
         self.drain();
     }
 
-    fn debit(&mut self, reservation: usize, count: usize) -> bool {
+    fn debit_reserved(&mut self, reservation: usize, count: usize) -> bool {
         let state = &self.reservations[reservation];
         if !state.open
             || state
@@ -461,20 +384,37 @@ impl PoolModel {
         {
             return false;
         }
-        let covered = count.min(self.available);
-        self.available -= covered;
-        self.uncovered += count - covered;
         self.reservations[reservation].direct_outstanding += count;
-        self.prepare_to(self.admission_used());
+        self.debit_aggregate(count);
         true
     }
 
-    fn allocate_carriers(&mut self, reservation: usize, count: usize) -> Vec<ModelCarrier> {
+    fn debit_unreserved(&mut self, count: usize) {
+        self.debit_aggregate(count);
+    }
+
+    fn debit_aggregate(&mut self, count: usize) {
+        let charged = self
+            .charged()
+            .checked_add(count)
+            .expect("model charged capacity overflowed");
+        self.available = self.available.saturating_sub(count);
+        let covered = self
+            .active
+            .checked_sub(self.available)
+            .expect("model available coverage exceeds active demand");
+        self.uncovered = charged
+            .checked_sub(covered)
+            .expect("model debit lost live charges");
+        self.prepare_to(self.admission_used());
+    }
+
+    fn allocate_carriers(&mut self, authority: Option<usize>, count: usize) -> Vec<ModelCarrier> {
         (0..count)
             .map(|_| {
                 let token = self.next_token;
                 self.next_token += 1;
-                self.token_reservations.insert(token, reservation);
+                self.token_authorities.insert(token, authority);
                 ModelCarrier {
                     token,
                     range_len: 0,
@@ -500,22 +440,37 @@ impl PoolModel {
 
     fn release_dead_tokens(&mut self, previously_live: HashSet<u64>) {
         let now_live = self.live_tokens();
-        let mut released_uncovered = false;
+        let released = previously_live.difference(&now_live).count();
+        if released == 0 {
+            return;
+        }
+        let charged = self
+            .charged()
+            .checked_sub(released)
+            .expect("model released more charges than remain live");
         for token in previously_live.difference(&now_live) {
-            let reservation = self.token_reservations[token];
-            let state = &mut self.reservations[reservation];
-            state.direct_outstanding = state
-                .direct_outstanding
-                .checked_sub(1)
-                .expect("model direct ownership underflowed");
-            if self.uncovered != 0 {
-                self.uncovered -= 1;
-                released_uncovered = true;
-            } else {
-                self.available += 1;
+            let authority = self
+                .token_authorities
+                .remove(token)
+                .expect("model live token has no acquisition authority");
+            if let Some(reservation) = authority {
+                let state = &mut self.reservations[reservation];
+                state.direct_outstanding = state
+                    .direct_outstanding
+                    .checked_sub(1)
+                    .expect("model direct ownership underflowed");
             }
         }
-        if released_uncovered {
+        let previous_uncovered = self.uncovered;
+        self.uncovered = self.uncovered.saturating_sub(released);
+        let covered = charged
+            .checked_sub(self.uncovered)
+            .expect("model uncovered charges exceed live charges");
+        self.available = self
+            .active
+            .checked_sub(covered)
+            .expect("model covered charges exceed active demand");
+        if self.uncovered != previous_uncovered {
             self.drain();
         }
     }
@@ -560,11 +515,24 @@ struct Runner {
     buffers: Vec<Option<PooledBufMut>>,
     values: Vec<Option<ValueHandle>>,
     model: PoolModel,
+    report: SequenceReport,
 }
 
 impl Runner {
     fn new() -> Self {
-        let (pool, carrier_size) = test_pool(BLOCK_CARRIERS, CONFIGURED_CARRIERS);
+        Self::with_pool(test_pool(BLOCK_CARRIERS, CONFIGURED_CARRIERS))
+    }
+
+    #[cfg(test)]
+    fn with_carrier_size(carrier_size: usize) -> Self {
+        Self::with_pool(test_pool_with_carrier_size(
+            BLOCK_CARRIERS,
+            CONFIGURED_CARRIERS,
+            carrier_size,
+        ))
+    }
+
+    fn with_pool((pool, carrier_size): (BufferPool, usize)) -> Self {
         Self {
             pool,
             carrier_size,
@@ -573,6 +541,7 @@ impl Runner {
             buffers: empty_slots(BUFFER_SLOTS),
             values: empty_slots(VALUE_SLOTS),
             model: PoolModel::new(),
+            report: SequenceReport::default(),
         }
     }
 
@@ -599,19 +568,21 @@ impl Runner {
                 reservation,
                 buffer,
                 carriers,
+                unreserved,
             } => self.acquire(
                 reservation as usize % RESERVATION_SLOTS,
                 buffer as usize % BUFFER_SLOTS,
                 carriers as usize,
+                unreserved,
             ),
             Operation::Grow { buffer, writable } => {
-                self.grow(buffer as usize % BUFFER_SLOTS, writable as usize)
+                self.grow(buffer as usize % BUFFER_SLOTS, writable)
             }
             Operation::Write {
                 buffer,
                 count,
                 byte,
-            } => self.write(buffer as usize % BUFFER_SLOTS, count as usize, byte),
+            } => self.write(buffer as usize % BUFFER_SLOTS, count, byte),
             Operation::Publish {
                 buffer,
                 value,
@@ -619,7 +590,7 @@ impl Runner {
             } => self.publish(
                 buffer as usize % BUFFER_SLOTS,
                 value as usize % VALUE_SLOTS,
-                count as usize,
+                count,
             ),
             Operation::Freeze { buffer, value } => {
                 self.freeze(buffer as usize % BUFFER_SLOTS, value as usize % VALUE_SLOTS)
@@ -639,7 +610,7 @@ impl Runner {
                 len as usize,
             ),
             Operation::AdvanceValue { value, count } => {
-                self.advance_value(value as usize % VALUE_SLOTS, count as usize)
+                self.advance_value(value as usize % VALUE_SLOTS, count)
             }
             Operation::AppendValue { target, source } => {
                 self.append_value(target as usize % VALUE_SLOTS, source as usize % VALUE_SLOTS)
@@ -694,7 +665,10 @@ impl Runner {
         let state = self.model.requests[request]
             .take()
             .expect("real request has no model state");
-        let poll = poll_future(&mut self.requests[request].as_mut().unwrap().value);
+        let poll = super::poll_reserve(
+            &mut self.requests[request].as_mut().unwrap().value,
+            Waker::noop(),
+        );
         match state {
             ModelRequest::Unpolled { envelope: 0 } => {
                 assert!(matches!(poll, Poll::Ready(Err(ReserveError::InvalidSize))));
@@ -724,6 +698,7 @@ impl Runner {
                 self.model.queue.push_back(request);
                 self.model.reservation_enqueues_total =
                     self.model.reservation_enqueues_total.saturating_add(1);
+                self.report.queued_requests += 1;
             }
             ModelRequest::Queued { envelope } => {
                 assert!(matches!(poll, Poll::Pending));
@@ -736,6 +711,7 @@ impl Runner {
                 self.model.handles[reservation] = Some(state);
                 self.reservations[reservation] = Some(ReservationHandle { value, state });
                 self.requests[request] = None;
+                self.report.granted_queued_requests += 1;
             }
         }
     }
@@ -771,14 +747,32 @@ impl Runner {
         self.model.close_reservation(state);
     }
 
-    fn acquire(&mut self, reservation: usize, buffer: usize, carriers: usize) {
-        if carriers == 0
-            || self.buffers[buffer].is_some()
-            || self.reservations[reservation].is_none()
-        {
+    fn acquire(&mut self, reservation: usize, buffer: usize, carriers: usize, unreserved: bool) {
+        if carriers == 0 || self.buffers[buffer].is_some() {
             return;
         }
-        let handle = self.reservations[reservation].as_ref().unwrap();
+
+        if unreserved {
+            let value = self
+                .pool
+                .acquire_unreserved(self.bytes_for_envelope(carriers))
+                .expect("valid unreserved acquisition failed");
+            self.model.debit_unreserved(carriers);
+            let mut model_carriers = self.model.allocate_carriers(None, carriers);
+            for carrier in &mut model_carriers {
+                carrier.range_len = self.carrier_size;
+            }
+            self.model.buffers[buffer] = Some(ModelBuffer {
+                authority: None,
+                carriers: model_carriers,
+            });
+            self.buffers[buffer] = Some(value);
+            return;
+        }
+
+        let Some(handle) = self.reservations[reservation].as_ref() else {
+            return;
+        };
         let can_debit = {
             let state = &self.model.reservations[handle.state];
             state.open
@@ -798,47 +792,62 @@ impl Runner {
             return;
         }
         let value = result.expect("valid reserved acquisition failed");
-        assert!(self.model.debit(handle.state, carriers));
-        let mut model_carriers = self.model.allocate_carriers(handle.state, carriers);
+        assert!(self.model.debit_reserved(handle.state, carriers));
+        let mut model_carriers = self.model.allocate_carriers(Some(handle.state), carriers);
         for carrier in &mut model_carriers {
             carrier.range_len = self.carrier_size;
         }
         self.model.buffers[buffer] = Some(ModelBuffer {
-            reservation: handle.state,
+            authority: Some(handle.state),
             carriers: model_carriers,
         });
         self.buffers[buffer] = Some(value);
     }
 
-    fn grow(&mut self, buffer: usize, selector: usize) {
+    fn grow(&mut self, buffer: usize, selector: u16) {
         let Some(real) = self.buffers[buffer].as_mut() else {
             return;
         };
         let model = self.model.buffers[buffer].as_ref().unwrap();
-        let min_writable = selector % (self.carrier_size * 3 + 1);
+        let min_writable =
+            select_growth_writable(selector, model.remaining_mut(), self.carrier_size);
         let shortfall = min_writable.saturating_sub(model.remaining_mut());
         let added = shortfall.div_ceil(self.carrier_size);
-        let state = &self.model.reservations[model.reservation];
-        let expected = if added == 0 {
-            Ok(())
-        } else if !state.open {
-            Err(AcquireError::ReservationClosed)
-        } else if state.direct_outstanding + added > state.envelope {
-            Err(AcquireError::ReservationCapacityExceeded)
-        } else {
-            Ok(())
+        let expected = match (added, model.authority) {
+            (0, _) | (_, None) => Ok(()),
+            (_, Some(reservation)) => {
+                let state = &self.model.reservations[reservation];
+                if !state.open {
+                    Err(AcquireError::ReservationClosed)
+                } else if state
+                    .direct_outstanding
+                    .checked_add(added)
+                    .is_none_or(|next| next > state.envelope)
+                {
+                    Err(AcquireError::ReservationCapacityExceeded)
+                } else {
+                    Ok(())
+                }
+            }
         };
         let before = (real.capacity(), real.len(), real.remaining_mut());
         let result = real.reserve(min_writable);
         assert_eq!(result, expected);
+        if matches!(&result, Err(AcquireError::ReservationClosed)) {
+            self.report.reservation_closed_growth_rejections += 1;
+        }
         if result.is_err() {
             assert_eq!((real.capacity(), real.len(), real.remaining_mut()), before);
             return;
         }
         if added != 0 {
-            let reservation = model.reservation;
-            assert!(self.model.debit(reservation, added));
-            let mut carriers = self.model.allocate_carriers(reservation, added);
+            let authority = model.authority;
+            if let Some(reservation) = authority {
+                assert!(self.model.debit_reserved(reservation, added));
+            } else {
+                self.model.debit_unreserved(added);
+            }
+            let mut carriers = self.model.allocate_carriers(authority, added);
             for carrier in &mut carriers {
                 carrier.range_len = self.carrier_size;
             }
@@ -847,21 +856,22 @@ impl Runner {
                 .unwrap()
                 .carriers
                 .extend(carriers);
+            self.report.successful_growths += 1;
         }
     }
 
-    fn write(&mut self, buffer: usize, selector: usize, byte: u8) {
+    fn write(&mut self, buffer: usize, selector: u16, byte: u8) {
         let Some(real) = self.buffers[buffer].as_mut() else {
             return;
         };
         let remaining = real.remaining_mut();
-        let count = selector % (remaining + 1);
+        let count = select_count(selector, remaining);
         let bytes = vec![byte; count];
         real.put_slice(&bytes);
         self.model.buffers[buffer].as_mut().unwrap().write(&bytes);
     }
 
-    fn publish(&mut self, buffer: usize, value: usize, selector: usize) {
+    fn publish(&mut self, buffer: usize, value: usize, selector: u16) {
         if self.values[value].is_some() {
             return;
         }
@@ -872,7 +882,7 @@ impl Runner {
         if available == 0 {
             return;
         }
-        let count = 1 + selector % available;
+        let count = select_nonzero_count(selector, available);
         let published = real.publish_prefix(count);
         let model = self.model.buffers[buffer]
             .as_mut()
@@ -880,6 +890,7 @@ impl Runner {
             .publish_prefix(count);
         self.values[value] = Some(ValueHandle::View(published));
         self.model.values[value] = Some(model);
+        self.report.publications += 1;
     }
 
     fn freeze(&mut self, buffer: usize, value: usize) {
@@ -892,6 +903,7 @@ impl Runner {
         self.values[value] = Some(ValueHandle::Segmented(real));
         self.model.values[value] = Some(model);
         self.model.release_dead_tokens(previously_live);
+        self.report.freezes += 1;
     }
 
     fn clone_value(&mut self, source: usize, output: usize) {
@@ -903,6 +915,7 @@ impl Runner {
         };
         self.values[output] = Some(real.clone_value());
         self.model.values[output] = self.model.values[source].clone();
+        self.report.clones += 1;
     }
 
     fn slice_view(
@@ -930,13 +943,14 @@ impl Runner {
                 .unwrap()
                 .slice(start, len),
         );
+        self.report.slices += 1;
     }
 
-    fn advance_value(&mut self, value: usize, selector: usize) {
+    fn advance_value(&mut self, value: usize, selector: u16) {
         let Some(real) = self.values[value].as_mut() else {
             return;
         };
-        let count = selector % (real.len() + 1);
+        let count = select_count(selector, real.len());
         let previously_live = self.model.live_tokens();
         real.advance(count);
         self.model.values[value].as_mut().unwrap().advance(count);
@@ -1097,7 +1111,7 @@ impl Runner {
         );
     }
 
-    fn finish(mut self) {
+    fn finish(mut self) -> SequenceReport {
         self.buffers.clear();
         self.values.clear();
         self.reservations.clear();
@@ -1110,6 +1124,7 @@ impl Runner {
         assert_eq!(audit.live_carriers, CarrierCount::ZERO);
         assert_eq!(audit.queued_reservations, 0);
         assert_eq!(audit.cleanup_pending_blocks, 0);
+        self.report
     }
 
     fn bytes_for_envelope(&self, envelope: usize) -> usize {
@@ -1127,235 +1142,226 @@ fn empty_slots<T>(count: usize) -> Vec<Option<T>> {
     std::iter::repeat_with(|| None).take(count).collect()
 }
 
-fn poll_future(future: &mut ReserveFuture) -> Poll<Result<Reservation, ReserveError>> {
-    let mut context = Context::from_waker(Waker::noop());
-    Pin::new(future).poll(&mut context)
+/// Named transitions reached while executing one operation sequence.
+#[must_use = "operation sequence milestones must be asserted or explicitly discarded"]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::runtime::buffer_pool) struct SequenceReport {
+    pub(in crate::runtime::buffer_pool) successful_growths: usize,
+    pub(in crate::runtime::buffer_pool) reservation_closed_growth_rejections: usize,
+    pub(in crate::runtime::buffer_pool) queued_requests: usize,
+    pub(in crate::runtime::buffer_pool) granted_queued_requests: usize,
+    pub(in crate::runtime::buffer_pool) publications: usize,
+    pub(in crate::runtime::buffer_pool) freezes: usize,
+    pub(in crate::runtime::buffer_pool) clones: usize,
+    pub(in crate::runtime::buffer_pool) slices: usize,
+}
+
+fn select_count(selector: u16, available: usize) -> usize {
+    if selector == ALL_REMAINING_SELECTOR {
+        available
+    } else {
+        usize::from(selector) % (available + 1)
+    }
+}
+
+fn select_nonzero_count(selector: u16, available: usize) -> usize {
+    if selector == ALL_REMAINING_SELECTOR {
+        available
+    } else {
+        1 + usize::from(selector) % available
+    }
+}
+
+fn select_growth_writable(selector: u16, remaining: usize, carrier_size: usize) -> usize {
+    if selector == GROW_ONE_CARRIER_SELECTOR {
+        remaining
+            .checked_add(carrier_size)
+            .expect("generated growth selector overflowed")
+    } else {
+        usize::from(selector) % (carrier_size * 3 + 1)
+    }
 }
 
 /// Applies a complete operation sequence and requires all ownership to drain on teardown.
-fn run_sequence(operations: &[Operation]) {
+pub(in crate::runtime::buffer_pool) fn run_sequence(operations: &[Operation]) -> SequenceReport {
     let mut runner = Runner::new();
     for (step, operation) in operations.iter().enumerate() {
         runner.apply(operation);
         runner.assert_consistent(step, operation);
     }
-    runner.finish();
+    runner.finish()
 }
 
-#[cfg(not(miri))]
-/// Generates state transitions with higher weight on ownership-producing operations.
-fn operation_strategy() -> impl Strategy<Value = Operation> {
-    prop_oneof![
-        4 => (0u8..8, 0u8..6).prop_map(|(slot, envelope)| Operation::TryReserve { slot, envelope }),
-        4 => (0u8..8, 0u8..6).prop_map(|(slot, envelope)| Operation::StartReserve { slot, envelope }),
-        5 => (0u8..8, 0u8..8).prop_map(|(request, reservation)| Operation::PollReserve {
-            request,
-            reservation,
-        }),
-        2 => (0u8..8).prop_map(|slot| Operation::CancelReserve { slot }),
-        3 => (0u8..8).prop_map(|slot| Operation::CloseReservation { slot }),
-        6 => (0u8..8, 0u8..8, 1u8..5).prop_map(
-            |(reservation, buffer, carriers)| Operation::Acquire {
-                reservation,
-                buffer,
-                carriers,
-            },
-        ),
-        4 => (0u8..8, any::<u16>())
-            .prop_map(|(buffer, writable)| Operation::Grow { buffer, writable }),
-        7 => (0u8..8, any::<u16>(), any::<u8>())
-            .prop_map(|(buffer, count, byte)| Operation::Write {
-                buffer,
-                count,
-                byte,
-            }),
-        5 => (0u8..8, 0u8..12, any::<u16>()).prop_map(
-            |(buffer, value, count)| Operation::Publish {
-                buffer,
-                value,
-                count,
-            },
-        ),
-        4 => (0u8..8, 0u8..12)
-            .prop_map(|(buffer, value)| Operation::Freeze { buffer, value }),
-        3 => (0u8..12, 0u8..12)
-            .prop_map(|(source, output)| Operation::CloneValue { source, output }),
-        2 => (0u8..12, 0u8..12, any::<u16>(), any::<u16>()).prop_map(
-            |(source, output, start, len)| Operation::SliceView {
-                source,
-                output,
-                start,
-                len,
-            },
-        ),
-        4 => (0u8..12, any::<u16>())
-            .prop_map(|(value, count)| Operation::AdvanceValue { value, count }),
-        2 => (0u8..12, 0u8..12)
-            .prop_map(|(target, source)| Operation::AppendValue { target, source }),
-        2 => (0u8..8).prop_map(|slot| Operation::DropBuffer { slot }),
-        3 => (0u8..12).prop_map(|slot| Operation::DropValue { slot }),
-    ]
+/// Decodes and executes one bounded libFuzzer input.
+pub(in crate::runtime::buffer_pool) fn run_fuzz_input(data: &[u8]) -> SequenceReport {
+    run_sequence(&decode_fuzz_input(data))
 }
 
-#[cfg(not(miri))]
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 128,
-        max_shrink_iters: 16_384,
-        ..ProptestConfig::default()
-    })]
+/// Replays one fuzz input with an explicit carrier size.
+#[cfg(test)]
+pub(in crate::runtime::buffer_pool) fn run_fuzz_input_with_carrier_size(
+    data: &[u8],
+    carrier_size: usize,
+) -> SequenceReport {
+    let mut runner = Runner::with_carrier_size(carrier_size);
+    for (step, operation) in decode_fuzz_input(data).iter().enumerate() {
+        runner.apply(operation);
+        runner.assert_consistent(step, operation);
+    }
+    runner.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
-    fn generated_pool_sequences_preserve_bytes_and_ownership(
-        operations in proptest::collection::vec(operation_strategy(), 1..80),
-    ) {
-        run_sequence(&operations);
+    fn close_derives_accounting_from_conserved_live_charges() {
+        let cases = [
+            (4, 1, 0, 4, 3, 0, 0, 3),
+            (3, 1, 0, 3, 0, 0, 0, 2),
+            // The direct owner returned after close sampled its outstanding count.
+            (1, 1, 0, 1, 1, 0, 0, 0),
+        ];
+
+        for (
+            active,
+            available,
+            uncovered,
+            envelope,
+            direct_outstanding,
+            expected_active,
+            expected_available,
+            expected_uncovered,
+        ) in cases
+        {
+            let mut model = PoolModel::new();
+            model.active = active;
+            model.available = available;
+            model.uncovered = uncovered;
+            model.reservations.push(ModelReservation {
+                envelope,
+                direct_outstanding,
+                open: true,
+            });
+
+            model.close_reservation(0);
+
+            assert_eq!(
+                (model.active, model.available, model.uncovered),
+                (expected_active, expected_available, expected_uncovered)
+            );
+        }
     }
-}
 
-#[test]
-fn deterministic_property_corpus_covers_queue_publication_and_owner_return() {
-    run_sequence(&[
-        Operation::TryReserve {
-            slot: 0,
-            envelope: 2,
-        },
-        Operation::Acquire {
-            reservation: 0,
-            buffer: 0,
-            carriers: 2,
-        },
-        Operation::Write {
-            buffer: 0,
-            count: u16::MAX,
-            byte: b'a',
-        },
-        Operation::Publish {
-            buffer: 0,
-            value: 0,
-            count: 17,
-        },
-        Operation::Freeze {
-            buffer: 0,
-            value: 1,
-        },
-        Operation::CloseReservation { slot: 0 },
-        Operation::StartReserve {
-            slot: 0,
-            envelope: 3,
-        },
-        Operation::PollReserve {
-            request: 0,
-            reservation: 1,
-        },
-        Operation::CloneValue {
-            source: 1,
-            output: 2,
-        },
-        Operation::DropValue { slot: 0 },
-        Operation::DropValue { slot: 1 },
-        Operation::AdvanceValue {
-            value: 2,
-            count: u16::MAX,
-        },
-        Operation::PollReserve {
-            request: 0,
-            reservation: 1,
-        },
-        Operation::CloseReservation { slot: 1 },
-        Operation::DropValue { slot: 2 },
-    ]);
-}
+    #[test]
+    fn close_preserves_coverage_for_an_open_reservation() {
+        let mut model = PoolModel::new();
+        model.active = 4;
+        model.available = 3;
+        model.reservations = vec![
+            ModelReservation {
+                envelope: 2,
+                direct_outstanding: 0,
+                open: true,
+            },
+            ModelReservation {
+                envelope: 2,
+                direct_outstanding: 1,
+                open: true,
+            },
+        ];
 
-#[test]
-fn deterministic_property_corpus_grants_after_final_owner_advance() {
-    run_sequence(&[
-        Operation::TryReserve {
-            slot: 0,
-            envelope: 4,
-        },
-        Operation::Acquire {
-            reservation: 0,
-            buffer: 0,
-            carriers: 4,
-        },
-        Operation::Write {
-            buffer: 0,
-            count: 10,
-            byte: b'x',
-        },
-        Operation::Freeze {
-            buffer: 0,
-            value: 0,
-        },
-        Operation::CloseReservation { slot: 0 },
-        Operation::StartReserve {
-            slot: 0,
-            envelope: 4,
-        },
-        Operation::PollReserve {
-            request: 0,
-            reservation: 1,
-        },
-        Operation::AdvanceValue {
-            value: 0,
-            count: 10,
-        },
-        Operation::PollReserve {
-            request: 0,
-            reservation: 1,
-        },
-        Operation::CloseReservation { slot: 1 },
-    ]);
-}
+        model.close_reservation(0);
 
-#[test]
-fn deterministic_property_corpus_preserves_closed_growth_and_view_aliases() {
-    run_sequence(&[
-        Operation::TryReserve {
-            slot: 0,
-            envelope: 3,
-        },
-        Operation::Acquire {
-            reservation: 0,
-            buffer: 0,
-            carriers: 1,
-        },
-        Operation::Grow {
-            buffer: 0,
-            writable: 32_768,
-        },
-        Operation::Write {
-            buffer: 0,
-            count: 100,
-            byte: b'g',
-        },
-        Operation::Publish {
-            buffer: 0,
-            value: 0,
-            count: 40,
-        },
-        Operation::SliceView {
-            source: 0,
-            output: 1,
-            start: 1,
-            len: 10,
-        },
-        Operation::CloneValue {
-            source: 1,
-            output: 2,
-        },
-        Operation::CloseReservation { slot: 0 },
-        Operation::Grow {
-            buffer: 0,
-            writable: 40_000,
-        },
-        Operation::DropBuffer { slot: 0 },
-        Operation::DropValue { slot: 0 },
-        Operation::DropValue { slot: 1 },
-        Operation::AdvanceValue {
-            value: 2,
-            count: 11,
-        },
-    ]);
+        assert_eq!((model.active, model.available, model.uncovered), (2, 1, 0));
+        assert!(model.reservations[1].open);
+    }
+
+    #[test]
+    fn debit_and_release_derive_accounting_from_live_charges() {
+        let debit_cases = [
+            (4, 4, 0, 2, 4, 2, 0),
+            (2, 0, 0, 1, 2, 0, 1),
+            (2, 1, 1, 2, 2, 0, 2),
+        ];
+        for (
+            active,
+            available,
+            uncovered,
+            count,
+            expected_active,
+            expected_available,
+            expected_uncovered,
+        ) in debit_cases
+        {
+            let mut model = PoolModel::new();
+            model.active = active;
+            model.available = available;
+            model.uncovered = uncovered;
+
+            model.debit_aggregate(count);
+
+            assert_eq!(
+                (model.active, model.available, model.uncovered),
+                (expected_active, expected_available, expected_uncovered)
+            );
+        }
+
+        let release_cases = [
+            (3, 1, 0, None, 3, 2, 0),
+            (2, 0, 1, None, 2, 0, 0),
+            (2, 1, 0, Some(0), 2, 2, 0),
+        ];
+        for (
+            active,
+            available,
+            uncovered,
+            authority,
+            expected_active,
+            expected_available,
+            expected_uncovered,
+        ) in release_cases
+        {
+            let mut model = PoolModel::new();
+            model.active = active;
+            model.available = available;
+            model.uncovered = uncovered;
+            model.token_authorities.insert(0, authority);
+            if let Some(reservation) = authority {
+                model.reservations.push(ModelReservation {
+                    envelope: active,
+                    direct_outstanding: 1,
+                    open: true,
+                });
+                assert_eq!(reservation, 0);
+            }
+
+            model.release_dead_tokens(HashSet::from([0]));
+
+            assert_eq!(
+                (model.active, model.available, model.uncovered),
+                (expected_active, expected_available, expected_uncovered)
+            );
+            if authority.is_some() {
+                assert_eq!(model.reservations[0].direct_outstanding, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_length_selectors_are_page_size_independent() {
+        for carrier_size in [4 * 1024, 16 * 1024, 64 * 1024] {
+            let remaining = carrier_size * 2 - 17;
+            assert_eq!(
+                select_growth_writable(GROW_ONE_CARRIER_SELECTOR, remaining, carrier_size),
+                remaining + carrier_size
+            );
+            assert_eq!(select_count(ALL_REMAINING_SELECTOR, remaining), remaining);
+            assert_eq!(
+                select_nonzero_count(ALL_REMAINING_SELECTOR, remaining),
+                remaining
+            );
+        }
+    }
 }

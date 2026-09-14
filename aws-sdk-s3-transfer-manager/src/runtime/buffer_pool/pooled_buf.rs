@@ -134,6 +134,28 @@ impl PooledBufMut {
             .sum()
     }
 
+    /// Returns the reservation containing the first retained carrier.
+    #[cfg(all(
+        test,
+        not(miri),
+        not(s3_tm_loom),
+        not(s3_tm_tsan),
+        any(
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )
+    ))]
+    fn test_first_reservation_address_range(&self) -> std::ops::Range<usize> {
+        self.runs[0].carriers[0]
+            .guard
+            .as_ref()
+            .expect("test buffer retained no first-carrier guard")
+            .slot()
+            .reservation_address_range()
+    }
+
     /// Returns the next contiguous initialized prefix.
     ///
     /// The result is empty exactly when [`Self::len`] is zero. A nonempty
@@ -1288,20 +1310,29 @@ mod tests {
         //! the parent can verify the native signal without terminating the
         //! complete test process.
 
+        #[cfg(not(s3_tm_tsan))]
+        use std::io::Write;
+        #[cfg(not(s3_tm_tsan))]
         use std::process::Command;
 
-        #[cfg(unix)]
+        #[cfg(all(unix, not(s3_tm_tsan)))]
         use std::os::unix::process::ExitStatusExt;
 
         use super::super::super::test_util::{test_guarded_pool, write_pooled};
         use super::super::super::CarrierCount;
         use super::*;
 
+        #[cfg(not(s3_tm_tsan))]
         const PROBE_ENV: &str = "AWS_S3_TM_GUARD_PAGE_PROBE";
+        #[cfg(not(s3_tm_tsan))]
         const PROBE_TEST: &str = concat!(
             "runtime::buffer_pool::pooled_buf::tests::guard_page_tests::",
             "test_guard_pages_reject_out_of_bounds_writes"
         );
+        #[cfg(not(s3_tm_tsan))]
+        const READY_MARKER: &str = "S3_TM_GUARD_PROBE_READY";
+        #[cfg(not(s3_tm_tsan))]
+        const SURVIVED_MARKER: &str = "S3_TM_GUARD_PROBE_SURVIVED";
 
         /// Exercises the ordinary mutable-to-immutable lifecycle across guarded blocks.
         #[test]
@@ -1326,6 +1357,7 @@ mod tests {
         }
 
         /// Verifies that writes immediately outside a block fault in child processes.
+        #[cfg(not(s3_tm_tsan))]
         #[test]
         fn test_guard_pages_reject_out_of_bounds_writes() {
             if let Some(probe) = std::env::var_os(PROBE_ENV) {
@@ -1342,20 +1374,32 @@ mod tests {
         }
 
         /// Runs one faulting probe in a child test process.
+        #[cfg(not(s3_tm_tsan))]
         fn assert_guard_page_fault(probe: &str) {
-            let status = Command::new(std::env::current_exe().expect("current test executable"))
+            let output = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg(PROBE_TEST)
                 .arg("--nocapture")
                 .env(PROBE_ENV, probe)
-                .status()
+                .output()
                 .expect("guard-page child process");
+            let status = output.status;
+            let stderr = String::from_utf8_lossy(&output.stderr);
 
             assert!(
                 !status.success(),
-                "{probe} unexpectedly remained accessible"
+                "{probe} unexpectedly remained accessible\n{stderr}"
             );
-            #[cfg(unix)]
+            assert!(
+                stderr.contains(READY_MARKER),
+                "{probe} failed before reaching the guard write: {status:?}\n{stderr}"
+            );
+            assert!(
+                !stderr.contains(SURVIVED_MARKER),
+                "{probe} guard write completed: {status:?}\n{stderr}"
+            );
+
+            #[cfg(all(unix, not(s3_tm_asan)))]
             {
                 let signal = status.signal();
                 assert!(
@@ -1363,13 +1407,41 @@ mod tests {
                     "{probe} failed without a guard-page signal: {status:?}"
                 );
             }
+
+            #[cfg(all(target_os = "windows", not(s3_tm_asan)))]
+            assert_eq!(
+                status.code(),
+                Some(0xC000_0005u32 as i32),
+                "{probe} failed without an access violation: {status:?}\n{stderr}"
+            );
+
+            // Native ASan may intercept the protection fault and convert it
+            // into a nonzero process exit before the OS signal is observable.
+            // Require sanitizer evidence so an unrelated child panic cannot
+            // satisfy the expected-fault assertion.
+            #[cfg(s3_tm_asan)]
+            {
+                #[cfg(unix)]
+                let native_fault =
+                    matches!(status.signal(), Some(libc::SIGSEGV) | Some(libc::SIGBUS));
+                #[cfg(not(unix))]
+                let native_fault = false;
+                let sanitizer_fault = stderr.contains("AddressSanitizer:DEADLYSIGNAL")
+                    && (stderr.contains("SEGV") || stderr.contains("BUS"));
+                assert!(
+                    native_fault || sanitizer_fault,
+                    "{probe} failed without a native fault or ASan report: {status:?}\n{stderr}"
+                );
+            }
         }
 
         /// Writes one byte immediately outside a guarded one-carrier block.
+        #[cfg(not(s3_tm_tsan))]
         fn run_guard_page_probe(probe: &str) {
             let (pool, carrier_size) = test_guarded_pool(1, 1);
             let mut buffer = pool.acquire_unreserved(carrier_size).unwrap();
             let ptr = buffer.chunk_mut().as_mut_ptr();
+            let reservation = buffer.test_first_reservation_address_range();
             let fault = match probe {
                 "underflow" => ptr.wrapping_sub(1),
                 // SAFETY: the one-past pointer remains within the complete
@@ -1377,9 +1449,18 @@ mod tests {
                 "overflow" => unsafe { ptr.add(carrier_size) },
                 other => panic!("unknown guard-page probe {other}"),
             };
+            assert!(
+                reservation.contains(&fault.addr()),
+                "{probe} address is outside the guarded reservation"
+            );
+            eprintln!("{READY_MARKER}:{probe}");
+            std::io::stderr()
+                .flush()
+                .expect("flush guard-page readiness marker");
             // SAFETY: the child process deliberately verifies that this
             // inaccessible address terminates execution.
             unsafe { fault.write_volatile(0x5a) };
+            eprintln!("{SURVIVED_MARKER}:{probe}");
         }
     }
 

@@ -514,6 +514,12 @@ impl BlockSlot {
         self.range.len()
     }
 
+    /// Returns the complete virtual reservation retained for this slot.
+    #[cfg(test)]
+    pub(super) fn reservation_address_range(&self) -> std::ops::Range<usize> {
+        self.range.reservation_address_range()
+    }
+
     /// Derives a checked immutable pointer from this slot's provenance root.
     ///
     /// # Safety

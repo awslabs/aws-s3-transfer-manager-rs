@@ -1,0 +1,74 @@
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * *"
+
+name: Scheduled fuzzing
+
+concurrency:
+  group: buffer-pool-fuzz
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  rust_nightly: nightly-2026-09-10
+  # FIXME: Remove `-Adeprecated` when MSRV reaches 1.95 and
+  # Atomic*::fetch_update can be replaced by try_update.
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: scheduled fuzz campaigns
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install llvm
+        run: sudo apt-get install -y llvm
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Restore evolving corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/fuzz_targets/**', 'aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/test_util/operation_sequence.rs') }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-
+      - name: Run scheduled campaigns
+        run: .github/scripts/run-fuzz-targets.sh campaign
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Check fuzz lock is unchanged
+        if: always()
+        run: git diff --exit-code -- fuzz/Cargo.lock
+      - name: Save evolving corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/fuzz_targets/**', 'aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/test_util/operation_sequence.rs') }}-${{ github.run_id }}
+      - name: Upload corpus and crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduled-fuzz-${{ github.run_id }}
+          path: |
+            fuzz/corpus
+            fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30

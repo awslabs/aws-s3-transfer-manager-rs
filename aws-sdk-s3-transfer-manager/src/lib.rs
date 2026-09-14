@@ -163,6 +163,16 @@ pub mod memory {
     pub use crate::types::{MemoryBudgetConfig, MemoryConfig};
 }
 
+/// Test-only entry points used by external fuzz targets.
+#[cfg(s3_tm_fuzz)]
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Runs one encoded buffer-pool operation sequence.
+    pub fn buffer_pool_operations(data: &[u8]) {
+        crate::runtime::buffer_pool::run_fuzz_input(data);
+    }
+}
+
 /// HTTP related components and utils
 pub(crate) mod http;
 
