@@ -1021,9 +1021,12 @@ fn report_whole_part_preflight(
     assert!(total != 0, "whole-part preflight produced no acquisitions");
     let contiguous_percent = preflight.contiguous as f64 * 100.0 / total as f64;
     let acquisition_ns = preflight.acquisition_time.as_nanos() / u128::from(preflight.acquisitions);
+    let prepared_bytes = churn.state.pool.metrics().prepared_capacity_bytes();
+    let occupancy_percent = CHURN_CAPACITY_BYTES as f64 * 100.0 / prepared_bytes as f64;
     eprintln!(
         "buffer-pool whole-part topology: part={part_name} schedule={} order={} \
          acquisitions={} acquisition_mean_ns={acquisition_ns} \
+         prepared_bytes={prepared_bytes} occupancy_percent={occupancy_percent:.2} \
          contiguous={} segmented={} contiguous_percent={contiguous_percent:.2}",
         schedule.benchmark_name(order),
         order.name(),
