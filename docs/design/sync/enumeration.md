@@ -58,7 +58,7 @@ opposite actions, and collapsing them is how a sync deletes files it failed to l
 exclusion, filtering and paging inside, because a consumer that had to remember to do them would
 eventually forget.
 
-The specification holds 72 requirements in twelve categories. The table below covers the three
+The specification holds 81 requirements in twelve categories. The table below covers the three
 that describe this layer — **FR-Root**, **FR-Enum** and **FR-Filter** — all 28 of them, in spec
 order.
 
@@ -90,7 +90,7 @@ after the table.
 | FR-Root-8 a key resolving outside the root | kept open | settled elsewhere; nothing here forecloses it |
 | FR-Enum-1 list both roots through | covered | only filters reduce what gets listed |
 | FR-Enum-2 folder markers invisible | covered | dropped in the stream, so no filter can bring them back, pinned by test |
-| FR-Enum-3 skip one entry, and say which kind | covered | `WalkErrorSeverity`, four warning kinds, reported on request |
+| FR-Enum-3 skip one entry, and say which kind | covered | `Severity`, four warning kinds, reported on request |
 | FR-Enum-4 symlinks off by default | inherited | `follow_symlinks` unchanged, beyond skipping unused cycle state |
 | FR-Enum-5 a time the platform cannot represent | partly | `last_modified_secs` is an `Option`; never-skip is the comparison's |
 | FR-Enum-6 keys compared byte for byte | covered | no folding, no normalizing, pinned by test |
@@ -130,17 +130,17 @@ under `io::key*` is new.
                report_untransferable
    S3Walk      + prefix()                    KeyStream             the trait they both implement
    DirEntry    one path plus a shared root   KeyFilter, Rule       include and exclude rules
-   WalkError   + severity(), four kinds      WalkErrorSeverity     fatal, failure, warning
+   WalkError   + severity(), four kinds      Severity              ends the run, failure, warning
                                              derive_object_key     path or key → relative key
                                              strip_key_prefix
 ```
 
 Five of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
-the switch that turns on S3 ordering; `WalkErrorSeverity`; `WalkErrorKind::severity()` and
+the switch that turns on S3 ordering; `Severity`; `WalkErrorKind::severity()` and
 `WalkError::severity()`; and four new `WalkErrorKind` variants — `SpecialFile`,
 `SymlinkNotFollowed`, `NonUtf8Name`, `DirectoryUnreadable`. `WalkErrorKind` was already
-`#[non_exhaustive]`, so adding variants breaks nobody, and `WalkErrorSeverity` is
-`#[non_exhaustive]` for the same reason.
+`#[non_exhaustive]`, so adding variants breaks nobody, and `Severity` is `#[non_exhaustive]` for
+the same reason.
 
 Everything in `io::key*` is crate-private, so `Entry`, `EntryMeta` and `KeyStream` can still
 change shape without breaking a caller.
@@ -176,14 +176,14 @@ failure, because the consumer needs the difference to suppress the right deletes
 and an unreadable directory looks like one skipped file, which is how objects under a directory
 nobody could read get deleted.
 
-**D6. Errors classify into three levels: fatal, entry failure, entry warning.** A warning must
-never become a failure under any policy. FR-Fail-9 requires one failure policy for the whole run
-and then names the exception this level exists for: a device, FIFO or socket "is a warning under
-either policy". Adding the third level later means reclassifying kinds that callers already match
-on.
+**D6. Errors classify into three levels: ends the run, entry failure, entry warning.** A warning
+must never become a failure under any policy. FR-Fail-9 requires one failure policy for the whole
+run and then names the exception this level exists for: a device, FIFO or socket "is a warning
+under either policy". Adding the third level later means reclassifying kinds that callers already
+match on.
 
 ```
-   fatal          the walk never started      SourceUnreadable, NotADirectory, Service
+   ends the run   nothing is left to do       SourceUnreadable, NotADirectory, Service
    entry failure  should have been readable   Io, PermissionDenied, DirectoryUnreadable,
                                               BrokenSymlink
    entry warning  no entry describes it       SpecialFile, SymlinkNotFollowed, NonUtf8Name,
@@ -196,9 +196,9 @@ symlink pointing at nothing" are one group, and a device, FIFO or socket the oth
 link is a read that failed; the walk would have produced an entry had the target been there.
 
 **D7. Reporting a warning is opt-in, because the walkers already have callers.** `upload_objects`
-records every non-fatal walk error as a failure, and aborts the whole transfer on one under its
-strictest policy. A walk that began reporting sockets unbidden would therefore have failed uploads
-with nothing wrong with them.
+records every walk error that does not end the run as a failure, and aborts the whole transfer on
+one under its strictest policy. A walk that began reporting sockets unbidden would therefore have
+failed uploads with nothing wrong with them.
 
 Two ways out of that: teach `upload_objects` to recognise a warning, or let the caller ask for the
 reports. FR-Enum-3 is a sync requirement, so the second matches who wants the information.
@@ -353,7 +353,7 @@ the matching key gets deleted.
 Three levels, because the consumer treats them differently:
 
 ```
-   fatal          → the walk never got going; there is no pile at all
+   ends the run   → the walk never got going; there is no pile at all
    entry failure  → this one key is unknown; the failure policy decides whether to continue
    entry warning  → something is at this key and no entry describes it; never a failure
 ```

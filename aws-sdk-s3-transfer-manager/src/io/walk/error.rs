@@ -5,34 +5,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// How a [`WalkError`] bears on the walk and on whoever consumes it.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalkErrorSeverity {
-    /// The walk cannot proceed and produces no further entries.
-    Fatal,
-    /// One entry could not be read. Whether this ends the caller's work is the
-    /// caller's decision; the walk itself continues.
-    EntryFailure,
-    /// Something occupies this path that a walk can never yield — a socket, a
-    /// device, a directory reached by a link that loops back on itself. Nothing
-    /// failed, and no retry or setting would produce an entry here. Reported so a
-    /// consumer knows the path is occupied even though no entry describes it.
-    EntryWarning,
-}
+use crate::error::Severity;
 
 /// Classifies a [`WalkError`].
 ///
-/// Each kind has a fixed severity; see [`WalkErrorKind::severity`].
+/// Each kind has a fixed [`Severity`]; see [`WalkErrorKind::severity`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
     /// Source root cannot be opened for reading (I/O or permission error
-    /// on the initial path). Fatal: the walk never gets off the ground.
+    /// on the initial path). Ends the run: the walk never gets off the ground.
     SourceUnreadable,
-    /// Source root exists but is not a directory. Fatal.
+    /// Source root exists but is not a directory. Ends the run.
     NotADirectory,
-    /// S3 service error from `ListObjectsV2` or related call. Fatal.
+    /// S3 service error from `ListObjectsV2` or related call. Ends the run.
     Service,
     /// I/O error reading a subdirectory or entry during the walk.
     /// The affected entry is skipped and the walk continues.
@@ -66,32 +52,33 @@ pub enum WalkErrorKind {
 
 impl WalkErrorKind {
     /// How an error of this kind bears on the walk.
-    pub fn severity(&self) -> WalkErrorSeverity {
+    pub fn severity(&self) -> Severity {
         match self {
             WalkErrorKind::SourceUnreadable
             | WalkErrorKind::NotADirectory
-            | WalkErrorKind::Service => WalkErrorSeverity::Fatal,
+            | WalkErrorKind::Service => Severity::EndsRun,
             WalkErrorKind::Io
             | WalkErrorKind::PermissionDenied
             | WalkErrorKind::DirectoryUnreadable
-            | WalkErrorKind::BrokenSymlink => WalkErrorSeverity::EntryFailure,
+            | WalkErrorKind::BrokenSymlink => Severity::EntryFailure,
             WalkErrorKind::SymlinkCycle
             | WalkErrorKind::SpecialFile
             | WalkErrorKind::SymlinkNotFollowed
-            | WalkErrorKind::NonUtf8Name => WalkErrorSeverity::EntryWarning,
+            | WalkErrorKind::NonUtf8Name => Severity::EntryWarning,
         }
     }
 
-    /// Whether an error of this kind terminates the walk.
+    /// Whether an error of this kind terminates the walk, which is
+    /// [`Severity::EndsRun`] seen from the walk's side.
     pub fn is_fatal(&self) -> bool {
-        self.severity() == WalkErrorSeverity::Fatal
+        self.severity() == Severity::EndsRun
     }
 }
 
 /// An error encountered during a directory walk.
 ///
 /// Wraps an optional path, a [`WalkErrorKind`] classifier, and a source
-/// error. Fatality is determined by [`kind`](Self::kind); see
+/// error. Its [`Severity`] follows from [`kind`](Self::kind); see
 /// [`is_fatal`](Self::is_fatal).
 #[derive(Debug)]
 pub struct WalkError {
@@ -116,8 +103,8 @@ impl WalkError {
         self.kind
     }
 
-    /// How this error bears on the walk. Equivalent to `self.kind().severity()`.
-    pub fn severity(&self) -> WalkErrorSeverity {
+    /// How this error bears on the run. Equivalent to `self.kind().severity()`.
+    pub fn severity(&self) -> Severity {
         self.kind.severity()
     }
 
@@ -218,11 +205,11 @@ mod tests {
 
     #[test]
     fn test_severity_by_kind() {
-        use WalkErrorSeverity::*;
+        use Severity::*;
         let cases = [
-            (WalkErrorKind::SourceUnreadable, Fatal),
-            (WalkErrorKind::NotADirectory, Fatal),
-            (WalkErrorKind::Service, Fatal),
+            (WalkErrorKind::SourceUnreadable, EndsRun),
+            (WalkErrorKind::NotADirectory, EndsRun),
+            (WalkErrorKind::Service, EndsRun),
             (WalkErrorKind::Io, EntryFailure),
             (WalkErrorKind::PermissionDenied, EntryFailure),
             (WalkErrorKind::DirectoryUnreadable, EntryFailure),
@@ -236,7 +223,7 @@ mod tests {
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.severity(), expected, "kind={kind:?}");
-            assert_eq!(kind.is_fatal(), expected == Fatal, "kind={kind:?}");
+            assert_eq!(kind.is_fatal(), expected == EndsRun, "kind={kind:?}");
         }
     }
 }

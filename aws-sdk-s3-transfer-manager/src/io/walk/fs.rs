@@ -995,8 +995,8 @@ impl FsWalk {
 
 #[cfg(test)]
 mod tests {
-    use super::super::error::WalkErrorSeverity;
     use super::*;
+    use crate::error::Severity;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind(), WalkErrorKind::SymlinkNotFollowed);
-        assert_eq!(errors[0].severity(), WalkErrorSeverity::EntryWarning);
+        assert_eq!(errors[0].severity(), Severity::EntryWarning);
         assert_eq!(
             errors[0].path().unwrap(),
             dir.path().join("link.txt").as_path()
@@ -1418,7 +1418,7 @@ mod tests {
         assert_eq!(entries[0].relative_path(), Path::new("regular.txt"));
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind(), WalkErrorKind::SpecialFile);
-        assert_eq!(errors[0].severity(), WalkErrorSeverity::EntryWarning);
+        assert_eq!(errors[0].severity(), Severity::EntryWarning);
         assert_eq!(
             errors[0].path().unwrap(),
             dir.path().join("socket.sock").as_path()
