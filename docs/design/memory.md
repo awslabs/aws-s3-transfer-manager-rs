@@ -3432,6 +3432,8 @@ lookup can establish presentation adjacency but cannot recover physical-return a
 
 | Target  | Stable reservation                         | Prepare                                    | Deactivate                   | Discard                 |
 | ------- | ------------------------------------------ | ------------------------------------------ | ---------------------------- | ----------------------- |
+| Android | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_DONTNEED`         |
+| FreeBSD | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_FREE`             |
 | Linux   | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_DONTNEED`         |
 | macOS   | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_FREE`             |
 | Windows | `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)` | `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)` | `VirtualFree(MEM_DECOMMIT)`  | Same decommit operation |
@@ -3443,22 +3445,29 @@ requires a later successful whole-range transition before the block can reenter 
 
 Windows preparation consumes system commit capacity for each newly required whole block. Starting
 without prepared capacity, a grant commits enough blocks to cover its complete post-grant admission
-floor and may fail before the grant is published. Linux and macOS writable protection does not
-provide the same commitment to later residency.
+floor and may fail before the grant is published. Writable protection on the Unix backends does
+not provide the same commitment to later residency.
 
 Discard runs only after the range is inaccessible. Failure may retain backing but cannot make the
 block claimable. Retry and preparation serialize so a delayed discard cannot affect a revived
 block. Registered, wired, mixed-policy, or completion-owned blocks remain trim-ineligible until
 their capability owner completes teardown.
 
-The Linux operations follow [mmap(2)][mmap2], [mprotect(2)][mprotect2], and
-[madvise(2)][madvise2]. Windows reservation, commit, and decommit follow
+The Android and Linux operations follow [mmap(2)][mmap2], [mprotect(2)][mprotect2], and
+[madvise(2)][madvise2]. FreeBSD and macOS use the same mapping and protection lifecycle with the
+target-specific `MADV_FREE` contract. Windows reservation, commit, and decommit follow
 [VirtualAlloc][virtual-alloc] and [VirtualFree][virtual-free].
 
 Qualification for each supported target includes runtime page and allocation geometry, stable
 address ownership, successful prepare/deactivate/revive, commit or overcommit failure, discard
 failure, and process destruction with escaped owners already absent. RSS or working-set reduction
 is an operational observation, not proof of address ownership or inaccessibility.
+
+Required native qualification covers GNU Linux on x86_64 and arm64, musl Linux on x86_64 and
+arm64, macOS on x86_64 and arm64, Windows MSVC on x86_64, and FreeBSD 14.4 on x86_64. Android API
+35 executes the library tests on x86_64 emulators with asserted 4 KiB and 16 KiB runtime pages. The
+Android arm64 test binary is link-qualified but not runtime-qualified until an arm64 device or
+emulator executes the same lifecycle.
 
 ## Appendix D: Verification
 
@@ -3476,7 +3485,7 @@ section; one property may discharge several contracts.
 | A5         | A grant never absorbs an existing uncovered charge                                | Transition property test with repeated grant and close | Recompute uncovered charges from the new envelope                 |
 | A7         | Grant, cancellation, and poll produce one terminal waiter result                  | Loom over FIFO and wait slot                           | Release the slot during preparation and publish after `Taken`     |
 | A7         | Waker reentry observes the terminal result without lock nesting                   | Loom with waker reentry                                | Invoke the waker before publication or while admission is locked  |
-| A7         | Idle-only admission grants at most one request at a time                          | State-machine property test                            | Gate idle escape on configured headroom instead of planned demand |
+| A7         | An envelope larger than configured capacity fails before FIFO insertion           | Boundary, property, and public API tests               | Queue the impossible head or grant it through an idle escape      |
 | A6         | Uncovered-charge return cannot strand an eligible waiter                          | Loom over drain signal, packed return, enqueue, and FIFO | Skip an unarmed repayment epoch or weaken poll-arm ordering        |
 | A2         | Published shortfall preserves the floor during unlocked claim                     | Composed Loom over debit, trim, claim, and rollback    | Unlock before charge publication or floor preparation             |
 | A3, A6     | Post-unlock shortfall rollback cannot strand an eligible waiter                   | Loom over rollback, enqueue, and FIFO drain            | Skip admission drain after rollback repays an uncovered charge    |
@@ -3546,7 +3555,7 @@ section; one property may discharge several contracts.
 | C2         | Cleanup retry cannot race preparation or revived access                | Concurrency test with injected protection and discard failures            | Run discard without the slot mapping lock                  |
 | C1         | Capacity detection honors process and container limits                 | Platform tests for physical memory, cgroup limits, and explicit overrides | Ignore the effective process or container limit            |
 | P3         | Commit-accounting targets prepare through the floor before grant       | Native grant test with injected commit exhaustion                         | Publish a grant before whole-block commit                  |
-| P7         | Supported mapping backends preserve the platform contract              | Native probe matrix for Linux, macOS, and Windows                         | Treat a failed protection or discard call as success       |
+| P7         | Supported mapping backends preserve the platform contract              | Required native matrix on Linux, macOS, Windows, FreeBSD, and Android x86_64; Android arm64 link qualification | Treat a failed protection or discard call as success       |
 | C2, C5     | Maintenance failure leaves ordinary operation valid and is reported    | Thread-start and cleanup-failure injection                                | Disable maintenance without recording degraded reclamation |
 | C3         | Manager shutdown preserves externally owned pool state                 | Integration test with shared pool, reservation, and escaped bytes         | Close the shared pool during manager shutdown              |
 | C2, C3     | Worker wait retains no pool owner; final upgrade may own the pool      | Deterministic wait and final-owner lifetime tests                         | Wait with pool `Arc` or join the worker from itself        |
