@@ -1281,6 +1281,7 @@ mod tests {
     #[cfg(all(
         not(miri),
         any(
+            target_os = "android",
             target_os = "freebsd",
             target_os = "linux",
             target_os = "macos",
