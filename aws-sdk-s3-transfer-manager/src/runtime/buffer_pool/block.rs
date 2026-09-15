@@ -974,6 +974,48 @@ impl BlockSlot {
         })
     }
 
+    /// Claims one run of consecutive fully free bitmap words.
+    ///
+    /// Returns no ownership unless the complete run is won. A collision rolls
+    /// back any word already won by this attempt.
+    pub(super) fn try_claim_word_run(
+        slot: &Arc<Self>,
+        start_word: usize,
+        word_limit: usize,
+        word_count: usize,
+    ) -> Result<BlockClaim, BlockError> {
+        if word_count == 0 {
+            return Err(BlockError::InvalidClaimCount);
+        }
+
+        let inspected_limit = slot
+            .bitmap_words()
+            .saturating_sub(start_word)
+            .min(word_limit);
+        if inspected_limit == 0 {
+            return Ok(BlockClaim::empty());
+        }
+        let Some(mut attempt) = BlockClaimAttempt::begin_with_capacity(slot, word_count)? else {
+            return Ok(BlockClaim {
+                provisional: None,
+                inspected_words: inspected_limit,
+            });
+        };
+        let (complete, inspected_words) =
+            attempt.take_word_run(start_word, inspected_limit, word_count);
+        if !complete {
+            drop(attempt);
+            return Ok(BlockClaim {
+                provisional: None,
+                inspected_words,
+            });
+        }
+        Ok(BlockClaim {
+            provisional: attempt.finish(),
+            inspected_words,
+        })
+    }
+
     /// Returns a set of bits from a gate-passed owner.
     ///
     /// Identity or ownership mismatch is fail-stop and clears no bits.
@@ -1345,6 +1387,52 @@ impl BlockClaimAttempt {
             }
         }
         (taken, inspected)
+    }
+
+    /// Claims `word_count` consecutive fully free bitmap words.
+    ///
+    /// A false result may retain words in this attempt; the caller must roll
+    /// the complete attempt back.
+    fn take_word_run(
+        &mut self,
+        start_word: usize,
+        word_limit: usize,
+        word_count: usize,
+    ) -> (bool, usize) {
+        let incarnation = self
+            .incarnation
+            .as_ref()
+            .expect("a claim attempt protects one incarnation");
+        let end_word = start_word
+            .saturating_add(word_limit)
+            .min(incarnation.in_use.len());
+        let scan_start = start_word.min(end_word);
+        let mut run_start = scan_start;
+        let mut inspected = 0;
+
+        for word_index in scan_start..end_word {
+            inspected += 1;
+            let fully_free = bitmap_word_mask(self.slot.geometry, word_index) == u64::MAX
+                && incarnation.in_use[word_index].load(Ordering::Relaxed) == 0;
+            if !fully_free {
+                run_start = word_index + 1;
+                continue;
+            }
+            if word_index + 1 - run_start < word_count {
+                continue;
+            }
+            for index in run_start..=word_index {
+                if incarnation.in_use[index]
+                    .compare_exchange(0, u64::MAX, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_err()
+                {
+                    return (false, inspected);
+                }
+                record_won(&mut self.won, index, u64::MAX);
+            }
+            return (true, inspected);
+        }
+        (false, inspected)
     }
 
     /// Claims until each word is observed full or `count` carriers are won.
@@ -2067,6 +2155,56 @@ mod tests {
             vec![128, 129]
         );
         drop(carriers);
+        assert_eq!(slot.live_carriers(), 0);
+    }
+
+    #[test]
+    fn word_run_claim_skips_fragmented_prefix() {
+        let (slot, _) = prepared_slot(192);
+        let mut occupied = BlockSlot::try_claim(&slot, CarrierCount::new(192))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        drop(occupied.drain(64..128).collect::<Vec<_>>());
+
+        let claim = BlockSlot::try_claim_word_run(&slot, 0, 3, 1).unwrap();
+
+        assert_eq!(claim.inspected_words(), 2);
+        let run = claim.into_provisional().unwrap().into_carriers().unwrap();
+        assert_eq!(run.len(), 64);
+        assert_eq!(run.first().unwrap().carrier_index(), 64);
+        assert_eq!(run.last().unwrap().carrier_index(), 127);
+
+        drop(run);
+        drop(occupied);
+        assert_eq!(slot.live_carriers(), 0);
+    }
+
+    #[test]
+    fn word_run_miss_leaves_fragmented_capacity_available() {
+        let (slot, _) = prepared_slot(192);
+        let mut occupied = BlockSlot::try_claim(&slot, CarrierCount::new(192))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        drop(occupied.drain(128..192).collect::<Vec<_>>());
+        drop(occupied.drain(0..64).collect::<Vec<_>>());
+
+        let claim = BlockSlot::try_claim_word_run(&slot, 0, 3, 2).unwrap();
+
+        assert_eq!(claim.inspected_words(), 3);
+        assert!(claim.into_provisional().is_none());
+        let fragmented = BlockSlot::try_claim(&slot, CarrierCount::new(128))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        assert_eq!(fragmented.len(), 128);
+
+        drop(fragmented);
+        drop(occupied);
         assert_eq!(slot.live_carriers(), 0);
     }
 
@@ -2899,6 +3037,54 @@ mod loom_tests {
             assert_eq!(slot.live_carriers(), 1);
             drop(first);
             drop(second);
+            assert_eq!(slot.live_carriers(), 0);
+        });
+    }
+
+    #[test]
+    fn word_run_collision_rolls_back_every_partial_win() {
+        loom::model(|| {
+            let geometry = PoolGeometry::new(4096, 128 * 4096, 4096).unwrap();
+            let slot = Arc::new(BlockSlot::new(0, geometry).unwrap());
+            let mut prepared = CarrierCount::ZERO;
+            slot.prepare(&mut prepared).unwrap();
+
+            let run_slot = Arc::clone(&slot);
+            let run = thread::spawn(move || {
+                BlockSlot::try_claim_word_run(&run_slot, 0, 2, 2)
+                    .unwrap()
+                    .into_provisional()
+                    .map(ProvisionalBits::into_carriers)
+                    .transpose()
+                    .unwrap()
+            });
+            let tail_slot = Arc::clone(&slot);
+            let tail = thread::spawn(move || {
+                BlockSlot::try_claim_words(&tail_slot, 1, 1, CarrierCount::new(64))
+                    .unwrap()
+                    .into_provisional()
+                    .map(ProvisionalBits::into_carriers)
+                    .transpose()
+                    .unwrap()
+            });
+
+            let run = run.join().unwrap();
+            let tail = tail.join().unwrap();
+            match (&run, &tail) {
+                (Some(run), None) => {
+                    assert_eq!(run.len(), 128);
+                    assert_eq!(slot.live_carriers(), 128);
+                }
+                (None, Some(tail)) => {
+                    assert_eq!(tail.len(), 64);
+                    assert!(tail.iter().all(|carrier| carrier.carrier_index() >= 64));
+                    assert_eq!(slot.live_carriers(), 64);
+                }
+                _ => panic!("overlapping whole-word claims published an invalid result"),
+            }
+
+            drop(run);
+            drop(tail);
             assert_eq!(slot.live_carriers(), 0);
         });
     }
