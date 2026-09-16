@@ -1873,7 +1873,7 @@ mod tests {
     // =========================================================================
 
     use crate::scheduler::transfer::mock::{
-        CompositeMock, CountedWork, DispatchCounter, PanickingCompositeMock,
+        CompositeMock, CountedWork, DispatchCounter, DispatchTrace, PanickingCompositeMock,
         SingleTicketCompositeMock,
     };
 
@@ -3040,8 +3040,21 @@ mod tests {
     async fn impl_single_ticket_two_composites_fair_share(handle: Arc<Handle>) {
         let scheduler = &handle.scheduler;
 
-        let c1_counter = DispatchCounter::new();
-        let c2_counter = DispatchCounter::new();
+        const C1: u8 = 1;
+        const C2: u8 = 2;
+        // Two thousand dispatches per tree leave room for the fixed fairness
+        // sample after asymmetric managed-runtime startup without reaching
+        // either tree's finite-work tail.
+        const TOTAL_CHILDREN: u64 = 400;
+        const WORK_PER_CHILD: u64 = 5;
+        const WARMUP_PER_COMPOSITE: usize = 100;
+        const SAMPLE_DISPATCHES: usize = 1200;
+
+        let work_per_composite = TOTAL_CHILDREN * WORK_PER_CHILD;
+        let total_work = 2 * work_per_composite;
+        let trace = DispatchTrace::new(total_work as usize);
+        let c1_counter = trace.counter(C1);
+        let c2_counter = trace.counter(C2);
 
         let c1_id = TransferId {
             id: 1,
@@ -3052,20 +3065,19 @@ mod tests {
             parent: None,
         };
 
-        let total_children = 200;
         let c1 = SingleTicketCompositeMock::new(
             c1_id,
             handle.clone(),
-            total_children,
-            5,       // work_per_child
+            TOTAL_CHILDREN,
+            WORK_PER_CHILD,
             100_000, // memory_cap
             c1_counter.clone(),
         );
         let c2 = SingleTicketCompositeMock::new(
             c2_id,
             handle.clone(),
-            total_children,
-            5,       // work_per_child
+            TOTAL_CHILDREN,
+            WORK_PER_CHILD,
             100_000, // memory_cap
             c2_counter.clone(),
         );
@@ -3073,41 +3085,66 @@ mod tests {
         scheduler.enqueue_transfer(Box::new(c1));
         scheduler.enqueue_transfer(Box::new(c2));
 
-        // Exclude initial enqueue skew from the sample. On slower managed
-        // runtimes, C1 can dispatch a measurable prefix before C2 becomes
-        // runnable even though their steady-state shares are equal.
-        const WARMUP_PER_COMPOSITE: u64 = 100;
-        let total_work = 2 * total_children * 5;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if c1_counter.count() >= WARMUP_PER_COMPOSITE
-                    && c2_counter.count() >= WARMUP_PER_COMPOSITE
-                {
+                let completed = c1_counter.count() + c2_counter.count();
+                if completed >= total_work && scheduler.is_idle() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("both composites should reach the fairness warmup");
+        .expect("both composites should complete");
 
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let sampled = c1_counter.count().saturating_sub(WARMUP_PER_COMPOSITE)
-                    + c2_counter.count().saturating_sub(WARMUP_PER_COMPOSITE);
-                let total = c1_counter.count() + c2_counter.count();
-                if sampled >= 1200 || total >= total_work {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(c1_counter.count(), work_per_composite);
+        assert_eq!(c2_counter.count(), work_per_composite);
+
+        // The managed runtime can dispatch C1 while the test thread enqueues
+        // C2. Locate the exact execution where both trees have completed the
+        // warmup, then measure a fixed window after that one-sided prefix.
+        let dispatches = trace.snapshot();
+        assert_eq!(dispatches.len(), total_work as usize);
+        let mut c1_seen = 0;
+        let mut c2_seen = 0;
+        let mut sample_start = None;
+        let mut overlap_end = None;
+        for (index, label) in dispatches.iter().copied().enumerate() {
+            match label {
+                C1 => c1_seen += 1,
+                C2 => c2_seen += 1,
+                other => panic!("unknown dispatch trace label {other}"),
             }
-        })
-        .await
-        .expect("should reach the steady-state fairness sampling window");
+            if sample_start.is_none()
+                && c1_seen >= WARMUP_PER_COMPOSITE
+                && c2_seen >= WARMUP_PER_COMPOSITE
+            {
+                sample_start = Some(index + 1);
+            }
+            if overlap_end.is_none()
+                && (c1_seen == work_per_composite as usize
+                    || c2_seen == work_per_composite as usize)
+            {
+                // This dispatch consumed one tree's final work item. Later
+                // entries cannot measure fair competition between two
+                // runnable trees.
+                overlap_end = Some(index + 1);
+            }
+        }
 
-        let c1_count = c1_counter.count().saturating_sub(WARMUP_PER_COMPOSITE);
-        let c2_count = c2_counter.count().saturating_sub(WARMUP_PER_COMPOSITE);
-        let total = c1_count + c2_count;
+        let sample_start = sample_start.expect("both composites should reach the warmup");
+        let overlap_end = overlap_end.expect("one composite should finish");
+        let sample_end = sample_start + SAMPLE_DISPATCHES;
+        assert!(
+            sample_end <= overlap_end,
+            "only {} jointly runnable dispatches remain after the warmup; expected \
+             {SAMPLE_DISPATCHES}",
+            overlap_end.saturating_sub(sample_start)
+        );
+        let sample = &dispatches[sample_start..sample_end];
+        let c1_count = sample.iter().filter(|&&label| label == C1).count() as u64;
+        let c2_count = sample.iter().filter(|&&label| label == C2).count() as u64;
+        let total = SAMPLE_DISPATCHES as u64;
         let fair_share = total as f64 / 2.0;
         let tolerance = fair_share * 0.10;
 

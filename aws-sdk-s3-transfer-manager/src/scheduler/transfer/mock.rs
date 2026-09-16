@@ -7,7 +7,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -234,17 +234,91 @@ where
 /// Each child's `execute` increments this counter, allowing tests to observe
 /// how many dispatches a particular tree has received.
 #[derive(Debug, Clone)]
-pub(crate) struct DispatchCounter(Arc<AtomicU64>);
+pub(crate) struct DispatchCounter {
+    count: Arc<AtomicU64>,
+    trace: Option<(u8, Arc<DispatchTrace>)>,
+}
 
 impl DispatchCounter {
     /// Create a new zero-valued counter.
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(0)))
+        Self {
+            count: Arc::new(AtomicU64::new(0)),
+            trace: None,
+        }
     }
 
     /// Current count of dispatches observed.
     pub(crate) fn count(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.count.load(Ordering::SeqCst)
+    }
+
+    fn increment(&self) {
+        if let Some((label, trace)) = &self.trace {
+            trace.record(*label);
+        }
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Ordered execution trace shared by a bounded set of dispatch counters.
+///
+/// Counters reserve trace slots atomically, so concurrent workers can record
+/// their execution order without adding a mutex to the scheduler hot path.
+/// The caller must wait for the corresponding counters before taking a
+/// snapshot; counters publish their trace entry before incrementing.
+#[derive(Debug)]
+pub(crate) struct DispatchTrace {
+    next: AtomicUsize,
+    entries: Box<[AtomicU8]>,
+}
+
+impl DispatchTrace {
+    /// Create a trace that can hold exactly `capacity` executions.
+    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+        let entries = (0..capacity)
+            .map(|_| AtomicU8::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Arc::new(Self {
+            next: AtomicUsize::new(0),
+            entries,
+        })
+    }
+
+    /// Create a counter whose executions are recorded with `label`.
+    pub(crate) fn counter(self: &Arc<Self>, label: u8) -> DispatchCounter {
+        assert_ne!(label, 0, "zero is reserved for unwritten trace slots");
+        DispatchCounter {
+            count: Arc::new(AtomicU64::new(0)),
+            trace: Some((label, Arc::clone(self))),
+        }
+    }
+
+    /// Return all executions recorded before the caller's completion barrier.
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        let len = self.next.load(Ordering::SeqCst);
+        assert!(
+            len <= self.entries.len(),
+            "dispatch trace recorded {len} entries into capacity {}",
+            self.entries.len()
+        );
+        self.entries[..len]
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let label = entry.load(Ordering::SeqCst);
+                assert_ne!(label, 0, "dispatch trace slot {index} was not published");
+                label
+            })
+            .collect()
+    }
+
+    fn record(&self, label: u8) {
+        let index = self.next.fetch_add(1, Ordering::SeqCst);
+        if let Some(entry) = self.entries.get(index) {
+            entry.store(label, Ordering::SeqCst);
+        }
     }
 }
 
@@ -296,7 +370,7 @@ impl MockStateMachine for CountedWork {
         _work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
-            self.counter.0.fetch_add(1, Ordering::SeqCst);
+            self.counter.increment();
             self.completed.fetch_add(1, Ordering::SeqCst);
             WorkOutcome::Success { data: None }
         })
@@ -354,7 +428,7 @@ impl MockStateMachine for BlockingWork {
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(async move {
             self.notify.notified().await;
-            self.counter.0.fetch_add(1, Ordering::SeqCst);
+            self.counter.increment();
             self.completed.fetch_add(1, Ordering::SeqCst);
             WorkOutcome::Success { data: None }
         })
@@ -518,7 +592,7 @@ impl Transfer for ChildMockTransfer {
             if self.ctx.is_cancelled() {
                 return WorkOutcome::Cancelled;
             }
-            self.counter.0.fetch_add(1, Ordering::SeqCst);
+            self.counter.increment();
             // Mutator pattern: lock → mutate → unlock → try_wake
             {
                 let _guard = self.state_lock.lock().unwrap();

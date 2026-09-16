@@ -121,8 +121,14 @@ case "$mode" in
         system_image="system-images;android-${android_api_level};${system_image_target};${abi}"
         avd_name="s3-tm-${android_api_level}-${system_image_target}-${abi}"
         android_avd_home=${ANDROID_AVD_HOME:-"$HOME/.android/avd"}
+        emulator_bin="$ANDROID_HOME/emulator/emulator"
         emulator_log=${RUNNER_TEMP:-/tmp}/s3-tm-android-emulator.log
         emulator_serial=emulator-5554
+
+        if [[ ! -x "$emulator_bin" ]]; then
+            echo "Android emulator binary is missing or not executable: $emulator_bin" >&2
+            exit 1
+        fi
 
         # Ubuntu 24.04 runners can give avdmanager and emulator different
         # implicit homes through XDG_CONFIG_HOME. Pin both tools to one
@@ -135,7 +141,7 @@ case "$mode" in
             --package "$system_image" \
             --device pixel_6
 
-        available_avds=$(emulator -list-avds)
+        available_avds=$("$emulator_bin" -list-avds)
         if ! grep -Fxq "$avd_name" <<<"$available_avds"; then
             echo "Android emulator cannot find newly created AVD '$avd_name'" >&2
             printf 'Available AVDs:\n%s\n' "$available_avds" >&2
@@ -146,7 +152,7 @@ case "$mode" in
             sudo chmod 666 /dev/kvm
         fi
 
-        emulator -avd "$avd_name" \
+        "$emulator_bin" -avd "$avd_name" \
             -port 5554 \
             -no-window \
             -no-audio \
