@@ -1105,13 +1105,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_preallocation_fails_only_for_storage_exhaustion() {
-        assert!(preallocation_failure_is_fatal(
+        assert!(super::preallocation_failure_is_fatal(
             &std::io::Error::from_raw_os_error(libc::ENOSPC)
         ));
-        assert!(preallocation_failure_is_fatal(
+        assert!(super::preallocation_failure_is_fatal(
             &std::io::Error::from_raw_os_error(libc::EDQUOT)
         ));
-        assert!(!preallocation_failure_is_fatal(
+        assert!(!super::preallocation_failure_is_fatal(
             &std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
         ));
     }
