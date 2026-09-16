@@ -144,7 +144,14 @@ jobs:
 
       - name: Run workspace tests
         run: |
-          cargo nextest run --locked --workspace --no-fail-fast
+          nextest_args=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # Several integration tests each create a local server and a
+            # concurrent transfer. Running those test processes in parallel can
+            # exhaust macOS socket buffers without increasing product coverage.
+            nextest_args+=(--test-threads 1)
+          fi
+          cargo nextest run --locked --workspace --no-fail-fast "${nextest_args[@]}"
           cargo test --locked --doc --workspace --no-fail-fast
 
   e2e:
@@ -208,8 +215,11 @@ jobs:
             "rust:${rust_min}-alpine" \
             sh -euxc '
               apk add --no-cache build-base cmake git linux-headers ninja perl pkgconf
-              cargo test --locked --workspace --no-fail-fast
-              cargo test --locked --doc --workspace --no-fail-fast
+              adduser -D -h /tmp/tmtest tmtest
+              mkdir -p /tmp/cargo /tmp/target
+              chown tmtest:tmtest /tmp/cargo /tmp/target
+              su tmtest -c "cargo test --locked --workspace --no-fail-fast"
+              su tmtest -c "cargo test --locked --doc --workspace --no-fail-fast"
             '
 
   android:
@@ -244,6 +254,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # The action's default still includes the retired `tools` package.
+          packages: platform-tools
       - name: Install Android packages
         run: |
           packages=(
@@ -475,8 +488,11 @@ jobs:
           # first report, and reject invalid C-string operations.
           ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
           # Retain additional access history for race reports and stop at the
-          # first diagnostic. Deadlock detection is not enabled.
-          TSAN_OPTIONS: halt_on_error=1:history_size=7
+          # first race diagnostic. Managed-runtime lifecycle tests can leave a
+          # finished Tokio blocking worker for process teardown, so thread-leak
+          # reporting remains disabled until their drain-and-join teardown is
+          # deterministic. Deadlock detection is not enabled.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
@@ -493,6 +509,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_nightly }}
+          components: clippy
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:

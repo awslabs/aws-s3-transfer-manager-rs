@@ -3073,22 +3073,40 @@ mod tests {
         scheduler.enqueue_transfer(Box::new(c1));
         scheduler.enqueue_transfer(Box::new(c2));
 
-        // Wait for enough dispatches to observe fairness.
+        // Exclude initial enqueue skew from the sample. On slower managed
+        // runtimes, C1 can dispatch a measurable prefix before C2 becomes
+        // runnable even though their steady-state shares are equal.
+        const WARMUP_PER_COMPOSITE: u64 = 100;
         let total_work = 2 * total_children * 5;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let total = c1_counter.count() + c2_counter.count();
-                if total >= 1200 || total >= total_work {
+                if c1_counter.count() >= WARMUP_PER_COMPOSITE
+                    && c2_counter.count() >= WARMUP_PER_COMPOSITE
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("should reach the fairness sampling window");
+        .expect("both composites should reach the fairness warmup");
 
-        let c1_count = c1_counter.count();
-        let c2_count = c2_counter.count();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let sampled = c1_counter.count().saturating_sub(WARMUP_PER_COMPOSITE)
+                    + c2_counter.count().saturating_sub(WARMUP_PER_COMPOSITE);
+                let total = c1_counter.count() + c2_counter.count();
+                if sampled >= 1200 || total >= total_work {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("should reach the steady-state fairness sampling window");
+
+        let c1_count = c1_counter.count().saturating_sub(WARMUP_PER_COMPOSITE);
+        let c2_count = c2_counter.count().saturating_sub(WARMUP_PER_COMPOSITE);
         let total = c1_count + c2_count;
         let fair_share = total as f64 / 2.0;
         let tolerance = fair_share * 0.10;
