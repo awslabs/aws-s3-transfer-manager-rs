@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 usage() {
     cat <<'EOF'
 Usage: run-android-tests.sh build <abi>
@@ -86,11 +88,11 @@ run_android_tests() {
     local runner_env
     runner_env=CARGO_TARGET_${rust_target^^}_RUNNER
     runner_env=${runner_env//-/_}
-    export "$runner_env=cargo ndk-runner"
+    export "$runner_env=$script_dir/android-test-runner.sh"
 
-    # cargo-ndk 4.1.2's `ndk-test` wrapper does not propagate the child
-    # `cargo test` status. Use Cargo's target runner so device failures remain
-    # visible to the required CI job.
+    # cargo-ndk 4.1.2's runners do not propagate device environment or the
+    # `ndk-test` child status. Use the repository runner so Android's trust
+    # store is visible and device failures remain visible to the CI job.
     cargo ndk --target "$abi" --platform "$android_api_level" \
         test --locked -p aws-sdk-s3-transfer-manager --lib
 }
@@ -222,7 +224,23 @@ case "$mode" in
             exit 1
         fi
 
+        android_cert_dirs=()
+        for cert_dir in \
+            /apex/com.android.conscrypt/cacerts \
+            /system/etc/security/cacerts
+        do
+            if adb -s "$emulator_serial" shell test -d "$cert_dir"; then
+                android_cert_dirs+=("$cert_dir")
+            fi
+        done
+        if (( ${#android_cert_dirs[@]} == 0 )); then
+            echo "Android system CA directories are unavailable" >&2
+            exit 1
+        fi
+
         export CARGO_NDK_ADB_SERIAL=$emulator_serial
+        ANDROID_TEST_SSL_CERT_DIR=$(IFS=:; echo "${android_cert_dirs[*]}")
+        export ANDROID_TEST_SSL_CERT_DIR
         run_android_tests
         ;;
     *)
