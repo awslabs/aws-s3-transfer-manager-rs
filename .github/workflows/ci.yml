@@ -125,7 +125,9 @@ jobs:
           - name: Windows x86_64 MSVC
             os: windows-2022
           - name: macOS arm64
-            os: macos-15-arm64
+            # Public repositories use the architecture-neutral image label for
+            # the standard macOS arm64 runner.
+            os: macos-15
           - name: macOS x86_64
             os: macos-15-intel
     needs: basics
@@ -170,7 +172,7 @@ jobs:
           - name: Windows
             os: windows-2022
           - name: macOS
-            os: macos-15-arm64
+            os: macos-15
     needs: basics
     steps:
       - uses: actions/checkout@v4
@@ -491,8 +493,10 @@ jobs:
           # first race diagnostic. Managed-runtime lifecycle tests can leave a
           # finished Tokio blocking worker for process teardown, so thread-leak
           # reporting remains disabled until their drain-and-join teardown is
-          # deterministic. Deadlock detection is not enabled.
-          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0
+          # deterministic. The suppression covers Tokio's kernel-mediated
+          # reactor registration; transfer-manager races remain unsuppressed.
+          # Deadlock detection is not enabled.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 

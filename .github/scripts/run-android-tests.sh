@@ -25,6 +25,8 @@ Arguments:
 Environment:
 
   ANDROID_API_LEVEL    Android API level (default: 35).
+  ANDROID_AVD_HOME     Android virtual-device directory in emulator mode
+                       (default: $HOME/.android/avd).
   ANDROID_HOME         Android SDK root. Required in emulator mode.
 
 Prerequisites:
@@ -118,13 +120,27 @@ case "$mode" in
 
         system_image="system-images;android-${android_api_level};${system_image_target};${abi}"
         avd_name="s3-tm-${android_api_level}-${system_image_target}-${abi}"
+        android_avd_home=${ANDROID_AVD_HOME:-"$HOME/.android/avd"}
         emulator_log=${RUNNER_TEMP:-/tmp}/s3-tm-android-emulator.log
         emulator_serial=emulator-5554
 
+        # Ubuntu 24.04 runners can give avdmanager and emulator different
+        # implicit homes through XDG_CONFIG_HOME. Pin both tools to one
+        # directory so the emulator can discover the device just created.
+        mkdir -p "$android_avd_home"
+        export ANDROID_AVD_HOME=$android_avd_home
         printf 'no\n' | avdmanager create avd --force \
             --name "$avd_name" \
+            --path "$android_avd_home/${avd_name}.avd" \
             --package "$system_image" \
             --device pixel_6
+
+        available_avds=$(emulator -list-avds)
+        if ! grep -Fxq "$avd_name" <<<"$available_avds"; then
+            echo "Android emulator cannot find newly created AVD '$avd_name'" >&2
+            printf 'Available AVDs:\n%s\n' "$available_avds" >&2
+            exit 1
+        fi
 
         if [[ -e /dev/kvm ]]; then
             sudo chmod 666 /dev/kvm
@@ -156,12 +172,25 @@ case "$mode" in
         }
         trap cleanup EXIT
 
-        adb -s "$emulator_serial" wait-for-device
         boot_deadline=$((SECONDS + 600))
-        while [[ "$(
-            adb -s "$emulator_serial" shell getprop sys.boot_completed 2>/dev/null |
-                tr -d '\r'
-        )" != "1" ]]; do
+        while true; do
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then
+                echo "Android emulator exited before registering with adb" >&2
+                wait "$emulator_pid" || true
+                exit 1
+            fi
+            if (( SECONDS >= boot_deadline )); then
+                echo "Android emulator did not register with adb within 600 seconds" >&2
+                exit 1
+            fi
+            adb_state=$(adb -s "$emulator_serial" get-state 2>/dev/null || true)
+            if [[ "$adb_state" == "device" ]]; then
+                break
+            fi
+            sleep 2
+        done
+
+        while true; do
             if ! kill -0 "$emulator_pid" 2>/dev/null; then
                 echo "Android emulator exited before completing boot" >&2
                 wait "$emulator_pid" || true
@@ -170,6 +199,13 @@ case "$mode" in
             if (( SECONDS >= boot_deadline )); then
                 echo "Android emulator did not finish booting within 600 seconds" >&2
                 exit 1
+            fi
+            boot_completed=$(
+                adb -s "$emulator_serial" shell getprop sys.boot_completed 2>/dev/null || true
+            )
+            boot_completed=${boot_completed//$'\r'/}
+            if [[ "$boot_completed" == "1" ]]; then
+                break
             fi
             sleep 2
         done
