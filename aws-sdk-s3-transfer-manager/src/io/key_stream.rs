@@ -12,6 +12,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,6 +46,59 @@ pub(crate) struct Entry<T> {
     pub(crate) source: T,
 }
 
+// What can go wrong while producing keyed entries.
+#[derive(Debug)]
+pub(crate) enum StreamError {
+    // The underlying walk failed. Whether it ends the run is the walk's own answer.
+    Walk(WalkError),
+    // A local name that is not valid UTF-8, so no S3 key could carry it. One name, and the walk
+    // read it fine.
+    UnkeyableName(PathBuf),
+    // A listed object without a field a comparison needs. One key that cannot be compared, and
+    // the listing itself arrived.
+    MalformedListing(&'static str),
+}
+
+impl StreamError {
+    // Whether nothing is left to carry on with. Only a walk can say so: a name that cannot be
+    // keyed and an object missing a field each cost one key.
+    pub(crate) fn is_fatal(&self) -> bool {
+        match self {
+            StreamError::Walk(err) => err.is_fatal(),
+            StreamError::UnkeyableName(_) | StreamError::MalformedListing(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Walk(err) => write!(f, "{err}"),
+            // `OsStr`'s `Debug` escapes invalid bytes, where `Path::display` replaces them and
+            // prints two different names identically.
+            StreamError::UnkeyableName(path) => {
+                write!(f, "name is not valid UTF-8: {:?}", path.as_os_str())
+            }
+            StreamError::MalformedListing(what) => write!(f, "{what}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StreamError::Walk(err) => Some(err),
+            StreamError::UnkeyableName(_) | StreamError::MalformedListing(_) => None,
+        }
+    }
+}
+
+impl From<WalkError> for StreamError {
+    fn from(err: WalkError) -> Self {
+        StreamError::Walk(err)
+    }
+}
+
 // Errors pass through as the walkers report them; what they mean is the caller's
 // call, via `view_incomplete`. A run may continue past an unreadable directory, but
 // not while also deleting keys it never saw.
@@ -54,14 +108,21 @@ pub(crate) trait KeyStream {
     // Named to avoid colliding with the walkers' inherent `next`.
     fn next_entry(
         &mut self,
-    ) -> impl Future<Output = Option<Result<Entry<Self::Source>, WalkError>>> + Send;
+    ) -> impl Future<Output = Option<Result<Entry<Self::Source>, StreamError>>> + Send;
 }
 
-// An unread subtree makes its side look emptier than it is, which position-based
-// comparison cannot tell apart from deletion. A single failed entry is just one key
-// unaccounted for.
-pub(crate) fn view_incomplete(err: &WalkError) -> bool {
-    err.is_fatal() || err.kind() == WalkErrorKind::DirectoryUnreadable
+// Whether a failure left keys unaccounted for, so a side looks emptier than it is.
+//
+// An unread subtree is the case that matters: position-based comparison cannot tell it from
+// deletion. A name that could not be keyed and an object missing a field each cost exactly one
+// key, which the stream reports in place, so the keys around them are still known.
+pub(crate) fn view_incomplete(err: &StreamError) -> bool {
+    match err {
+        StreamError::Walk(err) => {
+            err.is_fatal() || err.kind() == WalkErrorKind::DirectoryUnreadable
+        }
+        StreamError::UnkeyableName(_) | StreamError::MalformedListing(_) => false,
+    }
 }
 
 // Seconds from the epoch, negative for a time before it.
@@ -105,18 +166,9 @@ fn secs_since_epoch(modified: std::io::Result<SystemTime>) -> Option<i64> {
 // Case and Unicode form pass through untouched. Folding `README` onto `readme`, or
 // rewriting a name into a different normal form, would make a key match an object
 // that is not the same object.
-fn local_key(entry: &FsEntry) -> Result<String, WalkError> {
-    let relative = entry.relative_path();
-    match key_for_relative_path(relative) {
-        Some(key) => Ok(key),
-        // Debug on `OsStr` escapes the invalid bytes, where `Path::display` would
-        // replace them and print two different names identically.
-        None => Err(WalkError::new(
-            Some(entry.path().to_path_buf()),
-            WalkErrorKind::NonUtf8Name,
-            format!("name is not valid UTF-8: {:?}", relative.as_os_str()).into(),
-        )),
-    }
+fn local_key(entry: &FsEntry) -> Result<String, StreamError> {
+    key_for_relative_path(entry.relative_path())
+        .ok_or_else(|| StreamError::UnkeyableName(entry.path().to_path_buf()))
 }
 
 // `None` when the name cannot be a key at all.
@@ -173,7 +225,7 @@ pub(crate) fn s3_predicate(
 impl KeyStream for FsWalk {
     type Source = FsEntry;
 
-    async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, WalkError>> {
+    async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
         match self.next().await? {
             Ok(entry) => {
                 let key = match local_key(&entry) {
@@ -194,7 +246,7 @@ impl KeyStream for FsWalk {
                     source: entry,
                 }))
             }
-            Err(err) => Some(Err(err)),
+            Err(err) => Some(Err(err.into())),
         }
     }
 }
@@ -202,10 +254,10 @@ impl KeyStream for FsWalk {
 impl KeyStream for S3Walk {
     type Source = Object;
 
-    async fn next_entry(&mut self) -> Option<Result<Entry<Object>, WalkError>> {
+    async fn next_entry(&mut self) -> Option<Result<Entry<Object>, StreamError>> {
         loop {
             match self.next().await? {
-                Err(err) => return Some(Err(err)),
+                Err(err) => return Some(Err(err.into())),
                 Ok(obj) => match key_and_meta(&obj, &root_prefix(self.prefix())) {
                     Ok(None) => continue,
                     Ok(Some((key, meta))) => {
@@ -215,13 +267,9 @@ impl KeyStream for S3Walk {
                             source: obj,
                         }))
                     }
-                    Err(reason) => {
-                        return Some(Err(WalkError::new(
-                            obj.key().map(std::path::PathBuf::from),
-                            WalkErrorKind::Service,
-                            reason.into(),
-                        )))
-                    }
+                    // One key that cannot be compared. The listing itself arrived, so the run
+                    // carries on with the keys around it.
+                    Err(reason) => return Some(Err(StreamError::MalformedListing(reason))),
                 },
             }
         }
@@ -389,6 +437,14 @@ mod tests {
         assert_eq!(entry.source.path(), dir.path().join("f"));
     }
 
+    // What a stream error is, for asserting on a whole batch at once.
+    fn walk_kind(err: &StreamError) -> Option<WalkErrorKind> {
+        match err {
+            StreamError::Walk(err) => Some(err.kind()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn case_and_unicode_form_reach_the_key_untouched() {
         // Both sides are compared byte for byte, so folding case or rewriting a name
@@ -406,6 +462,23 @@ mod tests {
         assert_ne!(nfc.as_bytes(), nfd.as_bytes());
         assert_eq!(derive_object_key(nfc, None, None).unwrap(), nfc);
         assert_eq!(derive_object_key(nfd, None, None).unwrap(), nfd);
+    }
+
+    // Key derivation, without a filesystem that has to accept the name. macOS refuses to create
+    // one, so the walk-level test below is Linux-only, and this keeps the refusal itself covered
+    // everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_has_no_key() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0xFF cannot begin a valid UTF-8 sequence.
+        let bad = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"bad-\xff.txt"));
+        assert_eq!(key_for_relative_path(&bad), None);
+        assert_eq!(
+            key_for_relative_path(std::path::Path::new("fine.txt")),
+            Some("fine.txt".to_string())
+        );
     }
 
     // Only Linux is guaranteed to accept a filename that is not valid UTF-8; macOS
@@ -432,7 +505,11 @@ mod tests {
 
         assert_eq!(keys, ["good.txt"]);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].kind(), WalkErrorKind::NonUtf8Name);
+        assert!(
+            matches!(errors[0], StreamError::UnkeyableName(_)),
+            "got {:?}",
+            errors[0]
+        );
         // The raw bytes are named, so two names differing only in their invalid
         // bytes stay distinguishable.
         assert!(
@@ -558,6 +635,77 @@ mod tests {
         let rule = aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2)
             .then_output(move || output.clone());
         aws_smithy_mocks::mock_client!(aws_sdk_s3, aws_smithy_mocks::RuleMode::MatchAny, &[rule])
+    }
+
+    // A page holding one object missing a field a comparison needs. That one key cannot be
+    // compared, and the keys around it are fine, so the stream must report it and carry on. This
+    // guards a regression: while these errors borrowed `WalkErrorKind::Service`, which is fatal,
+    // one such object ended the whole run.
+    #[tokio::test]
+    async fn an_object_missing_a_field_costs_only_its_own_key() {
+        let contents = vec![
+            object("a.txt", 1),
+            // No size, so nothing to compare against a local file's length.
+            Object::builder()
+                .key("b.txt")
+                .last_modified(DateTime::from_secs(1_700_000_000))
+                .build(),
+            object("c.txt", 3),
+        ];
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .set_contents(Some(contents))
+            .build();
+        let rule = aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(move || output.clone());
+        let client = aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            &[rule]
+        );
+
+        let mut stream = s3(client, None);
+        let mut keys = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(item) = stream.next_entry().await {
+            match item {
+                Ok(entry) => keys.push(entry.key),
+                Err(err) => errors.push(err),
+            }
+        }
+
+        // The keys on both sides of the bad object arrive, which is what "carry on" means.
+        assert_eq!(keys, vec!["a.txt".to_string(), "c.txt".to_string()]);
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert!(
+            matches!(errors[0], StreamError::MalformedListing(_)),
+            "got {:?}",
+            errors[0]
+        );
+        assert!(!errors[0].is_fatal(), "one bad object must not end the run");
+        assert!(
+            !view_incomplete(&errors[0]),
+            "the listing arrived, so no key is unaccounted for"
+        );
+    }
+
+    // What each failure costs, since a comparison reads absence from position: a side that lost a
+    // subtree cannot be trusted to say a key is missing, while a side that lost one key can.
+    #[test]
+    fn only_a_lost_subtree_makes_a_side_look_emptier_than_it_is() {
+        let walk_err = |kind| StreamError::Walk(WalkError::new(None, kind, Box::from("test")));
+        let cases = [
+            (walk_err(WalkErrorKind::SourceUnreadable), true),
+            (walk_err(WalkErrorKind::DirectoryUnreadable), true),
+            (walk_err(WalkErrorKind::Service), true),
+            // A named file the walk read fine, and one listed object: both are single keys.
+            (walk_err(WalkErrorKind::PermissionDenied), false),
+            (walk_err(WalkErrorKind::BrokenSymlink), false),
+            (StreamError::UnkeyableName(PathBuf::from("/tmp/x")), false),
+            (StreamError::MalformedListing("no size"), false),
+        ];
+        for (err, hides_keys) in cases {
+            assert_eq!(view_incomplete(&err), hides_keys, "err={err:?}");
+        }
     }
 
     // The join reads "this key is absent from the other side" from position alone, so
@@ -850,7 +998,7 @@ mod tests {
         assert!(
             errors.is_empty(),
             "an excluded entry must not warn: {:?}",
-            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+            errors.iter().map(walk_kind).collect::<Vec<_>>()
         );
     }
 
@@ -877,9 +1025,9 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.kind() == WalkErrorKind::PermissionDenied),
+                .any(|e| walk_kind(e) == Some(WalkErrorKind::PermissionDenied)),
             "expected a per-entry permission warning, got {:?}",
-            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+            errors.iter().map(walk_kind).collect::<Vec<_>>()
         );
     }
 
@@ -1033,7 +1181,7 @@ mod tests {
 
         assert_eq!(seen, vec!["a.txt"]);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].kind(), WalkErrorKind::BrokenSymlink);
+        assert_eq!(walk_kind(&errors[0]), Some(WalkErrorKind::BrokenSymlink));
         assert!(!view_incomplete(&errors[0]));
     }
 

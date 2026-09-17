@@ -19,7 +19,7 @@ what it covers, the decisions behind it, and what those decisions cost.
        └────┬─────┘                   └────┬─────┘             │
             │                              │                   │
             │   Entry { key, meta, source }                    │
-            │   WalkError { path, kind }                       │
+            │   StreamError { walk, unkeyable name, listing }  │
             └──────────────┬───────────────┘                   ┘
                            │
                            │   two streams, one key order
@@ -130,7 +130,8 @@ under `io::key*` is new.
                report_untransferable         FileType              what the filesystem said is there
    S3Walk      + prefix()                    KeyStream             the trait they both implement
    FsEntry     file_type, metadata, root     KeyFilter, Rule       include and exclude rules
-   WalkError   + severity(), four kinds      Severity              ends the run, failure, warning
+   WalkError   + DirectoryUnreadable         Severity              ends the run, failure, warning
+                                             StreamError           a walk, a name, or a listing
                                              derive_object_key     path or key → relative key
                                              strip_key_prefix
 ```
@@ -138,8 +139,8 @@ under `io::key*` is new.
 Six of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
 the switch that turns on S3 ordering; `Severity`; `WalkErrorKind::severity()` and
 `WalkError::severity()`; `FsEntry`, whose accessors say what the filesystem
-reported and how the walk arrived; `FileType`, which names what is at a path; and two new
-`WalkErrorKind` variants — `NonUtf8Name` and `DirectoryUnreadable`. `WalkErrorKind` was already
+reported and how the walk arrived; `FileType`, which names what is at a path; and one new
+`WalkErrorKind` variant, `DirectoryUnreadable`. `WalkErrorKind` was already
 `#[non_exhaustive]`, so adding variants breaks nobody, and `Severity` is `#[non_exhaustive]` for
 the same reason.
 
@@ -183,14 +184,14 @@ follow from the entry existing: it arrives at its own key carrying `FileType::So
 comparison that reads absence from position sees the key occupied. Reporting it instead put a
 per-key fact on a channel with no keys in it.
 
-What stays a warning is what no single key stands for: a name that cannot be keyed, and a link that
-loops, which stops a descent so a subtree goes unenumerated.
+What stays a warning is what no single key stands for: a link that loops, which stops a descent so a
+subtree goes unenumerated.
 
 ```
    ends the run   nothing is left to do       SourceUnreadable, NotADirectory, Service
    entry failure  should have been readable   Io, PermissionDenied, DirectoryUnreadable,
                                               BrokenSymlink
-   entry warning  no key stands for it        NonUtf8Name, SymlinkCycle
+   entry warning  no key stands for it        SymlinkCycle
 ```
 
 A link pointing at nothing is an error while a socket is an entry, which is easy to get backwards.
@@ -265,6 +266,20 @@ stripped from each key to leave the relative key. A wrapper would have kept that
 What would force a wrapper: a stream needing state the walker has no business holding. Both
 walkers and the trait are crate-private, so adding one later touches construction sites inside
 this crate and nothing outside.
+
+**D13. The stream reports its own failures, not the walk's.** `next_entry` yields a `StreamError`,
+which is a walk failure, a name that cannot be keyed, or a listed object missing a field a
+comparison needs. Only the first comes from a walk.
+
+Sharing `WalkErrorKind` for all three meant borrowing kinds for failures a walk never has, and
+inheriting what they imply. An object with no size became `Service`, which ends the run — so one
+malformed object in a page stopped a whole sync, when the honest cost is that one key cannot be
+compared. A name that cannot be keyed had the same problem in reverse: it read as a walk failure
+when the walk had read the name perfectly.
+
+Separating them lets the consumer ask the question it actually has, which is what a failure cost.
+A walk failure may have hidden a subtree; the other two cost exactly one key, and the keys around
+them still arrive.
 
 ## 4. How the pieces fit
 
@@ -362,8 +377,7 @@ Three levels, because the consumer treats them differently:
 A FIFO, a socket, a device file and a symlink the walk was told not to follow all arrive as entries,
 each carrying the `FileType` that says which it is, and a walk yields them only when asked, through
 `report_untransferable`, so the operations that already use the walkers see nothing new. The warning
-level keeps what no key stands for: a name that is not valid UTF-8, and a directory reached by a
-link that loops. Sync copies none of them as things stand — the symlink would need a
+level keeps what no key stands for: a directory reached by a link that loops. Sync copies none of them as things stand — the symlink would need a
 setting changed, the rest can never be copied at all. But *something occupies that name*, and that
 is exactly what has to stop the object at the matching key from being deleted. That is the
 difference between a skip and a silent omission.

@@ -39,9 +39,6 @@ pub enum WalkErrorKind {
     /// to the same target) are not reported as cycles and are traversed
     /// normally.
     SymlinkCycle,
-    /// A local name that is not valid UTF-8. An S3 object key is Unicode encoded as
-    /// UTF-8, so no key could carry this name.
-    NonUtf8Name,
 }
 
 impl WalkErrorKind {
@@ -55,7 +52,7 @@ impl WalkErrorKind {
             | WalkErrorKind::PermissionDenied
             | WalkErrorKind::DirectoryUnreadable
             | WalkErrorKind::BrokenSymlink => Severity::EntryFailure,
-            WalkErrorKind::SymlinkCycle | WalkErrorKind::NonUtf8Name => Severity::EntryWarning,
+            WalkErrorKind::SymlinkCycle => Severity::EntryWarning,
         }
     }
 
@@ -206,9 +203,8 @@ mod tests {
             (WalkErrorKind::DirectoryUnreadable, EntryFailure),
             // A link with no target should have been readable and was not.
             (WalkErrorKind::BrokenSymlink, EntryFailure),
-            // A loop hides a subtree, and a name that cannot be keyed has no key to report at.
+            // A loop hides a subtree, so no single key stands for what went unread.
             (WalkErrorKind::SymlinkCycle, EntryWarning),
-            (WalkErrorKind::NonUtf8Name, EntryWarning),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.severity(), expected, "kind={kind:?}");
