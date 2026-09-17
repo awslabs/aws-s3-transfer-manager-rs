@@ -252,6 +252,8 @@ pub(crate) enum ReserveError {
     InvalidSize,
     /// Physical storage could not be prepared.
     PhysicalPreparationFailed,
+    /// Queue or ownership metadata could not reserve the required capacity.
+    MetadataAllocationFailed,
     /// The request or resulting accounting state is not representable.
     CapacityOverflow,
 }
@@ -263,6 +265,7 @@ impl fmt::Display for ReserveError {
             Self::PhysicalPreparationFailed => {
                 f.write_str("physical buffer-pool preparation failed")
             }
+            Self::MetadataAllocationFailed => f.write_str("buffer-pool metadata allocation failed"),
             Self::CapacityOverflow => {
                 f.write_str("reservation exceeds buffer-pool accounting capacity")
             }
@@ -323,6 +326,11 @@ impl Drop for Reservation {
 }
 
 impl ReservationState {
+    /// Returns the pool whose direct authority this state represents.
+    pub(super) fn pool(&self) -> &Arc<PoolInner> {
+        &self.pool
+    }
+
     /// Returns whether this reservation belongs to `pool`.
     pub(super) fn belongs_to(&self, pool: &Arc<PoolInner>) -> bool {
         Arc::ptr_eq(&self.pool, pool)

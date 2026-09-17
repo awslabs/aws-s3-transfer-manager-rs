@@ -275,9 +275,10 @@ impl VirtualRange {
     ///
     /// # Safety
     ///
-    /// The complete subrange must be prepared, exclusively owned by a claim
-    /// that passed the `Active` gate, and retained until the pointer is no
-    /// longer used.
+    /// The complete subrange must remain prepared until the pointer is no
+    /// longer used. Mutable access requires exclusive claim ownership.
+    /// Immutable access requires initialized owner coverage that prevents
+    /// deactivation for the complete access.
     pub(super) unsafe fn ptr_for_range(
         &self,
         offset: usize,
