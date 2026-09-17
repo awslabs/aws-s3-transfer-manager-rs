@@ -32,5 +32,9 @@ trap cleanup EXIT
 
 adb -s "$CARGO_NDK_ADB_SERIAL" push "$test_binary" "$device_path" >/dev/null
 adb -s "$CARGO_NDK_ADB_SERIAL" shell chmod 755 "$device_path"
+echo "Running Android tests through repository runner"
 adb -s "$CARGO_NDK_ADB_SERIAL" shell \
-    env "SSL_CERT_FILE=$ANDROID_TEST_SSL_CERT_FILE" "$device_path" "$@"
+    env \
+    "RUST_BACKTRACE=${RUST_BACKTRACE:-0}" \
+    "SSL_CERT_FILE=$ANDROID_TEST_SSL_CERT_FILE" \
+    "$device_path" "$@"

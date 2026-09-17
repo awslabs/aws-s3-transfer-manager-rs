@@ -34,8 +34,8 @@ Environment:
 Prerequisites:
 
   cargo-ndk, the Rust target for <abi>, and an Android NDK must be installed.
-  Emulator mode also requires adb, avdmanager, emulator, and the named system
-  image. The CI workflow installs these before invoking this script.
+  Emulator mode also requires adb, avdmanager, emulator, jq, and the named
+  system image. The CI workflow installs these before invoking this script.
 
 Examples, from the repository root:
 
@@ -85,16 +85,42 @@ case "$abi" in
 esac
 
 run_android_tests() {
-    local runner_env
-    runner_env=CARGO_TARGET_${rust_target^^}_RUNNER
-    runner_env=${runner_env//-/_}
-    export "$runner_env=$script_dir/android-test-runner.sh"
+    local build_messages
+    local test_binary
+    local test_binaries
 
-    # cargo-ndk 4.1.2's runners do not propagate device environment or the
-    # `ndk-test` child status. Use the repository runner so Android's trust
-    # store is visible and device failures remain visible to the CI job.
-    cargo ndk --target "$abi" --platform "$android_api_level" \
-        test --locked -p aws-sdk-s3-transfer-manager --lib
+    # cargo-ndk 4.1.2 unconditionally replaces Cargo's target runner with its
+    # own runner. Build without executing, then invoke the repository runner
+    # directly so device environment and the child status remain observable.
+    build_messages=$(
+        cargo ndk --target "$abi" --platform "$android_api_level" \
+            test --locked -p aws-sdk-s3-transfer-manager --lib --no-run \
+            --message-format=json-render-diagnostics
+    )
+    test_binaries=$(
+        jq -r '
+            select(
+                .reason == "compiler-artifact"
+                and .target.name == "aws_sdk_s3_transfer_manager"
+                and .target.kind == ["lib"]
+                and .profile.test
+            )
+            | .executable // empty
+        ' <<<"$build_messages"
+    )
+
+    if [[ -z "$test_binaries" ]]; then
+        echo "cargo did not report the Android library test binary" >&2
+        exit 1
+    fi
+    if [[ "$test_binaries" == *$'\n'* ]]; then
+        echo "cargo reported multiple Android library test binaries:" >&2
+        printf '%s\n' "$test_binaries" >&2
+        exit 1
+    fi
+
+    test_binary=$test_binaries
+    "$script_dir/android-test-runner.sh" "$test_binary"
 }
 
 case "$mode" in
