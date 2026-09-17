@@ -188,7 +188,15 @@ jobs:
       - name: Run real-S3 tests
         run: |
           RUSTFLAGS="-Dwarnings --cfg e2e_test" cargo test --locked --test e2e_transfer_test
-          RUSTFLAGS="-Dwarnings --cfg e2e_test" cargo test --locked -p integration-tests
+          integration_test_args=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # Mock integration tests start local servers and concurrent
+            # transfers. Serial execution avoids exhausting macOS socket
+            # buffers while preserving each test's internal concurrency.
+            integration_test_args+=(-- --test-threads 1)
+          fi
+          RUSTFLAGS="-Dwarnings --cfg e2e_test" \
+            cargo test --locked -p integration-tests "${integration_test_args[@]}"
 
   musl:
     name: musl (${{ matrix.name }})

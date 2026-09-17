@@ -257,6 +257,16 @@ impl TmTestClient {
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }
+        #[cfg(s3_tm_tsan)]
+        {
+            // TSan instruments both the client and the in-process mock server.
+            // Auto's 32-request floor can then starve request bodies on the
+            // four-vCPU hosted runner until stalled-stream protection fires.
+            // Four requests preserve concurrent execution without making
+            // sanitizer overhead look like a transport stall.
+            builder = builder
+                .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4));
+        }
         Self {
             tm: TmClient::new(builder.build()),
             bucket: "test-bucket".to_string(),
