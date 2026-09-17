@@ -45,7 +45,7 @@ use crate::types::MemoryBudgetConfig;
 use acquisition::acquire_count;
 pub use acquisition::AcquireError;
 use admission::{
-    wake_all, AdmissionGuard, AdmissionState, CoverageState, ReservationDrainSignal,
+    wake_all, AdmissionGuard, AdmissionState, CoverageDebit, CoverageState, ReservationDrainSignal,
     ReservationPoll, WaitSlot, WaitState, Waiter, MAX_PACKED_CARRIERS,
 };
 pub use admission::{Reservation, ReserveError, ReserveFuture};
@@ -418,24 +418,25 @@ impl PoolInner {
         pool: &Arc<Self>,
         admission: &mut AdmissionGuard<'_>,
         count: CarrierCount,
-    ) -> Result<(), ReserveError> {
-        pool.coverage
+    ) -> Result<CoverageDebit, ReserveError> {
+        let debit = pool
+            .coverage
             .debit(count, admission.maximum_uncovered())
             .map_err(|_| ReserveError::CapacityOverflow)?;
 
         let floor = match admission.acquisition_floor(&pool.coverage) {
             Ok(floor) => floor,
             Err(error) => {
-                admission.rollback_acquisition(&pool.coverage, count);
+                admission.rollback_acquisition(&pool.coverage, count, debit);
                 return Err(error);
             }
         };
         if let Err(error) = pool.arena.prepare_to(admission, floor) {
-            admission.rollback_acquisition(&pool.coverage, count);
+            admission.rollback_acquisition(&pool.coverage, count, debit);
             Self::request_cleanup_after_arena_error(pool, &error);
             return Err(map_preparation_error(error));
         }
-        Ok(())
+        Ok(debit)
     }
 
     /// Attempts one immediate grant without bypassing the FIFO.
@@ -637,7 +638,37 @@ impl PoolInner {
     /// invokes wakers only after unlocking.
     fn release_acquisition_charges(pool: &Arc<Self>, count: CarrierCount) {
         let returned = pool.coverage.release(count);
-        if returned.uncovered_removed == CarrierCount::ZERO
+        Self::drain_after_coverage_return(pool, returned.uncovered_removed);
+    }
+
+    /// Reverses charges that never became carrier owners.
+    fn rollback_acquisition_charges(pool: &Arc<Self>, count: CarrierCount, debit: CoverageDebit) {
+        let drained = {
+            let mut admission = AdmissionGuard::new(pool.admission.lock());
+            let returned = pool.coverage.rollback_debit(
+                count,
+                debit,
+                admission.inner.ledger.active_planned_demand,
+            );
+            let drained = (returned.uncovered_removed != CarrierCount::ZERO)
+                .then(|| Self::drain_fifo_locked(pool, &mut admission, false));
+            admission
+                .inner
+                .ledger
+                .assert_invariants(pool.coverage.snapshot());
+            drained
+        };
+        if let Some(drained) = drained {
+            if let Some(sample) = drained.queue_sample {
+                pool.log_reservation_queue_transition(sample);
+            }
+            wake_all(drained.wakers);
+        }
+    }
+
+    /// Reconsiders reservation admission after uncovered pressure decreases.
+    fn drain_after_coverage_return(pool: &Arc<Self>, uncovered_removed: CarrierCount) {
+        if uncovered_removed == CarrierCount::ZERO
             || !pool.reservation_drain.repayment_requires_drain()
         {
             return;

@@ -34,7 +34,7 @@ const RESERVATION_REPAYMENT_EPOCH: u64 = 2;
 
 mod coverage;
 use coverage::CoverageSnapshot;
-pub(super) use coverage::{CoverageState, MAX_PACKED_CARRIERS};
+pub(super) use coverage::{CoverageDebit, CoverageState, MAX_PACKED_CARRIERS};
 
 mod waiter;
 pub use waiter::ReserveFuture;
@@ -415,8 +415,13 @@ impl<'a> AdmissionGuard<'a> {
     }
 
     /// Reverses an unexposed acquisition while admission remains held.
-    pub(super) fn rollback_acquisition(&mut self, coverage: &CoverageState, count: CarrierCount) {
-        coverage.release(count);
+    pub(super) fn rollback_acquisition(
+        &mut self,
+        coverage: &CoverageState,
+        count: CarrierCount,
+        debit: CoverageDebit,
+    ) {
+        coverage.rollback_debit(count, debit, self.inner.ledger.active_planned_demand);
         self.inner.ledger.assert_invariants(coverage.snapshot());
     }
 }

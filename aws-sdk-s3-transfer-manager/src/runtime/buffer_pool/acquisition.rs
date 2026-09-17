@@ -11,7 +11,9 @@
 
 use std::fmt;
 
-use super::admission::{AdmissionGuard, DirectDebitError, ReservationState, ReserveError};
+use super::admission::{
+    AdmissionGuard, CoverageDebit, DirectDebitError, ReservationState, ReserveError,
+};
 use super::arena::{ArenaError, ClaimBatch};
 use super::block::{
     BlockError, BlockSlot, CarrierAllocation, CarrierAllocationBatch, CarrierLocation,
@@ -69,6 +71,8 @@ struct AcquisitionDebit {
     direct: Option<Arc<ReservationState>>,
     /// Charges not yet transferred to carrier guards.
     untransferred: CarrierCount,
+    /// Uncovered contribution still owned by the provisional charges.
+    aggregate: CoverageDebit,
 }
 
 impl AcquisitionDebit {
@@ -85,19 +89,20 @@ impl AcquisitionDebit {
         }
 
         let aggregate = match pool.try_debit_covered(count) {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(CoverageDebit::covered()),
             Ok(false) => {
                 let mut admission = AdmissionGuard::new(pool.admission.lock());
                 PoolInner::debit_and_prepare_locked(pool, &mut admission, count)
             }
             Err(error) => Err(error),
         };
-        if let Err(error) = aggregate {
-            return Err(map_reserve_error(error));
-        }
+        let aggregate = match aggregate {
+            Ok(aggregate) => aggregate,
+            Err(error) => return Err(map_reserve_error(error)),
+        };
         if let Some(direct) = direct.as_ref() {
             if let Err(error) = direct.try_debit(count) {
-                PoolInner::release_acquisition_charges(pool, count);
+                PoolInner::rollback_acquisition_charges(pool, count, aggregate);
                 return Err(map_direct_debit_error(error));
             }
         }
@@ -106,6 +111,7 @@ impl AcquisitionDebit {
             pool: Arc::clone(pool),
             direct,
             untransferred: count,
+            aggregate,
         })
     }
 
@@ -120,6 +126,7 @@ impl AcquisitionDebit {
             direct: self.direct.as_ref().map(Arc::clone),
         });
         self.untransferred = untransferred;
+        self.aggregate.commit_one();
         guard
     }
 }
@@ -132,7 +139,7 @@ impl Drop for AcquisitionDebit {
         if let Some(direct) = self.direct.as_ref() {
             direct.release(self.untransferred);
         }
-        PoolInner::release_acquisition_charges(&self.pool, self.untransferred);
+        PoolInner::rollback_acquisition_charges(&self.pool, self.untransferred, self.aggregate);
     }
 }
 
@@ -699,6 +706,41 @@ mod tests {
         assert_eq!(retry.capacity(), carrier_size);
         drop(retry);
         drop(occupying);
+    }
+
+    #[test]
+    fn test_failed_covered_acquisition_restores_prior_coverage_classification() {
+        let (pool, carrier_size) = test_pool(2, 6, 1);
+        let uncovered = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        let reservation = pool
+            .try_reserve(carrier_size * 4)
+            .unwrap()
+            .expect("reservation");
+        let before = pool.inner.test_accounting_state();
+        assert_eq!(
+            before,
+            (
+                CarrierCount::new(6),
+                CarrierCount::new(4),
+                CarrierCount::new(4),
+                CarrierCount::new(2),
+                0,
+            )
+        );
+        pool.inject_acquisition_allocation_failure(1);
+
+        assert!(matches!(
+            pool.acquire(&reservation, carrier_size),
+            Err(AcquireError::MetadataAllocationFailed)
+        ));
+
+        assert_eq!(pool.inner.test_accounting_state(), before);
+        let retry = pool
+            .acquire(&reservation, carrier_size)
+            .expect("rollback preserved covered acquisition authority");
+        drop(retry);
+        drop(reservation);
+        drop(uncovered);
     }
 
     #[test]
