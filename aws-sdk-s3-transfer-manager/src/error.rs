@@ -676,8 +676,6 @@ impl From<crate::io::walk::WalkError> for Error {
             | WalkErrorKind::DirectoryUnreadable
             | WalkErrorKind::BrokenSymlink
             | WalkErrorKind::SymlinkCycle
-            | WalkErrorKind::SpecialFile
-            | WalkErrorKind::SymlinkNotFollowed
             | WalkErrorKind::NonUtf8Name => Error::new(ErrorKind::IOError, e),
         }
     }

@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::io::key::derive_object_key;
-use crate::io::walk::{DirEntry, FsWalk};
+use crate::io::walk::{FsEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
 use crate::runtime::sync::Mutex;
@@ -326,7 +326,7 @@ impl fmt::Debug for ChildTransfer {
 
 /// Mutable state of an `upload_objects` transfer.
 ///
-/// Walker enumeration produces `DirEntry`s into `pending_entries`.
+/// Walker enumeration produces `FsEntry`s into `pending_entries`.
 /// `poll_work` consumes them through `claim_one` into child
 /// `UploadHandle`s in `children`, reaps terminal children via
 /// `JoinChildren` work items, and accumulates outcomes into
@@ -355,7 +355,7 @@ struct State {
     walks: BTreeMap<u64, FsWalk>,
     next_walk_id: u64,
     in_flight_walks: usize,
-    pending_entries: VecDeque<DirEntry>,
+    pending_entries: VecDeque<FsEntry>,
     children: HashMap<TransferId, ChildTransfer>,
     /// Entries that have been claimed from `pending_entries` by a `poll_work`
     /// frame that has released the state lock to run `orchestrate_child`, but
@@ -691,11 +691,13 @@ impl UploadObjectsTransfer {
                     }
                 };
 
-            let stream = match InputStream::read_from()
-                .path(entry.path())
-                .metadata(entry.metadata().clone())
-                .build()
-            {
+            // An upload only ever sees a regular file the walk read metadata for, since it does
+            // not ask for anything else.
+            let mut input = InputStream::read_from().path(entry.path());
+            if let Some(metadata) = entry.metadata() {
+                input = input.metadata(metadata.clone());
+            }
+            let stream = match input.build() {
                 Ok(s) => s,
                 Err(e) => {
                     state.failed.push(FailedUpload {

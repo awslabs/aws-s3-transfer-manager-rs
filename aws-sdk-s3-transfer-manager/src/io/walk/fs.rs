@@ -41,7 +41,7 @@ enum Cursor {
     // in a queue, which is what makes them claimable.
     Breadth {
         pending_dirs: VecDeque<PendingDir>,
-        ready_files: VecDeque<DirEntry>,
+        ready_files: VecDeque<FsEntry>,
     },
     // Emission follows key order, so a subtree is descended at the position
     // where it sorts. Each frame is a partially consumed directory.
@@ -54,7 +54,7 @@ enum Cursor {
 // into. Kept in a single list so sorting interleaves them, which is what
 // lets a nested key be emitted between two sibling files.
 enum Child {
-    File(DirEntry),
+    File(FsEntry),
     Dir(PendingDir),
 }
 
@@ -95,6 +95,27 @@ fn dir_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
     }
 }
 
+// Which of the special kinds a file type names. `FileType` from `std` answers each of these
+// separately on Unix, and a walk reports what it was told.
+fn special_file_type(file_type: &std::fs::FileType) -> FileType {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return FileType::Fifo;
+        }
+        if file_type.is_socket() {
+            return FileType::Socket;
+        }
+        if file_type.is_block_device() || file_type.is_char_device() {
+            return FileType::Device;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file_type;
+    FileType::Device
+}
+
 // Order two children as `ListObjectsV2` orders the keys they produce: a
 // directory sorts as if its name ended in '/' (0x2F), so `a.txt` precedes
 // `a/c`. Names within a directory never contain '/', so one trailing byte
@@ -113,24 +134,53 @@ fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
     }
 }
 
+/// What the filesystem said is at a path.
+///
+/// A walk yields an entry for whatever it found, so a consumer decides what to do with each
+/// one. Only a regular file holds bytes a transfer could move; the rest are named so a consumer
+/// can say why it left them alone.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    /// A regular file.
+    Regular,
+    /// A directory.
+    Directory,
+    /// A symlink this walk did not follow, so nothing here describes its target.
+    Symlink,
+    /// A named pipe.
+    Fifo,
+    /// A socket.
+    Socket,
+    /// A block or character device.
+    Device,
+}
+
 /// A file entry discovered during a filesystem walk.
 ///
-/// Contains the absolute path, the path relative to the walk root, and
-/// the file metadata. Only regular files (and symlinks to regular files
-/// when `follow_symlinks` is enabled) produce `DirEntry` values; directories
-/// are traversed but not yielded.
+/// Carries the absolute path, the path relative to the walk root, what the filesystem said is
+/// there, and the metadata if any was read.
+///
+/// A walk yields regular files, and whatever else it was asked to report: a socket, a symlink it
+/// left alone. Directories are traversed and not yielded, so a consumer sees the files under one
+/// and never the one itself.
 #[derive(Debug)]
-pub struct DirEntry {
+pub struct FsEntry {
     path: PathBuf,
+    file_type: FileType,
+    // True when the walk arrived here through a symlink it resolved, so this describes what the
+    // link points at. False for a path reached directly, and for a link left alone — which
+    // `file_type` reports as `Symlink`.
+    followed_symlink: bool,
     // The walk root, shared by every entry it produces. `relative_path` is a suffix of
     // `path`, so storing it separately would put a second copy of the whole path in
     // memory for every entry held — and a key-ordered walk holds the unconsumed
     // children of every directory on its descent path at once.
     root: Arc<Path>,
-    metadata: Metadata,
+    metadata: Option<Metadata>,
 }
 
-impl DirEntry {
+impl FsEntry {
     /// Absolute path to the file on the local filesystem.
     pub fn path(&self) -> &Path {
         &self.path
@@ -145,16 +195,27 @@ impl DirEntry {
         self.path.strip_prefix(&self.root).unwrap_or(&self.path)
     }
 
-    /// File metadata.
+    /// What the filesystem said is here.
+    pub fn file_type(&self) -> FileType {
+        self.file_type
+    }
+
+    /// Whether the walk arrived here through a symlink it resolved.
+    pub fn followed_symlink(&self) -> bool {
+        self.followed_symlink
+    }
+
+    /// File metadata, when the walk read any.
     ///
-    /// When the entry was produced by following a symlink, this is the
-    /// metadata of the symlink target (not the symlink itself).
-    pub fn metadata(&self) -> &Metadata {
-        &self.metadata
+    /// `None` when nothing was read here: a symlink left alone, or a path the filesystem
+    /// refused to describe. When the entry came of following a symlink, this describes what the
+    /// link points at.
+    pub fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
     }
 }
 
-type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
+type FilterFn = Arc<dyn Fn(&FsEntry) -> bool + Send + Sync>;
 // Consulted with a path relative to the root, before any metadata is read.
 type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
@@ -172,7 +233,7 @@ type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 ///
 /// The walker reads one directory at a time. Subdirectories discovered during
 /// a read are queued for subsequent reads. Only regular files produce yielded
-/// [`DirEntry`] values; directories, symlinks, and special files (sockets,
+/// [`FsEntry`] values; directories, symlinks, and special files (sockets,
 /// fifos, block/char devices) are traversed or skipped according to
 /// configuration but are never themselves yielded as entries.
 ///
@@ -196,7 +257,7 @@ type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 /// and the optional filter is stored as `Arc<dyn Fn>`. Clone a configured
 /// walker to reuse it across multiple operations without re-specifying the
 /// configuration.
-// TODO(walker): `dir_filter: Option<Box<dyn Fn(&DirEntry) -> bool>>` — subtree
+// TODO(walker): `dir_filter: Option<Box<dyn Fn(&FsEntry) -> bool>>` — subtree
 //   prune predicate. Biggest perf improvement for bulk ops on trees with large
 //   excluded subtrees (.git/, node_modules/).
 // TODO(walker): `min_depth: usize` — skip entries above this depth.
@@ -435,16 +496,15 @@ impl FsWalkerBuilder {
         self
     }
 
-    // Report a path the walk cannot yield an entry for: a socket, a FIFO, a device, a
-    // symlink left unfollowed. Off by default, because a caller that only uploads what
-    // it finds has no use for them, and a tree can hold thousands. A consumer that
-    // infers absence from the stream needs them, since a name it never hears about
-    // reads as a name that is free.
+    // Yield an entry for a path holding something no transfer could move: a socket, a FIFO, a
+    // device, a symlink left unfollowed. Off by default, because a caller that only uploads what
+    // it finds has no use for them, and a tree can hold thousands. A consumer that infers absence
+    // from the stream needs them, since a name it never hears about reads as a name that is free.
     //
     // Only tests call this until the comparison lands.
     #[allow(dead_code)]
-    pub(crate) fn report_untransferable(mut self, report: bool) -> Self {
-        self.report_untransferable = report;
+    pub(crate) fn report_untransferable(mut self, include: bool) -> Self {
+        self.report_untransferable = include;
         self
     }
 
@@ -477,14 +537,14 @@ impl FsWalkerBuilder {
     /// performance on trees with large excludable subtrees (e.g. `.git/`,
     /// `node_modules/`), compose multiple walks rooted at smaller subtrees.
     #[must_use]
-    pub fn filter(mut self, f: impl Fn(&DirEntry) -> bool + Send + Sync + 'static) -> Self {
+    pub fn filter(mut self, f: impl Fn(&FsEntry) -> bool + Send + Sync + 'static) -> Self {
         self.filter = Some(Arc::new(f));
         self
     }
 
     // Reject entries by relative path, before their metadata is read.
     //
-    // Unlike `filter`, which sees a fully built `DirEntry`, this is consulted first,
+    // Unlike `filter`, which sees a fully built `FsEntry`, this is consulted first,
     // so a rejected file is never stat'd and anything that went wrong reading it is
     // never reported. That is the difference between "excluded" and "excluded but it
     // still warned about a file the caller said to ignore".
@@ -604,7 +664,7 @@ impl FsWalk {
     ///   are followed by `None` on the next call; non-fatal errors are
     ///   followed by more results as the walk continues.
     /// - `None` when the walk is complete.
-    pub async fn next(&mut self) -> Option<Result<DirEntry, WalkError>> {
+    pub async fn next(&mut self) -> Option<Result<FsEntry, WalkError>> {
         loop {
             if let Some(err) = self.pending_errors.pop_front() {
                 if !err.is_fatal() {
@@ -849,11 +909,15 @@ impl FsWalk {
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
                     if !rejected && self.config.report_untransferable {
-                        result.errors.push(WalkError::new(
-                            Some(path),
-                            WalkErrorKind::SymlinkNotFollowed,
-                            Box::from("following symlinks is disabled"),
-                        ));
+                        // Nothing here describes what the link points at, because the walk did
+                        // not look. The metadata is the link's own, which is what `lstat` gave.
+                        self.push_entry(
+                            &mut result.children,
+                            path,
+                            entry.metadata().ok(),
+                            FileType::Symlink,
+                            false,
+                        );
                     }
                     continue;
                 }
@@ -902,13 +966,28 @@ impl FsWalk {
                         }
                     }
                 } else if metadata.is_file() {
-                    self.push_file(&mut result.children, path, &metadata);
+                    self.push_entry(
+                        &mut result.children,
+                        path,
+                        Some(metadata),
+                        FileType::Regular,
+                        true,
+                    );
                 } else if !rejected && self.config.report_untransferable {
-                    result.errors.push(WalkError::new(
-                        Some(path),
-                        WalkErrorKind::SpecialFile,
-                        Box::from("symlink target is neither a regular file nor a directory"),
-                    ));
+                    // The link points at something no transfer could read. The entry says so,
+                    // and the key stays accounted for.
+                    //
+                    // The type comes from the target's metadata, not from `file_type`, which
+                    // describes the link. A link is never a socket or a FIFO itself, so reading
+                    // the kind off it would report the wrong one for everything here.
+                    let target_type = special_file_type(&metadata.file_type());
+                    self.push_entry(
+                        &mut result.children,
+                        path,
+                        Some(metadata),
+                        target_type,
+                        true,
+                    );
                 }
             } else if file_type.is_file() {
                 if rejected {
@@ -924,7 +1003,13 @@ impl FsWalk {
                         continue;
                     }
                 };
-                self.push_file(&mut result.children, path, &metadata);
+                self.push_entry(
+                    &mut result.children,
+                    path,
+                    Some(metadata),
+                    FileType::Regular,
+                    false,
+                );
             } else if file_type.is_dir() {
                 if depth < self.config.max_depth {
                     result.children.push(Child::Dir(PendingDir {
@@ -934,15 +1019,30 @@ impl FsWalk {
                     }));
                 }
             } else if !rejected && self.config.report_untransferable {
-                // A socket, FIFO, or device. Reported so a consumer knows the name
-                // is taken: a name absent from the stream reads as nothing being
-                // there, which is a different fact. An excluded name is different
-                // again — nothing is going to look at it, so it stays quiet.
-                result.errors.push(WalkError::new(
-                    Some(path),
-                    WalkErrorKind::SpecialFile,
-                    Box::from("not a regular file or directory"),
-                ));
+                // A socket, FIFO, or device. Yielded so a consumer knows the name is taken: a
+                // name absent from the stream reads as nothing being there, which is a
+                // different fact. An excluded name is different again — nothing is going to
+                // look at it, so it stays quiet.
+                //
+                // The `lstat` behind `file_type` already described it, and a `stat` here would
+                // ask the same question a second time.
+                match entry.metadata() {
+                    Ok(metadata) => self.push_entry(
+                        &mut result.children,
+                        path,
+                        Some(metadata),
+                        special_file_type(&file_type),
+                        false,
+                    ),
+                    // Nothing describes it, and the name is still taken.
+                    Err(_) => self.push_entry(
+                        &mut result.children,
+                        path,
+                        None,
+                        special_file_type(&file_type),
+                        false,
+                    ),
+                }
             }
         }
 
@@ -962,7 +1062,16 @@ impl FsWalk {
         Ok(result)
     }
 
-    fn push_file(&self, children: &mut Vec<Child>, path: PathBuf, metadata: &Metadata) {
+    // `followed` says whether the path reached here through a symlink this walk resolved, so an
+    // entry describes what it points at.
+    fn push_entry(
+        &self,
+        children: &mut Vec<Child>,
+        path: PathBuf,
+        metadata: Option<Metadata>,
+        file_type: FileType,
+        followed_symlink: bool,
+    ) {
         let relative_path = path.strip_prefix(&self.root).unwrap_or(&path);
         if self
             .config
@@ -972,10 +1081,12 @@ impl FsWalk {
         {
             return;
         }
-        let entry = DirEntry {
+        let entry = FsEntry {
             path,
+            file_type,
+            followed_symlink,
             root: Arc::clone(&self.root),
-            metadata: metadata.clone(),
+            metadata,
         };
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {
             children.push(Child::File(entry));
@@ -996,7 +1107,6 @@ impl FsWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Severity;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1006,7 +1116,7 @@ mod tests {
             .replace(std::path::MAIN_SEPARATOR, "/")
     }
 
-    async fn collect_entries(mut walk: FsWalk) -> (Vec<DirEntry>, Vec<WalkError>) {
+    async fn collect_entries(mut walk: FsWalk) -> (Vec<FsEntry>, Vec<WalkError>) {
         let mut entries = Vec::new();
         let mut errors = Vec::new();
         while let Some(result) = walk.next().await {
@@ -1214,13 +1324,25 @@ mod tests {
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].kind(), WalkErrorKind::SymlinkNotFollowed);
-        assert_eq!(errors[0].severity(), Severity::EntryWarning);
+        // The link arrives as an entry saying it is a link, so its name is accounted for while
+        // nothing claims to describe what it points at. Nothing failed, so the error channel is
+        // empty.
+        assert!(
+            errors.is_empty(),
+            "a link left alone is not a failure: {errors:?}"
+        );
+
+        let mut seen: Vec<_> = entries
+            .iter()
+            .map(|e| (e.relative_path().to_owned(), e.file_type()))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            errors[0].path().unwrap(),
-            dir.path().join("link.txt").as_path()
+            seen,
+            vec![
+                (PathBuf::from("link.txt"), FileType::Symlink),
+                (PathBuf::from("real.txt"), FileType::Regular),
+            ]
         );
     }
 
@@ -1346,7 +1468,7 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         for e in &entries {
-            assert!(e.metadata().is_file());
+            assert!(e.metadata().is_some_and(|m| m.is_file()));
         }
     }
 
@@ -1398,6 +1520,49 @@ mod tests {
 
     // Opting in names the socket. It yields no entry either way, and a consumer that
     // reads absence from the stream would otherwise take the name for free.
+    // A link the walk follows, landing on something no transfer could read. Both facts are on the
+    // one entry: what is there, and how the walk got to it. Reaching this needs following turned
+    // on, which is why it is separate from the socket found directly.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_link_followed_to_a_special_file_reports_both() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("socket.sock"), dir.path().join("link"))
+            .unwrap();
+
+        let walk = walker()
+            .follow_symlinks(true)
+            .report_untransferable(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert!(errors.is_empty(), "nothing failed: {errors:?}");
+        let mut seen: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.relative_path().to_owned(),
+                    e.file_type(),
+                    e.followed_symlink(),
+                )
+            })
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            seen,
+            vec![
+                // The link resolved, so the type is what it pointed at, not `Symlink`.
+                (PathBuf::from("link"), FileType::Socket, true),
+                (PathBuf::from("socket.sock"), FileType::Socket, false),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1414,16 +1579,22 @@ mod tests {
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].relative_path(), Path::new("regular.txt"));
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].kind(), WalkErrorKind::SpecialFile);
-        assert_eq!(errors[0].severity(), Severity::EntryWarning);
+        // The socket arrives as an entry saying what it is, at its own position, so a consumer
+        // knows the name is taken. Nothing failed, so there is nothing on the error channel.
+        assert!(errors.is_empty(), "a socket is not a failure: {errors:?}");
+
+        let mut seen: Vec<_> = entries
+            .iter()
+            .map(|e| (e.relative_path().to_owned(), e.file_type()))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            errors[0].path().unwrap(),
-            dir.path().join("socket.sock").as_path()
+            seen,
+            vec![
+                (PathBuf::from("regular.txt"), FileType::Regular),
+                (PathBuf::from("socket.sock"), FileType::Socket),
+            ]
         );
-        assert!(!errors[0].is_fatal());
     }
 
     #[cfg(unix)]
@@ -2068,8 +2239,8 @@ mod tests {
             .find(|e| e.relative_path() == Path::new("link.txt"))
             .expect("link.txt should be yielded");
         assert_eq!(
-            link_entry.metadata().len(),
-            content.len() as u64,
+            link_entry.metadata().map(|m| m.len()),
+            Some(content.len() as u64),
             "symlink metadata should reflect target file size"
         );
     }
@@ -2927,14 +3098,14 @@ mod tests {
     // --- S3 key-order tests ---
 
     // Entries must be emitted in UTF-8 byte order, as ListObjectsV2 returns keys.
-    fn assert_s3_key_order(entries: &[DirEntry]) {
+    fn assert_s3_key_order(entries: &[FsEntry]) {
         let emitted: Vec<String> = entries.iter().map(|e| norm(e.relative_path())).collect();
         let mut expected = emitted.clone();
         expected.sort();
         assert_eq!(emitted, expected, "walk must emit keys in UTF-8 byte order");
     }
 
-    fn emitted(entries: &[DirEntry]) -> Vec<String> {
+    fn emitted(entries: &[FsEntry]) -> Vec<String> {
         entries.iter().map(|e| norm(e.relative_path())).collect()
     }
 

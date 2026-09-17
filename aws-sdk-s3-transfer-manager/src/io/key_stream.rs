@@ -20,7 +20,7 @@ use aws_sdk_s3::types::Object;
 use crate::io::key::{derive_object_key, DEFAULT_DELIMITER};
 use crate::io::key_filter::KeyFilter;
 use crate::io::walk::{
-    exclude_s3_folder_markers, DirEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
+    exclude_s3_folder_markers, FsEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
 };
 
 // Whole seconds, because that is the granularity S3 reports last-modified at.
@@ -105,7 +105,7 @@ fn secs_since_epoch(modified: std::io::Result<SystemTime>) -> Option<i64> {
 // Case and Unicode form pass through untouched. Folding `README` onto `readme`, or
 // rewriting a name into a different normal form, would make a key match an object
 // that is not the same object.
-fn local_key(entry: &DirEntry) -> Result<String, WalkError> {
+fn local_key(entry: &FsEntry) -> Result<String, WalkError> {
     let relative = entry.relative_path();
     match key_for_relative_path(relative) {
         Some(key) => Ok(key),
@@ -171,9 +171,9 @@ pub(crate) fn s3_predicate(
 }
 
 impl KeyStream for FsWalk {
-    type Source = DirEntry;
+    type Source = FsEntry;
 
-    async fn next_entry(&mut self) -> Option<Result<Entry<DirEntry>, WalkError>> {
+    async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, WalkError>> {
         match self.next().await? {
             Ok(entry) => {
                 let key = match local_key(&entry) {
@@ -181,8 +181,12 @@ impl KeyStream for FsWalk {
                     Err(err) => return Some(Err(err)),
                 };
                 let meta = EntryMeta {
-                    size: entry.metadata().len(),
-                    last_modified_secs: secs_since_epoch(entry.metadata().modified()),
+                    // A walk that read no metadata gives a zero-sized entry with no time, which
+                    // a comparison reads as differing from anything and never skips.
+                    size: entry.metadata().map_or(0, |m| m.len()),
+                    last_modified_secs: entry
+                        .metadata()
+                        .and_then(|m| secs_since_epoch(m.modified())),
                 };
                 Some(Ok(Entry {
                     key,

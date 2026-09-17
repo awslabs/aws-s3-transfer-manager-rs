@@ -13,7 +13,7 @@ what it covers, the decisions behind it, and what those decisions cost.
        ┌────▼─────┐                   ┌────▼─────┐             ┐
        │  FsWalk  │                   │  S3Walk  │             │
        └────┬─────┘                   └────┬─────┘             │
-            │ DirEntry                     │ Object            │
+            │ FsEntry                      │ Object            │
        ┌────▼─────┐                   ┌────▼─────┐             │  this layer
        │ KeyFilter│                   │ KeyFilter│             │
        └────┬─────┘                   └────┬─────┘             │
@@ -90,8 +90,8 @@ after the table.
 | FR-Root-8 a key resolving outside the root | kept open | settled elsewhere; nothing here forecloses it |
 | FR-Enum-1 list both roots through | covered | only filters reduce what gets listed |
 | FR-Enum-2 folder markers invisible | covered | dropped in the stream, so no filter can bring them back, pinned by test |
-| FR-Enum-3 skip one entry, and say which kind | covered | `Severity`, four warning kinds, reported on request |
-| FR-Enum-4 symlinks off by default | inherited | `follow_symlinks` unchanged, beyond skipping unused cycle state |
+| FR-Enum-3 skip one entry, and say which kind | covered | an entry carries its `FileType`, so a skipped kind is named where the key is |
+| FR-Enum-4 symlinks off by default | inherited | `follow_symlinks` unchanged; an unfollowed link arrives as an entry saying it is one |
 | FR-Enum-5 a time the platform cannot represent | partly | `last_modified_secs` is an `Option`; never-skip is the comparison's |
 | FR-Enum-6 keys compared byte for byte | covered | no folding, no normalizing, pinned by test |
 | FR-Enum-7 start before listing finishes | partly | an entry arrives before the second listing page is fetched, pinned by test; nothing starts transfers yet |
@@ -127,18 +127,19 @@ under `io::key*` is new.
    existing, extended here                   new here
    ───────────────────────                   ────────
    FsWalk      + key_order, path_filter,     Entry<T>, EntryMeta   what both sides emit
-               report_untransferable
+               report_untransferable         FileType              what the filesystem said is there
    S3Walk      + prefix()                    KeyStream             the trait they both implement
-   DirEntry    one path plus a shared root   KeyFilter, Rule       include and exclude rules
+   FsEntry     file_type, metadata, root     KeyFilter, Rule       include and exclude rules
    WalkError   + severity(), four kinds      Severity              ends the run, failure, warning
                                              derive_object_key     path or key → relative key
                                              strip_key_prefix
 ```
 
-Five of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
+Six of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
 the switch that turns on S3 ordering; `Severity`; `WalkErrorKind::severity()` and
-`WalkError::severity()`; and four new `WalkErrorKind` variants — `SpecialFile`,
-`SymlinkNotFollowed`, `NonUtf8Name`, `DirectoryUnreadable`. `WalkErrorKind` was already
+`WalkError::severity()`; `FsEntry`, whose accessors say what the filesystem
+reported and how the walk arrived; `FileType`, which names what is at a path; and two new
+`WalkErrorKind` variants — `NonUtf8Name` and `DirectoryUnreadable`. `WalkErrorKind` was already
 `#[non_exhaustive]`, so adding variants breaks nobody, and `Severity` is `#[non_exhaustive]` for
 the same reason.
 
@@ -176,36 +177,36 @@ failure, because the consumer needs the difference to suppress the right deletes
 and an unreadable directory looks like one skipped file, which is how objects under a directory
 nobody could read get deleted.
 
-**D6. Errors classify into three levels: ends the run, entry failure, entry warning.** A warning
-must never become a failure under any policy. FR-Fail-9 requires one failure policy for the whole
-run and then names the exception this level exists for: a device, FIFO or socket "is a warning
-under either policy". Adding the third level later means reclassifying kinds that callers already
-match on.
+**D6. A thing the walk found is an entry, whatever kind of thing it is.** FR-Fail-9 says a device,
+FIFO or socket must never fail a run, and FR-Fail-7 says its key must hold back a delete. Both
+follow from the entry existing: it arrives at its own key carrying `FileType::Socket`, and a
+comparison that reads absence from position sees the key occupied. Reporting it instead put a
+per-key fact on a channel with no keys in it.
+
+What stays a warning is what no single key stands for: a name that cannot be keyed, and a link that
+loops, which stops a descent so a subtree goes unenumerated.
 
 ```
    ends the run   nothing is left to do       SourceUnreadable, NotADirectory, Service
    entry failure  should have been readable   Io, PermissionDenied, DirectoryUnreadable,
                                               BrokenSymlink
-   entry warning  no entry describes it       SpecialFile, SymlinkNotFollowed, NonUtf8Name,
-                                              SymlinkCycle
+   entry warning  no key stands for it        NonUtf8Name, SymlinkCycle
 ```
 
-A link pointing at nothing sits with the failures, which is easy to get backwards. FR-Enum-3 sorts
-by whether the entry *should have been readable*: "missing, deleted mid-run, unreadable, or a
-symlink pointing at nothing" are one group, and a device, FIFO or socket the other. A dangling
-link is a read that failed; the walk would have produced an entry had the target been there.
+A link pointing at nothing is an error while a socket is an entry, which is easy to get backwards.
+FR-Enum-3 sorts by whether the walk *should have been able to read it*: a dangling link is a read
+that failed, and the walk would have produced an entry had the target been there.
 
-**D7. Reporting a warning is opt-in, because the walkers already have callers.** `upload_objects`
+**D7. Yielding these entries is opt-in, because the walkers already have callers.** `upload_objects`
 records every walk error that does not end the run as a failure, and aborts the whole transfer on
-one under its strictest policy. A walk that began reporting sockets unbidden would therefore have
-failed uploads with nothing wrong with them.
+one under its strictest policy. A walk that yielded sockets unbidden would hand it names it
+would try to upload.
 
-Two ways out of that: teach `upload_objects` to recognise a warning, or let the caller ask for the
-reports. FR-Enum-3 is a sync requirement, so the second matches who wants the information.
+Two ways out of that: teach `upload_objects` to recognise them, or let the caller ask. FR-Enum-3 is a sync requirement, so the second matches who wants the information.
 `upload_objects` sees exactly what it saw before, and its code is untouched.
 
-Severity still belongs to the walk. The consumer that asked for the reports has to tell a socket
-from a file it could not read, and only the walk knows which it found.
+Naming the kind still belongs to the walk. A consumer has to tell a socket from a file it could not
+read, and only the walk knows which it found.
 
 **D8. The filter is upstream of reporting, not just of emitting.** An excluded entry must produce
 no warning, so every place that reports one consults the filter first — the same check the failure
@@ -300,7 +301,7 @@ in this layer exists to make that inference sound.
 Externally they now promise one thing: entries come out in S3's order.
 
 **`Entry`** (new) is the shape they agree on — the key, the metadata worth comparing, and the
-original item (`DirEntry` or `Object`). That third field looks redundant and is not: some
+original item (`FsEntry` or `Object`). That third field looks redundant and is not: some
 comparison modes need fields only the original carries, like a checksum or an ETag. Handing over a
 summary closes that door.
 
@@ -355,13 +356,14 @@ Three levels, because the consumer treats them differently:
 ```
    ends the run   → the walk never got going; there is no pile at all
    entry failure  → this one key is unknown; the failure policy decides whether to continue
-   entry warning  → something is at this key and no entry describes it; never a failure
+   entry warning  → nothing at this key can be named; never a failure
 ```
 
-The third level covers a FIFO, a socket, a device file, a name that is not valid UTF-8, a symlink
-the walk was told not to follow, and a directory reached by a link that loops. A walk reports the
-first three only when asked, through `report_untransferable`, so the operations that already use
-the walkers see nothing new. Sync copies none of them as things stand — the symlink would need a
+A FIFO, a socket, a device file and a symlink the walk was told not to follow all arrive as entries,
+each carrying the `FileType` that says which it is, and a walk yields them only when asked, through
+`report_untransferable`, so the operations that already use the walkers see nothing new. The warning
+level keeps what no key stands for: a name that is not valid UTF-8, and a directory reached by a
+link that loops. Sync copies none of them as things stand — the symlink would need a
 setting changed, the rest can never be copied at all. But *something occupies that name*, and that
 is exactly what has to stop the object at the matching key from being deleted. That is the
 difference between a skip and a silent omission.
