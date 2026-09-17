@@ -188,7 +188,7 @@ fn meminfo_total() -> Option<usize> {
 /// parent cgroup may impose a tighter limit). Tries v2, then v1 (hybrid). `None`
 /// when no limit is set, then `available_ram` uses physical RAM.
 ///
-/// Refs: cgroups(7) /proc/[pid]/cgroup <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
+/// Refs: cgroups(7) `/proc/<pid>/cgroup` <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
 /// cgroup v2 memory.max <https://docs.kernel.org/admin-guide/cgroup-v2.html>;
 /// cgroup v1 memory.limit_in_bytes <https://docs.kernel.org/admin-guide/cgroup-v1/memory.html>
 #[cfg(any(target_os = "android", target_os = "linux"))]

@@ -282,7 +282,9 @@ jobs:
           sdkmanager "${packages[@]}"
           android_sdk_root=${ANDROID_HOME:-${ANDROID_SDK_ROOT:?}}
           echo "ANDROID_HOME=${android_sdk_root}" >>"$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${android_sdk_root}/ndk/${ANDROID_NDK_VERSION}" >>"$GITHUB_ENV"
+          android_ndk_root="${android_sdk_root}/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${android_ndk_root}" >>"$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${android_ndk_root}" >>"$GITHUB_ENV"
       - name: Install Rust ${{ env.rust_stable }}
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -360,7 +362,7 @@ jobs:
           cargo doc --lib --no-deps --document-private-items
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
-          RUSTDOCFLAGS: --cfg docsrs
+          RUSTDOCFLAGS: -Dwarnings --cfg docsrs
 
   minrust:
     name: minrust

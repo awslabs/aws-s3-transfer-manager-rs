@@ -490,7 +490,7 @@ where
 /// version. It is `0.x`, so a minor bump produces a distinct `TypeId` and the
 /// downcast silently misses (a mismatch would then misclassify as retryable I/O).
 /// Replace with a stable, version-independent classification once smithy-rs
-/// exposes one: https://github.com/smithy-lang/smithy-rs/issues/4718. The
+/// exposes one: <https://github.com/smithy-lang/smithy-rs/issues/4718>. The
 /// `corrupt_body_*` integration tests assert `ErrorKind::IntegrityError` against
 /// the linked version, so a break is CI-visible rather than silent in the interim.
 fn checksum_mismatch_values(err: &(dyn std::error::Error + 'static)) -> Option<(String, String)> {
