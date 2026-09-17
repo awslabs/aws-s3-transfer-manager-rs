@@ -119,8 +119,11 @@ impl PooledBufMut {
     }
 
     /// Returns the number of grouped runs for acquisition tests.
-    #[cfg(test)]
-    pub(super) fn test_run_count(&self) -> usize {
+    ///
+    /// Fuzzing uses this only as a placement witness. It does not expose block
+    /// addresses or mutable ownership outside the pool.
+    #[cfg(any(test, s3_tm_fuzz))]
+    pub(in crate::runtime::buffer_pool) fn test_run_count(&self) -> usize {
         self.runs.len()
     }
 

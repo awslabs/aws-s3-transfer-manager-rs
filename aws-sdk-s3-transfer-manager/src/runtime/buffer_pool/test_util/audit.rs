@@ -92,6 +92,20 @@ impl BufferPool {
         }
     }
 
+    /// Reports whether a complete aligned carrier-word run is currently free.
+    ///
+    /// No claim, return, reservation, or maintenance operation may overlap
+    /// this query. The result is used before a generated acquisition to assert
+    /// the allocator's contiguous-first contract without duplicating its
+    /// cursor or claim algorithm in the reference model.
+    pub(in crate::runtime::buffer_pool) fn has_free_word_run_quiescent(
+        &self,
+        word_count: usize,
+    ) -> bool {
+        let _admission = self.inner.admission.lock();
+        self.inner.arena.has_free_word_run_quiescent(word_count)
+    }
+
     /// Runs the internal accounting and ownership reconciliation.
     #[cfg(test)]
     pub(crate) fn validate_quiescent_for_test(&self) {
@@ -223,6 +237,37 @@ mod tests {
         );
 
         drop(queued);
+        drop(reservation);
+    }
+
+    #[test]
+    fn test_placement_audit_distinguishes_partial_and_complete_word_runs() {
+        /*
+         * Two 128-carrier blocks begin completely free:
+         *
+         *     block 0            block 1
+         *     [free][free]       [free][free]
+         *
+         * A one-carrier owner damages one word. A 128-carrier part consumes
+         * the other block, leaving one complete word but no two-word run.
+         */
+        let (pool, carrier_size) = test_pool(128, 192);
+        let reservation = pool
+            .try_reserve(carrier_size * 192)
+            .unwrap()
+            .expect("placement-audit reservation");
+        assert!(pool.has_free_word_run_quiescent(2));
+
+        let small = pool.acquire(&reservation, carrier_size).unwrap();
+        assert!(pool.has_free_word_run_quiescent(2));
+
+        let part = pool.acquire(&reservation, carrier_size * 128).unwrap();
+        assert!(pool.has_free_word_run_quiescent(1));
+        assert!(!pool.has_free_word_run_quiescent(2));
+
+        drop(part);
+        assert!(pool.has_free_word_run_quiescent(2));
+        drop(small);
         drop(reservation);
     }
 

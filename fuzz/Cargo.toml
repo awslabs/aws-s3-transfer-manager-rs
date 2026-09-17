@@ -17,3 +17,10 @@ path = "fuzz_targets/buffer_pool_operations.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "buffer-pool-placement"
+path = "fuzz_targets/buffer_pool_placement.rs"
+test = false
+doc = false
+bench = false

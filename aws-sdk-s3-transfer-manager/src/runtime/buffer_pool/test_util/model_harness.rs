@@ -23,14 +23,13 @@ use super::super::{
 };
 use super::audit::PoolAuditReport;
 use super::operation_sequence::{
-    decode_fuzz_input, Operation, ALL_REMAINING_SELECTOR, CONFIGURED_CARRIERS,
-    GROW_ONE_CARRIER_SELECTOR,
+    decode_fuzz_input, decode_fuzz_input_for_profile, Operation, SequenceProfile,
+    ALL_REMAINING_SELECTOR, COMPACT_PROFILE, GROW_ONE_CARRIER_SELECTOR, PLACEMENT_PROFILE,
 };
 use super::pool::test_pool;
 #[cfg(test)]
 use super::pool::test_pool_with_carrier_size;
 
-const BLOCK_CARRIERS: usize = 2;
 const RESERVATION_SLOTS: usize = 4;
 const REQUEST_SLOTS: usize = 4;
 const BUFFER_SLOTS: usize = 4;
@@ -275,6 +274,7 @@ enum ModelRequest {
 
 /// Plain accounting and ownership state used as the reference implementation.
 struct PoolModel {
+    profile: SequenceProfile,
     active: usize,
     available: usize,
     uncovered: usize,
@@ -291,8 +291,9 @@ struct PoolModel {
 }
 
 impl PoolModel {
-    fn new() -> Self {
+    fn new(profile: SequenceProfile) -> Self {
         Self {
+            profile,
             active: 0,
             available: 0,
             uncovered: 0,
@@ -325,7 +326,7 @@ impl PoolModel {
     fn can_grant(&self, envelope: usize) -> bool {
         self.admission_used()
             .checked_add(envelope)
-            .is_some_and(|next| next <= CONFIGURED_CARRIERS)
+            .is_some_and(|next| next <= self.profile.configured_carriers())
     }
 
     fn grant(&mut self, envelope: usize) -> usize {
@@ -495,8 +496,8 @@ impl PoolModel {
             return;
         }
         let rounded = target
-            .div_ceil(BLOCK_CARRIERS)
-            .checked_mul(BLOCK_CARRIERS)
+            .div_ceil(self.profile.block_carriers())
+            .checked_mul(self.profile.block_carriers())
             .expect("model prepared capacity overflowed");
         self.prepared = self.prepared.max(rounded);
     }
@@ -504,10 +505,12 @@ impl PoolModel {
 
 /// Applies operations to the real pool and its independent reference state.
 ///
-/// The runner retains only public handles. Its one privileged observation is
-/// [`BufferPool::audit_quiescent`], which reconciles accounting and live ownership after each
-/// operation.
+/// The runner retains only public handles. Its privileged observations are the
+/// complete quiescent audit and a read-only free-word predicate. The latter
+/// supplies only the precondition for a placement assertion; it does not
+/// reproduce cursor selection or bitmap mutation.
 struct Runner {
+    profile: SequenceProfile,
     pool: BufferPool,
     carrier_size: usize,
     reservations: Vec<Option<ReservationHandle>>,
@@ -519,28 +522,35 @@ struct Runner {
 }
 
 impl Runner {
-    fn new() -> Self {
-        Self::with_pool(test_pool(BLOCK_CARRIERS, CONFIGURED_CARRIERS))
+    fn with_profile(profile: SequenceProfile) -> Self {
+        Self::with_pool(
+            profile,
+            test_pool(profile.block_carriers(), profile.configured_carriers()),
+        )
     }
 
     #[cfg(test)]
-    fn with_carrier_size(carrier_size: usize) -> Self {
-        Self::with_pool(test_pool_with_carrier_size(
-            BLOCK_CARRIERS,
-            CONFIGURED_CARRIERS,
-            carrier_size,
-        ))
+    fn with_profile_and_carrier_size(profile: SequenceProfile, carrier_size: usize) -> Self {
+        Self::with_pool(
+            profile,
+            test_pool_with_carrier_size(
+                profile.block_carriers(),
+                profile.configured_carriers(),
+                carrier_size,
+            ),
+        )
     }
 
-    fn with_pool((pool, carrier_size): (BufferPool, usize)) -> Self {
+    fn with_pool(profile: SequenceProfile, (pool, carrier_size): (BufferPool, usize)) -> Self {
         Self {
+            profile,
             pool,
             carrier_size,
             reservations: empty_slots(RESERVATION_SLOTS),
             requests: empty_slots(REQUEST_SLOTS),
             buffers: empty_slots(BUFFER_SLOTS),
             values: empty_slots(VALUE_SLOTS),
-            model: PoolModel::new(),
+            model: PoolModel::new(profile),
             report: SequenceReport::default(),
         }
     }
@@ -629,7 +639,7 @@ impl Runner {
             assert!(matches!(result, Err(ReserveError::InvalidSize)));
             return;
         }
-        if envelope > CONFIGURED_CARRIERS {
+        if envelope > self.profile.configured_carriers() {
             assert!(matches!(result, Err(ReserveError::ExceedsCapacity)));
             return;
         }
@@ -674,7 +684,9 @@ impl Runner {
                 assert!(matches!(poll, Poll::Ready(Err(ReserveError::InvalidSize))));
                 self.requests[request] = None;
             }
-            ModelRequest::Unpolled { envelope } if envelope > CONFIGURED_CARRIERS => {
+            ModelRequest::Unpolled { envelope }
+                if envelope > self.profile.configured_carriers() =>
+            {
                 assert!(matches!(
                     poll,
                     Poll::Ready(Err(ReserveError::ExceedsCapacity))
@@ -753,10 +765,12 @@ impl Runner {
         }
 
         if unreserved {
+            let contiguous_opportunity = self.has_contiguous_opportunity(carriers);
             let value = self
                 .pool
                 .acquire_unreserved(self.bytes_for_envelope(carriers))
                 .expect("valid unreserved acquisition failed");
+            self.record_acquisition_placement(carriers, &value, contiguous_opportunity);
             self.model.debit_unreserved(carriers);
             let mut model_carriers = self.model.allocate_carriers(None, carriers);
             for carrier in &mut model_carriers {
@@ -773,14 +787,16 @@ impl Runner {
         let Some(handle) = self.reservations[reservation].as_ref() else {
             return;
         };
+        let reservation_state = handle.state;
         let can_debit = {
-            let state = &self.model.reservations[handle.state];
+            let state = &self.model.reservations[reservation_state];
             state.open
                 && state
                     .direct_outstanding
                     .checked_add(carriers)
                     .is_some_and(|next| next <= state.envelope)
         };
+        let contiguous_opportunity = can_debit && self.has_contiguous_opportunity(carriers);
         let result = self
             .pool
             .acquire(&handle.value, self.bytes_for_envelope(carriers));
@@ -792,16 +808,54 @@ impl Runner {
             return;
         }
         let value = result.expect("valid reserved acquisition failed");
-        assert!(self.model.debit_reserved(handle.state, carriers));
-        let mut model_carriers = self.model.allocate_carriers(Some(handle.state), carriers);
+        self.record_acquisition_placement(carriers, &value, contiguous_opportunity);
+        assert!(self.model.debit_reserved(reservation_state, carriers));
+        let mut model_carriers = self
+            .model
+            .allocate_carriers(Some(reservation_state), carriers);
         for carrier in &mut model_carriers {
             carrier.range_len = self.carrier_size;
         }
         self.model.buffers[buffer] = Some(ModelBuffer {
-            authority: Some(handle.state),
+            authority: Some(reservation_state),
             carriers: model_carriers,
         });
         self.buffers[buffer] = Some(value);
+    }
+
+    fn has_contiguous_opportunity(&self, carriers: usize) -> bool {
+        self.profile.is_whole_word_claim(carriers)
+            && self
+                .pool
+                .has_free_word_run_quiescent(carriers / u64::BITS as usize)
+    }
+
+    fn record_acquisition_placement(
+        &mut self,
+        carriers: usize,
+        value: &PooledBufMut,
+        contiguous_opportunity: bool,
+    ) {
+        if self.profile.is_whole_word_claim(carriers) {
+            let run_count = value.test_run_count();
+            self.report.whole_word_acquisitions += 1;
+            if contiguous_opportunity {
+                self.report.preexisting_contiguous_opportunities += 1;
+                assert_eq!(
+                    run_count, 1,
+                    "whole-word acquisition ignored a complete free bitmap-word run"
+                );
+            }
+            if run_count == 1 {
+                self.report.contiguous_whole_word_acquisitions += 1;
+            } else {
+                self.report.segmented_whole_word_acquisitions += 1;
+            }
+        } else if carriers < u64::BITS as usize {
+            self.report.partial_word_acquisitions += 1;
+        } else {
+            self.report.general_large_acquisitions += 1;
+        }
     }
 
     fn grow(&mut self, buffer: usize, selector: u16) {
@@ -1146,13 +1200,34 @@ fn empty_slots<T>(count: usize) -> Vec<Option<T>> {
 #[must_use = "operation sequence milestones must be asserted or explicitly discarded"]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::runtime::buffer_pool) struct SequenceReport {
+    /// Successful acquisitions eligible for whole-word placement.
+    pub(in crate::runtime::buffer_pool) whole_word_acquisitions: usize,
+    /// Eligible acquisitions preceded by a complete aligned free run.
+    pub(in crate::runtime::buffer_pool) preexisting_contiguous_opportunities: usize,
+    /// Eligible acquisitions represented by one physical carrier run.
+    pub(in crate::runtime::buffer_pool) contiguous_whole_word_acquisitions: usize,
+    /// Eligible acquisitions assembled from more than one physical run.
+    pub(in crate::runtime::buffer_pool) segmented_whole_word_acquisitions: usize,
+    /// Successful acquisitions smaller than one bitmap word.
+    pub(in crate::runtime::buffer_pool) partial_word_acquisitions: usize,
+    /// Successful acquisitions at least one word large but ineligible for the
+    /// preferred whole-word path.
+    pub(in crate::runtime::buffer_pool) general_large_acquisitions: usize,
+    /// Mutable buffers that successfully acquired additional carrier capacity.
     pub(in crate::runtime::buffer_pool) successful_growths: usize,
+    /// Growth attempts rejected because their reservation authority was closed.
     pub(in crate::runtime::buffer_pool) reservation_closed_growth_rejections: usize,
+    /// Reservation requests observed waiting in the FIFO.
     pub(in crate::runtime::buffer_pool) queued_requests: usize,
+    /// Previously queued reservation requests that were later granted.
     pub(in crate::runtime::buffer_pool) granted_queued_requests: usize,
+    /// Mutable prefixes published as immutable values.
     pub(in crate::runtime::buffer_pool) publications: usize,
+    /// Mutable buffers frozen into immutable values.
     pub(in crate::runtime::buffer_pool) freezes: usize,
+    /// Immutable values cloned into another value slot.
     pub(in crate::runtime::buffer_pool) clones: usize,
+    /// Immutable subranges placed into another value slot.
     pub(in crate::runtime::buffer_pool) slices: usize,
 }
 
@@ -1182,9 +1257,13 @@ fn select_growth_writable(selector: u16, remaining: usize, carrier_size: usize) 
     }
 }
 
-/// Applies a complete operation sequence and requires all ownership to drain on teardown.
-pub(in crate::runtime::buffer_pool) fn run_sequence(operations: &[Operation]) -> SequenceReport {
-    let mut runner = Runner::new();
+/// Applies one profile-specific sequence, audits every step, and requires all
+/// ownership to drain during teardown.
+pub(in crate::runtime::buffer_pool) fn run_sequence(
+    profile: SequenceProfile,
+    operations: &[Operation],
+) -> SequenceReport {
+    let mut runner = Runner::with_profile(profile);
     for (step, operation) in operations.iter().enumerate() {
         runner.apply(operation);
         runner.assert_consistent(step, operation);
@@ -1192,19 +1271,38 @@ pub(in crate::runtime::buffer_pool) fn run_sequence(operations: &[Operation]) ->
     runner.finish()
 }
 
-/// Decodes and executes one bounded libFuzzer input.
+/// Decodes and executes one bounded compact-profile libFuzzer input.
 pub(in crate::runtime::buffer_pool) fn run_fuzz_input(data: &[u8]) -> SequenceReport {
-    run_sequence(&decode_fuzz_input(data))
+    run_sequence(COMPACT_PROFILE, &decode_fuzz_input(data))
 }
 
-/// Replays one fuzz input with an explicit carrier size.
+/// Decodes and executes one placement-profile libFuzzer input.
+pub(in crate::runtime::buffer_pool) fn run_placement_fuzz_input(data: &[u8]) -> SequenceReport {
+    let operations = decode_fuzz_input_for_profile(data, PLACEMENT_PROFILE);
+    run_sequence(PLACEMENT_PROFILE, &operations)
+}
+
+/// Replays one compact-profile fuzz input with an explicit carrier size.
 #[cfg(test)]
 pub(in crate::runtime::buffer_pool) fn run_fuzz_input_with_carrier_size(
     data: &[u8],
     carrier_size: usize,
 ) -> SequenceReport {
-    let mut runner = Runner::with_carrier_size(carrier_size);
-    for (step, operation) in decode_fuzz_input(data).iter().enumerate() {
+    run_fuzz_input_with_profile_and_carrier_size(data, COMPACT_PROFILE, carrier_size)
+}
+
+/// Replays one profile-specific fuzz input with an explicit carrier size.
+#[cfg(test)]
+pub(in crate::runtime::buffer_pool) fn run_fuzz_input_with_profile_and_carrier_size(
+    data: &[u8],
+    profile: SequenceProfile,
+    carrier_size: usize,
+) -> SequenceReport {
+    let mut runner = Runner::with_profile_and_carrier_size(profile, carrier_size);
+    for (step, operation) in decode_fuzz_input_for_profile(data, profile)
+        .iter()
+        .enumerate()
+    {
         runner.apply(operation);
         runner.assert_consistent(step, operation);
     }
@@ -1235,7 +1333,7 @@ mod tests {
             expected_uncovered,
         ) in cases
         {
-            let mut model = PoolModel::new();
+            let mut model = PoolModel::new(COMPACT_PROFILE);
             model.active = active;
             model.available = available;
             model.uncovered = uncovered;
@@ -1256,7 +1354,7 @@ mod tests {
 
     #[test]
     fn close_preserves_coverage_for_an_open_reservation() {
-        let mut model = PoolModel::new();
+        let mut model = PoolModel::new(COMPACT_PROFILE);
         model.active = 4;
         model.available = 3;
         model.reservations = vec![
@@ -1295,7 +1393,7 @@ mod tests {
             expected_uncovered,
         ) in debit_cases
         {
-            let mut model = PoolModel::new();
+            let mut model = PoolModel::new(COMPACT_PROFILE);
             model.active = active;
             model.available = available;
             model.uncovered = uncovered;
@@ -1323,7 +1421,7 @@ mod tests {
             expected_uncovered,
         ) in release_cases
         {
-            let mut model = PoolModel::new();
+            let mut model = PoolModel::new(COMPACT_PROFILE);
             model.active = active;
             model.available = available;
             model.uncovered = uncovered;
