@@ -3237,7 +3237,7 @@ claim is all-or-error at the API boundary. Failure returns completed physical ca
 provisional bits, releases every untransferred charge, and restores direct-acquisition authority
 before returning an error.
 
-Aggregate rollback and final return use the same accounting transition for count `N`:
+Final return retires current aggregate pressure for count `N`:
 
 ```text
 repaid = min(N, uncovered_charges)
@@ -3246,18 +3246,36 @@ uncovered_charges -= repaid
 available_coverage += N - repaid
 ```
 
-The transition requires `N <= outstanding_charges`. Acquisition debit ownership and one charge per
-`CarrierGuard` establish that precondition. Physical carriers are returned before a final-return
+Rollback instead retains the debit's original `uncovered_added` contribution:
+
+```text
+nominally_repaid = min(uncovered_added, uncovered_charges)
+coverage_room = active_planned_demand - available_coverage
+required_for_active = max(0, N - coverage_room)
+repaid = max(nominally_repaid, required_for_active)
+
+uncovered_charges -= repaid
+available_coverage += N - repaid
+```
+
+This prevents a covered debit that never produced ownership from consuming unrelated uncovered
+charges. `required_for_active` handles a concurrent reservation close that reclassified the
+provisional charge after its debit: rollback removes enough uncovered pressure to keep available
+coverage within current active demand. If a concurrent return has already removed part of the
+debit's uncovered contribution, the remaining rollback restores coverage instead.
+
+Both transitions require `N <= outstanding_charges`. Acquisition debit ownership and one charge
+per `CarrierGuard` establish that precondition. Physical carriers are returned before either
 transition. A direct return also decrements `direct_outstanding`; it restores direct-acquisition
 authority only while the reservation remains open.
 
 A final return with `repaid > 0` enters admission serialization after the packed transition and
 reconsiders the FIFO. After admission has been released for physical claim, acquisition rollback
-follows the same rule after returning its physical bits: if its packed inverse removes an uncovered
-charge, it enters admission serialization and drains the FIFO. Preparation failure reverses its
-charge while the initial guard remains held and requires no separate drain. Serialized fallback
-never acquires or reacquires admission internally; after an optimistic miss, its caller supplies one
-held guard before entering arena state.
+returns its physical bits before applying the debit-specific inverse. If that inverse removes an
+uncovered charge, it enters admission serialization and drains the FIFO. Preparation failure
+reverses its charge while the initial guard remains held and requires no separate drain.
+Serialized fallback never acquires or reacquires admission internally; after an optimistic miss,
+its caller supplies one held guard before entering arena state.
 
 ### Reservation close
 
