@@ -173,6 +173,9 @@ case "$mode" in
                 echo "Android emulator log:" >&2
                 tail -200 "$emulator_log" >&2 || true
             fi
+            if [[ -n "${android_cert_bundle:-}" ]]; then
+                adb -s "$emulator_serial" shell rm -f "$android_cert_bundle" >/dev/null 2>&1 || true
+            fi
             adb -s "$emulator_serial" emu kill >/dev/null 2>&1 || true
             kill "$emulator_pid" >/dev/null 2>&1 || true
             wait "$emulator_pid" 2>/dev/null || true
@@ -224,23 +227,39 @@ case "$mode" in
             exit 1
         fi
 
-        android_cert_dirs=()
+        android_cert_sources=
         for cert_dir in \
             /apex/com.android.conscrypt/cacerts \
             /system/etc/security/cacerts
         do
             if adb -s "$emulator_serial" shell test -d "$cert_dir"; then
-                android_cert_dirs+=("$cert_dir")
+                android_cert_sources+=" $cert_dir/*"
             fi
         done
-        if (( ${#android_cert_dirs[@]} == 0 )); then
+        if [[ -z "$android_cert_sources" ]]; then
             echo "Android system CA directories are unavailable" >&2
             exit 1
         fi
 
+        # rustls-native-certs expects an OpenSSL-style PEM file or a directory
+        # it can enumerate. Android's system CA directories are not directly
+        # usable from the deployed test process, so materialize an accessible
+        # bundle in the adb shell domain and fail closed if it contains no roots.
+        android_cert_bundle=/data/local/tmp/s3-tm-ca-certificates.pem
+        adb -s "$emulator_serial" shell \
+            "cat$android_cert_sources > $android_cert_bundle"
+        android_cert_count=$(
+            adb -s "$emulator_serial" shell \
+                "grep -c 'BEGIN CERTIFICATE' $android_cert_bundle || true" |
+                tr -d '\r'
+        )
+        if [[ ! "$android_cert_count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Android CA bundle contains no PEM certificates" >&2
+            exit 1
+        fi
+
         export CARGO_NDK_ADB_SERIAL=$emulator_serial
-        ANDROID_TEST_SSL_CERT_DIR=$(IFS=:; echo "${android_cert_dirs[*]}")
-        export ANDROID_TEST_SSL_CERT_DIR
+        export ANDROID_TEST_SSL_CERT_FILE=$android_cert_bundle
         run_android_tests
         ;;
     *)

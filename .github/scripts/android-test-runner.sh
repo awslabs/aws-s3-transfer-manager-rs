@@ -12,8 +12,8 @@ if [[ -z "${CARGO_NDK_ADB_SERIAL:-}" ]]; then
     exit 2
 fi
 
-if [[ -z "${ANDROID_TEST_SSL_CERT_DIR:-}" ]]; then
-    echo "ANDROID_TEST_SSL_CERT_DIR must name the Android CA directories" >&2
+if [[ -z "${ANDROID_TEST_SSL_CERT_FILE:-}" ]]; then
+    echo "ANDROID_TEST_SSL_CERT_FILE must name the Android CA bundle" >&2
     exit 2
 fi
 
@@ -33,4 +33,4 @@ trap cleanup EXIT
 adb -s "$CARGO_NDK_ADB_SERIAL" push "$test_binary" "$device_path" >/dev/null
 adb -s "$CARGO_NDK_ADB_SERIAL" shell chmod 755 "$device_path"
 adb -s "$CARGO_NDK_ADB_SERIAL" shell \
-    env "SSL_CERT_DIR=$ANDROID_TEST_SSL_CERT_DIR" "$device_path" "$@"
+    env "SSL_CERT_FILE=$ANDROID_TEST_SSL_CERT_FILE" "$device_path" "$@"
