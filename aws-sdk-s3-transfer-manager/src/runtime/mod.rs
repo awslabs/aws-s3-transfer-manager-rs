@@ -16,6 +16,8 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::Topology;
 
+#[allow(dead_code)]
+pub(crate) mod buffer_pool;
 pub(crate) mod memory;
 pub(crate) mod platform;
 pub(crate) mod sync;
