@@ -181,8 +181,11 @@ sync MUST warn and treat the file as though it were last modified at the UNIX ep
 1970.
 
 The case is a portability one: a timestamp written by a machine with a wider range than the one reading it.
-`aws s3 sync` hits it between 64-bit and 32-bit systems. A modification time before 1970 is the same case,
-since not every platform can express one as an offset from the epoch.
+`aws s3 sync` hits it between 64-bit and 32-bit systems.
+
+A modification time before 1970 belongs here only where the platform cannot express it. Where it can, the
+time MUST be reported as it stands, as a negative offset from the epoch. Substituting there would leave the
+pair failing the time test on every run, so a restored backup would transfer its whole tree every time.
 
 - The substituted time MUST NOT let the file be skipped: whatever the time test is, it MUST come out false
   so the file gets transferred. The epoch is a stand-in for reporting, not evidence that the two sides

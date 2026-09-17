@@ -64,13 +64,33 @@ pub(crate) fn view_incomplete(err: &WalkError) -> bool {
     err.is_fatal() || err.kind() == WalkErrorKind::DirectoryUnreadable
 }
 
-// `None` when the time is missing, or is far enough outside this platform's range
-// that it cannot be expressed as seconds from the epoch.
+// Seconds from the epoch, negative for a time before it.
+//
+// A file dated before 1970 is a real time a run can compare, so it is reported as it stands.
+// Reading it as unknown instead would leave the pair failing the time test on every run, and a
+// restored backup would transfer its whole tree every time.
+//
+// `None` covers the two cases with no time to report: the filesystem gave none, or the value is
+// too large to hold in seconds. The second cannot happen where a clock is no wider than `i64`
+// seconds, and the conversion is checked anyway, because a cast on a wider platform would wrap
+// and hand a comparison a time nobody recorded.
 fn secs_since_epoch(modified: std::io::Result<SystemTime>) -> Option<i64> {
-    modified
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+    let modified = modified.ok()?;
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_secs()).ok(),
+        // A time before the epoch counts down, so a fraction of a second puts it in the second
+        // below. `stat` reports 1.9 seconds before the epoch as -2, and a run that called it -1
+        // would disagree with every other tool reading the same file.
+        Err(before) => {
+            let before = before.duration();
+            let secs = i64::try_from(before.as_secs()).ok()?;
+            if before.subsec_nanos() == 0 {
+                secs.checked_neg()
+            } else {
+                secs.checked_neg()?.checked_sub(1)
+            }
+        }
+    }
 }
 
 // Keys are compared relative to their own root, so no prefix is applied here. The
@@ -363,23 +383,6 @@ mod tests {
         assert!(entry.meta.last_modified_secs.unwrap() > 1_600_000_000);
         // What a transfer opens, not a path rebuilt from the key.
         assert_eq!(entry.source.path(), dir.path().join("f"));
-    }
-
-    #[test]
-    fn an_unreadable_mtime_is_unknown_not_a_substituted_value() {
-        // A consumer has to be able to tell "the epoch" from "no idea", since only
-        // the second one must never let a comparison decide the pair matches.
-        assert_eq!(
-            secs_since_epoch(Err(std::io::Error::other("unsupported"))),
-            None
-        );
-        let pre_epoch = UNIX_EPOCH - std::time::Duration::from_secs(1);
-        assert_eq!(secs_since_epoch(Ok(pre_epoch)), None);
-        assert_eq!(secs_since_epoch(Ok(UNIX_EPOCH)), Some(0));
-        assert_eq!(
-            secs_since_epoch(Ok(UNIX_EPOCH + std::time::Duration::from_secs(42))),
-            Some(42)
-        );
     }
 
     #[test]
@@ -1028,5 +1031,53 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind(), WalkErrorKind::BrokenSymlink);
         assert!(!view_incomplete(&errors[0]));
+    }
+
+    // A time either side of the epoch is a time a run can compare, so both are reported. Only a
+    // value with no seconds to give comes back unknown.
+    #[test]
+    fn a_time_before_the_epoch_is_reported_as_a_negative() {
+        use std::time::Duration;
+
+        let day = Duration::from_secs(86_400);
+        assert_eq!(secs_since_epoch(Ok(UNIX_EPOCH)), Some(0));
+        assert_eq!(secs_since_epoch(Ok(UNIX_EPOCH + day)), Some(86_400));
+        assert_eq!(secs_since_epoch(Ok(UNIX_EPOCH - day)), Some(-86_400));
+
+        // Both sides count down to the second below, the way `stat` reports them, so a run
+        // agrees with every other tool reading the same file.
+        let fraction = Duration::from_millis(1_900);
+        assert_eq!(secs_since_epoch(Ok(UNIX_EPOCH + fraction)), Some(1));
+        assert_eq!(secs_since_epoch(Ok(UNIX_EPOCH - fraction)), Some(-2));
+    }
+
+    #[test]
+    fn a_time_with_no_seconds_to_give_is_unknown() {
+        assert_eq!(
+            secs_since_epoch(Err(std::io::Error::other("no metadata"))),
+            None
+        );
+    }
+
+    // The largest time this platform holds still converts, and one second more cannot be built
+    // at all, so the checked conversion never fails here. It guards a platform whose clock is
+    // wider than `i64` seconds; should this assertion ever fail, that platform has arrived and
+    // `secs_since_epoch` wants testing against a time it cannot report.
+    #[test]
+    fn no_time_this_platform_can_hold_overflows_the_conversion() {
+        use std::time::Duration;
+
+        let largest = UNIX_EPOCH
+            .checked_add(Duration::from_secs(u64::try_from(i64::MAX).unwrap()))
+            .expect("i64::MAX seconds from the epoch");
+        assert_eq!(secs_since_epoch(Ok(largest)), Some(i64::MAX));
+
+        let beyond = u64::try_from(i64::MAX).unwrap() + 1;
+        assert!(
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(beyond))
+                .is_none(),
+            "this platform holds a time beyond i64 seconds, so the conversion needs testing"
+        );
     }
 }
