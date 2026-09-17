@@ -56,6 +56,25 @@ AWS_PROFILE=<profile-name> RUST_LOG=trace cargo run --example cp /local/path/<fi
 NOTE: To run in release mode add `--release/-r` to the command, see `cargo run -h` .
 NOTE: `trace` may be too verbose, you can see just this library's logs with `RUST_LOG=aws_sdk_s3_transfer_manager=trace`
 
+#### Runtime diagnostics
+
+`AWS_S3_TM_DIAGNOSTICS` accepts comma-separated, case-sensitive `key=value`
+settings. Memory snapshots use the
+`aws_sdk_s3_transfer_manager::memory` tracing target:
+
+```sh
+AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms,memory.detail=1 \
+RUST_LOG=aws_sdk_s3_transfer_manager::memory=debug \
+cargo run --release --example cp -- ...
+```
+
+`memory.snapshot` is `off` by default and otherwise accepts a positive integer
+number of milliseconds, such as `1000ms`; intervals below `100ms` use `100ms`.
+`memory.detail=0` is the default low-frequency collection level.
+`memory.detail=1` additionally updates optimistic allocator counters on every
+acquisition and can add measurable overhead. Snapshot cadence and detail level
+are independent.
+
 #### Flamegraphs
 
 See [cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph) for more prerequisites and installation information.

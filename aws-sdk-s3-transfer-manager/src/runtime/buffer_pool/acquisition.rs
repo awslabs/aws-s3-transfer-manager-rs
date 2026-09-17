@@ -20,7 +20,7 @@ use crate::runtime::sync::sync::Arc;
 /// Failure to acquire a complete mutable carrier batch.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AcquireError {
+pub enum AcquireError {
     /// The byte request was zero.
     InvalidSize,
     /// The reservation belongs to another pool.
@@ -261,6 +261,8 @@ pub(super) fn acquire_count(
     count: CarrierCount,
 ) -> Result<Vec<Arc<CarrierGuard>>, AcquireError> {
     let debit = AcquisitionDebit::install(pool, direct, count)?;
+    #[cfg(test)]
+    pool.test_hooks.record_acquisition_attempt();
     let mut pending = PendingAcquisition::new(debit);
     pending.claim = Some(
         pool.arena

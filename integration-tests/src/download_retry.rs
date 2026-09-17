@@ -691,7 +691,7 @@ async fn tm_download(tm: &TmClient, bucket: &str, key: &str) -> Result<Vec<u8>, 
     let mut data = Vec::new();
     while let Some(chunk) = handle.body_mut().next().await {
         match chunk {
-            Ok(c) => data.extend_from_slice(&c.data.into_bytes()),
+            Ok(c) => data.extend_from_slice(&c.data.into_contiguous()),
             Err(_) => {
                 let _ = handle.join().await;
                 return Err(());

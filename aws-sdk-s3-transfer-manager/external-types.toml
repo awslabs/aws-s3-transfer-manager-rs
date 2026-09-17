@@ -4,6 +4,7 @@ allowed_external_types = [
     "aws_smithy_types::*",
     "aws_types::request_id::RequestId",
     "bytes::buf::buf_impl::Buf",
+    "bytes::buf::buf_mut::BufMut",
     "bytes::bytes::Bytes",
     "tokio::io::async_read::AsyncRead",
     "tokio::runtime::task::error::JoinError",

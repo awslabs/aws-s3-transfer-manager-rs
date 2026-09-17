@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::task::Waker;
+use std::time::{Duration, Instant};
 
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::sync::{Arc, MutexGuard};
@@ -30,17 +31,15 @@ use coverage::CoverageSnapshot;
 pub(super) use coverage::{CoverageState, MAX_PACKED_CARRIERS};
 
 mod waiter;
-pub(crate) use waiter::ReserveFuture;
+pub use waiter::ReserveFuture;
 pub(super) use waiter::{ReservationPoll, WaitSlot, WaitState, Waiter};
 
 /// Planned-demand state protected by the pool admission mutex.
 pub(super) struct AdmissionState {
     /// Counters participating in grant and preparation decisions.
     pub(super) ledger: AdmissionLedger,
-    /// Reservation requests retained in strict arrival order.
-    pub(super) waiters: VecDeque<Waiter>,
-    /// Cumulative requests that entered the FIFO.
-    pub(super) parked_reservations_total: u64,
+    /// Reservation requests and queue observations retained in strict arrival order.
+    queue: ReservationQueue,
 }
 
 impl AdmissionState {
@@ -52,9 +51,227 @@ impl AdmissionState {
                 prepared_capacity: CarrierCount::ZERO,
                 active_planned_demand: CarrierCount::ZERO,
             },
-            waiters: VecDeque::new(),
-            parked_reservations_total: 0,
+            queue: ReservationQueue::new(Instant::now()),
         }
+    }
+
+    /// Returns whether no reservation request is queued.
+    pub(super) fn waiters_is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Returns the current reservation FIFO depth.
+    pub(super) fn waiter_count(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Returns the reservation request at the FIFO head.
+    pub(super) fn front_waiter(&self) -> Option<&Waiter> {
+        self.queue.front()
+    }
+
+    /// Appends one request after reserving its FIFO metadata.
+    ///
+    /// Returns whether the queue changed from empty to non-empty.
+    pub(super) fn enqueue_waiter(
+        &mut self,
+        waiter: Waiter,
+        now: Instant,
+    ) -> Result<bool, std::collections::TryReserveError> {
+        self.queue.enqueue(waiter, now)
+    }
+
+    /// Removes a reservation request and returns whether pressure cleared.
+    pub(super) fn remove_waiter(&mut self, slot: &Arc<WaitSlot>, now: Instant) -> bool {
+        self.queue.remove(slot, now)
+    }
+
+    /// Removes the FIFO head and returns whether pressure cleared.
+    pub(super) fn pop_front_waiter(&mut self, now: Instant) -> (Option<Waiter>, bool) {
+        self.queue.pop_front(now)
+    }
+
+    /// Takes interval queue statistics without changing the FIFO.
+    pub(super) fn take_queue_diagnostics(
+        &mut self,
+        now: Instant,
+    ) -> ReservationQueueDiagnosticSample {
+        self.queue.take_diagnostics(now)
+    }
+
+    /// Returns the cumulative requests that entered the FIFO.
+    pub(super) fn reservation_enqueues_total(&self) -> u64 {
+        self.queue.reservation_enqueues_total
+    }
+
+    /// Sets the cumulative enqueue count for saturation testing.
+    #[cfg(test)]
+    pub(super) fn set_reservation_enqueues_total_for_test(&mut self, total: u64) {
+        self.queue.reservation_enqueues_total = total;
+    }
+}
+
+/// Reservation FIFO and observations derived from its mutation order.
+struct ReservationQueue {
+    waiters: VecDeque<Waiter>,
+    diagnostics: ReservationQueueDiagnostics,
+    reservation_enqueues_total: u64,
+}
+
+impl ReservationQueue {
+    /// Creates an empty queue and diagnostic interval.
+    fn new(now: Instant) -> Self {
+        Self {
+            waiters: VecDeque::new(),
+            diagnostics: ReservationQueueDiagnostics::new(now),
+            reservation_enqueues_total: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.waiters.len()
+    }
+
+    fn front(&self) -> Option<&Waiter> {
+        self.waiters.front()
+    }
+
+    /// Reserves metadata, appends one request, and records its queue transition.
+    fn enqueue(
+        &mut self,
+        waiter: Waiter,
+        now: Instant,
+    ) -> Result<bool, std::collections::TryReserveError> {
+        self.waiters.try_reserve(1)?;
+        self.waiters.push_back(waiter);
+        self.reservation_enqueues_total = self.reservation_enqueues_total.saturating_add(1);
+        Ok(matches!(
+            self.diagnostics.record_depth(self.waiters.len(), now),
+            Some(ReservationQueueTransition::BecameNonempty)
+        ))
+    }
+
+    /// Removes a linked request and reports the nonempty-to-empty edge.
+    fn remove(&mut self, slot: &Arc<WaitSlot>, now: Instant) -> bool {
+        let Some(index) = self
+            .waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(&waiter.slot, slot))
+        else {
+            return false;
+        };
+        self.waiters.remove(index);
+        matches!(
+            self.diagnostics.record_depth(self.waiters.len(), now),
+            Some(ReservationQueueTransition::BecameEmpty)
+        )
+    }
+
+    /// Removes the oldest request and reports the nonempty-to-empty edge.
+    fn pop_front(&mut self, now: Instant) -> (Option<Waiter>, bool) {
+        let waiter = self.waiters.pop_front();
+        let cleared = waiter.is_some()
+            && matches!(
+                self.diagnostics.record_depth(self.waiters.len(), now),
+                Some(ReservationQueueTransition::BecameEmpty)
+            );
+        (waiter, cleared)
+    }
+
+    fn take_diagnostics(&mut self, now: Instant) -> ReservationQueueDiagnosticSample {
+        self.diagnostics.take(self.waiters.len(), now)
+    }
+}
+
+/// A reservation FIFO crossing its empty boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationQueueTransition {
+    /// The FIFO changed from empty to non-empty.
+    BecameNonempty,
+    /// The FIFO changed from non-empty to empty.
+    BecameEmpty,
+}
+
+/// Queue occupancy accumulated since the preceding diagnostic snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReservationQueueDiagnosticSample {
+    /// Requests retained in FIFO order at the snapshot boundary.
+    pub(super) current_depth: usize,
+    /// Largest FIFO depth observed during the interval.
+    pub(super) peak_depth: usize,
+    /// Time during the interval for which the FIFO was non-empty.
+    pub(super) nonempty_duration: Duration,
+    /// Duration of the current uninterrupted non-empty interval.
+    pub(super) continuous_nonempty_duration: Option<Duration>,
+}
+
+/// Queue timing and high-water state protected by admission serialization.
+struct ReservationQueueDiagnostics {
+    current_depth: usize,
+    peak_depth: usize,
+    nonempty_duration: Duration,
+    became_nonempty_at: Option<Instant>,
+    last_observed_at: Instant,
+}
+
+impl ReservationQueueDiagnostics {
+    /// Creates an empty interval at pool construction.
+    fn new(now: Instant) -> Self {
+        Self {
+            current_depth: 0,
+            peak_depth: 0,
+            nonempty_duration: Duration::ZERO,
+            became_nonempty_at: None,
+            last_observed_at: now,
+        }
+    }
+
+    /// Accounts elapsed non-empty time before changing the observed depth.
+    fn record_depth(&mut self, depth: usize, now: Instant) -> Option<ReservationQueueTransition> {
+        self.accrue(now);
+        let transition = match (self.current_depth == 0, depth == 0) {
+            (true, false) => {
+                self.became_nonempty_at = Some(now);
+                Some(ReservationQueueTransition::BecameNonempty)
+            }
+            (false, true) => {
+                self.became_nonempty_at = None;
+                Some(ReservationQueueTransition::BecameEmpty)
+            }
+            _ => None,
+        };
+        self.current_depth = depth;
+        self.peak_depth = self.peak_depth.max(depth);
+        transition
+    }
+
+    /// Returns and resets interval statistics at one coherent queue depth.
+    fn take(&mut self, depth: usize, now: Instant) -> ReservationQueueDiagnosticSample {
+        let _ = self.record_depth(depth, now);
+        let sample = ReservationQueueDiagnosticSample {
+            current_depth: depth,
+            peak_depth: self.peak_depth,
+            nonempty_duration: self.nonempty_duration,
+            continuous_nonempty_duration: self
+                .became_nonempty_at
+                .map(|started| now.saturating_duration_since(started)),
+        };
+        self.peak_depth = depth;
+        self.nonempty_duration = Duration::ZERO;
+        sample
+    }
+
+    /// Adds elapsed non-empty time through `now`.
+    fn accrue(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_observed_at);
+        if self.current_depth != 0 {
+            self.nonempty_duration = self.nonempty_duration.saturating_add(elapsed);
+        }
+        self.last_observed_at = now;
     }
 }
 
@@ -247,7 +464,7 @@ impl AdmissionLedger {
 /// Failure to create a new reservation.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReserveError {
+pub enum ReserveError {
     /// The byte request was zero.
     InvalidSize,
     /// Physical storage could not be prepared.
@@ -275,8 +492,12 @@ impl fmt::Display for ReserveError {
 
 impl std::error::Error for ReserveError {}
 
-/// Non-cloneable acquisition authority for one admitted envelope.
-pub(crate) struct Reservation {
+/// Non-cloneable acquisition authority for one admitted memory envelope.
+///
+/// Dropping the reservation closes it. Mutable buffers and immutable views
+/// already acquired through it remain valid and keep their memory charged
+/// until their final owners are dropped.
+pub struct Reservation {
     state: Option<Arc<ReservationState>>,
 }
 
@@ -302,8 +523,12 @@ impl Reservation {
         }
     }
 
-    /// Revokes acquisition of new carriers and retires planned demand.
-    pub(crate) fn close_acquisition(mut self) {
+    /// Revokes new acquisition and retires this reservation's planned demand.
+    ///
+    /// Buffers acquired before this call keep their existing capacity, but
+    /// attempts to grow them return
+    /// [`AcquireError::ReservationClosed`](super::AcquireError::ReservationClosed).
+    pub fn close_acquisition(mut self) {
         self.close();
     }
 
@@ -316,6 +541,15 @@ impl Reservation {
     /// Returns the private state retained by a direct acquisition.
     pub(super) fn acquisition_state(&self) -> Option<&Arc<ReservationState>> {
         self.state.as_ref()
+    }
+}
+
+impl fmt::Debug for Reservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Reservation")
+            .field("open", &self.state.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -363,15 +597,18 @@ impl ReservationState {
 
     /// Closes direct authority and withdraws this reservation's envelope.
     fn close_acquisition(&self) {
-        let wakers = {
+        let drained = {
             let mut admission = AdmissionGuard::new(self.pool.admission.lock());
             let Some(direct_outstanding) = self.owner_state.close() else {
                 return;
             };
             admission.close_envelope(&self.pool.coverage, self.envelope, direct_outstanding);
-            PoolInner::drain_fifo_locked(&self.pool, &mut admission)
+            PoolInner::drain_fifo_locked(&self.pool, &mut admission, false)
         };
-        wake_all(wakers);
+        if let Some(sample) = drained.queue_sample {
+            self.pool.log_reservation_queue_transition(sample);
+        }
+        wake_all(drained.wakers);
     }
 }
 
@@ -533,6 +770,44 @@ mod tests {
     use super::super::virtual_memory::VirtualMemoryOperation;
     use super::super::BufferPool;
     use super::*;
+
+    #[test]
+    fn test_queue_diagnostics_report_depth_peak_and_nonempty_durations() {
+        let start = Instant::now();
+        let mut diagnostics = ReservationQueueDiagnostics::new(start);
+
+        assert_eq!(
+            diagnostics.record_depth(1, start + Duration::from_millis(10)),
+            Some(ReservationQueueTransition::BecameNonempty)
+        );
+        assert_eq!(
+            diagnostics.record_depth(4, start + Duration::from_millis(20)),
+            None
+        );
+        assert_eq!(
+            diagnostics.take(4, start + Duration::from_millis(30)),
+            ReservationQueueDiagnosticSample {
+                current_depth: 4,
+                peak_depth: 4,
+                nonempty_duration: Duration::from_millis(20),
+                continuous_nonempty_duration: Some(Duration::from_millis(20)),
+            }
+        );
+
+        assert_eq!(
+            diagnostics.record_depth(0, start + Duration::from_millis(50)),
+            Some(ReservationQueueTransition::BecameEmpty)
+        );
+        assert_eq!(
+            diagnostics.take(0, start + Duration::from_millis(60)),
+            ReservationQueueDiagnosticSample {
+                current_depth: 0,
+                peak_depth: 4,
+                nonempty_duration: Duration::from_millis(20),
+                continuous_nonempty_duration: None,
+            }
+        );
+    }
 
     #[test]
     fn test_immediate_grant_prepares_before_publication() {
