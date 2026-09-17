@@ -10,13 +10,14 @@
 // their own item types, so this module derives a key and comparable metadata for
 // each.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::types::Object;
 
-use crate::io::key::{derive_object_key, strip_key_prefix};
+use crate::io::key::{derive_object_key, DEFAULT_DELIMITER};
 use crate::io::key_filter::KeyFilter;
 use crate::io::walk::{
     exclude_s3_folder_markers, DirEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
@@ -139,7 +140,13 @@ pub(crate) fn s3_predicate(
             return false;
         }
         let key = obj.key().unwrap_or_default();
-        filter.allows(strip_key_prefix(key, prefix.as_deref(), None))
+        // A key outside the root is not the filter's business: it should never have been
+        // listed, and testing a rule against a key that is not under the root would answer
+        // about a name nobody asked for.
+        match relative_key(key, &root_prefix(prefix.as_deref())) {
+            Some(relative) => filter.allows(relative),
+            None => false,
+        }
     }
 }
 
@@ -175,7 +182,7 @@ impl KeyStream for S3Walk {
         loop {
             match self.next().await? {
                 Err(err) => return Some(Err(err)),
-                Ok(obj) => match key_and_meta(&obj, self.prefix()) {
+                Ok(obj) => match key_and_meta(&obj, &root_prefix(self.prefix())) {
                     Ok(None) => continue,
                     Ok(Some((key, meta))) => {
                         return Some(Ok(Entry {
@@ -197,24 +204,74 @@ impl KeyStream for S3Walk {
     }
 }
 
-// `Ok(None)` is the prefix itself, or a folder marker. `Err` means the listing was
-// not what the API documents.
+// The prefix a sync root lists under, which always names a place that holds entries.
+//
+//     Some("data")   ->  "data/"
+//     Some("data/")  ->  "data/"
+//     Some("")       ->  ""
+//     None           ->  ""
+//
+// A root holds entries, so `data` means the folder `data/` and never the keys `datab/x` or
+// `datafile` that merely start the same way. Sending the delimiter to `ListObjectsV2` keeps
+// those out of the listing, which is what lets the keys that do arrive stay in order once the
+// prefix comes off them.
+//
+// A prefix that already names a place is borrowed, so the only case that allocates is the one
+// a caller wrote without the delimiter.
+pub(crate) fn root_prefix(prefix: Option<&str>) -> Cow<'_, str> {
+    match prefix {
+        None => Cow::Borrowed(""),
+        Some(prefix) if prefix.is_empty() || prefix.ends_with(DEFAULT_DELIMITER) => {
+            Cow::Borrowed(prefix)
+        }
+        Some(prefix) => Cow::Owned(format!("{prefix}{DEFAULT_DELIMITER}")),
+    }
+}
+
+// The key relative to a sync root, or `None` when the key does not sit under it.
+//
+// Under the root `data/`:
+//
+//     "data/a"     ->  Some("a")
+//     "data/x/y"   ->  Some("x/y")
+//     "data/"      ->  None          the root holds nothing of its own
+//     "datab/x"    ->  None          a neighbour, not a child
+//     "datafile"   ->  None          a neighbour, not a child
+//     "data"       ->  None          an object named like the root is not under it
+//
+// With no root, every key is already relative:
+//
+//     "a/b.txt"    ->  Some("a/b.txt")
+//
+// Every key this accepts shares the same leading run, so taking that run off cannot reorder
+// them. The merge reads absence from position, so keeping the order is what keeps a key the
+// destination still holds from looking deleted.
+//
+// `strip_key_prefix` cannot serve here. It strips a prefix that names a span of keys, which is
+// right for a download of `s3://bucket/data` and wrong for a sync: with `data` it turns
+// `data/z` into `z` and leaves `datab/x` alone, and `z` sorts after `datab/x`.
+pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a str> {
+    let relative = key.strip_prefix(root_prefix)?;
+    (!relative.is_empty()).then_some(relative)
+}
+
+// `Ok(None)` is the prefix itself, a folder marker, or a key outside the root. `Err` means
+// the listing was not what the API documents.
 //
 // Markers are dropped here, so they are invisible whether or not a filter is
 // configured. The walker's own default filter is replaced by any filter a caller
 // sets, which would otherwise make an entry out of a key holding nothing.
 fn key_and_meta(
     obj: &Object,
-    prefix: Option<&str>,
+    root_prefix: &str,
 ) -> Result<Option<(String, EntryMeta)>, &'static str> {
     if !exclude_s3_folder_markers(obj) {
         return Ok(None);
     }
     let key = obj.key().ok_or("listing returned an object with no key")?;
-    let relative = strip_key_prefix(key, prefix, None);
-    if relative.is_empty() {
+    let Some(relative) = relative_key(key, root_prefix) else {
         return Ok(None);
-    }
+    };
     let size = obj.size().ok_or("listing returned no size")?;
     let last_modified_secs = obj
         .last_modified()
@@ -248,10 +305,14 @@ mod tests {
             .walk(FsWalkContext::builder().root(root).build())
     }
 
+    // A sync lists under a root, so the prefix it hands the walker always names a place. Once
+    // roots are parsed this normalising happens there; the listing never asks for the sibling
+    // keys, and `relative_key` stays the guard that a wrong prefix cannot produce a wrong plan.
     fn s3(client: aws_sdk_s3::Client, prefix: Option<&str>) -> S3Walk {
         let mut builder = S3Walker::builder();
-        if let Some(prefix) = prefix {
-            builder = builder.prefix(prefix);
+        let root = root_prefix(prefix);
+        if !root.is_empty() {
+            builder = builder.prefix(root.into_owned());
         }
         builder.build().walk(
             S3WalkContext::builder()
@@ -581,7 +642,7 @@ mod tests {
 
     #[test]
     fn object_keys_lose_the_root_prefix() {
-        let (key, meta) = key_and_meta(&object("data/a/b.txt", 3), Some("data/"))
+        let (key, meta) = key_and_meta(&object("data/a/b.txt", 3), "data/")
             .unwrap()
             .unwrap();
         assert_eq!(key, "a/b.txt");
@@ -591,27 +652,64 @@ mod tests {
 
     // A prefix with and without its trailing delimiter must key alike, or the two
     // sides would disagree about every key.
+    // A root names a place, so a prefix without the delimiter still lists one: `data` reaches
+    // `data/` and nothing else.
     #[test]
-    fn a_trailing_delimiter_on_the_prefix_makes_no_difference() {
-        let with = key_and_meta(&object("data/a.txt", 1), Some("data/"))
-            .unwrap()
-            .unwrap();
-        let without = key_and_meta(&object("data/a.txt", 1), Some("data"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(with.0, "a.txt");
-        assert_eq!(with.0, without.0);
+    fn a_root_prefix_always_names_a_place() {
+        assert_eq!(root_prefix(Some("data")), "data/");
+        assert_eq!(root_prefix(Some("data/")), "data/");
+        assert_eq!(root_prefix(None), "");
+        assert_eq!(root_prefix(Some("")), "");
+
+        // A prefix that already names a place costs no allocation.
+        assert!(matches!(root_prefix(Some("data/")), Cow::Borrowed(_)));
+        assert!(matches!(root_prefix(None), Cow::Borrowed(_)));
+        assert!(matches!(root_prefix(Some("data")), Cow::Owned(_)));
+    }
+
+    // The keys a sync lists under a root keep their order once the prefix comes off, which is
+    // what the merge reads absence from. Stripping a prefix that names a span of names instead
+    // would reorder them: `data/z` becomes `z` while `datab/x` is left alone, and `z` sorts
+    // after `datab/x`.
+    #[test]
+    fn taking_the_root_prefix_off_keeps_the_keys_in_order() {
+        let prefix = root_prefix(Some("data"));
+        let listed = ["data/a", "data/z", "datab/x", "datafile"];
+
+        let under_the_root: Vec<_> = listed
+            .iter()
+            .filter_map(|key| relative_key(key, &prefix))
+            .collect();
+
+        assert_eq!(
+            under_the_root,
+            ["a", "z"],
+            "only keys under the root arrive"
+        );
+        assert!(
+            under_the_root.windows(2).all(|w| w[0] < w[1]),
+            "keys under a root stay sorted after the prefix comes off"
+        );
+    }
+
+    #[test]
+    fn a_key_outside_the_root_has_no_relative_key() {
+        let prefix = root_prefix(Some("data"));
+        assert_eq!(relative_key("datab/x", &prefix), None);
+        assert_eq!(relative_key("datafile", &prefix), None);
+        // The root itself holds nothing of its own.
+        assert_eq!(relative_key("data/", &prefix), None);
     }
 
     #[test]
     fn an_unprefixed_listing_keeps_whole_keys() {
-        let (key, _) = key_and_meta(&object("a/b.txt", 1), None).unwrap().unwrap();
+        let (key, _) = key_and_meta(&object("a/b.txt", 1), "").unwrap().unwrap();
         assert_eq!(key, "a/b.txt");
     }
 
     #[test]
     fn the_prefix_itself_is_not_an_entry() {
-        assert!(key_and_meta(&object("data/", 0), Some("data/"))
+        assert!(key_and_meta(&object("data/", 0), "data/")
             .unwrap()
             .is_none());
     }
@@ -622,10 +720,10 @@ mod tests {
             .key("data/a")
             .last_modified(DateTime::from_secs(1))
             .build();
-        assert!(key_and_meta(&no_size, Some("data/")).is_err());
+        assert!(key_and_meta(&no_size, "data/").is_err());
 
         let no_time = Object::builder().key("data/a").size(1).build();
-        assert!(key_and_meta(&no_time, Some("data/")).is_err());
+        assert!(key_and_meta(&no_time, "data/").is_err());
     }
 
     // Readability is decided from the listing, without a HeadObject per key.
