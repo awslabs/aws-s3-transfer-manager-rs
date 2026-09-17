@@ -284,7 +284,10 @@ pub(super) fn acquire_count(
                     .unwrap_or_else(|| invariant_violation("pending acquisition lost its claim")),
             )
         };
-        fallback.map_err(map_arena_error)?;
+        if let Err(error) = fallback {
+            PoolInner::request_cleanup_after_arena_error(pool, &error);
+            return Err(map_arena_error(error));
+        }
     }
 
     pending.finish()
