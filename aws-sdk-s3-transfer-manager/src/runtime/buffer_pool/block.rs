@@ -1086,6 +1086,39 @@ impl BlockSlot {
             })
     }
 
+    /// Returns whether the active bitmap contains `word_count` complete free words.
+    ///
+    /// The caller must externally quiesce claims and returns. This is a
+    /// test/fuzz oracle, not an allocation hint: it reads the bitmap with an
+    /// implementation-independent linear scan and does not mutate ownership.
+    #[cfg(any(test, s3_tm_fuzz))]
+    pub(super) fn has_free_word_run_quiescent(&self, word_count: usize) -> bool {
+        if word_count == 0 {
+            return false;
+        }
+        let current = self.current.load();
+        let Some(incarnation) = current.as_ref() else {
+            return false;
+        };
+        if incarnation.state.load(Ordering::Acquire) != IncarnationState::Active {
+            return false;
+        }
+
+        let mut free_words = 0;
+        for (word_index, word) in incarnation.in_use.iter().enumerate() {
+            let valid = bitmap_word_mask(self.geometry, word_index);
+            if valid == u64::MAX && word.load(Ordering::Acquire) & valid == 0 {
+                free_words += 1;
+                if free_words == word_count {
+                    return true;
+                }
+            } else {
+                free_words = 0;
+            }
+        }
+        false
+    }
+
     /// Counts set valid bits in the current incarnation.
     #[cfg(test)]
     pub(super) fn live_carriers(&self) -> usize {

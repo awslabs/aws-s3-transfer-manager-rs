@@ -171,6 +171,11 @@ pub mod __fuzz {
     pub fn buffer_pool_operations(data: &[u8]) {
         crate::runtime::buffer_pool::run_fuzz_input(data);
     }
+
+    /// Runs one encoded buffer-pool placement sequence.
+    pub fn buffer_pool_placement(data: &[u8]) {
+        crate::runtime::buffer_pool::run_placement_fuzz_input(data);
+    }
 }
 
 /// HTTP related components and utils

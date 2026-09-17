@@ -1,23 +1,30 @@
 # Buffer-pool fuzzing
 
-The `buffer-pool-operations` target checks public buffer-pool state
-transitions against an independent accounting and ownership model.
+Both targets check public buffer-pool state transitions against the same
+independent accounting and ownership model:
+
+- `buffer-pool-operations` uses two-carrier blocks and four admitted carriers
+  to explore many lifecycle transitions cheaply.
+- `buffer-pool-placement` uses 128-carrier blocks and a 192-carrier admission
+  limit to reach 64-bit bitmap-word placement and mixed small/part claims.
 
 ```text
  checked-in seeds ─┐
-                   ├─> libFuzzer mutations ─> 8-byte records ─> Operation values
- evolving corpus ──┘                                           │
-                                                               v
-                                          ┌──────────── real BufferPool
-                                          │
-                                          └──────────── PoolModel
-                                                               │
-                                                               v
-                                  compare bytes, handles, metrics, and audit
-                                         after every operation
-                                                               │
-                                                               v
-                                  drop all owners and require zero teardown
+                   ├─> libFuzzer ─> 8-byte records ─> Operation values
+ evolving corpus ──┘              │
+                                  ├─ compact geometry
+                                  └─ placement geometry: [64-bit word][64-bit word]
+                                                           │
+                                      ┌────────────────────┴───────────────────┐
+                                      v                                        v
+                               real BufferPool                            PoolModel
+                                      └────────────────────┬───────────────────┘
+                                                           v
+                                      compare bytes, metrics, ownership, audit
+                                                           │
+                         placement only: free-word snapshot ├─> require one run
+                                                           v
+                                         drop all owners and require teardown
 ```
 
 Property tests generate typed `Operation` values directly. Fuzzing and
@@ -39,6 +46,19 @@ RUSTFLAGS="-Dwarnings --cfg s3_tm_fuzz" \
     cargo +nightly-2026-09-10 fuzz run buffer-pool-operations \
     corpus/buffer-pool-operations \
     ../aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/tests/corpus/buffer-pool-operations \
+    -- -max_len=1024 -timeout=10
+```
+
+Use `buffer-pool-placement` and the matching checked-in corpus directory for a
+placement campaign. The repository runner discovers and executes both targets.
+
+```bash
+mkdir -p corpus/buffer-pool-placement
+
+RUSTFLAGS="-Dwarnings --cfg s3_tm_fuzz" \
+    cargo +nightly-2026-09-10 fuzz run buffer-pool-placement \
+    corpus/buffer-pool-placement \
+    ../aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/tests/corpus/buffer-pool-placement \
     -- -max_len=1024 -timeout=10
 ```
 
@@ -86,8 +106,10 @@ for installation, engine options, minimization, and coverage workflows.
 ## Checked-in seeds
 
 A checked-in seed is a small reviewed input that ordinary tests replay without
-starting libFuzzer. The current seeds cover distinct lifecycle, queue-return,
-aliasing, and growth scenarios.
+starting libFuzzer. The compact seeds cover lifecycle, queue-return, aliasing,
+and growth. Placement seeds cover both preferred one-run placement around a
+partial-word owner and legal segmented fallback when small owners damage every
+candidate two-word run.
 
 Check in another seed when it:
 
@@ -108,9 +130,8 @@ runtime page size can represent them.
 
 To add a seed:
 
-1. Copy the minimized input into
-   `src/runtime/buffer_pool/tests/corpus/buffer-pool-operations/` in the
-   transfer-manager package.
+1. Copy the minimized input into the directory matching the fuzz target under
+   `src/runtime/buffer_pool/tests/corpus/` in the transfer-manager package.
 2. Add its name and `include_bytes!` entry to `tests/fuzz_replay.rs`.
 3. Run the replay test and a short native campaign.
 

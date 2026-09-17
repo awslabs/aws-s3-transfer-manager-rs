@@ -257,6 +257,20 @@ impl Arena {
         sample
     }
 
+    /// Returns whether one prepared slot contains a complete free word run.
+    ///
+    /// The caller must externally quiesce claims and returns. Unlike the
+    /// allocator's cursor-bounded and serialized searches, this test/fuzz
+    /// oracle examines every current slot and performs no bitmap mutation.
+    #[cfg(any(test, s3_tm_fuzz))]
+    pub(super) fn has_free_word_run_quiescent(&self, word_count: usize) -> bool {
+        let generation = self.registry_generation();
+        generation
+            .slots_in_claim_order()
+            .iter()
+            .any(|slot| slot.has_free_word_run_quiescent(word_count))
+    }
+
     /// Prepares capacity through `target` under admission serialization.
     ///
     /// Whole-block preparation may raise prepared capacity above `target`.
@@ -1280,6 +1294,7 @@ mod tests {
 
     use super::super::admission::{AdmissionGuard, AdmissionState, MAX_PACKED_CARRIERS};
     use super::super::block::TrimBlocked;
+    use super::super::test_util::operation_sequence::PLACEMENT_PROFILE;
     use super::super::virtual_memory::{page_size, VirtualMemoryOperation};
     use super::super::CarrierCount;
     use super::*;
@@ -1596,6 +1611,25 @@ mod tests {
 
         assert_eq!(indices, vec![0, 128, 64]);
         assert_fully_free(&slot);
+    }
+
+    #[test]
+    fn placement_profile_matches_arena_whole_word_eligibility() {
+        let arena = test_arena(
+            geometry_with_carriers(PLACEMENT_PROFILE.block_carriers()),
+            1,
+        )
+        .unwrap();
+
+        for carriers in 0..=PLACEMENT_PROFILE.configured_carriers() + 1 {
+            assert_eq!(
+                arena
+                    .contiguous_word_count(CarrierCount::new(carriers))
+                    .is_some(),
+                PLACEMENT_PROFILE.is_whole_word_claim(carriers),
+                "placement profile drifted at {carriers} carriers"
+            );
+        }
     }
 
     #[test]
@@ -2274,6 +2308,76 @@ mod tests {
     )]
     fn packed_fallback_work_has_an_exact_ci_regression_barrier() {
         assert_packed_fallback_work(&[8, 16, 32, 64, 128, 256], 64, 1, 256);
+    }
+
+    #[test]
+    fn whole_word_miss_has_an_exact_serialized_work_barrier() {
+        /*
+         * Four two-word slots each retain one carrier in each word:
+         *
+         *     [x...............................][x...............................]
+         *
+         * No complete two-word run exists. Serialized completion must inspect
+         * all four slots for a contiguous run, then consume 126 fragmented
+         * carriers from slot 0 and the final two from slot 1. The exact work is
+         * therefore 4 + 2 slot inspections, with no growth pass.
+         */
+        const SLOTS: usize = 4;
+        const WORDS_PER_SLOT: usize = 2;
+        const REQUEST: usize = WORDS_PER_SLOT * u64::BITS as usize;
+
+        let arena = test_arena(geometry_with_carriers(REQUEST), 1).unwrap();
+        let slots = prepare_slots(&arena, SLOTS);
+        let mut blockers = Vec::new();
+        for slot in &slots {
+            for word in 0..WORDS_PER_SLOT {
+                let blocker = BlockSlot::try_claim_words(slot, word, 1, CarrierCount::new(1))
+                    .unwrap()
+                    .into_provisional()
+                    .expect("one carrier remains free in each word")
+                    .into_carriers()
+                    .unwrap();
+                blockers.push(blocker);
+            }
+        }
+
+        let admission = admission_with_prepared(CarrierCount::new(SLOTS * REQUEST));
+        let before = arena.diagnostics();
+        let mut batch = arena.claim_optimistic(CarrierCount::new(REQUEST)).unwrap();
+        assert_eq!(batch.claimed(), CarrierCount::ZERO);
+        arena
+            .complete_claim_serialized(&mut AdmissionGuard::new(admission.lock()), &mut batch)
+            .unwrap();
+        let carriers = batch.finish().unwrap();
+        let after = arena.diagnostics();
+
+        assert_eq!(after.serialized_fallbacks - before.serialized_fallbacks, 1);
+        assert_eq!(
+            after.serialized_slots_inspected - before.serialized_slots_inspected,
+            6
+        );
+        assert_eq!(after.blocks_prepared, before.blocks_prepared);
+        assert_eq!(after.block_ranges_reserved, before.block_ranges_reserved);
+        assert_eq!(
+            carriers
+                .iter()
+                .filter(|carrier| carrier.slot_id() == slots[0].id())
+                .count(),
+            REQUEST - WORDS_PER_SLOT
+        );
+        assert_eq!(
+            carriers
+                .iter()
+                .filter(|carrier| carrier.slot_id() == slots[1].id())
+                .count(),
+            WORDS_PER_SLOT
+        );
+
+        drop(carriers);
+        drop(blockers);
+        for slot in &slots {
+            assert_fully_free(slot);
+        }
     }
 
     #[test]

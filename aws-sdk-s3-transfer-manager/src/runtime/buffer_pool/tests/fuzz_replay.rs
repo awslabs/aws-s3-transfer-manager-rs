@@ -6,9 +6,10 @@
 //! Curated byte-sequence replay through the model harness.
 
 use super::super::test_util::model_harness::{
-    run_fuzz_input, run_fuzz_input_with_carrier_size, SequenceReport,
+    run_fuzz_input, run_fuzz_input_with_carrier_size, run_fuzz_input_with_profile_and_carrier_size,
+    run_placement_fuzz_input, SequenceReport,
 };
-use super::super::test_util::operation_sequence::FUZZ_RECORD_BYTES;
+use super::super::test_util::operation_sequence::{FUZZ_RECORD_BYTES, PLACEMENT_PROFILE};
 use super::super::virtual_memory::page_size;
 
 const CURATED_FUZZ_CORPUS: &[(&str, &[u8])] = &[
@@ -26,31 +27,73 @@ const CURATED_FUZZ_CORPUS: &[(&str, &[u8])] = &[
     ),
 ];
 
+const PLACEMENT_FUZZ_CORPUS: &[(&str, &[u8])] = &[
+    (
+        "partial-word-before-part",
+        include_bytes!("corpus/buffer-pool-placement/partial-word-before-part"),
+    ),
+    (
+        "fragmented-fallback",
+        include_bytes!("corpus/buffer-pool-placement/fragmented-fallback"),
+    ),
+];
+
 #[test]
 fn curated_inputs_replay_through_the_reference_model() {
     for (name, input) in CURATED_FUZZ_CORPUS {
-        assert!(!input.is_empty(), "{name} is empty");
-        assert_eq!(
-            input.len() % FUZZ_RECORD_BYTES,
-            0,
-            "{name} contains a partial operation record"
+        assert_replay_at_supported_carrier_sizes(
+            name,
+            input,
+            run_fuzz_input,
+            run_fuzz_input_with_carrier_size,
+            assert_named_milestones,
         );
+    }
+}
 
-        assert_named_milestones(name, run_fuzz_input(input));
+#[test]
+fn placement_inputs_replay_through_the_reference_model() {
+    for (name, input) in PLACEMENT_FUZZ_CORPUS {
+        assert_replay_at_supported_carrier_sizes(
+            name,
+            input,
+            run_placement_fuzz_input,
+            |input, carrier_size| {
+                run_fuzz_input_with_profile_and_carrier_size(input, PLACEMENT_PROFILE, carrier_size)
+            },
+            assert_placement_milestones,
+        );
+    }
+}
 
-        let runtime_page_size = page_size().expect("runtime page size").get();
-        for carrier_size in [4 * 1024, 16 * 1024, 64 * 1024] {
-            if carrier_size != runtime_page_size
-                && carrier_size >= runtime_page_size
-                && carrier_size.is_multiple_of(runtime_page_size)
-            {
-                assert_named_milestones(
-                    name,
-                    run_fuzz_input_with_carrier_size(input, carrier_size),
-                );
-            }
+fn assert_replay_at_supported_carrier_sizes(
+    name: &str,
+    input: &[u8],
+    run_default: impl Fn(&[u8]) -> SequenceReport,
+    run_with_carrier_size: impl Fn(&[u8], usize) -> SequenceReport,
+    assert_milestones: impl Fn(&str, SequenceReport),
+) {
+    assert_valid_record_file(name, input);
+    assert_milestones(name, run_default(input));
+
+    let runtime_page_size = page_size().expect("runtime page size").get();
+    for carrier_size in [4 * 1024, 16 * 1024, 64 * 1024] {
+        if carrier_size != runtime_page_size
+            && carrier_size >= runtime_page_size
+            && carrier_size.is_multiple_of(runtime_page_size)
+        {
+            assert_milestones(name, run_with_carrier_size(input, carrier_size));
         }
     }
+}
+
+fn assert_valid_record_file(name: &str, input: &[u8]) {
+    assert!(!input.is_empty(), "{name} is empty");
+    assert_eq!(
+        input.len() % FUZZ_RECORD_BYTES,
+        0,
+        "{name} contains a partial operation record"
+    );
 }
 
 fn assert_named_milestones(name: &str, report: SequenceReport) {
@@ -73,13 +116,41 @@ fn assert_named_milestones(name: &str, report: SequenceReport) {
     }
 }
 
+fn assert_placement_milestones(name: &str, report: SequenceReport) {
+    match name {
+        "partial-word-before-part" => {
+            assert_eq!(report.whole_word_acquisitions, 2);
+            assert_eq!(report.preexisting_contiguous_opportunities, 2);
+            assert_eq!(report.contiguous_whole_word_acquisitions, 2);
+            assert_eq!(report.segmented_whole_word_acquisitions, 0);
+            assert_eq!(report.partial_word_acquisitions, 1);
+            assert_eq!(report.freezes, 1);
+        }
+        "fragmented-fallback" => {
+            assert_eq!(report.whole_word_acquisitions, 1);
+            assert_eq!(report.preexisting_contiguous_opportunities, 0);
+            assert_eq!(report.contiguous_whole_word_acquisitions, 0);
+            assert_eq!(report.segmented_whole_word_acquisitions, 1);
+            assert_eq!(report.partial_word_acquisitions, 3);
+        }
+        _ => panic!("curated placement input has no semantic assertions: {name}"),
+    }
+}
+
 // cargo-ndk copies the test binary to the device without the package source
 // tree. Host CI retains the exact source-directory manifest assertion.
 #[cfg(all(not(miri), not(target_os = "android")))]
 #[test]
 fn manifest_matches_the_checked_in_directory() {
+    assert_manifest_matches("buffer-pool-operations", CURATED_FUZZ_CORPUS);
+    assert_manifest_matches("buffer-pool-placement", PLACEMENT_FUZZ_CORPUS);
+}
+
+#[cfg(all(not(miri), not(target_os = "android")))]
+fn assert_manifest_matches(directory: &str, corpus: &[(&str, &[u8])]) {
     let corpus_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/runtime/buffer_pool/tests/corpus/buffer-pool-operations");
+        .join("src/runtime/buffer_pool/tests/corpus")
+        .join(directory);
     let mut actual = std::fs::read_dir(&corpus_dir)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", corpus_dir.display()))
         .map(|entry| {
@@ -100,7 +171,7 @@ fn manifest_matches_the_checked_in_directory() {
         .collect::<Vec<_>>();
     actual.sort();
 
-    let mut expected = CURATED_FUZZ_CORPUS
+    let mut expected = corpus
         .iter()
         .map(|(name, _)| (*name).to_owned())
         .collect::<Vec<_>>();
