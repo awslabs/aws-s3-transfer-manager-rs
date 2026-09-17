@@ -376,9 +376,15 @@ impl S3Walk {
 
             if let Some(prefix) = &self.current_prefix {
                 let prefix = prefix.clone();
-                let token = self.next_token.take();
                 let first_page = self.initial_first_page_pending;
-                match self.list_page(&prefix, token.as_deref(), first_page).await {
+                // The token stays where it is until the page arrives. Dropping this future
+                // after taking it would leave the walk with no way back to its own position,
+                // so the next call would list this prefix from the start and hand out keys it
+                // had already given, which a consumer reading in key order cannot survive.
+                match self
+                    .list_page(&prefix, self.next_token.as_deref(), first_page)
+                    .await
+                {
                     Ok(page) => {
                         self.initial_first_page_pending = false;
 
@@ -398,6 +404,7 @@ impl S3Walk {
                             self.next_token = page.next_token;
                             self.current_prefix = Some(prefix);
                         } else {
+                            self.next_token = None;
                             self.current_prefix = None;
                         }
                     }
@@ -411,6 +418,13 @@ impl S3Walk {
 
             match self.pending_prefixes.pop_front() {
                 Some(prefix) => {
+                    // A prefix is only finished once its last page came back without a token,
+                    // and that is where the token is cleared. Holding one here would list a new
+                    // prefix from another prefix's position.
+                    debug_assert!(
+                        self.next_token.is_none(),
+                        "a new prefix starts from its own first page",
+                    );
                     self.current_prefix = Some(prefix);
                 }
                 None => {
@@ -723,6 +737,60 @@ mod tests {
             keys,
             vec!["root.txt", "sub/a.txt", "sub/b.txt", "sub/c.txt"]
         );
+    }
+
+    // One prefix paginates while another is still waiting, so the walk finishes the first and
+    // moves on. A token left over from the finished prefix would list the next one from another
+    // prefix's position, which is what the token being cleared on the last page prevents.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_prefix_that_paginated_does_not_carry_its_token_to_the_next() {
+        let root = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_common_prefixes(Some(vec![
+                    CommonPrefix::builder().prefix("one/").build(),
+                    CommonPrefix::builder().prefix("two/").build(),
+                ]))
+                .build()
+        });
+        let one_page1 = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .is_truncated(true)
+                .next_continuation_token("tok")
+                .set_contents(Some(vec![Object::builder().key("one/a.txt").build()]))
+                .build()
+        });
+        let one_page2 = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder().key("one/b.txt").build()]))
+                .build()
+        });
+        // The second prefix is listed from its own beginning, carrying no token.
+        let two = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(|req| {
+                req.prefix() == Some("two/") && req.continuation_token().is_none()
+            })
+            .then_output(|| {
+                ListObjectsV2Output::builder()
+                    .set_contents(Some(vec![Object::builder().key("two/c.txt").build()]))
+                    .build()
+            });
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&root, &one_page1, &one_page2, &two]
+        );
+
+        let mut walk = walker()
+            .delimiter("/")
+            .build()
+            .walk(s3ctx(client, "test-bucket"));
+
+        let mut keys = Vec::new();
+        while let Some(result) = walk.next().await {
+            keys.push(result.unwrap().key.unwrap());
+        }
+        assert_eq!(keys, vec!["one/a.txt", "one/b.txt", "two/c.txt"]);
     }
 
     #[cfg_attr(miri, ignore)]
