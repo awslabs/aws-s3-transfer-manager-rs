@@ -1114,12 +1114,12 @@ struct ArenaState {
 }
 
 struct BlockRegistry {
-    snapshot: ArcSwap<RegistrySnapshot>,
+    generation: ArcSwap<RegistryGeneration>,
 }
 
-struct RegistrySnapshot {
+struct RegistryGeneration {
     // Stable scan order for physical acquisition.
-    claim_slots: Box<[Arc<BlockSlot>]>,
+    slots_in_claim_order: Box<[Arc<BlockSlot>]>,
     // Non-overlapping virtual ranges sorted by start address.
     address_ranges: Box<[AddressRange]>,
 }
@@ -1128,18 +1128,18 @@ struct AddressRange {
     // Exposed addresses used only for comparison; end is exclusive.
     start: usize,
     end: usize,
-    // Index into RegistrySnapshot::claim_slots.
+    // Index into RegistryGeneration::slots_in_claim_order.
     slot_index: usize,
 }
 ```
 
-`BlockRegistry` publishes claim order and address classification as one immutable snapshot.
-Optimistic claim scans load `claim_slots` without taking `ArenaState`. An incoming immutable view
-uses binary search over `address_ranges` and accepts a match only when its complete checked range
-lies within one slot. The integer bounds classify addresses only; carrier pointers are always
-derived from `VirtualRange`.
+`BlockRegistry` publishes claim order and address classification as one immutable generation.
+Optimistic claim scans load `slots_in_claim_order` without taking `ArenaState`. An incoming
+immutable view uses binary search over `address_ranges` and accepts a match only when its complete
+checked range lies within one slot. The integer bounds classify addresses only; carrier pointers
+are always derived from `VirtualRange`.
 
-Snapshot construction rejects address overflow, overlap, or an invalid slot index. Growth rebuilds
+Generation construction rejects address overflow, overlap, or an invalid slot index. Growth rebuilds
 and publishes both arrays while holding `ArenaState`. Return goes directly to the slot recorded by
 the carrier allocation and does not scan the registry.
 
@@ -1193,7 +1193,7 @@ error; no partial batch is exposed.
 
 The common path performs a bounded amount of optimistic bitmap work from a rotating origin:
 
-1. Load one immutable registry snapshot.
+1. Load one immutable registry generation.
 2. Inspect at most the configured number of bitmap words across `Active` blocks.
 3. Keep every bit won from each atomic bitmap operation.
 4. Confirm that each touched block remains `Active` after the bitmap mutation.
@@ -1467,13 +1467,15 @@ Mapping state records whether the stable virtual range is accessible:
 enum MappingState {
     Reserved { reclaim_pending: bool },
     Prepared,
-    ProtectionPending,
+    ActivationRecoveryPending,
+    DeactivationRecoveryPending,
 }
 ```
 
 Incarnation state controls claims. Mapping state controls access to the stable virtual range.
 `MappingState::Prepared` records a writable, fully prepared mapping; it does not by itself include
-the block in `prepared_capacity`.
+the block in `prepared_capacity`. The recovery variants distinguish a failed preparation with no
+published incarnation from a failed deactivation that retains a `Draining` incarnation.
 
 ```text
 incarnation state
@@ -1505,11 +1507,13 @@ Prepared
   v
 Reserved
 
-Reserved  -- whole-range RW fails ----> ProtectionPending
-Prepared  -- whole-range NONE fails --> ProtectionPending
+Reserved  -- whole-range RW fails ----> ActivationRecoveryPending
+Prepared  -- whole-range NONE fails --> DeactivationRecoveryPending
 
-ProtectionPending -- whole-range NONE succeeds --> Reserved
-ProtectionPending -- whole-range RW succeeds ----> Prepared
+ActivationRecoveryPending   -- whole-range NONE succeeds --> Reserved
+ActivationRecoveryPending   -- whole-range RW succeeds ----> Prepared
+DeactivationRecoveryPending -- whole-range NONE succeeds --> Reserved
+DeactivationRecoveryPending -- whole-range RW succeeds ----> Prepared
 ```
 
 The state machines couple through ordered capacity and publication transitions:
@@ -1521,13 +1525,13 @@ The state machines couple through ordered capacity and publication transitions:
 - All-free confirmation removes the block from `prepared_capacity` while the mapping remains
   `Prepared` and the incarnation remains `Draining`. Cleanup then makes the range inaccessible,
   attempts discard, publishes `Dead`, and clears `current`.
-- A failed protection call enters `ProtectionPending` and leaves the block outside prepared
-  capacity. Initial preparation failure leaves `current` empty; deactivation failure leaves the
-  existing incarnation `Draining`. Neither state is claimable.
+- Failed preparation enters `ActivationRecoveryPending` with `current` empty. Failed deactivation
+  enters `DeactivationRecoveryPending` with the existing incarnation `Draining`. Both states remain
+  outside prepared capacity and are nonclaimable.
 
-A successful whole-range inaccessible transition from `ProtectionPending` continues the inactive
-path. A successful whole-range writable transition restores mapping state first. Admission then
-adds prepared capacity before either publishing a fresh incarnation or restoring a `Draining`
+A successful whole-range inaccessible transition from either recovery state continues the inactive
+path. A successful whole-range writable transition restores mapping state first. Admission then adds
+prepared capacity before either publishing a fresh incarnation or restoring a `Draining`
 incarnation to `Active`. No failed protection call authorizes a mapping, capacity, or incarnation
 transition.
 
@@ -1554,9 +1558,9 @@ Revival preserves the virtual address:
 The default mapping backend keeps each slot's virtual range reserved until pool destruction. The
 [platform contract](#platform-contract) defines its target operations and qualification rules.
 Every result preserves exclusive ownership of the same address. Deactivation success makes access
-fault. Deactivation failure enters `ProtectionPending` without assuming that prior protection
-remains. Discard success makes backing absent or reclaimable; discard failure may retain resident
-pages but cannot make the block claimable.
+fault. Deactivation failure enters `DeactivationRecoveryPending` without assuming that prior
+protection remains. Discard success makes backing absent or reclaimable; discard failure may retain
+resident pages but cannot make the block claimable.
 
 **Alternative: Allocator-owned blocks.** A page-aligned allocation provides the same common-path
 carrier claim, return, and reuse while retained. The standard allocator API does not provide a
@@ -1568,7 +1572,7 @@ instead gives idle trim an explicit page-level operation and failure contract.
 
 **Alternative: Release and replace virtual ranges.** A pool using operating-system mappings could
 release a trimmed range and allocate a new range on later growth. This returns virtual address space
-with the backing but makes trim a topology change. Old claim attempts and registry snapshots must
+with the backing but makes trim a topology change. Old claim attempts and registry generations must
 retire before the address can be reused, or every stale lookup must detect replacement. Revival also
 requires a new slot or registry publication. The selected backend can make a block inaccessible and
 discard its backing or make it reclaimable without waiting for metadata readers to quiesce. Those
@@ -2045,7 +2049,7 @@ impl<'a> SegmentedBytesBuilder<'a> {
 immutable producer view, whether pool-backed or foreign. `push_segmented` consumes the input's
 remaining segments and their existing holds; it does not reconstruct ownership from pointers.
 `PooledBufMut::freeze` constructs pooled segments directly. The private builder resolves the
-complete range of `push_view` with a binary search over the registry snapshot's sorted address
+complete range of `push_view` with a binary search over the registry generation's sorted address
 ranges; the finished value retains no builder borrow. Owner boundaries need not be presentation
 boundaries:
 
@@ -2634,7 +2638,7 @@ Recoverable resource failures remain local:
 | Virtual-range reservation                         | That growth or acquisition attempt fails                                              |
 | Reservation preparation                           | That request fails; reusable capacity prepared before the failure remains available   |
 | Reserved or unreserved acquisition                | The complete debit rolls back; no partial writable buffer escapes                     |
-| Whole-range protection                            | The affected block enters `ProtectionPending` outside prepared capacity               |
+| Whole-range protection                            | The block enters its nonclaimable recovery state outside prepared capacity            |
 | Backing discard                                   | The inactive block records `reclaim_pending`; other blocks remain usable              |
 | Maintenance-thread creation                       | Maintenance is disabled; ordinary paths continue and affected blocks stay unavailable |
 | Ownership, identity, or address-reservation check | The non-returning fail-stop handler aborts without continuing allocator mutation      |
@@ -3082,10 +3086,10 @@ charges as one packed transition.
 | Transition              | Preconditions                                                       | Ordering                                                                                              |
 | ----------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | Prepare or revive block | Stable range retained; target preparation succeeds                  | Establish writable mapping, add block to `prepared_capacity`, then publish fresh `Active` incarnation |
-| Failed preparation      | Any target operation fails                                          | Publish no `Active` incarnation; retain earlier successful preparation                                |
+| Failed preparation      | Any target operation fails                                          | Publish no `Active`; enter `ActivationRecoveryPending`; retain earlier successful preparation         |
 | Abandon trim            | Claim-trim gate observes any valid set bit                          | Restore `Active`; leave `prepared_capacity` unchanged                                                 |
 | Confirm trim            | Gate confirms all valid bits clear and admission floor is preserved | Subtract block from `prepared_capacity`, then perform physical cleanup                                |
-| Failed deactivation     | Whole-range inaccessible transition fails                           | Keep block nonclaimable in `ProtectionPending` outside prepared capacity                              |
+| Failed deactivation     | Whole-range inaccessible transition fails                           | Keep block nonclaimable in `DeactivationRecoveryPending` outside prepared capacity                    |
 | Failed discard          | Range is inaccessible but backing discard fails                     | Keep block inactive with `reclaim_pending`; prepared capacity is unchanged                            |
 
 The admission floor is checked against the post-removal count:
@@ -3154,7 +3158,7 @@ as a search hint may use `Relaxed`; ownership is decided by the gated `fetch_or`
 | Packed coverage and uncovered charges | Load or failed CAS retry                      | `Acquire`                                                |
 | Packed coverage and uncovered charges | Successful debit, grant, close, or return CAS | `AcqRel`                                                 |
 | Reservation owner state               | Direct debit, close, rollback, or return      | One packed `AcqRel` read-modify-write                    |
-| Block registry                        | Publish or load immutable registry snapshot   | ArcSwap publication and guard contract                   |
+| Block registry                        | Publish or load immutable registry generation | ArcSwap publication and guard contract                   |
 | Current block incarnation             | Publish, replace, or protect incarnation      | ArcSwap publication and guard contract                   |
 | Wait result                           | Store terminal result and consume it          | `WaitSlot` mutex                                         |
 | Admission ledger and FIFO             | Every read and write                          | `AdmissionState` mutex                                   |
@@ -3226,10 +3230,10 @@ lookup can establish presentation adjacency but cannot recover physical-return a
 | macOS   | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_FREE`             |
 | Windows | `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)` | `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)` | `VirtualFree(MEM_DECOMMIT)`  | Same decommit operation |
 
-All targets must preserve exclusive ownership of the virtual range after every successful or
-failed operation. A failed protection or commit operation enters `ProtectionPending`; no prior
-protection is assumed. Recovery requires a later successful whole-range transition before the block
-can reenter prepared capacity.
+All targets must preserve exclusive ownership of the virtual range after every successful or failed
+operation. Failed initial preparation or commit enters `ActivationRecoveryPending`; failed
+deactivation enters `DeactivationRecoveryPending`. No prior protection is assumed. Recovery
+requires a later successful whole-range transition before the block can reenter prepared capacity.
 
 Windows preparation consumes system commit capacity for each newly required whole block. Starting
 without prepared capacity, a grant commits enough blocks to cover its complete post-grant admission
