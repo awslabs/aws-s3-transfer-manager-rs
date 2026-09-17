@@ -85,32 +85,40 @@ case "$abi" in
 esac
 
 run_android_tests() {
-    local build_messages
+    local deps_directory
+    local target_directory
     local test_binary
     local test_binaries
 
     # cargo-ndk 4.1.2 unconditionally replaces Cargo's target runner with its
-    # own runner. Build without executing, then invoke the repository runner
-    # directly so device environment and the child status remain observable.
-    build_messages=$(
-        cargo ndk --target "$abi" --platform "$android_api_level" \
-            test --locked -p aws-sdk-s3-transfer-manager --lib --no-run \
-            --message-format=json-render-diagnostics
+    # own runner and consumes Cargo's compiler-artifact messages. Clean this
+    # package's target artifacts, build without executing, then identify the
+    # sole test executable for the repository runner.
+    target_directory=$(
+        cargo metadata --locked --no-deps --format-version 1 |
+            jq -r '.target_directory'
     )
+    deps_directory="$target_directory/$rust_target/debug/deps"
+
+    cargo clean --locked -p aws-sdk-s3-transfer-manager --target "$rust_target"
+    cargo ndk --target "$abi" --platform "$android_api_level" \
+        test --locked -p aws-sdk-s3-transfer-manager --lib --no-run
+
+    if [[ ! -d "$deps_directory" ]]; then
+        echo "Android test artifact directory is missing: $deps_directory" >&2
+        exit 1
+    fi
     test_binaries=$(
-        jq -r '
-            select(
-                .reason == "compiler-artifact"
-                and .target.name == "aws_sdk_s3_transfer_manager"
-                and .target.kind == ["lib"]
-                and .profile.test
-            )
-            | .executable // empty
-        ' <<<"$build_messages"
+        find "$deps_directory" \
+            -maxdepth 1 \
+            -type f \
+            -name 'aws_sdk_s3_transfer_manager-*' \
+            -perm -111 \
+            -print
     )
 
     if [[ -z "$test_binaries" ]]; then
-        echo "cargo did not report the Android library test binary" >&2
+        echo "cargo did not produce the Android library test binary" >&2
         exit 1
     fi
     if [[ "$test_binaries" == *$'\n'* ]]; then
