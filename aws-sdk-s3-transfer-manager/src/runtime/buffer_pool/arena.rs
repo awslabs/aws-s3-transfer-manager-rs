@@ -339,7 +339,10 @@ impl Arena {
         }
 
         let budget = self.optimistic_scan_words.min(total_positions);
-        let origin = self.scan_origin.fetch_add(budget, Ordering::Relaxed) % total_positions;
+        // Partial scans advance by one charged window. A full-space window
+        // would wrap to the same origin, so rotate it by one word instead.
+        let origin_stride = if budget == total_positions { 1 } else { budget };
+        let origin = self.scan_origin.fetch_add(origin_stride, Ordering::Relaxed) % total_positions;
         if let Some(word_count) = self.contiguous_word_count(required) {
             while batch.inspected_words < budget && !batch.is_complete() {
                 let position = wrapped_position(origin, batch.inspected_words, total_positions);
@@ -1610,6 +1613,26 @@ mod tests {
         }
 
         assert_eq!(indices, vec![0, 128, 64]);
+        assert_fully_free(&slot);
+    }
+
+    #[test]
+    fn scan_origin_rotates_when_budget_covers_the_scan_space() {
+        let arena = test_arena(geometry_with_carriers(130), 3).unwrap();
+        let slot = prepare_slots(&arena, 1).pop().unwrap();
+        let mut indices = Vec::new();
+
+        for _ in 0..3 {
+            let carriers = arena
+                .claim_optimistic(CarrierCount::new(1))
+                .unwrap()
+                .finish()
+                .unwrap();
+            indices.push(carriers[0].carrier_index());
+            drop(carriers);
+        }
+
+        assert_eq!(indices, vec![0, 64, 128]);
         assert_fully_free(&slot);
     }
 
