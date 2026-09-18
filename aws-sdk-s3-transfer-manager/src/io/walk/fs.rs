@@ -974,6 +974,9 @@ impl FsWalk {
                         }
                     }
                 } else if metadata.is_file() {
+                    if rejected {
+                        continue;
+                    }
                     self.push_entry(
                         &mut result.children,
                         path,
@@ -1080,15 +1083,6 @@ impl FsWalk {
         file_type: FileType,
         followed_symlink: bool,
     ) {
-        let relative_path = path.strip_prefix(&self.root).unwrap_or(&path);
-        if self
-            .config
-            .path_filter
-            .as_ref()
-            .is_some_and(|f| !f(relative_path))
-        {
-            return;
-        }
         let entry = FsEntry {
             path,
             file_type,

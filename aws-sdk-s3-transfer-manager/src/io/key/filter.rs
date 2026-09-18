@@ -41,22 +41,29 @@ pub(crate) enum Action {
 pub(crate) struct Rule {
     action: Action,
     pattern: String,
+    // The same pattern as characters, so matching a key does not re-parse it. Every entry on both
+    // sides is matched against every rule, so the parse would otherwise repeat per entry per rule.
+    parsed: Vec<char>,
     anchor: Anchor,
 }
 
 impl Rule {
     pub(crate) fn include(pattern: impl Into<String>) -> Self {
+        let pattern: String = pattern.into();
         Self {
             action: Action::Include,
-            pattern: pattern.into(),
+            parsed: pattern.chars().collect(),
+            pattern,
             anchor: Anchor::Root,
         }
     }
 
     pub(crate) fn exclude(pattern: impl Into<String>) -> Self {
+        let pattern: String = pattern.into();
         Self {
             action: Action::Exclude,
-            pattern: pattern.into(),
+            parsed: pattern.chars().collect(),
+            pattern,
             anchor: Anchor::Root,
         }
     }
@@ -66,18 +73,18 @@ impl Rule {
         self
     }
 
-    fn matches(&self, key: &str) -> bool {
+    fn matches(&self, key: &str, live: &mut Vec<bool>, next: &mut Vec<bool>) -> bool {
         match self.anchor {
-            Anchor::Root => glob_match(&self.pattern, key),
+            Anchor::Root => glob_match(&self.parsed, key, live, next),
             // Every segment start, plus the whole key, so a rule written for a
             // subtree applies at any depth including the top.
             Anchor::Anywhere => {
-                if glob_match(&self.pattern, key) {
+                if glob_match(&self.parsed, key, live, next) {
                     return true;
                 }
                 key.char_indices()
                     .filter(|(_, c)| *c == '/')
-                    .any(|(i, _)| glob_match(&self.pattern, &key[i + 1..]))
+                    .any(|(i, _)| glob_match(&self.parsed, &key[i + 1..], live, next))
             }
         }
     }
@@ -97,9 +104,12 @@ impl KeyFilter {
     }
 
     pub(crate) fn allows(&self, key: &str) -> bool {
+        // Two buffers for the whole call, rotated per character, rather than one allocation per
+        // character of the key.
+        let (mut live, mut next) = (Vec::new(), Vec::new());
         let mut allowed = true;
         for rule in &self.rules {
-            if rule.matches(key) {
+            if rule.matches(key, &mut live, &mut next) {
                 allowed = rule.action == Action::Include;
             }
         }
@@ -110,14 +120,15 @@ impl KeyFilter {
 // Tracks every pattern position still live and consumes the key once, so `*a*b*c*`
 // against a long key costs one pass. Guessing where each `*` ends and backing up on a
 // mismatch costs exponentially many splits instead.
-fn glob_match(pattern: &str, key: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
-    let mut live = vec![false; pat.len() + 1];
+fn glob_match(pat: &[char], key: &str, live: &mut Vec<bool>, next: &mut Vec<bool>) -> bool {
+    live.clear();
+    live.resize(pat.len() + 1, false);
     live[0] = true;
-    advance_stars(&pat, &mut live);
+    advance_stars(pat, live);
 
     for c in key.chars() {
-        let mut next = vec![false; pat.len() + 1];
+        next.clear();
+        next.resize(pat.len() + 1, false);
         for (pos, _) in live.iter().enumerate().filter(|(_, l)| **l) {
             if pos == pat.len() {
                 continue;
@@ -130,7 +141,7 @@ fn glob_match(pattern: &str, key: &str) -> bool {
                 }
                 '?' => next[pos + 1] = true,
                 '[' => {
-                    if let Some((end, matched)) = class_match(&pat, pos, c) {
+                    if let Some((end, matched)) = class_match(pat, pos, c) {
                         if matched {
                             next[end + 1] = true;
                         }
@@ -142,8 +153,8 @@ fn glob_match(pattern: &str, key: &str) -> bool {
                 _ => {}
             }
         }
-        live = next;
-        advance_stars(&pat, &mut live);
+        std::mem::swap(live, next);
+        advance_stars(pat, live);
         if !live.iter().any(|l| *l) {
             return false;
         }
@@ -426,7 +437,12 @@ mod tests {
         ];
         for (pattern, key, expected) in cases {
             assert_eq!(
-                glob_match(pattern, key),
+                glob_match(
+                    &pattern.chars().collect::<Vec<_>>(),
+                    key,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                ),
                 *expected,
                 "pattern={pattern:?} key={key:?}"
             );

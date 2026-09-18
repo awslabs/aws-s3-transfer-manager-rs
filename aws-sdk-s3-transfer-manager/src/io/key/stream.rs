@@ -217,16 +217,19 @@ fn secs_since_epoch(modified: std::io::Result<SystemTime>) -> Option<i64> {
 // that is not the same object.
 fn local_key(entry: &FsEntry) -> Result<String, StreamError> {
     key_for_relative_path(entry.relative_path())
+        .map(Cow::into_owned)
         .ok_or_else(|| StreamError::UnkeyableName(entry.path().to_path_buf()))
 }
 
 // `None` when the name cannot be a key at all.
-fn key_for_relative_path(relative: &std::path::Path) -> Option<String> {
+//
+// Borrowed where the separator is already `/`, which is every Unix name, because the path filter
+// reads the key and drops it for every file in the tree.
+fn key_for_relative_path(relative: &std::path::Path) -> Option<Cow<'_, str>> {
     let relative = relative.to_str()?;
     Some(
         derive_object_key(relative, None, None)
-            .expect("key derivation cannot fail without a custom delimiter")
-            .into_owned(),
+            .expect("key derivation cannot fail without a custom delimiter"),
     )
 }
 
@@ -254,6 +257,9 @@ pub(crate) fn s3_predicate(
     filter: Arc<KeyFilter>,
     prefix: Option<String>,
 ) -> impl Fn(&Object) -> bool + Send + Sync + 'static {
+    // Fixed for the whole run, so it is normalised here rather than rebuilt for every object. A
+    // prefix written without its delimiter would otherwise allocate once per listed object.
+    let root = root_prefix(prefix.as_deref()).into_owned();
     move |obj| {
         // Folder markers are dropped by the walker's own default, which setting a
         // filter would otherwise replace.
@@ -264,7 +270,7 @@ pub(crate) fn s3_predicate(
         // A key outside the root is not the filter's business: it should never have been
         // listed, and testing a rule against a key that is not under the root would answer
         // about a name nobody asked for.
-        match relative_key(key, &root_prefix(prefix.as_deref())) {
+        match relative_key(key, &root) {
             Some(relative) => filter.allows(relative),
             None => false,
         }
@@ -544,8 +550,8 @@ mod tests {
         let bad = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"bad-\xff.txt"));
         assert_eq!(key_for_relative_path(&bad), None);
         assert_eq!(
-            key_for_relative_path(std::path::Path::new("fine.txt")),
-            Some("fine.txt".to_string())
+            key_for_relative_path(std::path::Path::new("fine.txt")).as_deref(),
+            Some("fine.txt")
         );
     }
 
@@ -1081,6 +1087,34 @@ mod tests {
 
         let mut walk = filtered_local(dir.path(), vec![Rule::exclude("logs/*")]);
         assert_eq!(keys(&mut walk).await, vec!["keep.txt"]);
+    }
+
+    // A symlink the walk follows to a regular file is yielded on a different path from a file
+    // reached directly, and an excluded key has to stay excluded on both.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_excluded_symlink_to_a_file_is_not_yielded() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        fs::write(dir.path().join("target.txt"), "x").unwrap();
+        fs::write(dir.path().join("keep.txt"), "").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("target.txt"),
+            dir.path().join("logs/link.txt"),
+        )
+        .unwrap();
+
+        let filter = Arc::new(KeyFilter::new(vec![Rule::exclude("logs/*")]));
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .path_filter(local_predicate(filter))
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        assert_eq!(keys(&mut walk).await, vec!["keep.txt", "target.txt"]);
     }
 
     // An excluded entry must not warn even when it cannot be read, which means the
