@@ -53,7 +53,7 @@ A stream, because a run may cover millions of keys and building a list first fix
 entry count. Keyed, because the key is what makes an entry on one side the counterpart of one on
 the other. In S3's order, because the comparison decides a key is missing from a side when that
 side moves past where the key would sort, so both sides must agree on "past". With an ending that
-says which of the two happened, because "no more entries" and "I could not see the rest" license
+says which of the two happened, because "no more entries" and "I could not see the rest" call for
 opposite actions, and collapsing them is how a sync deletes files it failed to look at. Marker
 exclusion, filtering and paging inside, because a consumer that had to remember to do them would
 eventually forget.
@@ -79,7 +79,7 @@ than this layer. D11 and D12 are the cheap ones, and are here so that a reader k
 considered.
 
 **D1. Both sides emit one total key order.** A comparison reads absence from position: every
-delete is licensed by "the source moved past this key". Weaken the order guarantee and every
+delete rests on "the source moved past this key". Weaken the order guarantee and every
 decision downstream becomes unsound.
 
 **D2. A relative key is a UTF-8 `String`.** A local name that is not valid UTF-8 is skipped and
@@ -207,8 +207,11 @@ compared. A name that cannot be keyed had the same problem in reverse: it read a
 when the walk had read the name perfectly.
 
 Separating them lets the consumer ask the question it actually has, which is what a failure cost.
-A walk failure may have hidden a subtree; the other two cost exactly one key, and the keys around
-them still arrive.
+`keys_lost` answers in three: nothing, one key at the position the error arrived, or an unknown
+range. A comparison can act on the first two and must hold back on the third, because a delete is
+only safe when one side can say a key is absent, and a side that lost a subtree cannot say that. The
+answer is matched over every error kind rather than tested against one, so a kind added later will
+not compile until it is placed.
 
 ## 3. How the pieces fit
 
@@ -357,7 +360,7 @@ though every mode in the first release answers immediately. A mode that needs to
 says so from `poll_work`, the fetching happens where awaiting is allowed, and the answer is
 applied later — in key order, so FR-Cmp-8 still holds.
 
-Enumeration owes that arrangement one thing, and it is why `Entry` carries the original item.
+That arrangement needs one thing from enumeration, which is why `Entry` carries the original item.
 FR-Cmp-6 requires the comparison be given the entries themselves, because a checksum or ETag check
 needs listing fields that only the original carries. Hand over `(key, size, time)` alone and a
 deferring mode has nothing to defer on.

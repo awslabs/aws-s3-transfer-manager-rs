@@ -59,9 +59,12 @@ pub(crate) enum StreamError {
     // A local name that is not valid UTF-8, so no S3 key could carry it. One name, and the walk
     // read it fine.
     UnkeyableName(PathBuf),
-    // A listed object without a field a comparison needs. One key that cannot be compared, and
-    // the listing itself arrived.
-    MalformedListing(&'static str),
+    // A listed object without a field a comparison needs. The key is named where the listing gave
+    // one, so a consumer can hold back the action for that key alone.
+    MalformedListing {
+        key: Option<String>,
+        what: &'static str,
+    },
 }
 
 impl StreamError {
@@ -70,7 +73,7 @@ impl StreamError {
     pub(crate) fn is_fatal(&self) -> bool {
         match self {
             StreamError::Walk(err) => err.is_fatal(),
-            StreamError::UnkeyableName(_) | StreamError::MalformedListing(_) => false,
+            StreamError::UnkeyableName(_) | StreamError::MalformedListing { .. } => false,
         }
     }
 }
@@ -84,7 +87,13 @@ impl std::fmt::Display for StreamError {
             StreamError::UnkeyableName(path) => {
                 write!(f, "name is not valid UTF-8: {:?}", path.as_os_str())
             }
-            StreamError::MalformedListing(what) => write!(f, "{what}"),
+            StreamError::MalformedListing {
+                key: Some(key),
+                what,
+            } => {
+                write!(f, "{what}: {key}")
+            }
+            StreamError::MalformedListing { key: None, what } => write!(f, "{what}"),
         }
     }
 }
@@ -93,7 +102,7 @@ impl std::error::Error for StreamError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StreamError::Walk(err) => Some(err),
-            StreamError::UnkeyableName(_) | StreamError::MalformedListing(_) => None,
+            StreamError::UnkeyableName(_) | StreamError::MalformedListing { .. } => None,
         }
     }
 }
@@ -105,7 +114,7 @@ impl From<WalkError> for StreamError {
 }
 
 // Errors pass through as the walkers report them; what they mean is the caller's
-// call, via `view_incomplete`. A run may continue past an unreadable directory, but
+// call, via `keys_lost`. A run may continue past an unreadable directory, but
 // not while also deleting keys it never saw.
 pub(crate) trait KeyStream {
     type Source;
@@ -116,17 +125,49 @@ pub(crate) trait KeyStream {
     ) -> impl Future<Output = Option<Result<Entry<Self::Source>, StreamError>>> + Send;
 }
 
-// Whether a failure left keys unaccounted for, so a side looks emptier than it is.
+// What a failure cost the side that hit it.
 //
-// An unread subtree is the case that matters: position-based comparison cannot tell it from
-// deletion. A name that could not be keyed and an object missing a field each cost exactly one
-// key, which the stream reports in place, so the keys around them are still known.
-pub(crate) fn view_incomplete(err: &StreamError) -> bool {
-    match err {
-        StreamError::Walk(err) => {
-            err.is_fatal() || err.kind() == WalkErrorKind::DirectoryUnreadable
+// A comparison reads absence from position, so before it can act on "this key is missing from the
+// other side" it has to know whether the side it is reading is still able to account for its keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeysLost {
+    // Nothing: every key this side holds is still accounted for.
+    Nothing,
+    // One key, at the position the error arrived. The stream is ordered, so the position is what
+    // identifies it; the keys around it are known.
+    OneKey,
+    // An unknown range. A subtree went unenumerated, or the side stopped before its end, so
+    // absence cannot be read from position at all.
+    UnknownRange,
+}
+
+impl StreamError {
+    // Matched exhaustively rather than tested against one kind, so a kind added later has to be
+    // placed deliberately instead of defaulting to the answer that permits a delete.
+    pub(crate) fn keys_lost(&self) -> KeysLost {
+        match self {
+            StreamError::Walk(err) => match err.kind() {
+                // The walk never got going, or gave up part way.
+                WalkErrorKind::SourceUnreadable
+                | WalkErrorKind::NotADirectory
+                | WalkErrorKind::Service => KeysLost::UnknownRange,
+                // A directory nobody could read, and a cycle that stopped a descent, both leave a
+                // subtree unenumerated. No single key stands for a subtree.
+                WalkErrorKind::DirectoryUnreadable | WalkErrorKind::SymlinkCycle => {
+                    KeysLost::UnknownRange
+                }
+                // One entry that should have been readable.
+                WalkErrorKind::Io
+                | WalkErrorKind::PermissionDenied
+                | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
+            },
+            // The walk read the name; it is S3 that has no key it could take. Nothing on the other
+            // side can correspond to it, so no comparable key went missing.
+            StreamError::UnkeyableName(_) => KeysLost::Nothing,
+            // The object was listed and then dropped, so its key is absent from this side while
+            // the keys around it arrived.
+            StreamError::MalformedListing { .. } => KeysLost::OneKey,
         }
-        StreamError::UnkeyableName(_) | StreamError::MalformedListing(_) => false,
     }
 }
 
@@ -274,7 +315,7 @@ impl KeyStream for S3Walk {
                     }
                     // One key that cannot be compared. The listing itself arrived, so the run
                     // carries on with the keys around it.
-                    Err(reason) => return Some(Err(StreamError::MalformedListing(reason))),
+                    Err(err) => return Some(Err(err)),
                 },
             }
         }
@@ -338,21 +379,35 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
 // Markers are dropped here, so they are invisible whether or not a filter is
 // configured. The walker's own default filter is replaced by any filter a caller
 // sets, which would otherwise make an entry out of a key holding nothing.
+// The error names the key where the listing gave one, because that key is absent from this side
+// once the object is dropped, and a consumer that reads absence from position needs to know which
+// one to hold back.
 fn key_and_meta(
     obj: &Object,
     root_prefix: &str,
-) -> Result<Option<(String, EntryMeta)>, &'static str> {
+) -> Result<Option<(String, EntryMeta)>, StreamError> {
     if !exclude_s3_folder_markers(obj) {
         return Ok(None);
     }
-    let key = obj.key().ok_or("listing returned an object with no key")?;
+    let Some(key) = obj.key() else {
+        return Err(StreamError::MalformedListing {
+            key: None,
+            what: "listing returned an object with no key",
+        });
+    };
     let Some(relative) = relative_key(key, root_prefix) else {
         return Ok(None);
     };
-    let size = obj.size().ok_or("listing returned no size")?;
+    let malformed = |what| StreamError::MalformedListing {
+        key: Some(relative.to_string()),
+        what,
+    };
+    let size = obj
+        .size()
+        .ok_or_else(|| malformed("listing returned no size"))?;
     let last_modified_secs = obj
         .last_modified()
-        .ok_or("listing returned no last-modified")?
+        .ok_or_else(|| malformed("listing returned no last-modified"))?
         .secs();
     Ok(Some((
         relative.to_string(),
@@ -682,35 +737,103 @@ mod tests {
         // The keys on both sides of the bad object arrive, which is what "carry on" means.
         assert_eq!(keys, vec!["a.txt".to_string(), "c.txt".to_string()]);
         assert_eq!(errors.len(), 1, "got {errors:?}");
+        // The key is named, because that key is absent from this side now and a consumer that
+        // reads absence from position has to hold back the action for it alone.
         assert!(
-            matches!(errors[0], StreamError::MalformedListing(_)),
+            matches!(
+                &errors[0],
+                StreamError::MalformedListing { key: Some(key), .. } if key == "b.txt"
+            ),
             "got {:?}",
             errors[0]
         );
         assert!(!errors[0].is_fatal(), "one bad object must not end the run");
-        assert!(
-            !view_incomplete(&errors[0]),
-            "the listing arrived, so no key is unaccounted for"
+        assert_eq!(
+            errors[0].keys_lost(),
+            KeysLost::OneKey,
+            "the object was listed and dropped, so its key is unaccounted for"
         );
     }
 
-    // What each failure costs, since a comparison reads absence from position: a side that lost a
-    // subtree cannot be trusted to say a key is missing, while a side that lost one key can.
+    // The key named is the one the stream would have yielded, relative to the root, so a consumer
+    // holding back an action can match it against the keys it has already seen. An absolute key
+    // here would name something the consumer never saw.
     #[test]
-    fn only_a_lost_subtree_makes_a_side_look_emptier_than_it_is() {
+    fn a_malformed_object_names_its_key_relative_to_the_root() {
+        let no_size = Object::builder()
+            .key("data/a/b.txt")
+            .last_modified(DateTime::from_secs(1))
+            .build();
+        match key_and_meta(&no_size, "data/") {
+            Err(StreamError::MalformedListing {
+                key: Some(key),
+                what,
+            }) => {
+                assert_eq!(key, "a/b.txt");
+                assert!(what.contains("size"), "got {what:?}");
+            }
+            other => panic!("expected a named malformed listing, got {other:?}"),
+        }
+
+        // An object the listing gave no key for has none to name, and nothing on the other side
+        // could correspond to it.
+        let no_key = Object::builder()
+            .size(1)
+            .last_modified(DateTime::from_secs(1))
+            .build();
+        assert!(matches!(
+            key_and_meta(&no_key, "data/"),
+            Err(StreamError::MalformedListing { key: None, .. })
+        ));
+    }
+
+    // What each failure costs, since a comparison reads absence from position. Every kind is here,
+    // so a kind added later has to be placed deliberately rather than defaulting to the answer that
+    // permits a delete.
+    #[test]
+    fn a_failure_says_whether_it_cost_one_key_or_a_range() {
         let walk_err = |kind| StreamError::Walk(WalkError::new(None, kind, Box::from("test")));
         let cases = [
-            (walk_err(WalkErrorKind::SourceUnreadable), true),
-            (walk_err(WalkErrorKind::DirectoryUnreadable), true),
-            (walk_err(WalkErrorKind::Service), true),
-            // A named file the walk read fine, and one listed object: both are single keys.
-            (walk_err(WalkErrorKind::PermissionDenied), false),
-            (walk_err(WalkErrorKind::BrokenSymlink), false),
-            (StreamError::UnkeyableName(PathBuf::from("/tmp/x")), false),
-            (StreamError::MalformedListing("no size"), false),
+            // The walk never got going, or gave up part way.
+            (
+                walk_err(WalkErrorKind::SourceUnreadable),
+                KeysLost::UnknownRange,
+            ),
+            (
+                walk_err(WalkErrorKind::NotADirectory),
+                KeysLost::UnknownRange,
+            ),
+            (walk_err(WalkErrorKind::Service), KeysLost::UnknownRange),
+            // A subtree went unenumerated, and no single key stands for a subtree.
+            (
+                walk_err(WalkErrorKind::DirectoryUnreadable),
+                KeysLost::UnknownRange,
+            ),
+            (
+                walk_err(WalkErrorKind::SymlinkCycle),
+                KeysLost::UnknownRange,
+            ),
+            // One entry that should have been readable.
+            (walk_err(WalkErrorKind::Io), KeysLost::OneKey),
+            (walk_err(WalkErrorKind::PermissionDenied), KeysLost::OneKey),
+            (walk_err(WalkErrorKind::BrokenSymlink), KeysLost::OneKey),
+            // Listed, then dropped: the key is gone from this side.
+            (
+                StreamError::MalformedListing {
+                    key: Some("a.txt".to_string()),
+                    what: "no size",
+                },
+                KeysLost::OneKey,
+            ),
+            // No S3 key can carry a name that is not valid UTF-8, so nothing on the other side
+            // could have corresponded to it.
+            (
+                StreamError::UnkeyableName(PathBuf::from("/tmp/x")),
+                KeysLost::Nothing,
+            ),
         ];
-        for (err, hides_keys) in cases {
-            assert_eq!(view_incomplete(&err), hides_keys, "err={err:?}");
+        for (err, cost) in cases {
+            assert_eq!(err.keys_lost(), cost, "err={err:?}");
         }
     }
 
@@ -1133,7 +1256,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn an_unreadable_subdirectory_leaves_the_view_incomplete() {
+    async fn an_unreadable_subdirectory_leaves_a_range_unaccounted_for() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -1153,7 +1276,7 @@ mod tests {
         while let Some(next) = walk.next_entry().await {
             match next {
                 Ok(entry) => seen.push(entry.key),
-                Err(err) => incomplete |= view_incomplete(&err),
+                Err(err) => incomplete |= err.keys_lost() == KeysLost::UnknownRange,
             }
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1188,7 +1311,87 @@ mod tests {
         assert_eq!(seen, vec!["a.txt"]);
         assert_eq!(errors.len(), 1);
         assert_eq!(walk_kind(&errors[0]), Some(WalkErrorKind::BrokenSymlink));
-        assert!(!view_incomplete(&errors[0]));
+        assert_eq!(errors[0].keys_lost(), KeysLost::OneKey);
+    }
+
+    // A cycle stops a descent, so everything under it goes unenumerated. The side has to say so, or
+    // a delete removes destination keys nobody ever looked for.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_symlink_cycle_leaves_a_range_unaccounted_for() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        fs::write(dir.path().join("a/b/deep.txt"), "").unwrap();
+        fs::write(dir.path().join("top.txt"), "").unwrap();
+        // b/loop points back at a, so descending it would revisit a directory already on the path.
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("a/b/loop")).unwrap();
+
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut costs = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            if let Err(err) = next {
+                costs.push((walk_kind(&err), err.keys_lost()));
+            }
+        }
+
+        assert_eq!(
+            costs,
+            vec![(Some(WalkErrorKind::SymlinkCycle), KeysLost::UnknownRange)],
+            "a cycle costs the subtree it stopped at"
+        );
+    }
+
+    // A directory reached through a symlink that cannot be opened is not descended into either, so
+    // it has to report what every other unreadable directory reports.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_symlinked_directory_that_cannot_be_opened_costs_a_range() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The target sits outside the walk root, so the only way in is through the link. Inside the
+        // root it would also be read directly, and the direct read reports the right kind already.
+        let outside = tempdir().unwrap();
+        let hidden = outside.path().join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("under.txt"), "").unwrap();
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::os::unix::fs::symlink(&hidden, dir.path().join("link")).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&hidden).is_ok() {
+            fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root, or a filesystem that ignores the mode
+        }
+
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut costs = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            if let Err(err) = next {
+                costs.push((walk_kind(&err), err.keys_lost()));
+            }
+        }
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            costs.contains(&(
+                Some(WalkErrorKind::DirectoryUnreadable),
+                KeysLost::UnknownRange
+            )),
+            "an unopenable directory behind a link must read as a lost range, got {costs:?}"
+        );
     }
 
     // A time either side of the epoch is a time a run can compare, so both are reported. Only a

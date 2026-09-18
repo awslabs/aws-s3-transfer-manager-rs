@@ -961,8 +961,13 @@ impl FsWalk {
                                 }));
                             }
                         }
+                        // The directory is not descended into, so its subtree goes unenumerated —
+                        // the same cost as a directory that could not be read, and it has to report
+                        // the same kind or a consumer reads the side as complete. Never the root,
+                        // since this is a child of the directory being read, so `dir_error_kind`'s
+                        // depth test would wrongly call a top-level link the walk root.
                         Err(e) => {
-                            let kind = WalkError::classify_io(&e);
+                            let kind = WalkErrorKind::DirectoryUnreadable;
                             result
                                 .errors
                                 .push(WalkError::new(Some(path), kind, Box::new(e)));
