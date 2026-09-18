@@ -139,7 +139,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --no-deps
+        run: cargo clippy --all --tests --benches --no-deps
 
   docs:
     name: docs
