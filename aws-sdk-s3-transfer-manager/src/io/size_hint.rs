@@ -6,7 +6,8 @@
 /// Lower and optional upper bounds on a body size.
 ///
 /// Uploads require `lower <= upper` when an upper bound is present. Equal bounds declare an exact
-/// size. The transfer manager validates custom streams against these bounds when they reach EOF.
+/// size. The transfer manager rejects output above the upper bound as parts are read, then validates
+/// the final size after end-of-stream and all previously yielded parts have drained.
 #[derive(Debug, Clone, Default, Copy)]
 pub struct SizeHint {
     lower: u64,

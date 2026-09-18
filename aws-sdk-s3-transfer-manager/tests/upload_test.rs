@@ -327,6 +327,103 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
     )
 }
 
+/// Runs one valid zero-byte multipart source and verifies that the transfer sends exactly one empty
+/// part before completing a zero-byte object.
+async fn assert_single_empty_multipart_upload(stream: InputStream) {
+    let upload_id = "test-upload-id".to_owned();
+
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(1) && req.content_length() == Some(0))
+        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(|req| req.mpu_object_size() == Some(0))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(stream)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("a valid empty stream must complete as a zero-byte object");
+
+    assert_eq!(
+        upload_part.num_calls(),
+        1,
+        "an empty multipart source must upload exactly one empty part"
+    );
+    assert_eq!(complete_mpu.num_calls(), 1);
+}
+
+/// Runs one nonexact size declaration and verifies that CompleteMPU receives the validated bytes
+/// emitted by the source rather than either declared bound.
+async fn assert_ranged_mpu_object_size(size_hint: SizeHint, actual: usize) {
+    let upload_id = "test-upload-id".to_owned();
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .match_requests(move |req| req.mpu_object_size() == Some(actual as i64))
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx, size_hint,
+        )))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; actual])).await.unwrap();
+    drop(tx);
+
+    handle
+        .join()
+        .await
+        .expect("source output within its declared bounds must upload");
+    assert_eq!(complete_mpu.num_calls(), 1);
+}
+
 #[tokio::test]
 async fn test_custom_stream_uploads_segmented_part_data() {
     let mut data = SegmentedBytes::from(Bytes::from_static(b"left"));
@@ -633,66 +730,49 @@ async fn test_unknown_length_multipart_upload() {
         .expect("an unknown-length stream must upload, not panic");
 }
 
-/// An empty unknown-length stream must complete as a normal 0-byte object.
+/// An empty stream with no declared bounds must complete as a normal 0-byte object.
 ///
 /// S3 rejects a CompleteMultipartUpload that lists no parts, so "no bytes" cannot
 /// mean "no parts": the transfer synthesizes a single empty part 1. The mock
 /// asserts exactly that shape — one UploadPart, part number 1, zero bytes.
 #[tokio::test]
 async fn test_unknown_length_empty_stream() {
-    let upload_id = "test-upload-id".to_owned();
-
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-
-    // Matches only a zero-length part 1; anything else leaves the rule unproven.
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests(|req| req.part_number() == Some(1) && req.content_length() == Some(0))
-        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
-
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(|req| req.mpu_object_size() == Some(0))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
-
     let (tx, rx) = mpsc::channel(1);
-    let handle = tm
-        .upload()
-        .bucket("test-bucket")
-        .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
-        .initiate()
-        .unwrap();
-
-    // Empty: end-of-stream without ever sending data.
     drop(tx);
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(UnknownLengthStream::new(
+        rx,
+    )))
+    .await;
+}
 
-    handle
-        .join()
-        .await
-        .expect("an empty unknown-length stream must complete as a 0-byte object");
+/// A zero-byte source satisfies an upper-only declaration because its lower bound remains zero.
+#[tokio::test]
+async fn test_upper_only_hint_allows_empty_stream() {
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let stream =
+        TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(5 * 1024 * 1024)));
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(stream)).await;
+}
 
-    // Exactly one part, so CompleteMPU cannot have carried a duplicate part 1.
-    assert_eq!(
-        upload_part.num_calls(),
-        1,
-        "empty stream must upload exactly one (empty) part"
-    );
+/// An exact zero-byte declaration is valid and still requires one empty MPU part.
+#[tokio::test]
+async fn test_exact_zero_hint_allows_empty_stream() {
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(TestStream::exact(rx, 0)))
+        .await;
+}
+
+/// An explicitly yielded zero-byte part is the empty object; the transfer must not synthesize a
+/// duplicate after observing EOF.
+#[tokio::test]
+async fn test_explicit_zero_byte_part_is_not_duplicated() {
+    let stream = SegmentedPartStream {
+        part: Some(PartData::new(1, Bytes::new())),
+        size: 0,
+    };
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(stream)).await;
 }
 
 /// `MpuObjectSize` for an unknown-length upload is the sum of the bytes actually
@@ -799,6 +879,13 @@ async fn test_bounded_length_sends_validated_actual_size() {
         .join()
         .await
         .expect("a bounded upload must send its validated actual size as MpuObjectSize");
+}
+
+/// Lower-only and two-sided bounds constrain the source without becoming an exact object size.
+#[tokio::test]
+async fn test_ranged_hints_send_validated_actual_mpu_object_size() {
+    assert_ranged_mpu_object_size(SizeHint::default().with_lower(5), 7).await;
+    assert_ranged_mpu_object_size(SizeHint::default().with_lower(5).with_upper(Some(10)), 7).await;
 }
 
 /// An exact size hint is a contract, not only a planning input.
@@ -1411,13 +1498,12 @@ async fn test_unknown_length_exactly_max_parts_succeeds() {
         .expect("a stream of exactly the maximum part count must upload");
 }
 
-/// The synthesized empty part belongs to the unknown-length path only.
+/// A positive lower bound rejects an empty source without synthesizing a part.
 ///
-/// A declared length already gives the dispatch loop a part count, so a source that declares a size
-/// and then delivers nothing must not have a part invented on its behalf — that would upload a part
-/// the caller never produced, and one that contradicts the size it declared.
+/// Empty-part synthesis is based on whether zero satisfies the declared bounds, not merely whether
+/// a size hint exists.
 #[tokio::test]
-async fn test_known_length_never_synthesizes_empty_part() {
+async fn test_positive_lower_bound_never_synthesizes_empty_part() {
     let upload_id = "test-upload-id".to_owned();
 
     let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
@@ -1450,8 +1536,7 @@ async fn test_known_length_never_synthesizes_empty_part() {
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
-    // `TestStream` reports an exact size hint, so this is the known-length path. Declare a size and
-    // deliver nothing, which is what drives a read to end-of-stream with no part yielded.
+    // Declare a positive exact size and then reach EOF without yielding a part.
     let (tx, rx) = mpsc::channel(1);
     let declared = 5 * ByteUnit::Mebibyte.as_bytes_u64();
     let handle = tm
@@ -1465,13 +1550,19 @@ async fn test_known_length_never_synthesizes_empty_part() {
         .unwrap();
 
     drop(tx);
-    let _ = handle.join().await;
+    let error = handle
+        .join()
+        .await
+        .expect_err("an empty stream below its declared lower bound must fail");
 
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
     assert_eq!(
         0,
         empty_part.num_calls(),
-        "a declared-length source must never have an empty part synthesized for it"
+        "a positive lower bound must prevent empty-part synthesis"
     );
+    assert_eq!(0, data_part.num_calls());
+    assert_eq!(0, complete_mpu.num_calls());
 }
 
 // --- Conditional-write preconditions -----------------------------------------

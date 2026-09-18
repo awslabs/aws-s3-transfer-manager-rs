@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::io;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Wake, Waker};
@@ -21,21 +21,25 @@ use crate::operation::upload::diagnostics::{
 };
 use crate::operation::upload::UploadOutputBuilder;
 
-/// Source-size contract and multipart dispatch boundary.
+/// Multipart dispatch boundary and source-size declaration.
 ///
 /// [`PartStream`]: crate::io::PartStream
 #[derive(Debug)]
 pub(crate) enum PartPlan {
-    /// A byte or file source whose exact length defines its part count.
-    Fixed {
+    /// A manager-partitioned byte or file source whose exact length defines its part count.
+    Known {
         total_parts: u64,
-        expected_size: u64,
+        /// Size declared by the source and sent as `MpuObjectSize` on completion.
+        ///
+        /// This value is independent of multipart accounting, allowing S3 to detect an assembled
+        /// object whose size differs from the source declaration.
+        declared_object_size: u64,
     },
-    /// A caller-provided stream whose part boundaries are independent of the configured part size.
+    /// A caller-provided stream whose part boundaries require reading through end-of-stream.
     ///
-    /// Dispatch continues until EOF. Equal bounds are an exact contract; a missing upper bound
-    /// permits any size at or above `lower`.
-    Streaming { lower: u64, upper: Option<u64> },
+    /// The size hint may still be exact. It constrains total bytes, but cannot determine how many
+    /// caller-defined parts the stream will produce.
+    UntilEof { size_hint: SizeHint },
 }
 
 impl PartPlan {
@@ -45,60 +49,102 @@ impl PartPlan {
     /// therefore answers only whether dispatch is finished, not how many parts the source contains.
     fn all_dispatched(&self, parts_dispatched: u64, eof: bool) -> bool {
         match self {
-            Self::Fixed { total_parts, .. } => parts_dispatched >= *total_parts,
-            Self::Streaming { .. } => eof,
+            Self::Known { total_parts, .. } => parts_dispatched >= *total_parts,
+            Self::UntilEof { .. } => eof,
         }
     }
 
-    /// Returns whether source part count is known independently of EOF.
-    pub(crate) fn is_streaming(&self) -> bool {
-        matches!(self, Self::Streaming { .. })
+    /// Returns whether dispatch must observe end-of-stream.
+    pub(crate) fn reads_until_eof(&self) -> bool {
+        matches!(self, Self::UntilEof { .. })
     }
 
-    /// Returns whether a zero-byte stream satisfies its declared lower bound.
-    fn permits_empty(&self) -> bool {
-        self.bounds().0 == 0
+    /// Returns the declared bounds on total source bytes.
+    fn source_size_hint(&self) -> SizeHint {
+        match self {
+            Self::Known {
+                declared_object_size,
+                ..
+            } => SizeHint::exact(*declared_object_size),
+            Self::UntilEof { size_hint } => *size_hint,
+        }
     }
 
     /// Rejects a source as soon as its output exceeds the declared upper bound.
-    fn validate_progress(&self, actual: u64) -> io::Result<()> {
-        let (_, upper) = self.bounds();
-        if let Some(upper) = upper {
+    fn validate_progress(&self, actual: u64) -> Result<(), SizeHintViolation> {
+        if let Some(upper) = self.source_size_hint().upper() {
             if actual > upper {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "upload stream produced {actual} bytes, exceeding its declared upper \
-                         bound of {upper} bytes"
-                    ),
-                ));
+                return Err(SizeHintViolation::AboveUpper { actual, upper });
             }
         }
         Ok(())
     }
 
     /// Validates the final source size against both bounds.
-    pub(crate) fn validate_complete(&self, actual: u64) -> io::Result<()> {
+    fn validate_complete(&self, actual: u64) -> Result<(), SizeHintViolation> {
         self.validate_progress(actual)?;
-        let (lower, _) = self.bounds();
+        let lower = self.source_size_hint().lower();
         if actual < lower {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "upload stream ended after {actual} bytes, below its declared lower bound of \
-                     {lower} bytes"
-                ),
-            ));
+            return Err(SizeHintViolation::BelowLower { actual, lower });
         }
         Ok(())
     }
 
-    fn bounds(&self) -> (u64, Option<u64>) {
-        match self {
-            Self::Fixed { expected_size, .. } => (*expected_size, Some(*expected_size)),
-            Self::Streaming { lower, upper } => (*lower, *upper),
+    /// Returns the object size CompleteMultipartUpload must independently validate.
+    pub(crate) fn mpu_object_size(&self, bytes_read: u64) -> Result<u64, SizeHintViolation> {
+        self.validate_complete(bytes_read)?;
+        let size_hint = self.source_size_hint();
+
+        if size_hint.upper() == Some(size_hint.lower()) {
+            Ok(size_hint.lower())
+        } else {
+            Ok(bytes_read)
         }
     }
+}
+
+/// A caller-provided stream contradicted its declared size bounds.
+#[derive(Debug)]
+pub(crate) enum SizeHintViolation {
+    InvalidBounds { lower: u64, upper: u64 },
+    BelowLower { actual: u64, lower: u64 },
+    AboveUpper { actual: u64, upper: u64 },
+}
+
+impl fmt::Display for SizeHintViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBounds { lower, upper } => write!(
+                formatter,
+                "upload stream lower size bound {lower} exceeds upper bound {upper}"
+            ),
+            Self::BelowLower { actual, lower } => write!(
+                formatter,
+                "upload stream ended after {actual} bytes, below its declared lower bound of \
+                 {lower} bytes"
+            ),
+            Self::AboveUpper { actual, upper } => write!(
+                formatter,
+                "upload stream produced {actual} bytes, exceeding its declared upper bound of \
+                 {upper} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SizeHintViolation {}
+
+/// Validates the bounds captured before source polling begins.
+pub(crate) fn validate_size_hint(size_hint: SizeHint) -> Result<(), SizeHintViolation> {
+    if let Some(upper) = size_hint.upper() {
+        if size_hint.lower() > upper {
+            return Err(SizeHintViolation::InvalidBounds {
+                lower: size_hint.lower(),
+                upper,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Preserves source wakeups while a pending part read moves back into transfer state.
@@ -198,20 +244,43 @@ impl PendingPartReads {
 pub(crate) struct UploadPartWork {
     pending_read: Option<PendingPartRead>,
     timing: Option<UploadPartTiming>,
+    kind: UploadPartWorkKind,
+}
+
+/// Source of one UploadPart work item.
+#[derive(Debug)]
+enum UploadPartWorkKind {
+    /// A part supplied by the configured upload source.
+    SourceRead,
+    /// The canonical zero-byte part required to complete an empty MPU object.
+    EmptyObject,
 }
 
 impl UploadPartWork {
+    /// Starts a newly admitted source read.
     fn fresh(timing: UploadPartTiming) -> Self {
         Self {
             pending_read: None,
             timing: Some(timing),
+            kind: UploadPartWorkKind::SourceRead,
         }
     }
 
+    /// Resumes the exact source future retained after `Poll::Pending`.
     fn resumed(read: PendingPartRead) -> Self {
         Self {
             pending_read: Some(read),
             timing: None,
+            kind: UploadPartWorkKind::SourceRead,
+        }
+    }
+
+    /// Sends the canonical zero-byte part required for an empty MPU object.
+    fn empty_object(timing: UploadPartTiming) -> Self {
+        Self {
+            pending_read: None,
+            timing: Some(timing),
+            kind: UploadPartWorkKind::EmptyObject,
         }
     }
 
@@ -227,6 +296,10 @@ impl UploadPartWork {
 
     pub(crate) fn is_resumed(&self) -> bool {
         self.pending_read.is_some()
+    }
+
+    pub(crate) fn is_empty_object(&self) -> bool {
+        matches!(self.kind, UploadPartWorkKind::EmptyObject)
     }
 }
 
@@ -255,10 +328,12 @@ pub(crate) struct PartTransferState {
     pending_reads: PendingPartReads,
     /// S3 completion records collected as network uploads finish.
     completed_parts: Vec<CompletedPart>,
+    /// Number of `PartData` values returned by source reads.
+    parts_read: u64,
+    /// Bytes returned by source reads before UploadPart submission.
+    bytes_read: u64,
     /// Bytes accepted by completed UploadPart requests.
     bytes_uploaded: u64,
-    /// Bytes yielded by the source, including parts whose requests remain in flight.
-    bytes_yielded: u64,
     /// Optional aggregate collection and transition-reporting policy.
     diagnostics: UploadTransferDiagnostics,
 }
@@ -278,8 +353,9 @@ impl PartTransferState {
             parts_in_flight: 0,
             pending_reads: PendingPartReads::default(),
             completed_parts: Vec::with_capacity(completed_parts_capacity),
+            parts_read: 0,
+            bytes_read: 0,
             bytes_uploaded: 0,
-            bytes_yielded: 0,
             diagnostics,
         }
     }
@@ -339,35 +415,39 @@ impl PartTransferState {
         self.diagnostics.begin_upload(presentation_segments, timing)
     }
 
-    /// Records one part before its UploadPart request starts.
-    pub(crate) fn observe_part(&mut self, bytes: u64) -> io::Result<()> {
-        self.bytes_yielded = self
-            .bytes_yielded
+    /// Records one source part before its UploadPart request starts.
+    pub(crate) fn observe_part(&mut self, bytes: u64) -> Result<u64, SizeHintViolation> {
+        self.parts_read = self
+            .parts_read
+            .checked_add(1)
+            .expect("source part count overflow");
+        self.bytes_read = self
+            .bytes_read
             .checked_add(bytes)
-            .ok_or_else(|| io::Error::other("upload stream byte count overflowed"))?;
-        self.plan.validate_progress(self.bytes_yielded)
+            .expect("source byte count overflow");
+        self.plan.validate_progress(self.bytes_read)?;
+        Ok(self.parts_read)
     }
 
-    /// Records end-of-stream and returns whether this caller owns empty-stream synthesis.
-    ///
-    /// The false-to-true transition elects one caller. Empty-part synthesis is valid only when the
-    /// source's lower bound permits zero bytes.
-    pub(crate) fn observe_end_of_stream(&mut self, parts_yielded: u64) -> io::Result<bool> {
+    /// Records end-of-stream and returns whether this call changed source state.
+    pub(crate) fn record_end_of_stream(&mut self) -> bool {
         if self.eof {
-            return Ok(false);
+            return false;
         }
         self.eof = true;
         self.record_dispatch_closed();
-        self.plan.validate_complete(self.bytes_yielded)?;
-        Ok(self.plan.permits_empty() && parts_yielded == 0)
+        true
     }
 
     /// Retires scheduled work that ended without starting an UploadPart request.
-    pub(crate) fn finish_read_without_part(&mut self) {
+    ///
+    /// Returns whether the drained source now requires its empty-object part.
+    pub(crate) fn finish_read_without_part(&mut self) -> bool {
         self.parts_in_flight = self
             .parts_in_flight
             .checked_sub(1)
             .expect("multipart in-flight completion underflow");
+        self.needs_empty_object_part()
     }
 
     /// Records one successfully uploaded part.
@@ -390,46 +470,78 @@ impl PartTransferState {
     }
 
     /// Returns whether source part count is discovered by reading through EOF.
-    pub(crate) fn is_streaming(&self) -> bool {
-        self.plan.is_streaming()
+    pub(crate) fn reads_until_eof(&self) -> bool {
+        self.plan.reads_until_eof()
     }
 
-    /// Returns whether dispatch is closed and all scheduled work has retired.
-    pub(crate) fn is_complete(&self) -> bool {
+    /// Returns whether source dispatch is closed and all source work has retired.
+    fn source_drained(&self) -> bool {
         self.plan.all_dispatched(self.parts_dispatched, self.eof)
             && self.parts_in_flight == 0
             && self.pending_reads.is_empty()
     }
 
-    /// Consumes a drained state and returns the fields needed by CompleteMultipartUpload.
-    pub(crate) fn into_completion(
-        mut self,
-    ) -> (
-        Arc<PartReader>,
-        PartPlan,
-        Vec<CompletedPart>,
-        u64,
-        PartTransferSnapshot,
-        UploadTransferDiagnostics,
-    ) {
+    /// Returns whether drained source state requires the single empty part S3 MPU expects.
+    fn needs_empty_object_part(&self) -> bool {
+        let source_returned_no_parts = self.parts_read == 0;
+
+        // The empty-object part does not increment `parts_read`, but its completion is recorded here.
+        // Requiring an empty list makes this predicate false after that part completes.
+        let no_part_was_already_uploaded = self.completed_parts.is_empty();
+
+        // A zero lower bound means an empty source satisfies its declared size bounds.
+        let empty_satisfies_size_hint = self.plan.source_size_hint().lower() == 0;
+
+        self.source_drained()
+            && source_returned_no_parts
+            && no_part_was_already_uploaded
+            && empty_satisfies_size_hint
+    }
+
+    /// Starts the one zero-byte part required for a valid empty MPU source, when needed.
+    pub(crate) fn maybe_start_empty_object_part(&mut self) -> Option<UploadPartWork> {
+        if !self.needs_empty_object_part() {
+            return None;
+        }
+        self.parts_dispatched = self
+            .parts_dispatched
+            .checked_add(1)
+            .expect("multipart dispatch count overflow");
+        self.parts_in_flight = self
+            .parts_in_flight
+            .checked_add(1)
+            .expect("multipart in-flight count overflow");
+        self.record_dispatch_closed();
+        Some(UploadPartWork::empty_object(
+            self.diagnostics.part_scheduled(),
+        ))
+    }
+
+    /// Returns whether dispatch is closed and all scheduled work has retired.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.source_drained() && !self.needs_empty_object_part()
+    }
+
+    /// Consumes drained multipart state.
+    pub(crate) fn into_completion(mut self) -> MultipartCompletion {
         assert!(
             self.is_complete(),
             "multipart state completed while work remained"
         );
         assert_eq!(
-            self.bytes_yielded, self.bytes_uploaded,
+            self.bytes_read, self.bytes_uploaded,
             "multipart completion lost or duplicated source bytes"
         );
-        let snapshot = self.snapshot();
+        let final_snapshot = self.snapshot();
         self.diagnostics.finish_body();
-        (
-            self.part_reader,
-            self.plan,
-            self.completed_parts,
-            self.bytes_uploaded,
-            snapshot,
-            self.diagnostics,
-        )
+        MultipartCompletion {
+            part_reader: self.part_reader,
+            plan: self.plan,
+            completed_parts: self.completed_parts,
+            bytes_read: self.bytes_read,
+            final_snapshot,
+            diagnostics: self.diagnostics,
+        }
     }
 
     /// Returns a coherent view while the caller holds the upload-state lock.
@@ -484,6 +596,16 @@ impl PartTransferState {
     }
 }
 
+/// Drained multipart state consumed by CompleteMultipartUpload.
+pub(crate) struct MultipartCompletion {
+    pub(crate) part_reader: Arc<PartReader>,
+    pub(crate) plan: PartPlan,
+    pub(crate) completed_parts: Vec<CompletedPart>,
+    pub(crate) bytes_read: u64,
+    pub(crate) final_snapshot: PartTransferSnapshot,
+    pub(crate) diagnostics: UploadTransferDiagnostics,
+}
+
 /// State machine for tracking upload work progress.
 #[derive(Debug)]
 pub(crate) enum UploadState {
@@ -517,42 +639,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_and_streaming_plans_close_at_their_own_boundaries() {
-        let fixed = PartPlan::Fixed {
+    fn known_and_end_of_stream_plans_close_at_their_own_boundaries() {
+        let known = PartPlan::Known {
             total_parts: 10_000,
-            expected_size: 100 * 1024 * 1024 * 1024,
+            declared_object_size: 100 * 1024 * 1024 * 1024,
         };
-        assert!(!fixed.all_dispatched(1, true));
-        assert!(fixed.all_dispatched(10_000, false));
+        assert!(!known.all_dispatched(1, true));
+        assert!(known.all_dispatched(10_000, false));
 
-        let streaming = PartPlan::Streaming {
-            lower: 0,
-            upper: Some(10),
+        let until_eof = PartPlan::UntilEof {
+            size_hint: SizeHint::default().with_upper(Some(10)),
         };
-        assert!(!streaming.all_dispatched(10_000, false));
-        assert!(streaming.all_dispatched(1, true));
+        assert!(!until_eof.all_dispatched(10_000, false));
+        assert!(until_eof.all_dispatched(1, true));
     }
 
     #[test]
-    fn fixed_plan_can_complete_without_an_extra_end_of_stream_poll() {
-        let fixed = PartPlan::Fixed {
+    fn known_plan_can_complete_without_an_extra_end_of_stream_poll() {
+        let known = PartPlan::Known {
             total_parts: 2,
-            expected_size: 10,
+            declared_object_size: 10,
         };
-        assert!(!fixed.all_dispatched(1, false));
-        assert!(fixed.all_dispatched(2, false));
+        assert!(!known.all_dispatched(1, false));
+        assert!(known.all_dispatched(2, false));
     }
 
     #[test]
-    fn streaming_bounds_reject_underflow_and_overflow() {
-        let bounded = PartPlan::Streaming {
-            lower: 5,
-            upper: Some(10),
+    fn end_of_stream_bounds_reject_underflow_and_overflow() {
+        let bounded = PartPlan::UntilEof {
+            size_hint: SizeHint::default().with_lower(5).with_upper(Some(10)),
         };
         assert!(bounded.validate_complete(4).is_err());
         assert!(bounded.validate_complete(5).is_ok());
         assert!(bounded.validate_complete(10).is_ok());
         assert!(bounded.validate_complete(11).is_err());
+    }
+
+    #[test]
+    fn exact_size_remains_the_mpu_object_size_witness() {
+        let exact = PartPlan::UntilEof {
+            size_hint: SizeHint::exact(7),
+        };
+        assert_eq!(7, exact.mpu_object_size(7).unwrap());
+
+        let bounded = PartPlan::UntilEof {
+            size_hint: SizeHint::default().with_lower(5).with_upper(Some(10)),
+        };
+        assert_eq!(7, bounded.mpu_object_size(7).unwrap());
     }
 
     #[test]

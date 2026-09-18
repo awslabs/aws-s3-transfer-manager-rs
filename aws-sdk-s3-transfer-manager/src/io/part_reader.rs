@@ -6,7 +6,6 @@ use std::cmp;
 use std::fs::File;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -189,18 +188,6 @@ impl PartReader {
         }
     }
 
-    /// Number of parts this reader has produced.
-    ///
-    /// Exact for custom streams because the count is advanced before the gate returns the stream.
-    /// File readers count claimed ranges, so their value may lead an in-flight or failed read.
-    pub(crate) fn parts_yielded(&self) -> u64 {
-        match &self.inner {
-            Inner::Bytes(bytes) => bytes.parts_yielded(),
-            Inner::Fs(path_body) => path_body.parts_yielded(),
-            Inner::Dyn(part_stream) => part_stream.parts_yielded.load(Ordering::Acquire),
-        }
-    }
-
     pub(crate) async fn full_object_checksum(&self) -> Option<String> {
         match &self.inner {
             Inner::Dyn(part_stream) => part_stream.full_object_checksum().await,
@@ -340,10 +327,6 @@ impl BytesPartReader {
 }
 
 impl BytesPartReader {
-    fn parts_yielded(&self) -> u64 {
-        self.state.lock().expect("lock valid").part_number - 1
-    }
-
     fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
         let mut state = self.state.lock().expect("lock valid");
         if state.is_end() {
@@ -405,10 +388,6 @@ impl PathBodyPartReader {
 }
 
 impl PathBodyPartReader {
-    fn parts_yielded(&self) -> u64 {
-        self.state.lock().expect("lock valid").part_number - 1
-    }
-
     /// Claims and reads the next file range.
     ///
     /// The complete range is admitted before file I/O begins. The returned
@@ -496,15 +475,12 @@ struct PathBodyReadCursor {
 #[derive(Debug)]
 struct DynPartReader {
     gate: PartStreamGate,
-    /// Counted explicitly because a custom stream has no internal part cursor.
-    parts_yielded: AtomicU64,
 }
 
 impl DynPartReader {
     fn new(inner: BoxStream) -> Self {
         Self {
             gate: PartStreamGate::new(inner),
-            parts_yielded: AtomicU64::new(0),
         }
     }
 
@@ -668,9 +644,6 @@ impl Future for DynNextPartFuture {
                     .expect("custom stream disappeared at completion");
                 match result {
                     Some(Ok(part)) => {
-                        this.part_stream
-                            .parts_yielded
-                            .fetch_add(1, Ordering::Release);
                         this.part_stream.gate.release(stream);
                         Poll::Ready(Ok(Some(part)))
                     }
@@ -704,14 +677,13 @@ mod test {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
     use crate::io::part_reader::{
-        Builder, BytesPartReader, DynPartReader, Inner, PartData, PartReadStart, PartReader,
-        PathBodyPartReader, SourceAccess,
+        Builder, BytesPartReader, PartData, PartReadStart, PartReader, PathBodyPartReader,
     };
     use crate::io::path_body::PathBody;
     use crate::io::stream::{PartStream, StreamContext};
@@ -1094,7 +1066,6 @@ mod test {
         let part = first.await.unwrap().expect("source should yield a part");
         assert_eq!(part.data, Bytes::from_static(b"ready"));
         assert!(!reader.source_unavailable());
-        assert_eq!(reader.parts_yielded(), 1);
     }
 
     // Tokio's test runtime initializes kqueue, which Miri cannot execute.
@@ -1133,72 +1104,6 @@ mod test {
             Bytes::from_static(b"second")
         );
         assert!(!reader.source_unavailable());
-    }
-
-    struct CountPublishedWake {
-        part_stream: Arc<DynPartReader>,
-        woke: AtomicBool,
-    }
-
-    impl Wake for CountPublishedWake {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            assert_eq!(
-                self.part_stream.parts_yielded.load(Ordering::Acquire),
-                1,
-                "gate handoff became visible before the yielded-part count"
-            );
-            self.woke.store(true, Ordering::Release);
-        }
-    }
-
-    #[tokio::test]
-    async fn custom_stream_publishes_count_before_gate_handoff() {
-        let reader = Arc::new(
-            Builder::new()
-                .part_size(5)
-                .stream(InputStream::from_part_stream(TestStream::new(vec![
-                    Bytes::from_static(b"first"),
-                ])))
-                .buffer_pool(test_pool())
-                .metrics(test_metrics())
-                .telemetry(test_telemetry())
-                .build()
-                .unwrap(),
-        );
-        let Inner::Dyn(part_stream) = &reader.inner else {
-            panic!("custom stream did not build a dynamic reader");
-        };
-        let part_stream = Arc::clone(part_stream);
-
-        let PartReadStart::Ready(first) = reader.start_part_read().await else {
-            panic!("fresh custom stream was blocked");
-        };
-        let mut waiter = Box::pin(part_stream.gate.acquire());
-        let wake = Arc::new(CountPublishedWake {
-            part_stream: Arc::clone(&part_stream),
-            woke: AtomicBool::new(false),
-        });
-        let waker = Waker::from(Arc::clone(&wake));
-        let mut cx = Context::from_waker(&waker);
-        assert!(waiter.as_mut().poll(&mut cx).is_pending());
-
-        assert_eq!(
-            first.await.unwrap().unwrap().data,
-            Bytes::from_static(b"first")
-        );
-        assert!(
-            wake.woke.load(Ordering::Acquire),
-            "gate handoff did not wake its waiter"
-        );
-
-        let Poll::Ready(SourceAccess::Acquired(stream)) = waiter.as_mut().poll(&mut cx) else {
-            panic!("released stream was not handed to its waiter");
-        };
-        part_stream.gate.release(stream);
     }
 
     #[derive(Debug)]

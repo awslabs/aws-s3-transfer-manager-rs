@@ -67,6 +67,10 @@ pub(crate) enum PartTransferTransition {
     NewPartScheduled,
     /// A retained source operation was rescheduled after notification.
     SourceWakeScheduled,
+    /// The source reported end-of-stream and closed further dispatch.
+    SourceExhausted,
+    /// The zero-byte part required for an empty MPU object was scheduled.
+    EmptyObjectPartScheduled,
     /// Dispatch is closed and every scheduled operation has retired.
     CompletionReady,
     /// No upload-part work can be dispatched until pipeline state changes.
@@ -80,6 +84,8 @@ impl PartTransferTransition {
         match self {
             Self::NewPartScheduled => ("work_scheduled", "new_part"),
             Self::SourceWakeScheduled => ("work_scheduled", "source_wake"),
+            Self::SourceExhausted => ("dispatch_closed", "source_eof"),
+            Self::EmptyObjectPartScheduled => ("work_scheduled", "empty_object"),
             Self::CompletionReady => ("completion_ready", "pipeline_drained"),
             Self::Pending(PartTransferPendingReason::SourceUnavailable) => {
                 ("poll_pending", "source_unavailable")
@@ -675,6 +681,14 @@ mod tests {
         assert_eq!(
             PartTransferTransition::SourceWakeScheduled.fields(),
             ("work_scheduled", "source_wake")
+        );
+        assert_eq!(
+            PartTransferTransition::SourceExhausted.fields(),
+            ("dispatch_closed", "source_eof")
+        );
+        assert_eq!(
+            PartTransferTransition::EmptyObjectPartScheduled.fields(),
+            ("work_scheduled", "empty_object")
         );
         assert_eq!(
             PartTransferTransition::CompletionReady.fields(),

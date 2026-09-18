@@ -185,9 +185,9 @@ impl InputStream {
     ///
     /// The stream must emit at least [`SizeHint::lower`](crate::io::SizeHint::lower) bytes and no
     /// more than its optional [`SizeHint::upper`](crate::io::SizeHint::upper). Equal bounds declare
-    /// an exact size. The upper bound is used for part-size planning, but completion sends the
-    /// validated number of bytes actually emitted as `MpuObjectSize`. Contradictory bounds, early
-    /// EOF, and output past the upper bound fail the upload.
+    /// an exact size and are retained as the independent `MpuObjectSize` sent to S3. For nonexact
+    /// bounds, completion sends the validated number of bytes actually emitted. Contradictory
+    /// bounds, early EOF, and output past the upper bound fail the upload.
     ///
     /// # Streams without an upper bound
     ///
@@ -390,7 +390,8 @@ pub trait PartStream {
     /// Returns the bounds on the total size of the stream.
     ///
     /// Equal bounds are exact. When an upper bound is present it must be greater than or equal to
-    /// the lower bound.
+    /// the lower bound. The transfer manager captures this declaration once before polling begins;
+    /// it must describe the complete sequence of parts returned before end-of-stream.
     fn size_hint(&self) -> crate::io::SizeHint;
 
     /// If you calculated the full object checksum while streaming, return it.
