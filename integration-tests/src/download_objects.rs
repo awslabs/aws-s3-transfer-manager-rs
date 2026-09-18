@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{ByteTotal, FailedTransferPolicy, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::{
+    ByteTotal, EntryTotal, FailedTransferPolicy, RuntimeMode,
+};
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
 use aws_sdk_s3_transfer_manager::events::{Decision, Endpoint, Outcome, TransferEvent};
@@ -1159,6 +1161,195 @@ async fn test_download_objects_bar_is_monotonic_and_short_by_what_never_moved() 
     })
     .await
     .expect("test_download_objects_bar_is_monotonic_and_short_by_what_never_moved timed out");
+}
+
+/// The entry count reaches its total on a run with failures, which is the question bytes
+/// cannot answer.
+///
+/// This is the `N file(s) remaining` the AWS CLI prints on every progress line and the
+/// `transferredFiles` the SEP's directory snapshot marks Required. The byte bar on this same
+/// run ends at 14/16 of the payload, because two objects moved no bytes — so a consumer with
+/// only bytes cannot distinguish "finished with failures" from "still working". The count
+/// can: 16 of 16 settled, 2 of them unsuccessfully.
+///
+/// Both halves matter and both are asserted: the numerator counts endings rather than
+/// successes, and the denominator counts every object listed.
+#[tokio::test]
+async fn test_download_objects_entry_count_reaches_its_total_with_failures() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 16usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "entries/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        for doomed in ["0002.bin", "0011.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            let mut settled_events = 0usize;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => settled_events += 1,
+                    _ => {}
+                }
+            }
+            (root, settled_events, stream.dropped())
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, settled_events, dropped) = collector.await.expect("collector");
+        let root = root.expect("the root announced itself with a view");
+
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must actually have failed, or this test proves nothing"
+        );
+
+        // The denominator: every object listed, including the two that failed.
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root.entry_total(),
+            "the entry denominator counts what listing produced"
+        );
+        // The numerator: every ending, not every success. 14 succeeded and 2 failed, and all
+        // 16 are no longer pending — so "remaining" is 0 and a CLI stops printing work left.
+        assert_eq!(
+            count as u64,
+            root.entries_settled(),
+            "a failed entry has still settled; counting only successes would leave 2 \
+             objects 'remaining' forever on a finished transfer"
+        );
+
+        // The count is published on the view, not tallied from the stream, and this is why:
+        // the two agree here only because nothing was dropped. Under loss the view stays
+        // exact and the tally goes short.
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+        assert_eq!(
+            count, settled_events,
+            "with no loss the stream's terminal count matches the view's, which is the \
+             invariant that makes the view the authority when there is loss"
+        );
+
+        // And the contrast that motivates the whole item: bytes stop short on this same run.
+        assert_eq!(
+            ByteTotal::Final((count * size) as u64),
+            root.byte_total(),
+            "both denominators seal together"
+        );
+        assert_eq!(
+            ((count - 2) * size) as u64,
+            root.metrics().network_rx,
+            "the byte numerator is short by the two objects that moved nothing, which is \
+             exactly why the entry count is needed"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_entry_count_reaches_its_total_with_failures timed out");
+}
+
+/// A run whose listing never completed publishes no entry total, for the same reason it
+/// publishes no byte total: nobody knows how many objects there were.
+///
+/// `EntryTotal::Final(0)` would be the damaging answer — a consumer reads it as "zero objects
+/// to do, we are done" at the instant listing failed.
+#[tokio::test]
+async fn test_download_objects_does_not_seal_an_entry_total_when_listing_never_ran() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let bucket = "test-bucket";
+        let prefix = "unsealed-entries/";
+        seed_bucket(&m.server, bucket, prefix, 12, 1024).await;
+
+        // A destination that is a plain file, not a directory: validation fails on the first
+        // walker advance, before a single key is listed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"x").expect("write file");
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&not_a_dir)
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            while let Some(ev) = stream.next().await {
+                if let TransferEvent::Decided {
+                    parent: None, view, ..
+                } = ev
+                {
+                    root = view;
+                }
+            }
+            root
+        });
+
+        let _ = handle.join().await;
+        let root = collector
+            .await
+            .expect("collector")
+            .expect("the root announced itself with a view");
+
+        assert_eq!(
+            EntryTotal::Unknown,
+            root.entry_total(),
+            "listing never ran, so the object count is unknown and must not read as 0 of 0"
+        );
+        assert_eq!(
+            ByteTotal::Unknown,
+            root.byte_total(),
+            "and the byte total is unknown for the same reason, from the same seal"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_does_not_seal_an_entry_total_when_listing_never_ran timed out");
 }
 
 /// A doomed object must surface as `Outcome::Failed` on its own child event while

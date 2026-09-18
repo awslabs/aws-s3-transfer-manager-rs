@@ -384,6 +384,37 @@ impl TransferView {
     pub fn byte_total(&self) -> ByteTotal {
         self.metrics.byte_total()
     }
+
+    /// This transfer's entry denominator: how many objects the directory operation will
+    /// act on. See [`EntryTotal`].
+    ///
+    /// Always [`EntryTotal::Unknown`] for a single-object transfer, which is one entry and
+    /// is itself the thing being counted.
+    ///
+    /// Sealed by the same enumeration-complete fact as [`byte_total`](Self::byte_total), so
+    /// the two denominators agree about whether listing finished and one cannot be `Final`
+    /// while the other is still `Provisional`.
+    pub fn entry_total(&self) -> EntryTotal {
+        self.metrics.entry_total()
+    }
+
+    /// Entries that have reached a terminal state, however they ended.
+    ///
+    /// Counts successes, failures, cancellations and entries abandoned before they
+    /// started — "no longer pending", not "succeeded". This is the numerator for a
+    /// `N of M objects` or `M - N remaining` display, where
+    /// [`entry_total`](Self::entry_total) is `M`: a caller that counted only successes
+    /// would show work remaining forever on a run with failures.
+    ///
+    /// Incremented at the same instant the entry's
+    /// [`TransferEvent::Settled`](crate::events::TransferEvent::Settled) is claimed, so
+    /// this is exactly what a consumer would tally from the stream if no event were ever
+    /// dropped — and unlike that tally, it stays exact when events are.
+    ///
+    /// 0 for a single-object transfer.
+    pub fn entries_settled(&self) -> u64 {
+        self.metrics.entries_settled()
+    }
 }
 
 /// A transfer's expected total payload bytes, and how much to trust it.
@@ -398,6 +429,27 @@ pub enum ByteTotal {
     /// A lower bound. Enumeration is still running, so this will only grow. Do not treat
     /// it as final even when a later reading repeats it — only [`ByteTotal::Final`] says
     /// enumeration is over.
+    Provisional(u64),
+    /// Enumeration finished and this will not change again.
+    Final(u64),
+}
+
+/// How many entries a directory operation will act on, and how much to trust the number.
+///
+/// Deliberately a distinct type from [`ByteTotal`] despite the identical shape. The two are
+/// different units, and the bug that conflates them is visible and alarming: a bar drawing a
+/// *byte* numerator against an *entry* denominator renders a 10 MiB / 900 object transfer at
+/// 1,165,084%, which reads as data corruption rather than as a units mistake. Separate types
+/// make that unrepresentable instead of merely unlikely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EntryTotal {
+    /// No count is known. A single-object transfer, or a directory operation cancelled
+    /// before enumeration finished. Report entries done, not a fraction.
+    Unknown,
+    /// A lower bound: enumeration is still running, so this will only grow. Render it as
+    /// approximate — the AWS CLI prints `~4 file(s) remaining (calculating...)` in exactly
+    /// this state.
     Provisional(u64),
     /// Enumeration finished and this will not change again.
     Final(u64),

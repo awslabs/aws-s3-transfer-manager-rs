@@ -324,6 +324,25 @@ async fn draw_progress(
     let mut root: Option<TransferView> = None;
     let (mut ok, mut failed) = (0u64, 0u64);
 
+    // "N file(s) remaining", the AWS CLI's own tail. Both numbers come off the view rather
+    // than being tallied from the stream, so they stay exact when events are dropped.
+    let remaining = |view: &TransferView| -> String {
+        use aws_sdk_s3_transfer_manager::types::EntryTotal;
+        let settled = view.entries_settled();
+        match view.entry_total() {
+            // `~` while enumeration can still grow the total, matching how the CLI marks a
+            // total it has not finished calculating.
+            EntryTotal::Provisional(total) => {
+                format!("~{} file(s) remaining", total.saturating_sub(settled))
+            }
+            EntryTotal::Final(total) => {
+                format!("{} file(s) remaining", total.saturating_sub(settled))
+            }
+            // No total to subtract from: report what is done instead of a remainder.
+            _ => format!("{settled} file(s) done"),
+        }
+    };
+
     let repaint = |root: &Option<TransferView>, ok: u64, failed: u64| {
         let Some(view) = root else { return };
         let done = numerator.of(&view.metrics());
@@ -351,7 +370,10 @@ async fn draw_progress(
             ),
             _ => format!("[{:<40}] {} (total unknown)", "", ByteUnit::display(done)),
         };
-        print!("\r{line}  {ok} ok, {failed} failed ");
+        print!(
+            "\r{line} with {}  ({ok} ok, {failed} failed) ",
+            remaining(view)
+        );
         let _ = std::io::stdout().flush();
     };
 

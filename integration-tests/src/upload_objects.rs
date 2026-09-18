@@ -808,6 +808,7 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
         let mut settled: HashMap<u64, usize> = HashMap::new();
         let mut child_keys: HashSet<String> = HashSet::new();
         let mut viewless_children = 0usize;
+        let mut root_view: Option<aws_sdk_s3_transfer_manager::types::TransferView> = None;
 
         for ev in &events {
             let key = match ev.transfer().destination() {
@@ -827,6 +828,8 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
                         if view.is_none() {
                             viewless_children += 1;
                         }
+                    } else {
+                        root_view = view.clone();
                     }
                 }
                 TransferEvent::Settled { id, .. } => {
@@ -865,6 +868,26 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
             "the sweep must produce viewless entries and the spawned children must carry \
              views: {viewless_children} of {} children were viewless",
             child_keys.len()
+        );
+
+        // The settled-entry count on the aborted run. This is the assertion that covers the
+        // sweep and orphan-drain sites: a `Continue` run reaps every child through
+        // `claim_child_finish`, so only a cancel reaches the other two paths. Counting only
+        // at the reap would leave this at 1 -- the single spawned child -- against 60
+        // announced entries.
+        let root_view = root_view.expect("the root announced itself with a view");
+        assert_eq!(
+            child_keys.len() as u64,
+            root_view.entries_settled(),
+            "every announced entry settled exactly once, so the count must equal them: a \
+             swept entry and an orphaned child each settle on a path the reap never touches"
+        );
+        // And the count agrees with the stream, which is the same equality the clean-run test
+        // asserts -- here on the cancel paths instead of the reap path.
+        assert_eq!(
+            settled.len() as u64,
+            root_view.entries_settled() + 1,
+            "the stream also carries the root's own Settled, which is not one of the entries"
         );
 
         m.handle.shutdown().await.expect("shutdown");

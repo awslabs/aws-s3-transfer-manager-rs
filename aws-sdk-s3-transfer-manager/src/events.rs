@@ -17,16 +17,18 @@
 //! depend on the caller having seen an earlier one: [`TransferRef`] and
 //! [`Decision`] appear on both variants, and a consumer needs no side map.
 //!
-//! **Lifecycle is pushed; bytes are pulled.** No event carries a byte count. Each
-//! [`TransferEvent::Decided`] instead hands over a
+//! **Lifecycle is pushed; quantities are pulled.** No event carries a byte count or an
+//! object count. Each [`TransferEvent::Decided`] instead hands over a
 //! [`TransferView`](crate::types::TransferView) — a read-only handle you keep and read
 //! whenever you want to repaint. Nothing pushes a number at you.
 //!
-//! Both halves of that split are forced. Pushing byte counts would mean running caller
-//! code on the thread that records them, which holds a scheduler dispatch ticket and one
-//! of the fixed per-core threads, so it would stall every transfer in the client. And a
-//! total *summed from* a lossy stream would disagree with the operation's own result,
-//! whereas a counter read off a view is the same number the operation reports.
+//! Both halves of that split are forced. Pushing counts would mean running caller code on
+//! the thread that records them, which holds a scheduler dispatch ticket and one of the
+//! fixed per-core threads, so it would stall every transfer in the client. And any total
+//! *summed from* a lossy stream is a lower bound that silently disagrees with the
+//! operation's own result, where a counter read off a view is the number the operation
+//! reports — which is why `entries_settled()` exists rather than leaving a consumer to tally
+//! `Settled` events itself.
 //!
 //! **Two invariants carry the transport.**
 //!
@@ -88,7 +90,7 @@
 //!
 //! ```
 //! use aws_sdk_s3_transfer_manager::events::{TransferEvent, TransferEventStream, TryNextError};
-//! use aws_sdk_s3_transfer_manager::types::{ByteTotal, TransferView};
+//! use aws_sdk_s3_transfer_manager::types::{ByteTotal, EntryTotal, TransferView};
 //!
 //! /// Drain whatever has arrived, then draw. Called on the caller's own clock — every
 //! /// 100 ms, on a keypress, whenever suits — not once per event.
@@ -111,7 +113,7 @@
 //!
 //!     let view = root.as_ref()?;
 //!     let done = view.metrics().network_rx;
-//!     Some(match view.byte_total() {
+//!     let bytes = match view.byte_total() {
 //!         // A percentage is defined only against a final total.
 //!         ByteTotal::Final(total) if total > 0 => {
 //!             format!("{:.1}%", (done as f64 / total as f64) * 100.0)
@@ -120,7 +122,21 @@
 //!         // walk backwards. Show bytes instead.
 //!         ByteTotal::Provisional(total) => format!("{done} of {total}+ bytes"),
 //!         _ => format!("{done} bytes"),
-//!     })
+//!     };
+//!
+//!     // The other half of a progress line, and the half bytes cannot supply: how many
+//!     // entries are left. Counts endings, so it reaches zero even when entries fail --
+//!     // where the byte bar above stops short by whatever never moved.
+//!     let settled = view.entries_settled();
+//!     let files = match view.entry_total() {
+//!         EntryTotal::Final(total) => format!("{} file(s) remaining", total - settled),
+//!         // `~` because enumeration can still raise the total.
+//!         EntryTotal::Provisional(total) => {
+//!             format!("~{} file(s) remaining", total.saturating_sub(settled))
+//!         }
+//!         _ => format!("{settled} file(s) done"),
+//!     };
+//!     Some(format!("{bytes} with {files}"))
 //! }
 //! let _ = repaint;
 //! ```

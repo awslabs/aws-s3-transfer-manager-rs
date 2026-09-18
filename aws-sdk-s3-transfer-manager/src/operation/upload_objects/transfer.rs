@@ -560,6 +560,9 @@ impl UploadObjectsTransfer {
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
+                    // Settled without ever being a child: orchestration failed. Still one of
+                    // the enumerated entries, and still no longer pending.
+                    self.inner.ctx.metrics.record_entry_settled();
                     emit.send();
                 }
             }
@@ -592,13 +595,22 @@ impl UploadObjectsTransfer {
 
     /// claim one child's terminal emit. Safe under the state guard --
     /// claiming does not send. The caller sends once the guard is released.
+    ///
+    /// The settled-entry count rides the claim rather than the caller: `finish` yields
+    /// `Some` for exactly one caller per entry, so counting here is exactly-once on every
+    /// terminal path for free. Counting at the call sites instead would need the same
+    /// guarantee rebuilt at each, and a new terminal path would silently not count.
     fn claim_child_finish(
         &self,
         child_id: TransferId,
         outcome: crate::events::Outcome,
     ) -> Option<crate::events::PendingEmit> {
         let lc = self.inner.child_lifecycles.lock().remove(&child_id);
-        lc.and_then(|lc| lc.finish(outcome))
+        let emit = lc.and_then(|lc| lc.finish(outcome));
+        if emit.is_some() {
+            self.inner.ctx.metrics.record_entry_settled();
+        }
+        emit
     }
 
     /// discharge every outstanding obligation and release the sink.
@@ -657,10 +669,17 @@ impl UploadObjectsTransfer {
                 None => crate::events::Outcome::Cancelled {},
             };
             if let Some(emit) = lc.finish(child_outcome) {
+                // An orphan discharged here settles like any other entry. Under `Abort` this
+                // is the only site that ever settles it, so omitting the count would leave
+                // `entries_settled()` short by every cancelled child.
+                self.inner.ctx.metrics.record_entry_settled();
                 out.push(emit);
             }
         }
         if let Some(lc) = root {
+            // Deliberately not counted: the root is the operation, not one of the entries it
+            // enumerated. Counting it would put `entries_settled()` one above
+            // `EntryTotal::Final` at the end of every run.
             if let Some(emit) = lc.finish(outcome) {
                 out.push(emit);
             }
@@ -725,6 +744,11 @@ impl UploadObjectsTransfer {
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                    // An abandoned entry settles too: it is no longer pending, and it was
+                    // counted into the enumerated total when the walker produced it. Not
+                    // counting it here would leave `entries_settled()` permanently short of
+                    // `EntryTotal::Final` on every cancelled run.
+                    self.inner.ctx.metrics.record_entry_settled();
                     out.push(emit);
                 }
             }
@@ -1418,15 +1442,17 @@ impl UploadObjectsTransfer {
         // only path from a walker into the work queue. Counting at spawn instead
         // would miss entries abandoned when the transfer goes inactive.
         //
-        // The byte total is accumulated on the same principle and in this same critical
-        // section: the denominator counts what was enumerated, so an entry abandoned
-        // later still belongs in it, and a bar that omitted those could never reach the
-        // numerator once they were swept.
+        // Both denominators are accumulated on the same principle and in this same critical
+        // section: they count what was enumerated, so an entry abandoned later still belongs
+        // in them, and a bar that omitted those could never reach the numerator once they
+        // were swept. Every entry here is addressable -- it came from the filesystem walker
+        // with a path -- so unlike the download side there is nothing to exclude from the
+        // count, and `n_entries` is the same set `pending_entries` receives below.
         if !state.total_sealed {
-            self.inner
-                .ctx
-                .metrics
-                .add_discovered(entries.iter().map(|e| e.metadata().len()).sum::<u64>());
+            self.inner.ctx.metrics.add_discovered(
+                entries.iter().map(|e| e.metadata().len()).sum::<u64>(),
+                n_entries as u64,
+            );
         }
         state.pending_entries.extend(entries);
         if !self.inner.ctx.is_active() {

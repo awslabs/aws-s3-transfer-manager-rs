@@ -410,6 +410,9 @@ impl DownloadObjectsTransfer {
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
+                    // Settled without ever being a child: orchestration failed. Still one of
+                    // the enumerated entries, and still no longer pending.
+                    self.inner.ctx.metrics.record_entry_settled();
                     emit.send();
                 }
             }
@@ -465,6 +468,11 @@ impl DownloadObjectsTransfer {
             );
             lc.announce();
             if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                // An abandoned entry settles too: it is no longer pending, and it was counted
+                // into the enumerated total when listing produced it. Not counting it here
+                // would leave `entries_settled()` permanently short of `EntryTotal::Final` on
+                // every cancelled run.
+                self.inner.ctx.metrics.record_entry_settled();
                 out.push(emit);
             }
         }
@@ -472,13 +480,22 @@ impl DownloadObjectsTransfer {
 
     /// Claim one child's terminal emit. Safe under the state guard -- claiming
     /// does not send. The caller sends once the guard is released.
+    ///
+    /// The settled-entry count rides the claim rather than the caller: `finish` yields
+    /// `Some` for exactly one caller per entry, so counting here is exactly-once on every
+    /// terminal path for free. Counting at the call sites instead would need the same
+    /// guarantee rebuilt at each, and a new terminal path would silently not count.
     fn claim_child_finish(
         &self,
         child_id: TransferId,
         outcome: crate::events::Outcome,
     ) -> Option<crate::events::PendingEmit> {
         let lc = self.inner.child_lifecycles.lock().remove(&child_id);
-        lc.and_then(|lc| lc.finish(outcome))
+        let emit = lc.and_then(|lc| lc.finish(outcome));
+        if emit.is_some() {
+            self.inner.ctx.metrics.record_entry_settled();
+        }
+        emit
     }
 
     /// Discharge every outstanding obligation and release the sink.
@@ -526,10 +543,17 @@ impl DownloadObjectsTransfer {
                 None => crate::events::Outcome::Cancelled {},
             };
             if let Some(emit) = lc.finish(child_outcome) {
+                // An orphan discharged here settles like any other entry. Under `Abort` this
+                // is the only site that ever settles it, so omitting the count would leave
+                // `entries_settled()` short by every cancelled child.
+                self.inner.ctx.metrics.record_entry_settled();
                 out.push(emit);
             }
         }
         if let Some(lc) = root {
+            // Deliberately not counted: the root is the operation, not one of the entries it
+            // enumerated. Counting it would put `entries_settled()` one above
+            // `EntryTotal::Final` at the end of every run.
             if let Some(emit) = lc.finish(outcome) {
                 out.push(emit);
             }
@@ -886,26 +910,35 @@ impl DownloadObjectsTransfer {
         inserted
     }
 
-    /// Accumulate a just-listed batch into the enumerated-byte total.
+    /// Accumulate a just-listed batch into the enumerated byte and entry totals.
     ///
-    /// Caller holds the `State` lock. The denominator counts what was *listed*, so an
-    /// object abandoned later still belongs in it — a bar that omitted those could never
-    /// reach its numerator once they were swept.
+    /// Caller holds the `State` lock, and the caller extends `pending_entries` from this
+    /// same batch in this same critical section, which is what makes the entry count and the
+    /// entries that will actually be acted on the same set. The denominator counts what was
+    /// *listed*, so an object abandoned later still belongs in it — a bar that omitted those
+    /// could never reach its numerator once they were swept.
+    ///
+    /// **A keyless object is counted in neither total.** `Object::key()` is an `Option`, and
+    /// `record_abandoned_entries` skips an object without one — it cannot name a source, so
+    /// no event can be emitted for it and no child can be spawned. Counted, it would sit in
+    /// both denominators with nothing able to settle it: `entries_settled()` would stop one
+    /// short of `EntryTotal::Final` for the rest of the run, so a caller showing "N
+    /// remaining" would stick above zero on a transfer that had finished. Excluding it keeps
+    /// the entry total equal to the number of entries that can reach a terminal.
     ///
     /// `Object::size()` is an `Option<i64>`: absent for a zero-byte folder marker, and
     /// the signed type is the wire shape rather than a real possibility. Both collapse to
-    /// 0 rather than being skipped, so a missing size understates the total instead of
-    /// corrupting it.
+    /// 0 rather than being skipped, so a missing size understates the byte total instead of
+    /// corrupting it — a size is not needed to settle an entry, where a key is.
     fn accumulate_listed(&self, state: &mut State, batch: &[Object]) {
         if state.total_sealed {
             return;
         }
-        self.inner.ctx.metrics.add_discovered(
-            batch
-                .iter()
-                .map(|o| o.size().unwrap_or(0).max(0) as u64)
-                .sum::<u64>(),
-        );
+        let addressable = batch.iter().filter(|o| o.key().is_some());
+        let (bytes, entries) = addressable.fold((0u64, 0u64), |(bytes, entries), o| {
+            (bytes + o.size().unwrap_or(0).max(0) as u64, entries + 1)
+        });
+        self.inner.ctx.metrics.add_discovered(bytes, entries);
     }
 
     /// Seal the enumerated-byte total once listing is quiescent.

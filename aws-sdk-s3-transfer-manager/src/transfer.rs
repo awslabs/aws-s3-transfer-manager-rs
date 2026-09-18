@@ -426,7 +426,22 @@ pub(crate) struct MetricsState {
     /// the seal that reads it. The atomic exists to publish the value to a reader on
     /// another thread, which is `byte_total` and nothing else.
     discovered_bytes: AtomicU64,
+    /// Entries enumerated so far, counted at the same site and under the same lock as
+    /// `discovered_bytes`, from the same batch. Always 0 for a leaf.
+    discovered_entries: AtomicU64,
+    /// Entries that reached a terminal state, counted where the entry's `Settled` is
+    /// claimed rather than where its status transitions — so this equals the number of
+    /// terminal events the stream would have delivered had none been dropped.
+    ///
+    /// Counts every ending, not only success: an entry that failed, was cancelled, or was
+    /// abandoned before it started is no longer pending, and a consumer subtracting this
+    /// from the total to show "remaining" would otherwise never reach zero.
+    settled_entries: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
+    /// Sealed from `discovered_entries` by the same call that seals `total_bytes`, so one
+    /// enumeration-complete fact serves both denominators and they cannot disagree about
+    /// whether listing finished.
+    total_entries: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
 }
@@ -448,7 +463,10 @@ impl MetricsState {
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
             discovered_bytes: AtomicU64::new(0),
+            discovered_entries: AtomicU64::new(0),
+            settled_entries: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
+            total_entries: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
         }
@@ -482,22 +500,44 @@ impl MetricsState {
         let _ = self.total_bytes.set(n);
     }
 
-    /// Add the payload bytes of newly enumerated entries to the running total.
+    /// Add a just-enumerated batch to the running totals: its payload bytes and how many
+    /// entries it holds.
     ///
-    /// Caller is the owning composite, holding its own `State` lock.
-    pub(crate) fn add_discovered(&self, n: u64) {
-        self.discovered_bytes.fetch_add(n, Ordering::Relaxed);
+    /// One call for both, because they come from one batch and must agree — a batch counted
+    /// for bytes but not for entries, or the reverse, leaves the two denominators describing
+    /// different work. Caller is the owning composite, holding its own `State` lock.
+    pub(crate) fn add_discovered(&self, bytes: u64, entries: u64) {
+        self.discovered_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.discovered_entries
+            .fetch_add(entries, Ordering::Relaxed);
     }
 
-    /// Promote the running enumerated total to the final one. No-op if already set.
+    /// Record that one entry reached a terminal state.
     ///
-    /// Reads `discovered_bytes` rather than taking a value, so the number sealed is by
-    /// construction the number a concurrent `byte_total` was already reporting as
-    /// provisional, and the two cannot name different totals for the same walk.
+    /// Called where the entry's terminal event is *claimed*, so the exactly-once swap that
+    /// makes `Settled` unique makes this count unique too, on every terminal path, without
+    /// a second mechanism to keep in step.
+    pub(crate) fn record_entry_settled(&self) {
+        self.settled_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Promote both running enumerated totals to final ones. No-op if already set.
+    ///
+    /// Reads the accumulators rather than taking values, so each number sealed is by
+    /// construction the number a concurrent `byte_total`/`entry_total` was already
+    /// reporting as provisional, and they cannot name different totals for the same walk.
     pub(crate) fn seal_total(&self) {
         let _ = self
             .total_bytes
             .set(self.discovered_bytes.load(Ordering::Relaxed));
+        let _ = self
+            .total_entries
+            .set(self.discovered_entries.load(Ordering::Relaxed));
+    }
+
+    /// Entries that reached a terminal state.
+    pub(crate) fn entries_settled(&self) -> u64 {
+        self.settled_entries.load(Ordering::Relaxed)
     }
 
     /// This transfer's byte denominator and how far to trust it.
@@ -514,6 +554,19 @@ impl MetricsState {
         match self.discovered_bytes.load(Ordering::Relaxed) {
             0 => ByteTotal::Unknown,
             n => ByteTotal::Provisional(n),
+        }
+    }
+
+    /// This transfer's entry denominator. Same three states and same ordering rule as
+    /// [`byte_total`](Self::byte_total), reading the pair sealed by the same call.
+    pub(crate) fn entry_total(&self) -> crate::types::EntryTotal {
+        use crate::types::EntryTotal;
+        if let Some(n) = self.total_entries.get().copied() {
+            return EntryTotal::Final(n);
+        }
+        match self.discovered_entries.load(Ordering::Relaxed) {
+            0 => EntryTotal::Unknown,
+            n => EntryTotal::Provisional(n),
         }
     }
 
@@ -1304,14 +1357,14 @@ mod tests {
             let m = MetricsState::with_parent(None);
             assert_eq!(crate::types::ByteTotal::Unknown, m.byte_total());
 
-            m.add_discovered(100);
+            m.add_discovered(100, 1);
             assert_eq!(
                 crate::types::ByteTotal::Provisional(100),
                 m.byte_total(),
                 "enumeration is still running, so the total is a lower bound"
             );
 
-            m.add_discovered(50);
+            m.add_discovered(50, 1);
             assert_eq!(crate::types::ByteTotal::Provisional(150), m.byte_total());
 
             m.seal_total();
@@ -1335,7 +1388,7 @@ mod tests {
             m.set_total_bytes(64);
             assert_eq!(crate::types::ByteTotal::Final(64), m.byte_total());
 
-            m.add_discovered(1_000);
+            m.add_discovered(1_000, 1);
             m.seal_total();
             assert_eq!(
                 crate::types::ByteTotal::Final(64),
@@ -1353,10 +1406,112 @@ mod tests {
             let parent = Arc::new(MetricsState::with_parent(None));
             let child = MetricsState::with_parent(Some(parent.clone()));
 
-            child.add_discovered(7);
+            child.add_discovered(7, 1);
 
             assert_eq!(crate::types::ByteTotal::Provisional(7), child.byte_total());
             assert_eq!(crate::types::ByteTotal::Unknown, parent.byte_total());
+        }
+
+        /// One seal, two denominators. The entry count walks the same three states as the
+        /// byte total and is promoted by the same call, so a reader can never see one of
+        /// them `Final` while the other is still `Provisional` — which is what would let a
+        /// consumer render "900 of 900 files" beside a byte bar still claiming to be
+        /// counting.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn one_seal_finalises_both_denominators_together() {
+            use crate::types::{ByteTotal, EntryTotal};
+            let m = MetricsState::with_parent(None);
+            assert_eq!(ByteTotal::Unknown, m.byte_total());
+            assert_eq!(EntryTotal::Unknown, m.entry_total());
+
+            m.add_discovered(4096, 2);
+            assert_eq!(ByteTotal::Provisional(4096), m.byte_total());
+            assert_eq!(EntryTotal::Provisional(2), m.entry_total());
+
+            m.add_discovered(2048, 1);
+            assert_eq!(ByteTotal::Provisional(6144), m.byte_total());
+            assert_eq!(EntryTotal::Provisional(3), m.entry_total());
+
+            m.seal_total();
+            assert_eq!(ByteTotal::Final(6144), m.byte_total());
+            assert_eq!(
+                EntryTotal::Final(3),
+                m.entry_total(),
+                "the same call that sealed bytes must have sealed the count"
+            );
+        }
+
+        /// The numerator counts every ending, and reaches the denominator.
+        ///
+        /// This is the property a `N of M` display depends on and the one a bytes-only
+        /// numerator cannot offer: bytes stop short when an entry fails before moving any,
+        /// where a settled *count* does not care how the entry ended.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn settled_entries_reach_the_sealed_total_regardless_of_outcome() {
+            use crate::types::EntryTotal;
+            let m = MetricsState::with_parent(None);
+            m.add_discovered(3000, 3);
+            m.seal_total();
+
+            assert_eq!(0, m.entries_settled());
+            // Three entries, three different endings, one count.
+            m.record_entry_settled(); // succeeded
+            m.record_entry_settled(); // failed before its first byte
+            m.record_entry_settled(); // abandoned, never started
+
+            assert_eq!(EntryTotal::Final(3), m.entry_total());
+            assert_eq!(
+                3,
+                m.entries_settled(),
+                "an entry that failed or was abandoned is still no longer pending"
+            );
+        }
+
+        /// A leaf reports `Unknown` forever: it is one entry, not a set of them.
+        ///
+        /// `EntryTotal::Provisional(1)` would be worse than `Unknown` here — it would invite
+        /// a caller to draw a one-entry progress bar that is either 0% or 100%.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_leaf_has_no_entry_total() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            ctx.set_total_bytes(512);
+
+            let view = ctx.view();
+            assert_eq!(crate::types::ByteTotal::Final(512), view.byte_total());
+            assert_eq!(
+                crate::types::EntryTotal::Unknown,
+                view.entry_total(),
+                "a single-object transfer enumerates nothing"
+            );
+            assert_eq!(0, view.entries_settled());
+        }
+
+        /// Entry counts do not roll up, for the same reason byte totals do not: a child's
+        /// own denominator is not a contribution to its parent's.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn entry_counts_do_not_roll_up() {
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.add_discovered(10, 5);
+            child.record_entry_settled();
+
+            assert_eq!(
+                crate::types::EntryTotal::Provisional(5),
+                child.entry_total()
+            );
+            assert_eq!(1, child.entries_settled());
+            assert_eq!(crate::types::EntryTotal::Unknown, parent.entry_total());
+            assert_eq!(
+                0,
+                parent.entries_settled(),
+                "a composite counts the entries it enumerated, not its children's"
+            );
         }
 
         /// A view outlives the context it came from, and still reads the live counters.
