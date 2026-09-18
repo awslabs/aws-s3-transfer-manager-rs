@@ -323,7 +323,30 @@ impl DownloadObjectsTransfer {
     /// cannot see. It gets no entry in the child map because there is nothing to
     /// reap.
     fn announce_child(&self, result: &Result<(ManagedDownloadHandle, PathBuf), Error>, key: &str) {
-        let Some(root) = self.inner.lifecycle.lock().clone() else {
+        // The root guard is held across the whole body, so the check that the root is
+        // still live and the insert into `child_lifecycles` are one critical section.
+        //
+        // Cloning the root and releasing first admits this interleaving, which loses a
+        // `Settled` for good:
+        //
+        //   A (walk thread, announce_child)      B (terminal path, finish_root)
+        //   ---------------------------------    -----------------------------------
+        //   lock lifecycle, clone -> Some        .
+        //   unlock lifecycle                     .
+        //   .                                    lock child_lifecycles, drain (empty)
+        //   .                                    unlock
+        //   .                                    lock lifecycle, take -> None
+        //   .                                    unlock; root Settled emitted
+        //   lock child_lifecycles, insert        .
+        //   unlock  <-- nothing drains this map again
+        //
+        // `finish_root` takes `lifecycle` before touching `child_lifecycles`, so it
+        // blocks here until this body finishes and then observes the insert. The only
+        // nesting is this function's lifecycle -> child_lifecycles; no path takes them in
+        // the other order, so there is no inversion. `announce()` is a non-blocking
+        // `try_send` with no `.await`, so holding the guard across it is bounded.
+        let root_guard = self.inner.lifecycle.lock();
+        let Some(root) = root_guard.clone() else {
             return;
         };
         let child_ref = |destination| {
@@ -454,6 +477,12 @@ impl DownloadObjectsTransfer {
         outcome: crate::events::Outcome,
         out: &mut Vec<crate::events::PendingEmit>,
     ) {
+        // Take the root FIRST. `announce_child` holds the `lifecycle` guard across its
+        // check and its insert, so taking it here either blocks until that insert is
+        // visible to the drain below, or wins and makes the next `announce_child` see
+        // `None` and announce nothing. Draining first would let a concurrent announce
+        // insert into a map nothing reads again — see the interleaving on `announce_child`.
+        let root = self.inner.lifecycle.lock().take();
         let orphans: Vec<_> = self.inner.child_lifecycles.lock().drain().collect();
         for (child_id, lc) in orphans {
             // Derived from the child's own handle rather than assumed. Under `Abort`
@@ -477,7 +506,6 @@ impl DownloadObjectsTransfer {
                 out.push(emit);
             }
         }
-        let root = self.inner.lifecycle.lock().take();
         if let Some(lc) = root {
             if let Some(emit) = lc.finish(outcome) {
                 out.push(emit);
