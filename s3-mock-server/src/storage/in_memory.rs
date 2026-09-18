@@ -378,14 +378,16 @@ impl StorageBackend for InMemoryStorage {
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
     ) -> Result<crate::storage::CompleteMultipartUploadResponse> {
         let (bucket, key, mut final_metadata, checksum_algorithm, checksum_type, upload_parts) = {
-            let mut multipart = self.multipart.write().await;
+            let multipart = self.multipart.read().await;
             let upload = multipart
                 .uploads
-                .remove(request.upload_id)
+                .get(request.upload_id)
+                .cloned()
                 .ok_or(Error::NoSuchUpload)?;
             let upload_parts = multipart
                 .parts
-                .remove(request.upload_id)
+                .get(request.upload_id)
+                .cloned()
                 .ok_or(Error::NoSuchUpload)?;
             (
                 upload.bucket.unwrap_or_else(|| request.bucket.to_string()),
@@ -565,6 +567,18 @@ impl StorageBackend for InMemoryStorage {
         final_metadata.sha1 = object_integrity.sha1.clone();
         final_metadata.sha256 = object_integrity.sha256.clone();
         final_metadata.crc64nvme = object_integrity.crc64nvme.clone();
+
+        // Completion errors leave the upload and its parts available for retry. Remove both only
+        // after every request and checksum validation has succeeded.
+        {
+            let mut multipart = self.multipart.write().await;
+            if multipart.uploads.remove(request.upload_id).is_none() {
+                return Err(Error::NoSuchUpload);
+            }
+            if multipart.parts.remove(request.upload_id).is_none() {
+                return Err(Error::NoSuchUpload);
+            }
+        }
 
         // Store the final object
         let combined_data = combined.freeze();
@@ -912,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multipart_upload_missing_part() {
+    async fn test_rejected_multipart_completion_retains_upload() {
         let storage = InMemoryStorage::new();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
@@ -935,7 +949,8 @@ mod tests {
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
-        let parts_to_complete = vec![(1, etag1.etag), (2, "missing-etag".to_string())];
+        let valid_etag = etag1.etag;
+        let parts_to_complete = vec![(1, valid_etag.clone()), (2, "missing-etag".to_string())];
         let request = crate::storage::CompleteMultipartUploadRequest {
             bucket: TEST_BUCKET,
             upload_id,
@@ -944,6 +959,24 @@ mod tests {
         };
         let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());
+
+        let parts = storage
+            .list_parts(upload_id)
+            .await
+            .expect("rejected completion must retain multipart state");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, 1);
+
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            upload_id,
+            parts: vec![(1, valid_etag)],
+            client_checksums: None,
+        };
+        storage
+            .complete_multipart_upload(request)
+            .await
+            .expect("a corrected completion request must be retryable");
     }
 
     #[tokio::test]
