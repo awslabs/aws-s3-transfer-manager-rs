@@ -273,7 +273,7 @@ pub struct FsWalker {
     max_depth: usize,
     sort: bool,
     key_order: bool,
-    report_untransferable: bool,
+    include_special_files: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
     path_filter: Option<PathFilterFn>,
@@ -390,7 +390,7 @@ pub struct FsWalkerBuilder {
     max_depth: usize,
     sort: bool,
     key_order: bool,
-    report_untransferable: bool,
+    include_special_files: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
     path_filter: Option<PathFilterFn>,
@@ -503,8 +503,8 @@ impl FsWalkerBuilder {
     //
     // Only tests call this until the comparison lands.
     #[allow(dead_code)]
-    pub(crate) fn report_untransferable(mut self, include: bool) -> Self {
-        self.report_untransferable = include;
+    pub(crate) fn include_special_files(mut self, include: bool) -> Self {
+        self.include_special_files = include;
         self
     }
 
@@ -565,7 +565,7 @@ impl FsWalkerBuilder {
             follow_symlinks: self.follow_symlinks,
             max_depth: self.max_depth,
             sort: self.sort,
-            report_untransferable: self.report_untransferable,
+            include_special_files: self.include_special_files,
             key_order: self.key_order,
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
@@ -908,7 +908,7 @@ impl FsWalk {
 
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
-                    if !rejected && self.config.report_untransferable {
+                    if !rejected && self.config.include_special_files {
                         // Nothing here describes what the link points at, because the walk did
                         // not look. The metadata is the link's own, which is what `lstat` gave.
                         self.push_entry(
@@ -973,7 +973,7 @@ impl FsWalk {
                         FileType::Regular,
                         true,
                     );
-                } else if !rejected && self.config.report_untransferable {
+                } else if !rejected && self.config.include_special_files {
                     // The link points at something no transfer could read. The entry says so,
                     // and the key stays accounted for.
                     //
@@ -1018,7 +1018,7 @@ impl FsWalk {
                         ancestor_handles: next_ancestors.clone(),
                     }));
                 }
-            } else if !rejected && self.config.report_untransferable {
+            } else if !rejected && self.config.include_special_files {
                 // A socket, FIFO, or device. Yielded so a consumer knows the name is taken: a
                 // name absent from the stream reads as nothing being there, which is a
                 // different fact. An excluded name is different again — nothing is going to
@@ -1319,7 +1319,7 @@ mod tests {
 
         let walk = walker()
             .follow_symlinks(false)
-            .report_untransferable(true)
+            .include_special_files(true)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -1536,7 +1536,7 @@ mod tests {
 
         let walk = walker()
             .follow_symlinks(true)
-            .report_untransferable(true)
+            .include_special_files(true)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -1574,7 +1574,7 @@ mod tests {
         let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
 
         let walk = walker()
-            .report_untransferable(true)
+            .include_special_files(true)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;

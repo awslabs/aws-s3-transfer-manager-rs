@@ -372,7 +372,7 @@ mod tests {
         FsWalker::builder()
             .recursive(true)
             .key_order(true)
-            .report_untransferable(true)
+            .include_special_files(true)
             .build()
             .walk(FsWalkContext::builder().root(root).build())
     }
@@ -929,7 +929,7 @@ mod tests {
             .key_order(true)
             // On, so the socket test proves the filter suppresses a report that would
             // otherwise fire.
-            .report_untransferable(true)
+            .include_special_files(true)
             .path_filter(local_predicate(filter))
             .build()
             .walk(FsWalkContext::builder().root(root).build())

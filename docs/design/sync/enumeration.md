@@ -127,7 +127,7 @@ under `io::key*` is new.
    existing, extended here                   new here
    ───────────────────────                   ────────
    FsWalk      + key_order, path_filter,     Entry<T>, EntryMeta   what both sides emit
-               report_untransferable         FileType              what the filesystem said is there
+               include_special_files         FileType              what the filesystem said is there
    S3Walk      + prefix()                    KeyStream             the trait they both implement
    FsEntry     file_type, metadata, root     KeyFilter, Rule       include and exclude rules
    WalkError   + DirectoryUnreadable         Severity              ends the run, failure, warning
@@ -376,7 +376,7 @@ Three levels, because the consumer treats them differently:
 
 A FIFO, a socket, a device file and a symlink the walk was told not to follow all arrive as entries,
 each carrying the `FileType` that says which it is, and a walk yields them only when asked, through
-`report_untransferable`, so the operations that already use the walkers see nothing new. The warning
+`include_special_files`, so the operations that already use the walkers see nothing new. The warning
 level keeps what no key stands for: a directory reached by a link that loops. Sync copies none of them as things stand — the symlink would need a
 setting changed, the rest can never be copied at all. But *something occupies that name*, and that
 is exactly what has to stop the object at the matching key from being deleted. That is the
