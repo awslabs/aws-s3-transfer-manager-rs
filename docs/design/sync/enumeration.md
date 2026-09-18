@@ -1,7 +1,7 @@
 # Key-ordered enumeration
 
 The first layer of sync: producing the two entry streams that the comparison reads. This describes
-what it covers, the decisions behind it, and what those decisions cost.
+what it covers, the decisions behind it and what each would cost to change, and how the pieces fit.
 
 ---
 
@@ -58,97 +58,24 @@ opposite actions, and collapsing them is how a sync deletes files it failed to l
 exclusion, filtering and paging inside, because a consumer that had to remember to do them would
 eventually forget.
 
-The specification holds 81 requirements in twelve categories. The table below covers the three
-that describe this layer — **FR-Root**, **FR-Enum** and **FR-Filter** — all 28 of them, in spec
-order.
-
-The other nine categories are not handled here: **FR-Cmp** comparison, **FR-Exec** execution,
-**FR-Fail** failure handling, **FR-Obs** reporting, **FR-Dry** dry runs, **NFR-Cost** request
-cost, **NFR-Tput**, **NFR-Lat** and **NFR-Mem**. Six requirements from them are exceptions, named
-after the table.
-
-```
-   covered        satisfied here
-   partly         the part belonging here is settled; the row names who owns the rest
-   inherited      already true of the walkers, which upload_objects and download_objects
-                  rely on; the obligation here is to leave them working
-   kept open      unbuilt, and a choice here could make it harder — the behavior may still
-                  be undecided, or the opt-in may invert something this layer decided
-   later phase    unbuilt, and it lands somewhere other than this layer — listed so its
-                  absence raises no question
-```
-
-| Requirement | Status | Where it stands |
-|---|---|---|
-| FR-Root-1 Upload, Download and Copy | partly | `FsWalk` and `S3Walk` both implement `KeyStream`, so a direction is a choice of two streams; `Copy` pairs two `S3Walk`s and is backfill work |
-| FR-Root-2 a root names a place, never one entry | later phase | root parsing and validation |
-| FR-Root-3 relative key derivation | covered | `io/key.rs` |
-| FR-Root-4 a trailing separator changes nothing | covered | `strip_key_prefix`, pinned by test |
-| FR-Root-5 any bucket identifier the API accepts | later phase | root parsing and validation |
-| FR-Root-6 two S3 endpoints for `Copy` | later phase | root parsing and validation |
-| FR-Root-7 reject a bad configuration first | later phase | root parsing and validation |
-| FR-Root-8 a key resolving outside the root | kept open | settled elsewhere; nothing here forecloses it |
-| FR-Enum-1 list both roots through | covered | only filters reduce what gets listed |
-| FR-Enum-2 folder markers invisible | covered | dropped in the stream, so no filter can bring them back, pinned by test |
-| FR-Enum-3 skip one entry, and say which kind | covered | an entry carries its `FileType`, so a skipped kind is named where the key is |
-| FR-Enum-4 symlinks off by default | inherited | `follow_symlinks` unchanged; an unfollowed link arrives as an entry saying it is one |
-| FR-Enum-5 a time the platform cannot represent | partly | `last_modified_secs` is an `Option`; never-skip is the comparison's |
-| FR-Enum-6 keys compared byte for byte | covered | no folding, no normalizing, pinned by test |
-| FR-Enum-7 start before listing finishes | partly | an entry arrives before the second listing page is fetched, pinned by test; nothing starts transfers yet |
-| FR-Enum-8 files added or deleted mid-run | inherited | unchanged |
-| FR-Enum-9 a symlink loop ends the descent | covered | `SymlinkCycle`; the ancestor-handle check survives depth-first |
-| FR-Enum-10 markers become local directories | kept open | one check in `key_and_meta` is where the opt-in has to reach |
-| FR-Enum-11 configurable page size | inherited | unchanged |
-| FR-Enum-12 an unreadable directory is a range | covered | `DirectoryUnreadable`, positioned in key order |
-| FR-Enum-13 listing sends no delimiter | inherited | unchanged |
-| FR-Filter-1 ordered include and exclude rules | covered | `io/key/filter.rs` |
-| FR-Filter-2 matched on the whole path, `*` crosses `/` | covered | `fnmatch` semantics reproduced |
-| FR-Filter-3 the rule set applies to both sides | covered | one `KeyFilter`, read by `local_predicate` and `s3_predicate` |
-| FR-Filter-4 order-independent, holds neither side | covered | matched per entry as it arrives, with the same answers in any order, pinned by test |
-| FR-Filter-5 an excluded entry stays silent | covered | consulted before metadata, and before any report |
-| FR-Filter-6 anchored or matched anywhere | covered | the API says which; the pattern text keeps its `fnmatch` meaning |
-| FR-Filter-7 delete what the filters excluded | kept open | `s3_predicate` is the only place to invert |
-
-Six requirements from other categories are served here. **FR-Cmp-6** wants the comparison handed
-the entries themselves, so `Entry` carries the walker's own item; the interface is the
-comparison's. **FR-Cmp-8** wants a plan that does not depend on interleaving, and this layer
-supplies the ordering half. **FR-Fail-9** wants one failure policy, and severity is what makes its
-own exception expressible. **NFR-Tput-1**, **NFR-Lat-1** and **NFR-Mem-1** are measured in §5 —
-the first two covered, the third for the one term of its bound that has code today.
+This layer answers the requirement categories that describe enumeration — **FR-Root**, **FR-Enum**
+and **FR-Filter**, which [`functional-spec.md`](functional-spec.md) defines. Comparison,
+execution, failure handling, reporting, dry runs and the cost and rate requirements belong to
+other layers, though seven of their requirements are served here. **FR-Cmp-6** wants the
+comparison handed the entries themselves, so `Entry` carries the walker's own item; the interface
+is the comparison's. **FR-Cmp-8** wants a plan that does not depend on interleaving, and this
+layer supplies the ordering half. **FR-Fail-7** wants a name a transfer cannot move to hold back a
+delete, and **FR-Fail-9** wants a device, FIFO or socket never to fail a run; both follow from
+those arriving as entries rather than as failures. **NFR-Tput-1** and **NFR-Lat-1** are throughput
+and latency bounds a merge-shaped traversal has to respect, and **NFR-Mem-1** is the memory bound
+D11's structure answers.
 
 ---
 
-## 2. What exists, and what this adds
+## 2. Design decisions
 
-`io::walk` already exists, because `upload_objects` and `download_objects` use it. Everything
-under `io::key*` is new.
-
-```
-   existing, extended here                   new here
-   ───────────────────────                   ────────
-   FsWalk      + sort_order, path_filter,    Entry<T>, EntryMeta   what both sides emit
-               include_special_files         FileType              what the filesystem said is there
-   S3Walk      + prefix()                    KeyStream             the trait they both implement
-   FsEntry     file_type, metadata, root     KeyFilter, Rule       include and exclude rules
-   WalkError   + DirectoryUnreadable
-                                             StreamError           a walk, a name, or a listing
-                                             derive_object_key     path or key → relative key
-                                             strip_key_prefix
-```
-
-Four of these are public, which is the part a caller can come to depend on: `SortOrder`, which
-replaces the two booleans that used to select an order; `FsEntry`, whose accessors say what the filesystem reported
-and how the walk arrived; `FileType`, which names what is at a path; and one new `WalkErrorKind`
-variant, `DirectoryUnreadable`. `FileType` and `WalkErrorKind` are both `#[non_exhaustive]`, so a
-kind added later breaks nobody.
-
-Everything in `io::key*` is crate-private, so `Entry`, `EntryMeta` and `KeyStream` can still
-change shape without breaking a caller.
-
-## 3. Design decisions
-
-D1 to D10 are what the comparison will build on, so revisiting one later means touching more than
-this layer. D11 and D12 are cheaper to change, and are here so that a reader knows they were
+Most of these are what the comparison will build on, so revisiting one later means touching more
+than this layer. D11 and D12 are the cheap ones, and are here so that a reader knows they were
 considered.
 
 **D1. Both sides emit one total key order.** A comparison reads absence from position: every
@@ -182,12 +109,12 @@ follow from the entry existing: it arrives at its own key carrying `FileType::So
 comparison that reads absence from position sees the key occupied. Reporting it instead put a
 per-key fact on a channel with no keys in it.
 
-So errors divide in two, and only a walk answers which:
+So errors divide in two, which `is_fatal` answers and only a walk can:
 
 ```
-   ends the run   nothing is left to do       SourceUnreadable, NotADirectory, Service
-   one entry      should have been readable   Io, PermissionDenied, DirectoryUnreadable,
-                                              BrokenSymlink, SymlinkCycle
+   ends the walk   nothing is left to do       SourceUnreadable, NotADirectory, Service
+   one entry       should have been readable    Io, PermissionDenied, DirectoryUnreadable,
+                                                BrokenSymlink, SymlinkCycle
 ```
 
 A cycle sits with the second group. It stops a descent, so a subtree goes unenumerated, and no
@@ -198,7 +125,7 @@ FR-Enum-3 sorts by whether the walk *should have been able to read it*: a dangli
 that failed, and the walk would have produced an entry had the target been there.
 
 **D7. Yielding these entries is opt-in, because the walkers already have callers.** `upload_objects`
-records every walk error that does not end the run as a failure, and aborts the whole transfer on
+records every walk error that does not end the walk as a failure, and aborts the whole transfer on
 one under its strictest policy. A walk that yielded sockets unbidden would hand it names it
 would try to upload.
 
@@ -231,8 +158,8 @@ which FR-Filter-5 forbids.
 ### Reversible, recorded anyway
 
 **D11. Every level of the descent path keeps its children.** Peak memory is therefore the depth of
-the path times the width of each directory on it — §5 measures 6,941,474 bytes for a hundred
-levels of a hundred files, against breadth-first's 159,060.
+the path times the width of each directory on it, where a breadth-first walk down a chain holds one
+level. That is the price of knowing what comes next without re-reading a directory.
 
 Two alternatives were built and measured on another machine, so the comparison below is by ratio.
 Keeping only a resume point per level, and reading a directory again on the way back up, brought
@@ -246,9 +173,10 @@ Both dismissed. The memory saved is bounded in practice — `PATH_MAX` caps how 
 and a single wide directory already costs as much, since sorting one requires holding it — while
 re-reading introduces a directory that can change between visits.
 
-Neither slowdown would show. A local walk reads entries several times faster than `ListObjectsV2`
-returns keys, and the two sides advance in step, so the walk already waits on the listing. If this
-ever needs revisiting, spending walk time to save memory is the trade that fits.
+Whether either slowdown would show is a separate question, and nothing measures it: the two sides
+advance in step, so what matters is which one a run waits on, and no benchmark compares a walk
+against a listing. If this ever needs revisiting, spending walk time to save memory is the trade
+that fits, and that comparison is what would decide it.
 
 Switching later is an internal change, since the traversal's state is private to the module. It
 stays that way on one condition: the comparison must treat an unreadable directory as *unknown
@@ -273,7 +201,7 @@ which is a walk failure, a name that cannot be keyed, or a listed object missing
 comparison needs. Only the first comes from a walk.
 
 Sharing `WalkErrorKind` for all three meant borrowing kinds for failures a walk never has, and
-inheriting what they imply. An object with no size became `Service`, which ends the run — so one
+inheriting what they imply. An object with no size became `Service`, which is fatal — so one
 malformed object in a page stopped a whole sync, when the honest cost is that one key cannot be
 compared. A name that cannot be keyed had the same problem in reverse: it read as a walk failure
 when the walk had read the name perfectly.
@@ -282,7 +210,7 @@ Separating them lets the consumer ask the question it actually has, which is wha
 A walk failure may have hidden a subtree; the other two cost exactly one key, and the keys around
 them still arrive.
 
-## 4. How the pieces fit
+## 3. How the pieces fit
 
 ### The problem
 
@@ -323,6 +251,11 @@ summary closes that door.
 
 **`KeyFilter`** (new) is the gate, and it matches on the key. **`WalkError`** (existing, one
 variant added) carries everything the stream could not turn into an entry.
+
+`SortOrder`, `FsEntry`, `FileType` and `WalkErrorKind` are public, so a caller can come to depend on
+them. `FileType` and `WalkErrorKind` are `#[non_exhaustive]`, so a kind added later breaks nobody.
+Everything under `io::key` is crate-private, which is what leaves `Entry`, `EntryMeta` and
+`KeyStream` free to change shape.
 
 ### The sort trick
 
@@ -370,8 +303,8 @@ the matching key gets deleted.
 Two levels, because the consumer treats them differently:
 
 ```
-   ends the run   → the walk never got going; there is no pile at all
-   one entry      → this key is unknown; the failure policy decides whether to continue
+   ends the walk   → the walk never got going; there is no pile at all
+   one entry       → this key is unknown; the failure policy decides whether to continue
 ```
 
 A FIFO, a socket, a device file and a symlink the walk was told not to follow all arrive as entries,
@@ -429,69 +362,3 @@ FR-Cmp-6 requires the comparison be given the entries themselves, because a chec
 needs listing fields that only the original carries. Hand over `(key, size, time)` alone and a
 deferring mode has nothing to defer on.
 
----
-
-## 5. Measurements
-
-`benches/walk.rs`, all figures from one host and one build: an m7i.4xlarge running Amazon Linux
-2023, x86_64, 6.12 kernel, with fixtures on tmpfs and the machine idle. Every measurement runs
-both traversals over the same tree, because breadth-first is the existing traversal and therefore
-the only baseline that says which cost key ordering introduced.
-
-**Time to the first entry does not depend on how many entries exist.** The leftmost path is the
-same at every size, so a rising curve would mean the walk reads more than it needs to before
-emitting anything.
-
-```
-   entries      within     whole_walk
-      1,000    46.40 µs     46.05 µs
-     10,000    46.00 µs     46.40 µs
-     50,000    46.61 µs     46.32 µs
-```
-
-Fifty times the entries moves nothing: all six medians fall within 1.4% of each other, and no
-confidence interval is wider than ±0.5%.
-
-**Ordering costs nothing in throughput.** A whole-walk order is faster on all three shapes, by
-2.1%, 9.5% and 3.8%, because sorting within a directory compares whole paths while a whole-walk
-order compares names and skips the shared prefix on every comparison.
-
-```
-   shape                      within     whole_walk
-   wide_1dir_10k            17.67 ms     17.29 ms
-   deep_100dirs_100each     65.25 ms     59.05 ms
-   balanced_f10_d3_10each   55.62 ms     53.53 ms
-```
-
-**Peak memory, in bytes, from a tracking allocator in the bench crate.**
-
-```
-   shape                          entries       within     whole_walk
-   bounded_fanout_1000_per_dir       1,000      603,268      489,124
-   bounded_fanout_1000_per_dir      10,000      709,702      492,324
-   bounded_fanout_1000_per_dir      50,000      713,910      504,212
-   one_wide_directory                1,000      583,127      467,543
-   one_wide_directory               10,000    9,147,527    5,999,303
-   one_wide_directory               50,000   36,889,607   23,656,127
-   chain_depth_25_100_per_dir        2,500       98,250    1,009,202
-   chain_depth_50_100_per_dir        5,000      118,450    2,486,626
-   chain_depth_100_100_per_dir      10,000      159,060    6,941,474
-```
-
-Three shapes, three different answers.
-
-At bounded fanout key order is flat: 3.1% more for fifty times the entries, where breadth-first
-grows 18.3%. In one wide directory both grow linearly — 50.6× for key order, 63.3× for
-breadth-first — because a directory's children have to be held before they can be sorted. That is
-the case NFR-Mem-1 was amended for.
-
-Down a nested chain key order costs an order of magnitude more, and that is the honest price of
-the ordering. Depth-first has to keep every directory on the path open to know what comes next, so
-peak tracks depth times fanout, while breadth-first walking a chain holds one level: at depth 100
-the two are 6,941,474 against 159,060. It is superlinear too, since a path string lengthens as the
-walk descends — four times the depth costs 6.9 times the memory.
-
-Two caveats on what any of this covers. NFR-Mem-1 bounds three things — the descent path, one
-listing page per side, and transfers in flight — and only the first exists yet. And the largest
-tree here is 50,000 entries where the requirement asks about a million; the curves are flat or
-linear well before that, but the point itself is untested.
