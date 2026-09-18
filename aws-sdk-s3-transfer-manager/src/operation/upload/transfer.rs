@@ -110,21 +110,19 @@ impl UploadTransfer {
         request: UploadInput,
         stream: InputStream,
     ) -> Self {
-        // `None` identifies a `PartStream` whose total size is not known up front. Such a source is
-        // multipart-only, so reads continue speculatively until it reports end-of-stream.
-        let content_length = stream.size_hint().upper();
+        let size_hint = stream.size_hint();
 
-        // An unknown-length transfer reports no total while in progress. The exact total is
-        // published after end-of-stream from the sum of successfully uploaded parts.
-        if let Some(content_length) = content_length {
-            ctx.set_total_bytes(content_length);
+        // Only equal bounds are a known total. A bounded stream reports no total while in progress;
+        // its actual size is published after EOF.
+        if size_hint.upper() == Some(size_hint.lower()) {
+            ctx.set_total_bytes(size_hint.lower());
         }
 
         let inner = Arc::new(UploadTransferInner {
             ctx,
             state: Mutex::new(UploadState::PendingInit {
                 stream: Some(stream),
-                content_length,
+                size_hint,
                 init_in_flight: false,
             }),
             request: Arc::new(request),
@@ -204,7 +202,7 @@ impl UploadTransfer {
             match &mut *state {
                 UploadState::PendingInit {
                     init_in_flight,
-                    content_length,
+                    size_hint,
                     stream,
                 } => {
                     if *init_in_flight {
@@ -212,11 +210,11 @@ impl UploadTransfer {
                         return PollWork::Pending;
                     }
 
-                    let use_mpu = match *content_length {
+                    let use_mpu = match size_hint.upper() {
                         None => true,
-                        Some(content_length) => {
+                        Some(upper) => {
                             stream.as_ref().is_some_and(|stream| stream.is_mpu_only())
-                                || content_length >= self.inner.ctx.handle.mpu_threshold_bytes()
+                                || upper >= self.inner.ctx.handle.mpu_threshold_bytes()
                         }
                     };
                     return if use_mpu {
@@ -329,37 +327,40 @@ impl UploadTransfer {
         let upload_id = resp.upload_id().expect("upload_id present").to_string();
         let response_builder = UploadOutputBuilder::from(resp);
 
-        let (stream, content_length) = {
+        let (stream, size_hint) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             match &mut *state {
                 UploadState::PendingInit {
-                    stream,
-                    content_length,
-                    ..
-                } => (
-                    stream.take().expect("stream already taken"),
-                    content_length.take(),
-                ),
+                    stream, size_hint, ..
+                } => (stream.take().expect("stream already taken"), *size_hint),
                 _ => panic!("unexpected state for create_mpu"),
             }
         };
+        let streaming = stream.is_mpu_only();
 
-        // Known-length uploads increase the configured part size when necessary to fit S3's part
-        // limit. An unknown-length upload has no total from which to calculate that adjustment, so
-        // it uses the configured size and enforces the limit as parts are produced.
-        let part_size = match content_length {
-            Some(content_length) => cmp::max(
+        // An upper bound can size parts so a manager-produced body fits S3's part limit. A stream
+        // without one uses the configured size and enforces the limit as parts are produced.
+        let part_size = match size_hint.upper() {
+            Some(upper) => cmp::max(
                 self.inner.ctx.handle.upload_part_size_bytes(),
-                content_length.div_ceil(MAX_PARTS),
+                upper.div_ceil(MAX_PARTS),
             ),
             None => self.inner.ctx.handle.upload_part_size_bytes(),
         };
-        let plan = match content_length {
-            Some(content_length) => PartPlan::Known {
-                total_parts: content_length.div_ceil(part_size),
-                declared_object_size: content_length,
-            },
-            None => PartPlan::Unknown,
+        let plan = if streaming {
+            PartPlan::Streaming {
+                lower: size_hint.lower(),
+                upper: size_hint.upper(),
+            }
+        } else {
+            let expected_size = size_hint
+                .upper()
+                .expect("byte and file streams have an exact size");
+            debug_assert_eq!(size_hint.lower(), expected_size);
+            PartPlan::Fixed {
+                total_parts: expected_size.div_ceil(part_size),
+                expected_size,
+            }
         };
 
         tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
@@ -380,8 +381,11 @@ impl UploadTransfer {
         );
 
         let completed_parts_capacity = match &plan {
-            PartPlan::Known { total_parts, .. } => *total_parts as usize,
-            PartPlan::Unknown => UNKNOWN_LENGTH_DEFAULT_NUM_PARTS,
+            PartPlan::Fixed { total_parts, .. } => *total_parts as usize,
+            PartPlan::Streaming {
+                upper: Some(upper), ..
+            } => upper.div_ceil(part_size) as usize,
+            PartPlan::Streaming { upper: None, .. } => UNKNOWN_LENGTH_DEFAULT_NUM_PARTS,
         };
         {
             let mut state = self.inner.state.lock().expect("lock poisoned");
@@ -399,7 +403,7 @@ impl UploadTransfer {
 
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            total_parts = content_length.map(|length| length.div_ceil(part_size)),
+            total_parts = size_hint.upper().map(|upper| upper.div_ceil(part_size)),
             part_size,
             "MPU created, transferring",
         );
@@ -408,13 +412,12 @@ impl UploadTransfer {
     }
 
     async fn execute_upload_part(&self, work: &mut UploadPartWork) -> WorkOutcome {
-        let (part_reader, has_unknown_content_length) = {
+        let (part_reader, streaming) = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
-                UploadState::Transferring { parts, .. } => (
-                    Arc::clone(&parts.part_reader),
-                    parts.has_unknown_content_length(),
-                ),
+                UploadState::Transferring { parts, .. } => {
+                    (Arc::clone(&parts.part_reader), parts.is_streaming())
+                }
                 _ => panic!("unexpected state for read_part"),
             }
         };
@@ -488,13 +491,24 @@ impl UploadTransfer {
             Poll::Ready(Err(error)) => return self.fail(error.into()),
         };
 
+        {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            let UploadState::Transferring { parts, .. } = &mut *state else {
+                panic!("unexpected state while recording upload part");
+            };
+            if let Err(error) = parts.observe_part(data.data.len() as u64) {
+                drop(state);
+                return self.fail(crate::error::invalid_input(error));
+            }
+        }
+
         // A custom source that was blocked is available again. Refill the work withheld while the
         // retained source operation was pending so reading the next part can overlap this upload.
         self.inner.ctx.try_wake();
 
         // Guard S3's part-count ceiling by parts the source actually yielded, not speculative
         // dispatches. Fail before sending part 10,001 so the error can name the remedy.
-        if has_unknown_content_length && part_reader.parts_yielded() > MAX_PARTS {
+        if streaming && part_reader.parts_yielded() > MAX_PARTS {
             return self.fail(Error::new(
                 ErrorKind::InputInvalid,
                 format!(
@@ -523,7 +537,13 @@ impl UploadTransfer {
             let UploadState::Transferring { parts, .. } = &mut *state else {
                 panic!("unexpected state at upload end-of-stream");
             };
-            parts.observe_end_of_stream(part_reader.parts_yielded())
+            match parts.observe_end_of_stream(part_reader.parts_yielded()) {
+                Ok(empty_and_owned) => empty_and_owned,
+                Err(error) => {
+                    drop(state);
+                    return self.fail(crate::error::invalid_input(error));
+                }
+            }
         };
         // End-of-stream may close dispatch while `poll_work` is parked behind the source gate.
         self.inner.ctx.try_wake();
@@ -863,20 +883,10 @@ impl UploadTransfer {
             parts.into_completion();
         completed_parts.sort_by_key(|p| p.part_number);
 
-        let object_size = match plan {
-            PartPlan::Known {
-                declared_object_size,
-                ..
-            } => {
-                debug_assert!(
-                    bytes_uploaded <= declared_object_size,
-                    "uploaded {bytes_uploaded} bytes, more than declared upper bound \
-                     {declared_object_size}"
-                );
-                declared_object_size
-            }
-            PartPlan::Unknown => bytes_uploaded,
-        };
+        if let Err(error) = plan.validate_complete(bytes_uploaded) {
+            return self.fail(crate::error::invalid_input(error));
+        }
+        let object_size = bytes_uploaded;
         self.inner.ctx.set_total_bytes(object_size);
 
         let base_req = self

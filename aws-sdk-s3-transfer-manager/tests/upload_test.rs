@@ -50,18 +50,20 @@ pin_project! {
     struct TestStream {
         next_part_num: u64,
         rx: mpsc::Receiver<Bytes>,
-        content_len: usize,
-        size_hint: u64,
+        size_hint: SizeHint,
         observed_part_size: Arc<AtomicUsize>,
     }
 }
 
 impl TestStream {
-    fn new(rx: mpsc::Receiver<Bytes>, content_len: usize, size_hint: u64) -> Self {
+    fn exact(rx: mpsc::Receiver<Bytes>, size: u64) -> Self {
+        Self::with_size_hint(rx, SizeHint::exact(size))
+    }
+
+    fn with_size_hint(rx: mpsc::Receiver<Bytes>, size_hint: SizeHint) -> Self {
         Self {
             next_part_num: 1,
             rx,
-            content_len,
             size_hint,
             observed_part_size: Arc::new(AtomicUsize::new(0)),
         }
@@ -91,7 +93,7 @@ impl PartStream for TestStream {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::exact(self.size_hint)
+        self.size_hint
     }
 }
 
@@ -222,7 +224,8 @@ impl PartStream for WakeBeforePendingStream {
                 Poll::Pending
             }
             1 => Poll::Ready(Some(Ok(PartData::new(1, Bytes::from_static(b"ready"))))),
-            _ => panic!("single-part stream was polled after yielding its part"),
+            2 => Poll::Ready(None),
+            _ => panic!("single-part stream was polled after end-of-stream"),
         }
     }
 
@@ -421,7 +424,7 @@ async fn test_source_wake_before_read_parking_is_retained() {
         .await
         .expect("source wake was lost before the retained read was parked")
         .unwrap();
-    assert_eq!(polls.load(Ordering::Relaxed), 2);
+    assert_eq!(polls.load(Ordering::Relaxed), 3);
 }
 
 // Regression test for deadlock discovered by a user of Mountpoint
@@ -509,7 +512,7 @@ async fn test_large_upload_part_size_bump() {
 
     let (tx, rx) = mpsc::channel(1);
     let size_hint = 100 * ByteUnit::Gibibyte.as_bytes_u64();
-    let stream = TestStream::new(rx, 0, size_hint);
+    let stream = TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(size_hint)));
     let observed_part_size = stream.observed_part_size();
 
     let handle = tm
@@ -572,8 +575,8 @@ async fn test_complete_mpu_sends_mpu_object_size() {
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
-    let (tx, rx) = mpsc::channel(1);
-    let stream = TestStream::new(rx, content_length, content_length as u64);
+    let (tx, rx) = mpsc::channel(3);
+    let stream = TestStream::exact(rx, content_length as u64);
 
     let handle = tm
         .upload()
@@ -583,6 +586,9 @@ async fn test_complete_mpu_sends_mpu_object_size() {
         .initiate()
         .unwrap();
 
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; 1024])).await.unwrap();
     drop(tx);
     handle
         .join()
@@ -742,19 +748,16 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
     );
 }
 
-/// A known-length upload must keep sending its *declared* size as `MpuObjectSize`,
-/// not a sum accumulated from the parts it uploaded.
+/// An upper bound sizes the transfer but does not become the completed object size.
 ///
-/// The declared length is an independent witness: it comes from the source rather
-/// than from this crate's own part accounting, so it also catches a part the crate
-/// itself dropped or duplicated. A running sum cannot. Unifying the two paths onto
-/// one accumulator would look like a simplification and would quietly lose that,
-/// so this pins the known-length path against that refactor.
+/// The stream declares at most two full parts and ends after one full part plus a tail.
+/// `MpuObjectSize` must carry the validated bytes actually emitted, not the planning bound.
 #[tokio::test]
-async fn test_known_length_sends_declared_size_not_running_sum() {
+async fn test_bounded_length_sends_validated_actual_size() {
     let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let declared = 2 * part_size;
+    let upper = 2 * part_size;
+    let actual = part_size + 1024;
 
     let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
         let upload_id = upload_id.clone();
@@ -764,12 +767,10 @@ async fn test_known_length_sends_declared_size_not_running_sum() {
                 .build()
         }
     });
-    // Drop every part on the floor: no part response contributes an ETag, so a
-    // sum-derived MpuObjectSize would be wrong while the declared one stays right.
     let upload_part =
         mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.mpu_object_size() == Some(declared as i64))
+        .match_requests(move |req| req.mpu_object_size() == Some(actual as i64))
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
 
     let client = mock_client!(
@@ -782,8 +783,8 @@ async fn test_known_length_sends_declared_size_not_running_sum() {
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
-    let (tx, rx) = mpsc::channel(2);
-    let stream = TestStream::new(rx, declared, declared as u64);
+    let (tx, rx) = mpsc::channel(1);
+    let stream = TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(upper as u64)));
     let handle = tm
         .upload()
         .bucket("test-bucket")
@@ -791,12 +792,160 @@ async fn test_known_length_sends_declared_size_not_running_sum() {
         .body(InputStream::from_part_stream(stream))
         .initiate()
         .unwrap();
+    tx.send(Bytes::from(vec![0u8; actual])).await.unwrap();
     drop(tx);
 
     handle
         .join()
         .await
-        .expect("a known-length upload must send its declared content length as MpuObjectSize");
+        .expect("a bounded upload must send its validated actual size as MpuObjectSize");
+}
+
+/// An exact size hint is a contract, not only a planning input.
+#[tokio::test]
+async fn test_exact_length_rejects_early_end_of_stream() {
+    let upload_id = "test-upload-id".to_owned();
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::exact(rx, 10)))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"short")).await.unwrap();
+    drop(tx);
+
+    let error = handle
+        .join()
+        .await
+        .expect_err("an exact stream ending below its size must fail");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+    assert_eq!(upload_part.num_calls(), 1);
+    assert_eq!(complete_mpu.num_calls(), 0);
+}
+
+/// The upper bound is enforced before an oversized part is sent to S3.
+#[tokio::test]
+async fn test_exact_length_rejects_overflow_before_upload_part() {
+    let upload_id = "test-upload-id".to_owned();
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
+        let upload_id = upload_id.clone();
+        move || {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(upload_id.clone())
+                .build()
+        }
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::exact(rx, 5)))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"excess")).await.unwrap();
+    drop(tx);
+
+    let error = handle
+        .join()
+        .await
+        .expect_err("a stream exceeding its exact size must fail");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+    assert_eq!(upload_part.num_calls(), 0);
+    assert_eq!(complete_mpu.num_calls(), 0);
+}
+
+/// A bounded stream must satisfy its lower bound when EOF closes dispatch.
+#[tokio::test]
+async fn test_bounded_length_rejects_below_lower_bound() {
+    let client = mock_s3_client_for_multipart_upload();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+    let (tx, rx) = mpsc::channel(1);
+    let hint = SizeHint::default().with_lower(5).with_upper(Some(10));
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx, hint,
+        )))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"four")).await.unwrap();
+    drop(tx);
+
+    let error = handle
+        .join()
+        .await
+        .expect_err("a bounded stream ending below its lower bound must fail");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+}
+
+/// Contradictory bounds are rejected before any upload work is scheduled.
+#[test]
+fn test_stream_rejects_lower_bound_above_upper_bound() {
+    let (_tx, rx) = mpsc::channel(1);
+    let hint = SizeHint::default().with_lower(11).with_upper(Some(10));
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_client!(aws_sdk_s3, []))
+            .build(),
+    );
+
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx, hint,
+        )))
+        .initiate()
+        .expect_err("contradictory stream bounds must be rejected");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
 }
 
 /// A stream that yields data must never *also* send an empty part 1.
@@ -1309,8 +1458,8 @@ async fn test_known_length_never_synthesizes_empty_part() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(TestStream::new(
-            rx, 0, declared,
+        .body(InputStream::from_part_stream(TestStream::exact(
+            rx, declared,
         )))
         .initiate()
         .unwrap();
@@ -1449,8 +1598,8 @@ async fn test_complete_mpu_forwards_if_match() {
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
-    let (tx, rx) = mpsc::channel(1);
-    let stream = TestStream::new(rx, content_length, content_length as u64);
+    let (tx, rx) = mpsc::channel(2);
+    let stream = TestStream::exact(rx, content_length as u64);
 
     let handle = tm
         .upload()
@@ -1460,6 +1609,8 @@ async fn test_complete_mpu_forwards_if_match() {
         .body(InputStream::from_part_stream(stream))
         .initiate()
         .unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
     drop(tx);
     handle
         .join()
@@ -1504,8 +1655,8 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
-    let (tx, rx) = mpsc::channel(1);
-    let stream = TestStream::new(rx, content_length, content_length as u64);
+    let (tx, rx) = mpsc::channel(2);
+    let stream = TestStream::exact(rx, content_length as u64);
 
     let handle = tm
         .upload()
@@ -1515,6 +1666,8 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
         .body(InputStream::from_part_stream(stream))
         .initiate()
         .unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
     drop(tx);
     let err = handle
         .join()

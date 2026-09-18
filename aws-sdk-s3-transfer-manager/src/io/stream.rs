@@ -181,7 +181,15 @@ impl InputStream {
     /// NOTE: Implementing `PartStream` directly is a more advanced use case. You should reach for
     /// one of the provided implementations or adapters first if possible.
     ///
-    /// # Streams of unknown length
+    /// # Size bounds
+    ///
+    /// The stream must emit at least [`SizeHint::lower`](crate::io::SizeHint::lower) bytes and no
+    /// more than its optional [`SizeHint::upper`](crate::io::SizeHint::upper). Equal bounds declare
+    /// an exact size. The upper bound is used for part-size planning, but completion sends the
+    /// validated number of bytes actually emitted as `MpuObjectSize`. Contradictory bounds, early
+    /// EOF, and output past the upper bound fail the upload.
+    ///
+    /// # Streams without an upper bound
     ///
     /// A stream whose [`size_hint`](PartStream::size_hint) has no upper bound is read until it ends,
     /// with no declared total. Prefer declaring a size when one is available, because without it:
@@ -353,7 +361,7 @@ impl PartData {
 /// [`Poll::Ready(None)`](std::task::Poll::Ready) marks end-of-stream. The transfer manager does not
 /// poll the stream again after that result.
 ///
-/// The `size_hint` function provides insight into the total number of bytes that will be streamed.
+/// [`size_hint`](PartStream::size_hint) declares bounds on the total bytes emitted before EOF.
 pub trait PartStream {
     /// Polls for the next complete upload part.
     ///
@@ -379,7 +387,10 @@ pub trait PartStream {
         stream_cx: &StreamContext,
     ) -> std::task::Poll<Option<std::io::Result<PartData>>>;
 
-    /// Returns the bounds on the total size of the stream
+    /// Returns the bounds on the total size of the stream.
+    ///
+    /// Equal bounds are exact. When an upper bound is present it must be greater than or equal to
+    /// the lower bound.
     fn size_hint(&self) -> crate::io::SizeHint;
 
     /// If you calculated the full object checksum while streaming, return it.

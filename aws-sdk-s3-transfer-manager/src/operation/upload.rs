@@ -78,6 +78,20 @@ impl Upload {
         }
 
         let stream = input.take_body();
+        let size_hint = stream.size_hint();
+        if size_hint
+            .upper()
+            .is_some_and(|upper| size_hint.lower() > upper)
+        {
+            return Err(error::invalid_input(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "upload stream lower size bound {} exceeds upper bound {}",
+                    size_hint.lower(),
+                    size_hint.upper().expect("upper bound checked above")
+                ),
+            )));
+        }
 
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));

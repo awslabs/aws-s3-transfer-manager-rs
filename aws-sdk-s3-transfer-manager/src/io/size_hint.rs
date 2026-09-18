@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/// A body size hint
+/// Lower and optional upper bounds on a body size.
+///
+/// Uploads require `lower <= upper` when an upper bound is present. Equal bounds declare an exact
+/// size. The transfer manager validates custom streams against these bounds when they reach EOF.
 #[derive(Debug, Clone, Default, Copy)]
 pub struct SizeHint {
     lower: u64,
@@ -19,17 +22,17 @@ impl SizeHint {
         }
     }
 
-    /// Set the lower bound on the body size
+    /// Set the lower bound on the body size.
     pub fn with_lower(self, lower: u64) -> Self {
         Self { lower, ..self }
     }
 
-    /// Set the upper bound on the body size
+    /// Set the upper bound on the body size.
     pub fn with_upper(self, upper: Option<u64>) -> Self {
         Self { upper, ..self }
     }
 
-    /// Get the lower bound of the body size
+    /// Get the lower bound of the body size.
     pub fn lower(&self) -> u64 {
         self.lower
     }
