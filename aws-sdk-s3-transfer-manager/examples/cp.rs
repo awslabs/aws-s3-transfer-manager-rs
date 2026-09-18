@@ -300,11 +300,17 @@ impl Numerator {
 /// consumer repainting at 10 Hz reads the same handle 10 times a second and the transfer
 /// never waits for it.
 ///
-/// The bar is monotonic and never exceeds 100%. It reaches 100% only when every listed
-/// object's payload actually moved: the denominator counts what was enumerated, so an
-/// object that failed before its first body byte leaves the bar permanently short by its
-/// whole size. Bytes from a failure mid-body do count. A caller that wants "15 of 16 done"
-/// wants an entry count, which is a different question — bytes cannot answer it.
+/// The bar is monotonic and never exceeds 100%. This drawer reads the root's counter only,
+/// so it reaches 100% only when every listed object's payload actually moved: the
+/// denominator counts what was enumerated, so an object that failed before its first body
+/// byte leaves this bar short by its whole size. Bytes from a failure mid-body do count.
+///
+/// Reaching 100% on a run with failures is possible and this example does not do it. It
+/// costs a `HashMap<u64, TransferView>` of child views kept from `Decided`: on a child's
+/// `Settled { outcome: Failed }`, `byte_total() - metrics().network_rx` is the payload that
+/// will now never move, and a bar drawn against `moved + abandoned` completes. That is what
+/// the AWS CLI does (`ResultRecorder._record_failure_result`). Kept out of here so the
+/// example stays one view and one loop; a CLI wants the map anyway for its per-file lines.
 async fn draw_progress(
     mut stream: aws_sdk_s3_transfer_manager::events::TransferEventStream,
     numerator: Numerator,

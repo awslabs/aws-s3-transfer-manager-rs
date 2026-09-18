@@ -1027,17 +1027,19 @@ async fn test_download_objects_views_report_per_object_progress() {
 /// transfer. A time-sampled version of this test would pass vacuously whenever the mock
 /// finished between ticks.
 ///
-/// **The bar does not reach 100% on a run with failures, and cannot.** The denominator
-/// counts every object that was *listed*; the numerator counts bytes that actually moved.
-/// An object rejected with a 403 is refused before a single body byte arrives, so it
-/// contributes 0 of its 8 KiB and the bar ends permanently short — here at 14/16 of the
-/// payload. Bytes from a failure *mid-body* do count (that is what the parent rollup
-/// fixed, and what `progress_chaos.rs` pins), so the shortfall is exactly the payload that
-/// was never transferred and never more.
+/// **The root's own counter does not reach its own denominator on a run with failures.**
+/// The denominator counts every object that was *listed*; the numerator counts bytes that
+/// actually moved. An object rejected with a 403 is refused before a single body byte
+/// arrives, so it contributes 0 of its 8 KiB and the root ends short — here at 14/16 of the
+/// payload. Bytes from a failure *mid-body* do count (that is what the parent rollup fixed,
+/// and what `progress_chaos.rs` pins), so the shortfall is exactly the payload that was
+/// never transferred and never more. That exactness is the assertion below, and it is what
+/// makes the shortfall reconstructible rather than merely absent.
 ///
-/// A caller that needs "15 of 16 objects are done" needs an entry count, which the crate
-/// does not publish mid-flight. Bytes cannot answer it: the two are different questions and
-/// only one has a denominator today.
+/// A consumer that wants a bar reaching 100% adds the abandoned payload back, per child, as
+/// `byte_total() - network_rx` at its `Settled` — the AWS CLI's
+/// `ResultRecorder._record_failure_result` arithmetic. Not asserted here: this test pins the
+/// root counter's meaning, which is what that reconstruction depends on.
 #[tokio::test]
 async fn test_download_objects_bar_is_monotonic_and_short_by_what_never_moved() {
     timeout(TEST_TIMEOUT, async {
