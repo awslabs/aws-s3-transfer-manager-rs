@@ -418,6 +418,13 @@ pub(crate) struct MetricsState {
     network_rx: AtomicU64,
     disk_read: AtomicU64,
     disk_write: AtomicU64,
+    /// Bytes enumerated so far by a composite's walk; 0 for a leaf.
+    ///
+    /// Written only by the owning composite and only while it holds its own `State`
+    /// lock, which is what serializes it — this atomic is the publication channel, not
+    /// the synchronization. Read alongside `total_bytes` to tell "still counting" from
+    /// "not known": `total_bytes` is `Some` if and only if enumeration finished.
+    discovered_bytes: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
@@ -439,6 +446,7 @@ impl MetricsState {
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
+            discovered_bytes: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
@@ -466,6 +474,18 @@ impl MetricsState {
             m.disk_write.fetch_add(sample.disk_write, Ordering::Relaxed);
             cur = m.parent.as_deref();
         }
+    }
+
+    /// Publish a composite's running enumerated-byte total.
+    ///
+    /// Takes the absolute value rather than a delta because the caller owns the
+    /// authoritative sum under its `State` lock; a `fetch_add` here would make this the
+    /// second place the total is accumulated and the two could drift.
+    ///
+    /// Monotonic by the caller's contract: a composite only ever grows
+    /// `State::discovered_bytes`, and only while unsealed.
+    pub(crate) fn publish_discovered(&self, n: u64) {
+        self.discovered_bytes.store(n, Ordering::Relaxed);
     }
 
     /// Set the expected total payload bytes. No-op if already set.

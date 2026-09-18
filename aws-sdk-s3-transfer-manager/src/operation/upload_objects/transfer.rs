@@ -374,6 +374,18 @@ struct State {
     reaping_in_flight: usize,
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
+    /// Sum of the sizes of every entry accepted into `pending_entries`. Grows only, and
+    /// only while `!total_sealed`. Mirrored into the transfer's `MetricsState` in the
+    /// same critical section, because that is what a public reader can see.
+    discovered_bytes: u64,
+    /// Enumeration is finished — every walker has completed or been abandoned — so
+    /// `discovered_bytes` will not change again.
+    ///
+    /// Read and written only under this same `State` lock, never as a separate atomic:
+    /// a "has X happened yet?" flag checked in one critical section and acted on in
+    /// another is a race however tight the window looks. Keeping it here means the last
+    /// accumulation and the seal cannot interleave.
+    total_sealed: bool,
 }
 
 impl State {
@@ -452,6 +464,8 @@ impl UploadObjectsTransfer {
                 walks,
                 next_walk_id: 1,
                 in_flight_walks: 0,
+                discovered_bytes: 0,
+                total_sealed: false,
                 pending_entries: VecDeque::new(),
                 children: HashMap::new(),
                 children_reserved: 0,
@@ -1135,11 +1149,35 @@ impl UploadObjectsTransfer {
         }
     }
 
+    /// Seal the enumerated-byte total once the walk is quiescent.
+    ///
+    /// Finality is walk quiescence, deliberately not the transfer's terminal signal.
+    /// `abort()` signals and returns `Done` without `on_terminal` ever running, while up
+    /// to `MAX_PARALLEL_WALKS` walkers may still be mid-batch; a total published at that
+    /// moment would freeze below the value those batches go on to produce, so a caller
+    /// could see a "final" percentage decrease after `join()` had already returned.
+    ///
+    /// Caller holds the `State` lock, so the seal and the last accumulation are in one
+    /// critical section. An aborted run may therefore never seal, which is the honest
+    /// answer: the walk did not finish, so nobody knows the total.
+    fn maybe_seal_total(&self, state: &mut State) {
+        if !state.total_sealed && state.walks.is_empty() && state.in_flight_walks == 0 {
+            state.total_sealed = true;
+            self.inner
+                .ctx
+                .metrics
+                .set_total_bytes(state.discovered_bytes);
+        }
+    }
+
     fn check_terminal(
         &self,
         state: &mut State,
         out: &mut Vec<crate::events::PendingEmit>,
     ) -> Option<PollWork> {
+        // Before any terminal decision: if the walk has drained, the denominator is final.
+        self.maybe_seal_total(state);
+
         if !self.inner.ctx.is_active() {
             // Cancelled or failed: wait only for genuinely in-flight work to
             // drain before signaling terminal, so the parent does not report
@@ -1368,6 +1406,18 @@ impl UploadObjectsTransfer {
         // Every accepted entry is counted exactly once, here, because this is the
         // only path from a walker into the work queue. Counting at spawn instead
         // would miss entries abandoned when the transfer goes inactive.
+        //
+        // The byte total is accumulated on the same principle and in this same critical
+        // section: the denominator counts what was enumerated, so an entry abandoned
+        // later still belongs in it, and a bar that omitted those could never reach the
+        // numerator once they were swept.
+        if !state.total_sealed {
+            state.discovered_bytes += entries.iter().map(|e| e.metadata().len()).sum::<u64>();
+            self.inner
+                .ctx
+                .metrics
+                .publish_discovered(state.discovered_bytes);
+        }
         state.pending_entries.extend(entries);
         if !self.inner.ctx.is_active() {
             // A walker batch that landed after the terminal transition. Discharge

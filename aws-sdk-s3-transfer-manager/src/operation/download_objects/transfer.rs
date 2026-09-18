@@ -219,6 +219,16 @@ struct State {
 
     /// Whether a walker work item is currently in flight.
     walk_in_flight: bool,
+    /// Sum of the sizes of every object accepted into `pending_entries`. Grows only, and
+    /// only while `!total_sealed`. Mirrored into the transfer's `MetricsState` in the
+    /// same critical section, because that is what a public reader can see.
+    discovered_bytes: u64,
+    /// Listing is finished, so `discovered_bytes` will not change again.
+    ///
+    /// Read and written only under this same `State` lock, never as a separate atomic:
+    /// a "has X happened yet?" flag checked in one critical section and acted on in
+    /// another is a race however tight the window looks.
+    total_sealed: bool,
 
     /// Objects discovered by the walker, waiting to be spawned as children.
     pending_entries: std::collections::VecDeque<Object>,
@@ -295,6 +305,8 @@ impl DownloadObjectsTransfer {
                     walk: Some(walk),
                     validated: false,
                     walk_in_flight: false,
+                    discovered_bytes: 0,
+                    total_sealed: false,
                     pending_entries: std::collections::VecDeque::new(),
                     children: HashMap::new(),
                     children_reserved: 0,
@@ -863,11 +875,60 @@ impl DownloadObjectsTransfer {
         inserted
     }
 
+    /// Accumulate a just-listed batch into the enumerated-byte total.
+    ///
+    /// Caller holds the `State` lock. The denominator counts what was *listed*, so an
+    /// object abandoned later still belongs in it — a bar that omitted those could never
+    /// reach its numerator once they were swept.
+    ///
+    /// `Object::size()` is an `Option<i64>`: absent for a zero-byte folder marker, and
+    /// the signed type is the wire shape rather than a real possibility. Both collapse to
+    /// 0 rather than being skipped, so a missing size understates the total instead of
+    /// corrupting it.
+    fn accumulate_listed(&self, state: &mut State, batch: &[Object]) {
+        if state.total_sealed {
+            return;
+        }
+        state.discovered_bytes += batch
+            .iter()
+            .map(|o| o.size().unwrap_or(0).max(0) as u64)
+            .sum::<u64>();
+        self.inner
+            .ctx
+            .metrics
+            .publish_discovered(state.discovered_bytes);
+    }
+
+    /// Seal the enumerated-byte total once listing is quiescent.
+    ///
+    /// Finality is walk quiescence, deliberately not the transfer's terminal signal: the
+    /// `Abort` reap arm signals immediately while the walker's drain loop can still be
+    /// flushing chunks, so a total published there would freeze below what those chunks
+    /// go on to produce — and a caller could see a "final" percentage decrease after
+    /// `join()` had already returned.
+    ///
+    /// Caller holds the `State` lock, so the seal and the last accumulation are in one
+    /// critical section. A cancelled run may never seal, which is the honest answer:
+    /// listing did not finish, so nobody knows the total.
+    fn maybe_seal_total(&self, state: &mut State) {
+        let listing_done = state.walk.as_ref().is_none_or(|w| w.is_done()) && !state.walk_in_flight;
+        if !state.total_sealed && listing_done {
+            state.total_sealed = true;
+            self.inner
+                .ctx
+                .metrics
+                .set_total_bytes(state.discovered_bytes);
+        }
+    }
+
     fn check_terminal(
         &self,
         state: &mut State,
         out: &mut Vec<crate::events::PendingEmit>,
     ) -> Option<PollWork> {
+        // Before any terminal decision: if listing has drained, the denominator is final.
+        self.maybe_seal_total(state);
+
         if !self.inner.ctx.is_active() {
             // Wait for all in-flight work to drain
             if state.children.is_empty()
@@ -1031,6 +1092,7 @@ impl DownloadObjectsTransfer {
                     discovered += 1;
                     if chunk.len() >= WALK_FLUSH_CHUNK {
                         let mut state = self.inner.state.lock();
+                        self.accumulate_listed(&mut state, &chunk);
                         state.pending_entries.extend(chunk.drain(..));
                         drop(state);
                         // Wake so a spawn poll runs against the just-published
@@ -1081,6 +1143,7 @@ impl DownloadObjectsTransfer {
                 walk_done = walk.is_done(),
                 "download_objects walker advanced",
             );
+            self.accumulate_listed(&mut state, &chunk);
             state.pending_entries.extend(chunk.drain(..));
             if !walk.is_done() {
                 state.walk = Some(walk);

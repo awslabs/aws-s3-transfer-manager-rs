@@ -206,20 +206,40 @@ async fn assert_chaos(percent: usize, prefix: &str) {
         expected_lost_bytes(percent) > 0,
         "the scenario must actually push bytes that then fail, or it proves nothing"
     );
-    assert_eq!(
+    // Bounds, not equality. `expected_lost_bytes` models how much a doomed child gets
+    // through before its fault fires (`FAULT_SKIP` parts each), which is an upper
+    // estimate: a doomed child can be cancelled, or reach its fault sooner, so the real
+    // figure sits between the two. The load-bearing half is the lower bound — strictly
+    // greater than success-only is what proves a failed child's bytes are counted.
+    assert!(
+        r.network_tx_at_join > expected_success_bytes(percent),
+        "the parent must count bytes pushed by children that later failed; \
+         {} == {} means the rollup regressed to a success-arm fold",
         r.network_tx_at_join,
-        expected_success_bytes(percent) + expected_lost_bytes(percent),
-        "the parent must count bytes pushed by children that later failed; if this \
-         drops back to success-only, the rollup regressed to a reap-time fold"
+        expected_success_bytes(percent)
+    );
+    assert!(
+        r.network_tx_at_join <= expected_success_bytes(percent) + expected_lost_bytes(percent),
+        "the parent counted {} but at most {} could have been pushed — a total above \
+         that means something is counted twice",
+        r.network_tx_at_join,
+        expected_success_bytes(percent) + expected_lost_bytes(percent)
     );
 
-    // DEFECT 2 — a composite never establishes a byte denominator. `set_total_bytes`
-    // has three call sites, all leaf transfers (upload/transfer.rs x2,
-    // download/transfer.rs x1); neither composite calls it.
-    // TODO(RUST-1224): becomes `is_some()` once composites accumulate a total.
-    assert!(
-        r.total_bytes.is_none(),
-        "no composite sets total_bytes today"
+    // FIXED: a composite establishes a byte denominator.
+    //
+    // This used to assert `total_bytes.is_none()` — `set_total_bytes` had three call
+    // sites, all leaf transfers, so a directory transfer had no denominator at all and
+    // a percentage was undefined. Both composites now accumulate the sizes of every
+    // entry their walk enumerates and seal the total once enumeration is quiescent.
+    //
+    // Every file is enumerated whatever its eventual outcome, so the denominator is the
+    // whole dataset — not the part that succeeded. That is the point: a numerator that
+    // now includes failed children's bytes needs a denominator on the same basis.
+    assert_eq!(
+        Some(FILE_COUNT as u64 * FILE_SIZE as u64),
+        r.total_bytes,
+        "a sealed composite total must cover every enumerated entry"
     );
 
     // Quiescence probe — NOT a reproduction. `signal_terminal`'s doc says it "is

@@ -1125,6 +1125,60 @@ async fn test_download_objects_events_abandoned_entries_still_settle() {
     .expect("test_download_objects_events_abandoned_entries_still_settle timed out");
 }
 
+/// A composite seals a byte denominator covering every object it listed.
+///
+/// `set_total_bytes` used to have three call sites, all leaf transfers, so a directory
+/// transfer had no denominator at all and a percentage was undefined for the whole run.
+/// Both composites now accumulate the size of every entry their walk produces, in the
+/// same critical section that publishes the entry, and seal the total once listing is
+/// quiescent.
+///
+/// Asserted on the joined output rather than mid-flight: the seal fires when listing
+/// drains, and a timing-based read of the provisional value would be flaky. What this
+/// pins is the invariant that matters for a bar — the denominator covers the whole
+/// dataset, so the numerator can reach it.
+#[tokio::test]
+async fn test_download_objects_seals_a_byte_denominator() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 25usize;
+        let size = 4096usize;
+        let bucket = "test-bucket";
+        let prefix = "denominator/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("download_objects");
+
+        assert_eq!(
+            Some(count as u64 * size as u64),
+            output.metrics.total_bytes,
+            "the sealed total must cover every listed object"
+        );
+        // The numerator reaches the denominator on a clean run. Before the rollup and the
+        // seal, one was folded only from successful children and the other did not exist.
+        assert_eq!(
+            output.metrics.total_bytes,
+            Some(output.metrics.network_rx),
+            "on a run with no failures the bar must reach exactly 100%"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_seals_a_byte_denominator timed out");
+}
+
 /// A caller-supplied walker must still exclude 0-byte folder markers.
 ///
 /// Verified against a real bucket: the marker `markers/sub/` derives the local path `<dest>/sub`,
