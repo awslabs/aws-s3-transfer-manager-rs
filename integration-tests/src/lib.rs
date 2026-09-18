@@ -17,6 +17,8 @@ mod download_retry;
 mod harness;
 mod integrity;
 mod metrics;
+mod progress_chaos;
+mod progress_scale;
 mod upload;
 mod upload_objects;
 mod upload_retry;

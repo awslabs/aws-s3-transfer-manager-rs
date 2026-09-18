@@ -490,6 +490,15 @@ impl Scheduler {
             // handle observes completion. Idempotent if already signaled.
             if let Some(completed) = completed {
                 completed.transfer().ctx().signal_terminal();
+                // The fourth and last removal path. A transfer whose status went
+                // terminal while work was still in flight is removed here, by the
+                // completing work rather than by a later poll, so it never reaches
+                // the `Done` arm. Without this call that transfer's `on_terminal`
+                // never runs, and an observer sees it start and never finish.
+                //
+                // Safe to reach from more than one path: the hook's work is
+                // guarded by a claim that exactly one caller can win.
+                completed.transfer().on_terminal();
             }
         }
 
@@ -720,6 +729,13 @@ impl Scheduler {
                             "poll_work.done",
                         );
                         claim.release();
+                        // Symmetric with the cancel (:404) and panic (:514) paths.
+                        // `on_terminal` is a defaulted trait method, so this is
+                        // additive for every operation that ignores it; the two that
+                        // implement it both want it on a normal completion as well.
+                        // Called before the descriptor is removed, so the transfer is
+                        // still reachable, and outside any state guard.
+                        desc.transfer().on_terminal();
                         let desc_id = desc.id();
                         let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
                         // The parent's `_completed` descriptor is the same one

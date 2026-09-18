@@ -415,7 +415,19 @@ pub(crate) struct UploadObjectsTransfer {
 struct UploadObjectsTransferInner {
     ctx: TransferContext,
     request: Arc<super::UploadObjectsInput>,
+    /// Interned once per operation: every child event names it, and a directory
+    /// upload over millions of files must not allocate it per entry.
+    bucket: Arc<str>,
     state: Mutex<State>,
+    /// `None` when nobody registered a sink. Taken at the
+    /// root's terminal so the crate stops holding a sink clone -- without that,
+    /// `TransferEventStream::next()` never returns `None` and a consumer looping
+    /// on it after `join()` hangs forever.
+    lifecycle: Mutex<Option<Arc<crate::events::TransferLifecycle>>>,
+    /// Per-child emitters, keyed by child id. Written only from the
+    /// spawn/reap paths, which are already serialised by the state lock in
+    /// phase 3 and by `reaping_in_flight` respectively.
+    child_lifecycles: Mutex<HashMap<TransferId, Arc<crate::events::TransferLifecycle>>>,
 }
 
 impl UploadObjectsTransfer {
@@ -423,12 +435,19 @@ impl UploadObjectsTransfer {
         ctx: TransferContext,
         request: super::UploadObjectsInput,
         walker: FsWalk,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Self {
         let mut walks = BTreeMap::new();
         walks.insert(0, walker);
+        let bucket: Arc<str> = Arc::from(
+            request
+                .bucket()
+                .expect("bucket validated by UploadObjectsInputBuilder::build"),
+        );
         let inner = Arc::new(UploadObjectsTransferInner {
             ctx,
             request: Arc::new(request),
+            bucket,
             state: Mutex::new(State {
                 walks,
                 next_walk_id: 1,
@@ -440,6 +459,8 @@ impl UploadObjectsTransfer {
                 failed: Vec::new(),
                 successful_uploads: 0,
             }),
+            lifecycle: Mutex::new(lifecycle),
+            child_lifecycles: Mutex::new(HashMap::new()),
         });
         Self { inner }
     }
@@ -448,12 +469,210 @@ impl UploadObjectsTransfer {
         &self.inner.ctx
     }
 
+    /// announce one claimed entry. Called with no state guard held.
+    ///
+    /// An entry whose orchestration failed is announced too, then finished
+    /// immediately: it is a real fact about a real entry, and suppressing it
+    /// would make `Decided` and `Settled` counts disagree for a reason a
+    /// consumer cannot see. It gets no lifecycle in the child map because there
+    /// is no child to reap.
+    fn announce_child(
+        &self,
+        outcome: &OrchestrateOutcome,
+        source_path: &std::path::Path,
+        key: &str,
+    ) {
+        let Some(root) = self.inner.lifecycle.lock().clone() else {
+            return;
+        };
+        let child_ref = self.child_ref(source_path, Some(Arc::from(key)));
+        match outcome {
+            Ok(handle) => {
+                let child_id = handle.id();
+                let lc = Arc::new(crate::events::TransferLifecycle::new(
+                    root.child_sink(),
+                    child_id.id,
+                    Some(self.inner.ctx.id.id),
+                    child_ref,
+                ));
+                lc.announce();
+                self.inner.child_lifecycles.lock().insert(child_id, lc);
+            }
+            Err(e) => {
+                // A fresh id rather than a placeholder: this entry never got a
+                // child transfer, but it is still announced and finished, and a
+                // consumer keying a map on `id` would collide every such entry
+                // onto one slot -- reporting one failure where there were five.
+                let lc = crate::events::TransferLifecycle::new(
+                    root.child_sink(),
+                    crate::transfer::next_transfer_id().id,
+                    Some(self.inner.ctx.id.id),
+                    child_ref,
+                );
+                lc.announce();
+                if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
+                    emit.send();
+                }
+            }
+        }
+    }
+
+    /// One entry of this operation: the file the walker found, and the object it
+    /// maps to under the operation's bucket.
+    ///
+    /// `destination` is [`Endpoint::Unresolved`](crate::events::Endpoint::Unresolved)
+    /// when the key could not be derived. An empty key would print as
+    /// `s3://bucket/`, which is an address the operation never touched.
+    fn child_ref(
+        &self,
+        source_path: &std::path::Path,
+        key: Option<Arc<str>>,
+    ) -> crate::events::TransferRef {
+        let source = crate::events::Endpoint::Local {
+            path: Arc::from(source_path),
+        };
+        let destination = match key {
+            Some(key) => crate::events::Endpoint::S3 {
+                bucket: self.inner.bucket.clone(),
+                key,
+            },
+            None => crate::events::Endpoint::Unresolved {},
+        };
+        crate::events::TransferRef::upload(source, destination)
+    }
+
+    /// claim one child's terminal emit. Safe under the state guard --
+    /// claiming does not send. The caller sends once the guard is released.
+    fn claim_child_finish(
+        &self,
+        child_id: TransferId,
+        outcome: crate::events::Outcome,
+    ) -> Option<crate::events::PendingEmit> {
+        let lc = self.inner.child_lifecycles.lock().remove(&child_id);
+        lc.and_then(|lc| lc.finish(outcome))
+    }
+
+    /// discharge every outstanding obligation and release the sink.
+    ///
+    /// Reachable from three sites -- both `check_terminal` branches and
+    /// `on_terminal` on the cancel/panic paths. The `owes_finish` swap is what
+    /// makes that safe: the first caller wins and the rest are no-ops. A reserved
+    /// slot would not have tolerated more than one candidate site.
+    ///
+    /// Two things happen here that a per-transfer view of the problem misses.
+    /// First, the root's terminal is the only place that can discharge children
+    /// which were announced but never reaped -- under `Abort` those children are
+    /// cancelled with their handles dropped, so no reap ever runs and their
+    /// `Settled` would otherwise never be emitted. Second, the sink clones must
+    /// be released, or the stream never ends.
+    ///
+    /// Emits are pushed onto `out` rather than sent, and the root's goes last.
+    /// The caller sends the whole vector after releasing the state guard, which is
+    /// what makes "the root's `Settled` is the end of the operation" true: a
+    /// caller that reaped children in the same pass already has their emits in
+    /// `out`, so they precede the root's.
+    ///
+    /// An orphan's outcome is derived from its own handle rather than assumed.
+    /// Under `Abort` a child can have already succeeded and be awaiting a reap
+    /// that will now never run; reporting it `Cancelled` tells a delete-on-success
+    /// consumer to keep a source whose object is in S3.
+    fn finish_root(
+        &self,
+        state: &State,
+        outcome: crate::events::Outcome,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) {
+        let orphans: Vec<_> = self.inner.child_lifecycles.lock().drain().collect();
+        for (child_id, lc) in orphans {
+            // A child still in `state.children` has a live handle to ask. One that
+            // is gone was removed by a reap that already claimed its emit, or was
+            // abandoned before any status existed -- `Cancelled` is the honest
+            // answer for the latter, and `finish` returns `None` for the former.
+            let child_outcome = match state.children.get(&child_id) {
+                Some(child) => match child.handle.status() {
+                    crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+                    crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                        error: crate::error::Error::new(
+                            crate::error::ErrorKind::ChildOperationFailed,
+                            format!("upload of {} failed", child.key),
+                        ),
+                    },
+                    _ => crate::events::Outcome::Cancelled {},
+                },
+                None => crate::events::Outcome::Cancelled {},
+            };
+            if let Some(emit) = lc.finish(child_outcome) {
+                out.push(emit);
+            }
+        }
+        let root = self.inner.lifecycle.lock().take();
+        if let Some(lc) = root {
+            if let Some(emit) = lc.finish(outcome) {
+                out.push(emit);
+            }
+        }
+    }
+
     pub(crate) fn successful_uploads(&self) -> u64 {
         self.inner.state.lock().successful_uploads
     }
 
     pub(crate) fn take_failed(&self) -> Vec<FailedUpload> {
         std::mem::take(&mut self.inner.state.lock().failed)
+    }
+
+    /// Record entries the walker produced that will never be claimed. Caller holds
+    /// the state guard.
+    ///
+    /// `check_terminal` abandons `pending_entries` by design once the transfer is
+    /// inactive, so without this they are discovered and reach no bucket -- which
+    /// is indistinguishable, to a consumer, from quietly succeeding. Draining is
+    /// idempotent, so this is safe from more than one terminal site.
+    fn record_abandoned_entries(
+        &self,
+        state: &mut State,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) {
+        if state.pending_entries.is_empty() {
+            return;
+        }
+        let key_prefix = self.inner.request.key_prefix().map(|s| s.to_string());
+        let delimiter = self.inner.request.delimiter().map(|s| s.to_string());
+        // Taken once, not per entry. This loop is bounded by the entry buffer's
+        // high-water mark rather than by a constant, and it runs under the state
+        // guard, so `scheduler.md`'s bounded-per-call-cost invariant makes the
+        // per-iteration cost the thing to keep small: one lock acquisition per
+        // abandoned entry is up to a thousand of them in a single `poll_work`.
+        let root = self.inner.lifecycle.lock().clone();
+        let abandoned: Vec<_> = state.pending_entries.drain(..).collect();
+        for entry in abandoned {
+            let relative = entry.relative_path().to_string_lossy().to_string();
+            // Derived here rather than carried: an unclaimed entry never reached
+            // `claim_one`. A derivation failure means it could not have been
+            // uploaded under any outcome, so it is still reported, with its path
+            // and an unresolved destination.
+            let key = derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref())
+                .ok()
+                .map(|k| Arc::from(k.as_ref()));
+            // The stream must agree with the counts. An abandoned entry was never
+            // claimed, so it has no child and no id -- it is announced and
+            // finished in one step, the same shape `announce_child` uses for an
+            // entry whose orchestration failed. Without this the counts report it
+            // and the stream does not, and two observers of the same transfer
+            // disagree about how many objects there were.
+            if let Some(root) = &root {
+                let lc = crate::events::TransferLifecycle::new(
+                    root.child_sink(),
+                    crate::transfer::next_transfer_id().id,
+                    Some(self.inner.ctx.id.id),
+                    self.child_ref(entry.path(), key),
+                );
+                lc.announce();
+                if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                    out.push(emit);
+                }
+            }
+        }
     }
 
     fn max_concurrent_uploads(&self) -> usize {
@@ -483,7 +702,24 @@ impl UploadObjectsTransfer {
     /// turns and done children are retired as they appear rather than
     /// accumulating. Walk and spawn are skipped when inactive so cancel/fail
     /// stops new work while in-flight drains.
+    /// Publishes whatever `poll_work_inner` claimed, after it has returned and
+    /// therefore after its state guard is gone.
+    ///
+    /// The split is what makes the publish point structural rather than a rule to
+    /// remember: `poll_work_inner` has nine return paths, every one of them holding
+    /// the guard, so a hand-placed send would have to be repeated nine times and a
+    /// tenth path added later would silently drop its events. Claiming into an
+    /// out-param and sending here is one place, checked by the compiler.
     pub(crate) fn poll_work(&self) -> PollWork {
+        let mut emits = Vec::new();
+        let work = self.poll_work_inner(&mut emits);
+        for emit in emits {
+            emit.send();
+        }
+        work
+    }
+
+    fn poll_work_inner(&self, emits: &mut Vec<crate::events::PendingEmit>) -> PollWork {
         let active = self.inner.ctx.is_active();
         let mut state = self.inner.state.lock();
 
@@ -509,7 +745,7 @@ impl UploadObjectsTransfer {
         let mut attempted = false;
         let mut materialized = false;
         if active {
-            let claim = self.claim_one(&mut state);
+            let claim = self.claim_one(&mut state, emits);
             match claim {
                 SpawnDecision::Abort => return PollWork::Done,
                 SpawnDecision::Batch(claimed, reservation) => {
@@ -530,6 +766,13 @@ impl UploadObjectsTransfer {
                                     input,
                                     self.inner.ctx.id.id,
                                 );
+                                // announce here, not in
+                                // `merge_spawned`. This is the only point in
+                                // `poll_work` where the state guard is not held:
+                                // phase 2 drops it above and phase 3 re-takes it,
+                                // and every other exit from `poll_work` returns
+                                // with the guard live.
+                                self.announce_child(&outcome, &source_path, &key);
                                 (outcome, source_path, key)
                             })
                             .collect();
@@ -537,7 +780,7 @@ impl UploadObjectsTransfer {
                         // Phase 3: re-lock and merge.
                         state = self.inner.state.lock();
                         let (abort, inserted) =
-                            self.merge_spawned(&mut state, outcomes, reservation);
+                            self.merge_spawned(&mut state, outcomes, reservation, emits);
                         if let Some(done) = abort {
                             return done;
                         }
@@ -579,8 +822,8 @@ impl UploadObjectsTransfer {
         // `check_terminal` handles both the inactive drain (signal terminal only
         // once in-flight work has drained) and the active success transition;
         // otherwise the transfer parks Pending and the draining work re-polls it.
-        if let Some(out) = self.check_terminal(&mut state) {
-            return out;
+        if let Some(work) = self.check_terminal(&mut state, emits) {
+            return work;
         }
         if active {
             state.debug_assert_capacity(self.max_concurrent_uploads());
@@ -591,25 +834,48 @@ impl UploadObjectsTransfer {
 
     /// Record the failure cause and signal terminal. Children are cancelled
     /// when the handle's cancel path runs `scheduler.cancel_transfer(parent_id)`.
-    fn abort(&self, _state: &mut State, cause: impl Into<String>) -> PollWork {
+    fn abort(
+        &self,
+        state: &mut State,
+        cause: impl Into<String>,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) -> PollWork {
         let cause = cause.into();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
-        // TODO: the triggering child's error is preserved structurally in
-        // `state.failed` (reachable via `Error::failed_uploads`), but the root
-        // error's `source()` is only this string. Connecting the root `source()`
-        // to the failing child's error needs a shareable error (`Arc`) since
-        // `Error` is not `Clone` and the child is also owned by the
-        // failed-uploads list.
-        self.inner
-            .ctx
-            .set_failed_and_signal(crate::error::Error::new(
-                crate::error::ErrorKind::ChildOperationFailed,
-                format!("upload_objects aborted: {cause}"),
-            ));
+        // The triggering child's error is preserved structurally in `state.failed`
+        // (reachable via `Error::failed_uploads`); the root error's `source()` is
+        // this string. `Error` is `Clone`, so the same value is both signalled and
+        // reported on the root's terminal event.
+        let root_error = crate::error::Error::new(
+            crate::error::ErrorKind::ChildOperationFailed,
+            format!("upload_objects aborted: {cause}"),
+        );
+        // First-write-wins: a later abort in the same poll does not overwrite the
+        // cause. The return is not needed — `record_abandoned_entries` drains, so it
+        // is idempotent across the several sites `abort()` is reachable from.
+        self.inner.ctx.set_failed_and_signal(root_error.clone());
+        self.record_abandoned_entries(state, out);
+        // the fourth terminal site, and the one that breaks the
+        // ordering rule. This returns `Done`, so the scheduler removes the
+        // transfer without ever calling `on_terminal` and without another
+        // `check_terminal` -- emit here or the root's event is never sent and the
+        // stream never ends. But children may still be executing, so their
+        // obligations are discharged as `Cancelled` before the root's, which keeps
+        // child-before-root ordering at the cost of accuracy: a child that had
+        // already succeeded and was awaiting reap is reported cancelled.
+        // The caller holds the state guard and `abort` returns `Done`, so there is
+        // no post-guard point to publish from. `try_send` cannot block, so sending
+        // here is legal; a reserving send would not be, and moving this onto an
+        // outbox is part of making delivery at-least-once.
+        self.finish_root(
+            state,
+            crate::events::Outcome::Failed { error: root_error },
+            out,
+        );
         PollWork::Done
     }
 
@@ -651,7 +917,11 @@ impl UploadObjectsTransfer {
     /// (key derivation or InputStream build), until it either (a) claims
     /// one good entry, or (b) exhausts `pending_entries`. Under Abort
     /// policy the first failure aborts immediately.
-    fn claim_one(&self, state: &mut State) -> SpawnDecision {
+    fn claim_one(
+        &self,
+        state: &mut State,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) -> SpawnDecision {
         let max_concurrent_uploads = self.max_concurrent_uploads();
         let bucket = self
             .inner
@@ -686,7 +956,7 @@ impl UploadObjectsTransfer {
                             source_path: Some(entry.path().to_path_buf()),
                         });
                         if *self.failure_policy() == FailedTransferPolicy::Abort {
-                            self.abort(state, "key derivation failure");
+                            self.abort(state, "key derivation failure", out);
                             return SpawnDecision::Abort;
                         }
                         continue;
@@ -706,7 +976,7 @@ impl UploadObjectsTransfer {
                         source_path: Some(entry.path().to_path_buf()),
                     });
                     if *self.failure_policy() == FailedTransferPolicy::Abort {
-                        self.abort(state, "stream creation failure");
+                        self.abort(state, "stream creation failure", out);
                         return SpawnDecision::Abort;
                     }
                     continue;
@@ -756,6 +1026,7 @@ impl UploadObjectsTransfer {
         state: &mut State,
         outcomes: Vec<(OrchestrateOutcome, PathBuf, String)>,
         reservation: Reservation,
+        out: &mut Vec<crate::events::PendingEmit>,
     ) -> (Option<PollWork>, usize) {
         debug_assert_eq!(
             outcomes.len(),
@@ -795,7 +1066,7 @@ impl UploadObjectsTransfer {
                         source_path: Some(source_path),
                     });
                     if !aborted_in_batch && *self.failure_policy() == FailedTransferPolicy::Abort {
-                        abort_result = Some(self.abort(state, "orchestration failure"));
+                        abort_result = Some(self.abort(state, "orchestration failure", out));
                         aborted_in_batch = true;
                     }
                 }
@@ -836,7 +1107,11 @@ impl UploadObjectsTransfer {
         }
     }
 
-    fn check_terminal(&self, state: &mut State) -> Option<PollWork> {
+    fn check_terminal(
+        &self,
+        state: &mut State,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) -> Option<PollWork> {
         if !self.inner.ctx.is_active() {
             // Cancelled or failed: wait only for genuinely in-flight work to
             // drain before signaling terminal, so the parent does not report
@@ -858,7 +1133,11 @@ impl UploadObjectsTransfer {
                     failed = state.failed.len(),
                     "upload_objects terminal (cancelled/failed), signaling",
                 );
+                // Children are provably empty on this branch (it is the gate
+                // above), so only unclaimed entries can still be owed.
+                self.record_abandoned_entries(state, out);
                 self.inner.ctx.signal_terminal();
+                self.finish_root(state, crate::events::Outcome::Cancelled {}, out);
                 return Some(PollWork::Done);
             }
             return None;
@@ -885,6 +1164,7 @@ impl UploadObjectsTransfer {
             );
             self.inner.ctx.set_completed();
             self.inner.ctx.signal_terminal();
+            self.finish_root(state, crate::events::Outcome::Succeeded {}, out);
             return Some(PollWork::Done);
         }
         None
@@ -978,7 +1258,23 @@ impl UploadObjectsTransfer {
         }
     }
 
-    async fn execute_advance_walker(&self, mut slot: WalkSlot) -> WorkOutcome {
+    /// Publishes after `execute_advance_walker_inner` returns, for the same reason
+    /// `poll_work` does: the inner body holds the state guard across three return
+    /// paths, so one publish point outside it beats three inside.
+    async fn execute_advance_walker(&self, slot: WalkSlot) -> WorkOutcome {
+        let mut emits = Vec::new();
+        let outcome = self.execute_advance_walker_inner(slot, &mut emits).await;
+        for emit in emits {
+            emit.send();
+        }
+        outcome
+    }
+
+    async fn execute_advance_walker_inner(
+        &self,
+        mut slot: WalkSlot,
+        emits: &mut Vec<crate::events::PendingEmit>,
+    ) -> WorkOutcome {
         let walk_id = slot.walk_id;
         let mut walk = slot.take_walk();
         let ctx = &self.inner.ctx;
@@ -1041,7 +1337,16 @@ impl UploadObjectsTransfer {
         }
 
         let n_entries = entries.len();
+        // Every accepted entry is counted exactly once, here, because this is the
+        // only path from a walker into the work queue. Counting at spawn instead
+        // would miss entries abandoned when the transfer goes inactive.
         state.pending_entries.extend(entries);
+        if !self.inner.ctx.is_active() {
+            // A walker batch that landed after the terminal transition. Discharge
+            // it now: a one-shot discharge at terminal leaves these counted as
+            // discovered and in no bucket.
+            self.record_abandoned_entries(&mut state, emits);
+        }
 
         for we in walk_errors {
             tracing::warn!(
@@ -1061,7 +1366,7 @@ impl UploadObjectsTransfer {
             if *self.failure_policy() == FailedTransferPolicy::Abort {
                 // Transfer is aborting: drop the walker (no walk_back).
                 slot.consume(&mut state, None);
-                self.abort(&mut state, "walker error");
+                self.abort(&mut state, "walker error", emits);
                 return WorkOutcome::Failed {
                     classification: None,
                 };
@@ -1091,7 +1396,7 @@ impl UploadObjectsTransfer {
         // An execute callback that drains the last in-flight work owns the
         // terminal transition: check and signal here rather than deferring to
         // a subsequent poll_work.
-        if self.check_terminal(&mut state).is_some() {
+        if self.check_terminal(&mut state, emits).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };
         }
@@ -1123,11 +1428,24 @@ impl UploadObjectsTransfer {
         let futures = children.into_iter().map(|child| {
             // Snapshot metrics before `join()` consumes the handle.
             let metrics = child.handle.metrics();
+            // the id and the status must be captured here too.
+            // `join()` takes the handle, and a cancelled child returns `Err` just
+            // like a failed one, so the status is the only thing that tells them
+            // apart -- and it is unreachable after this line.
+            let child_id = child.handle.id();
+            let status_before_join = child.handle.status();
             let source_path = child.source_path;
             let key = child.key;
             async move {
                 let result = child.handle.join().await;
-                (result, metrics, source_path, key)
+                (
+                    result,
+                    metrics,
+                    source_path,
+                    key,
+                    child_id,
+                    status_before_join,
+                )
             }
         });
         let results = futures_util::future::join_all(futures).await;
@@ -1137,7 +1455,26 @@ impl UploadObjectsTransfer {
         let reaped = results.len();
         let mut aborted_in_batch = false;
 
-        for (result, metrics, source_path, key) in results {
+        // claimed terminal emits, sent after the guard is released.
+        let mut pending_emits: Vec<crate::events::PendingEmit> = Vec::new();
+
+        for (result, metrics, source_path, key, child_id, status_before_join) in results {
+            // One classification, two consumers: the counters below and the
+            // lifecycle event. `join()` returns `Err` for a cancelled child and a
+            // failed one alike, so the pre-join status is the only thing that
+            // separates them -- which is why it was captured before the handle was
+            // consumed.
+            let was_cancelled =
+                result.is_err() && status_before_join == crate::types::TransferStatus::Cancelled;
+
+            // Claim under the guard, send after it is released.
+            let outcome = match &result {
+                Ok(_) => crate::events::Outcome::Succeeded {},
+                Err(_) if was_cancelled => crate::events::Outcome::Cancelled {},
+                Err(e) => crate::events::Outcome::Failed { error: e.clone() },
+            };
+            pending_emits.extend(self.claim_child_finish(child_id, outcome));
+
             match result {
                 Ok(_output) => {
                     state.successful_uploads += 1;
@@ -1184,7 +1521,7 @@ impl UploadObjectsTransfer {
                         source_path: Some(source_path),
                     });
                     if let Some(cause) = abort_cause {
-                        self.abort(&mut state, cause);
+                        self.abort(&mut state, cause, &mut pending_emits);
                         aborted_in_batch = true;
                     }
                 }
@@ -1211,11 +1548,22 @@ impl UploadObjectsTransfer {
         // An execute callback that drains the last in-flight work owns the
         // terminal transition: check and signal here rather than deferring to
         // a subsequent poll_work.
-        if self.check_terminal(&mut state).is_some() {
+        // `check_terminal` appends the root's emit to the same vector the reap
+        // filled, so the root is published after every child reaped in this pass.
+        if self
+            .check_terminal(&mut state, &mut pending_emits)
+            .is_some()
+        {
             drop(state);
+            for emit in pending_emits {
+                emit.send();
+            }
             return WorkOutcome::Success { data: None };
         }
         drop(state);
+        for emit in pending_emits {
+            emit.send();
+        }
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
     }
@@ -1245,7 +1593,44 @@ impl Transfer for UploadObjectsTransfer {
         Box::pin(UploadObjectsTransfer::execute(self, work))
     }
 
-    fn on_terminal(&self) {}
+    fn on_terminal(&self) {
+        // Guard-free by contract, so this is the one terminal site that can lock
+        // state and publish without an outbox.
+        //
+        // The outcome is derived from the status rather than assumed: this hook is
+        // reached from the scheduler's cancel path *and* its panic path, which sets
+        // `Failed` first. Hardcoding `Cancelled` reported a panicked transfer as
+        // cancelled, and a delete-on-success consumer cannot distinguish "we
+        // stopped this" from "this broke".
+        let outcome = match self.inner.ctx.transfer_status() {
+            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                error: self.inner.ctx.error().unwrap_or_else(|| {
+                    crate::error::Error::new(
+                        crate::error::ErrorKind::ChildOperationFailed,
+                        "upload_objects failed",
+                    )
+                }),
+            },
+            _ => crate::events::Outcome::Cancelled {},
+        };
+        let mut emits = Vec::new();
+        {
+            let mut state = self.inner.state.lock();
+            // Sweep before finishing the root, and here as well as in `check_terminal`:
+            // whichever terminal path fires first drains `pending_entries` and the other
+            // finds it empty. This hook is the one that runs on the scheduler-driven
+            // cancel path, where no further `poll_work` re-enters `check_terminal` to
+            // sweep — so without this, a cancelled `upload_objects` emits nothing at all
+            // for entries the walker had already buffered, and a consumer keying
+            // per-entry state off `Decided` holds them open forever.
+            self.record_abandoned_entries(&mut state, &mut emits);
+            UploadObjectsTransfer::finish_root(self, &state, outcome, &mut emits);
+        }
+        for emit in emits {
+            emit.send();
+        }
+    }
 }
 
 /// Derive the S3 object key for a file at `relative_filename` inside the walk root.
@@ -1414,7 +1799,7 @@ mod tests {
             .walk(FsWalkContext::builder().root(source).build());
 
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker, None);
         // Register the parent group so children spawned via the scheduler
         // can find it. The composite is driven directly via `drive_transfer`
         // rather than enqueued, so we set up only the group entry, not the
@@ -1539,7 +1924,7 @@ mod tests {
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker, None);
         transfer
             .inner
             .ctx
@@ -2216,7 +2601,7 @@ mod tests {
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker, None);
         transfer
             .inner
             .ctx
@@ -2295,7 +2680,7 @@ mod tests {
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker, None);
         transfer
             .inner
             .ctx
@@ -2345,7 +2730,7 @@ mod tests {
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker, None);
         transfer
             .inner
             .ctx

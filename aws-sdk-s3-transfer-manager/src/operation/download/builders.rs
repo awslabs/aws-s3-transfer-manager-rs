@@ -11,6 +11,7 @@ use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
 pub struct DownloadFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: DownloadInputBuilder,
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl DownloadFluentBuilder {
@@ -18,7 +19,17 @@ impl DownloadFluentBuilder {
         Self {
             handle,
             inner: ::std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// Report lifecycle events for this transfer to `sink`.
+    ///
+    /// Registered on the builder rather than the handle because orchestration
+    /// dispatches work before the handle exists.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        self.events = Some(sink);
+        self
     }
 
     /// Initiate a download transfer for a single object
@@ -28,7 +39,17 @@ impl DownloadFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate(self.handle, input, false)
+        crate::operation::download::Download::orchestrate(
+            self.handle,
+            input,
+            false,
+            self.events
+                .map(|sink| crate::operation::download::EventRegistration {
+                    sink,
+                    // The caller drains the body itself, so there is no file to name.
+                    destination: crate::events::Endpoint::Stream {},
+                }),
+        )
     }
 
     /// Download the object and write it to the given file path.
@@ -42,11 +63,21 @@ impl DownloadFluentBuilder {
         path: impl Into<std::path::PathBuf>,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
+        let path = path.into();
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Local {
+                    path: std::sync::Arc::from(path.as_path()),
+                },
+            });
         crate::operation::download::Download::orchestrate_to_path(
             self.handle,
             input,
-            path.into(),
+            path,
             None,
+            events,
         )
         .await
     }

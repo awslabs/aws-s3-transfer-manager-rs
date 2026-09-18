@@ -717,6 +717,20 @@ impl TransferContext {
         }
     }
 
+    /// Clone the error if the transfer failed. Returns None if not failed or
+    /// already taken.
+    ///
+    /// Non-destructive, unlike [`Self::take_error`]: an observer reporting why a
+    /// transfer failed must not consume the error the caller still needs from
+    /// `join()`. Cheap — [`error::Error`] is `Clone` over an `Arc` source.
+    pub(crate) fn error(&self) -> Option<error::Error> {
+        if self.status.is_failed() {
+            self.error.lock().unwrap().as_ref().map(|e| (**e).clone())
+        } else {
+            None
+        }
+    }
+
     /// Peek at the error kind if transfer failed. Returns None if not failed or already taken.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {

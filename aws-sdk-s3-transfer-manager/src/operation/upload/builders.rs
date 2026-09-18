@@ -14,6 +14,7 @@ use super::{ChecksumStrategy, UploadHandle, UploadInputBuilder};
 pub struct UploadFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: UploadInputBuilder,
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl UploadFluentBuilder {
@@ -21,7 +22,18 @@ impl UploadFluentBuilder {
         Self {
             handle,
             inner: ::std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// Report lifecycle events for this transfer to `sink`.
+    ///
+    /// Registered on the builder rather than the handle because orchestration
+    /// dispatches work before the handle exists, so a handle-side registration
+    /// could miss the transfer's own start.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        self.events = Some(sink);
+        self
     }
 
     /// Initiate an upload transfer for a single object
@@ -32,7 +44,7 @@ impl UploadFluentBuilder {
 
     pub fn initiate(self) -> Result<UploadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload::Upload::orchestrate(self.handle, input)
+        crate::operation::upload::Upload::orchestrate(self.handle, input, self.events)
     }
 
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>

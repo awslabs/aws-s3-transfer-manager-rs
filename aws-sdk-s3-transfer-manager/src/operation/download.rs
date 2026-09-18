@@ -54,12 +54,45 @@ use std::sync::Arc;
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
 
+/// Where a download's events go, and the end it writes to.
+///
+/// One value rather than two parameters: a sink is only ever useful alongside the
+/// destination to report with it, and only the entry point that chose the
+/// destination knows what it is — a file for `write_to_path`, the caller's own body
+/// for a streaming download.
+pub(crate) struct EventRegistration {
+    pub(crate) sink: crate::events::TransferEventSink,
+    pub(crate) destination: crate::events::Endpoint,
+}
+
 impl Download {
+    fn lifecycle_for(
+        ctx: &crate::transfer::TransferContext,
+        input: &DownloadInput,
+        events: Option<EventRegistration>,
+    ) -> Option<Arc<crate::events::TransferLifecycle>> {
+        events.map(|reg| {
+            Arc::new(crate::events::TransferLifecycle::new(
+                reg.sink,
+                ctx.id.id,
+                None,
+                crate::events::TransferRef::download(
+                    crate::events::Endpoint::S3 {
+                        bucket: Arc::from(input.bucket().unwrap_or_default()),
+                        key: Arc::from(input.key().unwrap_or_default()),
+                    },
+                    reg.destination,
+                ),
+            ))
+        })
+    }
+
     /// Execute a single `Download` transfer operation
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         _use_current_span_as_parent_for_tasks: bool,
+        events: Option<EventRegistration>,
     ) -> Result<DownloadHandle, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -74,7 +107,13 @@ impl Download {
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        // A streaming download has no local path: the caller owns the body.
+        let lifecycle = Self::lifecycle_for(&ctx, &input, events);
+        let transfer =
+            DownloadTransfer::new(ctx.clone(), bucket_type, input, writer, lifecycle.clone());
+        if let Some(lc) = &lifecycle {
+            lc.announce();
+        }
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -84,7 +123,7 @@ impl Download {
 
     /// Orchestrate a download that writes to a file path (temp file + rename).
     ///
-    /// When `parent_id` is `Some`, the transfer is linked as a child of the
+    /// When `parent` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
@@ -92,6 +131,7 @@ impl Download {
         input: DownloadInput,
         dest_path: std::path::PathBuf,
         parent_id: Option<u64>,
+        events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
         let unique_id = fastrand::u32(..);
@@ -108,7 +148,8 @@ impl Download {
         let file = tokio_file.into_std().await;
 
         let range_start = object_range_start_from_input(&input);
-        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, true, parent_id)?;
+        let inner =
+            Self::orchestrate_with_sink(handle, input, file, range_start, true, parent_id, events)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -120,7 +161,8 @@ impl Download {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let range_start = object_range_start_from_input(&input);
-        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, false, None)?;
+        let inner =
+            Self::orchestrate_with_sink(handle, input, file, range_start, false, None, None)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
@@ -134,6 +176,7 @@ impl Download {
         object_range_start: u64,
         owns_file: bool,
         parent_id: Option<u64>,
+        events: Option<EventRegistration>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -152,7 +195,12 @@ impl Download {
             None => TransferContext::new(handle.clone()),
         };
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        let lifecycle = Self::lifecycle_for(&ctx, &input, events);
+        let transfer =
+            DownloadTransfer::new(ctx.clone(), bucket_type, input, writer, lifecycle.clone());
+        if let Some(lc) = &lifecycle {
+            lc.announce();
+        }
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));

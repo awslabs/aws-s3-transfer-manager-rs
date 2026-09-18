@@ -507,7 +507,8 @@ mod tests {
             .unwrap();
         let (writer, consumer) = new_recv_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
+        let transfer =
+            DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer, None);
 
         ctx.set_cancelled();
         ctx.signal_terminal();

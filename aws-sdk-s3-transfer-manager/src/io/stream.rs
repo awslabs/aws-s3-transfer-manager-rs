@@ -96,6 +96,19 @@ impl InputStream {
         matches!(self.inner, RawInputStream::Fs(_))
     }
 
+    /// The file this stream reads from, or `None` for an in-memory or
+    /// caller-supplied stream.
+    ///
+    /// The path as given, not canonicalized: it is reported to an observer as the
+    /// upload's source, and a caller that passed a relative path is entitled to
+    /// read its own back.
+    pub(crate) fn source_path(&self) -> Option<&Path> {
+        match &self.inner {
+            RawInputStream::Fs(body) => Some(&body.path),
+            RawInputStream::Buf(_) | RawInputStream::Dyn(_) => None,
+        }
+    }
+
     /// Convert this input stream into an [`SdkBody`] suitable for a top-level
     /// retryable SDK call (e.g. `PutObject`). The returned body is retryable at
     /// the SDK layer:

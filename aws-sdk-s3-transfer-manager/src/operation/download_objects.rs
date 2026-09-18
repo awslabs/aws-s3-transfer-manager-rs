@@ -33,9 +33,15 @@ impl DownloadObjects {
     ///
     /// Destination validation (exists, is a directory) is performed
     /// synchronously. Walker errors surface from `handle.join()`.
+    ///
+    /// `events` is `None` unless a caller registered a sink. The root is announced
+    /// before `enqueue_transfer`, so no child event can precede it: children are
+    /// only created from `poll_work`, which cannot run until the transfer is in the
+    /// scheduler.
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: DownloadObjectsInput,
+        events: Option<crate::events::TransferEventSink>,
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
         // Destination presence is validated here (cheap, no I/O); directory
         // validation is deferred to the state machine's first walker advance so
@@ -75,7 +81,33 @@ impl DownloadObjects {
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, pipeline_depth);
+        // The root's ends are the prefix being downloaded and the destination
+        // directory — the two halves of what the operation was asked to do, so a
+        // consumer can label the operation before any child appears. Its bucket is
+        // interned here and cloned per child, not re-interned per entry.
+        let lifecycle = events.map(|sink| {
+            Arc::new(crate::events::TransferLifecycle::new(
+                sink,
+                ctx.id.id,
+                None,
+                crate::events::TransferRef::download(
+                    crate::events::Endpoint::S3 {
+                        bucket: Arc::from(bucket.as_str()),
+                        key: Arc::from(input.key_prefix().unwrap_or_default()),
+                    },
+                    crate::events::Endpoint::Local {
+                        path: Arc::from(input.destination().expect("destination validated above")),
+                    },
+                ),
+            ))
+        });
+
+        let transfer =
+            DownloadObjectsTransfer::new(ctx, &input, walk, pipeline_depth, lifecycle.clone());
+
+        if let Some(lc) = &lifecycle {
+            lc.announce();
+        }
 
         handle
             .scheduler

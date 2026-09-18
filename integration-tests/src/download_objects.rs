@@ -20,6 +20,8 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::types::{FailedTransferPolicy, RuntimeMode};
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
+use aws_sdk_s3_transfer_manager::events::{Decision, Endpoint, Outcome, TransferEvent};
+
 use crate::harness::mock_tm;
 use tokio::time::timeout;
 
@@ -763,6 +765,364 @@ async fn test_upload_then_download_objects_roundtrip_mock_gp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
     test_upload_then_download_objects_roundtrip(RuntimeMode::MultiThreadTokio).await;
+}
+
+// ---------------------------------------------------------------------------
+// RUST-1224: lifecycle events for `download_objects`.
+//
+// The download side is where the event's byte count is easiest to get wrong.
+// `TransferMetrics` carries four counters and a download populates `network_rx`,
+// not `network_tx` — so an emit copy-pasted from `upload_objects` compiles, runs,
+// and reports every object as having transferred zero bytes. The byte assertions
+// below are the regression guard for exactly that.
+// ---------------------------------------------------------------------------
+
+/// One `Decided` per object plus the root, each finishing exactly once, with
+/// byte counts that match what was actually downloaded.
+#[tokio::test]
+async fn test_download_objects_events_pair_and_report_bytes() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 12usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "events/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        // 2 per transfer (Decided + Settled) plus the root's pair, so nothing
+        // is dropped for want of room and the counts below are exact.
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            (evs, stream.dropped())
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        assert_eq!(count as u64, output.objects_downloaded());
+        let (events, dropped) = collector.await.expect("collector");
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+
+        // Keyed by id, holding the destination each event named, so the two halves
+        // of a pair can be checked against each other.
+        let mut decided: HashMap<u64, PathBuf> = HashMap::new();
+        let mut settled: HashMap<u64, u64> = HashMap::new();
+        let mut root_id: Option<u64> = None;
+
+        for ev in &events {
+            let dest_path = match ev.transfer().destination() {
+                Endpoint::Local { path, .. } => path.to_path_buf(),
+                other => panic!("a download writes to a local file, got {other:?}"),
+            };
+            assert!(
+                matches!(ev.decision(), Decision::Transfer { .. }),
+                "every event of a download_objects run decides a transfer: {ev:?}"
+            );
+            match ev {
+                TransferEvent::Decided { id, parent, .. } => {
+                    assert!(
+                        decided.insert(*id, dest_path).is_none(),
+                        "id {id} announced twice"
+                    );
+                    if parent.is_none() {
+                        root_id = Some(*id);
+                    }
+                }
+                TransferEvent::Settled { id, outcome, .. } => {
+                    *settled.entry(*id).or_default() += 1;
+                    assert!(
+                        matches!(outcome, Outcome::Succeeded { .. }),
+                        "id {id} must succeed, got {outcome:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            count + 1,
+            decided.len(),
+            "one decision per object plus the root"
+        );
+        assert_eq!(
+            decided.len(),
+            settled.len(),
+            "every announced transfer must settle"
+        );
+        for (id, n) in &settled {
+            assert_eq!(1, *n, "id {id} settled {n} times, expected exactly once");
+        }
+
+        // The byte regression guard, read from the operation's own result rather
+        // than summed from the stream: delivery is lossy, so a stream-derived total
+        // is only ever a lower bound. A download populates `network_rx`; reading
+        // `network_tx` yields 0 here.
+        let expected = (count * size) as u64;
+        assert_eq!(
+            expected,
+            output.metrics().network_rx,
+            "the operation must report the whole directory's downloaded bytes"
+        );
+
+        // Each child names the file it wrote, inside the destination directory.
+        let root = root_id.expect("root was announced");
+        for (id, path) in &decided {
+            if *id == root {
+                assert_eq!(
+                    dest.path(),
+                    path.as_path(),
+                    "the root's destination is the destination directory"
+                );
+                continue;
+            }
+            assert!(
+                path.starts_with(dest.path()),
+                "child destination {path:?} must be inside {:?}",
+                dest.path()
+            );
+        }
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_events_pair_and_report_bytes timed out");
+}
+
+/// A doomed object must surface as `Outcome::Failed` on its own child event while
+/// the rest still report success, under `Continue`.
+#[tokio::test]
+async fn test_download_objects_events_report_per_object_failure() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 8usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "evfail/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        // 403 rather than 500: non-retryable, so the child fails on its first
+        // attempt and the run does not depend on the retry policy.
+        let doomed = format!("{prefix}0003.bin");
+        m.server.insert_fault(
+            bucket,
+            &doomed,
+            FaultType::ServiceError { status: 403 },
+            0,
+            Occurrence::Always,
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            evs
+        });
+
+        let _ = handle.join().await;
+        let events = collector.await.expect("collector");
+
+        let mut failed_keys = Vec::new();
+        let mut succeeded = 0usize;
+        let mut announced = 0usize;
+        let mut finished = 0usize;
+        for ev in &events {
+            // The key comes off the event's own source endpoint, which is where a
+            // download reads from -- no side map keyed by id.
+            let key = match ev.transfer().source() {
+                Endpoint::S3 { key, .. } => key.to_string(),
+                other => panic!("a download reads from S3, got {other:?}"),
+            };
+            match ev {
+                TransferEvent::Decided { .. } => announced += 1,
+                TransferEvent::Settled {
+                    outcome, parent, ..
+                } => {
+                    finished += 1;
+                    match outcome {
+                        Outcome::Failed { .. } => failed_keys.push(key),
+                        Outcome::Succeeded { .. } if parent.is_some() => succeeded += 1,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            announced, finished,
+            "every announced transfer must reach a terminal event"
+        );
+        assert!(
+            failed_keys.iter().any(|k| k == &doomed),
+            "the doomed key must report Failed, got {failed_keys:?}"
+        );
+        assert_eq!(
+            count - 1,
+            succeeded,
+            "every other object must still report Succeeded"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_events_report_per_object_failure timed out");
+}
+
+/// Under `Abort`, a key the walker listed but never got to spawn must still reach
+/// the stream. Without the abandoned-entry sweep those keys vanish: the run reports
+/// fewer objects on the stream than it listed, and a per-object consumer never hears
+/// that the file existed.
+///
+/// The setup makes the gap deterministic. All `count` keys fit in one list page
+/// (count < WALK_LOW_WATER), so the walk drains into `pending_entries` before spawn
+/// touches it; `max_concurrent_downloads(1)` then spawns only the faulted head key
+/// before it fails and Abort cancels, leaving every other listed key unspawned. With
+/// the sweep, all `count` keys appear; without it, one does.
+#[tokio::test]
+async fn test_download_objects_events_abandoned_entries_still_settle() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 60usize;
+        let size = 1024usize;
+        let bucket = "test-bucket";
+        let prefix = "abandon/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        // 503 Always on the first key: it exhausts retries and fails, which under
+        // Abort cancels the run with the remaining listed keys still in
+        // `pending_entries`.
+        m.server.insert_fault(
+            bucket,
+            &format!("{prefix}0000.bin"),
+            FaultType::ServiceError { status: 503 },
+            0,
+            Occurrence::Always,
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        // 2 per object plus the root's pair; the sweep announces-and-finishes every
+        // abandoned key, so the stream must have room for all of them to lose nothing.
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Abort)
+            // Serialize spawning so only the faulted head key materializes before
+            // the abort; the rest stay listed-but-unspawned for the sweep.
+            .max_concurrent_downloads(1)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            (evs, stream.dropped())
+        });
+
+        let result = handle.join().await;
+        assert!(
+            result.is_err(),
+            "Abort with a faulted key must return an error"
+        );
+        let (events, dropped) = collector.await.expect("collector");
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+
+        // Pairing: every announced id settles exactly once. The sweep announces and
+        // finishes an abandoned entry in one step, so a swept key contributes one of
+        // each; the two-lock reorder bug (a late Decided landing in a drained map)
+        // would surface here as a Decided with no Settled.
+        let mut decided: HashMap<u64, bool> = HashMap::new();
+        let mut settled: HashMap<u64, usize> = HashMap::new();
+        // Completeness: the distinct S3 keys of child events. This is the sweep's
+        // guard -- without it, only the head key appears.
+        let mut child_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for ev in &events {
+            let key = match ev.transfer().source() {
+                Endpoint::S3 { key, .. } => key.to_string(),
+                other => panic!("a download reads from S3, got {other:?}"),
+            };
+            match ev {
+                TransferEvent::Decided { id, parent, .. } => {
+                    assert!(
+                        decided.insert(*id, parent.is_some()).is_none(),
+                        "id {id} announced twice"
+                    );
+                    if parent.is_some() {
+                        child_keys.insert(key);
+                    }
+                }
+                TransferEvent::Settled { id, .. } => {
+                    *settled.entry(*id).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+
+        for id in decided.keys() {
+            assert_eq!(
+                Some(&1),
+                settled.get(id),
+                "announced id {id} must settle exactly once, got {:?}",
+                settled.get(id)
+            );
+        }
+        assert_eq!(
+            count,
+            child_keys.len(),
+            "every listed key must reach the stream: the sweep is what covers the \
+             ones cancelled before they spawned"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_events_abandoned_entries_still_settle timed out");
 }
 
 /// A caller-supplied walker must still exclude 0-byte folder markers.

@@ -727,3 +727,130 @@ async fn download_objects_transient_throttle_storm_recovers() {
     .await
     .expect("download_objects_transient_throttle_storm_recovers timed out");
 }
+
+/// A caller-initiated abort must still settle every file the walker enumerated but
+/// never spawned.
+///
+/// This is the path upload had no sweep on. `upload_objects` has four
+/// `record_abandoned_entries` sites, and a *child* failure under `Abort` reaches the one
+/// inside the transfer's own `abort()` — so a child-failure test passes either way and
+/// proves nothing. A caller calling `handle.abort()` instead goes
+/// `ctx.set_cancelled()` -> `scheduler.cancel_transfer()` -> `on_terminal`, which called
+/// `finish_root` alone: no further `poll_work` re-enters `check_terminal`, the transfer's
+/// `abort()` never runs, and every enumerated-but-unspawned file vanished from the stream.
+/// Download has swept here for a while; this is upload's mirror.
+///
+/// Determinism: `count` is far below `WALK_LOW_WATER`
+/// (`MAX_PARALLEL_WALKS * WALK_BATCH_SIZE` = 1024), so the flat walk buffers all `count`
+/// entries into `pending_entries` almost immediately, while `max_concurrent_uploads(1)`
+/// plus a permanently-503 head key keeps spawn parked on one file through its retries.
+/// `Continue` is deliberate: under `Abort` the child failure would reach the transfer's own
+/// `abort()` and sweep there, hiding the defect this test exists for.
+#[tokio::test]
+async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
+    timeout(TEST_TIMEOUT, async {
+        let m = setup().await;
+
+        let count = 60usize;
+        let size = 1024usize;
+        let dataset = make_flat_dataset(count, size);
+        let bucket = "test-bucket";
+        let key_prefix = "abandon/";
+
+        // Park spawn on the head key for the duration of its retries, so the walk gets
+        // ahead of spawn and the caller's abort lands with entries still buffered.
+        m.server.insert_fault(
+            bucket,
+            &format!("{key_prefix}0000.bin"),
+            s3_mock_server::FaultType::ServiceError { status: 503 },
+            0,
+            s3_mock_server::Occurrence::Always,
+        );
+
+        // 2 per object plus the root's pair; the sweep announces-and-finishes every
+        // abandoned file, so the stream must have room for all of them to lose nothing.
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix(key_prefix)
+            .failure_policy(aws_sdk_s3_transfer_manager::types::FailedTransferPolicy::Continue)
+            .max_concurrent_uploads(1)
+            .events(sink)
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            (evs, stream.dropped())
+        });
+
+        // Let the walk buffer every entry while spawn is parked on the faulted head.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.abort().await;
+
+        let (events, dropped) = collector.await.expect("collector");
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+
+        use aws_sdk_s3_transfer_manager::events::{Endpoint, TransferEvent};
+        use std::collections::{HashMap, HashSet};
+
+        let mut decided: HashMap<u64, bool> = HashMap::new();
+        let mut settled: HashMap<u64, usize> = HashMap::new();
+        let mut child_keys: HashSet<String> = HashSet::new();
+
+        for ev in &events {
+            let key = match ev.transfer().destination() {
+                Endpoint::S3 { key, .. } => key.to_string(),
+                other => panic!("an upload writes to S3, got {other:?}"),
+            };
+            match ev {
+                TransferEvent::Decided { id, parent, .. } => {
+                    assert!(
+                        decided.insert(*id, parent.is_some()).is_none(),
+                        "id {id} announced twice"
+                    );
+                    if parent.is_some() {
+                        child_keys.insert(key);
+                    }
+                }
+                TransferEvent::Settled { id, .. } => {
+                    *settled.entry(*id).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Pairing: the sweep announces and finishes an abandoned entry in one step, so a
+        // swept file contributes exactly one of each.
+        for id in decided.keys() {
+            assert_eq!(
+                Some(&1),
+                settled.get(id),
+                "announced id {id} must settle exactly once, got {:?}",
+                settled.get(id)
+            );
+        }
+        // Completeness: this is the sweep's guard. Without it only the spawned head key
+        // reaches the stream.
+        assert_eq!(
+            count,
+            child_keys.len(),
+            "every enumerated file must reach the stream: the sweep in on_terminal is what \
+             covers the ones a caller's abort cancelled before they spawned"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_upload_objects_events_caller_abort_settles_abandoned_entries timed out");
+}

@@ -24,6 +24,7 @@ use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 pub struct DownloadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: DownloadObjectsInputBuilder,
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl DownloadObjectsFluentBuilder {
@@ -31,7 +32,14 @@ impl DownloadObjectsFluentBuilder {
         Self {
             handle,
             inner: std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// observe lifecycle events for this request and its children.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        self.events = Some(sink);
+        self
     }
 
     /// Initiate download of multiple objects.
@@ -42,7 +50,11 @@ impl DownloadObjectsFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<DownloadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download_objects::DownloadObjects::orchestrate(self.handle, input)
+        crate::operation::download_objects::DownloadObjects::orchestrate(
+            self.handle,
+            input,
+            self.events,
+        )
     }
 
     /// The S3 bucket name containing the object(s) to download. Required.

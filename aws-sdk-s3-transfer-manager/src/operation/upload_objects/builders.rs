@@ -23,6 +23,9 @@ use super::{UploadObjectsHandle, UploadObjectsInputBuilder};
 pub struct UploadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: UploadObjectsInputBuilder,
+    /// Held beside the generated input, not inside it, so a
+    /// retryable `FailedUpload::input()` does not retain a sink.
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl UploadObjectsFluentBuilder {
@@ -30,7 +33,14 @@ impl UploadObjectsFluentBuilder {
         Self {
             handle,
             inner: std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// observe lifecycle events for this request and its children.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        self.events = Some(sink);
+        self
     }
 
     /// Initiate upload of multiple objects.
@@ -41,7 +51,11 @@ impl UploadObjectsFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<UploadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input)
+        crate::operation::upload_objects::UploadObjects::orchestrate(
+            self.handle,
+            input,
+            self.events,
+        )
     }
 
     /// The S3 bucket name that objects will upload to. Required.
