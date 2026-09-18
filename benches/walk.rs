@@ -7,8 +7,8 @@
 // `WithinDirectory` is breadth-first; `WholeWalk` is depth-first in key order,
 // which must descend a subtree before emitting a sibling that sorts after it.
 //
-// Caches are warm — criterion re-walks the same fixture and there is no portable
-// way to drop page cache — so these are upper bounds.
+// Caches are warm — criterion re-walks the same fixture and there is no portable way to drop page
+// cache — so every duration here is a floor, and what the device would add is unmeasured.
 
 use aws_sdk_s3_transfer_manager::io::walk::{FsWalkContext, FsWalker, SortOrder};
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
@@ -55,8 +55,10 @@ fn build_balanced(root: &Path, fanout: usize, depth: usize, files_per_dir: usize
     count
 }
 
-// Subdirectories all sort before the root's files: worst case for key order,
-// where every subtree must be read before the first entry can be emitted.
+// Subdirectories all sort before the root's files, so a whole-walk order has to descend before it
+// can emit anything: it reads the root, then the first subdirectory, and stops there. That is one
+// extra directory read, not every subtree — `build_deep` is the shape where a whole-walk order pays
+// for a chain of them, and nothing here measures that.
 fn build_front_loaded(root: &Path, subdirs: usize, files_per_dir: usize) -> usize {
     let mut count = 0;
     for i in 0..subdirs {
@@ -157,7 +159,9 @@ fn walk_cycle_detection_cost(c: &mut Criterion) {
     group.finish();
 }
 
-fn drain(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> usize {
+// `expected` is the fixture's own count. Checking it here is what stops a walk that yielded nothing
+// from being timed and reported as throughput: the figure would look excellent and mean nothing.
+fn drain(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder, expected: usize) -> usize {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
         let mut walk = walker(order).walk(ctx);
@@ -167,21 +171,35 @@ fn drain(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> usize {
                 n += 1;
             }
         }
+        assert_eq!(
+            n, expected,
+            "walk yielded {n} entries, fixture holds {expected}"
+        );
         n
     })
 }
 
+// Panics rather than returning a whole-walk duration when no entry ever arrives. Timing an empty
+// walk and calling it first-entry latency would manufacture the rising curve the scaling benchmark
+// exists to rule out.
 fn time_to_first_entry(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> Duration {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
         let mut walk = walker(order).walk(ctx);
         let start = Instant::now();
+        let mut arrived = false;
         while let Some(result) = walk.next().await {
             if result.is_ok() {
+                arrived = true;
                 break;
             }
         }
-        start.elapsed()
+        let elapsed = start.elapsed();
+        assert!(
+            arrived,
+            "no entry arrived, so there is no first-entry time to report"
+        );
+        elapsed
     })
 }
 
@@ -213,7 +231,7 @@ fn walk_throughput(c: &mut Criterion) {
             ("whole_walk", SortOrder::WholeWalk),
         ] {
             group.bench_with_input(BenchmarkId::new(*label, mode), &order, |b, &order| {
-                b.iter(|| black_box(drain(&rt, dir.path(), order)));
+                b.iter(|| black_box(drain(&rt, dir.path(), order, *count)));
             });
         }
     }
