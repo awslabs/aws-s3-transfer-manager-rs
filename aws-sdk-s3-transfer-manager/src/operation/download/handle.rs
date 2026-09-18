@@ -367,6 +367,11 @@ impl ManagedDownloadHandle {
         self.inner.transfer.id()
     }
 
+    /// A read-only view of this download's counters, for a parent to hand to observers.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        self.inner.transfer.ctx().view()
+    }
+
     /// Object metadata.
     ///
     /// Waits for discovery to complete if metadata is not yet available.

@@ -198,6 +198,11 @@ impl UploadHandle {
         self.transfer.ctx().id
     }
 
+    /// A read-only view of this upload's counters, for a parent to hand to observers.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        self.transfer.ctx().view()
+    }
+
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()

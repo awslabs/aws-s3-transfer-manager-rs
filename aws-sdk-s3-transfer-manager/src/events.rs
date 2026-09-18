@@ -17,11 +17,16 @@
 //! depend on the caller having seen an earlier one: [`TransferRef`] and
 //! [`Decision`] appear on both variants, and a consumer needs no side map.
 //!
-//! **Byte progress is not here.** It is read off the operation handle. The thread
-//! that records bytes holds a scheduler dispatch ticket and one of the fixed
-//! per-core threads, so running caller code there stalls every transfer in the
-//! client; and a total summed from a lossy stream would disagree with the
-//! operation's own result.
+//! **Lifecycle is pushed; bytes are pulled.** No event carries a byte count. Each
+//! [`TransferEvent::Decided`] instead hands over a
+//! [`TransferView`](crate::types::TransferView) — a read-only handle you keep and read
+//! whenever you want to repaint. Nothing pushes a number at you.
+//!
+//! Both halves of that split are forced. Pushing byte counts would mean running caller
+//! code on the thread that records them, which holds a scheduler dispatch ticket and one
+//! of the fixed per-core threads, so it would stall every transfer in the client. And a
+//! total *summed from* a lossy stream would disagree with the operation's own result,
+//! whereas a counter read off a view is the same number the operation reports.
 //!
 //! **Two invariants carry the transport.**
 //!
@@ -75,6 +80,49 @@
 //!     })
 //! }
 //! let _ = line;
+//! ```
+//!
+//! And the other half — a whole-transfer bar, pulled rather than pushed. The root is the
+//! one entry with no parent, so one subscription feeds both the per-entry lines above and
+//! the bar below:
+//!
+//! ```
+//! use aws_sdk_s3_transfer_manager::events::{TransferEvent, TransferEventStream, TryNextError};
+//! use aws_sdk_s3_transfer_manager::types::{ByteTotal, TransferView};
+//!
+//! /// Drain whatever has arrived, then draw. Called on the caller's own clock — every
+//! /// 100 ms, on a keypress, whenever suits — not once per event.
+//! fn repaint(stream: &mut TransferEventStream, root: &mut Option<TransferView>) -> Option<String> {
+//!     loop {
+//!         match stream.try_next() {
+//!             // `Decided` for the root carries the view the bar is drawn from.
+//!             Ok(TransferEvent::Decided { parent: None, view, .. }) => *root = view,
+//!             Ok(_) => continue,
+//!             // Nothing new. The view is still live, so draw from what is already held.
+//!             Err(TryNextError::Empty) => break,
+//!             // Every sink is gone: this is the last frame.
+//!             Err(TryNextError::Disconnected) => break,
+//!             // `TryNextError` is `#[non_exhaustive]`, so external code needs this arm.
+//!             // Stopping the drain is the safe default for an unfamiliar reason: it
+//!             // still repaints from the view it holds, and it cannot spin.
+//!             Err(_) => break,
+//!         }
+//!     }
+//!
+//!     let view = root.as_ref()?;
+//!     let done = view.metrics().network_rx;
+//!     Some(match view.byte_total() {
+//!         // A percentage is defined only against a final total.
+//!         ByteTotal::Final(total) if total > 0 => {
+//!             format!("{:.1}%", (done as f64 / total as f64) * 100.0)
+//!         }
+//!         // Still enumerating: the denominator can grow, so a bar drawn on it would
+//!         // walk backwards. Show bytes instead.
+//!         ByteTotal::Provisional(total) => format!("{done} of {total}+ bytes"),
+//!         _ => format!("{done} bytes"),
+//!     })
+//! }
+//! let _ = repaint;
 //! ```
 
 use std::fmt;
@@ -393,6 +441,12 @@ pub enum TransferEvent {
         transfer: TransferRef,
         /// What was decided, and why.
         decision: Decision,
+        /// Read-only view of this entry's byte counters, for as long as you keep it.
+        ///
+        /// `None` when the entry never became a transfer — a skip, or an entry the
+        /// operation abandoned before it could be started — so there are no counters
+        /// to read. Distinct from a live transfer sitting at zero bytes.
+        view: Option<crate::types::TransferView>,
     },
     /// An attempted action reached a terminal state. At most one per
     /// [`TransferEvent::Decided`], and none at all for a decision that attempts
@@ -588,6 +642,12 @@ pub(crate) struct TransferLifecycle {
     /// every entry it decides is an unconditional transfer, and the field is not a
     /// constructor parameter until a producer exists that can vary it.
     decision: Decision,
+    /// The view `announce` hands out, or `None` for an entry with no transfer behind it.
+    ///
+    /// Held rather than passed to `announce`, because the obligation and the thing it
+    /// announces are fixed together at construction: a site that can build a lifecycle
+    /// already knows whether a transfer exists.
+    view: Option<crate::types::TransferView>,
     /// Set by `announce`, cleared by whichever site claims the terminal emit.
     ///
     /// Shared with the [`PendingEmit`] the claim produces, so an emit dropped
@@ -620,6 +680,7 @@ impl TransferLifecycle {
         id: u64,
         parent: Option<u64>,
         transfer: TransferRef,
+        view: Option<crate::types::TransferView>,
     ) -> Self {
         Self {
             sink,
@@ -629,6 +690,7 @@ impl TransferLifecycle {
             decision: Decision::Transfer {
                 reason: TransferReason::Forced {},
             },
+            view,
             owes_finish: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -645,6 +707,7 @@ impl TransferLifecycle {
             parent: self.parent,
             transfer: self.transfer.clone(),
             decision: self.decision.clone(),
+            view: self.view.clone(),
         });
     }
 
@@ -747,7 +810,10 @@ mod tests {
 
     fn lifecycle() -> (TransferLifecycle, TransferEventStream) {
         let (sink, stream) = channel(NonZeroUsize::new(8).unwrap());
-        (TransferLifecycle::new(sink, 1, None, upload_ref()), stream)
+        (
+            TransferLifecycle::new(sink, 1, None, upload_ref(), None),
+            stream,
+        )
     }
 
     fn boom() -> Error {
@@ -863,6 +929,7 @@ mod tests {
             parent: Some(0),
             transfer: upload_ref(),
             decision: forced(),
+            view: None,
         };
         assert_eq!(
             line(&decided, true).as_deref(),
@@ -1064,7 +1131,7 @@ mod tests {
         // reserved, so the loss is at the end rather than the beginning -- and it is
         // counted, which is the whole of what bounded delivery promises.
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
-        let lc = TransferLifecycle::new(sink, 7, None, upload_ref());
+        let lc = TransferLifecycle::new(sink, 7, None, upload_ref(), None);
         lc.announce();
         lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
@@ -1102,6 +1169,7 @@ mod tests {
             decision: Decision::Transfer {
                 reason: TransferReason::Forced {},
             },
+            view: None,
         };
 
         assert!(sink.emit(ev()), "the first event fits");

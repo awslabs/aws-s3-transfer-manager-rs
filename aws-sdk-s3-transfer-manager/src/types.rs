@@ -300,6 +300,22 @@ impl TransferStatus {
 }
 
 /// Snapshot of transfer progress and IO metrics.
+///
+/// The four byte counters are four views of the *same* payload, not four addends. A
+/// file-backed upload of an 8 MiB object records 8 MiB as `disk_read` and 8 MiB again as
+/// `network_tx`, so summing them reports 200% against [`total_bytes`](Self::total_bytes).
+///
+/// To draw a bar, take the one counter that matches the direction:
+///
+/// | Direction | Numerator | Why not the other |
+/// |---|---|---|
+/// | Upload | `network_tx` | `disk_read` runs ahead of it — bytes are read into memory before they are sent, so a bar on `disk_read` reaches 100% while the last parts are still in flight |
+/// | Download | `network_rx` | `disk_write` lags it, and is 0 for a download whose body the caller reads itself instead of writing to a path |
+///
+/// A directory operation aggregates its children into the same four counters, so the same
+/// rule picks its numerator. `total_bytes` is the denominator for both; prefer
+/// [`TransferView::byte_total`] where you need to distinguish a total that is still
+/// growing from one that is final.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -317,6 +333,74 @@ pub struct TransferMetrics {
     pub started_at: std::time::Instant,
     /// When the transfer reached a terminal state, if it has.
     pub finished_at: Option<std::time::Instant>,
+}
+
+/// Detached, read-only view of one transfer's live byte counters.
+///
+/// Handed out on [`TransferEvent::Decided`](crate::events::TransferEvent::Decided). Owns
+/// nothing the caller can act with and borrows nothing, so it outlives the `join(self)`
+/// that consumes the operation handle. Read it whenever you repaint; nothing pushes.
+///
+/// Drop it once that entry's
+/// [`TransferEvent::Settled`](crate::events::TransferEvent::Settled) arrives — it keeps
+/// one small allocation alive until then, so retaining every view of a million-object
+/// directory transfer retains a million of them.
+#[derive(Debug, Clone)]
+pub struct TransferView {
+    metrics: std::sync::Arc<crate::transfer::MetricsState>,
+}
+
+impl TransferView {
+    pub(crate) fn new(metrics: std::sync::Arc<crate::transfer::MetricsState>) -> Self {
+        Self { metrics }
+    }
+
+    /// Point-in-time reading of this transfer's counters.
+    ///
+    /// Every counter is an **absolute cumulative total for this transfer, never a
+    /// delta**: a rate is the caller's own difference between two readings. Each is
+    /// monotonically non-decreasing, so a later reading never returns less than an
+    /// earlier one.
+    ///
+    /// Which counter is the numerator depends on the direction — see
+    /// [`TransferMetrics`]. Summing all four double-counts: a file-backed upload records
+    /// the same payload as both `network_tx` and `disk_read`.
+    ///
+    /// [`TransferMetrics::finished_at`] is set on the transfer's terminal transition,
+    /// which happens while in-flight work may still be draining, so a counter can still
+    /// grow after it is `Some`. For exact final numbers use the operation's own `join()`
+    /// result.
+    pub fn metrics(&self) -> TransferMetrics {
+        self.metrics.snapshot()
+    }
+
+    /// This transfer's byte denominator. See [`ByteTotal`].
+    ///
+    /// For a single-object transfer this is `Final` as soon as the length is known, and
+    /// `Unknown` for an unknown-length streaming upload. For a directory operation it
+    /// climbs through `Provisional` while enumeration runs and becomes `Final` only if
+    /// enumeration completed — a run cancelled mid-listing never seals, because nobody
+    /// knows the total.
+    pub fn byte_total(&self) -> ByteTotal {
+        self.metrics.byte_total()
+    }
+}
+
+/// A transfer's expected total payload bytes, and how much to trust it.
+///
+/// A percentage is defined only for [`ByteTotal::Final`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ByteTotal {
+    /// No total is known, and none may ever be: an unknown-length streaming upload, or a
+    /// directory operation cancelled before enumeration finished. Render bytes, not a bar.
+    Unknown,
+    /// A lower bound. Enumeration is still running, so this will only grow. Do not treat
+    /// it as final even when a later reading repeats it — only [`ByteTotal::Final`] says
+    /// enumeration is over.
+    Provisional(u64),
+    /// Enumeration finished and this will not change again.
+    Final(u64),
 }
 
 /// Type of the bucket for the transfer

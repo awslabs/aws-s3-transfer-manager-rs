@@ -374,10 +374,6 @@ struct State {
     reaping_in_flight: usize,
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
-    /// Sum of the sizes of every entry accepted into `pending_entries`. Grows only, and
-    /// only while `!total_sealed`. Published once into the transfer's `MetricsState` at
-    /// the seal, which is the only point a value here becomes externally visible.
-    discovered_bytes: u64,
     /// Every walker reported itself exhausted, and none was abandoned.
     ///
     /// Positive on purpose: set at exactly one site, where a walker exhausts and no other
@@ -392,7 +388,7 @@ struct State {
     /// transfer terminal first, and an inactive transfer drops its walkers at the top of
     /// `execute_advance_walker_inner` without ever reaching the exhaustion site.
     listing_complete: bool,
-    /// Enumeration is finished, so `discovered_bytes` will not change again.
+    /// Enumeration is finished, so the metrics' running enumerated total will not change again.
     ///
     /// Read and written only under this same `State` lock, never as a separate atomic:
     /// a "has X happened yet?" flag checked in one critical section and acted on in
@@ -478,7 +474,6 @@ impl UploadObjectsTransfer {
                 next_walk_id: 1,
                 in_flight_walks: 0,
                 listing_complete: false,
-                discovered_bytes: 0,
                 total_sealed: false,
                 pending_entries: VecDeque::new(),
                 children: HashMap::new(),
@@ -545,6 +540,7 @@ impl UploadObjectsTransfer {
                     child_id.id,
                     Some(self.inner.ctx.id.id),
                     child_ref,
+                    Some(handle.view()),
                 ));
                 lc.announce();
                 self.inner.child_lifecycles.lock().insert(child_id, lc);
@@ -559,6 +555,8 @@ impl UploadObjectsTransfer {
                     crate::transfer::next_transfer_id().id,
                     Some(self.inner.ctx.id.id),
                     child_ref,
+                    // No transfer was ever created, so there are no counters to view.
+                    None,
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
@@ -722,6 +720,8 @@ impl UploadObjectsTransfer {
                     crate::transfer::next_transfer_id().id,
                     Some(self.inner.ctx.id.id),
                     self.child_ref(entry.path(), key),
+                    // Abandoned before it was claimed, so it never had a transfer.
+                    None,
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
@@ -1177,10 +1177,7 @@ impl UploadObjectsTransfer {
     fn maybe_seal_total(&self, state: &mut State) {
         if !state.total_sealed && state.listing_complete {
             state.total_sealed = true;
-            self.inner
-                .ctx
-                .metrics
-                .set_total_bytes(state.discovered_bytes);
+            self.inner.ctx.metrics.seal_total();
         }
     }
 
@@ -1426,7 +1423,10 @@ impl UploadObjectsTransfer {
         // later still belongs in it, and a bar that omitted those could never reach the
         // numerator once they were swept.
         if !state.total_sealed {
-            state.discovered_bytes += entries.iter().map(|e| e.metadata().len()).sum::<u64>();
+            self.inner
+                .ctx
+                .metrics
+                .add_discovered(entries.iter().map(|e| e.metadata().len()).sum::<u64>());
         }
         state.pending_entries.extend(entries);
         if !self.inner.ctx.is_active() {

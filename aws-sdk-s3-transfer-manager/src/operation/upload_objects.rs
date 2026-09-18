@@ -68,6 +68,7 @@ impl UploadObjects {
                         key: Arc::from(input.key_prefix().unwrap_or_default()),
                     },
                 ),
+                Some(ctx.view()),
             ))
         });
 

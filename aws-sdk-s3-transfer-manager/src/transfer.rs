@@ -418,6 +418,14 @@ pub(crate) struct MetricsState {
     network_rx: AtomicU64,
     disk_read: AtomicU64,
     disk_write: AtomicU64,
+    /// Running sum of the payload sizes of the entries enumerated so far, for a
+    /// composite; always 0 for a leaf, which learns its total in one piece.
+    ///
+    /// Written only by the owning composite and only while it holds its own `State`
+    /// lock, so that lock — not this atomic — is what orders an accumulation against
+    /// the seal that reads it. The atomic exists to publish the value to a reader on
+    /// another thread, which is `byte_total` and nothing else.
+    discovered_bytes: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
@@ -439,6 +447,7 @@ impl MetricsState {
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
+            discovered_bytes: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
@@ -471,6 +480,41 @@ impl MetricsState {
     /// Set the expected total payload bytes. No-op if already set.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         let _ = self.total_bytes.set(n);
+    }
+
+    /// Add the payload bytes of newly enumerated entries to the running total.
+    ///
+    /// Caller is the owning composite, holding its own `State` lock.
+    pub(crate) fn add_discovered(&self, n: u64) {
+        self.discovered_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Promote the running enumerated total to the final one. No-op if already set.
+    ///
+    /// Reads `discovered_bytes` rather than taking a value, so the number sealed is by
+    /// construction the number a concurrent `byte_total` was already reporting as
+    /// provisional, and the two cannot name different totals for the same walk.
+    pub(crate) fn seal_total(&self) {
+        let _ = self
+            .total_bytes
+            .set(self.discovered_bytes.load(Ordering::Relaxed));
+    }
+
+    /// This transfer's byte denominator and how far to trust it.
+    ///
+    /// `total_bytes` is read first and short-circuits, so the three states come from one
+    /// `MetricsState` and cannot contradict each other. A seal landing between the two
+    /// loads can only make this reading conservative — a `Provisional` equal to the value
+    /// that just became final — never an overstatement.
+    pub(crate) fn byte_total(&self) -> crate::types::ByteTotal {
+        use crate::types::ByteTotal;
+        if let Some(n) = self.total_bytes.get().copied() {
+            return ByteTotal::Final(n);
+        }
+        match self.discovered_bytes.load(Ordering::Relaxed) {
+            0 => ByteTotal::Unknown,
+            n => ByteTotal::Provisional(n),
+        }
     }
 
     /// Mark the transfer as finished. No-op if already set.
@@ -882,6 +926,15 @@ impl TransferContext {
         self.metrics.snapshot()
     }
 
+    /// A detached, read-only view of this transfer's counters.
+    ///
+    /// Clones the metrics `Arc` only. Nothing else from the context comes along — in
+    /// particular not `handle`, whose `Drop` shuts the runtime down, so a view parked in
+    /// a slow consumer's queue cannot defer that shutdown.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        crate::types::TransferView::new(self.metrics.clone())
+    }
+
     /// Get scheduling controls for this transfer.
     pub(crate) fn scheduling(&self) -> SchedulingCtl<'_> {
         SchedulingCtl { ctx: self }
@@ -1239,6 +1292,96 @@ mod tests {
             assert_eq!(ctx.metrics().total_bytes, None);
             ctx.set_total_bytes(42);
             assert_eq!(ctx.metrics().total_bytes, Some(42));
+        }
+
+        /// The three states of a denominator, in the order a directory operation walks
+        /// them. `Unknown` and `Provisional(0)` are deliberately the same state: a walk
+        /// that has listed only empty objects knows no more about the total than one that
+        /// has listed nothing, and a bar drawn against 0 divides by zero either way.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn byte_total_walks_unknown_then_provisional_then_final() {
+            let m = MetricsState::with_parent(None);
+            assert_eq!(crate::types::ByteTotal::Unknown, m.byte_total());
+
+            m.add_discovered(100);
+            assert_eq!(
+                crate::types::ByteTotal::Provisional(100),
+                m.byte_total(),
+                "enumeration is still running, so the total is a lower bound"
+            );
+
+            m.add_discovered(50);
+            assert_eq!(crate::types::ByteTotal::Provisional(150), m.byte_total());
+
+            m.seal_total();
+            assert_eq!(
+                crate::types::ByteTotal::Final(150),
+                m.byte_total(),
+                "the seal promotes whatever was accumulated, unchanged"
+            );
+        }
+
+        /// A leaf that learns its length in one piece reports `Final` without ever being
+        /// `Provisional`, and a second seal cannot move it.
+        ///
+        /// The no-op-on-reseal half is what stops a late walker batch from rewriting a
+        /// published denominator: `total_bytes` is a `OnceLock`, so the first value wins
+        /// and a consumer's bar cannot be made to jump after it reached 100%.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn byte_total_is_final_once_and_does_not_move() {
+            let m = MetricsState::with_parent(None);
+            m.set_total_bytes(64);
+            assert_eq!(crate::types::ByteTotal::Final(64), m.byte_total());
+
+            m.add_discovered(1_000);
+            m.seal_total();
+            assert_eq!(
+                crate::types::ByteTotal::Final(64),
+                m.byte_total(),
+                "a total already published must not be rewritten"
+            );
+        }
+
+        /// A parent's denominator is its own. `add_discovered` counts what the composite
+        /// enumerated; a child's contribution arrives as bytes through `record_io`, not as
+        /// a second denominator, or the parent would count every object twice.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn discovered_bytes_do_not_roll_up() {
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.add_discovered(7);
+
+            assert_eq!(crate::types::ByteTotal::Provisional(7), child.byte_total());
+            assert_eq!(crate::types::ByteTotal::Unknown, parent.byte_total());
+        }
+
+        /// A view outlives the context it came from, and still reads the live counters.
+        ///
+        /// This is the property the public API rests on: `join(self)` consumes the
+        /// operation handle, so a view that borrowed anything would be unusable exactly
+        /// when a caller wants to read the final numbers.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_view_outlives_its_context_and_still_reads() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            let view = ctx.view();
+
+            ctx.record_io(&crate::metrics::IoSample {
+                network_tx: 11,
+                network_rx: 0,
+                disk_read: 0,
+                disk_write: 0,
+            });
+            ctx.set_total_bytes(11);
+            drop(ctx);
+
+            assert_eq!(11, view.metrics().network_tx);
+            assert_eq!(crate::types::ByteTotal::Final(11), view.byte_total());
         }
     }
 }

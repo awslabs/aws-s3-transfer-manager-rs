@@ -99,6 +99,7 @@ impl DownloadObjects {
                         path: Arc::from(input.destination().expect("destination validated above")),
                     },
                 ),
+                Some(ctx.view()),
             ))
         });
 

@@ -122,6 +122,7 @@ impl Upload {
                         key: Arc::from(input.key().unwrap_or_default()),
                     },
                 ),
+                Some(ctx.view()),
             ))
         });
 

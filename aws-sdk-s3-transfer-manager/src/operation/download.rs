@@ -83,6 +83,7 @@ impl Download {
                     },
                     reg.destination,
                 ),
+                Some(ctx.view()),
             ))
         })
     }

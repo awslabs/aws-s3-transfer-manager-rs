@@ -219,10 +219,6 @@ struct State {
 
     /// Whether a walker work item is currently in flight.
     walk_in_flight: bool,
-    /// Sum of the sizes of every object accepted into `pending_entries`. Grows only, and
-    /// only while `!total_sealed`. Published once into the transfer's `MetricsState` at
-    /// the seal, which is the only point a value here becomes externally visible.
-    discovered_bytes: u64,
     /// The walker reported itself exhausted. Positive on purpose: it is set at exactly
     /// one site, the clean end of enumeration, so every path that abandons a walk — a
     /// fatal listing error, a destination that is not a directory, a cancel — leaves it
@@ -233,7 +229,7 @@ struct State {
     /// the duration of an advance, so `None` means "out for execution", "exhausted", or
     /// "dropped after a failure" indistinguishably.
     listing_complete: bool,
-    /// Listing is finished, so `discovered_bytes` will not change again.
+    /// Listing is finished, so the metrics' running enumerated total will not change again.
     ///
     /// Read and written only under this same `State` lock, never as a separate atomic:
     /// a "has X happened yet?" flag checked in one critical section and acted on in
@@ -316,7 +312,6 @@ impl DownloadObjectsTransfer {
                     validated: false,
                     walk_in_flight: false,
                     listing_complete: false,
-                    discovered_bytes: 0,
                     total_sealed: false,
                     pending_entries: std::collections::VecDeque::new(),
                     children: HashMap::new(),
@@ -391,6 +386,7 @@ impl DownloadObjectsTransfer {
                     child_ref(crate::events::Endpoint::Local {
                         path: Arc::from(dest_path.as_path()),
                     }),
+                    Some(handle.view()),
                 ));
                 lc.announce();
                 self.inner.child_lifecycles.lock().insert(child_id, lc);
@@ -409,6 +405,8 @@ impl DownloadObjectsTransfer {
                     crate::transfer::next_transfer_id().id,
                     Some(self.inner.ctx.id.id),
                     child_ref(crate::events::Endpoint::Unresolved {}),
+                    // No transfer was ever created, so there are no counters to view.
+                    None,
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
@@ -462,6 +460,8 @@ impl DownloadObjectsTransfer {
                 crate::transfer::next_transfer_id().id,
                 Some(self.inner.ctx.id.id),
                 transfer,
+                // Abandoned before it was started, so it never had a transfer.
+                None,
             );
             lc.announce();
             if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
@@ -900,10 +900,12 @@ impl DownloadObjectsTransfer {
         if state.total_sealed {
             return;
         }
-        state.discovered_bytes += batch
-            .iter()
-            .map(|o| o.size().unwrap_or(0).max(0) as u64)
-            .sum::<u64>();
+        self.inner.ctx.metrics.add_discovered(
+            batch
+                .iter()
+                .map(|o| o.size().unwrap_or(0).max(0) as u64)
+                .sum::<u64>(),
+        );
     }
 
     /// Seal the enumerated-byte total once listing is quiescent.
@@ -920,10 +922,7 @@ impl DownloadObjectsTransfer {
     fn maybe_seal_total(&self, state: &mut State) {
         if !state.total_sealed && state.listing_complete && !state.walk_in_flight {
             state.total_sealed = true;
-            self.inner
-                .ctx
-                .metrics
-                .set_total_bytes(state.discovered_bytes);
+            self.inner.ctx.metrics.seal_total();
         }
     }
 
