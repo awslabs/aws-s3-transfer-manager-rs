@@ -355,8 +355,6 @@ mod tests {
         assert!(f.allows("ab"));
     }
 
-    // S3 keys are case-sensitive, and a case-folding local side would decide
-    // differently from the remote one for the same rule.
     // The same rules must give the same answers whatever order the keys arrive in, so
     // nothing may accumulate between calls.
     #[test]
@@ -391,6 +389,9 @@ mod tests {
         }
     }
 
+    // S3 keys are case-sensitive, and a case-folding local side would decide differently from the
+    // remote one for the same rule. `aws s3 sync` folds case on Windows through `os.path.normcase`;
+    // this deliberately does not.
     #[test]
     fn matching_is_case_sensitive() {
         let f = filter(vec![Rule::exclude("logs/*")]);

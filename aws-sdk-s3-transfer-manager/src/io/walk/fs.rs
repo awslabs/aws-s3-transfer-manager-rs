@@ -144,8 +144,6 @@ fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
 pub enum FileType {
     /// A regular file.
     Regular,
-    /// A directory.
-    Directory,
     /// A symlink this walk did not follow, so nothing here describes its target.
     Symlink,
     /// A named pipe.
@@ -253,8 +251,6 @@ pub enum SortOrder {
     WholeWalk,
 }
 
-/// Configuration for walking a local filesystem directory.
-///
 /// Configuration for walking a local directory tree.
 ///
 /// Describes what to look for and how (depth, symlink policy, sorting,
@@ -265,11 +261,15 @@ pub enum SortOrder {
 ///
 /// # Traversal model
 ///
-/// The walker reads one directory at a time. Subdirectories discovered during
-/// a read are queued for subsequent reads. Only regular files produce yielded
-/// [`FsEntry`] values; directories, symlinks, and special files (sockets,
-/// fifos, block/char devices) are traversed or skipped according to
-/// configuration but are never themselves yielded as entries.
+/// The walker reads one directory at a time, and which order it emits in decides how the rest is
+/// held: [`SortOrder::Native`] and [`SortOrder::WithinDirectory`] queue subdirectories for later
+/// reads, while [`SortOrder::WholeWalk`] keeps the directories of the current descent path open so
+/// a subtree can be emitted where it sorts.
+///
+/// Regular files always produce an [`FsEntry`]. A socket, FIFO, device or symlink left unfollowed
+/// produces one too when the walker is asked for them, so a consumer can see that the name is
+/// taken. Directories are traversed and never yielded, so a consumer sees the files under one and
+/// never the one itself.
 ///
 /// # Symlink cycle handling
 ///
@@ -3104,6 +3104,36 @@ mod tests {
         assert_eq!(
             parallel_set, serial_set,
             "concurrent walks must yield the same entries as serial walk"
+        );
+    }
+
+    // The oracle the other ordering tests compare against goes through `to_string_lossy`, so it
+    // cannot express a name that is not valid UTF-8 — both such names become the same string. The
+    // comparator works on bytes, which is what keeps two names differing only in their invalid bytes
+    // apart, so it is compared here against the byte order directly.
+    #[cfg(unix)]
+    #[test]
+    fn the_comparator_orders_names_that_are_not_valid_utf8_by_byte() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let child = |bytes: &[u8]| {
+            Child::Dir(PendingDir {
+                path: PathBuf::from(std::ffi::OsStr::from_bytes(bytes)),
+                depth: 1,
+                ancestor_handles: Vec::new(),
+            })
+        };
+
+        // 0xFE and 0xFF cannot begin a valid UTF-8 sequence, and `to_string_lossy` maps both to the
+        // replacement character, so a lossy comparison reads them as equal.
+        let lower = child(b"a-\xfe.txt");
+        let upper = child(b"a-\xff.txt");
+        assert_eq!(cmp_key_form(&lower, &upper), Ordering::Less);
+        assert_eq!(cmp_key_form(&upper, &lower), Ordering::Greater);
+        assert_eq!(
+            lower.path().to_string_lossy(),
+            upper.path().to_string_lossy(),
+            "the oracle cannot tell these apart, which is why this test exists"
         );
     }
 

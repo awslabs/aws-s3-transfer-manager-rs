@@ -6,7 +6,6 @@
 use std::path::{Path, PathBuf};
 
 /// Classifies a [`WalkError`].
-///
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
