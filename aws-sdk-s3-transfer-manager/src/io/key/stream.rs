@@ -242,6 +242,8 @@ fn key_for_relative_path(relative: &std::path::Path) -> Option<Cow<'_, str>> {
 //
 // The destination side is built here too, in one place, because the deferred
 // `--delete-excluded` behavior inverts exactly this decision.
+
+// Whether a local walk should yield a file, answered from the key that file would take.
 pub(crate) fn local_predicate(
     filter: Arc<KeyFilter>,
 ) -> impl Fn(&std::path::Path) -> bool + Send + Sync + 'static {
@@ -253,6 +255,11 @@ pub(crate) fn local_predicate(
     }
 }
 
+// Whether a listing should yield an object, answered from its key taken relative to the root.
+//
+// Under the root `data/`, a key like `datab/x` starts with the same letters without sitting inside
+// the root, so it has no relative key and the rules never see it. Sending the delimiter to
+// `ListObjectsV2` keeps such keys out of the listing; this is the guard behind that.
 pub(crate) fn s3_predicate(
     filter: Arc<KeyFilter>,
     prefix: Option<String>,

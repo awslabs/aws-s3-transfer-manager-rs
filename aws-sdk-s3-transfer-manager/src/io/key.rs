@@ -63,6 +63,11 @@ pub(crate) fn derive_object_key<'a>(
     Ok(object_key)
 }
 
+// The part of `key` below `prefix`, for building a local path under a download's destination.
+//
+// A download of `s3://bucket/data` writes `data/a.txt` to `a.txt`, so the prefix here names a span
+// of keys. A sync needs `relative_key`, which treats it as a place: with the prefix `data` this
+// turns `data/z` into `z` and leaves `datab/x` alone, and `z` sorts after `datab/x`.
 pub(crate) fn strip_key_prefix<'a>(
     key: &'a str,
     prefix: Option<&str>,
@@ -84,6 +89,16 @@ pub(crate) fn strip_key_prefix<'a>(
     &stripped[1..]
 }
 
+// `key` with the bucket's delimiter swapped for the platform's path separator, so a key becomes a
+// relative path.
+//
+//     ("a|b|c.txt", Some("|"), "/")   ->  "a/b/c.txt"
+//     ("a/b/c.txt", Some("/"), "/")   ->  "a/b/c.txt"    borrowed, the two agree
+//     ("a/b/c.txt", None,      "/")   ->  "a/b/c.txt"    borrowed, no delimiter configured
+//     ("a/b/c.txt", Some("/"), "\\")  ->  "a\\b\\c.txt"   Windows
+//
+// Only a caller-configured delimiter that differs from the separator allocates, so every key on
+// Unix with the default delimiter is borrowed.
 pub(crate) fn replace_delim<'a>(
     key: &'a str,
     delimiter: Option<&str>,

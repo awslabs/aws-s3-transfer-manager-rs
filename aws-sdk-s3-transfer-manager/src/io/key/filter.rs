@@ -48,6 +48,8 @@ pub(crate) struct Rule {
 }
 
 impl Rule {
+    // A rule that puts back a key an earlier rule excluded. Anchored at the root, so `logs/*`
+    // means the top-level `logs/` and nothing deeper; `anywhere` changes that.
     pub(crate) fn include(pattern: impl Into<String>) -> Self {
         let pattern: String = pattern.into();
         Self {
@@ -58,6 +60,7 @@ impl Rule {
         }
     }
 
+    // A rule that takes a key out. Anchored at the root like `include`.
     pub(crate) fn exclude(pattern: impl Into<String>) -> Self {
         let pattern: String = pattern.into();
         Self {
@@ -68,11 +71,16 @@ impl Rule {
         }
     }
 
+    // Match at any segment boundary, so a rule written for a subtree applies wherever that subtree
+    // appears. This is how to say "at any depth": `**` is two stars to a pattern, and `*/logs/*`
+    // needs a segment before `logs`.
     pub(crate) fn anywhere(mut self) -> Self {
         self.anchor = Anchor::Anywhere;
         self
     }
 
+    // Whether this rule has anything to say about `key`. The two buffers hold the matcher's state,
+    // passed in so one call does not allocate per character of the key.
     fn matches(&self, key: &str, live: &mut Vec<bool>, next: &mut Vec<bool>) -> bool {
         match self.anchor {
             Anchor::Root => glob_match(&self.parsed, key, live, next),
@@ -99,10 +107,14 @@ pub(crate) struct KeyFilter {
 }
 
 impl KeyFilter {
+    // Rules in the order they were written. The order is the API: it is what expresses "all of
+    // `logs/` except `logs/keep/`".
     pub(crate) fn new(rules: Vec<Rule>) -> Self {
         Self { rules }
     }
 
+    // Whether this key survives the rules. Every key starts included, each matching rule overrides
+    // the one before it, and the last match decides.
     pub(crate) fn allows(&self, key: &str) -> bool {
         // Two buffers for the whole call, rotated per character, rather than one allocation per
         // character of the key.
