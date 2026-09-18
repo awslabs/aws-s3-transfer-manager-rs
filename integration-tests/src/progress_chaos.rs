@@ -3,14 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! POC / spike: does today's metrics surface survive partial failure?
+//! Does the metrics surface survive partial failure?
 //!
-//! RUST-1224 proposes reporting per-object progress. Before designing that
-//! surface, these tests establish what `handle.metrics()` reports **today** when
-//! a fraction of a directory upload fails. Each assertion pins the behaviour
-//! that exists today, with a TODO naming what it should become — so the defect
-//! is executable evidence rather than a claim, and the test turns red the moment
-//! the prerequisite lands.
+//! Written for RUST-1224 as a spike that pinned two defects as executable evidence: a
+//! composite counted only its successful children's bytes, and never established a byte
+//! denominator at all. Both assertions carried a note naming what they should become, and
+//! both have since been inverted — these tests now guard the fixed behaviour, so a
+//! regression to either defect turns them red.
+//!
+//! What they cover: a directory upload where a deterministic fraction of children fail
+//! after having already pushed real bytes. The parent must count those bytes, and its
+//! denominator must cover every entry the walk enumerated.
 //!
 //! Failure injection is deterministic, not random: the mock server registers
 //! faults per `(bucket, key)`, so "10%" means a fault on every 10th key. Same

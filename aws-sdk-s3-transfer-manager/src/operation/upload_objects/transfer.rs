@@ -375,11 +375,24 @@ struct State {
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
     /// Sum of the sizes of every entry accepted into `pending_entries`. Grows only, and
-    /// only while `!total_sealed`. Mirrored into the transfer's `MetricsState` in the
-    /// same critical section, because that is what a public reader can see.
+    /// only while `!total_sealed`. Published once into the transfer's `MetricsState` at
+    /// the seal, which is the only point a value here becomes externally visible.
     discovered_bytes: u64,
-    /// Enumeration is finished — every walker has completed or been abandoned — so
-    /// `discovered_bytes` will not change again.
+    /// Every walker reported itself exhausted, and none was abandoned.
+    ///
+    /// Positive on purpose: set at exactly one site, where a walker exhausts and no other
+    /// walker remains, so every path that drops a walker instead — cancel, a fatal walker
+    /// error, `Abort` on a non-fatal one — leaves it `false` by default. A negative
+    /// "abandoned" flag would need setting at each of those and would fail open the moment
+    /// a fourth was added.
+    ///
+    /// `walks.is_empty() && in_flight_walks == 0` cannot answer this on its own: it is
+    /// equally true of "all walkers finished" and "the last walker was thrown away".
+    /// Safe to set on the last exhaustion because every abandonment path drives the
+    /// transfer terminal first, and an inactive transfer drops its walkers at the top of
+    /// `execute_advance_walker_inner` without ever reaching the exhaustion site.
+    listing_complete: bool,
+    /// Enumeration is finished, so `discovered_bytes` will not change again.
     ///
     /// Read and written only under this same `State` lock, never as a separate atomic:
     /// a "has X happened yet?" flag checked in one critical section and acted on in
@@ -464,6 +477,7 @@ impl UploadObjectsTransfer {
                 walks,
                 next_walk_id: 1,
                 in_flight_walks: 0,
+                listing_complete: false,
                 discovered_bytes: 0,
                 total_sealed: false,
                 pending_entries: VecDeque::new(),
@@ -1161,7 +1175,7 @@ impl UploadObjectsTransfer {
     /// critical section. An aborted run may therefore never seal, which is the honest
     /// answer: the walk did not finish, so nobody knows the total.
     fn maybe_seal_total(&self, state: &mut State) {
-        if !state.total_sealed && state.walks.is_empty() && state.in_flight_walks == 0 {
+        if !state.total_sealed && state.listing_complete {
             state.total_sealed = true;
             self.inner
                 .ctx
@@ -1413,10 +1427,6 @@ impl UploadObjectsTransfer {
         // numerator once they were swept.
         if !state.total_sealed {
             state.discovered_bytes += entries.iter().map(|e| e.metadata().len()).sum::<u64>();
-            self.inner
-                .ctx
-                .metrics
-                .publish_discovered(state.discovered_bytes);
         }
         state.pending_entries.extend(entries);
         if !self.inner.ctx.is_active() {
@@ -1458,6 +1468,10 @@ impl UploadObjectsTransfer {
         // Normal completion: re-insert the walker if it still has work.
         let walk_back = (!exhausted_now).then_some(walk);
         slot.consume(&mut state, walk_back);
+        if exhausted_now && state.walks.is_empty() && state.in_flight_walks == 0 {
+            // The last walker exhausted, so enumeration completed rather than stopped.
+            state.listing_complete = true;
+        }
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
             tid = %self.inner.ctx.id,

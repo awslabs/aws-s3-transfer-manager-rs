@@ -1179,6 +1179,71 @@ async fn test_download_objects_seals_a_byte_denominator() {
     .expect("test_download_objects_seals_a_byte_denominator timed out");
 }
 
+/// A run whose listing never completed must not publish a byte total.
+///
+/// `total_bytes` means "this is the whole payload". Sealing it on a path where enumeration
+/// stopped early makes that claim false and `OnceLock` makes it permanent: a consumer sees
+/// `None -> Some(partial)` at the instant listing fails and its bar snaps toward 100%
+/// immediately before the transfer reports failure.
+///
+/// The seal is therefore gated on a positive `listing_complete` flag set only where the
+/// walker reports itself exhausted, not on "the walk is no longer in state" — which is
+/// equally true of a walk that is out for execution, one that finished, and one that was
+/// dropped after a failure.
+///
+/// Exercised through the destination-validation path: a destination that is a file rather
+/// than a directory fails on the first walker advance, before a single key is listed. That
+/// used to seal `Some(0)` for an arbitrarily large prefix.
+#[tokio::test]
+async fn test_download_objects_does_not_seal_a_total_when_listing_never_ran() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let bucket = "test-bucket";
+        let prefix = "unsealed/";
+        seed_bucket(&m.server, bucket, prefix, 12, 4096).await;
+
+        // A file, not a directory: `validate_destination` fails on the first advance.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"x").expect("write file");
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&not_a_dir)
+            .key_prefix(prefix)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // Read metrics AFTER the transfer has gone terminal. Reading before it starts
+        // would assert `None` on a transfer that had not run yet, which is vacuous.
+        loop {
+            if handle.status().is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let metrics = handle.metrics();
+        let result = handle.join().await;
+
+        assert!(
+            result.is_err(),
+            "a non-directory destination must fail the transfer"
+        );
+        assert_eq!(
+            None, metrics.total_bytes,
+            "listing never ran, so no total is known — Some(0) here would claim the \
+             prefix was empty"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_does_not_seal_a_total_when_listing_never_ran timed out");
+}
+
 /// A caller-supplied walker must still exclude 0-byte folder markers.
 ///
 /// Verified against a real bucket: the marker `markers/sub/` derives the local path `<dest>/sub`,

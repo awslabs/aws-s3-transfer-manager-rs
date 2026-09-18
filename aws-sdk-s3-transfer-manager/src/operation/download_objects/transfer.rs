@@ -220,9 +220,19 @@ struct State {
     /// Whether a walker work item is currently in flight.
     walk_in_flight: bool,
     /// Sum of the sizes of every object accepted into `pending_entries`. Grows only, and
-    /// only while `!total_sealed`. Mirrored into the transfer's `MetricsState` in the
-    /// same critical section, because that is what a public reader can see.
+    /// only while `!total_sealed`. Published once into the transfer's `MetricsState` at
+    /// the seal, which is the only point a value here becomes externally visible.
     discovered_bytes: u64,
+    /// The walker reported itself exhausted. Positive on purpose: it is set at exactly
+    /// one site, the clean end of enumeration, so every path that abandons a walk — a
+    /// fatal listing error, a destination that is not a directory, a cancel — leaves it
+    /// `false` by default. A negative "abandoned" flag would have to be set at every
+    /// teardown site and would fail open the moment a new one was added.
+    ///
+    /// `state.walk.is_none()` cannot answer this: `dispatch_walk` takes the walk out for
+    /// the duration of an advance, so `None` means "out for execution", "exhausted", or
+    /// "dropped after a failure" indistinguishably.
+    listing_complete: bool,
     /// Listing is finished, so `discovered_bytes` will not change again.
     ///
     /// Read and written only under this same `State` lock, never as a separate atomic:
@@ -305,6 +315,7 @@ impl DownloadObjectsTransfer {
                     walk: Some(walk),
                     validated: false,
                     walk_in_flight: false,
+                    listing_complete: false,
                     discovered_bytes: 0,
                     total_sealed: false,
                     pending_entries: std::collections::VecDeque::new(),
@@ -893,10 +904,6 @@ impl DownloadObjectsTransfer {
             .iter()
             .map(|o| o.size().unwrap_or(0).max(0) as u64)
             .sum::<u64>();
-        self.inner
-            .ctx
-            .metrics
-            .publish_discovered(state.discovered_bytes);
     }
 
     /// Seal the enumerated-byte total once listing is quiescent.
@@ -911,8 +918,7 @@ impl DownloadObjectsTransfer {
     /// critical section. A cancelled run may never seal, which is the honest answer:
     /// listing did not finish, so nobody knows the total.
     fn maybe_seal_total(&self, state: &mut State) {
-        let listing_done = state.walk.as_ref().is_none_or(|w| w.is_done()) && !state.walk_in_flight;
-        if !state.total_sealed && listing_done {
+        if !state.total_sealed && state.listing_complete && !state.walk_in_flight {
             state.total_sealed = true;
             self.inner
                 .ctx
@@ -1145,7 +1151,12 @@ impl DownloadObjectsTransfer {
             );
             self.accumulate_listed(&mut state, &chunk);
             state.pending_entries.extend(chunk.drain(..));
-            if !walk.is_done() {
+            if walk.is_done() {
+                // The one place enumeration is known to have *completed* rather than
+                // stopped. Reached only when `fatal_error` is `None`, so a walk that
+                // errored never sets this.
+                state.listing_complete = true;
+            } else {
                 state.walk = Some(walk);
             }
         }

@@ -18,7 +18,8 @@ pub struct DownloadObjectsOutput {
     /// Details for each download that failed. Empty on a fully successful transfer.
     pub failed_transfers: Vec<FailedDownload>,
 
-    /// Aggregated metrics across every completed child download.
+    /// Aggregated byte counters across every child download, including bytes received by
+    /// a child that later failed.
     pub metrics: TransferMetrics,
 }
 
