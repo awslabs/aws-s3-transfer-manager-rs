@@ -178,19 +178,21 @@ mod sys {
     use std::io;
     use std::os::windows::fs::FileExt;
 
-    pub(super) fn read_exact_at(file: &File, dst: &mut [u8], mut offset: u64) -> io::Result<()> {
-        while !dst.is_empty() {
-            let count = file.seek_read(dst, offset)?;
+    pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
+        let mut initialized = 0;
+
+        while initialized < dst.len() {
+            let read_offset = offset
+                .checked_add(initialized as u64)
+                .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
+            let count = file.seek_read(&mut dst[initialized..], read_offset)?;
             if count == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "unexpected end of file",
                 ));
             }
-            dst = &mut dst[count..];
-            offset = offset
-                .checked_add(count as u64)
-                .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
+            initialized += count;
         }
         Ok(())
     }
