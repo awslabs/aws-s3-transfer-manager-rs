@@ -807,6 +807,7 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
         let mut decided: HashMap<u64, bool> = HashMap::new();
         let mut settled: HashMap<u64, usize> = HashMap::new();
         let mut child_keys: HashSet<String> = HashSet::new();
+        let mut viewless_children = 0usize;
 
         for ev in &events {
             let key = match ev.transfer().destination() {
@@ -814,13 +815,18 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
                 other => panic!("an upload writes to S3, got {other:?}"),
             };
             match ev {
-                TransferEvent::Decided { id, parent, .. } => {
+                TransferEvent::Decided {
+                    id, parent, view, ..
+                } => {
                     assert!(
                         decided.insert(*id, parent.is_some()).is_none(),
                         "id {id} announced twice"
                     );
                     if parent.is_some() {
                         child_keys.insert(key);
+                        if view.is_none() {
+                            viewless_children += 1;
+                        }
                     }
                 }
                 TransferEvent::Settled { id, .. } => {
@@ -847,6 +853,18 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
             child_keys.len(),
             "every enumerated file must reach the stream: the sweep in on_terminal is what \
              covers the ones a caller's abort cancelled before they spawned"
+        );
+        // Both arms of `view` in one run. An entry the sweep discharged never became a
+        // transfer, so it has no counters and its view is `None`; an entry that did spawn
+        // carries one. Asserted as a range rather than a count because how many spawn
+        // before a caller's abort lands is a race — `max_concurrent_uploads(1)` bounds
+        // concurrency, not how far the run got. What must hold is that neither arm is
+        // empty, so `None` is exercised as its own state and not inferred.
+        assert!(
+            viewless_children > 0 && viewless_children < child_keys.len(),
+            "the sweep must produce viewless entries and the spawned children must carry \
+             views: {viewless_children} of {} children were viewless",
+            child_keys.len()
         );
 
         m.handle.shutdown().await.expect("shutdown");

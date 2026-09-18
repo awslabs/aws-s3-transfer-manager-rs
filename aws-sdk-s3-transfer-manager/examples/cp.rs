@@ -137,6 +137,10 @@ pub struct Args {
     /// Enable CPU profiling in dial9 traces (Linux only, requires --trace-dir)
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue, requires = "trace_dir")]
     cpu_profiling: bool,
+
+    /// Draw a progress bar and print a line per object (recursive transfers only)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    progress: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -272,22 +276,150 @@ async fn do_single_download(
     }
 }
 
+/// Which counter is the numerator. Summing all four double-counts: a file-backed upload
+/// records the same payload as both `disk_read` and `network_tx`.
+#[derive(Clone, Copy)]
+enum Numerator {
+    Sent,
+    Received,
+}
+
+impl Numerator {
+    fn of(&self, m: &aws_sdk_s3_transfer_manager::types::TransferMetrics) -> u64 {
+        match self {
+            Numerator::Sent => m.network_tx,
+            Numerator::Received => m.network_rx,
+        }
+    }
+}
+
+/// Render one whole-transfer bar plus a line per object, from the event stream.
+///
+/// The push/pull split in one function: lifecycle arrives on the stream, and bytes are
+/// *pulled* off the root's view on the repaint tick. Nothing pushes a byte count, so a
+/// consumer repainting at 10 Hz reads the same handle 10 times a second and the transfer
+/// never waits for it.
+///
+/// The bar is monotonic and never exceeds 100%. It reaches 100% only when every listed
+/// object's payload actually moved: the denominator counts what was enumerated, so an
+/// object that failed before its first body byte leaves the bar permanently short by its
+/// whole size. Bytes from a failure mid-body do count. A caller that wants "15 of 16 done"
+/// wants an entry count, which is a different question — bytes cannot answer it.
+async fn draw_progress(
+    mut stream: aws_sdk_s3_transfer_manager::events::TransferEventStream,
+    numerator: Numerator,
+) {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::{ByteTotal, TransferView};
+    use std::io::Write;
+
+    // The root announces itself first and is the only entry with no parent, so one
+    // subscription covers both the per-object lines and the whole-transfer bar.
+    let mut root: Option<TransferView> = None;
+    let (mut ok, mut failed) = (0u64, 0u64);
+
+    let repaint = |root: &Option<TransferView>, ok: u64, failed: u64| {
+        let Some(view) = root else { return };
+        let done = numerator.of(&view.metrics());
+        let line = match view.byte_total() {
+            // A percentage is defined only against a final total. While enumeration is
+            // still running the denominator can still grow, so a bar drawn against it
+            // would walk backwards; show bytes instead.
+            ByteTotal::Final(total) if total > 0 => {
+                let frac = (done as f64 / total as f64).min(1.0);
+                let filled = (frac * 40.0).round() as usize;
+                format!(
+                    "[{}{}] {:>5.1}%  {} / {}",
+                    "#".repeat(filled),
+                    "-".repeat(40 - filled),
+                    frac * 100.0,
+                    ByteUnit::display(done),
+                    ByteUnit::display(total),
+                )
+            }
+            ByteTotal::Provisional(total) => format!(
+                "[{:<40}] {} / {}+ (listing)",
+                "",
+                ByteUnit::display(done),
+                ByteUnit::display(total),
+            ),
+            _ => format!("[{:<40}] {} (total unknown)", "", ByteUnit::display(done)),
+        };
+        print!("\r{line}  {ok} ok, {failed} failed ");
+        let _ = std::io::stdout().flush();
+    };
+
+    let mut tick = tokio::time::interval(time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            ev = stream.next() => {
+                // `None` once every sink is gone: the operation is over and its last
+                // event has been handed over.
+                let Some(ev) = ev else { break };
+                match ev {
+                    TransferEvent::Decided { parent: None, view, .. } => root = view,
+                    TransferEvent::Settled { parent: Some(_), outcome, transfer, .. } => {
+                        match outcome {
+                            Outcome::Failed { error, .. } => {
+                                failed += 1;
+                                // Printed above the bar, which the next tick redraws.
+                                println!("\r{} failed: {error}", transfer.source());
+                            }
+                            _ => ok += 1,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = tick.tick() => repaint(&root, ok, failed),
+        }
+    }
+    repaint(&root, ok, failed);
+    println!();
+    let lost = stream.dropped();
+    if lost > 0 {
+        // Delivery is lossy on purpose. The counts above are short by exactly this much,
+        // and a consumer that needs exact numbers reads the operation's own output.
+        println!("note: {lost} events dropped; per-object counts are a lower bound");
+    }
+}
+
 async fn do_recursive_download(
     tm: &aws_sdk_s3_transfer_manager::Client,
     bucket: &str,
     key_prefix: &str,
     dest: &Path,
+    progress: bool,
 ) -> Result<u64, BoxError> {
     fs::create_dir_all(dest).await?;
 
-    let handle = tm
+    let mut req = tm
         .download_objects()
         .bucket(bucket)
         .key_prefix(key_prefix)
-        .destination(dest)
-        .initiate()?;
+        .destination(dest);
+
+    // Capacity is the consumer's admission of how far behind it may fall. 1024 events is
+    // ~512 objects of slack; past that the oldest are dropped and counted rather than
+    // the transfer being slowed to match the terminal.
+    let drawing = if progress {
+        let (sink, stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(1024).expect("capacity > 0"),
+        );
+        req = req.events(sink);
+        Some(tokio::spawn(draw_progress(stream, Numerator::Received)))
+    } else {
+        None
+    };
+
+    let handle = req.initiate()?;
 
     let output = handle.join().await?;
+    if let Some(drawing) = drawing {
+        // The sinks are gone once the operation is, so the drawer's loop has ended or is
+        // about to; awaiting it is what stops the bar from interleaving with the summary.
+        let _ = drawing.await;
+    }
     tracing::info!("download output: {output:?}");
 
     let transfer_size_bytes = output.metrics.network_rx;
@@ -324,8 +456,9 @@ async fn do_recursive_upload(
     bucket: &str,
     key_prefix: &str,
     source: &Path,
+    progress: bool,
 ) -> Result<u64, BoxError> {
-    let handle = tm
+    let mut req = tm
         .upload_objects()
         .source(source)
         .bucket(bucket)
@@ -334,10 +467,24 @@ async fn do_recursive_upload(
             aws_sdk_s3_transfer_manager::io::walk::FsWalker::builder()
                 .recursive(true)
                 .build(),
-        )
-        .initiate()?;
+        );
+
+    let drawing = if progress {
+        let (sink, stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(1024).expect("capacity > 0"),
+        );
+        req = req.events(sink);
+        Some(tokio::spawn(draw_progress(stream, Numerator::Sent)))
+    } else {
+        None
+    };
+
+    let handle = req.initiate()?;
 
     let output = handle.join().await?;
+    if let Some(drawing) = drawing {
+        let _ = drawing.await;
+    }
     tracing::info!("recursive upload output: {output:?}");
 
     let transfer_size_bytes = output.metrics.network_tx;
@@ -539,7 +686,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
             let (bucket, key) = args.source.expect_s3().parts();
             let dest = args.dest.expect_local();
             if args.recursive {
-                do_recursive_download(&tm, bucket, key, dest).await?
+                do_recursive_download(&tm, bucket, key, dest, args.progress).await?
             } else {
                 do_single_download(&tm, bucket, key, dest).await?
             }
@@ -547,7 +694,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
             let (bucket, key) = args.dest.expect_s3().parts();
             let source = args.source.expect_local();
             if args.recursive {
-                do_recursive_upload(&tm, bucket, key, source).await?
+                do_recursive_upload(&tm, bucket, key, source, args.progress).await?
             } else {
                 do_single_upload(&tm, bucket, key, source).await?
             }

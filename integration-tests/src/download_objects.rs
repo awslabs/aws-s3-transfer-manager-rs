@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{FailedTransferPolicy, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::{ByteTotal, FailedTransferPolicy, RuntimeMode};
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
 use aws_sdk_s3_transfer_manager::events::{Decision, Endpoint, Outcome, TransferEvent};
@@ -903,6 +903,260 @@ async fn test_download_objects_events_pair_and_report_bytes() {
     })
     .await
     .expect("test_download_objects_events_pair_and_report_bytes timed out");
+}
+
+/// The view handed out on `Decided` is what makes per-object progress readable, and it
+/// has to keep working after `join(self)` has consumed the operation handle.
+///
+/// This is the one assertion that exercises the pull half of the design end to end: the
+/// stream pushes lifecycle, the view is pulled for bytes. Without it the events carry an
+/// id and nothing a caller can read a numerator from, which is how the feature looked
+/// while every other test in this file was already green.
+///
+/// Read after `join()` on purpose. A view holding the `TransferContext` — or anything
+/// reaching the client `Handle` — would either fail to compile here or defer the runtime
+/// shutdown below; holding only the metrics `Arc` is what makes both fine.
+#[tokio::test]
+async fn test_download_objects_views_report_per_object_progress() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 10usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "views/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // Keep only the views, keyed by id and by whether the entry is the root. The
+        // events themselves are covered by the pairing test above.
+        let collector = tokio::spawn(async move {
+            let mut views = Vec::new();
+            while let Some(ev) = stream.next().await {
+                if let TransferEvent::Decided {
+                    id, parent, view, ..
+                } = ev
+                {
+                    views.push((id, parent, view));
+                }
+            }
+            views
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let views = collector.await.expect("collector");
+
+        assert_eq!(
+            count + 1,
+            views.len(),
+            "one Decided per object plus the root"
+        );
+
+        let expected_total = (count * size) as u64;
+        let mut roots = 0;
+        let mut children = 0;
+        for (id, parent, view) in &views {
+            let view = view
+                .as_ref()
+                .unwrap_or_else(|| panic!("id {id} became a real transfer, so it owes a view"));
+            let metrics = view.metrics();
+            if parent.is_none() {
+                roots += 1;
+                assert_eq!(
+                    ByteTotal::Final(expected_total),
+                    view.byte_total(),
+                    "the root's denominator is sealed and covers every listed object"
+                );
+                assert_eq!(
+                    expected_total, metrics.network_rx,
+                    "the root's numerator reaches its denominator on a clean run"
+                );
+                // The same fact the joined output reports, from a handle the caller kept
+                // across the join rather than from the value join returned.
+                assert_eq!(
+                    output.metrics().network_rx,
+                    metrics.network_rx,
+                    "a view and the operation's own result must not disagree"
+                );
+            } else {
+                children += 1;
+                assert_eq!(
+                    ByteTotal::Final(size as u64),
+                    view.byte_total(),
+                    "a single-object download knows its length, so its total is final"
+                );
+                assert_eq!(
+                    size as u64, metrics.network_rx,
+                    "each child reports exactly the object it downloaded"
+                );
+            }
+            assert!(
+                metrics.finished_at.is_some(),
+                "id {id} settled before join returned, so its view reports terminal"
+            );
+        }
+        assert_eq!(1, roots, "exactly one entry has no parent");
+        assert_eq!(count, children, "every object announced a child view");
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_views_report_per_object_progress timed out");
+}
+
+/// A bar drawn off the root view never walks backwards and never exceeds its denominator,
+/// and a failed object leaves it short by exactly the bytes that never moved.
+///
+/// This is what `examples/cp.rs --progress` renders, asserted rather than eyeballed. The
+/// root view is read at every child `Settled` — a real mid-flight moment, and one per
+/// object, so the sample count is fixed rather than dependent on a tick landing inside the
+/// transfer. A time-sampled version of this test would pass vacuously whenever the mock
+/// finished between ticks.
+///
+/// **The bar does not reach 100% on a run with failures, and cannot.** The denominator
+/// counts every object that was *listed*; the numerator counts bytes that actually moved.
+/// An object rejected with a 403 is refused before a single body byte arrives, so it
+/// contributes 0 of its 8 KiB and the bar ends permanently short — here at 14/16 of the
+/// payload. Bytes from a failure *mid-body* do count (that is what the parent rollup
+/// fixed, and what `progress_chaos.rs` pins), so the shortfall is exactly the payload that
+/// was never transferred and never more.
+///
+/// A caller that needs "15 of 16 objects are done" needs an entry count, which the crate
+/// does not publish mid-flight. Bytes cannot answer it: the two are different questions and
+/// only one has a denominator today.
+#[tokio::test]
+async fn test_download_objects_bar_is_monotonic_and_short_by_what_never_moved() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 16usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "bar/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        // 403 is non-retryable, so each doomed object fails on its first attempt and the
+        // run does not depend on the retry policy.
+        for doomed in ["0002.bin", "0011.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // The drawer, in the shape the example uses: hold the root's view, and read it
+        // whenever something happens. Bytes are pulled, never pushed — no event carries a
+        // count, which is why a lost event cannot corrupt the bar.
+        let collector = tokio::spawn(async move {
+            let mut root: Option<aws_sdk_s3_transfer_manager::types::TransferView> = None;
+            let mut samples: Vec<(u64, ByteTotal)> = Vec::new();
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => {
+                        if let Some(view) = &root {
+                            samples.push((view.metrics().network_rx, view.byte_total()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (root, samples)
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, samples) = collector.await.expect("collector");
+        let root = root.expect("the root announced itself with a view");
+
+        assert_eq!(
+            count,
+            samples.len(),
+            "one reading per settled object: {} readings for {count} objects",
+            samples.len()
+        );
+
+        // Monotonic: a bar that can decrease is worse than no bar, because a caller reads
+        // a decrease as data loss.
+        for pair in samples.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "the numerator must never decrease: {} then {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        // Never over 100% at any sample, and the denominator never shrinks once final.
+        for (done, total) in &samples {
+            if let ByteTotal::Final(n) = total {
+                assert!(
+                    done <= n,
+                    "a sample must not exceed its own denominator: {done} of {n}"
+                );
+            }
+        }
+
+        let listed = (count * size) as u64;
+        assert_eq!(
+            ByteTotal::Final(listed),
+            root.byte_total(),
+            "every listed object belongs in the denominator, including the failed ones"
+        );
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must actually have failed, or this test proves nothing"
+        );
+        // The shortfall is the whole of what the two rejected objects would have carried,
+        // to the byte. Less than this would mean a successful object's bytes went missing;
+        // more would mean a failed object's bytes were counted twice.
+        assert_eq!(
+            listed - 2 * size as u64,
+            root.metrics().network_rx,
+            "a 403 is refused before any body byte, so the bar ends short by exactly the \
+             payload that never moved"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_bar_is_monotonic_and_short_by_what_never_moved timed out");
 }
 
 /// A doomed object must surface as `Outcome::Failed` on its own child event while
