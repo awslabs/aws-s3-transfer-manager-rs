@@ -688,6 +688,7 @@ impl TransferContext {
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
         if self.status.set_failed() {
             *self.error.lock().unwrap() = Some(Box::new(err.into()));
+            self.metrics.set_finished();
             true
         } else {
             false
@@ -698,14 +699,24 @@ impl TransferContext {
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_completed(&self) -> bool {
-        self.status.set_completed()
+        if self.status.set_completed() {
+            self.metrics.set_finished();
+            true
+        } else {
+            false
+        }
     }
 
     /// Mark transfer as cancelled.
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        self.status.set_cancelled()
+        if self.status.set_cancelled() {
+            self.metrics.set_finished();
+            true
+        } else {
+            false
+        }
     }
 
     /// Take the error if transfer failed. Returns None if not failed or already taken.
@@ -774,6 +785,12 @@ impl TransferContext {
     /// transition must therefore reach exactly one `signal_terminal`. It is safe
     /// to call while in-flight work is still draining.
     pub(crate) fn signal_terminal(&self) {
+        // Backstop only. `finished_at` is stamped by the winning status CAS in
+        // `set_failed` / `set_completed` / `set_cancelled`, because a handle's `Drop`
+        // reaches terminal through `set_cancelled` and never gets here — leaving
+        // `TransferMetrics::finished_at` permanently `None` on a transfer that had
+        // already reported a terminal status. `set_finished` is `OnceLock::set`, so
+        // whichever runs first wins and this call is a no-op.
         self.metrics.set_finished();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
@@ -1060,6 +1077,53 @@ mod tests {
             ctx.set_completed();
             ctx.signal_terminal();
             assert!(ctx.metrics().finished_at.is_some());
+        }
+
+        /// `finished_at` is stamped by the status transition itself, not by
+        /// `signal_terminal`.
+        ///
+        /// A handle's `Drop` reaches terminal through `set_cancelled` and never calls
+        /// `signal_terminal` (`upload/handle.rs`, `upload_objects/handle.rs`,
+        /// `download/handle.rs`, `download_objects/handle.rs`). While `set_finished` was
+        /// reachable only from `signal_terminal`, a consumer that read a terminal status
+        /// and then unwrapped `finished_at` panicked on every dropped handle.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_set_without_signal_terminal() {
+            for transition in ["cancelled", "completed", "failed"] {
+                let (ctx, _rx) = TransferContext::new(test_handle());
+                assert!(ctx.metrics().finished_at.is_none());
+                match transition {
+                    "cancelled" => assert!(ctx.set_cancelled()),
+                    "completed" => assert!(ctx.set_completed()),
+                    _ => assert!(ctx.set_failed(crate::error::Error::new(
+                        crate::error::ErrorKind::ChildOperationFailed,
+                        "test",
+                    ))),
+                }
+                assert!(
+                    ctx.metrics().finished_at.is_some(),
+                    "{transition} must stamp finished_at without signal_terminal"
+                );
+                assert!(ctx.transfer_status().is_terminal());
+            }
+        }
+
+        /// The stamp is first-write-wins, like the status CAS it rides on, so a losing
+        /// transition cannot move a time the winner already published.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_is_first_write_wins() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_completed());
+            let first = ctx.metrics().finished_at.expect("stamped by set_completed");
+            assert!(!ctx.set_cancelled(), "second transition must lose");
+            ctx.signal_terminal();
+            assert_eq!(
+                Some(first),
+                ctx.metrics().finished_at,
+                "a losing transition, and signal_terminal, must not re-stamp"
+            );
         }
 
         #[cfg_attr(miri, ignore)]
