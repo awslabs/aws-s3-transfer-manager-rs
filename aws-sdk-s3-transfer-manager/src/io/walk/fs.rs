@@ -887,8 +887,11 @@ impl FsWalk {
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
+                // The iterator may end on its next call, so how many of this directory's remaining
+                // names never arrived is unknown. That is a range, and the error names the directory
+                // rather than any one entry, so it has to report the kind a lost subtree reports.
                 Err(e) => {
-                    let kind = WalkError::classify_io(&e);
+                    let kind = dir_error_kind(&e, depth);
                     result
                         .errors
                         .push(WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e)));
@@ -900,12 +903,16 @@ impl FsWalk {
             let rejected = self.rejects_path(&path);
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
+                // Without a type there is no telling whether this name was a file or a directory, so
+                // the honest report is the wider one: if it was a directory, everything under it
+                // went unenumerated.
                 Err(e) => {
                     if !rejected {
-                        let kind = WalkError::classify_io(&e);
-                        result
-                            .errors
-                            .push(WalkError::new(Some(path), kind, Box::new(e)));
+                        result.errors.push(WalkError::new(
+                            Some(path),
+                            WalkErrorKind::DirectoryUnreadable,
+                            Box::new(e),
+                        ));
                     }
                     continue;
                 }
@@ -931,8 +938,11 @@ impl FsWalk {
                     Err(e) => {
                         if !rejected {
                             let kind = match e.kind() {
+                                // A link pointing at nothing has no subtree to lose.
                                 std::io::ErrorKind::NotFound => WalkErrorKind::BrokenSymlink,
-                                _ => WalkError::classify_io(&e),
+                                // Anything else leaves the target's kind unknown, and a link to a
+                                // directory would have filed a whole subtree under this name.
+                                _ => WalkErrorKind::DirectoryUnreadable,
                             };
                             result
                                 .errors

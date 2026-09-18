@@ -169,7 +169,10 @@ impl StreamError {
             StreamError::UnkeyableName(_) => KeysLost::Nothing,
             // The object was listed and then dropped, so its key is absent from this side while
             // the keys around it arrived.
-            StreamError::MalformedListing { .. } => KeysLost::OneKey,
+            StreamError::MalformedListing { key: Some(_), .. } => KeysLost::OneKey,
+            // No key to name, so a consumer cannot hold back the action for it. One key is gone and
+            // which one is unknowable, which is a range of one.
+            StreamError::MalformedListing { key: None, .. } => KeysLost::UnknownRange,
         }
     }
 }
@@ -845,6 +848,14 @@ mod tests {
                 },
                 KeysLost::OneKey,
             ),
+            // Nothing to name, so a consumer cannot hold back the action for it.
+            (
+                StreamError::MalformedListing {
+                    key: None,
+                    what: "no key",
+                },
+                KeysLost::UnknownRange,
+            ),
             // No S3 key can carry a name that is not valid UTF-8, so nothing on the other side
             // could have corresponded to it.
             (
@@ -855,6 +866,180 @@ mod tests {
         for (err, cost) in cases {
             assert_eq!(err.keys_lost(), cost, "err={err:?}");
         }
+    }
+
+    // A link the walk follows to a directory it cannot stat: the target may hold a whole subtree,
+    // filed under the link's name, and none of it was seen.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_link_to_an_unstattable_directory_costs_a_range() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outside = tempdir().unwrap();
+        let protected = outside.path().join("protected");
+        fs::create_dir(&protected).unwrap();
+        fs::create_dir(protected.join("data")).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(protected.join("data")).is_ok() {
+            fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root
+        }
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::os::unix::fs::symlink(protected.join("data"), dir.path().join("link")).unwrap();
+
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut costs = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            if let Err(err) = next {
+                costs.push((walk_kind(&err), err.keys_lost()));
+            }
+        }
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            costs.contains(&(
+                Some(WalkErrorKind::DirectoryUnreadable),
+                KeysLost::UnknownRange
+            )),
+            "a link the walk could not stat must read as a lost range, got {costs:?}"
+        );
+    }
+
+    // The reason this layer exists. A source that could not read one subdirectory must not let the
+    // destination's keys under that name be deleted: they may still exist on the source, inside the
+    // part nobody could see.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_lost_range_on_the_source_holds_back_every_delete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("hidden.txt"), "x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root
+        }
+
+        // The destination holds a key under the directory the source could not read, and one that is
+        // genuinely gone from the source.
+        let contents = vec![
+            object("a.txt", 1),
+            object("locked/hidden.txt", 1),
+            object("z.txt", 1),
+        ];
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .set_contents(Some(contents))
+            .build();
+        let rule = aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(move || output.clone());
+        let client = aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            &[rule]
+        );
+
+        let mut src = local(dir.path());
+        let mut dest = s3(client, None);
+        let (plan, lost) = merge_respecting_loss(&mut src, &mut dest).await;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            lost,
+            "an unreadable subdirectory has to read as a lost range"
+        );
+        let deletes: Vec<_> = plan
+            .iter()
+            .filter(|(_, a)| *a == Action::Delete)
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(
+            deletes.is_empty(),
+            "the source could not see everything, so nothing may be deleted: {deletes:?}"
+        );
+    }
+
+    // A merge that reads what a failure cost instead of unwrapping it. The source losing a range is
+    // the case that matters: a key the destination holds may exist on the source inside the part
+    // nobody could read, so its absence cannot be trusted and a delete has to be held back.
+    //
+    // This is the shape the comparison will take. It lives here to show the stream hands over enough
+    // to make that decision.
+    async fn merge_respecting_loss<S, D>(src: &mut S, dest: &mut D) -> (Vec<(String, Action)>, bool)
+    where
+        S: KeyStream,
+        D: KeyStream,
+    {
+        let mut plan = Vec::new();
+        let mut source_lost_a_range = false;
+
+        // Read one side past any failures, recording whether the view stayed trustworthy.
+        async fn advance<K: KeyStream>(
+            k: &mut K,
+            lost_range: &mut bool,
+        ) -> Option<Entry<K::Source>> {
+            loop {
+                match k.next_entry().await {
+                    None => return None,
+                    Some(Ok(entry)) => return Some(entry),
+                    Some(Err(err)) => {
+                        if err.keys_lost() == KeysLost::UnknownRange {
+                            *lost_range = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ignored = false;
+        let mut s = advance(src, &mut source_lost_a_range).await;
+        let mut d = advance(dest, &mut ignored).await;
+        loop {
+            match (&s, &d) {
+                (None, None) => break,
+                (Some(se), None) => {
+                    plan.push((se.key.clone(), Action::Transfer));
+                    s = advance(src, &mut source_lost_a_range).await;
+                }
+                (None, Some(de)) => {
+                    if !source_lost_a_range {
+                        plan.push((de.key.clone(), Action::Delete));
+                    }
+                    d = advance(dest, &mut ignored).await;
+                }
+                (Some(se), Some(de)) => match se.key.cmp(&de.key) {
+                    std::cmp::Ordering::Less => {
+                        plan.push((se.key.clone(), Action::Transfer));
+                        s = advance(src, &mut source_lost_a_range).await;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if !source_lost_a_range {
+                            plan.push((de.key.clone(), Action::Delete));
+                        }
+                        d = advance(dest, &mut ignored).await;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        plan.push((se.key.clone(), decide(se, de)));
+                        s = advance(src, &mut source_lost_a_range).await;
+                        d = advance(dest, &mut ignored).await;
+                    }
+                },
+            }
+        }
+        (plan, source_lost_a_range)
     }
 
     // The join reads "this key is absent from the other side" from position alone, so
