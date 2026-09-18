@@ -34,8 +34,8 @@ struct ReadDirResult {
     errors: Vec<WalkError>,
 }
 
-// How the walk is positioned. The two traversals serve different callers, so each
-// keeps its own state.
+// How the walk is positioned. Which traversal a walk uses follows from its `SortOrder`: ordering
+// the whole walk needs depth-first, and the other two orders are breadth-first.
 enum Cursor {
     // Files of a directory are emitted before descending. Subdirectories wait
     // in a queue, which is what makes them claimable.
@@ -43,9 +43,9 @@ enum Cursor {
         pending_dirs: VecDeque<PendingDir>,
         ready_files: VecDeque<FsEntry>,
     },
-    // Emission follows key order, so a subtree is descended at the position
-    // where it sorts. Each frame is a partially consumed directory.
-    KeyOrder {
+    // Depth-first, so a subtree is descended at the position where it sorts rather than after
+    // its parent's files. Each frame is a partially consumed directory.
+    Depth {
         stack: Vec<VecDeque<Child>>,
     },
 }
@@ -377,16 +377,18 @@ impl FsWalker {
             depth: 0,
             ancestor_handles: Vec::new(),
         };
-        let cursor = match (done, self.sort_order == SortOrder::WholeWalk) {
-            (true, true) => Cursor::KeyOrder { stack: Vec::new() },
-            (true, false) => Cursor::Breadth {
+        // Matched over every order rather than tested against one, so an order added later has to
+        // say which traversal it needs instead of silently taking the breadth-first one.
+        let cursor = match self.sort_order {
+            SortOrder::WholeWalk if done => Cursor::Depth { stack: Vec::new() },
+            SortOrder::WholeWalk => Cursor::Depth {
+                stack: vec![VecDeque::from([Child::Dir(root_dir)])],
+            },
+            SortOrder::Native | SortOrder::WithinDirectory if done => Cursor::Breadth {
                 pending_dirs: VecDeque::new(),
                 ready_files: VecDeque::new(),
             },
-            (false, true) => Cursor::KeyOrder {
-                stack: vec![VecDeque::from([Child::Dir(root_dir)])],
-            },
-            (false, false) => Cursor::Breadth {
+            SortOrder::Native | SortOrder::WithinDirectory => Cursor::Breadth {
                 pending_dirs: VecDeque::from([root_dir]),
                 ready_files: VecDeque::new(),
             },
@@ -699,7 +701,7 @@ impl FsWalk {
                         }
                     }
                 }
-                Cursor::KeyOrder { stack } => {
+                Cursor::Depth { stack } => {
                     // Work the newest frame, so a subtree is emitted where it
                     // sorts rather than after its parent's files.
                     let child = loop {
@@ -739,7 +741,7 @@ impl FsWalk {
                                 }
                             }
                         }
-                        Cursor::KeyOrder { stack } => stack.push(result.children.into()),
+                        Cursor::Depth { stack } => stack.push(result.children.into()),
                     }
                 }
                 Err(err) => {
@@ -783,14 +785,14 @@ impl FsWalk {
     /// them.
     ///
     /// Always returns `None` for a [`SortOrder::WholeWalk`]
-    /// walk: emitting in key order requires descending into a subtree before a
+    /// walk: emitting in that order requires descending into a subtree before a
     /// sibling that sorts after it can be emitted, so by the time entries come
     /// out there is little left to hand off, and handing off the next-needed
     /// subtree would stall the consumer waiting for it.
     pub fn try_claim_subtree(&mut self) -> Option<FsWalk> {
         let pending_dirs = match &mut self.cursor {
             Cursor::Breadth { pending_dirs, .. } => pending_dirs,
-            Cursor::KeyOrder { .. } => return None,
+            Cursor::Depth { .. } => return None,
         };
         if self.done || pending_dirs.len() < 2 {
             return None;
@@ -822,7 +824,7 @@ impl FsWalk {
                 pending_dirs,
                 ready_files,
             } => pending_dirs.is_empty() && ready_files.is_empty(),
-            Cursor::KeyOrder { stack } => stack.iter().all(|f| f.is_empty()),
+            Cursor::Depth { stack } => stack.iter().all(|f| f.is_empty()),
         };
         cursor_empty && self.pending_errors.is_empty()
     }
@@ -831,7 +833,7 @@ impl FsWalk {
     pub(crate) fn ready_files_len(&self) -> usize {
         match &self.cursor {
             Cursor::Breadth { ready_files, .. } => ready_files.len(),
-            Cursor::KeyOrder { stack } => stack
+            Cursor::Depth { stack } => stack
                 .iter()
                 .flatten()
                 .filter(|c| matches!(c, Child::File(_)))
@@ -843,7 +845,7 @@ impl FsWalk {
     pub(crate) fn pending_dirs_len(&self) -> usize {
         match &self.cursor {
             Cursor::Breadth { pending_dirs, .. } => pending_dirs.len(),
-            Cursor::KeyOrder { stack } => stack
+            Cursor::Depth { stack } => stack
                 .iter()
                 .flatten()
                 .filter(|c| matches!(c, Child::Dir(_)))
@@ -1057,10 +1059,12 @@ impl FsWalk {
             }
         }
 
-        if self.config.sort_order == SortOrder::WholeWalk {
-            result.children.sort_by(cmp_key_form);
-        } else if self.config.sort_order == SortOrder::WithinDirectory {
-            result.children.sort_by(|a, b| a.path().cmp(b.path()));
+        // Likewise: an order added later has to name its comparator rather than inheriting whatever
+        // order the filesystem gave.
+        match self.config.sort_order {
+            SortOrder::WholeWalk => result.children.sort_by(cmp_key_form),
+            SortOrder::WithinDirectory => result.children.sort_by(|a, b| a.path().cmp(b.path())),
+            SortOrder::Native => {}
         }
 
         tracing::trace!(
@@ -3103,7 +3107,7 @@ mod tests {
         );
     }
 
-    // --- S3 key-order tests ---
+    // --- whole-walk order tests ---
 
     // Entries must be emitted in UTF-8 byte order, as ListObjectsV2 returns keys.
     fn assert_whole_walk_order(entries: &[FsEntry]) {
