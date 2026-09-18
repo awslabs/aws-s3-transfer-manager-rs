@@ -130,19 +130,17 @@ under `io::key*` is new.
                include_special_files         FileType              what the filesystem said is there
    S3Walk      + prefix()                    KeyStream             the trait they both implement
    FsEntry     file_type, metadata, root     KeyFilter, Rule       include and exclude rules
-   WalkError   + DirectoryUnreadable         Severity              ends the run, failure, warning
+   WalkError   + DirectoryUnreadable
                                              StreamError           a walk, a name, or a listing
                                              derive_object_key     path or key → relative key
                                              strip_key_prefix
 ```
 
-Six of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
-the switch that turns on S3 ordering; `Severity`; `WalkErrorKind::severity()` and
-`WalkError::severity()`; `FsEntry`, whose accessors say what the filesystem
-reported and how the walk arrived; `FileType`, which names what is at a path; and one new
-`WalkErrorKind` variant, `DirectoryUnreadable`. `WalkErrorKind` was already
-`#[non_exhaustive]`, so adding variants breaks nobody, and `Severity` is `#[non_exhaustive]` for
-the same reason.
+Four of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
+the switch that turns on S3 ordering; `FsEntry`, whose accessors say what the filesystem reported
+and how the walk arrived; `FileType`, which names what is at a path; and one new `WalkErrorKind`
+variant, `DirectoryUnreadable`. `FileType` and `WalkErrorKind` are both `#[non_exhaustive]`, so a
+kind added later breaks nobody.
 
 Everything in `io::key*` is crate-private, so `Entry`, `EntryMeta` and `KeyStream` can still
 change shape without breaking a caller.
@@ -184,15 +182,16 @@ follow from the entry existing: it arrives at its own key carrying `FileType::So
 comparison that reads absence from position sees the key occupied. Reporting it instead put a
 per-key fact on a channel with no keys in it.
 
-What stays a warning is what no single key stands for: a link that loops, which stops a descent so a
-subtree goes unenumerated.
+So errors divide in two, and only a walk answers which:
 
 ```
    ends the run   nothing is left to do       SourceUnreadable, NotADirectory, Service
-   entry failure  should have been readable   Io, PermissionDenied, DirectoryUnreadable,
-                                              BrokenSymlink
-   entry warning  no key stands for it        SymlinkCycle
+   one entry      should have been readable   Io, PermissionDenied, DirectoryUnreadable,
+                                              BrokenSymlink, SymlinkCycle
 ```
+
+A cycle sits with the second group. It stops a descent, so a subtree goes unenumerated, and no
+single key stands for a subtree — the same reason D5 keeps an unreadable directory distinct.
 
 A link pointing at nothing is an error while a socket is an entry, which is easy to get backwards.
 FR-Enum-3 sorts by whether the walk *should have been able to read it*: a dangling link is a read
@@ -203,20 +202,22 @@ records every walk error that does not end the run as a failure, and aborts the 
 one under its strictest policy. A walk that yielded sockets unbidden would hand it names it
 would try to upload.
 
-Two ways out of that: teach `upload_objects` to recognise them, or let the caller ask. FR-Enum-3 is a sync requirement, so the second matches who wants the information.
-`upload_objects` sees exactly what it saw before, and its code is untouched.
+Two ways out of that: teach `upload_objects` to recognise them, or let the caller ask. FR-Enum-3 is
+a sync requirement, so the second matches who wants the information. `upload_objects` sees exactly
+what it saw before, and its code is untouched.
 
 Naming the kind still belongs to the walk. A consumer has to tell a socket from a file it could not
 read, and only the walk knows which it found.
 
-**D8. The filter is upstream of reporting, not just of emitting.** An excluded entry must produce
-no warning, so every place that reports one consults the filter first — the same check the failure
-paths already made. Miss it at one site and an excluded socket warns anyway.
+**D8. The filter is upstream of every way out, not just of emitting.** An excluded name must
+produce nothing at all, so every place that yields an entry or reports a failure consults the filter
+first — the same check the failure paths already made. Miss it at one site and an excluded socket
+comes out anyway.
 
 **D9. A name that cannot be keyed is never filtered out.** Key derivation returns `None` for a
 name that is not valid UTF-8, and the local predicate keeps such an entry. Excluding it there
-would drop it silently, which is the outcome the warning exists to prevent. So filters can only
-exclude names that have keys.
+would drop it silently, and a name nobody hears about reads as a name that is free. So filters can
+only exclude names that have keys.
 
 **D10. Filters run inside enumeration, on both sides, before metadata is read.** One ordered rule
 list matched on the relative key (FR-Filter-1, FR-Filter-2), applied to both sides (FR-Filter-3),
@@ -366,27 +367,26 @@ A stream yields entries. It also has to report what it could not turn into an en
 silence is dangerous: a name missing from the pile reads as "nothing is there", and the object at
 the matching key gets deleted.
 
-Three levels, because the consumer treats them differently:
+Two levels, because the consumer treats them differently:
 
 ```
    ends the run   → the walk never got going; there is no pile at all
-   entry failure  → this one key is unknown; the failure policy decides whether to continue
-   entry warning  → nothing at this key can be named; never a failure
+   one entry      → this key is unknown; the failure policy decides whether to continue
 ```
 
 A FIFO, a socket, a device file and a symlink the walk was told not to follow all arrive as entries,
 each carrying the `FileType` that says which it is, and a walk yields them only when asked, through
-`include_special_files`, so the operations that already use the walkers see nothing new. The warning
-level keeps what no key stands for: a directory reached by a link that loops. Sync copies none of them as things stand — the symlink would need a
-setting changed, the rest can never be copied at all. But *something occupies that name*, and that
+`include_special_files`, so the operations that already use the walkers see nothing new. Sync copies
+none of them as things stand — the symlink would need a setting changed, the rest can never be
+copied at all. But *something occupies that name*, and that
 is exactly what has to stop the object at the matching key from being deleted. That is the
 difference between a skip and a silent omission.
 
 A timestamp the platform cannot represent is a different shape of problem. The file is fine and
 transferable; only one field of its metadata is missing. So it stays an ordinary entry and carries
-`None` for its time, and the layer that reports to the caller turns that `None` into the warning
-FR-Enum-5 asks for. Warnings that stand in for an entry and information that travels inside one
-are separate mechanisms.
+`None` for its time, and the layer that reports to the caller turns that `None` into the report
+FR-Enum-5 asks for. A failure that stands in for an entry and a fact that travels inside one are
+separate mechanisms.
 
 Errors surface at the position of the directory they came from, before any key inside it. A
 directory-unreadable error at `img/` arrives where `img/` would have, so the comparison learns

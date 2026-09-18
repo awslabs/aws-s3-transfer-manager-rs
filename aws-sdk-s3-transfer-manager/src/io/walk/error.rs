@@ -5,11 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::Severity;
-
 /// Classifies a [`WalkError`].
 ///
-/// Each kind has a fixed [`Severity`]; see [`WalkErrorKind::severity`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
@@ -42,31 +39,19 @@ pub enum WalkErrorKind {
 }
 
 impl WalkErrorKind {
-    /// How an error of this kind bears on the walk.
-    pub fn severity(&self) -> Severity {
-        match self {
-            WalkErrorKind::SourceUnreadable
-            | WalkErrorKind::NotADirectory
-            | WalkErrorKind::Service => Severity::EndsRun,
-            WalkErrorKind::Io
-            | WalkErrorKind::PermissionDenied
-            | WalkErrorKind::DirectoryUnreadable
-            | WalkErrorKind::BrokenSymlink => Severity::EntryFailure,
-            WalkErrorKind::SymlinkCycle => Severity::EntryWarning,
-        }
-    }
-
-    /// Whether an error of this kind terminates the walk, which is
-    /// [`Severity::EndsRun`] seen from the walk's side.
+    /// Whether an error of this kind terminates the walk.
     pub fn is_fatal(&self) -> bool {
-        self.severity() == Severity::EndsRun
+        matches!(
+            self,
+            WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory | WalkErrorKind::Service
+        )
     }
 }
 
 /// An error encountered during a directory walk.
 ///
 /// Wraps an optional path, a [`WalkErrorKind`] classifier, and a source
-/// error. Its [`Severity`] follows from [`kind`](Self::kind); see
+/// error. Fatality is determined by [`kind`](Self::kind); see
 /// [`is_fatal`](Self::is_fatal).
 #[derive(Debug)]
 pub struct WalkError {
@@ -90,12 +75,6 @@ impl WalkError {
     pub fn kind(&self) -> WalkErrorKind {
         self.kind
     }
-
-    /// How this error bears on the run. Equivalent to `self.kind().severity()`.
-    pub fn severity(&self) -> Severity {
-        self.kind.severity()
-    }
-
     /// Whether this error terminates the walk.
     ///
     /// When `true`, no further entries will be produced by the walk.
@@ -191,24 +170,23 @@ mod tests {
         assert!(!WalkErrorKind::SymlinkCycle.is_fatal());
     }
 
+    // Every kind, so a new one has to be placed deliberately. Only a failure that leaves nothing
+    // to carry on with ends the walk; the rest cost one entry, and a cycle costs the subtree it
+    // stopped at, which the run's failure policy decides about.
     #[test]
-    fn test_severity_by_kind() {
-        use Severity::*;
+    fn only_a_failure_with_nothing_left_ends_the_walk() {
         let cases = [
-            (WalkErrorKind::SourceUnreadable, EndsRun),
-            (WalkErrorKind::NotADirectory, EndsRun),
-            (WalkErrorKind::Service, EndsRun),
-            (WalkErrorKind::Io, EntryFailure),
-            (WalkErrorKind::PermissionDenied, EntryFailure),
-            (WalkErrorKind::DirectoryUnreadable, EntryFailure),
-            // A link with no target should have been readable and was not.
-            (WalkErrorKind::BrokenSymlink, EntryFailure),
-            // A loop hides a subtree, so no single key stands for what went unread.
-            (WalkErrorKind::SymlinkCycle, EntryWarning),
+            (WalkErrorKind::SourceUnreadable, true),
+            (WalkErrorKind::NotADirectory, true),
+            (WalkErrorKind::Service, true),
+            (WalkErrorKind::Io, false),
+            (WalkErrorKind::PermissionDenied, false),
+            (WalkErrorKind::DirectoryUnreadable, false),
+            (WalkErrorKind::BrokenSymlink, false),
+            (WalkErrorKind::SymlinkCycle, false),
         ];
-        for (kind, expected) in cases {
-            assert_eq!(kind.severity(), expected, "kind={kind:?}");
-            assert_eq!(kind.is_fatal(), expected == EndsRun, "kind={kind:?}");
+        for (kind, ends_the_walk) in cases {
+            assert_eq!(kind.is_fatal(), ends_the_walk, "kind={kind:?}");
         }
     }
 }

@@ -26,27 +26,6 @@ use crate::types::{FailedDownload, FailedUpload};
 /// A boxed error that is `Send` and `Sync`.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// How a failure bears on a run.
-///
-/// One classification for every place a failure can happen — an entry that could not
-/// be listed, a directory that could not be read, a listing page that never arrived,
-/// an object that could not be transferred, a key that could not be deleted — so that
-/// a caller reasons about failure once.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    /// Nothing is left to carry on with, so the run ends whatever the failure policy
-    /// says. This is an absence of remaining work, and not a policy being overridden:
-    /// a source root that cannot be read leaves nothing to continue doing.
-    EndsRun,
-    /// The run's failure policy decides whether to carry on past this.
-    EntryFailure,
-    /// Never a failure, under any policy. Something is there that no setting or retry
-    /// would let the run act on — a socket, a device, a link that loops. Reported so a
-    /// consumer knows the name is taken even though nothing describes it.
-    EntryWarning,
-}
-
 /// Errors returned by this library.
 ///
 /// NOTE: Use [`aws_smithy_types::error::display::DisplayErrorContext`] or similar to display
