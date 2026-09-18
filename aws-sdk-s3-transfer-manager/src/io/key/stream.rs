@@ -24,8 +24,11 @@ use crate::io::walk::{
     exclude_s3_folder_markers, FsEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
 };
 
-// Whole seconds, because that is the granularity S3 reports last-modified at.
-// Keeping finer local precision would make an identical pair differ every run.
+// Metadata of an `Entry`, read off the item the walker produced and kept to what a comparison
+// needs to tell whether two sides differ.
+//
+// Whole seconds, because that is the granularity S3 reports last-modified at. Keeping finer
+// local precision would make an identical pair differ every run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryMeta {
     pub(crate) size: u64,
@@ -35,10 +38,12 @@ pub(crate) struct EntryMeta {
     pub(crate) last_modified_secs: Option<i64>,
 }
 
-// `source` travels with the key because the key alone is not enough to act on: a
-// path rebuilt from it is not the path that was walked, and on the S3 side the
-// listing's storage class and restore status decide whether the object is readable
-// at all.
+// An item a walker produced, carried under the key a comparison pairs it by, with the metadata
+// that comparison reads.
+//
+// `source` travels with the key because the key alone is not enough to act on: a path rebuilt
+// from it is not the path that was walked, and on the S3 side the listing's storage class and
+// restore status decide whether the object is readable at all.
 #[derive(Debug, Clone)]
 pub(crate) struct Entry<T> {
     pub(crate) key: String,

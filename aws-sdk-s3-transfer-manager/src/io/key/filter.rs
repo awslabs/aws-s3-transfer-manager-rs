@@ -17,7 +17,7 @@
 //!
 //! Anchoring is not part of the pattern text; see [`Anchor`].
 
-// Whether a pattern matches from the start of the key or at any segment boundary.
+// Where in a key a `Rule`'s pattern may match: from the start, or at any segment boundary.
 //
 // Kept out of the pattern text: `**` is just two stars, so `**/logs/*` and `*/logs/*`
 // mean the same thing, and both need a segment before `logs`. Spelling "at any depth"
@@ -28,12 +28,15 @@ pub(crate) enum Anchor {
     Anywhere,
 }
 
+// What a matching rule does to the key it matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
     Include,
     Exclude,
 }
 
+// One rule of a `KeyFilter`: a pattern, what it does to a key it matches, and where it may
+// match.
 #[derive(Debug, Clone)]
 pub(crate) struct Rule {
     action: Action,

@@ -156,10 +156,10 @@ pub enum FileType {
     Device,
 }
 
-/// A file entry discovered during a filesystem walk.
+/// One thing a filesystem walk found.
 ///
 /// Carries the absolute path, the path relative to the walk root, what the filesystem said is
-/// there, and the metadata if any was read.
+/// there, whether a symlink was resolved to reach it, and the metadata if any was read.
 ///
 /// A walk yields regular files, and whatever else it was asked to report: a socket, a symlink it
 /// left alone. Directories are traversed and not yielded, so a consumer sees the files under one
