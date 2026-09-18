@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::io::key::derive_object_key;
-use crate::io::walk::{FsEntry, FsWalk};
+use crate::io::walk::{FileType, FsEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
 use crate::runtime::sync::Mutex;
@@ -691,13 +691,43 @@ impl UploadObjectsTransfer {
                     }
                 };
 
-            // An upload only ever sees a regular file the walk read metadata for, since it does
-            // not ask for anything else.
-            let mut input = InputStream::read_from().path(entry.path());
-            if let Some(metadata) = entry.metadata() {
-                input = input.metadata(metadata.clone());
+            // Only a regular file holds bytes to upload. A walk yields anything else only when
+            // asked, and an upload never asks — but the entry type can carry a socket, a FIFO or a
+            // symlink left alone, so the check belongs here rather than in a comment. Reading a
+            // FIFO with no writer would block this task for as long as the transfer lives, and an
+            // unfollowed symlink carries the link's own length while the path opens the target.
+            if entry.file_type() != FileType::Regular {
+                tracing::warn!(
+                    path = ?entry.path(),
+                    file_type = ?entry.file_type(),
+                    "skipping: not a regular file",
+                );
+                continue;
             }
-            let stream = match input.build() {
+            // The walk reports a regular file it could not describe as an error, so no entry for
+            // one reaches here. Were that to change, building the stream without a length makes it
+            // `stat` the path again, which both blocks this task and reads a length the walk never
+            // saw.
+            let Some(metadata) = entry.metadata() else {
+                state.failed.push(FailedUpload {
+                    input: None,
+                    error: crate::error::Error::new(
+                        crate::error::ErrorKind::IOError,
+                        "walk produced a regular file with no metadata",
+                    ),
+                    source_path: Some(entry.path().to_path_buf()),
+                });
+                if *self.failure_policy() == FailedTransferPolicy::Abort {
+                    self.abort(state, "entry with no metadata");
+                    return SpawnDecision::Abort;
+                }
+                continue;
+            };
+            let stream = match InputStream::read_from()
+                .path(entry.path())
+                .metadata(metadata.clone())
+                .build()
+            {
                 Ok(s) => s,
                 Err(e) => {
                     state.failed.push(FailedUpload {
@@ -1289,6 +1319,19 @@ mod tests {
         UploadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
+        setup_with_special_files(source, policy, s3_client, recursive, false)
+    }
+
+    fn setup_with_special_files(
+        source: &std::path::Path,
+        policy: FailedTransferPolicy,
+        s3_client: aws_sdk_s3::Client,
+        recursive: bool,
+        include_special_files: bool,
+    ) -> (
+        UploadObjectsTransfer,
+        crate::transfer::StateMachineTerminalReceiver,
+    ) {
         let config = crate::Config::builder().client(s3_client).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
@@ -1302,6 +1345,7 @@ mod tests {
         let walker = FsWalker::builder()
             .recursive(recursive)
             .follow_symlinks(true)
+            .include_special_files(include_special_files)
             .build()
             .walk(FsWalkContext::builder().root(source).build());
 
@@ -1360,6 +1404,80 @@ mod tests {
         .expect("transfer should complete within timeout");
 
         assert_eq!(transfer.successful_uploads(), 3);
+        assert!(transfer.take_failed().is_empty());
+    }
+
+    // A walk asked for what no transfer can move yields a socket at its own key. An upload has to
+    // leave it alone: its bytes cannot be read, and opening a FIFO with no writer would block the
+    // read task for as long as the transfer lives.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_special_files_are_not_uploaded() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
+
+        let (transfer, completion_rx) = setup_with_special_files(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+            true,
+        );
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        // Only the regular file. The socket is neither uploaded nor counted as a failure, the same
+        // as when the walk is not asked for it at all.
+        assert_eq!(transfer.successful_uploads(), 1);
+        assert!(
+            transfer.take_failed().is_empty(),
+            "a socket is not a failed upload"
+        );
+    }
+
+    // A FIFO with no writer is the case that would hang rather than fail: opening it blocks until a
+    // writer appears, which for a transfer means forever. The timeout is the assertion.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_a_fifo_does_not_stall_the_transfer() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            return; // no mkfifo on this host
+        }
+
+        let (transfer, completion_rx) = setup_with_special_files(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+            true,
+        );
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("a FIFO must not stall the transfer");
+
+        assert_eq!(transfer.successful_uploads(), 1);
         assert!(transfer.take_failed().is_empty());
     }
 
