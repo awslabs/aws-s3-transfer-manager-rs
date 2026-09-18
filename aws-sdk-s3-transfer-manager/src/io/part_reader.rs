@@ -666,20 +666,22 @@ impl Future for DynNextPartFuture {
                     .stream
                     .take()
                     .expect("custom stream disappeared at completion");
-                if result.is_none() {
-                    this.part_stream.gate.finish(stream);
-                } else {
-                    this.part_stream.gate.release(stream);
-                }
                 match result {
                     Some(Ok(part)) => {
                         this.part_stream
                             .parts_yielded
                             .fetch_add(1, Ordering::Release);
+                        this.part_stream.gate.release(stream);
                         Poll::Ready(Ok(Some(part)))
                     }
-                    Some(Err(error)) => Poll::Ready(Err(error.into())),
-                    None => Poll::Ready(Ok(None)),
+                    Some(Err(error)) => {
+                        this.part_stream.gate.finish(stream);
+                        Poll::Ready(Err(error.into()))
+                    }
+                    None => {
+                        this.part_stream.gate.finish(stream);
+                        Poll::Ready(Ok(None))
+                    }
                 }
             }
         }
@@ -702,13 +704,14 @@ mod test {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
 
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
     use crate::io::part_reader::{
-        Builder, BytesPartReader, PartData, PartReadStart, PartReader, PathBodyPartReader,
+        Builder, BytesPartReader, DynPartReader, Inner, PartData, PartReadStart, PartReader,
+        PathBodyPartReader, SourceAccess,
     };
     use crate::io::path_body::PathBody;
     use crate::io::stream::{PartStream, StreamContext};
@@ -1132,6 +1135,72 @@ mod test {
         assert!(!reader.source_unavailable());
     }
 
+    struct CountPublishedWake {
+        part_stream: Arc<DynPartReader>,
+        woke: AtomicBool,
+    }
+
+    impl Wake for CountPublishedWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert_eq!(
+                self.part_stream.parts_yielded.load(Ordering::Acquire),
+                1,
+                "gate handoff became visible before the yielded-part count"
+            );
+            self.woke.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_stream_publishes_count_before_gate_handoff() {
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(5)
+                .stream(InputStream::from_part_stream(TestStream::new(vec![
+                    Bytes::from_static(b"first"),
+                ])))
+                .buffer_pool(test_pool())
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+        let Inner::Dyn(part_stream) = &reader.inner else {
+            panic!("custom stream did not build a dynamic reader");
+        };
+        let part_stream = Arc::clone(part_stream);
+
+        let PartReadStart::Ready(first) = reader.start_part_read().await else {
+            panic!("fresh custom stream was blocked");
+        };
+        let mut waiter = Box::pin(part_stream.gate.acquire());
+        let wake = Arc::new(CountPublishedWake {
+            part_stream: Arc::clone(&part_stream),
+            woke: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+
+        assert_eq!(
+            first.await.unwrap().unwrap().data,
+            Bytes::from_static(b"first")
+        );
+        assert!(
+            wake.woke.load(Ordering::Acquire),
+            "gate handoff did not wake its waiter"
+        );
+
+        let Poll::Ready(SourceAccess::Acquired(stream)) = waiter.as_mut().poll(&mut cx) else {
+            panic!("released stream was not handed to its waiter");
+        };
+        part_stream.gate.release(stream);
+    }
+
     #[derive(Debug)]
     struct EofOnceStream {
         polls: Arc<AtomicUsize>,
@@ -1181,6 +1250,60 @@ mod test {
         tokio::task::yield_now().await;
 
         assert!(eof.await.unwrap().is_none());
+        assert!(matches!(waiter.await.unwrap(), PartReadStart::Finished));
+        assert!(reader.source_unavailable());
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Debug)]
+    struct ErrorOnceStream {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl PartStream for ErrorOnceStream {
+        fn poll_part(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _stream_cx: &StreamContext,
+        ) -> Poll<Option<std::io::Result<PartData>>> {
+            assert_eq!(
+                self.polls.fetch_add(1, Ordering::Relaxed),
+                0,
+                "custom stream was polled after its terminal error"
+            );
+            Poll::Ready(Some(Err(std::io::Error::other(
+                "simulated terminal source error",
+            ))))
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            crate::io::SizeHint::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_stream_error_retires_waiters_without_another_poll() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(
+            Builder::new()
+                .part_size(5)
+                .stream(InputStream::from_part_stream(ErrorOnceStream {
+                    polls: Arc::clone(&polls),
+                }))
+                .buffer_pool(test_pool())
+                .metrics(test_metrics())
+                .telemetry(test_telemetry())
+                .build()
+                .unwrap(),
+        );
+        let PartReadStart::Ready(failing) = reader.start_part_read().await else {
+            panic!("fresh custom stream was unavailable");
+        };
+        let waiter_reader = Arc::clone(&reader);
+        let waiter = tokio::spawn(async move { waiter_reader.start_part_read().await });
+        tokio::task::yield_now().await;
+
+        assert!(failing.await.is_err());
         assert!(matches!(waiter.await.unwrap(), PartReadStart::Finished));
         assert!(reader.source_unavailable());
         assert_eq!(polls.load(Ordering::Relaxed), 1);
