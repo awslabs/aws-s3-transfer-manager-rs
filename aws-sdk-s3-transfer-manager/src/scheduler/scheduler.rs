@@ -571,6 +571,10 @@ impl Scheduler {
             }
         }
         desc.notify_idle();
+
+        // The panicking work item released a concurrency slot. A peer may already be queued behind
+        // it, including at target=1 where no other completion can re-drive generation.
+        self.generate_work();
     }
 
     fn has_capacity(&self) -> bool {
@@ -942,7 +946,7 @@ mod tests {
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1563,25 +1567,63 @@ mod tests {
         handle.runtime.shutdown();
     }
 
+    #[derive(Debug)]
+    struct PanicAfterSignal {
+        generated: AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl PanicAfterSignal {
+        fn new() -> Self {
+            Self {
+                generated: AtomicBool::new(false),
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl MockStateMachine for PanicAfterSignal {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.generated.swap(true, Ordering::SeqCst) {
+                PollWork::Done
+            } else {
+                PollWork::ready(IoRequest { data: None })
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                panic!("intentional execute panic")
+            })
+        }
+    }
+
     #[cfg_attr(miri, ignore)]
     #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_panic_transfer_cleaned_up_and_error_propagated() {
         let _logs = show_test_logs();
-        let handle = test_handle(2);
+        let handle = test_handle(1);
         let scheduler = &handle.scheduler;
 
         let panic_id = TransferId {
             id: 1,
             parent: None,
         };
-        let panic_sm = Arc::new(WithExecute::new(
-            FixedWorkCount::new(1),
-            |_| -> WorkOutcome { panic!("boom") },
-        ));
-        let panic_mock = MockTransfer::new(panic_id, panic_sm);
+        let panic_sm = Arc::new(PanicAfterSignal::new());
+        let panic_mock = MockTransfer::new(panic_id, Arc::clone(&panic_sm));
         let panic_ctx = panic_mock.ctx().clone();
         scheduler.enqueue_transfer(Box::new(panic_mock));
+        tokio::time::timeout(Duration::from_secs(5), panic_sm.started.notified())
+            .await
+            .expect("panicking work did not occupy the scheduler slot");
 
         let ok_id = TransferId {
             id: 2,
@@ -1589,6 +1631,10 @@ mod tests {
         };
         let ok_sm = Arc::new(FixedWorkCount::new(3));
         scheduler.enqueue_transfer(Box::new(MockTransfer::new(ok_id, ok_sm.clone())));
+        assert_eq!(scheduler.dispatched_for_test(), 1);
+        assert_eq!(ok_sm.completed_count(), 0);
+
+        panic_sm.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {
