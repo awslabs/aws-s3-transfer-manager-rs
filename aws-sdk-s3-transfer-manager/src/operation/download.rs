@@ -130,7 +130,7 @@ impl Download {
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         dest_path: std::path::PathBuf,
-        parent_id: Option<u64>,
+        parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
@@ -149,7 +149,7 @@ impl Download {
 
         let range_start = object_range_start_from_input(&input);
         let inner =
-            Self::orchestrate_with_sink(handle, input, file, range_start, true, parent_id, events)?;
+            Self::orchestrate_with_sink(handle, input, file, range_start, true, parent, events)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -175,7 +175,7 @@ impl Download {
         file: std::fs::File,
         object_range_start: u64,
         owns_file: bool,
-        parent_id: Option<u64>,
+        parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
@@ -190,8 +190,8 @@ impl Download {
         let (writer, _consumer) =
             body::new_recv_body_with_sink(file, object_range_start, owns_file);
 
-        let (ctx, completion_rx) = match parent_id {
-            Some(pid) => TransferContext::new_child(handle.clone(), pid),
+        let (ctx, completion_rx) = match parent {
+            Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
 

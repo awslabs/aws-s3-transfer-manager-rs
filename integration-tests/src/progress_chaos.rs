@@ -192,26 +192,25 @@ async fn assert_chaos(percent: usize, prefix: &str) {
         r.network_tx_after,
     );
 
-    // A composite's byte total permanently omits every byte moved by a child that
-    // then failed. The fold into the parent runs once, at reap, inside the success
-    // arm (`upload_objects/transfer.rs`, the `Ok(_output)` branch), so a child that
-    // pushed most of its object and then failed contributes nothing — not late,
-    // never. At 10% doomed the total lands ~5% short and stays there.
+    // FIXED: a composite counts every byte its children moved, including bytes moved
+    // by a child that then failed.
     //
-    // Asserted as the CURRENT behaviour, not the desired one: a progress bar built
-    // on `metrics()` cannot reach 100% on any run with a failure. Fixing it means
-    // folding as each child records rather than at reap, which changes
-    // `metrics()` for every caller and is therefore its own change, not this one.
+    // This used to assert `network_tx_at_join == expected_success_bytes(percent)` —
+    // the defect. The fold into the parent ran once, at reap, inside the success arm
+    // only, so a child that pushed most of its object and then failed contributed
+    // nothing, not late but never, and a bar built on `metrics()` could not reach
+    // 100% on any run with a failure. `MetricsState` now carries a parent link and
+    // `record_io` walks it, so a child's bytes reach the parent as they move and the
+    // reap-time folds are gone.
     assert!(
         expected_lost_bytes(percent) > 0,
         "the scenario must actually push bytes that then fail, or it proves nothing"
     );
     assert_eq!(
         r.network_tx_at_join,
-        expected_success_bytes(percent),
-        "today the parent counts only successful children's bytes; if this now \
-         equals success + lost, the fold moved off the reap path and this test \
-         should become the FIXED assertion"
+        expected_success_bytes(percent) + expected_lost_bytes(percent),
+        "the parent must count bytes pushed by children that later failed; if this \
+         drops back to success-only, the rollup regressed to a reap-time fold"
     );
 
     // DEFECT 2 — a composite never establishes a byte denominator. `set_total_bytes`

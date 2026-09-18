@@ -411,6 +411,9 @@ impl fmt::Debug for StateMachineStatus {
 
 /// Per-transfer cumulative metrics.
 pub(crate) struct MetricsState {
+    /// The composite this transfer rolls up into, if any. Set once at construction and
+    /// never mutated, so the chain is immutable for the life of the transfer.
+    parent: Option<Arc<MetricsState>>,
     network_tx: AtomicU64,
     network_rx: AtomicU64,
     disk_read: AtomicU64,
@@ -421,8 +424,17 @@ pub(crate) struct MetricsState {
 }
 
 impl MetricsState {
-    pub(crate) fn new() -> Self {
+    /// Root of a rollup chain, or a link in one.
+    ///
+    /// `Arc` and not `Weak`: `MetricsState` holds only counters and timestamps, with no
+    /// pointer to a child, to a `TransferContext`, or to the client `Handle`, so a parent
+    /// edge makes this a chain and a cycle is not constructible. `Weak` would add an
+    /// `upgrade()` per sample and a `None` arm reachable exactly under `Abort`, where
+    /// cancelled siblings are still recording after the parent has gone terminal — and a
+    /// child's bytes would vanish there with nothing to show it happened.
+    pub(crate) fn with_parent(parent: Option<Arc<MetricsState>>) -> Self {
         Self {
+            parent,
             network_tx: AtomicU64::new(0),
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
@@ -433,16 +445,27 @@ impl MetricsState {
         }
     }
 
-    /// Record an IO sample (per-transfer cumulative counters only).
+    /// Record an IO sample into this transfer and every composite above it.
+    ///
+    /// The child add precedes the parent add, so a parent counter is a lower bound on the
+    /// sum of its children at every instant rather than an over-count: every parent
+    /// counter only ever receives a non-negative `fetch_add` and is therefore
+    /// non-decreasing under any interleaving. A reader *can* observe
+    /// `parent < sum(children)` mid-flight — the window is the instructions between two
+    /// adds — so equality holds only at quiescence.
+    ///
+    /// A loop rather than a single `if let`: the depth is 1 today (only leaf operations
+    /// call `new_child`), and a loop needs no re-audit if a composite ever becomes a
+    /// child of another.
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
-        self.network_tx
-            .fetch_add(sample.network_tx, Ordering::Relaxed);
-        self.network_rx
-            .fetch_add(sample.network_rx, Ordering::Relaxed);
-        self.disk_read
-            .fetch_add(sample.disk_read, Ordering::Relaxed);
-        self.disk_write
-            .fetch_add(sample.disk_write, Ordering::Relaxed);
+        let mut cur = Some(self);
+        while let Some(m) = cur {
+            m.network_tx.fetch_add(sample.network_tx, Ordering::Relaxed);
+            m.network_rx.fetch_add(sample.network_rx, Ordering::Relaxed);
+            m.disk_read.fetch_add(sample.disk_read, Ordering::Relaxed);
+            m.disk_write.fetch_add(sample.disk_write, Ordering::Relaxed);
+            cur = m.parent.as_deref();
+        }
     }
 
     /// Set the expected total payload bytes. No-op if already set.
@@ -526,7 +549,7 @@ impl TransferContext {
     /// Create a new transfer context.
     /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, next_transfer_id())
+        Self::new_inner(handle, next_transfer_id(), None)
     }
 
     /// Returns a context + receiver for a child transfer linked to `parent_id`.
@@ -535,23 +558,30 @@ impl TransferContext {
     /// on the child wakes the parent so the parent state machine can reap it.
     /// `scheduler.cancel_transfer(parent_id)` cascades to children via the
     /// parent linkage.
+    /// A child of `parent`, linked both by id and by metrics.
+    ///
+    /// Takes the parent context rather than its id so the two linkages cannot drift: a
+    /// child whose bytes do not roll up is indistinguishable from one that transferred
+    /// nothing, and the composite's own counters would then under-report by exactly that
+    /// child's payload.
     pub(crate) fn new_child(
         handle: Arc<crate::client::Handle>,
-        parent_id: u64,
+        parent: &TransferContext,
     ) -> (Self, StateMachineTerminalReceiver) {
         let mut id = next_transfer_id();
-        id.parent = Some(parent_id);
-        Self::new_inner(handle, id)
+        id.parent = Some(parent.id.id);
+        Self::new_inner(handle, id, Some(parent.metrics.clone()))
     }
 
     fn new_inner(
         handle: Arc<crate::client::Handle>,
         id: TransferId,
+        parent_metrics: Option<Arc<MetricsState>>,
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let ctx = Self {
             id,
-            metrics: Arc::new(MetricsState::new()),
+            metrics: Arc::new(MetricsState::with_parent(parent_metrics)),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
@@ -572,7 +602,7 @@ impl TransferContext {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let ctx = Self {
             id,
-            metrics: Arc::new(MetricsState::new()),
+            metrics: Arc::new(MetricsState::with_parent(None)),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
@@ -1124,6 +1154,81 @@ mod tests {
                 ctx.metrics().finished_at,
                 "a losing transition, and signal_terminal, must not re-stamp"
             );
+        }
+
+        /// A child's bytes reach its parent as they are recorded, and the parent equals
+        /// the sum of its children once everything is quiescent.
+        ///
+        /// This is what replaced the reap-time folds in both composites. Those folded on
+        /// the success arm only, so a child that moved bytes and then failed contributed
+        /// nothing — permanently, not late.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn record_io_rolls_up_into_the_parent() {
+            let sample = |n: u64| crate::metrics::IoSample {
+                network_tx: n,
+                network_rx: 2 * n,
+                disk_read: 3 * n,
+                disk_write: 4 * n,
+            };
+
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child_a = MetricsState::with_parent(Some(parent.clone()));
+            let child_b = MetricsState::with_parent(Some(parent.clone()));
+
+            child_a.record_io(&sample(10));
+            child_b.record_io(&sample(7));
+            child_a.record_io(&sample(3));
+
+            // Each child keeps its own total.
+            assert_eq!(13, child_a.snapshot().network_tx);
+            assert_eq!(7, child_b.snapshot().network_tx);
+
+            // The parent is the sum, on every counter.
+            let p = parent.snapshot();
+            assert_eq!(20, p.network_tx);
+            assert_eq!(40, p.network_rx);
+            assert_eq!(60, p.disk_read);
+            assert_eq!(80, p.disk_write);
+        }
+
+        /// A parent that also has a parent rolls the whole way up, which is why
+        /// `record_io` walks a loop rather than checking one level.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn record_io_rolls_up_through_more_than_one_level() {
+            let root = Arc::new(MetricsState::with_parent(None));
+            let mid = Arc::new(MetricsState::with_parent(Some(root.clone())));
+            let leaf = MetricsState::with_parent(Some(mid.clone()));
+
+            leaf.record_io(&crate::metrics::IoSample {
+                network_tx: 5,
+                network_rx: 0,
+                disk_read: 0,
+                disk_write: 0,
+            });
+
+            assert_eq!(5, leaf.snapshot().network_tx);
+            assert_eq!(5, mid.snapshot().network_tx);
+            assert_eq!(5, root.snapshot().network_tx, "the root must see it too");
+        }
+
+        /// The rollup is bytes only. `total_bytes` and `finished_at` are per-transfer
+        /// facts: a child's own denominator is not a contribution to its parent's, and a
+        /// child finishing does not finish the parent.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn rollup_does_not_propagate_total_bytes_or_finished_at() {
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.set_total_bytes(999);
+            child.set_finished();
+
+            assert_eq!(Some(999), child.snapshot().total_bytes);
+            assert_eq!(None, parent.snapshot().total_bytes);
+            assert!(child.snapshot().finished_at.is_some());
+            assert!(parent.snapshot().finished_at.is_none());
         }
 
         #[cfg_attr(miri, ignore)]

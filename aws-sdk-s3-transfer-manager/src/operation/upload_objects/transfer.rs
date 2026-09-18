@@ -792,7 +792,7 @@ impl UploadObjectsTransfer {
                                 let outcome = Upload::orchestrate_child(
                                     self.inner.ctx.handle.clone(),
                                     input,
-                                    self.inner.ctx.id.id,
+                                    &self.inner.ctx,
                                 );
                                 // announce here, not in
                                 // `merge_spawned`. This is the only point in
@@ -1454,8 +1454,6 @@ impl UploadObjectsTransfer {
         // the pattern open for handles whose completion signal has not yet
         // fully drained.
         let futures = children.into_iter().map(|child| {
-            // Snapshot metrics before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
             // the id and the status must be captured here too.
             // `join()` takes the handle, and a cancelled child returns `Err` just
             // like a failed one, so the status is the only thing that tells them
@@ -1466,14 +1464,7 @@ impl UploadObjectsTransfer {
             let key = child.key;
             async move {
                 let result = child.handle.join().await;
-                (
-                    result,
-                    metrics,
-                    source_path,
-                    key,
-                    child_id,
-                    status_before_join,
-                )
+                (result, source_path, key, child_id, status_before_join)
             }
         });
         let results = futures_util::future::join_all(futures).await;
@@ -1486,7 +1477,7 @@ impl UploadObjectsTransfer {
         // claimed terminal emits, sent after the guard is released.
         let mut pending_emits: Vec<crate::events::PendingEmit> = Vec::new();
 
-        for (result, metrics, source_path, key, child_id, status_before_join) in results {
+        for (result, source_path, key, child_id, status_before_join) in results {
             // One classification, two consumers: the counters below and the
             // lifecycle event. `join()` returns `Err` for a cancelled child and a
             // failed one alike, so the pre-join status is the only thing that
@@ -1506,18 +1497,9 @@ impl UploadObjectsTransfer {
             match result {
                 Ok(_output) => {
                     state.successful_uploads += 1;
-                    // Record directly into the parent's `MetricsState` via
-                    // the field (rather than `TransferContext::record_io`)
-                    // so the child's bytes are aggregated into the parent's
-                    // per-transfer metrics without double-counting them in
-                    // the client-level telemetry counters, which the child's
-                    // own context already updated during its transfer.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // No byte fold here. The child's `MetricsState` carries a parent
+                    // link, so its bytes reached this transfer's counters as they
+                    // moved. Folding again at reap would count every byte twice.
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         tid = %self.inner.ctx.id,

@@ -692,7 +692,6 @@ impl DownloadObjectsTransfer {
 
     fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
         let handle = &self.inner.ctx.handle;
-        let parent_id = self.inner.ctx.id.id;
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -708,7 +707,7 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key, parent_id);
+                let result = self.spawn_single_child(handle, &key);
                 // Announced here rather than in `merge_spawned`: this is the only
                 // point in `poll_work` where the state guard is not held, and
                 // announcing is a send.
@@ -734,7 +733,6 @@ impl DownloadObjectsTransfer {
         &self,
         handle: &Arc<crate::client::Handle>,
         key: &str,
-        parent_id: u64,
     ) -> Result<(ManagedDownloadHandle, PathBuf), Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
@@ -796,7 +794,7 @@ impl DownloadObjectsTransfer {
             file,
             0, // range_start
             true,
-            Some(parent_id),
+            Some(&self.inner.ctx),
             // No sink for the child: the parent announces its own children, so
             // registering one here would announce every child twice.
             None,
@@ -1115,8 +1113,7 @@ impl DownloadObjectsTransfer {
         let mut pending_emits: Vec<crate::events::PendingEmit> = Vec::new();
         for child in children {
             let key = child.key;
-            // Snapshot metrics and id before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
+            // The id must be captured before `join()` consumes the handle.
             let child_id = child.handle.transfer_id();
             let was_cancelled = child.handle.status() == crate::types::TransferStatus::Cancelled;
             let result = child.handle.join().await;
@@ -1134,17 +1131,9 @@ impl DownloadObjectsTransfer {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
                     drop(state);
-                    // Aggregate the child's bytes into the parent's per-transfer
-                    // MetricsState directly (not via record_io on the child's
-                    // context, which already updated the client-level counters
-                    // during the child transfer) so DownloadObjectsOutput.metrics
-                    // reflects the whole directory download without double-counting.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // No byte fold here. The child's `MetricsState` carries a parent
+                    // link, so its bytes reached this transfer's counters as they
+                    // moved. Folding again at reap would count every byte twice.
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();
