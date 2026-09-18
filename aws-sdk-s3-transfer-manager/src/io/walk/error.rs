@@ -22,12 +22,11 @@ pub enum WalkErrorKind {
     Io,
     /// Permission denied on a subdirectory or entry during the walk.
     PermissionDenied,
-    /// A directory could not be read: the `read_dir` itself failed, or opening it
-    /// for cycle detection did. The walk continues with the rest of the tree, but
-    /// that subtree was never enumerated, so a consumer that infers absence from
-    /// the stream must decide for itself whether to keep going. Distinct from an
-    /// entry-level failure so that decision is possible. The underlying
-    /// `io::Error` remains available via [`std::error::Error::source`].
+    /// A directory below the root could not be read: the `read_dir` itself failed,
+    /// or opening it for cycle detection did. The same failure at the root is
+    /// [`SourceUnreadable`](Self::SourceUnreadable), which leaves nothing to walk;
+    /// here the walk continues with the rest of the tree, but that subtree was never
+    /// enumerated.
     DirectoryUnreadable,
     /// Symlink encountered with no valid target.
     BrokenSymlink,
