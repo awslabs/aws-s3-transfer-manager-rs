@@ -316,6 +316,130 @@ async fn test_download_write_to_file() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
+/// Every entry point that accepts `.events(sink)` must actually report.
+///
+/// `write_to_file` took a sink and threw it away: it built the input and called
+/// `orchestrate_to_file`, which passed `None` for events, so a caller got a handle, a
+/// correct download, and total silence on a stream it had registered. Nothing failed and
+/// nothing warned — the failure mode of a builder method that quietly ignores half its
+/// configuration.
+///
+/// Covered as a table over all three single-object download entry points rather than as one
+/// test for the one that was broken, because the defect is *per entry point* and a fourth
+/// would be just as silent. A single-object transfer is one entry, so the shape is the same
+/// for all three: one `Decided` with no parent carrying a view, one `Settled` succeeding, and
+/// the view's counter reaching the object size.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_single_object_entry_points_all_report_events() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::ByteTotal;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    enum Sink {
+        Path,
+        File,
+        Body,
+    }
+
+    let size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+
+    for variant in [Sink::Path, Sink::File, Sink::Body] {
+        let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+        let m = setup_concurrent(part_size, 8).await;
+        let content = deterministic_data(size);
+        m.server
+            .add_object("test-bucket", "ev-key", content.clone(), None)
+            .await
+            .expect("add object");
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let req = m
+            .client
+            .download()
+            .bucket("test-bucket")
+            .key("ev-key")
+            .events(sink);
+
+        // Each arm drives the transfer to completion and drops its handle, which is what
+        // releases the sink and ends the stream.
+        match variant {
+            Sink::Path => {
+                let h = req
+                    .write_to_path(dir.path().join("out.dat"))
+                    .await
+                    .expect("write_to_path");
+                h.join().await.expect("join");
+            }
+            Sink::File => {
+                let f = std::fs::File::create(dir.path().join("out.dat")).unwrap();
+                let h = req.write_to_file(f).expect("write_to_file");
+                h.join().await.expect("join");
+            }
+            Sink::Body => {
+                let mut h = req.initiate().expect("initiate");
+                drain_body(&mut h).await.expect("drain body");
+                h.join().await.expect("join");
+            }
+        }
+
+        // A single-object transfer's `Settled` is emitted from `on_terminal`, which the
+        // scheduler runs *after* `join()` has returned — `signal_terminal` wakes the joiner
+        // first. So a consumer-facing fact: `join()` returning does not mean the terminal
+        // event has been delivered. Polled with a deadline rather than awaiting stream
+        // termination (the sink outlives the handle, so awaiting `None` hangs) and rather
+        // than draining once (which passes or fails on the rename's wall-clock — the
+        // `write_to_path` arm of this test did exactly that before the deadline was added).
+        let mut decided = 0usize;
+        let mut settled = 0usize;
+        let mut view = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while settled == 0 && tokio::time::Instant::now() < deadline {
+            match stream.try_next() {
+                Ok(TransferEvent::Decided {
+                    parent: None,
+                    view: v,
+                    ..
+                }) => {
+                    decided += 1;
+                    view = v;
+                }
+                Ok(TransferEvent::Settled { parent: None, .. }) => settled += 1,
+                Ok(_) => continue,
+                // Empty: the terminal has not been emitted yet. Disconnected: every sink is
+                // gone, so nothing more is coming and the loop should stop.
+                Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            1, decided,
+            "{variant:?}: a registered sink must receive exactly one Decided"
+        );
+        assert_eq!(1, settled, "{variant:?}: and exactly one Settled");
+        let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
+        assert_eq!(
+            size as u64,
+            view.metrics().network_rx,
+            "{variant:?}: the view must report the bytes that moved"
+        );
+        assert_eq!(
+            ByteTotal::Final(size as u64),
+            view.byte_total(),
+            "{variant:?}: a single object's length is known, so its total is final"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    }
+}
+
 /// Test ranged download to file path (bytes 10000000-59999999 of 100 MB object).
 #[cfg(any(unix, windows))]
 #[tokio::test]

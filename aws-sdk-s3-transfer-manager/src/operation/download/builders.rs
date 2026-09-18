@@ -93,7 +93,18 @@ impl DownloadFluentBuilder {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file)
+        // The destination is `Stream`, not `Local`: the caller opened the file and this
+        // method is never told its path, so naming one would put an address in the event
+        // that the transfer manager cannot know. `Unresolved` would be wrong the other way
+        // -- it means "could not be determined", where here there is a real sink the caller
+        // already holds.
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Stream {},
+            });
+        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file, events)
     }
 
     /// <p>The bucket name containing the object.</p>

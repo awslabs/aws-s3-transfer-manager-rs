@@ -160,10 +160,11 @@ impl Download {
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
+        events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let range_start = object_range_start_from_input(&input);
         let inner =
-            Self::orchestrate_with_sink(handle, input, file, range_start, false, None, None)?;
+            Self::orchestrate_with_sink(handle, input, file, range_start, false, None, events)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
