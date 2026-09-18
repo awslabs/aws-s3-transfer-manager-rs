@@ -618,7 +618,7 @@ impl StorageBackend for InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ObjectIntegrityChecks;
+    use crate::types::{ClientChecksums, ObjectIntegrityChecks};
     use futures::StreamExt;
     use std::collections::HashMap;
     use std::pin::Pin;
@@ -950,7 +950,7 @@ mod tests {
         let etag1 = storage.upload_part(request).await.unwrap();
 
         let valid_etag = etag1.etag;
-        let parts_to_complete = vec![(1, valid_etag.clone()), (2, "missing-etag".to_string())];
+        let parts_to_complete = vec![(1, "wrong-etag".to_string())];
         let request = crate::storage::CompleteMultipartUploadRequest {
             bucket: TEST_BUCKET,
             upload_id,
@@ -977,6 +977,68 @@ mod tests {
             .complete_multipart_upload(request)
             .await
             .expect("a corrected completion request must be retryable");
+    }
+
+    #[tokio::test]
+    async fn test_checksum_rejection_retains_multipart_upload() {
+        let storage = InMemoryStorage::new();
+        let upload_id = "test-upload-checksum";
+        let key = "test-multipart-checksum-key";
+        let mut metadata = create_test_metadata(0);
+        metadata.checksum_algorithm = Some(aws_smithy_checksums::ChecksumAlgorithm::Crc32);
+
+        storage
+            .create_multipart_upload(crate::storage::CreateMultipartUploadRequest {
+                bucket: TEST_BUCKET,
+                key,
+                upload_id,
+                metadata,
+                checksum_type: aws_sdk_s3::types::ChecksumType::FullObject,
+            })
+            .await
+            .unwrap();
+
+        let etag = storage
+            .upload_part(crate::storage::UploadPartRequest {
+                upload_id,
+                part_number: 1,
+                content: Bytes::from_static(b"part1"),
+            })
+            .await
+            .unwrap()
+            .etag;
+        let invalid_checksum = ClientChecksums {
+            crc32: Some("AAAAAA==".to_string()),
+            crc32c: None,
+            sha1: None,
+            sha256: None,
+            crc64nvme: None,
+        };
+
+        let result = storage
+            .complete_multipart_upload(crate::storage::CompleteMultipartUploadRequest {
+                bucket: TEST_BUCKET,
+                upload_id,
+                parts: vec![(1, etag.clone())],
+                client_checksums: Some(&invalid_checksum),
+            })
+            .await;
+        assert!(matches!(result, Err(Error::ChecksumMismatch(_))));
+        assert_eq!(
+            storage.list_parts(upload_id).await.unwrap().len(),
+            1,
+            "checksum rejection must retain multipart state"
+        );
+
+        storage
+            .complete_multipart_upload(crate::storage::CompleteMultipartUploadRequest {
+                bucket: TEST_BUCKET,
+                upload_id,
+                parts: vec![(1, etag)],
+                client_checksums: None,
+            })
+            .await
+            .expect("completion must remain retryable after checksum rejection");
     }
 
     #[tokio::test]
