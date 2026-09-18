@@ -126,7 +126,7 @@ under `io::key*` is new.
 ```
    existing, extended here                   new here
    ───────────────────────                   ────────
-   FsWalk      + key_order, path_filter,     Entry<T>, EntryMeta   what both sides emit
+   FsWalk      + sort_order, path_filter,    Entry<T>, EntryMeta   what both sides emit
                include_special_files         FileType              what the filesystem said is there
    S3Walk      + prefix()                    KeyStream             the trait they both implement
    FsEntry     file_type, metadata, root     KeyFilter, Rule       include and exclude rules
@@ -136,8 +136,8 @@ under `io::key*` is new.
                                              strip_key_prefix
 ```
 
-Four of these are public, which is the part a caller can come to depend on: `FsWalk::key_order`,
-the switch that turns on S3 ordering; `FsEntry`, whose accessors say what the filesystem reported
+Four of these are public, which is the part a caller can come to depend on: `SortOrder`, which
+replaces the two booleans that used to select an order; `FsEntry`, whose accessors say what the filesystem reported
 and how the walk arrived; `FileType`, which names what is at a path; and one new `WalkErrorKind`
 variant, `DirectoryUnreadable`. `FileType` and `WalkErrorKind` are both `#[non_exhaustive]`, so a
 kind added later breaks nobody.
@@ -443,7 +443,7 @@ same at every size, so a rising curve would mean the walk reads more than it nee
 emitting anything.
 
 ```
-   entries      breadth    key_order
+   entries      within     whole_walk
       1,000    46.40 µs     46.05 µs
      10,000    46.00 µs     46.40 µs
      50,000    46.61 µs     46.32 µs
@@ -452,12 +452,12 @@ emitting anything.
 Fifty times the entries moves nothing: all six medians fall within 1.4% of each other, and no
 confidence interval is wider than ±0.5%.
 
-**Ordering costs nothing in throughput.** Key order is faster on all three shapes, by 2.1%, 9.5%
-and 3.8%, because breadth-first's sort compares whole paths while key order compares names and
-skips the shared prefix on every comparison.
+**Ordering costs nothing in throughput.** A whole-walk order is faster on all three shapes, by
+2.1%, 9.5% and 3.8%, because sorting within a directory compares whole paths while a whole-walk
+order compares names and skips the shared prefix on every comparison.
 
 ```
-   shape                     breadth    key_order
+   shape                      within     whole_walk
    wide_1dir_10k            17.67 ms     17.29 ms
    deep_100dirs_100each     65.25 ms     59.05 ms
    balanced_f10_d3_10each   55.62 ms     53.53 ms
@@ -466,7 +466,7 @@ skips the shared prefix on every comparison.
 **Peak memory, in bytes, from a tracking allocator in the bench crate.**
 
 ```
-   shape                          entries      breadth    key_order
+   shape                          entries       within     whole_walk
    bounded_fanout_1000_per_dir       1,000      603,268      489,124
    bounded_fanout_1000_per_dir      10,000      709,702      492,324
    bounded_fanout_1000_per_dir      50,000      713,910      504,212

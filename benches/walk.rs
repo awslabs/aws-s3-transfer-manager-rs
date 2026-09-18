@@ -4,13 +4,13 @@
  */
 
 // Filesystem walk benchmarks: cost per entry, and what ordering adds on top.
-// `sort` is breadth-first; `key_order` is depth-first in ListObjectsV2 key order,
+// `WithinDirectory` is breadth-first; `WholeWalk` is depth-first in key order,
 // which must descend a subtree before emitting a sibling that sorts after it.
 //
 // Caches are warm — criterion re-walks the same fixture and there is no portable
 // way to drop page cache — so these are upper bounds.
 
-use aws_sdk_s3_transfer_manager::io::walk::{FsWalkContext, FsWalker};
+use aws_sdk_s3_transfer_manager::io::walk::{FsWalkContext, FsWalker, SortOrder};
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use std::path::Path;
@@ -111,15 +111,14 @@ fn build_early_first_key(root: &Path, bulk: usize) -> usize {
     count
 }
 
-fn walker(key_order: bool) -> FsWalker {
-    walker_with(key_order, false)
+fn walker(order: SortOrder) -> FsWalker {
+    walker_with(order, false)
 }
 
-fn walker_with(key_order: bool, follow_symlinks: bool) -> FsWalker {
+fn walker_with(order: SortOrder, follow_symlinks: bool) -> FsWalker {
     FsWalker::builder()
         .recursive(true)
-        .sort(true)
-        .key_order(key_order)
+        .sort_order(order)
         .follow_symlinks(follow_symlinks)
         .build()
 }
@@ -129,7 +128,7 @@ fn walker_with(key_order: bool, follow_symlinks: bool) -> FsWalker {
 fn drain_follow(rt: &tokio::runtime::Runtime, root: &Path, follow_symlinks: bool) -> usize {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
-        let mut walk = walker_with(false, follow_symlinks).walk(ctx);
+        let mut walk = walker_with(SortOrder::WithinDirectory, follow_symlinks).walk(ctx);
         let mut n = 0;
         while let Some(result) = walk.next().await {
             if result.is_ok() {
@@ -158,10 +157,10 @@ fn walk_cycle_detection_cost(c: &mut Criterion) {
     group.finish();
 }
 
-fn drain(rt: &tokio::runtime::Runtime, root: &Path, key_order: bool) -> usize {
+fn drain(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> usize {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
-        let mut walk = walker(key_order).walk(ctx);
+        let mut walk = walker(order).walk(ctx);
         let mut n = 0;
         while let Some(result) = walk.next().await {
             if result.is_ok() {
@@ -172,10 +171,10 @@ fn drain(rt: &tokio::runtime::Runtime, root: &Path, key_order: bool) -> usize {
     })
 }
 
-fn time_to_first_entry(rt: &tokio::runtime::Runtime, root: &Path, key_order: bool) -> Duration {
+fn time_to_first_entry(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> Duration {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
-        let mut walk = walker(key_order).walk(ctx);
+        let mut walk = walker(order).walk(ctx);
         let start = Instant::now();
         while let Some(result) = walk.next().await {
             if result.is_ok() {
@@ -209,14 +208,13 @@ fn walk_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("walk_throughput");
     for (label, dir, count) in &fixtures {
         group.throughput(Throughput::Elements(*count as u64));
-        for (mode, key_order) in [("breadth", false), ("key_order", true)] {
-            group.bench_with_input(
-                BenchmarkId::new(*label, mode),
-                &key_order,
-                |b, &key_order| {
-                    b.iter(|| black_box(drain(&rt, dir.path(), key_order)));
-                },
-            );
+        for (mode, order) in [
+            ("within_directory", SortOrder::WithinDirectory),
+            ("whole_walk", SortOrder::WholeWalk),
+        ] {
+            group.bench_with_input(BenchmarkId::new(*label, mode), &order, |b, &order| {
+                b.iter(|| black_box(drain(&rt, dir.path(), order)));
+            });
         }
     }
     group.finish();
@@ -232,12 +230,15 @@ fn walk_first_entry_latency(c: &mut Criterion) {
     assert!(build_front_loaded(dir.path(), 100, 10) > 0);
 
     let mut group = c.benchmark_group("walk_first_entry");
-    for (mode, key_order) in [("breadth", false), ("key_order", true)] {
+    for (mode, order) in [
+        ("within_directory", SortOrder::WithinDirectory),
+        ("whole_walk", SortOrder::WholeWalk),
+    ] {
         group.bench_function(BenchmarkId::new("front_loaded_100dirs", mode), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    total += time_to_first_entry(&rt, dir.path(), key_order);
+                    total += time_to_first_entry(&rt, dir.path(), order);
                 }
                 total
             });
@@ -264,12 +265,15 @@ fn walk_first_entry_scaling(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("walk_first_entry_scaling");
     for (bulk, dir) in &fixtures {
-        for (mode, key_order) in [("breadth", false), ("key_order", true)] {
+        for (mode, order) in [
+            ("within_directory", SortOrder::WithinDirectory),
+            ("whole_walk", SortOrder::WholeWalk),
+        ] {
             group.bench_function(BenchmarkId::new(mode, bulk), |b| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += time_to_first_entry(&rt, dir.path(), key_order);
+                        total += time_to_first_entry(&rt, dir.path(), order);
                     }
                     total
                 });
@@ -337,10 +341,10 @@ mod peak {
 #[global_allocator]
 static ALLOC: peak::Tracking = peak::Tracking;
 
-fn peak_bytes_draining(rt: &tokio::runtime::Runtime, root: &Path, key_order: bool) -> usize {
+fn peak_bytes_draining(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> usize {
     let baseline = peak::live();
     peak::start();
-    let drained = drain(rt, root, key_order);
+    let drained = drain(rt, root, order);
     assert!(drained > 0);
     peak::since_start(baseline)
 }
@@ -360,15 +364,15 @@ fn report_peak_memory() {
     println!("\npeak bytes while draining a walk");
     println!(
         "{:<30} {:>8} {:>12} {:>12}",
-        "shape", "entries", "breadth", "key_order"
+        "shape", "entries", "within_directory", "whole_walk"
     );
 
     // Bounded fanout, growing total: the case that has to stay flat.
     for bulk in [1_000usize, 10_000, 50_000] {
         let dir = TempDir::new().unwrap();
         let count = build_early_first_key(dir.path(), bulk);
-        let breadth = peak_bytes_draining(&rt, dir.path(), false);
-        let ordered = peak_bytes_draining(&rt, dir.path(), true);
+        let breadth = peak_bytes_draining(&rt, dir.path(), SortOrder::WithinDirectory);
+        let ordered = peak_bytes_draining(&rt, dir.path(), SortOrder::WholeWalk);
         println!(
             "{:<30} {count:>8} {breadth:>12} {ordered:>12}",
             "bounded_fanout_1000_per_dir"
@@ -379,8 +383,8 @@ fn report_peak_memory() {
     for files in [1_000usize, 10_000, 50_000] {
         let dir = TempDir::new().unwrap();
         let count = build_wide(dir.path(), files);
-        let breadth = peak_bytes_draining(&rt, dir.path(), false);
-        let ordered = peak_bytes_draining(&rt, dir.path(), true);
+        let breadth = peak_bytes_draining(&rt, dir.path(), SortOrder::WithinDirectory);
+        let ordered = peak_bytes_draining(&rt, dir.path(), SortOrder::WholeWalk);
         println!(
             "{:<30} {count:>8} {breadth:>12} {ordered:>12}",
             "one_wide_directory"
@@ -393,8 +397,8 @@ fn report_peak_memory() {
     for depth in [25usize, 50, 100] {
         let dir = TempDir::new().unwrap();
         let count = build_deep(dir.path(), depth, 100);
-        let breadth = peak_bytes_draining(&rt, dir.path(), false);
-        let ordered = peak_bytes_draining(&rt, dir.path(), true);
+        let breadth = peak_bytes_draining(&rt, dir.path(), SortOrder::WithinDirectory);
+        let ordered = peak_bytes_draining(&rt, dir.path(), SortOrder::WholeWalk);
         println!(
             "{:<30} {count:>8} {breadth:>12} {ordered:>12}",
             format!("chain_depth_{depth}_100_per_dir")

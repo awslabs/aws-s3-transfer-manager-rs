@@ -219,6 +219,40 @@ type FilterFn = Arc<dyn Fn(&FsEntry) -> bool + Send + Sync>;
 // Consulted with a path relative to the root, before any metadata is read.
 type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
+/// How a walk orders the entries it produces.
+///
+/// The default is [`Native`](SortOrder::Native).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    /// Whatever order the filesystem gave, which is not guaranteed to be stable between runs.
+    #[default]
+    Native,
+
+    /// Each directory's entries ordered among themselves, lexicographically by path.
+    ///
+    /// The traversal stays breadth-first, so a directory's files come out before its
+    /// subdirectories are descended, and entries are not ordered against entries elsewhere in
+    /// the tree. [`try_claim_subtree`](FsWalk::try_claim_subtree) stays available, and claims come
+    /// in the same order every run.
+    WithinDirectory,
+
+    /// Every entry ordered against every other, lexicographically by the key it would produce.
+    ///
+    /// A directory is compared as if its name ended in `/`, which is what places `a.txt` before
+    /// `a/c`: `a.` sorts before `a/`. Note that this is not the order of the paths themselves,
+    /// where `a` would sort before `a.txt`.
+    ///
+    /// A merge against a bucket listing needs this, since it reads "absent from the other side"
+    /// from position alone. General-purpose buckets list keys this way.
+    ///
+    /// Two costs come with it. [`try_claim_subtree`](FsWalk::try_claim_subtree) is unavailable,
+    /// because ordered emission has to descend before it can know what comes next. And
+    /// time-to-first-entry grows, because subtrees sorting ahead of a sibling file must be read
+    /// first.
+    WholeWalk,
+}
+
 /// Configuration for walking a local filesystem directory.
 ///
 /// Configuration for walking a local directory tree.
@@ -271,8 +305,7 @@ type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 pub struct FsWalker {
     follow_symlinks: bool,
     max_depth: usize,
-    sort: bool,
-    key_order: bool,
+    sort_order: SortOrder,
     include_special_files: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
@@ -284,8 +317,7 @@ impl std::fmt::Debug for FsWalker {
         f.debug_struct("FsWalker")
             .field("follow_symlinks", &self.follow_symlinks)
             .field("max_depth", &self.max_depth)
-            .field("sort", &self.sort)
-            .field("key_order", &self.key_order)
+            .field("sort_order", &self.sort_order)
             .field("canonicalize_root", &self.canonicalize_root)
             .finish()
     }
@@ -345,7 +377,7 @@ impl FsWalker {
             depth: 0,
             ancestor_handles: Vec::new(),
         };
-        let cursor = match (done, self.key_order) {
+        let cursor = match (done, self.sort_order == SortOrder::WholeWalk) {
             (true, true) => Cursor::KeyOrder { stack: Vec::new() },
             (true, false) => Cursor::Breadth {
                 pending_dirs: VecDeque::new(),
@@ -364,7 +396,7 @@ impl FsWalker {
             ?root,
             follow_symlinks = self.follow_symlinks,
             max_depth = self.max_depth,
-            sort = self.sort,
+            sort_order = ?self.sort_order,
             "fs walk started",
         );
 
@@ -388,8 +420,7 @@ impl FsWalker {
 pub struct FsWalkerBuilder {
     follow_symlinks: bool,
     max_depth: usize,
-    sort: bool,
-    key_order: bool,
+    sort_order: SortOrder,
     include_special_files: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
@@ -401,7 +432,7 @@ impl std::fmt::Debug for FsWalkerBuilder {
         f.debug_struct("FsWalkerBuilder")
             .field("follow_symlinks", &self.follow_symlinks)
             .field("max_depth", &self.max_depth)
-            .field("sort", &self.sort)
+            .field("sort_order", &self.sort_order)
             .field("canonicalize_root", &self.canonicalize_root)
             .finish()
     }
@@ -462,37 +493,10 @@ impl FsWalkerBuilder {
         self
     }
 
-    /// Enable lexicographic sorting of entries within each directory.
-    ///
-    /// When `true`, each directory's entries are sorted by full path. Sorting is
-    /// per directory, not global: the traversal is breadth-first, so a
-    /// directory's files are emitted before its subdirectories are descended.
-    /// For a globally ordered walk see [`key_order`](Self::key_order).
-    ///
-    /// When `false` (default), entries are returned in OS-native order.
+    /// How to order the entries this walk produces. See [`SortOrder`].
     #[must_use]
-    pub fn sort(mut self, sort: bool) -> Self {
-        self.sort = sort;
-        self
-    }
-
-    /// Emit entries in `ListObjectsV2` key order, so the walk can be merge-joined
-    /// against a bucket listing. Defaults to `false`.
-    ///
-    /// This selects a depth-first traversal and compares a directory as if its
-    /// name ended in `/`, which is what places `a.txt` before `a/c`. Sorting
-    /// alone is not sufficient: a breadth-first walk emits every file of a
-    /// directory before descending, so it can never place a nested key between
-    /// two siblings.
-    ///
-    /// Implies [`sort`](Self::sort). Two costs come with it:
-    /// [`try_claim_subtree`](FsWalk::try_claim_subtree) is unavailable, since
-    /// ordered emission has to descend before it can know what comes next, and
-    /// time-to-first-entry grows because subtrees sorting ahead of a sibling file
-    /// must be read first.
-    #[must_use]
-    pub fn key_order(mut self, key_order: bool) -> Self {
-        self.key_order = key_order;
+    pub fn sort_order(mut self, sort_order: SortOrder) -> Self {
+        self.sort_order = sort_order;
         self
     }
 
@@ -564,9 +568,8 @@ impl FsWalkerBuilder {
         FsWalker {
             follow_symlinks: self.follow_symlinks,
             max_depth: self.max_depth,
-            sort: self.sort,
+            sort_order: self.sort_order,
             include_special_files: self.include_special_files,
-            key_order: self.key_order,
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
             path_filter: self.path_filter,
@@ -779,7 +782,7 @@ impl FsWalk {
     /// Subtrees are claimed in the order [`next`](Self::next) would have visited
     /// them.
     ///
-    /// Always returns `None` for a [`key_order`](FsWalkerBuilder::key_order)
+    /// Always returns `None` for a [`SortOrder::WholeWalk`]
     /// walk: emitting in key order requires descending into a subtree before a
     /// sibling that sorts after it can be emitted, so by the time entries come
     /// out there is little left to hand off, and handing off the next-needed
@@ -1046,9 +1049,9 @@ impl FsWalk {
             }
         }
 
-        if self.config.key_order {
+        if self.config.sort_order == SortOrder::WholeWalk {
             result.children.sort_by(cmp_key_form);
-        } else if self.config.sort {
+        } else if self.config.sort_order == SortOrder::WithinDirectory {
             result.children.sort_by(|a, b| a.path().cmp(b.path()));
         }
 
@@ -1735,7 +1738,10 @@ mod tests {
         fs::write(dir.path().join("apple.txt"), "").unwrap();
         fs::write(dir.path().join("mango.txt"), "").unwrap();
 
-        let walk = walker().sort(true).build().walk(ctx(dir.path()));
+        let walk = walker()
+            .sort_order(SortOrder::WithinDirectory)
+            .build()
+            .walk(ctx(dir.path()));
         let (entries, _) = collect_entries(walk).await;
         let names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         assert_eq!(names, vec!["apple.txt", "mango.txt", "zebra.txt"]);
@@ -1753,7 +1759,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (entries, _) = collect_entries(walk).await;
@@ -1798,7 +1804,10 @@ mod tests {
         fs::write(dir.path().join("🦀.txt"), "").unwrap();
         fs::write(dir.path().join("file with spaces.txt"), "").unwrap();
 
-        let walk = walker().sort(true).build().walk(ctx(dir.path()));
+        let walk = walker()
+            .sort_order(SortOrder::WithinDirectory)
+            .build()
+            .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
         assert!(
             errors.is_empty(),
@@ -1988,7 +1997,7 @@ mod tests {
         let walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -2196,7 +2205,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .filter(move |entry| {
                 collected_clone
                     .lock()
@@ -2228,7 +2237,7 @@ mod tests {
 
         let walk = walker()
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -2261,7 +2270,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(0)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -2273,7 +2282,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(1)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -2286,7 +2295,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(2)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -2299,7 +2308,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(3)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -2398,7 +2407,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // Read root: next() reads the root dir, populating pending_dirs with
@@ -2424,7 +2433,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // Read root to populate pending_dirs with [other, sub] (sorted).
@@ -2463,7 +2472,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // yields top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2487,7 +2496,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // yields root_file.txt; pending_dirs = [c, zz_unrelated]
@@ -2514,7 +2523,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // yields top.txt; pending_dirs = [a, zz_unrelated]
@@ -2599,7 +2608,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
             .build()
             .walk(ctx(dir.path()));
@@ -2633,7 +2642,7 @@ mod tests {
         // max_depth=2: should yield d0.txt, a/d1.txt, a/b/d2.txt but NOT a/b/c/d3.txt.
         let mut walk = walker()
             .max_depth(2)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let entry = walk.next().await.unwrap().unwrap();
@@ -2663,7 +2672,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2694,7 +2703,7 @@ mod tests {
         let mut walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2731,7 +2740,7 @@ mod tests {
         let mut walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2770,7 +2779,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let entry = walk.next().await.unwrap().unwrap();
@@ -2814,7 +2823,7 @@ mod tests {
         let mut walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2845,7 +2854,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // First next() reads root: files [a.txt, b.txt] go to ready_files,
@@ -2877,7 +2886,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [empty, zz_unrelated]
@@ -2916,7 +2925,7 @@ mod tests {
         // With sort, pending_dirs after root read will be [aaa, bbb, ccc, ddd].
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt
@@ -2950,7 +2959,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
 
@@ -3039,7 +3048,7 @@ mod tests {
         // Serial walk for reference
         let serial_walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (serial_entries, _) = collect_entries(serial_walk).await;
@@ -3052,7 +3061,7 @@ mod tests {
         // Parallel walk: prime, claim all subtrees, spawn concurrently
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // Prime: first next() reads root, populating pending_dirs
@@ -3098,7 +3107,7 @@ mod tests {
     // --- S3 key-order tests ---
 
     // Entries must be emitted in UTF-8 byte order, as ListObjectsV2 returns keys.
-    fn assert_s3_key_order(entries: &[FsEntry]) {
+    fn assert_whole_walk_order(entries: &[FsEntry]) {
         let emitted: Vec<String> = entries.iter().map(|e| norm(e.relative_path())).collect();
         let mut expected = emitted.clone();
         expected.sort();
@@ -3111,7 +3120,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_sorted_walk_key_order_nested_before_sibling() {
+    async fn test_whole_walk_places_nested_before_sibling() {
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join("a")).unwrap();
         fs::write(dir.path().join("a/c"), "").unwrap();
@@ -3119,7 +3128,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .key_order(true)
+            .sort_order(SortOrder::WholeWalk)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -3127,12 +3136,12 @@ mod tests {
 
         // 'z' (0x7A) > '/' (0x2F), so the nested key comes first.
         assert_eq!(emitted(&entries), vec!["a/c", "az.txt"]);
-        assert_s3_key_order(&entries);
+        assert_whole_walk_order(&entries);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_sorted_walk_key_order_shared_prefix() {
+    async fn test_whole_walk_orders_a_shared_prefix() {
         let dir = tempdir().unwrap();
         fs::create_dir(dir.path().join("test")).unwrap();
         fs::write(dir.path().join("test/inner.txt"), "").unwrap();
@@ -3142,7 +3151,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .key_order(true)
+            .sort_order(SortOrder::WholeWalk)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -3153,12 +3162,12 @@ mod tests {
             emitted(&entries),
             vec!["test-123.txt", "test.txt", "test/inner.txt", "test0.txt"]
         );
-        assert_s3_key_order(&entries);
+        assert_whole_walk_order(&entries);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_sorted_walk_key_order_across_depths() {
+    async fn test_whole_walk_orders_across_depths() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("b/c")).unwrap();
         fs::write(dir.path().join("b/c/d.txt"), "").unwrap();
@@ -3168,7 +3177,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .key_order(true)
+            .sort_order(SortOrder::WholeWalk)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -3178,7 +3187,7 @@ mod tests {
             emitted(&entries),
             vec!["b.txt", "b/c/d.txt", "b/z.txt", "ba.txt"]
         );
-        assert_s3_key_order(&entries);
+        assert_whole_walk_order(&entries);
     }
 
     // Random tree; returns the file count. Fragments bracket '/' (0x2F) in byte
@@ -3206,7 +3215,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_sorted_walk_key_order_property() {
+    async fn test_whole_walk_order_holds_for_random_trees() {
         for seed in 0..32u64 {
             let mut rng = fastrand::Rng::with_seed(seed);
             let dir = tempdir().unwrap();
@@ -3214,7 +3223,7 @@ mod tests {
 
             let walk = walker()
                 .recursive(true)
-                .key_order(true)
+                .sort_order(SortOrder::WholeWalk)
                 .build()
                 .walk(ctx(dir.path()));
             let (entries, errors) = collect_entries(walk).await;
@@ -3246,7 +3255,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
 

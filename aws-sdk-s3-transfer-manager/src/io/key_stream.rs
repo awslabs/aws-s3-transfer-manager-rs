@@ -362,6 +362,7 @@ fn key_and_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::walk::SortOrder;
     use crate::io::walk::{FsWalkContext, FsWalker, S3WalkContext, S3Walker};
     use aws_sdk_s3::types::{ObjectStorageClass, RestoreStatus};
     use aws_smithy_types::DateTime;
@@ -371,7 +372,7 @@ mod tests {
     fn local(root: &std::path::Path) -> FsWalk {
         FsWalker::builder()
             .recursive(true)
-            .key_order(true)
+            .sort_order(SortOrder::WholeWalk)
             .include_special_files(true)
             .build()
             .walk(FsWalkContext::builder().root(root).build())
@@ -926,7 +927,7 @@ mod tests {
         let filter = Arc::new(KeyFilter::new(rules));
         FsWalker::builder()
             .recursive(true)
-            .key_order(true)
+            .sort_order(SortOrder::WholeWalk)
             // On, so the socket test proves the filter suppresses a report that would
             // otherwise fire.
             .include_special_files(true)
@@ -1165,7 +1166,7 @@ mod tests {
 
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .key_order(true)
+            .sort_order(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
