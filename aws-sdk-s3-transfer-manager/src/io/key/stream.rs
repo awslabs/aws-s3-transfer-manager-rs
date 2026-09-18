@@ -31,7 +31,10 @@ use crate::io::walk::{
 // local precision would make an identical pair differ every run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryMeta {
-    pub(crate) size: u64,
+    // `None` when the side never read it. A number invented here would be a length nobody
+    // observed, and a real zero-byte object would be indistinguishable from an entry the walk
+    // could not describe.
+    pub(crate) size: Option<u64>,
     // `None` when the platform cannot represent the recorded time. Substituting a
     // value here would hand a comparison a number nobody observed, with nothing to
     // say so.
@@ -278,10 +281,11 @@ impl KeyStream for FsWalk {
                     Ok(key) => key,
                     Err(err) => return Some(Err(err)),
                 };
+                // An entry the walk could not describe carries neither field. A comparison cannot
+                // decide such a key on size or time and has to hold it: the name is taken, which is
+                // what keeps a delete off it, but nothing here says whether it matches.
                 let meta = EntryMeta {
-                    // A walk that read no metadata gives a zero-sized entry with no time, which
-                    // a comparison reads as differing from anything and never skips.
-                    size: entry.metadata().map_or(0, |m| m.len()),
+                    size: entry.metadata().map(|m| m.len()),
                     last_modified_secs: entry
                         .metadata()
                         .and_then(|m| secs_since_epoch(m.modified())),
@@ -402,9 +406,12 @@ fn key_and_meta(
         key: Some(relative.to_string()),
         what,
     };
+    // A negative length is impossible, so it is a malformed listing rather than a size to cast.
+    // Wrapping it would give an enormous length a comparison reads as real.
     let size = obj
         .size()
         .ok_or_else(|| malformed("listing returned no size"))?;
+    let size = u64::try_from(size).map_err(|_| malformed("listing returned a negative size"))?;
     let last_modified_secs = obj
         .last_modified()
         .ok_or_else(|| malformed("listing returned no last-modified"))?
@@ -412,7 +419,7 @@ fn key_and_meta(
     Ok(Some((
         relative.to_string(),
         EntryMeta {
-            size: size as u64,
+            size: Some(size),
             // Always present: a listing without one is rejected above.
             last_modified_secs: Some(last_modified_secs),
         },
@@ -492,7 +499,7 @@ mod tests {
         fs::write(dir.path().join("f"), "hello").unwrap();
 
         let entry = local(dir.path()).next_entry().await.unwrap().unwrap();
-        assert_eq!(entry.meta.size, 5);
+        assert_eq!(entry.meta.size, Some(5));
         assert!(entry.meta.last_modified_secs.unwrap() > 1_600_000_000);
         // What a transfer opens, not a path rebuilt from the key.
         assert_eq!(entry.source.path(), dir.path().join("f"));
@@ -930,7 +937,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(key, "a/b.txt");
-        assert_eq!(meta.size, 3);
+        assert_eq!(meta.size, Some(3));
         assert_eq!(meta.last_modified_secs, Some(1_700_000_000));
     }
 
@@ -1027,7 +1034,7 @@ mod tests {
         let entry = Entry {
             key: "cold".to_string(),
             meta: EntryMeta {
-                size: 1,
+                size: Some(1),
                 last_modified_secs: Some(1),
             },
             source: obj,
@@ -1392,6 +1399,52 @@ mod tests {
             )),
             "an unopenable directory behind a link must read as a lost range, got {costs:?}"
         );
+    }
+
+    // A walk that read no metadata must not look like a real zero-byte object. Reporting a size of
+    // zero makes the two compare equal, and with no time to compare either the pair reads as
+    // unchanged — so the key is skipped, which is what FR-Enum-5 forbids.
+    #[test]
+    fn an_entry_whose_metadata_was_never_read_is_not_taken_for_an_empty_object() {
+        let unread = Entry {
+            key: "a.txt".to_string(),
+            meta: EntryMeta {
+                size: None,
+                last_modified_secs: None,
+            },
+            source: (),
+        };
+        let empty_object = Entry {
+            key: "a.txt".to_string(),
+            meta: EntryMeta {
+                size: Some(0),
+                last_modified_secs: Some(1_700_000_000),
+            },
+            source: (),
+        };
+        assert_eq!(decide(&unread, &empty_object), Action::Transfer);
+    }
+
+    // A listing that reports a negative size has told us something impossible. Casting it would
+    // give an enormous length a comparison reads as real, and anything sizing a buffer or a part
+    // plan from it would trust a 16-exabyte object.
+    #[test]
+    fn a_negative_size_is_reported_rather_than_wrapped() {
+        let negative = Object::builder()
+            .key("data/a.txt")
+            .size(-1)
+            .last_modified(DateTime::from_secs(1))
+            .build();
+        match key_and_meta(&negative, "data/") {
+            Err(StreamError::MalformedListing {
+                key: Some(key),
+                what,
+            }) => {
+                assert_eq!(key, "a.txt");
+                assert!(what.contains("size"), "got {what:?}");
+            }
+            other => panic!("expected a named malformed listing, got {other:?}"),
+        }
     }
 
     // A time either side of the epoch is a time a run can compare, so both are reported. Only a
