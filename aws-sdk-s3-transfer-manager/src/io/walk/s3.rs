@@ -541,6 +541,58 @@ mod tests {
             .build()
     }
 
+    // Dropping a listing mid-flight must leave the walk able to resume. Taking the continuation
+    // token before the request would lose it here, and the next call would list the prefix from its
+    // start and hand out keys it had already given — which a consumer reading in key order cannot
+    // survive, because a key it has already passed can never be seen again.
+    //
+    // A client that never answers is what makes the drop point reachable: with a mock that resolves
+    // a page in one poll, the future completes before there is anything to cancel.
+    // Inside a runtime, because the SDK's timeout machinery needs a reactor, but polled by hand so
+    // the drop happens at a point of this test's choosing rather than when the request completes.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_dropped_listing_keeps_the_walk_at_its_own_position() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        #[allow(deprecated)]
+        let http_client = aws_smithy_runtime::client::http::test_util::NeverClient::new();
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-west-2"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+            .http_client(http_client)
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(config);
+
+        let mut walk = walker()
+            .prefix("prefix/")
+            .build()
+            .walk(s3ctx(client, "test-bucket"));
+
+        // Mid-walk: a page has already arrived and left a token behind.
+        walk.current_prefix = Some("prefix/".to_string());
+        walk.next_token = Some("tok".to_string());
+        walk.initial_first_page_pending = false;
+
+        {
+            let mut listing = std::pin::pin!(walk.next());
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(
+                matches!(listing.as_mut().poll(&mut cx), Poll::Pending),
+                "the request has to be in flight for the drop to mean anything"
+            );
+        } // dropped here, with the request unanswered
+
+        assert_eq!(
+            walk.next_token.as_deref(),
+            Some("tok"),
+            "the walk lost its position, so the next call would re-list the prefix"
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_list_single_page() {
