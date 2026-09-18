@@ -101,7 +101,7 @@ after the table.
 | FR-Enum-11 configurable page size | inherited | unchanged |
 | FR-Enum-12 an unreadable directory is a range | covered | `DirectoryUnreadable`, positioned in key order |
 | FR-Enum-13 listing sends no delimiter | inherited | unchanged |
-| FR-Filter-1 ordered include and exclude rules | covered | `io/key_filter.rs` |
+| FR-Filter-1 ordered include and exclude rules | covered | `io/key/filter.rs` |
 | FR-Filter-2 matched on the whole path, `*` crosses `/` | covered | `fnmatch` semantics reproduced |
 | FR-Filter-3 the rule set applies to both sides | covered | one `KeyFilter`, read by `local_predicate` and `s3_predicate` |
 | FR-Filter-4 order-independent, holds neither side | covered | matched per entry as it arrives, with the same answers in any order, pinned by test |

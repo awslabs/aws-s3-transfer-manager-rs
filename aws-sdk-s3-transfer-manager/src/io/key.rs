@@ -3,6 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Reached only by its own tests until the comparison wires it up.
+#[allow(dead_code)] // TODO(sync): the comparison applies these rules to both sides
+pub(crate) mod filter;
+// Nothing outside this module's own tests calls it until the comparison lands.
+#[allow(dead_code)] // TODO(sync): the comparison reads both sides through this
+pub(crate) mod stream;
+
 // Translating between local relative paths and S3 object keys.
 //
 // Shared by the directory operations and by key-ordered comparison, which all need

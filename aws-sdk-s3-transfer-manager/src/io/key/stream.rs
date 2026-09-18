@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::types::Object;
 
-use crate::io::key::{derive_object_key, DEFAULT_DELIMITER};
-use crate::io::key_filter::KeyFilter;
+use super::filter::KeyFilter;
+use super::{derive_object_key, DEFAULT_DELIMITER};
 use crate::io::walk::{
     exclude_s3_folder_markers, FsEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
 };
@@ -921,7 +921,7 @@ mod tests {
 
     // --- filters ---
 
-    use crate::io::key_filter::Rule;
+    use crate::io::key::filter::Rule;
 
     fn filtered_local(root: &std::path::Path, rules: Vec<Rule>) -> FsWalk {
         let filter = Arc::new(KeyFilter::new(rules));

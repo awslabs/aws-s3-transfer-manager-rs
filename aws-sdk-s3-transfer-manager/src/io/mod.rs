@@ -16,12 +16,6 @@ mod stream;
 pub mod error;
 pub(crate) mod fs;
 pub(crate) mod key;
-// Reached only by its own tests until the comparison wires it up.
-#[allow(dead_code)]
-pub(crate) mod key_filter;
-// Nothing outside this module's own tests calls it until the comparison lands.
-#[allow(dead_code)]
-pub(crate) mod key_stream;
 mod size_hint;
 /// Walker types for traversing filesystems and S3 buckets.
 pub mod walk;
