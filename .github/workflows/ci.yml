@@ -45,6 +45,7 @@ jobs:
       - check-external-types
       - check-deny
       - sanitizers
+      - walk-benches
       - features
       - dial9-build
       - miri
@@ -140,6 +141,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
         run: cargo clippy --all --tests --benches --no-deps
+
+  walk-benches:
+    name: walk bench assertions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: basics
+    # Nothing here talks to AWS, so it declines the workflow-wide `id-token: write`.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      # Runs each benchmark once for its assertions and reports no timings. Clippy already
+      # type-checks these targets; this is what makes their `assert_eq!`s mean something — entry
+      # counts, and which key a walk hands over first. `throughput` is left out because it stands up
+      # a mock server, which is a heavier thing to owe every pull request.
+      - name: "bench --test"
+        run: cargo bench -p benches --bench walk -- --test
 
   docs:
     name: docs

@@ -62,8 +62,8 @@ fn build_balanced(root: &Path, fanout: usize, depth: usize, files_per_dir: usize
 
 // Subdirectories all sort before the root's files, so a whole-walk order has to descend before it
 // can emit anything: it reads the root, then the first subdirectory, and stops there. That is one
-// extra directory read, not every subtree — `build_deep` is the shape where a whole-walk order pays
-// for a chain of them, and nothing here measures that.
+// extra directory read, not every subtree, which makes this the cheap end of the range —
+// `chain_100deep` below is the expensive end, where the descent goes all the way down.
 fn build_front_loaded(root: &Path, subdirs: usize, files_per_dir: usize) -> usize {
     let mut count = 0;
     for i in 0..subdirs {

@@ -763,9 +763,10 @@ impl FsWalk {
 
             // Reading a directory blocks, and this loop keeps reading until it has a file to
             // return: down the leftmost chain under depth-first order, and through any directory
-            // holding no files under breadth-first. Yielding before every read after the first
-            // keeps one call from holding the runtime for all of them, and leaves a call that reads
-            // a single directory costing what it always did.
+            // holding no files under breadth-first. Yielding from the second read onward keeps one
+            // call from holding the runtime for all of them, and leaves a call that reads a single
+            // directory costing what it always did. One read still blocks for as long as the
+            // directory is wide, which no yield placed between reads can bound.
             if std::mem::replace(&mut read_a_directory, true) {
                 tokio::task::yield_now().await;
             }
@@ -1055,11 +1056,11 @@ impl FsWalk {
                     continue;
                 }
                 // TODO(walker): read this when the entry is handed over, not when its directory is.
-                // Ordering needs a name and a type, so in key order every file on the way down to
-                // the first key gets stat'd before anything is emitted — on a chain of directories
-                // that is the whole tree. Moving it also puts a read failure at its own key's
-                // position rather than at its directory's, which is a separate change to how
-                // failures are ordered.
+                // Ordering needs a name and a type, so a walk emitting in a listing's order stats
+                // every file on the way down to the first key it can emit — on a chain of
+                // directories that is the whole tree. Deferring it has to keep reporting a file that
+                // cannot be read at its directory's position, ahead of every key inside, which is
+                // what a comparison needs before it decides anything about those keys.
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
