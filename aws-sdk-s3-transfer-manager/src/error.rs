@@ -631,7 +631,13 @@ impl From<crate::io::walk::WalkError> for Error {
     /// A `ListObjectsV2` service failure is recovered to a full
     /// [`ErrorKind::ServiceError`] (with operation, code, and request ids); an
     /// unreadable or non-directory source root is [`ErrorKind::InputInvalid`];
-    /// per-entry filesystem failures are [`ErrorKind::IOError`].
+    /// per-entry filesystem failures and unreadable subdirectories are
+    /// [`ErrorKind::IOError`].
+    ///
+    /// A subdirectory that turns out not to be a directory between being listed and being read is
+    /// one of the latter. It used to be [`ErrorKind::InputInvalid`] and end the walk, because the
+    /// kind came from the error itself rather than from where it happened; a walk that has already
+    /// produced entries has no reason to stop over one name, so it now costs that name alone.
     fn from(e: crate::io::walk::WalkError) -> Self {
         use crate::io::walk::WalkErrorKind;
         match e.kind() {
@@ -651,6 +657,7 @@ impl From<crate::io::walk::WalkError> for Error {
             }
             WalkErrorKind::Io
             | WalkErrorKind::PermissionDenied
+            | WalkErrorKind::DirectoryUnreadable
             | WalkErrorKind::BrokenSymlink
             | WalkErrorKind::SymlinkCycle => Error::new(ErrorKind::IOError, e),
         }

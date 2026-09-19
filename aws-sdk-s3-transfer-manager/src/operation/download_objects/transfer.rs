@@ -12,7 +12,6 @@
 use aws_sdk_s3::types::Object;
 use parking_lot::Mutex;
 use path_clean::PathClean;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
+use crate::io::key::{replace_delim, strip_key_prefix};
 use crate::io::walk::S3Walk;
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
@@ -52,9 +52,6 @@ const WALK_LOW_WATER: usize = MAX_ENTRIES_PER_WALK;
 /// while a page is still being fetched, large enough to amortize the state-lock
 /// acquisition across many keys.
 const WALK_FLUSH_CHUNK: usize = 64;
-
-/// Default S3 key delimiter.
-const DEFAULT_DELIMITER: &str = "/";
 
 /// Work items produced by [`DownloadObjectsTransfer::poll_work`].
 pub(crate) enum DownloadObjectsWork {
@@ -932,33 +929,6 @@ impl Transfer for DownloadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
-fn strip_key_prefix<'a>(key: &'a str, prefix: Option<&str>, delimiter: Option<&str>) -> &'a str {
-    let prefix = prefix.unwrap_or("");
-    let delim = delimiter.unwrap_or(DEFAULT_DELIMITER);
-
-    if key.is_empty() || prefix.is_empty() || !key.starts_with(prefix) || !key.contains(delim) {
-        return key;
-    }
-
-    let stripped = &key[prefix.len()..];
-
-    if prefix.ends_with(delim) || !stripped.starts_with(delim) {
-        return stripped;
-    }
-
-    &stripped[1..]
-}
-
-fn replace_delim<'a>(key: &'a str, delimiter: Option<&str>, path_separator: &str) -> Cow<'a, str> {
-    match delimiter {
-        Some(delim) if delim != path_separator => {
-            let replaced = key.replace(delim, path_separator);
-            Cow::Owned(replaced)
-        }
-        _ => Cow::Borrowed(key),
-    }
-}
-
 /// Derive the local filesystem path for a given S3 key.
 ///
 /// Strips the configured prefix, replaces the delimiter with the OS path
@@ -1137,73 +1107,6 @@ mod tests {
     }
 
     // --- Key derivation tests (ported from worker.rs) ---
-
-    #[test]
-    fn test_strip_key_prefix() {
-        let cases: &[(&str, Option<&str>, Option<&str>, &str)] = &[
-            ("no-delim", None, None, "no-delim"),
-            ("no-delim", Some(""), None, "no-delim"),
-            (
-                "delim/with/separator",
-                Some(""),
-                None,
-                "delim/with/separator",
-            ),
-            ("", Some("no-delim"), None, ""),
-            ("no-delim", Some("no-delim"), None, "no-delim"),
-            ("delim/", Some("delim"), None, ""),
-            ("not-in-key", Some("prefix"), None, "not-in-key"),
-            ("notes/2021/1.txt", Some("notes/2021"), None, "1.txt"),
-            ("notes/2021/1.txt", Some("notes/2021/"), None, "1.txt"),
-            (
-                "top-level/sub-folder/1.txt",
-                Some("top-"),
-                None,
-                "level/sub-folder/1.txt",
-            ),
-            (
-                "someInnerFolder/another/file1.txt",
-                Some("someInner"),
-                None,
-                "Folder/another/file1.txt",
-            ),
-            (
-                "someInnerF/another/file1.txt",
-                Some("someInner"),
-                None,
-                "F/another/file1.txt",
-            ),
-            (
-                "someInner/another/file1.txt",
-                Some("someInner"),
-                None,
-                "another/file1.txt",
-            ),
-            (
-                "someInner/another/file1.txt",
-                Some("someInner/a"),
-                None,
-                "nother/file1.txt",
-            ),
-        ];
-        for (key, prefix, delim, expected) in cases {
-            let actual = strip_key_prefix(key, *prefix, *delim);
-            assert_eq!(
-                *expected, actual,
-                "key={key:?} prefix={prefix:?} delim={delim:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_strip_key_prefix_delims() {
-        for delim in ["/", "//", "\\", "|", "delim"] {
-            let prefix = format!("notes{delim}2021{delim}");
-            let key = format!("notes{delim}2021{delim}1.txt");
-            let actual = strip_key_prefix(&key, Some(&prefix), Some(delim));
-            assert_eq!("1.txt", actual, "delim={delim:?}");
-        }
-    }
 
     #[cfg(target_family = "unix")]
     #[test]

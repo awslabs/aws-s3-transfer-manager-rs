@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -24,34 +25,160 @@ struct PendingDir {
     ancestor_handles: Vec<Arc<Handle>>,
 }
 
-/// Result of reading a single directory.
-///
-/// Contains all files discovered in the directory (after filter application),
-/// subdirectories to recurse into (subject to `max_depth`), and any non-fatal
-/// non-fatal errors encountered during the read.
+// Result of reading a single directory: its entries in emission order, plus any
+// non-fatal errors from reading them.
 struct ReadDirResult {
-    /// Files discovered in the directory, after filter application.
-    files: Vec<DirEntry>,
-    /// Subdirectories to recurse into. Empty if `depth >= max_depth`.
-    subdirs: Vec<PendingDir>,
-    /// Non-fatal errors encountered reading individual entries.
+    // Files and subdirectories interleaved, in emission order.
+    children: Vec<Child>,
+    // Non-fatal errors encountered reading individual entries.
     errors: Vec<WalkError>,
 }
 
-/// A file entry discovered during a filesystem walk.
-///
-/// Contains the absolute path, the path relative to the walk root, and
-/// the file metadata. Only regular files (and symlinks to regular files
-/// when `follow_symlinks` is enabled) produce `DirEntry` values; directories
-/// are traversed but not yielded.
-#[derive(Debug)]
-pub struct DirEntry {
-    path: PathBuf,
-    relative_path: PathBuf,
-    metadata: Metadata,
+// How the walk is positioned. Which traversal a walk uses follows from its `SortOrder`: ordering
+// the whole walk needs depth-first, and the other two orders are breadth-first.
+enum Cursor {
+    // Files of a directory are emitted before descending. Subdirectories wait
+    // in a queue, which is what makes them claimable.
+    Breadth {
+        pending_dirs: VecDeque<PendingDir>,
+        ready_files: VecDeque<FsEntry>,
+    },
+    // Depth-first, so a subtree is descended at the position where it sorts rather than after
+    // its parent's files. Each frame is a partially consumed directory.
+    Depth {
+        stack: Vec<VecDeque<Child>>,
+    },
 }
 
-impl DirEntry {
+// One entry of a directory: a file to yield, or a subdirectory to descend
+// into. Kept in a single list so sorting interleaves them, which is what
+// lets a nested key be emitted between two sibling files.
+enum Child {
+    File(FsEntry),
+    Dir(PendingDir),
+}
+
+impl Child {
+    fn path(&self) -> &Path {
+        match self {
+            Child::File(e) => &e.path,
+            Child::Dir(d) => &d.path,
+        }
+    }
+
+    // Name bytes plus whether this is a directory, for `cmp_key_form`.
+    fn sort_name(&self) -> (&[u8], bool) {
+        match self {
+            Child::File(e) => (name_bytes(&e.path), false),
+            Child::Dir(d) => (name_bytes(&d.path), true),
+        }
+    }
+}
+
+fn name_bytes(path: &Path) -> &[u8] {
+    path.file_name()
+        .map(|n| n.as_encoded_bytes())
+        .unwrap_or(b"")
+}
+
+// A directory that cannot be read. At the walk root this is fatal, since nothing
+// can be enumerated; deeper it is not, but it is kept distinct from entry-level
+// failures so consumers can tell that a subtree went unenumerated.
+fn dir_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
+    if depth == 0 {
+        match WalkError::classify_io(e) {
+            WalkErrorKind::NotADirectory => WalkErrorKind::NotADirectory,
+            _ => WalkErrorKind::SourceUnreadable,
+        }
+    } else {
+        WalkErrorKind::DirectoryUnreadable
+    }
+}
+
+// Which of the special kinds a file type names. `FileType` from `std` answers each of these
+// separately on Unix, and a walk reports what it was told.
+fn special_file_type(file_type: &std::fs::FileType) -> FileType {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return FileType::Fifo;
+        }
+        if file_type.is_socket() {
+            return FileType::Socket;
+        }
+        if file_type.is_block_device() || file_type.is_char_device() {
+            return FileType::Device;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file_type;
+    FileType::Device
+}
+
+// Order two children as `ListObjectsV2` orders the keys they produce: a
+// directory sorts as if its name ended in '/' (0x2F), so `a.txt` precedes
+// `a/c`. Names within a directory never contain '/', so one trailing byte
+// decides it.
+fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
+    let (an, ad) = a.sort_name();
+    let (bn, bd) = b.sort_name();
+    let n = an.len().min(bn.len());
+    match an[..n].cmp(&bn[..n]) {
+        Ordering::Equal => {
+            let at = an.get(n).copied().or(ad.then_some(b'/'));
+            let bt = bn.get(n).copied().or(bd.then_some(b'/'));
+            at.cmp(&bt)
+        }
+        ord => ord,
+    }
+}
+
+/// What the filesystem said is at a path.
+///
+/// A walk yields an entry for whatever it found, so a consumer decides what to do with each
+/// one. Only a regular file holds bytes a transfer could move; the rest are named so a consumer
+/// can say why it left them alone.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    /// A regular file.
+    Regular,
+    /// A symlink this walk did not follow, so nothing here describes its target.
+    Symlink,
+    /// A named pipe.
+    Fifo,
+    /// A socket.
+    Socket,
+    /// A block or character device.
+    Device,
+}
+
+/// One thing a filesystem walk found.
+///
+/// Carries the absolute path, the path relative to the walk root, what the filesystem said is
+/// there, whether a symlink was resolved to reach it, and the metadata if any was read.
+///
+/// A walk yields regular files, and whatever else it was asked to report: a socket, a symlink it
+/// left alone. Directories are traversed and not yielded, so a consumer sees the files under one
+/// and never the one itself.
+#[derive(Debug)]
+pub struct FsEntry {
+    path: PathBuf,
+    file_type: FileType,
+    // True when the walk arrived here through a symlink it resolved, so this describes what the
+    // link points at. False for a path reached directly, and for a link left alone — which
+    // `file_type` reports as `Symlink`.
+    followed_symlink: bool,
+    // The walk root, shared by every entry it produces. `relative_path` is a suffix of
+    // `path`, so storing it separately would put a second copy of the whole path in
+    // memory for every entry held — and a key-ordered walk holds the unconsumed
+    // children of every directory on its descent path at once.
+    root: Arc<Path>,
+    metadata: Option<Metadata>,
+}
+
+impl FsEntry {
     /// Absolute path to the file on the local filesystem.
     pub fn path(&self) -> &Path {
         &self.path
@@ -63,22 +190,67 @@ impl DirEntry {
     /// the relative path is `a/b.txt`. Useful for deriving destination keys
     /// for uploads.
     pub fn relative_path(&self) -> &Path {
-        &self.relative_path
+        self.path.strip_prefix(&self.root).unwrap_or(&self.path)
     }
 
-    /// File metadata.
+    /// What the filesystem said is here.
+    pub fn file_type(&self) -> FileType {
+        self.file_type
+    }
+
+    /// Whether the walk arrived here through a symlink it resolved.
+    pub fn followed_symlink(&self) -> bool {
+        self.followed_symlink
+    }
+
+    /// File metadata, when the walk read any.
     ///
-    /// When the entry was produced by following a symlink, this is the
-    /// metadata of the symlink target (not the symlink itself).
-    pub fn metadata(&self) -> &Metadata {
-        &self.metadata
+    /// `None` when nothing was read here: a symlink left alone, or a path the filesystem
+    /// refused to describe. When the entry came of following a symlink, this describes what the
+    /// link points at.
+    pub fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
     }
 }
 
-type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
+type FilterFn = Arc<dyn Fn(&FsEntry) -> bool + Send + Sync>;
+// Consulted with a path relative to the root, before any metadata is read.
+type PathFilterFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
-/// Configuration for walking a local filesystem directory.
+/// How a walk orders the entries it produces.
 ///
+/// The default is [`Native`](SortOrder::Native).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    /// Whatever order the filesystem gave, which is not guaranteed to be stable between runs.
+    #[default]
+    Native,
+
+    /// Each directory's entries ordered among themselves, lexicographically by path.
+    ///
+    /// The traversal stays breadth-first, so a directory's files come out before its
+    /// subdirectories are descended, and entries are not ordered against entries elsewhere in
+    /// the tree. [`try_claim_subtree`](FsWalk::try_claim_subtree) stays available, and claims come
+    /// in the same order every run.
+    WithinDirectory,
+
+    /// Every entry ordered against every other, lexicographically by the key it would produce.
+    ///
+    /// A directory is compared as if its name ended in `/`, which is what places `a.txt` before
+    /// `a/c`: `a.` sorts before `a/`. Note that this is not the order of the paths themselves,
+    /// where `a` would sort before `a.txt`.
+    ///
+    /// A merge against a bucket listing needs this, since it reads "absent from the other side"
+    /// from position alone. General-purpose buckets list keys this way.
+    ///
+    /// Two costs come with it. [`try_claim_subtree`](FsWalk::try_claim_subtree) is unavailable,
+    /// because ordered emission has to descend before it can know what comes next. And
+    /// time-to-first-entry grows, because subtrees sorting ahead of a sibling file must be read
+    /// first.
+    WholeWalk,
+}
+
 /// Configuration for walking a local directory tree.
 ///
 /// Describes what to look for and how (depth, symlink policy, sorting,
@@ -89,11 +261,15 @@ type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 ///
 /// # Traversal model
 ///
-/// The walker reads one directory at a time. Subdirectories discovered during
-/// a read are queued for subsequent reads. Only regular files produce yielded
-/// [`DirEntry`] values; directories, symlinks, and special files (sockets,
-/// fifos, block/char devices) are traversed or skipped according to
-/// configuration but are never themselves yielded as entries.
+/// The walker reads one directory at a time, and which order it emits in decides how the rest is
+/// held: [`SortOrder::Native`] and [`SortOrder::WithinDirectory`] queue subdirectories for later
+/// reads, while [`SortOrder::WholeWalk`] keeps the directories of the current descent path open so
+/// a subtree can be emitted where it sorts.
+///
+/// Regular files always produce an [`FsEntry`]. A socket, FIFO, device or symlink left unfollowed
+/// produces one too when the walker is asked for them, so a consumer can see that the name is
+/// taken. Directories are traversed and never yielded, so a consumer sees the files under one and
+/// never the one itself.
 ///
 /// # Symlink cycle handling
 ///
@@ -115,7 +291,7 @@ type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 /// and the optional filter is stored as `Arc<dyn Fn>`. Clone a configured
 /// walker to reuse it across multiple operations without re-specifying the
 /// configuration.
-// TODO(walker): `dir_filter: Option<Box<dyn Fn(&DirEntry) -> bool>>` — subtree
+// TODO(walker): `dir_filter: Option<Box<dyn Fn(&FsEntry) -> bool>>` — subtree
 //   prune predicate. Biggest perf improvement for bulk ops on trees with large
 //   excluded subtrees (.git/, node_modules/).
 // TODO(walker): `min_depth: usize` — skip entries above this depth.
@@ -129,9 +305,11 @@ type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 pub struct FsWalker {
     follow_symlinks: bool,
     max_depth: usize,
-    sort: bool,
+    sort_order: SortOrder,
+    include_special_files: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
+    path_filter: Option<PathFilterFn>,
 }
 
 impl std::fmt::Debug for FsWalker {
@@ -139,7 +317,7 @@ impl std::fmt::Debug for FsWalker {
         f.debug_struct("FsWalker")
             .field("follow_symlinks", &self.follow_symlinks)
             .field("max_depth", &self.max_depth)
-            .field("sort", &self.sort)
+            .field("sort_order", &self.sort_order)
             .field("canonicalize_root", &self.canonicalize_root)
             .finish()
     }
@@ -163,7 +341,6 @@ impl FsWalker {
         let mut root = ctx.root;
         let mut pending_errors = VecDeque::new();
         let mut done = false;
-        let mut pending_dirs = VecDeque::new();
 
         if self.canonicalize_root {
             match std::fs::canonicalize(&root) {
@@ -195,19 +372,33 @@ impl FsWalker {
             }
         }
 
-        if !done {
-            pending_dirs.push_back(PendingDir {
-                path: root.clone(),
-                depth: 0,
-                ancestor_handles: Vec::new(),
-            });
-        }
+        let root_dir = PendingDir {
+            path: root.clone(),
+            depth: 0,
+            ancestor_handles: Vec::new(),
+        };
+        // Matched over every order rather than tested against one, so an order added later has to
+        // say which traversal it needs instead of silently taking the breadth-first one.
+        let cursor = match self.sort_order {
+            SortOrder::WholeWalk if done => Cursor::Depth { stack: Vec::new() },
+            SortOrder::WholeWalk => Cursor::Depth {
+                stack: vec![VecDeque::from([Child::Dir(root_dir)])],
+            },
+            SortOrder::Native | SortOrder::WithinDirectory if done => Cursor::Breadth {
+                pending_dirs: VecDeque::new(),
+                ready_files: VecDeque::new(),
+            },
+            SortOrder::Native | SortOrder::WithinDirectory => Cursor::Breadth {
+                pending_dirs: VecDeque::from([root_dir]),
+                ready_files: VecDeque::new(),
+            },
+        };
 
         tracing::debug!(
             ?root,
             follow_symlinks = self.follow_symlinks,
             max_depth = self.max_depth,
-            sort = self.sort,
+            sort_order = ?self.sort_order,
             "fs walk started",
         );
 
@@ -216,8 +407,7 @@ impl FsWalker {
         FsWalk {
             config: Arc::new(self),
             root,
-            pending_dirs,
-            ready_files: VecDeque::new(),
+            cursor,
             pending_errors,
             done,
         }
@@ -232,9 +422,11 @@ impl FsWalker {
 pub struct FsWalkerBuilder {
     follow_symlinks: bool,
     max_depth: usize,
-    sort: bool,
+    sort_order: SortOrder,
+    include_special_files: bool,
     canonicalize_root: bool,
     filter: Option<FilterFn>,
+    path_filter: Option<PathFilterFn>,
 }
 
 impl std::fmt::Debug for FsWalkerBuilder {
@@ -242,7 +434,7 @@ impl std::fmt::Debug for FsWalkerBuilder {
         f.debug_struct("FsWalkerBuilder")
             .field("follow_symlinks", &self.follow_symlinks)
             .field("max_depth", &self.max_depth)
-            .field("sort", &self.sort)
+            .field("sort_order", &self.sort_order)
             .field("canonicalize_root", &self.canonicalize_root)
             .finish()
     }
@@ -303,20 +495,22 @@ impl FsWalkerBuilder {
         self
     }
 
-    /// Enable lexicographic sorting of entries within each directory.
-    ///
-    /// When `true`, files and subdirectories from each directory read are
-    /// sorted by full path. Entries are sorted *within* a directory level
-    /// but not globally. Depth-first traversal produces entries
-    /// level-by-level.
-    ///
-    /// When `false` (default), entries are returned in OS-native order.
-    ///
-    /// Sort is required for `sync`-style operations that merge-join against
-    /// `ListObjectsV2` results (which are UTF-8 binary sorted by key).
+    /// How to order the entries this walk produces. See [`SortOrder`].
     #[must_use]
-    pub fn sort(mut self, sort: bool) -> Self {
-        self.sort = sort;
+    pub fn sort_order(mut self, sort_order: SortOrder) -> Self {
+        self.sort_order = sort_order;
+        self
+    }
+
+    // Yield an entry for a path holding something no transfer could move: a socket, a FIFO, a
+    // device, a symlink left unfollowed. Off by default, because a caller that only uploads what
+    // it finds has no use for them, and a tree can hold thousands. A consumer that infers absence
+    // from the stream needs them, since a name it never hears about reads as a name that is free.
+    //
+    // Only tests call this until the comparison lands.
+    #[allow(dead_code)] // TODO(sync): the comparison turns this on to hold back a delete
+    pub(crate) fn include_special_files(mut self, include: bool) -> Self {
+        self.include_special_files = include;
         self
     }
 
@@ -349,8 +543,24 @@ impl FsWalkerBuilder {
     /// performance on trees with large excludable subtrees (e.g. `.git/`,
     /// `node_modules/`), compose multiple walks rooted at smaller subtrees.
     #[must_use]
-    pub fn filter(mut self, f: impl Fn(&DirEntry) -> bool + Send + Sync + 'static) -> Self {
+    pub fn filter(mut self, f: impl Fn(&FsEntry) -> bool + Send + Sync + 'static) -> Self {
         self.filter = Some(Arc::new(f));
+        self
+    }
+
+    // Reject entries by relative path, before their metadata is read.
+    //
+    // Unlike `filter`, which sees a fully built `FsEntry`, this is consulted first,
+    // so a rejected file is never stat'd and anything that went wrong reading it is
+    // never reported. That is the difference between "excluded" and "excluded but it
+    // still warned about a file the caller said to ignore".
+    //
+    // Directories are not offered to it: skipping one would skip everything beneath,
+    // and a rule written for a file's key says nothing about the keys under a folder
+    // of a similar name.
+    #[allow(dead_code)] // TODO(sync): the comparison sets this from its filter rules
+    pub(crate) fn path_filter(mut self, f: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+        self.path_filter = Some(Arc::new(f));
         self
     }
 
@@ -360,9 +570,11 @@ impl FsWalkerBuilder {
         FsWalker {
             follow_symlinks: self.follow_symlinks,
             max_depth: self.max_depth,
-            sort: self.sort,
+            sort_order: self.sort_order,
+            include_special_files: self.include_special_files,
             canonicalize_root: self.canonicalize_root,
             filter: self.filter,
+            path_filter: self.path_filter,
         }
     }
 }
@@ -434,8 +646,7 @@ impl FsWalkContextBuilder {
 pub struct FsWalk {
     config: Arc<FsWalker>,
     root: Arc<Path>,
-    pending_dirs: VecDeque<PendingDir>,
-    ready_files: VecDeque<DirEntry>,
+    cursor: Cursor,
     pending_errors: VecDeque<WalkError>,
     done: bool,
 }
@@ -458,13 +669,15 @@ impl FsWalk {
     ///   are followed by `None` on the next call; non-fatal errors are
     ///   followed by more results as the walk continues.
     /// - `None` when the walk is complete.
-    pub async fn next(&mut self) -> Option<Result<DirEntry, WalkError>> {
+    pub async fn next(&mut self) -> Option<Result<FsEntry, WalkError>> {
+        let mut read_a_directory = false;
         loop {
-            if let Some(entry) = self.ready_files.pop_front() {
-                return Some(Ok(entry));
-            }
             if let Some(err) = self.pending_errors.pop_front() {
-                if !err.is_fatal() {
+                if err.is_fatal() {
+                    // Nothing further can be enumerated, so anything still queued would be part of a
+                    // view this error already says is incomplete.
+                    self.done = true;
+                } else {
                     tracing::warn!(
                         path = ?err.path(),
                         kind = ?err.kind(),
@@ -477,19 +690,64 @@ impl FsWalk {
                 return None;
             }
 
-            let pending = match self.pending_dirs.pop_front() {
-                Some(d) => d,
-                None => {
-                    self.done = true;
-                    return None;
+            let dir = match &mut self.cursor {
+                Cursor::Breadth {
+                    pending_dirs,
+                    ready_files,
+                } => {
+                    if let Some(entry) = ready_files.pop_front() {
+                        return Some(Ok(entry));
+                    }
+                    match pending_dirs.pop_front() {
+                        Some(dir) => dir,
+                        None => {
+                            self.done = true;
+                            return None;
+                        }
+                    }
+                }
+                Cursor::Depth { stack } => {
+                    // Work the newest frame, so a subtree is emitted where it
+                    // sorts rather than after its parent's files.
+                    let child = loop {
+                        match stack.last_mut() {
+                            None => break None,
+                            Some(frame) => match frame.pop_front() {
+                                Some(child) => break Some(child),
+                                None => {
+                                    stack.pop();
+                                }
+                            },
+                        }
+                    };
+                    match child {
+                        None => {
+                            self.done = true;
+                            return None;
+                        }
+                        Some(Child::File(entry)) => return Some(Ok(entry)),
+                        Some(Child::Dir(dir)) => dir,
+                    }
                 }
             };
 
-            match self.read_dir(&pending.path, pending.depth, &pending.ancestor_handles) {
+            match self.read_dir(&dir.path, dir.depth, &dir.ancestor_handles) {
                 Ok(result) => {
-                    self.ready_files.extend(result.files);
                     self.pending_errors.extend(result.errors);
-                    self.pending_dirs.extend(result.subdirs);
+                    match &mut self.cursor {
+                        Cursor::Breadth {
+                            pending_dirs,
+                            ready_files,
+                        } => {
+                            for child in result.children {
+                                match child {
+                                    Child::File(entry) => ready_files.push_back(entry),
+                                    Child::Dir(dir) => pending_dirs.push_back(dir),
+                                }
+                            }
+                        }
+                        Cursor::Depth { stack } => stack.push(result.children.into()),
+                    }
                 }
                 Err(err) => {
                     if err.is_fatal() {
@@ -497,6 +755,15 @@ impl FsWalk {
                     }
                     return Some(Err(err));
                 }
+            }
+
+            // Reading a directory blocks, and this loop keeps reading until it has a file to
+            // return: down the leftmost chain under depth-first order, and through any directory
+            // holding no files under breadth-first. Yielding before every read after the first
+            // keeps one call from holding the runtime for all of them, and leaves a call that reads
+            // a single directory costing what it always did.
+            if std::mem::replace(&mut read_a_directory, true) {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -528,18 +795,30 @@ impl FsWalk {
     /// The claimed subtree and the parent walk can be advanced concurrently on
     /// different threads. There is no shared mutable state between them.
     ///
-    /// Subtrees are claimed in BFS order (front of the pending queue), matching
-    /// the order that [`next`](Self::next) would have visited them.
+    /// Subtrees are claimed in the order [`next`](Self::next) would have visited
+    /// them.
+    ///
+    /// Always returns `None` for a [`SortOrder::WholeWalk`]
+    /// walk: emitting in that order requires descending into a subtree before a
+    /// sibling that sorts after it can be emitted, so by the time entries come
+    /// out there is little left to hand off, and handing off the next-needed
+    /// subtree would stall the consumer waiting for it.
     pub fn try_claim_subtree(&mut self) -> Option<FsWalk> {
-        if self.done || self.pending_dirs.len() < 2 {
+        let pending_dirs = match &mut self.cursor {
+            Cursor::Breadth { pending_dirs, .. } => pending_dirs,
+            Cursor::Depth { .. } => return None,
+        };
+        if self.done || pending_dirs.len() < 2 {
             return None;
         }
-        let claimed = self.pending_dirs.pop_front()?;
+        let claimed = pending_dirs.pop_front()?;
         Some(FsWalk {
             config: Arc::clone(&self.config),
             root: Arc::clone(&self.root),
-            pending_dirs: VecDeque::from([claimed]),
-            ready_files: VecDeque::new(),
+            cursor: Cursor::Breadth {
+                pending_dirs: VecDeque::from([claimed]),
+                ready_files: VecDeque::new(),
+            },
             pending_errors: VecDeque::new(),
             done: false,
         })
@@ -551,20 +830,41 @@ impl FsWalk {
     /// and no buffered errors. Equivalent to `next()` having returned (or being
     /// about to return) `None`.
     pub fn is_exhausted(&self) -> bool {
-        self.done
-            || (self.pending_dirs.is_empty()
-                && self.ready_files.is_empty()
-                && self.pending_errors.is_empty())
+        if self.done {
+            return true;
+        }
+        let cursor_empty = match &self.cursor {
+            Cursor::Breadth {
+                pending_dirs,
+                ready_files,
+            } => pending_dirs.is_empty() && ready_files.is_empty(),
+            Cursor::Depth { stack } => stack.iter().all(|f| f.is_empty()),
+        };
+        cursor_empty && self.pending_errors.is_empty()
     }
 
     /// Number of files already read and queued for yield. Diagnostic accessor.
     pub(crate) fn ready_files_len(&self) -> usize {
-        self.ready_files.len()
+        match &self.cursor {
+            Cursor::Breadth { ready_files, .. } => ready_files.len(),
+            Cursor::Depth { stack } => stack
+                .iter()
+                .flatten()
+                .filter(|c| matches!(c, Child::File(_)))
+                .count(),
+        }
     }
 
     /// Number of directories queued for read. Diagnostic accessor.
     pub(crate) fn pending_dirs_len(&self) -> usize {
-        self.pending_dirs.len()
+        match &self.cursor {
+            Cursor::Breadth { pending_dirs, .. } => pending_dirs.len(),
+            Cursor::Depth { stack } => stack
+                .iter()
+                .flatten()
+                .filter(|c| matches!(c, Child::Dir(_)))
+                .count(),
+        }
     }
 
     fn read_dir(
@@ -574,43 +874,38 @@ impl FsWalk {
         ancestor_handles: &[Arc<Handle>],
     ) -> Result<ReadDirResult, WalkError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
-            let kind = WalkError::classify_io(&e);
-            let kind = if depth == 0
-                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-            {
-                WalkErrorKind::SourceUnreadable
-            } else {
-                kind
-            };
+            let kind = dir_error_kind(&e, depth);
             WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
-        // Build the ancestor chain for children of this directory.
-        let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-            let kind = WalkError::classify_io(&e);
-            let kind = if depth == 0
-                && matches!(kind, WalkErrorKind::Io | WalkErrorKind::PermissionDenied)
-            {
-                WalkErrorKind::SourceUnreadable
-            } else {
-                kind
-            };
-            WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
-        })?);
-        let mut next_ancestors = ancestor_handles.to_vec();
-        next_ancestors.push(Arc::clone(&self_handle));
+        // Ancestor chain for children of this directory. Only symlinked
+        // directories can form a cycle, so when symlinks are not followed the
+        // chain is never consulted and the open()+fstat is pure cost.
+        let next_ancestors = if self.config.follow_symlinks {
+            let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
+                let kind = dir_error_kind(&e, depth);
+                WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
+            })?);
+            let mut chain = ancestor_handles.to_vec();
+            chain.push(self_handle);
+            chain
+        } else {
+            Vec::new()
+        };
 
         let mut result = ReadDirResult {
-            files: Vec::new(),
-            subdirs: Vec::new(),
+            children: Vec::new(),
             errors: Vec::new(),
         };
 
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
+                // The iterator may end on its next call, so how many of this directory's remaining
+                // names never arrived is unknown. That is a range, and the error names the directory
+                // rather than any one entry, so it has to report the kind a lost subtree reports.
                 Err(e) => {
-                    let kind = WalkError::classify_io(&e);
+                    let kind = dir_error_kind(&e, depth);
                     result
                         .errors
                         .push(WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e)));
@@ -619,31 +914,69 @@ impl FsWalk {
             };
 
             let path = entry.path();
+            let rejected = self.rejects_path(&path);
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
+                // Without a type there is no telling whether this name was a file or a directory, so
+                // the honest report is the wider one: if it was a directory, everything under it
+                // went unenumerated.
+                //
+                // Reported even when the filter excluded the name, because a rule on a name says
+                // nothing about the keys under it — `exclude("img")` matches `img` and not
+                // `img/a.txt`. An excluded entry stays silent, and this may be a directory, which
+                // is not an entry.
                 Err(e) => {
-                    let kind = WalkError::classify_io(&e);
-                    result
-                        .errors
-                        .push(WalkError::new(Some(path), kind, Box::new(e)));
+                    result.errors.push(WalkError::new(
+                        Some(path),
+                        WalkErrorKind::DirectoryUnreadable,
+                        Box::new(e),
+                    ));
                     continue;
                 }
             };
 
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
+                    if !rejected && self.config.include_special_files {
+                        // Nothing here describes what the link points at, because the walk did
+                        // not look. The metadata is the link's own, which is what `lstat` gave.
+                        self.push_entry(
+                            &mut result.children,
+                            path,
+                            entry.metadata().ok(),
+                            FileType::Symlink,
+                            false,
+                        );
+                    }
                     continue;
                 }
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
-                        let kind = match e.kind() {
-                            std::io::ErrorKind::NotFound => WalkErrorKind::BrokenSymlink,
-                            _ => WalkError::classify_io(&e),
-                        };
-                        result
-                            .errors
-                            .push(WalkError::new(Some(path), kind, Box::new(e)));
+                        match e.kind() {
+                            // A link pointing at nothing has no subtree to lose, so it is one
+                            // entry, and an excluded entry stays silent.
+                            std::io::ErrorKind::NotFound => {
+                                if !rejected {
+                                    result.errors.push(WalkError::new(
+                                        Some(path),
+                                        WalkErrorKind::BrokenSymlink,
+                                        Box::new(e),
+                                    ));
+                                }
+                            }
+                            // Anything else leaves the target's kind unknown, and a link to a
+                            // directory would have filed a whole subtree under this name. Reported
+                            // even when the filter excluded the name, because a rule on a name says
+                            // nothing about the keys under it.
+                            _ => {
+                                result.errors.push(WalkError::new(
+                                    Some(path),
+                                    WalkErrorKind::DirectoryUnreadable,
+                                    Box::new(e),
+                                ));
+                            }
+                        }
                         continue;
                     }
                 };
@@ -662,24 +995,62 @@ impl FsWalk {
                                 continue;
                             }
                             if depth < self.config.max_depth {
-                                result.subdirs.push(PendingDir {
+                                result.children.push(Child::Dir(PendingDir {
                                     path,
                                     depth: depth + 1,
                                     ancestor_handles: next_ancestors.clone(),
-                                });
+                                }));
                             }
                         }
+                        // The directory is not descended into, so its subtree goes unenumerated —
+                        // the same cost as a directory that could not be read, and it has to report
+                        // the same kind or a consumer reads the side as complete. Never the root,
+                        // since this is a child of the directory being read, so `dir_error_kind`'s
+                        // depth test would wrongly call a top-level link the walk root.
                         Err(e) => {
-                            let kind = WalkError::classify_io(&e);
+                            let kind = WalkErrorKind::DirectoryUnreadable;
                             result
                                 .errors
                                 .push(WalkError::new(Some(path), kind, Box::new(e)));
                         }
                     }
                 } else if metadata.is_file() {
-                    self.push_file(&mut result.files, path, &metadata);
+                    if rejected {
+                        continue;
+                    }
+                    self.push_entry(
+                        &mut result.children,
+                        path,
+                        Some(metadata),
+                        FileType::Regular,
+                        true,
+                    );
+                } else if !rejected && self.config.include_special_files {
+                    // The link points at something no transfer could read. The entry says so,
+                    // and the key stays accounted for.
+                    //
+                    // The type comes from the target's metadata, not from `file_type`, which
+                    // describes the link. A link is never a socket or a FIFO itself, so reading
+                    // the kind off it would report the wrong one for everything here.
+                    let target_type = special_file_type(&metadata.file_type());
+                    self.push_entry(
+                        &mut result.children,
+                        path,
+                        Some(metadata),
+                        target_type,
+                        true,
+                    );
                 }
             } else if file_type.is_file() {
+                if rejected {
+                    continue;
+                }
+                // TODO(walker): read this when the entry is handed over, not when its directory is.
+                // Ordering needs a name and a type, so in key order every file on the way down to
+                // the first key gets stat'd before anything is emitted — on a chain of directories
+                // that is the whole tree. Moving it also puts a read failure at its own key's
+                // position rather than at its directory's, which is a separate change to how
+                // failures are ordered.
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
@@ -690,25 +1061,60 @@ impl FsWalk {
                         continue;
                     }
                 };
-                self.push_file(&mut result.files, path, &metadata);
-            } else if file_type.is_dir() && depth < self.config.max_depth {
-                result.subdirs.push(PendingDir {
+                self.push_entry(
+                    &mut result.children,
                     path,
-                    depth: depth + 1,
-                    ancestor_handles: next_ancestors.clone(),
-                });
+                    Some(metadata),
+                    FileType::Regular,
+                    false,
+                );
+            } else if file_type.is_dir() {
+                if depth < self.config.max_depth {
+                    result.children.push(Child::Dir(PendingDir {
+                        path,
+                        depth: depth + 1,
+                        ancestor_handles: next_ancestors.clone(),
+                    }));
+                }
+            } else if !rejected && self.config.include_special_files {
+                // A socket, FIFO, or device. Yielded so a consumer knows the name is taken: a
+                // name absent from the stream reads as nothing being there, which is a
+                // different fact. An excluded name is different again — nothing is going to
+                // look at it, so it stays quiet.
+                //
+                // The `lstat` behind `file_type` already described it, and a `stat` here would
+                // ask the same question a second time.
+                match entry.metadata() {
+                    Ok(metadata) => self.push_entry(
+                        &mut result.children,
+                        path,
+                        Some(metadata),
+                        special_file_type(&file_type),
+                        false,
+                    ),
+                    // Nothing describes it, and the name is still taken.
+                    Err(_) => self.push_entry(
+                        &mut result.children,
+                        path,
+                        None,
+                        special_file_type(&file_type),
+                        false,
+                    ),
+                }
             }
         }
 
-        if self.config.sort {
-            result.files.sort_by(|a, b| a.path.cmp(&b.path));
-            result.subdirs.sort_by(|a, b| a.path.cmp(&b.path));
+        // Likewise: an order added later has to name its comparator rather than inheriting whatever
+        // order the filesystem gave.
+        match self.config.sort_order {
+            SortOrder::WholeWalk => result.children.sort_by(cmp_key_form),
+            SortOrder::WithinDirectory => result.children.sort_by(|a, b| a.path().cmp(b.path())),
+            SortOrder::Native => {}
         }
 
         tracing::trace!(
             ?dir,
-            files = result.files.len(),
-            subdirs = result.subdirs.len(),
+            children = result.children.len(),
             errors = result.errors.len(),
             "directory read",
         );
@@ -716,16 +1122,36 @@ impl FsWalk {
         Ok(result)
     }
 
-    fn push_file(&self, files: &mut Vec<DirEntry>, path: PathBuf, metadata: &Metadata) {
-        let relative_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
-        let entry = DirEntry {
+    // `followed` says whether the path reached here through a symlink this walk resolved, so an
+    // entry describes what it points at.
+    fn push_entry(
+        &self,
+        children: &mut Vec<Child>,
+        path: PathBuf,
+        metadata: Option<Metadata>,
+        file_type: FileType,
+        followed_symlink: bool,
+    ) {
+        let entry = FsEntry {
             path,
-            relative_path,
-            metadata: metadata.clone(),
+            file_type,
+            followed_symlink,
+            root: Arc::clone(&self.root),
+            metadata,
         };
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {
-            files.push(entry);
+            children.push(Child::File(entry));
         }
+    }
+
+    // Whether the path filter rejects this entry. `push_file` is where rejection is
+    // enforced; this is what lets the read path skip the `stat` first and stay quiet
+    // about anything that failed on the way.
+    fn rejects_path(&self, path: &Path) -> bool {
+        self.config.path_filter.as_ref().is_some_and(|f| {
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            !f(relative)
+        })
     }
 }
 
@@ -741,7 +1167,7 @@ mod tests {
             .replace(std::path::MAIN_SEPARATOR, "/")
     }
 
-    async fn collect_entries(mut walk: FsWalk) -> (Vec<DirEntry>, Vec<WalkError>) {
+    async fn collect_entries(mut walk: FsWalk) -> (Vec<FsEntry>, Vec<WalkError>) {
         let mut entries = Vec::new();
         let mut errors = Vec::new();
         while let Some(result) = walk.next().await {
@@ -931,6 +1357,46 @@ mod tests {
         assert_eq!(entries[0].relative_path(), Path::new("real.txt"));
     }
 
+    // Opting in names the link, so a consumer that reads absence from the stream does
+    // not take the name for free.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_reports_an_unfollowed_symlink_when_asked() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), "content").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+
+        let walk = walker()
+            .follow_symlinks(false)
+            .include_special_files(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        // The link arrives as an entry saying it is a link, so its name is accounted for while
+        // nothing claims to describe what it points at. Nothing failed, so the error channel is
+        // empty.
+        assert!(
+            errors.is_empty(),
+            "a link left alone is not a failure: {errors:?}"
+        );
+
+        let mut seen: Vec<_> = entries
+            .iter()
+            .map(|e| (e.relative_path().to_owned(), e.file_type()))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            seen,
+            vec![
+                (PathBuf::from("link.txt"), FileType::Symlink),
+                (PathBuf::from("real.txt"), FileType::Regular),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -960,6 +1426,65 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "expected cycle detection errors but got none"
+        );
+    }
+
+    // A descent must not run to its end inside one poll. Depth-first order reaches the first file
+    // only at the bottom of a chain, so every directory above it is read before the caller gets
+    // anything back, and nothing else on the runtime gets to run either.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_descent_does_not_run_to_its_end_in_one_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let deep = temp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("file.txt"), b"x").unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .build()
+            .walk(ctx(temp.path()));
+
+        {
+            let mut first = tokio_test::task::spawn(walk.next());
+            tokio_test::assert_pending!(first.poll(), "the chain should not be read in one poll");
+        }
+
+        // Dropping that poll loses nothing: what was read is held on the walk, so the file still
+        // arrives.
+        let entry = walk.next().await.unwrap().unwrap();
+        assert!(entry.path().ends_with("file.txt"), "got {:?}", entry.path());
+    }
+
+    // A fatal error says nothing further can be enumerated, so the walk has to stop saying it. When
+    // the root fails the walk ends anyway, having queued nothing — the case worth pinning is a fatal
+    // error arriving while entries are still queued, which no filesystem condition reaches today
+    // because the kinds raised below the root are all per-entry. Injected for that reason.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_fatal_error_ends_the_walk_even_with_entries_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(temp.path().join("b.txt"), b"b").unwrap();
+
+        let mut walk = walker().build().walk(ctx(temp.path()));
+        assert!(
+            matches!(walk.next().await, Some(Ok(_))),
+            "the first file should arrive"
+        );
+
+        walk.pending_errors.push_back(WalkError::new(
+            Some(temp.path().to_path_buf()),
+            WalkErrorKind::SourceUnreadable,
+            Box::new(std::io::Error::other("injected")),
+        ));
+
+        let err = walk.next().await.unwrap().unwrap_err();
+        assert!(err.is_fatal(), "the injected error should be fatal");
+        assert!(
+            walk.next().await.is_none(),
+            "a fatal error means nothing more can be enumerated, so no entry may follow it"
         );
     }
 
@@ -1053,7 +1578,7 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         for e in &entries {
-            assert!(e.metadata().is_file());
+            assert!(e.metadata().is_some_and(|m| m.is_file()));
         }
     }
 
@@ -1103,6 +1628,85 @@ mod tests {
         assert!(errors.is_empty());
     }
 
+    // Opting in names the socket. It yields no entry either way, and a consumer that
+    // reads absence from the stream would otherwise take the name for free.
+    // A link the walk follows, landing on something no transfer could read. Both facts are on the
+    // one entry: what is there, and how the walk got to it. Reaching this needs following turned
+    // on, which is why it is separate from the socket found directly.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_link_followed_to_a_special_file_reports_both() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("socket.sock"), dir.path().join("link"))
+            .unwrap();
+
+        let walk = walker()
+            .follow_symlinks(true)
+            .include_special_files(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert!(errors.is_empty(), "nothing failed: {errors:?}");
+        let mut seen: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.relative_path().to_owned(),
+                    e.file_type(),
+                    e.followed_symlink(),
+                )
+            })
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            seen,
+            vec![
+                // The link resolved, so the type is what it pointed at, not `Symlink`.
+                (PathBuf::from("link"), FileType::Socket, true),
+                (PathBuf::from("socket.sock"), FileType::Socket, false),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_reports_special_files_when_asked() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("regular.txt"), "").unwrap();
+        let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
+
+        let walk = walker()
+            .include_special_files(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        // The socket arrives as an entry saying what it is, at its own position, so a consumer
+        // knows the name is taken. Nothing failed, so there is nothing on the error channel.
+        assert!(errors.is_empty(), "a socket is not a failure: {errors:?}");
+
+        let mut seen: Vec<_> = entries
+            .iter()
+            .map(|e| (e.relative_path().to_owned(), e.file_type()))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            seen,
+            vec![
+                (PathBuf::from("regular.txt"), FileType::Regular),
+                (PathBuf::from("socket.sock"), FileType::Socket),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1133,6 +1737,45 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "expected permission-denied error for unreadable subdir"
+        );
+        // The subtree went unenumerated, which a consumer inferring absence from
+        // the stream has to be able to tell apart from an entry-level failure.
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.kind() == WalkErrorKind::DirectoryUnreadable),
+            "unreadable subdir must report DirectoryUnreadable, got {:?}",
+            errors.iter().map(|e| e.kind()).collect::<Vec<_>>()
+        );
+        assert!(
+            errors.iter().all(|e| !e.is_fatal()),
+            "an unreadable subdir must not end the walk"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_entry_failure_is_not_directory_scoped() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("ok.txt"), "").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("broken")).unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .follow_symlinks(true)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+
+        assert!(entries
+            .iter()
+            .any(|e| e.relative_path() == Path::new("ok.txt")));
+        assert!(!errors.is_empty(), "expected a broken-symlink error");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.kind() != WalkErrorKind::DirectoryUnreadable),
+            "an entry-level failure must not be reported as DirectoryUnreadable"
         );
     }
 
@@ -1202,7 +1845,10 @@ mod tests {
         fs::write(dir.path().join("apple.txt"), "").unwrap();
         fs::write(dir.path().join("mango.txt"), "").unwrap();
 
-        let walk = walker().sort(true).build().walk(ctx(dir.path()));
+        let walk = walker()
+            .sort_order(SortOrder::WithinDirectory)
+            .build()
+            .walk(ctx(dir.path()));
         let (entries, _) = collect_entries(walk).await;
         let names: Vec<_> = entries.iter().map(|e| norm(e.relative_path())).collect();
         assert_eq!(names, vec!["apple.txt", "mango.txt", "zebra.txt"]);
@@ -1210,7 +1856,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_walk_recursive_sort_is_depth_first_per_dir() {
+    async fn test_walk_recursive_sort_is_breadth_first_per_dir() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("c-file.txt"), "").unwrap();
         fs::write(dir.path().join("b-file.txt"), "").unwrap();
@@ -1220,7 +1866,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (entries, _) = collect_entries(walk).await;
@@ -1265,7 +1911,10 @@ mod tests {
         fs::write(dir.path().join("🦀.txt"), "").unwrap();
         fs::write(dir.path().join("file with spaces.txt"), "").unwrap();
 
-        let walk = walker().sort(true).build().walk(ctx(dir.path()));
+        let walk = walker()
+            .sort_order(SortOrder::WithinDirectory)
+            .build()
+            .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
         assert!(
             errors.is_empty(),
@@ -1455,7 +2104,7 @@ mod tests {
         let walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -1663,7 +2312,7 @@ mod tests {
 
         let walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .filter(move |entry| {
                 collected_clone
                     .lock()
@@ -1695,7 +2344,7 @@ mod tests {
 
         let walk = walker()
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (entries, errors) = collect_entries(walk).await;
@@ -1706,8 +2355,8 @@ mod tests {
             .find(|e| e.relative_path() == Path::new("link.txt"))
             .expect("link.txt should be yielded");
         assert_eq!(
-            link_entry.metadata().len(),
-            content.len() as u64,
+            link_entry.metadata().map(|m| m.len()),
+            Some(content.len() as u64),
             "symlink metadata should reflect target file size"
         );
     }
@@ -1728,7 +2377,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(0)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -1740,7 +2389,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(1)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -1753,7 +2402,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(2)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -1766,7 +2415,7 @@ mod tests {
         let (e, _) = collect_entries(
             walker()
                 .max_depth(3)
-                .sort(true)
+                .sort_order(SortOrder::WithinDirectory)
                 .build()
                 .walk(ctx(dir.path())),
         )
@@ -1865,7 +2514,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // Read root: next() reads the root dir, populating pending_dirs with
@@ -1891,7 +2540,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // Read root to populate pending_dirs with [other, sub] (sorted).
@@ -1930,7 +2579,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // yields top.txt; pending_dirs = [sub, zz_unrelated]
@@ -1954,7 +2603,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // yields root_file.txt; pending_dirs = [c, zz_unrelated]
@@ -1981,7 +2630,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // yields top.txt; pending_dirs = [a, zz_unrelated]
@@ -2066,7 +2715,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
             .build()
             .walk(ctx(dir.path()));
@@ -2100,7 +2749,7 @@ mod tests {
         // max_depth=2: should yield d0.txt, a/d1.txt, a/b/d2.txt but NOT a/b/c/d3.txt.
         let mut walk = walker()
             .max_depth(2)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let entry = walk.next().await.unwrap().unwrap();
@@ -2130,7 +2779,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2161,7 +2810,7 @@ mod tests {
         let mut walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2198,7 +2847,7 @@ mod tests {
         let mut walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2237,7 +2886,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let entry = walk.next().await.unwrap().unwrap();
@@ -2281,7 +2930,7 @@ mod tests {
         let mut walk = walker()
             .recursive(true)
             .follow_symlinks(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [sub, zz_unrelated]
@@ -2312,7 +2961,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // First next() reads root: files [a.txt, b.txt] go to ready_files,
@@ -2344,7 +2993,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt; pending_dirs = [empty, zz_unrelated]
@@ -2383,7 +3032,7 @@ mod tests {
         // With sort, pending_dirs after root read will be [aaa, bbb, ccc, ddd].
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let _ = walk.next().await; // top.txt
@@ -2417,7 +3066,7 @@ mod tests {
 
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
 
@@ -2506,7 +3155,7 @@ mod tests {
         // Serial walk for reference
         let serial_walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         let (serial_entries, _) = collect_entries(serial_walk).await;
@@ -2519,7 +3168,7 @@ mod tests {
         // Parallel walk: prime, claim all subtrees, spawn concurrently
         let mut walk = walker()
             .recursive(true)
-            .sort(true)
+            .sort_order(SortOrder::WithinDirectory)
             .build()
             .walk(ctx(dir.path()));
         // Prime: first next() reads root, populating pending_dirs
@@ -2560,5 +3209,203 @@ mod tests {
             parallel_set, serial_set,
             "concurrent walks must yield the same entries as serial walk"
         );
+    }
+
+    // The oracle the other ordering tests compare against goes through `to_string_lossy`, so it
+    // cannot express a name that is not valid UTF-8 — both such names become the same string. The
+    // comparator works on bytes, which is what keeps two names differing only in their invalid bytes
+    // apart, so it is compared here against the byte order directly.
+    #[cfg(unix)]
+    #[test]
+    fn the_comparator_orders_names_that_are_not_valid_utf8_by_byte() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let child = |bytes: &[u8]| {
+            Child::Dir(PendingDir {
+                path: PathBuf::from(std::ffi::OsStr::from_bytes(bytes)),
+                depth: 1,
+                ancestor_handles: Vec::new(),
+            })
+        };
+
+        // 0xFE and 0xFF cannot begin a valid UTF-8 sequence, and `to_string_lossy` maps both to the
+        // replacement character, so a lossy comparison reads them as equal.
+        let lower = child(b"a-\xfe.txt");
+        let upper = child(b"a-\xff.txt");
+        assert_eq!(cmp_key_form(&lower, &upper), Ordering::Less);
+        assert_eq!(cmp_key_form(&upper, &lower), Ordering::Greater);
+        assert_eq!(
+            lower.path().to_string_lossy(),
+            upper.path().to_string_lossy(),
+            "the oracle cannot tell these apart, which is why this test exists"
+        );
+    }
+
+    // --- whole-walk order tests ---
+
+    // Entries must be emitted in UTF-8 byte order, as ListObjectsV2 returns keys.
+    fn assert_whole_walk_order(entries: &[FsEntry]) {
+        let emitted: Vec<String> = entries.iter().map(|e| norm(e.relative_path())).collect();
+        let mut expected = emitted.clone();
+        expected.sort();
+        assert_eq!(emitted, expected, "walk must emit keys in UTF-8 byte order");
+    }
+
+    fn emitted(entries: &[FsEntry]) -> Vec<String> {
+        entries.iter().map(|e| norm(e.relative_path())).collect()
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_whole_walk_places_nested_before_sibling() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/c"), "").unwrap();
+        fs::write(dir.path().join("az.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // 'z' (0x7A) > '/' (0x2F), so the nested key comes first.
+        assert_eq!(emitted(&entries), vec!["a/c", "az.txt"]);
+        assert_whole_walk_order(&entries);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_whole_walk_orders_a_shared_prefix() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("test")).unwrap();
+        fs::write(dir.path().join("test/inner.txt"), "").unwrap();
+        fs::write(dir.path().join("test-123.txt"), "").unwrap();
+        fs::write(dir.path().join("test.txt"), "").unwrap();
+        fs::write(dir.path().join("test0.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // Divergent bytes: '-' 0x2D, '.' 0x2E, '/' 0x2F, '0' 0x30.
+        assert_eq!(
+            emitted(&entries),
+            vec!["test-123.txt", "test.txt", "test/inner.txt", "test0.txt"]
+        );
+        assert_whole_walk_order(&entries);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_whole_walk_orders_across_depths() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("b/c")).unwrap();
+        fs::write(dir.path().join("b/c/d.txt"), "").unwrap();
+        fs::write(dir.path().join("b/z.txt"), "").unwrap();
+        fs::write(dir.path().join("b.txt"), "").unwrap();
+        fs::write(dir.path().join("ba.txt"), "").unwrap();
+
+        let walk = walker()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .build()
+            .walk(ctx(dir.path()));
+        let (entries, errors) = collect_entries(walk).await;
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        assert_eq!(
+            emitted(&entries),
+            vec!["b.txt", "b/c/d.txt", "b/z.txt", "ba.txt"]
+        );
+        assert_whole_walk_order(&entries);
+    }
+
+    // Random tree; returns the file count. Fragments bracket '/' (0x2F) in byte
+    // order, where interleaving matters. ASCII only until NFC/NFD is settled.
+    fn build_random_tree(rng: &mut fastrand::Rng, root: &Path, depth: usize) -> usize {
+        const FRAGMENTS: &[&str] = &[
+            "a", "a.txt", "a-1", "a+1", "a 1", "a%1", "a#1", "a0", "az", "b", "b.dat", "bz",
+        ];
+        let mut files = 0;
+        for _ in 0..rng.usize(1..=6) {
+            let path = root.join(FRAGMENTS[rng.usize(..FRAGMENTS.len())]);
+            if path.exists() {
+                continue;
+            }
+            if depth > 0 && rng.bool() {
+                fs::create_dir(&path).unwrap();
+                files += build_random_tree(rng, &path, depth - 1);
+            } else {
+                fs::write(&path, "").unwrap();
+                files += 1;
+            }
+        }
+        files
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_whole_walk_order_holds_for_random_trees() {
+        for seed in 0..32u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let dir = tempdir().unwrap();
+            let expected = build_random_tree(&mut rng, dir.path(), 3);
+
+            let walk = walker()
+                .recursive(true)
+                .sort_order(SortOrder::WholeWalk)
+                .build()
+                .walk(ctx(dir.path()));
+            let (entries, errors) = collect_entries(walk).await;
+            assert!(
+                errors.is_empty(),
+                "seed {seed}: unexpected errors: {errors:?}"
+            );
+            assert_eq!(entries.len(), expected, "seed {seed}: wrong entry count");
+
+            let keys = emitted(&entries);
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted, "seed {seed}: emitted out of key order");
+        }
+    }
+
+    // Directories are read on demand, so removing an entry from a directory the
+    // walk has not reached yet must not disturb it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walk_entry_removed_before_its_directory_is_read() {
+        let dir = tempdir().unwrap();
+        for sub in ["a", "b"] {
+            fs::create_dir(dir.path().join(sub)).unwrap();
+            for name in ["1", "2", "3"] {
+                fs::write(dir.path().join(sub).join(name), "").unwrap();
+            }
+        }
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort_order(SortOrder::WithinDirectory)
+            .build()
+            .walk(ctx(dir.path()));
+
+        // The first entry comes from `a`, so `b` is still unread.
+        let first = walk.next().await.unwrap().unwrap();
+        assert!(norm(first.relative_path()).starts_with("a/"));
+        fs::remove_file(dir.path().join("b/2")).unwrap();
+
+        let mut keys = vec![norm(first.relative_path())];
+        while let Some(result) = walk.next().await {
+            keys.push(norm(result.expect("walk must not fail").relative_path()));
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["a/1", "a/2", "a/3", "b/1", "b/3"]);
     }
 }
