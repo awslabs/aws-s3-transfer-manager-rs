@@ -97,7 +97,13 @@ impl PathBodyBuilder {
         let length = match self.length {
             None => {
                 // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
-                let metadata = self.metadata.unwrap_or(fs::metadata(path.clone())?);
+                // `unwrap_or` would evaluate its argument before checking whether it is needed, so
+                // a caller that supplied metadata still paid for a `stat` — and failed outright if
+                // the path had since been removed.
+                let metadata = match self.metadata {
+                    Some(metadata) => metadata,
+                    None => fs::metadata(path.clone())?,
+                };
                 let file_size = metadata.len();
 
                 if offset > file_size {
@@ -150,6 +156,28 @@ mod test {
         let body = path_body(&stream);
         assert_eq!(0, body.offset);
         assert_eq!(content.len() as u64, body.length);
+    }
+
+    // Metadata already read by the caller is what the length comes from, so building must not go
+    // back to the filesystem for it. Proven by handing over metadata for a path that no longer
+    // exists: a second look would fail, and the supplied length is right there.
+    #[test]
+    fn supplied_metadata_is_not_read_again() {
+        let tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        std::fs::write(tmp.path(), content).unwrap();
+        let metadata = std::fs::metadata(tmp.path()).unwrap();
+
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        assert!(!path.exists(), "the file should be gone");
+
+        let stream = PathBodyBuilder::new()
+            .path(&path)
+            .metadata(metadata)
+            .build()
+            .expect("the supplied metadata carries the length");
+        assert_eq!(content.len() as u64, path_body(&stream).length);
     }
 
     #[test]
