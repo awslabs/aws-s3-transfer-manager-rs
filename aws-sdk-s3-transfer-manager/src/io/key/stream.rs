@@ -281,7 +281,13 @@ pub(crate) fn s3_predicate(
         if !exclude_s3_folder_markers(obj) {
             return false;
         }
-        let key = obj.key().unwrap_or_default();
+        // No key means no name to test a rule against, and selecting it leaves the judgement to the
+        // code that reports a malformed listing. Substituting an empty key here would have a rule
+        // decide the fate of an object nobody can name, and a lost key would go unreported for no
+        // reason beyond a filter being installed.
+        let Some(key) = obj.key() else {
+            return true;
+        };
         // A key outside the root is not the filter's business: it should never have been
         // listed, and testing a rule against a key that is not under the root would answer
         // about a name nobody asked for.
@@ -805,6 +811,26 @@ mod tests {
             }
             other => panic!("expected a named malformed listing, got {other:?}"),
         }
+
+        // Whether a filter is installed decides what gets selected, never what gets reported. An
+        // object with no key cannot be matched against a rule at all, so the predicate has to pass
+        // it on to the one place that can say a key was lost.
+        let no_key = Object::builder()
+            .size(1)
+            .last_modified(DateTime::from_secs(1))
+            .build();
+        let filtered = s3_predicate(
+            Arc::new(KeyFilter::new(vec![
+                Rule::exclude("*"),
+                Rule::include("data/*"),
+            ])),
+            Some("data/".to_string()),
+        );
+        assert!(
+            filtered(&no_key),
+            "a keyless object must reach the code that reports it, not be dropped by a rule it \
+             cannot be tested against"
+        );
 
         // An object the listing gave no key for has none to name, and nothing on the other side
         // could correspond to it.
