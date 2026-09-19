@@ -12,8 +12,9 @@ pub(crate) mod stream;
 
 // Translating between local relative paths and S3 object keys.
 //
-// Shared by the directory operations and by key-ordered comparison, which all need
-// the same answer for what key a given file has.
+// The directory operations and key-ordered comparison both come here, and they do not agree on what
+// a prefix is: one names a span of keys to take off, the other names a place that holds entries.
+// Both notions live here, and `strip_key_prefix` and `relative_key` are where they part.
 
 use std::borrow::Cow;
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
@@ -66,8 +67,10 @@ pub(crate) fn derive_object_key<'a>(
 // The part of `key` below `prefix`, for building a local path under a download's destination.
 //
 // A download of `s3://bucket/data` writes `data/a.txt` to `a.txt`, so the prefix here names a span
-// of keys. A sync needs `relative_key`, which treats it as a place: with the prefix `data` this
-// turns `data/z` into `z` and leaves `datab/x` alone, and `z` sorts after `datab/x`.
+// of keys: it comes off any key that starts with those letters and holds a delimiter somewhere, so
+// `data/z` becomes `z` and `datab/x` becomes `b/x`. A sync needs `relative_key`, which treats the
+// prefix as a place, where `datab/x` is not under `data/` and has no relative key at all. The two
+// also disagree on order: `data/z` sorts before `datab/x`, while `b/x` sorts before `z`.
 pub(crate) fn strip_key_prefix<'a>(
     key: &'a str,
     prefix: Option<&str>,
@@ -132,6 +135,11 @@ mod tests {
             ("no-delim", Some("no-delim"), None, "no-delim"),
             ("delim/", Some("delim"), None, ""),
             ("not-in-key", Some("prefix"), None, "not-in-key"),
+            // A prefix here names a span of keys, so it comes off a key that merely starts with
+            // those letters. A sync cannot use this, which is why `relative_key` exists.
+            ("datab/x", Some("data"), None, "b/x"),
+            // And a key with no delimiter anywhere keeps its whole name.
+            ("datafile", Some("data"), None, "datafile"),
             ("notes/2021/1.txt", Some("notes/2021"), None, "1.txt"),
             ("notes/2021/1.txt", Some("notes/2021/"), None, "1.txt"),
             (

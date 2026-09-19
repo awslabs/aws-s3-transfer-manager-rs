@@ -12,7 +12,7 @@
 //! In a pattern, `*` matches any run of characters including `/`, `?` matches exactly
 //! one, and `[abc]` or `[!abc]` match one character in or not in a set, ranges
 //! included. There is no escape character, so a bracket opening no complete set is
-//! literal text, and a literal `*` cannot be matched exactly. Matching is
+//! literal text, and a literal `*` is matched by the one-member set `[*]`. Matching is
 //! case-sensitive, so both sides decide alike for the same rule.
 //!
 //! Anchoring is not part of the pattern text; see [`Anchor`].
@@ -48,8 +48,9 @@ pub(crate) struct Rule {
 }
 
 impl Rule {
-    // A rule that puts back a key an earlier rule excluded. Anchored at the root, so `logs/*`
-    // means the top-level `logs/` and nothing deeper; `anywhere` changes that.
+    // A rule that puts back a key an earlier rule excluded. Anchored at the root, meaning the
+    // pattern is matched from the start of a key: `logs/*` covers everything under `logs/`, however
+    // deep, and never `other/logs/a.txt`. `anywhere` changes where the match may start.
     pub(crate) fn include(pattern: impl Into<String>) -> Self {
         let pattern: String = pattern.into();
         Self {
@@ -242,6 +243,15 @@ mod tests {
         let f = filter(vec![]);
         assert!(f.allows("a.txt"));
         assert!(f.allows("logs/deep/a.txt"));
+    }
+
+    // A bracket set holding one character matches that character, which is the only way to ask for
+    // a literal `*` where there is no escape character.
+    #[test]
+    fn a_one_member_set_matches_a_literal_star() {
+        let f = filter(vec![Rule::exclude("*"), Rule::include("[*]")]);
+        assert!(f.allows("*"));
+        assert!(!f.allows("a"));
     }
 
     // test_include. Worth pinning because it surprises people: every key starts
