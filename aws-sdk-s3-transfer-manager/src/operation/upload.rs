@@ -10,8 +10,10 @@ mod input;
 mod output;
 
 mod context;
+mod diagnostics;
 pub(crate) mod file_body;
 mod handle;
+mod part_body;
 mod transfer;
 
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
@@ -88,7 +90,7 @@ impl Upload {
             None => TransferContext::new(handle.clone()),
         };
 
-        let transfer = UploadTransfer::new(ctx, bucket_type, input, stream);
+        let transfer = UploadTransfer::try_new(ctx, bucket_type, input, stream)?;
 
         handle
             .scheduler

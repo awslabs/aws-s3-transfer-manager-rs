@@ -19,6 +19,8 @@
 use std::task::Waker;
 
 use crate::config::MemoryDiagnosticsConfig;
+#[cfg(not(all(test, s3_tm_loom)))]
+use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
 mod acquisition;
@@ -41,8 +43,8 @@ use crate::types::MemoryBudgetConfig;
 use acquisition::acquire_count;
 pub use acquisition::AcquireError;
 use admission::{
-    wake_all, AdmissionGuard, AdmissionState, CoverageState, ReservationPoll, WaitSlot, WaitState,
-    Waiter, MAX_PACKED_CARRIERS,
+    wake_all, AdmissionGuard, AdmissionState, CoverageState, ReservationDrainSignal,
+    ReservationPoll, WaitSlot, WaitState, Waiter, MAX_PACKED_CARRIERS,
 };
 pub use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError, ArenaOptions};
@@ -259,6 +261,11 @@ struct PoolInner {
     geometry: PoolGeometry,
     /// Planned-demand policy and prepared-capacity serialization.
     admission: Mutex<AdmissionState>,
+    /// Repayment ordering and the reservation FIFO's drain requirement.
+    reservation_drain: ReservationDrainSignal,
+    /// Whole-value returns currently publishing physical ownership.
+    #[cfg(not(all(test, s3_tm_loom)))]
+    active_owner_returns: AtomicUsize,
     /// Aggregate charges updated by carrier acquisition and final return.
     coverage: CoverageState,
     /// Stable virtual ranges and physical carrier ownership.
@@ -311,6 +318,9 @@ impl PoolInner {
         Ok(Self {
             geometry,
             admission: Mutex::new(AdmissionState::new(configured_capacity)),
+            reservation_drain: ReservationDrainSignal::new(),
+            #[cfg(not(all(test, s3_tm_loom)))]
+            active_owner_returns: AtomicUsize::new(0),
             coverage: CoverageState::new(),
             arena: Arena::new(
                 geometry,
@@ -460,23 +470,33 @@ impl PoolInner {
         }
 
         let mut admission = AdmissionGuard::new(pool.admission.lock());
+        pool.reservation_drain.arm();
         let coverage = pool.coverage.snapshot();
         if admission.inner.waiters_is_empty() && admission.can_grant(coverage, envelope) {
-            return Self::prepare_and_grant_locked(pool, &mut admission, envelope)
+            let result = Self::prepare_and_grant_locked(pool, &mut admission, envelope)
                 .map(ReservationPoll::Ready);
+            pool.reservation_drain
+                .publish_waiter_state(!admission.inner.waiters_is_empty());
+            return result;
         }
 
         let slot = Arc::new(WaitSlot::new(waker));
-        let queue_became_nonempty = admission
-            .inner
-            .enqueue_waiter(
-                Waiter {
-                    envelope,
-                    slot: Arc::clone(&slot),
-                },
-                std::time::Instant::now(),
-            )
-            .map_err(|_| ReserveError::MetadataAllocationFailed)?;
+        let queue_became_nonempty = match admission.inner.enqueue_waiter(
+            Waiter {
+                envelope,
+                slot: Arc::clone(&slot),
+            },
+            std::time::Instant::now(),
+        ) {
+            Ok(queue_became_nonempty) => queue_became_nonempty,
+            Err(_) => {
+                pool.reservation_drain
+                    .publish_waiter_state(!admission.inner.waiters_is_empty());
+                return Err(ReserveError::MetadataAllocationFailed);
+            }
+        };
+        pool.reservation_drain
+            .publish_waiter_state(!admission.inner.waiters_is_empty());
         let queue_sample = queue_became_nonempty
             .then(|| {
                 Self::reservation_queue_sample(
@@ -574,6 +594,8 @@ impl PoolInner {
             }
             wakers.push(waker);
         }
+        pool.reservation_drain
+            .publish_waiter_state(!admission.inner.waiters_is_empty());
         let queue_sample = queue_became_empty
             .then(|| {
                 Self::reservation_queue_sample(
@@ -593,13 +615,18 @@ impl PoolInner {
     ///
     /// Physical ownership and direct provenance are returned before this
     /// boundary. Coverage-only returns stay lock-free. Repayment of uncovered
-    /// charges enters admission and invokes wakers only after unlocking.
+    /// charges enters admission only when a reservation poll may be queued and
+    /// invokes wakers only after unlocking.
     fn release_acquisition_charges(pool: &Arc<Self>, count: CarrierCount) {
         let returned = pool.coverage.release(count);
-        if returned.uncovered_removed == CarrierCount::ZERO {
+        if returned.uncovered_removed == CarrierCount::ZERO
+            || !pool.reservation_drain.repayment_requires_drain()
+        {
             return;
         }
 
+        #[cfg(test)]
+        pool.test_hooks.record_return_admission_entry();
         let drained = {
             let mut admission = AdmissionGuard::new(pool.admission.lock());
             let drained = Self::drain_fifo_locked(pool, &mut admission, false);
@@ -613,6 +640,23 @@ impl PoolInner {
             pool.log_reservation_queue_transition(sample);
         }
         wake_all(drained.wakers);
+    }
+
+    /// Marks one whole-value return and selects its physical publication mode.
+    fn begin_owner_return(pool: &Arc<Self>) -> OwnerReturnPermit {
+        // Overlap detection selects between two equivalent return strategies.
+        // Modeling it multiplies every multi-owner drop in unrelated Loom
+        // tests; the queue-driven batch path retains modeled synchronization.
+        #[cfg(not(all(test, s3_tm_loom)))]
+        let previous = pool.active_owner_returns.fetch_add(1, Ordering::AcqRel);
+        #[cfg(not(all(test, s3_tm_loom)))]
+        let overlapping = previous != 0;
+        #[cfg(all(test, s3_tm_loom))]
+        let overlapping = false;
+        OwnerReturnPermit {
+            pool: Arc::clone(pool),
+            batch: overlapping || pool.reservation_drain.is_armed(),
+        }
     }
 
     /// Schedules recovery when block preparation leaves a slot nonclaimable.
@@ -683,6 +727,40 @@ impl PoolInner {
         let count = u64::try_from(count.get()).unwrap_or(u64::MAX);
         let carrier_size = u64::try_from(self.geometry.carrier_size()).unwrap_or(u64::MAX);
         count.saturating_mul(carrier_size)
+    }
+}
+
+/// One whole-value return participating in pool-local contention detection.
+///
+/// The permit owns the pool independently of any carrier guard. Drop paths can
+/// therefore drain their mutable owner collections while the permit remains
+/// live and still retire the active-return count afterward.
+pub(super) struct OwnerReturnPermit {
+    /// Pool whose active-return count this permit decrements on drop.
+    pool: Arc<PoolInner>,
+    /// Whether this return should use the batched physical path.
+    batch: bool,
+}
+
+impl OwnerReturnPermit {
+    /// Returns whether contention or queued admission warrants batching.
+    pub(super) fn should_batch(&self) -> bool {
+        self.batch
+    }
+}
+
+impl Drop for OwnerReturnPermit {
+    fn drop(&mut self) {
+        #[cfg(not(all(test, s3_tm_loom)))]
+        {
+            let previous = self
+                .pool
+                .active_owner_returns
+                .fetch_sub(1, Ordering::AcqRel);
+            if previous == 0 {
+                invariant_violation("owner-return permit underflowed");
+            }
+        }
     }
 }
 

@@ -17,10 +17,14 @@ const MIN_MEMORY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 /// Highest memory detail level understood by this binary.
 const MAX_MEMORY_DETAIL_LEVEL: u64 = 1;
 
+/// Highest transfer detail level understood by this binary.
+const MAX_TRANSFER_DETAIL_LEVEL: u64 = 2;
+
 /// Immutable diagnostic policy for one transfer-manager runtime domain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DiagnosticsConfig {
     memory: MemoryDiagnosticsConfig,
+    transfer: TransferDiagnosticsConfig,
 }
 
 impl DiagnosticsConfig {
@@ -48,6 +52,24 @@ impl DiagnosticsConfig {
     /// Returns the memory-subsystem policy.
     pub(crate) fn memory(self) -> MemoryDiagnosticsConfig {
         self.memory
+    }
+
+    /// Returns the per-transfer policy shared by uploads and downloads.
+    pub(crate) fn transfer(self) -> TransferDiagnosticsConfig {
+        self.transfer
+    }
+
+    /// Constructs an explicit policy for deterministic internal tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(memory: MemoryDiagnosticsConfig, transfer_detail_level: u64) -> Self {
+        Self {
+            memory,
+            transfer: TransferDiagnosticsConfig {
+                detail: TransferDiagnosticDetail::from_level(
+                    transfer_detail_level.min(MAX_TRANSFER_DETAIL_LEVEL),
+                ),
+            },
+        }
     }
 
     /// Parses comma-separated `key=value` settings from one Unicode value.
@@ -85,6 +107,23 @@ impl DiagnosticsConfig {
                         config.memory.detail = MemoryDiagnosticDetail::from_level(effective);
                     }
                     Err(_) => warn_invalid_setting(key, value),
+                },
+                "transfer.detail" => match value.parse::<u64>() {
+                    Ok(requested) => {
+                        let effective = requested.min(MAX_TRANSFER_DETAIL_LEVEL);
+                        if requested != effective {
+                            tracing::warn!(
+                                target: crate::telemetry::TARGET_TRANSFER,
+                                variable = DIAGNOSTICS_ENV,
+                                setting = key,
+                                requested,
+                                effective,
+                                "clamped unsupported transfer-manager diagnostic detail level"
+                            );
+                        }
+                        config.transfer.detail = TransferDiagnosticDetail::from_level(effective);
+                    }
+                    Err(_) => warn_invalid_transfer_setting(key, value),
                 },
                 _ => {}
             }
@@ -147,6 +186,54 @@ impl MemoryDiagnosticDetail {
     }
 }
 
+/// Immutable diagnostic policy consumed by transfer state machines.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransferDiagnosticsConfig {
+    detail: TransferDiagnosticDetail,
+}
+
+impl TransferDiagnosticsConfig {
+    /// Returns the effective documented detail level.
+    #[cfg(test)]
+    pub(crate) fn detail_level(self) -> u8 {
+        self.detail as u8
+    }
+
+    /// Returns whether per-transfer summaries and aggregate timings are collected.
+    pub(crate) fn enable_summaries(self) -> bool {
+        self.detail >= TransferDiagnosticDetail::Summary
+    }
+
+    /// Returns whether individual transfer-state transitions are reported.
+    pub(crate) fn enable_transitions(self) -> bool {
+        self.detail >= TransferDiagnosticDetail::Transitions
+    }
+}
+
+/// Cumulative transfer-diagnostic detail enabled for one client.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+enum TransferDiagnosticDetail {
+    /// No optional transfer-state collection.
+    #[default]
+    Disabled = 0,
+    /// Aggregate timings and counters reported once per transfer.
+    Summary = 1,
+    /// Summary collection plus individual state-transition records.
+    Transitions = 2,
+}
+
+impl TransferDiagnosticDetail {
+    /// Converts one requested level, saturating at the highest supported detail.
+    fn from_level(level: u64) -> Self {
+        match level {
+            0 => Self::Disabled,
+            1 => Self::Summary,
+            _ => Self::Transitions,
+        }
+    }
+}
+
 /// Parses `off` or one positive integer millisecond duration.
 fn parse_memory_snapshot(value: &str) -> Result<Option<Duration>, ()> {
     if value == "off" {
@@ -195,6 +282,17 @@ fn warn_invalid_setting(setting: &str, value: &str) {
     );
 }
 
+/// Reports one invalid transfer diagnostic setting.
+fn warn_invalid_transfer_setting(setting: &str, value: &str) {
+    tracing::warn!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        variable = DIAGNOSTICS_ENV,
+        setting,
+        value,
+        "ignored invalid transfer-manager diagnostic setting"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,10 +314,18 @@ mod tests {
         );
         assert_eq!(
             DiagnosticsConfig::from_environment_value(Ok(
-                "memory.snapshot=250ms,memory.detail=1".to_owned()
+                "memory.snapshot=250ms,memory.detail=1,transfer.detail=2".to_owned()
             ))
             .memory(),
             MemoryDiagnosticsConfig::for_test(Some(Duration::from_millis(250)), 1)
+        );
+        assert_eq!(
+            DiagnosticsConfig::from_environment_value(Ok(
+                "memory.snapshot=250ms,memory.detail=1,transfer.detail=2".to_owned()
+            ))
+            .transfer()
+            .detail_level(),
+            2
         );
         assert_eq!(
             DiagnosticsConfig::from_environment_value(Err(VarError::NotUnicode(
@@ -292,10 +398,39 @@ mod tests {
     }
 
     #[test]
+    fn transfer_detail_levels_are_cumulative_and_clamped() {
+        let disabled = DiagnosticsConfig::parse("transfer.detail=0").transfer();
+        assert_eq!(disabled.detail_level(), 0);
+        assert!(!disabled.enable_summaries());
+        assert!(!disabled.enable_transitions());
+
+        let summary = DiagnosticsConfig::parse("transfer.detail=1").transfer();
+        assert_eq!(summary.detail_level(), 1);
+        assert!(summary.enable_summaries());
+        assert!(!summary.enable_transitions());
+
+        let transitions = DiagnosticsConfig::parse("transfer.detail=2").transfer();
+        assert_eq!(transitions.detail_level(), 2);
+        assert!(transitions.enable_summaries());
+        assert!(transitions.enable_transitions());
+
+        assert_eq!(
+            DiagnosticsConfig::parse("transfer.detail=3")
+                .transfer()
+                .detail_level(),
+            2
+        );
+    }
+
+    #[test]
     fn detail_conversion_saturates_at_the_highest_supported_level() {
         assert_eq!(
             MemoryDiagnosticDetail::from_level(u64::MAX),
             MemoryDiagnosticDetail::AllocatorScans
+        );
+        assert_eq!(
+            TransferDiagnosticDetail::from_level(u64::MAX),
+            TransferDiagnosticDetail::Transitions
         );
     }
 
@@ -316,9 +451,11 @@ mod tests {
     #[test]
     fn settings_are_trimmed_and_last_valid_assignment_wins() {
         let config = DiagnosticsConfig::parse(
-            " memory.detail = 1 , memory.snapshot = 500ms , memory.detail = 0 ",
+            " memory.detail = 1 , memory.snapshot = 500ms , transfer.detail = 2 , \
+              memory.detail = 0 , transfer.detail = 1 ",
         );
         assert_eq!(config.memory().detail_level(), 0);
+        assert_eq!(config.transfer().detail_level(), 1);
         assert_eq!(
             config.memory().snapshot_interval(),
             Some(Duration::from_millis(500))
@@ -327,8 +464,12 @@ mod tests {
 
     #[test]
     fn malformed_entries_do_not_change_other_settings() {
-        let config = DiagnosticsConfig::parse("bad-entry,memory.detail=1,memory.snapshot=broken");
+        let config = DiagnosticsConfig::parse(
+            "bad-entry,memory.detail=1,memory.snapshot=broken,transfer.detail=1,\
+             transfer.detail=bad",
+        );
         assert_eq!(config.memory().detail_level(), 1);
         assert_eq!(config.memory().snapshot_interval(), None);
+        assert_eq!(config.transfer().detail_level(), 1);
     }
 }

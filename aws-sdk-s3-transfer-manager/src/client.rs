@@ -519,29 +519,47 @@ fn resolve_concurrency_target(
     match mode {
         // Guard the trait's `target >= 1` invariant: `Explicit(0)` would panic in
         // `FixedConcurrency::new`. Clamp to 1 rather than panic on a config value.
-        ConcurrencyMode::Explicit(n) => (*n).max(1),
+        ConcurrencyMode::Explicit(n) => {
+            let target = (*n).max(1);
+            tracing::debug!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                mode = "explicit",
+                source = "configured_concurrency",
+                requested_concurrency = *n,
+                concurrency_target = target,
+                "resolved concurrency target",
+            );
+            target
+        }
         ConcurrencyMode::TargetThroughput(t) => {
             let gbps = t.download().as_unit_per_sec(ByteUnit::Gigabit);
             let target = platform::seed_from_gbps(gbps);
             tracing::debug!(
                 target: crate::telemetry::TARGET_CONCURRENCY,
-                gbps,
-                seed = target,
-                "resolved TargetThroughput concurrency",
+                mode = "target_throughput",
+                source = "configured_throughput",
+                target_gbps = gbps,
+                assumed_gbps_per_inflight = platform::GBPS_PER_CONN,
+                concurrency_target = target,
+                "resolved concurrency target",
             );
             target
         }
         ConcurrencyMode::Auto => {
-            let target =
-                platform::auto_concurrency_seed(profile.instance_type.as_deref(), profile.vcpus);
+            let resolved =
+                platform::resolve_auto_concurrency(profile.instance_type.as_deref(), profile.vcpus);
             tracing::debug!(
                 target: crate::telemetry::TARGET_CONCURRENCY,
+                mode = "auto",
+                source = resolved.source.as_str(),
                 instance_type = ?profile.instance_type,
                 vcpus = profile.vcpus,
-                seed = target,
-                "resolved Auto concurrency seed",
+                estimated_gbps = ?resolved.estimated_gbps,
+                assumed_gbps_per_inflight = platform::GBPS_PER_CONN,
+                concurrency_target = resolved.target,
+                "resolved concurrency target",
             );
-            target
+            resolved.target
         }
     }
 }
@@ -775,7 +793,7 @@ mod tests {
         // feeding local vCPU into resolution is caught (not just a clamp-range
         // check that holds by construction).
         use crate::runtime::platform;
-        let expected = platform::auto_concurrency_seed(None, platform::local_vcpus());
+        let expected = platform::resolve_auto_concurrency(None, platform::local_vcpus()).target;
         let config = config_with(ConcurrencyMode::Auto, None);
         let client = Client::new(config);
         assert_eq!(client.handle.controller.target(), expected);

@@ -75,6 +75,19 @@ number of milliseconds, such as `1000ms`; intervals below `100ms` use `100ms`.
 acquisition and can add measurable overhead. Snapshot cadence and detail level
 are independent.
 
+`transfer.detail` controls diagnostics for individual upload and download state
+machines. Level `0` is the default and collects nothing. Level `1` collects
+aggregate per-transfer summaries; level `2` also emits individual state
+transitions. Multipart uploads currently provide summaries and transitions.
+Transfer records use the
+`aws_sdk_s3_transfer_manager::transfer` tracing target:
+
+```sh
+AWS_S3_TM_DIAGNOSTICS=transfer.detail=1 \
+RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug \
+cargo run --release --example cp -- ...
+```
+
 #### Flamegraphs
 
 See [cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph) for more prerequisites and installation information.

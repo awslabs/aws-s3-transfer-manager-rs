@@ -5,7 +5,6 @@
 
 use std::default::Default;
 use std::fmt;
-use std::future::poll_fn;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -14,7 +13,9 @@ use bytes::{Buf, Bytes};
 use crate::io::path_body::PathBody;
 use crate::io::path_body::PathBodyBuilder;
 use crate::io::size_hint::SizeHint;
-use crate::io::Buffer;
+use crate::io::PartBuffer;
+use crate::memory::BufferPool;
+use crate::memory::SegmentedBytes;
 
 /// Source of binary data.
 ///
@@ -104,13 +105,20 @@ impl InputStream {
     ///   path is a cheap `Bytes` clone. Keeping the native in-memory body (rather
     ///   than a custom wrapper) is what lets the SDK take its inline-checksum
     ///   path; wrapping would force aws-chunked trailer encoding.
-    /// * File-backed (`Fs`) streams go through [`SdkBody::retryable`]; each retry
-    ///   constructs a fresh [`DirectFileBody`] or [`OffloadedFileBody`] with its
-    ///   own open file descriptor and read cursor.
+    /// * File-backed (`Fs`) streams open the file once, then go through
+    ///   [`SdkBody::retryable`]. Each retry constructs a fresh
+    ///   [`DirectFileBody`] or [`OffloadedFileBody`] with an independent cursor
+    ///   over the same open file identity.
     ///
     /// `direct_io` selects between the two file-body implementations: `true`
     /// when the caller owns the polling thread (managed-thread direct I/O),
     /// `false` when the body may be polled by the shared tokio runtime.
+    ///
+    /// File-backed bodies acquire bounded chunks from `buffer_pool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file-backed stream cannot open its path.
     ///
     /// # Panics
     ///
@@ -122,23 +130,33 @@ impl InputStream {
     /// [`SdkBody::retryable`]: aws_smithy_types::body::SdkBody::retryable
     /// [`DirectFileBody`]: crate::operation::upload::file_body::DirectFileBody
     /// [`OffloadedFileBody`]: crate::operation::upload::file_body::OffloadedFileBody
-    pub(crate) fn into_sdk_body(self, direct_io: bool) -> aws_smithy_types::body::SdkBody {
-        use crate::operation::upload::file_body::{DirectFileBody, OffloadedFileBody};
+    pub(crate) fn into_sdk_body(
+        self,
+        direct_io: bool,
+        buffer_pool: BufferPool,
+    ) -> std::io::Result<aws_smithy_types::body::SdkBody> {
+        use crate::operation::upload::file_body::{
+            DirectFileBody, FileBodySource, OffloadedFileBody,
+        };
         use aws_smithy_types::body::SdkBody;
         match self.inner {
-            RawInputStream::Buf(bytes) => SdkBody::from(bytes),
+            RawInputStream::Buf(bytes) => Ok(SdkBody::from(bytes)),
             RawInputStream::Fs(path_body) => {
-                let path = path_body.path;
+                let source = FileBodySource::open(&path_body.path, buffer_pool)?;
                 let offset = path_body.offset;
                 let length = path_body.length;
                 if direct_io {
-                    SdkBody::retryable(move || {
-                        SdkBody::from_body_1_x(DirectFileBody::new(path.clone(), offset, length))
-                    })
+                    Ok(SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(DirectFileBody::new(source.clone(), offset, length))
+                    }))
                 } else {
-                    SdkBody::retryable(move || {
-                        SdkBody::from_body_1_x(OffloadedFileBody::new(path.clone(), offset, length))
-                    })
+                    Ok(SdkBody::retryable(move || {
+                        SdkBody::from_body_1_x(OffloadedFileBody::new(
+                            source.clone(),
+                            offset,
+                            length,
+                        ))
+                    }))
                 }
             }
             RawInputStream::Dyn(_) => panic!(
@@ -163,7 +181,15 @@ impl InputStream {
     /// NOTE: Implementing `PartStream` directly is a more advanced use case. You should reach for
     /// one of the provided implementations or adapters first if possible.
     ///
-    /// # Streams of unknown length
+    /// # Size bounds
+    ///
+    /// The stream must emit at least [`SizeHint::lower`](crate::io::SizeHint::lower) bytes and no
+    /// more than its optional [`SizeHint::upper`](crate::io::SizeHint::upper). Equal bounds declare
+    /// an exact size and are retained as the independent `MpuObjectSize` sent to S3. For nonexact
+    /// bounds, completion sends the validated number of bytes actually emitted. Contradictory
+    /// bounds, early EOF, and output past the upper bound fail the upload.
+    ///
+    /// # Streams without an upper bound
     ///
     /// A stream whose [`size_hint`](PartStream::size_hint) has no upper bound is read until it ends,
     /// with no declared total. Prefer declaring a size when one is available, because without it:
@@ -197,6 +223,8 @@ pub(super) enum RawInputStream {
 #[derive(Debug)]
 pub struct StreamContext {
     part_size: usize,
+    /// Shared payload-memory pool used by this client.
+    buffer_pool: BufferPool,
     /// When true, file I/O runs directly on the calling thread.
     direct_io: bool,
     /// Per-transfer cumulative metrics.
@@ -208,12 +236,14 @@ pub struct StreamContext {
 impl StreamContext {
     pub(super) fn new(
         part_size: usize,
+        buffer_pool: BufferPool,
         direct_io: bool,
         metrics: std::sync::Arc<crate::transfer::MetricsState>,
         telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
     ) -> Self {
         Self {
             part_size,
+            buffer_pool,
             direct_io,
             metrics,
             telemetry,
@@ -227,6 +257,15 @@ impl StreamContext {
         self.part_size
     }
 
+    /// Creates empty pooled storage for one part produced by this stream.
+    ///
+    /// Creating the buffer does not reserve memory. The stream must retain the
+    /// [`PartBuffer`] across `Poll::Pending` and call
+    /// [`PartBuffer::poll_acquire`] before writing.
+    pub fn part_buffer(&self) -> PartBuffer {
+        PartBuffer::new(self.buffer_pool.clone(), self.part_size)
+    }
+
     /// Whether file I/O should run directly on the calling thread.
     pub(crate) fn direct_io(&self) -> bool {
         self.direct_io
@@ -237,23 +276,20 @@ impl StreamContext {
         self.metrics.record_io(sample);
         self.telemetry.io_counters.record(sample);
     }
-
-    // TODO - eventually make the ability to allocate a buffer public after carefully review of the `Buffer` API.
-    /// Request a new buffer to fill
-    pub(crate) fn new_buffer(&self, capacity: usize) -> Buffer {
-        // TODO - replace allocation with memory pool
-        Buffer::new(capacity)
-    }
 }
 
 /// Contents and (optional) metadata for a single part of a [multipart upload].
+///
+/// [`PartData::new`] accepts one contiguous [`Bytes`] value.
+/// [`PartData::from_segmented`] accepts an existing [`SegmentedBytes`] value
+/// without gathering its immutable segments.
 ///
 /// [multipart upload]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
 #[derive(Clone, PartialEq, Eq)]
 pub struct PartData {
     // 1-indexed
     pub(crate) part_number: u64,
-    pub(crate) data: Bytes,
+    pub(crate) data: SegmentedBytes,
     pub(crate) checksum: Option<String>,
     pub(crate) is_last: Option<bool>,
 }
@@ -270,24 +306,26 @@ impl std::fmt::Debug for PartData {
 }
 
 impl PartData {
-    // Check if this is the last part
-    //
-    // It is `Option` because it's not always possible to determine
-    // whether the just-yielded part is the last one, e.g., streaming cases.
-    #[allow(dead_code)] // TODO: re-wire upload part validation
-    pub(crate) fn is_last(&self) -> Option<bool> {
-        self.is_last
+    /// Creates a part from contiguous immutable data.
+    ///
+    /// The data is retained without copying and uses the SDK's native
+    /// contiguous request-body path.
+    pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+        Self::from_segmented(part_number, SegmentedBytes::from(data.into()))
     }
 
-    /// Create a new part
-    pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
+    /// Creates a part from an existing segmented payload.
+    ///
+    /// The transfer manager retains the payload's immutable owners through
+    /// request retries without gathering its presentation segments.
+    pub fn from_segmented(part_number: u64, data: SegmentedBytes) -> Self {
         debug_assert!(
             part_number > 0,
             "part numbers are 1-indexed and must be greater than zero"
         );
         Self {
             part_number,
-            data: data.into(),
+            data,
             checksum: None,
             is_last: None,
         }
@@ -314,24 +352,46 @@ impl PartData {
 
 /// Trait representing a stream of object parts (streaming body).
 ///
-/// Individual parts are streamed via the `poll_part` function, which asynchronously yields
-/// instances of `PartData`. When `Poll::Ready(None)` is returned the stream is assumed to have
-/// reached EOF and is finished.
+/// Individual parts are streamed via [`PartStream::poll_part`]. The transfer manager polls one
+/// operation at a time with exclusive access to the stream, but a pending operation may resume on
+/// a different thread. Implementations must retain any partial progress in `Self`, arrange for the
+/// task waker to be notified before returning [`Poll::Pending`](std::task::Poll::Pending), and
+/// return promptly rather than block the executor thread.
 ///
-/// The `size_hint` function provides insight into the total number of bytes that will be streamed.
+/// [`Poll::Ready(None)`](std::task::Poll::Ready) marks end-of-stream. The transfer manager does not
+/// poll the stream again after that result.
+///
+/// [`size_hint`](PartStream::size_hint) declares bounds on the total bytes emitted before EOF.
 pub trait PartStream {
-    /// Attempt to pull the next part from the stream.
+    /// Polls for the next complete upload part.
     ///
-    /// The `stream_cx` will have the part size that should be utilized. Implementations should be
-    /// careful to only yield full parts for every part except the last one, which _may_ be less
-    /// than the full part size.
+    /// Returns [`Poll::Ready(Some(Ok(part)))`](std::task::Poll::Ready) when one part is available.
+    /// Parts should contain [`StreamContext::part_size`] bytes except for the final part, which may
+    /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
+    /// transfer manager does not poll the stream again after end-of-stream or an error.
+    ///
+    /// Returns [`Poll::Pending`](std::task::Poll::Pending) when the next part is not ready. Before
+    /// returning `Pending`, the implementation must arrange for `cx.waker()` to be notified when
+    /// polling may make progress. Partial reads, pending futures, and acquired storage must be
+    /// retained in `Self`; dropping them and recreating the operation on the next poll can lose
+    /// progress or notification. A later poll may use a different thread and a different waker.
+    ///
+    /// Implementations must return promptly and must not block the executor thread. Sources that
+    /// need transfer-manager-owned storage can create a [`PartBuffer`] through
+    /// [`StreamContext::part_buffer`]. Creating the buffer does not reserve memory. Retain it in
+    /// `Self` across `Pending`, poll its admission before writing, and freeze it only after the
+    /// complete part is available.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         stream_cx: &StreamContext,
     ) -> std::task::Poll<Option<std::io::Result<PartData>>>;
 
-    /// Returns the bounds on the total size of the stream
+    /// Returns the bounds on the total size of the stream.
+    ///
+    /// Equal bounds are exact. When an upper bound is present it must be greater than or equal to
+    /// the lower bound. The transfer manager captures this declaration once before polling begins;
+    /// it must describe the complete sequence of parts returned before end-of-stream.
     fn size_hint(&self) -> crate::io::SizeHint;
 
     /// If you calculated the full object checksum while streaming, return it.
@@ -363,11 +423,12 @@ impl BoxStream {
         }
     }
 
-    pub(crate) async fn next(
+    pub(crate) fn poll_next(
         &mut self,
+        cx: &mut std::task::Context<'_>,
         stream_cx: &StreamContext,
-    ) -> Option<std::io::Result<PartData>> {
-        poll_fn(|cx| self.inner.as_mut().poll_part(cx, stream_cx)).await
+    ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+        self.inner.as_mut().poll_part(cx, stream_cx)
     }
 
     pub(crate) fn full_object_checksum(&self) -> Option<String> {

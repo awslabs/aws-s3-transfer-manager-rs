@@ -22,9 +22,10 @@ use std::ptr::NonNull;
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::acquisition::CarrierGuard;
+use super::acquisition::{CarrierGuard, CarrierReturnBatch};
 use super::block::BlockSlot;
 use super::invariant_violation;
+use super::BufferPool;
 use super::PoolInner;
 use crate::runtime::sync::sync::Arc;
 
@@ -57,34 +58,106 @@ impl SegmentedBytes {
         self.remaining == 0
     }
 
+    /// Returns the number of presentation segments remaining from this cursor.
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Appends the remaining bytes from `other`.
+    ///
+    /// This preserves existing owner boundaries and coalesces presentation
+    /// segments only when both ranges have the same pooled slot provenance.
+    pub fn append(&mut self, other: Self) {
+        let current = std::mem::replace(self, Self::empty());
+        let mut builder = SegmentedBytesBuilder::new();
+        builder.push_segmented(current);
+        builder.push_segmented(other);
+        *self = builder.finish();
+    }
+
+    /// Appends `view` after classifying its complete range against `pool`.
+    ///
+    /// Classification permits adjacent views from the same concrete block slot
+    /// to share one presentation segment. The view retains all lifetime and
+    /// accounting ownership; classification does not recover mutable or return
+    /// authority. A foreign or otherwise unclassified view remains a separate
+    /// segment.
+    pub(crate) fn append_pool_view(&mut self, pool: &BufferPool, view: Bytes) {
+        let current = std::mem::replace(self, Self::empty());
+        let mut builder = SegmentedBytesBuilder::for_pool(Arc::clone(&pool.inner));
+        builder.push_segmented(current);
+        builder.push_view(view);
+        *self = builder.finish();
+    }
+
+    /// Consumes this value and returns its remaining presentation segments.
+    ///
+    /// Each returned [`Bytes`] retains the owners for that complete segment.
+    /// No payload bytes are copied.
+    pub fn into_segments(mut self) -> Vec<Bytes> {
+        let mut segments = Vec::with_capacity(self.segments.len());
+        while let Some(segment) = self.take_front_segment() {
+            segments.push(segment);
+        }
+        segments
+    }
+
+    /// Returns one contiguous immutable buffer when no gathering is required.
+    ///
+    /// Empty and single-segment values return `Ok` without copying. A
+    /// multi-segment value is returned unchanged in `Err`.
+    pub fn try_into_contiguous(self) -> Result<Bytes, Self> {
+        if self.segments.len() > 1 {
+            return Err(self);
+        }
+
+        let mut value = self;
+        Ok(value.take_front_segment().unwrap_or_default())
+    }
+
     /// Consumes this value and returns one contiguous immutable buffer.
     ///
     /// Empty and single-segment values do not copy. Multiple segments are
     /// copied in logical order while each source owner remains live until its
     /// bytes have been copied.
-    pub fn into_contiguous(mut self) -> Bytes {
-        match self.segments.len() {
-            0 => Bytes::new(),
-            1 => {
-                let segment = self
-                    .segments
-                    .pop_front()
-                    .unwrap_or_else(|| invariant_violation("single segment disappeared"))
-                    .trim_prefix(self.front_offset);
-                self.front_offset = 0;
-                self.remaining = 0;
-                Bytes::from_owner(ContiguousOwner::new(segment))
-            }
-            _ => {
-                let mut contiguous = BytesMut::with_capacity(self.remaining);
-                while self.has_remaining() {
-                    let copied = self.chunk().len();
-                    contiguous.extend_from_slice(self.chunk());
-                    self.advance(copied);
+    pub fn into_contiguous(self) -> Bytes {
+        match self.try_into_contiguous() {
+            Ok(contiguous) => contiguous,
+            Err(mut segmented) => {
+                let mut contiguous = BytesMut::with_capacity(segmented.remaining);
+                while let Some(segment) = segmented.take_front_segment() {
+                    contiguous.extend_from_slice(&segment);
                 }
                 contiguous.freeze()
             }
         }
+    }
+
+    /// Removes and returns the front presentation segment without copying.
+    pub(crate) fn take_front_segment(&mut self) -> Option<Bytes> {
+        if self.remaining == 0 {
+            if !self.segments.is_empty() {
+                invariant_violation("empty segmented value retained presentation ranges");
+            }
+            return None;
+        }
+
+        let mut segment = self
+            .segments
+            .pop_front()
+            .unwrap_or_else(|| invariant_violation("remaining bytes have no front segment"));
+        if self.front_offset != 0 {
+            segment = segment.trim_prefix(self.front_offset);
+            self.front_offset = 0;
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(segment.len)
+            .unwrap_or_else(|| invariant_violation("segment exceeds remaining byte length"));
+        if self.remaining == 0 && !self.segments.is_empty() {
+            invariant_violation("exhausted segmented value retained segments");
+        }
+        Some(Bytes::from_owner(ContiguousOwner::new(segment)))
     }
 
     /// Returns the contiguous bytes beginning at `offset` from this cursor.
@@ -209,6 +282,15 @@ impl SegmentedBytes {
         }
         value
     }
+
+    /// Constructs an empty segmented value.
+    fn empty() -> Self {
+        Self {
+            segments: VecDeque::new(),
+            front_offset: 0,
+            remaining: 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for SegmentedBytes {
@@ -218,6 +300,44 @@ impl std::fmt::Debug for SegmentedBytes {
             .field("segments", &self.segments.len())
             .field("remaining", &self.remaining)
             .finish()
+    }
+}
+
+impl Drop for SegmentedBytes {
+    fn drop(&mut self) {
+        let Some(first) = first_pooled_owner(
+            self.segments
+                .iter()
+                .flat_map(|segment| segment.owners.iter()),
+        ) else {
+            return;
+        };
+        let permit = first.begin_owner_return();
+        if !permit.should_batch() {
+            // Return owners before releasing the permit so overlapping drops
+            // observe this whole-value return as active.
+            self.segments.clear();
+            return;
+        }
+
+        let mut batch = CarrierReturnBatch::for_guard(first);
+        for segment in &mut self.segments {
+            transfer_batchable_owners(&mut segment.owners, &mut batch);
+        }
+    }
+}
+
+impl PartialEq for SegmentedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        buffers_equal(self.clone(), other.clone())
+    }
+}
+
+impl Eq for SegmentedBytes {}
+
+impl PartialEq<Bytes> for SegmentedBytes {
+    fn eq(&self, other: &Bytes) -> bool {
+        buffers_equal(self.clone(), other.clone())
     }
 }
 
@@ -343,6 +463,23 @@ impl From<Bytes> for SegmentedBytes {
     }
 }
 
+/// Compares two byte cursors without gathering either value.
+fn buffers_equal(mut left: impl Buf, mut right: impl Buf) -> bool {
+    if left.remaining() != right.remaining() {
+        return false;
+    }
+
+    while left.has_remaining() {
+        let compared = left.chunk().len().min(right.chunk().len());
+        if left.chunk()[..compared] != right.chunk()[..compared] {
+            return false;
+        }
+        left.advance(compared);
+        right.advance(compared);
+    }
+    true
+}
+
 /// One contiguous initialized presentation range.
 ///
 /// `owners` covers this complete range in order. Its boundaries may be finer
@@ -420,6 +557,45 @@ enum Hold {
     View(Bytes),
 }
 
+/// Returns the first pooled owner when a value has several owner boundaries.
+fn first_pooled_owner<'a>(
+    owners: impl IntoIterator<Item = &'a OwnedRange>,
+) -> Option<&'a CarrierGuard> {
+    let mut first = None;
+    let mut count = 0usize;
+    for owner in owners {
+        count += 1;
+        if first.is_none() {
+            if let Hold::Pooled(guard) = &owner.hold {
+                first = Some(guard.as_ref());
+            }
+        }
+        if count >= 2 && first.is_some() {
+            return first;
+        }
+    }
+    None
+}
+
+/// Transfers uniquely held matching owners into one physical-first batch.
+fn transfer_batchable_owners(owners: &mut VecDeque<OwnedRange>, batch: &mut CarrierReturnBatch) {
+    while let Some(owner) = owners.pop_front() {
+        match owner.hold {
+            Hold::Pooled(guard) => {
+                if !batch.accepts(&guard) {
+                    drop(guard);
+                    continue;
+                }
+                match Arc::try_unwrap(guard) {
+                    Ok(guard) => batch.push(guard.into_return()),
+                    Err(guard) => drop(guard),
+                }
+            }
+            Hold::View(view) => drop(view),
+        }
+    }
+}
+
 /// Constructs segmented values while preserving complete owner coverage.
 ///
 /// A pool-aware builder may recognize opaque views produced by that pool. It
@@ -461,12 +637,10 @@ impl SegmentedBytesBuilder {
     }
 
     /// Appends the unconsumed ranges and existing owners from `buffer`.
-    pub(super) fn push_segmented(&mut self, buffer: SegmentedBytes) {
-        let SegmentedBytes {
-            mut segments,
-            front_offset,
-            remaining,
-        } = buffer;
+    pub(super) fn push_segmented(&mut self, mut buffer: SegmentedBytes) {
+        let mut segments = std::mem::take(&mut buffer.segments);
+        let front_offset = std::mem::take(&mut buffer.front_offset);
+        let remaining = std::mem::take(&mut buffer.remaining);
         if remaining == 0 {
             return;
         }
@@ -640,11 +814,32 @@ impl AsRef<[u8]> for ContiguousOwner {
 // SAFETY: the pointer names immutable initialized storage retained by owners.
 unsafe impl Send for ContiguousOwner {}
 
+impl Drop for ContiguousOwner {
+    fn drop(&mut self) {
+        let Some(first) = first_pooled_owner(self.owners.iter()) else {
+            return;
+        };
+        let permit = first.begin_owner_return();
+        if !permit.should_batch() {
+            // Return owners before releasing the permit so overlapping drops
+            // observe this whole-value return as active.
+            self.owners.clear();
+            return;
+        }
+
+        let mut batch = CarrierReturnBatch::for_guard(first);
+        transfer_batchable_owners(&mut self.owners, &mut batch);
+    }
+}
+
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
     use bytes::Buf;
 
-    use super::super::test_util::{test_pool, write_pooled};
+    use super::super::admission::AdmissionGuard;
+    use super::super::arena::ArenaTrim;
+    use super::super::test_util::{poll_reserve, slot_claiming_waker, test_pool, write_pooled};
+    use super::super::CarrierCount;
     use super::*;
 
     #[test]
@@ -689,6 +884,271 @@ mod tests {
         assert_eq!(frozen.segments.len(), 1);
         assert_eq!(frozen.segments[0].owners.len(), 2);
         assert_eq!(frozen.chunk(), input.as_slice());
+    }
+
+    #[test]
+    fn test_whole_value_drop_batches_physical_and_accounting_return() {
+        let (pool, carrier_size) = test_pool(8, 8);
+        let reservation = pool
+            .try_reserve(carrier_size * 8)
+            .unwrap()
+            .expect("part reservation");
+        let mut mutable = pool.acquire(&reservation, carrier_size * 8).unwrap();
+        write_pooled(&mut mutable, &vec![0x5a; carrier_size * 8]);
+        let frozen = mutable.freeze();
+        let slot = Arc::clone(
+            frozen.segments[0]
+                .slot
+                .as_ref()
+                .expect("pooled segment slot"),
+        );
+        drop(reservation);
+
+        let holder = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("idle-progress reservation");
+        let (waker, wake_state) = slot_claiming_waker(Arc::clone(&slot));
+        let mut queued = pool.reserve(carrier_size * 7);
+        assert!(poll_reserve(&mut queued, &waker).is_pending());
+        let release_batches = slot.test_release_batches();
+
+        drop(frozen);
+
+        // One grouped return plus the wake-time probe returning its claim.
+        assert_eq!(slot.test_release_batches() - release_batches, 2);
+        assert_eq!(pool.return_admission_entries(), 1);
+        assert_eq!(wake_state.wakes(), 1);
+        assert!(
+            wake_state.claimed(),
+            "waiter reentry ran before the batched physical return was reusable"
+        );
+        let granted = match poll_reserve(&mut queued, &waker) {
+            std::task::Poll::Ready(Ok(reservation)) => reservation,
+            std::task::Poll::Ready(Err(error)) => panic!("reservation failed: {error}"),
+            std::task::Poll::Pending => panic!("batched return stranded queued admission"),
+        };
+        drop(holder);
+        drop(granted);
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        assert_eq!(audit.queued_reservations, 0);
+    }
+
+    #[test]
+    fn test_overlapping_whole_value_return_batches_without_a_waiter() {
+        let (pool, carrier_size) = test_pool(4, 4);
+        let mut first = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        write_pooled(&mut first, &vec![0x5a; carrier_size * 2]);
+        let first = first.freeze();
+        let Hold::Pooled(guard) = &first.segments[0].owners[0].hold else {
+            panic!("frozen pool value should retain a carrier guard");
+        };
+        let active_return = guard.begin_owner_return();
+        assert!(!active_return.should_batch());
+
+        let mut second = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        write_pooled(&mut second, &vec![0xa5; carrier_size * 2]);
+        let second = second.freeze();
+        let slot = Arc::clone(
+            second.segments[0]
+                .slot
+                .as_ref()
+                .expect("pooled segment slot"),
+        );
+        let release_batches = slot.test_release_batches();
+
+        drop(second);
+
+        assert_eq!(slot.test_release_batches() - release_batches, 1);
+        drop(active_return);
+        drop(first);
+    }
+
+    #[test]
+    fn test_batched_drop_preserves_owners_shared_with_a_clone() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let mut mutable = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        write_pooled(&mut mutable, &vec![0x5a; carrier_size * 2]);
+        let frozen = mutable.freeze();
+        let shared = frozen.clone();
+        let slot = Arc::clone(
+            frozen.segments[0]
+                .slot
+                .as_ref()
+                .expect("pooled segment slot"),
+        );
+        let active_return = first_pooled_owner(
+            frozen
+                .segments
+                .iter()
+                .flat_map(|segment| segment.owners.iter()),
+        )
+        .expect("multi-owner pooled value")
+        .begin_owner_return();
+        let release_batches = slot.test_release_batches();
+
+        drop(frozen);
+
+        assert_eq!(slot.test_release_batches() - release_batches, 0);
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.charged_capacity, CarrierCount::new(2));
+        assert_eq!(audit.live_carriers, CarrierCount::new(2));
+        assert_eq!(shared.chunk(), vec![0x5a; carrier_size * 2]);
+
+        drop(active_return);
+        drop(shared);
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+    }
+
+    #[test]
+    fn test_batched_drop_falls_back_for_different_reservation_owners() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let first_reservation = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("first reservation");
+        let mut first = pool.acquire(&first_reservation, carrier_size).unwrap();
+        write_pooled(&mut first, &vec![0x5a; carrier_size]);
+        let mut first = first.freeze();
+
+        let second_reservation = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("second reservation");
+        let mut second = pool.acquire(&second_reservation, carrier_size).unwrap();
+        write_pooled(&mut second, &vec![0xa5; carrier_size]);
+        let second = second.freeze();
+
+        let slot = Arc::clone(
+            first.segments[0]
+                .slot
+                .as_ref()
+                .expect("pooled segment slot"),
+        );
+        let Hold::Pooled(first_guard) = &first.segments[0].owners[0].hold else {
+            panic!("pooled segment should retain its carrier guard");
+        };
+        let active_return = first_guard.begin_owner_return();
+        first.append(second);
+        drop(first_reservation);
+        drop(second_reservation);
+        let release_batches = slot.test_release_batches();
+
+        drop(first);
+
+        assert_eq!(slot.test_release_batches() - release_batches, 2);
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        drop(active_return);
+    }
+
+    #[test]
+    fn test_contiguous_owner_batches_before_waking_waiter() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let reservation = pool
+            .try_reserve(carrier_size * 2)
+            .unwrap()
+            .expect("part reservation");
+        let mut mutable = pool.acquire(&reservation, carrier_size * 2).unwrap();
+        write_pooled(&mut mutable, &vec![0x5a; carrier_size * 2]);
+        let frozen = mutable.freeze();
+        let slot = Arc::clone(
+            frozen.segments[0]
+                .slot
+                .as_ref()
+                .expect("pooled segment slot"),
+        );
+        let contiguous = frozen
+            .try_into_contiguous()
+            .expect("one-segment pooled value");
+        drop(reservation);
+
+        let holder = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("idle-progress reservation");
+        let (waker, wake_state) = slot_claiming_waker(Arc::clone(&slot));
+        let mut queued = pool.reserve(carrier_size);
+        assert!(poll_reserve(&mut queued, &waker).is_pending());
+        let release_batches = slot.test_release_batches();
+
+        drop(contiguous);
+
+        // One grouped return plus the wake-time probe returning its claim.
+        assert_eq!(slot.test_release_batches() - release_batches, 2);
+        assert_eq!(wake_state.wakes(), 1);
+        assert!(
+            wake_state.claimed(),
+            "waiter reentry ran before the contiguous physical return was reusable"
+        );
+        let granted = match poll_reserve(&mut queued, &waker) {
+            std::task::Poll::Ready(Ok(reservation)) => reservation,
+            std::task::Poll::Ready(Err(error)) => panic!("reservation failed: {error}"),
+            std::task::Poll::Pending => panic!("contiguous return stranded queued admission"),
+        };
+        drop(holder);
+        drop(granted);
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        assert_eq!(audit.queued_reservations, 0);
+    }
+
+    #[test]
+    fn test_batched_return_makes_the_block_trimmable() {
+        let (pool, carrier_size) = test_pool(2, 2);
+        let mut mutable = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        write_pooled(&mut mutable, &vec![0x5a; carrier_size * 2]);
+        let frozen = mutable.freeze();
+        let slot = Arc::clone(
+            frozen.segments[0]
+                .slot
+                .as_ref()
+                .expect("pooled segment slot"),
+        );
+        let active_return = first_pooled_owner(
+            frozen
+                .segments
+                .iter()
+                .flat_map(|segment| segment.owners.iter()),
+        )
+        .expect("multi-owner pooled value")
+        .begin_owner_return();
+        assert!(pool.inner.arena.select_trim_candidate().is_none());
+        let release_batches = slot.test_release_batches();
+
+        drop(frozen);
+
+        assert_eq!(slot.test_release_batches() - release_batches, 1);
+        let candidate = pool
+            .inner
+            .arena
+            .select_trim_candidate()
+            .expect("batched return should expose one free block");
+        assert!(Arc::ptr_eq(&candidate, &slot));
+        let cleanup = {
+            let mut admission = AdmissionGuard::new(pool.inner.admission.lock());
+            match pool
+                .inner
+                .arena
+                .start_trim(&mut admission, CarrierCount::ZERO)
+            {
+                ArenaTrim::Started(cleanup) => cleanup,
+                ArenaTrim::Blocked => panic!("free block was not trimmable"),
+            }
+        };
+        cleanup.finish().expect("trim cleanup");
+        drop(active_return);
+
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.prepared_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        assert_eq!(audit.cleanup_pending_blocks, 0);
     }
 
     #[test]
@@ -1125,6 +1585,61 @@ mod tests {
     }
 
     #[test]
+    fn test_try_into_contiguous_returns_multisegment_value_unchanged() {
+        let left = Bytes::from_static(b"left");
+        let right = Bytes::from_static(b"right");
+        let mut segmented = SegmentedBytes::from(left);
+        segmented.append(SegmentedBytes::from(right));
+
+        let segmented = segmented
+            .try_into_contiguous()
+            .expect_err("foreign segments must not be gathered");
+
+        assert_eq!(segmented.len(), 9);
+        assert_eq!(segmented.into_contiguous(), b"leftright"[..]);
+    }
+
+    #[test]
+    fn test_into_segments_preserves_partial_cursor_and_releases_each_owner() {
+        let (pool, carrier_size) = test_pool(1, 2);
+        let input: Vec<u8> = (0..carrier_size * 2)
+            .map(|index| (index.wrapping_mul(17) % 251) as u8)
+            .collect();
+        let mut mutable = pool.acquire_unreserved(input.len()).unwrap();
+        write_pooled(&mut mutable, &input);
+        let mut frozen = mutable.freeze();
+        frozen.advance(carrier_size - 3);
+        assert_eq!(frozen.segments.len(), 2);
+
+        let mut segments = frozen.into_segments().into_iter();
+        let first = segments.next().expect("partial front segment");
+        let second = segments.next().expect("second segment");
+
+        assert_eq!(first, input[carrier_size - 3..carrier_size]);
+        assert_eq!(second, input[carrier_size..]);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            (carrier_size * 2) as u64
+        );
+        drop(first);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        drop(second);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_append_preserves_unconsumed_bytes_and_segmentation_independent_equality() {
+        let mut left = SegmentedBytes::from(Bytes::from_static(b"abcd"));
+        left.advance(2);
+        left.append(SegmentedBytes::from(Bytes::from_static(b"efgh")));
+
+        let right = SegmentedBytes::from(Bytes::from_static(b"cdefgh"));
+
+        assert_eq!(left, right);
+        assert_eq!(left, Bytes::from_static(b"cdefgh"));
+    }
+
+    #[test]
     fn test_from_bytes_and_single_segment_conversion_preserve_owner() {
         let source = Bytes::from_static(b"foreign");
         let source_ptr = source.as_ptr();
@@ -1293,13 +1808,79 @@ mod tests {
 
 #[cfg(all(test, s3_tm_loom))]
 mod loom_tests {
-    use super::super::test_util::{test_single_carrier_pool as test_pool, write_pooled};
+    use std::task::Poll;
+
+    use super::super::block::BlockSlot;
+    use super::super::test_util::{
+        poll_reserve, slot_claiming_waker, test_pool, test_single_carrier_pool, write_pooled,
+    };
+    use super::super::CarrierCount;
+    use crate::runtime::sync::sync::Arc;
     use crate::runtime::sync::thread;
+
+    #[test]
+    fn test_batched_return_races_claim_and_publishes_before_wake() {
+        loom::model(|| {
+            let (pool, carrier_size) = test_pool(2, 2);
+            let reservation = pool
+                .try_reserve(carrier_size * 2)
+                .unwrap()
+                .expect("part reservation");
+            let mut mutable = pool.acquire(&reservation, carrier_size * 2).unwrap();
+            write_pooled(&mut mutable, &vec![0x5a; carrier_size * 2]);
+            let frozen = mutable.freeze();
+            let slot = Arc::clone(
+                frozen.segments[0]
+                    .slot
+                    .as_ref()
+                    .expect("pooled segment slot"),
+            );
+            // The racer and wake probe need distinct carriers published by one
+            // bitmap-word update; otherwise contention can consume the only
+            // returned carrier before the probe runs.
+            assert_eq!(slot.carrier_count(), CarrierCount::new(2));
+            assert_eq!(slot.bitmap_words(), 1);
+            drop(reservation);
+
+            let holder = pool
+                .try_reserve(carrier_size)
+                .unwrap()
+                .expect("idle-progress reservation");
+            let (waker, wake_state) = slot_claiming_waker(Arc::clone(&slot));
+            let mut queued = pool.reserve(carrier_size);
+            assert!(poll_reserve(&mut queued, &waker).is_pending());
+
+            let returning = thread::spawn(move || drop(frozen));
+            let raced_claim =
+                BlockSlot::try_claim(&slot, CarrierCount::new(1)).expect("racing slot claim");
+            let first_poll = poll_reserve(&mut queued, &waker);
+            returning.join().unwrap();
+
+            assert_eq!(wake_state.wakes(), 1);
+            assert!(
+                wake_state.claimed(),
+                "batched return woke admission before physical ownership was reusable"
+            );
+            let granted = match first_poll {
+                Poll::Ready(Ok(reservation)) => reservation,
+                Poll::Ready(Err(error)) => panic!("reservation failed: {error}"),
+                Poll::Pending => match poll_reserve(&mut queued, &waker) {
+                    Poll::Ready(Ok(reservation)) => reservation,
+                    Poll::Ready(Err(error)) => panic!("reservation failed: {error}"),
+                    Poll::Pending => panic!("batched return stranded queued admission"),
+                },
+            };
+            drop(raced_claim);
+            drop(holder);
+            drop(granted);
+            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        });
+    }
 
     #[test]
     fn test_concurrent_frozen_clone_drops_return_one_carrier_once() {
         loom::model(|| {
-            let (pool, carrier_size) = test_pool(1);
+            let (pool, carrier_size) = test_single_carrier_pool(1);
             let mut mutable = pool.acquire_unreserved(carrier_size).unwrap();
             write_pooled(&mut mutable, b"x");
             let first = mutable.freeze();
@@ -1317,7 +1898,7 @@ mod loom_tests {
     #[test]
     fn test_published_and_frozen_drop_race_returns_one_carrier_once() {
         loom::model(|| {
-            let (pool, carrier_size) = test_pool(1);
+            let (pool, carrier_size) = test_single_carrier_pool(1);
             let mut mutable = pool.acquire_unreserved(carrier_size).unwrap();
             write_pooled(&mut mutable, b"xy");
             let published = mutable.publish_prefix(1);

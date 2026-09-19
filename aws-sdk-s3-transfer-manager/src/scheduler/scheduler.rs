@@ -37,10 +37,12 @@
 //!
 //! # Backpressure
 //!
-//! Transfers that cannot acquire resources (sequence window full, memory budget
-//! exhausted) return `Pending` from `poll_work()`. The scheduler stops polling them
-//! until `wake()` is called, which re-inserts the transfer into the ready set and
-//! triggers work generation.
+//! Transfers that cannot produce dispatchable work return `Pending` from
+//! `poll_work()`. The scheduler stops polling them until `wake()` is called. Work
+//! whose readiness is discovered only after dispatch may instead return
+//! [`WorkOutcome::Yielded`]. That retires its execution slot without reporting an
+//! I/O operation or failure to the concurrency controller; transfer state must
+//! already have retained any continuation or retracted the speculative operation.
 //!
 //! # Threading and Cost
 //!
@@ -84,10 +86,14 @@
 //! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
 //! - **Failed lifecycle**: record the error and signal termination before returning
 //!   a failure outcome.
-//! - **Pending/wake obligation**: every `Pending` must have a future wake path.
-//!   The wake primitive is edge-triggered; the mutator pattern is
+//! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must have a
+//!   future wake path. The wake primitive is edge-triggered; the mutator pattern is
 //!   `lock → mutate → unlock → try_wake`. See [`crate::transfer::TransferContext`]
 //!   for the protocol.
+//! - **Execution-yield obligation**: before returning `WorkOutcome::Yielded`, a
+//!   transfer must reconcile the dispatched work exactly once. A retained
+//!   continuation keeps its progress and wake state; retracted work leaves no
+//!   continuation behind.
 //! - **Panic safety**: `execute` panics are caught by the runtime's
 //!   `catch_unwind` wrapper and converted to a terminal transition.
 //!   `poll_work` panics are caught by the scheduler itself inside
@@ -456,6 +462,7 @@ impl Scheduler {
     ) {
         let outcome_tag = match &outcome {
             WorkOutcome::Success { .. } => "success",
+            WorkOutcome::Yielded => "yielded",
             WorkOutcome::Failed { .. } => "failed",
             WorkOutcome::Cancelled => "cancelled",
         };
@@ -464,19 +471,26 @@ impl Scheduler {
             tid = %work.descriptor.id(),
             ?elapsed,
             outcome = outcome_tag,
-            "work completed",
+            "work execution finished",
         );
         self.release_dispatched(1);
 
-        // Report to concurrency controller
-        let classification = match &outcome {
-            WorkOutcome::Failed { classification } => *classification,
-            _ => None,
+        // Report to the concurrency controller. Yielded work retires the dispatch slot without
+        // contributing an I/O operation or failure observation.
+        let completion_sample = if matches!(outcome, WorkOutcome::Yielded) {
+            None
+        } else {
+            let classification = match &outcome {
+                WorkOutcome::Failed { classification } => *classification,
+                _ => None,
+            };
+            Some(CompletionSample {
+                error: classification,
+            })
         };
-        let sample = CompletionSample {
-            error: classification,
-        };
-        self.handle().controller.on_completion(&sample);
+        self.handle()
+            .controller
+            .on_completion(completion_sample.as_ref());
 
         let desc = &work.descriptor;
         let is_idle = desc.work_finished();
@@ -557,6 +571,10 @@ impl Scheduler {
             }
         }
         desc.notify_idle();
+
+        // The panicking work item released a concurrency slot. A peer may already be queued behind
+        // it, including at target=1 where no other completion can re-drive generation.
+        self.generate_work();
     }
 
     fn has_capacity(&self) -> bool {
@@ -928,7 +946,7 @@ mod tests {
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -940,6 +958,60 @@ mod tests {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
         Handle::new_for_test(config, concurrency)
+    }
+
+    #[derive(Debug)]
+    struct CountingCompletionController {
+        completions: AtomicUsize,
+        samples: AtomicUsize,
+    }
+
+    impl crate::scheduler::ConcurrencyController for CountingCompletionController {
+        fn target(&self) -> usize {
+            1
+        }
+
+        fn on_completion(&self, sample: Option<&crate::scheduler::CompletionSample>) {
+            self.completions.fetch_add(1, Ordering::Relaxed);
+            if sample.is_some() {
+                self.samples.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn yielded_work_releases_capacity_without_reporting_completion() {
+        let controller = Arc::new(CountingCompletionController {
+            completions: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+        });
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder().client(s3_client).build();
+        let handle = Handle::new_for_test_with_runtime(config, controller.clone(), |weak| {
+            Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
+        });
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(WithExecute::new(FixedWorkCount::new(1), |_| {
+            WorkOutcome::Yielded
+        }));
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(id, state)));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.scheduler.is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler did not drain yielded work");
+
+        assert_eq!(controller.completions.load(Ordering::Relaxed), 1);
+        assert_eq!(controller.samples.load(Ordering::Relaxed), 0);
     }
 
     // TODO(vnext): tests built on this helper are gated out under asan
@@ -1495,25 +1567,63 @@ mod tests {
         handle.runtime.shutdown();
     }
 
+    #[derive(Debug)]
+    struct PanicAfterSignal {
+        generated: AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl PanicAfterSignal {
+        fn new() -> Self {
+            Self {
+                generated: AtomicBool::new(false),
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl MockStateMachine for PanicAfterSignal {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.generated.swap(true, Ordering::SeqCst) {
+                PollWork::Done
+            } else {
+                PollWork::ready(IoRequest { data: None })
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                panic!("intentional execute panic")
+            })
+        }
+    }
+
     #[cfg_attr(miri, ignore)]
     #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_panic_transfer_cleaned_up_and_error_propagated() {
         let _logs = show_test_logs();
-        let handle = test_handle(2);
+        let handle = test_handle(1);
         let scheduler = &handle.scheduler;
 
         let panic_id = TransferId {
             id: 1,
             parent: None,
         };
-        let panic_sm = Arc::new(WithExecute::new(
-            FixedWorkCount::new(1),
-            |_| -> WorkOutcome { panic!("boom") },
-        ));
-        let panic_mock = MockTransfer::new(panic_id, panic_sm);
+        let panic_sm = Arc::new(PanicAfterSignal::new());
+        let panic_mock = MockTransfer::new(panic_id, Arc::clone(&panic_sm));
         let panic_ctx = panic_mock.ctx().clone();
         scheduler.enqueue_transfer(Box::new(panic_mock));
+        tokio::time::timeout(Duration::from_secs(5), panic_sm.started.notified())
+            .await
+            .expect("panicking work did not occupy the scheduler slot");
 
         let ok_id = TransferId {
             id: 2,
@@ -1521,6 +1631,10 @@ mod tests {
         };
         let ok_sm = Arc::new(FixedWorkCount::new(3));
         scheduler.enqueue_transfer(Box::new(MockTransfer::new(ok_id, ok_sm.clone())));
+        assert_eq!(scheduler.dispatched_for_test(), 1);
+        assert_eq!(ok_sm.completed_count(), 0);
+
+        panic_sm.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !scheduler.is_idle() {

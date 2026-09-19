@@ -109,9 +109,27 @@ pub(crate) trait Transfer: Send + Sync {
 
 `poll_work()` returns `Ready { io, spawned }` (a work item to dispatch, optionally fused with a
 child spawn), `Spawned` (a composite enqueued one child, no work item), `Pending`, or `Done`.
-`execute(work)` returns `Success`, `Failed`, or `Cancelled`. The scheduler calls `poll_work()` when
-it has capacity and the transfer is in the ready set; it never calls `poll_work()` on a transfer
-that returned `Pending` until that transfer is explicitly woken.
+`execute(work)` returns `Success`, `Yielded`, `Failed`, or `Cancelled`. The scheduler calls
+`poll_work()` when it has capacity and the transfer is in the ready set; it never calls
+`poll_work()` on a transfer that returned `PollWork::Pending` until that transfer is explicitly
+woken.
+
+`PollWork::Pending` and `WorkOutcome::Yielded` occur at different boundaries:
+
+| Result | Lifecycle point | Scheduler behavior |
+| --- | --- | --- |
+| `PollWork::Pending` | Before dispatch | No execution slot is consumed. The transfer leaves the ready set until it is woken. |
+| `WorkOutcome::Yielded` | After dispatch | The execution slot is released, no I/O operation or failure is reported to the concurrency controller, and work generation runs again. |
+
+`WorkOutcome::Yielded` means that dispatched execution retired without completing a reportable I/O
+operation or reporting a failure. The transfer may have retained an exact continuation, retracted
+speculative work that never started, or retired work that observed a completed source. Before
+returning it, transfer state must reconcile the dispatched work exactly once. If a continuation
+remains, that continuation must retain its progress and have a future wake path.
+
+`WorkOutcome::Yielded` does not itself remove the transfer from the ready set. The next
+`poll_work()` call determines whether another work item is ready or whether the transfer must return
+`PollWork::Pending` and wait for a wake.
 
 **Lazy generation.** Transfers produce work on demand, not all upfront. A 10,000-part upload
 generates one work item per `poll_work()` call. Memory and in-flight work are naturally bounded
@@ -235,16 +253,22 @@ admitted work without re-competing.
 
 ### Concurrency Control
 
-The scheduler delegates concurrency decisions to a controller. The scheduler calls
-`controller.on_completion()` after each work item finishes and checks `controller.target()` in
-`generate_work()` to decide whether to poll the next transfer.
+The scheduler delegates concurrency decisions to a controller. It calls `on_dispatch()` when a work
+item is handed to execution, calls `on_completion()` once that dispatched execution retires, and
+checks `target()` in `generate_work()` to decide whether to poll the next transfer.
 
 ```rust
 pub(crate) trait ConcurrencyController: Send + Sync {
     fn target(&self) -> usize;
-    fn on_completion(&self, bytes: u64, duration: Duration);
+    fn on_dispatch(&self);
+    fn on_completion(&self, sample: Option<&CompletionSample>);
 }
 ```
+
+A `Some(sample)` value reports the outcome observed for completed, failed, or cancelled work.
+`None` retires controller dispatch accounting for `WorkOutcome::Yielded` without treating source or
+memory blockage as successful, failed, or zero-throughput I/O. The scheduler releases its own
+execution capacity and drives work generation in both cases.
 
 A fixed controller returns a constant target. An adaptive controller observes throughput and adjusts
 the target, ramping up when throughput improves and backing off when it doesn't. The adaptive
@@ -274,10 +298,12 @@ when one is saturated and the other is idle.
 
 ### Backpressure
 
-The scheduler provides a general backpressure mechanism through the ready set: transfers that
-cannot acquire resources return `Pending` from `poll_work()`, and the scheduler stops polling them
-until they are woken. The mechanism is not specific to any resource. Transfers use it for whatever
-gating they need.
+The scheduler supports backpressure before and after dispatch. The scheduler does not interpret the
+resource being awaited; the transfer owns that policy and the state required to resume.
+
+**Pre-dispatch gating.** A transfer that knows it cannot produce dispatchable work returns
+`PollWork::Pending`. The scheduler releases the descriptor's ready-set claim and stops polling that
+transfer until it is woken.
 
 **Sequence window.** Each download limits how far ahead of the consumer it generates work. The
 window defines the maximum gap between the consumer's read position and the generation head. When
@@ -285,20 +311,30 @@ the gap is exhausted, the download returns `Pending`. When the consumer reads da
 the read head and wakes the transfer. The gap scales with concurrency to avoid becoming a
 throughput bottleneck at high concurrency while still bounding memory from out-of-order completion.
 
-**Buffer pool.** A transfer polls a `ReserveFuture` for the work item's planned memory envelope before
-dispatch. While admission is pending, it retains the candidate work and future and returns
-`Pending`. The pool assigns the `Reservation` before waking the transfer; a later poll moves that
-reservation into the dispatched work. Reservation close, cancellation, and carrier returns that
-reduce admission use reconsider queued admission according to the
-[memory design](./memory.md#scheduler-admission-and-dispatch).
+**Known memory envelope.** A download polls a `ReserveFuture` for the range's planned memory
+envelope before dispatch. While admission is pending, it retains the candidate work and future and
+returns `PollWork::Pending`. The pool assigns the `Reservation` before waking the transfer; a later
+poll moves that reservation into the dispatched work. Reservation close, cancellation, and carrier
+returns that reduce admission use reconsider queued admission according to the
+[memory design](./memory.md#reservation-handoff).
 
-When a transfer returns `Pending`, it leaves the ready set. The scheduler does not poll it again
-until something calls `scheduler.wake(id)`, which re-inserts the transfer into the ready set and
-triggers `generate_work()`. This closes the event-driven cycle: work completes or a resource is
-freed, the transfer is woken, and the scheduler polls it for the next piece of work.
+**Execution-time gating.** Some work cannot know its storage or source readiness before execution.
+Upload is the current example: immutable input may need no pool allocation, file reads acquire a
+complete part envelope, and a custom stream may choose one or several envelopes through its stream
+context. The scheduler dispatches a source operation without imposing one universal reservation.
 
-In both cases, the scheduler's role is the same: provide the Pending/wake lifecycle. What transfers
-gate on is their own concern.
+If that operation cannot yet progress, `execute()` returns `WorkOutcome::Yielded`. The scheduler
+releases the execution slot and drives work generation so another transfer can use the capacity.
+The transfer has already retained the exact continuation or retracted the speculative operation.
+While the source remains unavailable, later `poll_work()` calls stop creating fresh source work and
+eventually return `PollWork::Pending`. A source or memory wake then returns the transfer to the ready
+set.
+
+When a transfer returns `PollWork::Pending`, it leaves the ready set. The scheduler does not poll it
+again until something calls `scheduler.wake(id)`, which re-inserts the transfer into the ready set
+and triggers `generate_work()`. This closes the event-driven cycle: work completes, execution
+yields, or a resource becomes available; capacity is reused immediately, and blocked transfer state
+resumes only after its wake condition occurs.
 
 **Wake primitive protocol.** The Pending/wake handshake is edge-triggered, so
 lost-wake avoidance relies on the transfer's state mutex serializing the
@@ -344,10 +380,18 @@ A Transfer implementation must uphold several contracts:
 termination before returning the failure outcome. The scheduler relies on the terminal signal to
 stop generating work and clean up.
 
-**Pending/wake obligation.** Every `Pending` return from `poll_work()` must have a corresponding
-future wake path. If a transfer returns `Pending` and nothing ever wakes it, that transfer is stuck
-permanently. This is the correctness obligation of the edge-triggered model: the scheduler scales
-with active transfers rather than total transfer count, but every `Pending` must eventually resolve.
+**Poll-time pending/wake obligation.** Every `PollWork::Pending` return must have a corresponding
+future wake path. If a transfer returns `PollWork::Pending` and nothing ever wakes it, that transfer
+is stuck permanently. This is the correctness obligation of the edge-triggered model: the scheduler
+scales with active transfers rather than total transfer count, but every blocked transfer must
+eventually resolve.
+
+**Execution-yield obligation.** Before returning `WorkOutcome::Yielded`, a transfer must reconcile
+the dispatched work exactly once. It may retain the exact continuation and its wake state, retract a
+speculative operation that never started, or retire an operation whose source is already complete.
+A retained continuation must not be dropped and reconstructed, and a wake racing its insertion into
+transfer state must remain observable. A yielded execution does not report an I/O operation or
+failure to the concurrency controller.
 
 **Panic safety.** If `execute()` panics, the scheduler catches it and forces the terminal
 transition from outside. Execution continues with the next work item. If `poll_work()` panics,
@@ -419,10 +463,12 @@ composite calls it once per `poll_work`, so the per-poll cost is one enqueue;
 the aggregate over a pass is bounded by the concurrency target that gates how
 many times the parent is re-polled.
 
-**`on_completion` is O(1) + one `generate_work` pass.** The generate_work
-pass pops at most the number of descriptors that fit under the current
-concurrency target, each paying a `poll_work` call. Total cost of one
-`on_completion` is therefore `O(target × poll_work_cost)`.
+**`on_completion` is O(1) + one `generate_work` pass.** This applies to success, failure,
+cancellation, and `WorkOutcome::Yielded`: each retires one execution slot and makes that capacity
+available to another transfer. Yielded execution passes no observation sample to the concurrency
+controller. The generate_work pass pops at most the number of descriptors that fit under the
+current concurrency target, each paying a `poll_work` call. Total cost of one `on_completion` is
+therefore `O(target × poll_work_cost)`.
 
 **What the cost model rules out.** A `poll_work` implementation that
 iterates over an unbounded collection (pending entries, completed children,
@@ -521,6 +567,26 @@ On the scheduler side, the descriptor carries a `wake_requested` flag that
 and then reads `wake_requested`; if it is set, `generate_work` re-inserts
 the descriptor itself. A wake that arrives during the release window is
 never lost.
+
+### Execution-time yield
+
+**Invariant.** A dispatched item returning `WorkOutcome::Yielded` releases its execution capacity
+exactly once without reporting an I/O operation or failure. Transfer state already owns any
+continuation required to resume it, or has retracted or retired the speculative operation so no
+continuation remains.
+
+**What it rules out.** Dropping and recreating a pending future can lose source progress or its
+registered waker. Retaining the future without releasing scheduler capacity can let externally
+blocked work exhaust the concurrency target. Releasing capacity without retracting speculative
+transfer counters can prevent terminal detection. Treating the yield as a completed I/O sample can
+distort an adaptive controller.
+
+**Mechanism.** The scheduler always retires the descriptor's executing count and global dispatched
+count, calls the concurrency controller with `None`, and starts another generation pass. The
+transfer is responsible for balancing its own counters before returning. A retained future carries
+a wake that reaches the transfer's scheduler waker; a notification latch must preserve a wake that
+races with moving that future into transfer state. The next `poll_work()` call either dispatches a
+notified continuation or returns `PollWork::Pending` under the ordinary edge-triggered protocol.
 
 ### Single-poll exclusivity
 

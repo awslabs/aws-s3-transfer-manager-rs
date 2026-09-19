@@ -488,12 +488,16 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
         self.peak_in_flight.fetch_max(n, Ordering::Relaxed);
     }
 
-    fn on_completion(&self, sample: &CompletionSample) {
+    fn on_completion(&self, sample: Option<&CompletionSample>) {
         let _ = self
             .in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
+
+        let Some(sample) = sample else {
+            return;
+        };
 
         // Throttle error: immediate transition to shedding
         if sample.error == Some(ErrorKind::Throttle) {
@@ -680,7 +684,7 @@ mod tests {
 
         let mut s = sample(8_000_000);
         s.error = Some(ErrorKind::Throttle);
-        tc.0.on_completion(&s);
+        tc.0.on_completion(Some(&s));
 
         assert_eq!(tc.phase(), Phase::StableShedding);
     }
@@ -707,7 +711,7 @@ mod tests {
                 network_tx: 8_000_000,
                 ..Default::default()
             });
-            tc.0.on_completion(&sample(8_000_000));
+            tc.0.on_completion(Some(&sample(8_000_000)));
         }
         // Force window boundary by sleeping briefly
         std::thread::sleep(Duration::from_millis(1));
@@ -716,7 +720,7 @@ mod tests {
                 network_tx: 16_000_000,
                 ..Default::default()
             });
-            tc.0.on_completion(&sample(16_000_000));
+            tc.0.on_completion(Some(&sample(16_000_000)));
         }
 
         // Target should be clamped to max_concurrency
@@ -806,7 +810,7 @@ mod tests {
         let controller = AdaptiveConcurrencyController::new(config, Arc::clone(&io_counters));
         // Don't record any bytes — IOCounters is idle
         controller.on_dispatch();
-        controller.on_completion(&sample(0));
+        controller.on_completion(Some(&sample(0)));
         // History should be empty — idle window was skipped
         let state = controller.state.lock().unwrap();
         assert_eq!(state.recent_goodput.len(), 0, "idle window was evaluated");

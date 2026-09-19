@@ -13,8 +13,10 @@ use std::fmt;
 
 use super::admission::{AdmissionGuard, DirectDebitError, ReservationState, ReserveError};
 use super::arena::{ArenaError, ClaimBatch};
-use super::block::{BlockError, BlockSlot, CarrierAllocation, CarrierLocation};
-use super::{invariant_violation, CarrierCount, PoolInner};
+use super::block::{
+    BlockError, BlockSlot, CarrierAllocation, CarrierAllocationBatch, CarrierLocation,
+};
+use super::{invariant_violation, CarrierCount, OwnerReturnPermit, PoolInner};
 use crate::runtime::sync::sync::Arc;
 
 /// Failure to acquire a complete mutable carrier batch.
@@ -113,7 +115,7 @@ impl AcquisitionDebit {
             invariant_violation("acquisition debit transferred too many charges");
         };
         let guard = Arc::new(CarrierGuard {
-            pool: Arc::clone(&self.pool),
+            pool: Some(Arc::clone(&self.pool)),
             allocation: Some(allocation),
             direct: self.direct.as_ref().map(Arc::clone),
         });
@@ -198,7 +200,7 @@ impl Drop for PendingAcquisition {
 /// One physical carrier and its aggregate accounting charge.
 pub(super) struct CarrierGuard {
     /// Pool retained through final physical and accounting return.
-    pool: Arc<PoolInner>,
+    pool: Option<Arc<PoolInner>>,
     /// Single-owner physical return capability.
     allocation: Option<CarrierAllocation>,
     /// Optional reservation-local return provenance.
@@ -206,6 +208,13 @@ pub(super) struct CarrierGuard {
 }
 
 impl CarrierGuard {
+    /// Returns the pool that owns this live carrier.
+    fn pool(&self) -> &Arc<PoolInner> {
+        self.pool
+            .as_ref()
+            .unwrap_or_else(|| invariant_violation("live carrier guard lost its pool"))
+    }
+
     /// Returns the physical location used to group adjacent carriers.
     pub(super) fn location(&self) -> CarrierLocation {
         let allocation = self
@@ -238,10 +247,35 @@ impl CarrierGuard {
             .unwrap_or_else(|| invariant_violation("live carrier guard lost its allocation"))
             .ptr()
     }
+
+    /// Enters pool-local whole-value return publication.
+    pub(super) fn begin_owner_return(&self) -> OwnerReturnPermit {
+        PoolInner::begin_owner_return(self.pool())
+    }
+
+    /// Transfers final return authority into a whole-value batch.
+    pub(super) fn into_return(mut self) -> CarrierReturn {
+        let pool = self
+            .pool
+            .take()
+            .unwrap_or_else(|| invariant_violation("carrier guard lost aggregate ownership"));
+        let allocation = self
+            .allocation
+            .take()
+            .unwrap_or_else(|| invariant_violation("carrier guard lost physical ownership"));
+        CarrierReturn {
+            pool: Some(pool),
+            allocation: Some(allocation),
+            direct: self.direct.take(),
+        }
+    }
 }
 
 impl Drop for CarrierGuard {
     fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
         let allocation = self
             .allocation
             .take()
@@ -250,7 +284,128 @@ impl Drop for CarrierGuard {
         if let Some(direct) = self.direct.as_ref() {
             direct.release(CarrierCount::new(1));
         }
-        PoolInner::release_acquisition_charges(&self.pool, CarrierCount::new(1));
+        PoolInner::release_acquisition_charges(&pool, CarrierCount::new(1));
+    }
+}
+
+/// Final physical and accounting return for one carrier.
+pub(super) struct CarrierReturn {
+    /// Pool retained until aggregate accounting is repaid.
+    pool: Option<Arc<PoolInner>>,
+    /// Physical ownership returned before any accounting publication.
+    allocation: Option<CarrierAllocation>,
+    /// Optional reservation-local owner count.
+    direct: Option<Arc<ReservationState>>,
+}
+
+impl Drop for CarrierReturn {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
+        let allocation = self
+            .allocation
+            .take()
+            .unwrap_or_else(|| invariant_violation("carrier return lost physical ownership"));
+        drop(allocation);
+        if let Some(direct) = self.direct.take() {
+            direct.release(CarrierCount::new(1));
+        }
+        PoolInner::release_acquisition_charges(&pool, CarrierCount::new(1));
+    }
+}
+
+/// Homogeneous whole-value return with physical-first publication.
+pub(super) struct CarrierReturnBatch {
+    /// Physical word groups released before accounting on drop.
+    physical: Option<CarrierAllocationBatch>,
+    /// Shared pool for every owner in this batch.
+    pool: Option<Arc<PoolInner>>,
+    /// Shared direct reservation state, when present.
+    direct: Option<Arc<ReservationState>>,
+    /// Owners transferred into this batch.
+    count: usize,
+}
+
+impl CarrierReturnBatch {
+    /// Creates an empty batch for one guard's accounting provenance.
+    pub(super) fn for_guard(guard: &CarrierGuard) -> Self {
+        Self {
+            physical: Some(CarrierAllocationBatch::new()),
+            pool: Some(Arc::clone(guard.pool())),
+            direct: guard.direct.as_ref().map(Arc::clone),
+            count: 0,
+        }
+    }
+
+    /// Returns whether `guard` has this batch's accounting provenance.
+    pub(super) fn accepts(&self, guard: &CarrierGuard) -> bool {
+        Arc::ptr_eq(
+            self.pool
+                .as_ref()
+                .unwrap_or_else(|| invariant_violation("carrier batch lost aggregate ownership")),
+            guard.pool(),
+        ) && option_arc_ptr_eq(self.direct.as_ref(), guard.direct.as_ref())
+    }
+
+    /// Transfers one prevalidated homogeneous owner into this batch.
+    pub(super) fn push(&mut self, mut returned: CarrierReturn) {
+        let pool = returned
+            .pool
+            .take()
+            .unwrap_or_else(|| invariant_violation("carrier batch lost aggregate ownership"));
+        let direct = returned.direct.take();
+        let current_pool = self
+            .pool
+            .as_ref()
+            .unwrap_or_else(|| invariant_violation("carrier batch lost aggregate ownership"));
+        if !Arc::ptr_eq(current_pool, &pool)
+            || !option_arc_ptr_eq(self.direct.as_ref(), direct.as_ref())
+        {
+            invariant_violation("carrier batch mixed accounting owners");
+        }
+
+        let allocation = returned
+            .allocation
+            .as_mut()
+            .unwrap_or_else(|| invariant_violation("carrier batch lost physical ownership"));
+        self.physical
+            .as_mut()
+            .unwrap_or_else(|| invariant_violation("finished carrier batch accepted an owner"))
+            .push(allocation);
+        drop(returned.allocation.take());
+        self.count = self
+            .count
+            .checked_add(1)
+            .unwrap_or_else(|| invariant_violation("carrier return count overflowed"));
+    }
+}
+
+impl Drop for CarrierReturnBatch {
+    fn drop(&mut self) {
+        drop(self.physical.take());
+        if self.count == 0 {
+            return;
+        }
+
+        let count = CarrierCount::new(self.count);
+        if let Some(direct) = self.direct.take() {
+            direct.release(count);
+        }
+        let pool = self
+            .pool
+            .take()
+            .unwrap_or_else(|| invariant_violation("carrier batch lost aggregate ownership"));
+        PoolInner::release_acquisition_charges(&pool, count);
+    }
+}
+
+/// Returns whether two optional owners name the same reservation state.
+fn option_arc_ptr_eq<T>(left: Option<&Arc<T>>, right: Option<&Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -345,40 +500,15 @@ fn map_arena_error(error: ArenaError) -> AcquireError {
 
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc as StdArc;
-    use std::task::{Poll, Wake, Waker};
+    use std::task::Poll;
     use std::time::Duration;
 
     use super::super::block::{BlockSlot, TrimBlocked};
-    use super::super::test_util::{poll_reserve, test_pool_with_scan as test_pool};
+    use super::super::test_util::{claiming_waker, poll_reserve, test_pool_with_scan as test_pool};
     use super::super::virtual_memory::VirtualMemoryOperation;
-    use super::super::{BufferPool, PooledBufMut, Reservation};
+    use super::super::{PooledBufMut, Reservation};
     use super::*;
-
-    struct ClaimingWake {
-        pool: BufferPool,
-        wakes: AtomicUsize,
-        claimed: AtomicBool,
-    }
-
-    impl Wake for ClaimingWake {
-        fn wake(self: StdArc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &StdArc<Self>) {
-            let claim = self
-                .pool
-                .inner
-                .arena
-                .claim_optimistic(CarrierCount::new(1))
-                .expect("wake-time claim");
-            self.claimed.store(claim.is_complete(), Ordering::Release);
-            self.wakes.fetch_add(1, Ordering::Release);
-        }
-    }
 
     #[test]
     fn test_metadata_failures_retain_their_error_classification() {
@@ -625,6 +755,22 @@ mod tests {
     }
 
     #[test]
+    fn test_uncovered_return_skips_admission_when_fifo_is_empty() {
+        let (pool, carrier_size) = test_pool(1, 1, 1);
+        let reservation = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("reservation");
+        let acquired = pool.acquire(&reservation, carrier_size).unwrap();
+        reservation.close_acquisition();
+
+        drop(acquired);
+
+        assert_eq!(pool.return_admission_entries(), 0);
+        assert_eq!(pool.inner.test_accounting_state().3, CarrierCount::ZERO);
+    }
+
+    #[test]
     fn test_uncovered_return_drains_fifo_after_physical_return() {
         let (pool, carrier_size) = test_pool(1, 2, 1);
         let first = pool
@@ -639,20 +785,16 @@ mod tests {
             .unwrap()
             .expect("idle-only reservation");
         let second_acquired = pool.acquire(&second, carrier_size).unwrap();
-        let wake_state = StdArc::new(ClaimingWake {
-            pool: pool.clone(),
-            wakes: AtomicUsize::new(0),
-            claimed: AtomicBool::new(false),
-        });
-        let waker = Waker::from(StdArc::clone(&wake_state));
+        let (waker, wake_state) = claiming_waker(pool.clone());
         let mut queued = pool.reserve(carrier_size);
         assert!(poll_reserve(&mut queued, &waker).is_pending());
 
         drop(first_acquired);
 
-        assert_eq!(wake_state.wakes.load(Ordering::Acquire), 1);
+        assert_eq!(pool.return_admission_entries(), 1);
+        assert_eq!(wake_state.wakes(), 1);
         assert!(
-            wake_state.claimed.load(Ordering::Acquire),
+            wake_state.claimed(),
             "waiter reentry ran before the returned physical bit was reusable"
         );
         let third = match poll_reserve(&mut queued, &waker) {

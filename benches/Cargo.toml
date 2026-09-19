@@ -17,6 +17,11 @@ name = "buffer_pool"
 path = "buffer_pool.rs"
 harness = false
 
+[[bench]]
+name = "upload_part_stream"
+path = "upload_part_stream.rs"
+harness = false
+
 [dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }

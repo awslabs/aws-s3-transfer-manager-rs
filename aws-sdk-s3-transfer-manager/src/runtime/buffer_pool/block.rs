@@ -448,6 +448,12 @@ pub(super) struct BlockSlot {
     mapping: Mutex<MappingState>,
     /// Published claimable incarnation.
     current: IncarnationCell,
+    /// Physical bitmap-return operations observed by tests.
+    ///
+    /// This counter is slot-local so tests can distinguish grouped publication
+    /// from unrelated returns in other slots.
+    #[cfg(test)]
+    release_batches: AtomicU64,
 }
 
 impl BlockSlot {
@@ -468,6 +474,8 @@ impl BlockSlot {
                 reclaim_pending: false,
             }),
             current: IncarnationCell::new(),
+            #[cfg(test)]
+            release_batches: AtomicU64::new(0),
         })
     }
 
@@ -952,6 +960,8 @@ impl BlockSlot {
         if won.iter().all(|word| word.mask == 0) {
             return;
         }
+        #[cfg(test)]
+        self.release_batches.fetch_add(1, Ordering::AcqRel);
         let current = self.current.load();
         let Some(current) = current.as_ref() else {
             invariant_violation("owned carriers have no current incarnation");
@@ -982,6 +992,12 @@ impl BlockSlot {
                 mask: 1u64 << (index % u64::BITS as usize),
             }],
         );
+    }
+
+    /// Returns physical bitmap-return operations observed by this slot.
+    #[cfg(test)]
+    pub(super) fn test_release_batches(&self) -> u64 {
+        self.release_batches.load(Ordering::Acquire)
     }
 
     /// Returns `true` when the current active incarnation appears all-free.
@@ -1428,11 +1444,11 @@ impl ProvisionalBits {
                     .unwrap_or_else(|_| invariant_violation("carrier index exceeds geometry"));
                 let carrier = CarrierAllocation {
                     slot: Arc::clone(&self.slot),
-                    id: CarrierId {
+                    id: Some(CarrierId {
                         slot: self.slot.id,
                         index,
                         incarnation: self.incarnation,
-                    },
+                    }),
                 };
 
                 // Move ownership before push so unwinding leaves each bit with
@@ -1456,10 +1472,16 @@ pub(super) struct CarrierAllocation {
     /// Slot that retains the carrier address.
     slot: Arc<BlockSlot>,
     /// Stable carrier and incarnation identity.
-    id: CarrierId,
+    id: Option<CarrierId>,
 }
 
 impl CarrierAllocation {
+    /// Returns this allocation's live carrier identity.
+    fn id(&self) -> CarrierId {
+        self.id
+            .unwrap_or_else(|| invariant_violation("carrier allocation returned its bit twice"))
+    }
+
     /// Returns the concrete slot that roots this carrier's pointer provenance.
     pub(super) fn slot(&self) -> &Arc<BlockSlot> {
         &self.slot
@@ -1467,7 +1489,8 @@ impl CarrierAllocation {
 
     /// Returns this carrier's stable physical location within the arena.
     pub(super) fn location(&self) -> CarrierLocation {
-        CarrierLocation::new(self.id.slot, self.id.index)
+        let id = self.id();
+        CarrierLocation::new(id.slot, id.index)
     }
 
     /// Returns the stable block-slot identifier.
@@ -1490,7 +1513,7 @@ impl CarrierAllocation {
     /// The range remains prepared and exclusively owned while `self` lives.
     /// Dereferencing the pointer must still obey initialization rules.
     pub(super) fn ptr(&self) -> NonNull<MaybeUninit<u8>> {
-        let index = self.id.index as usize;
+        let index = self.id().index as usize;
         let offset = self
             .slot
             .geometry
@@ -1509,7 +1532,73 @@ impl CarrierAllocation {
 
 impl Drop for CarrierAllocation {
     fn drop(&mut self) {
-        self.slot.release_one(self.id);
+        if let Some(id) = self.id.take() {
+            self.slot.release_one(id);
+        }
+    }
+}
+
+/// Consecutive physical returns accumulated for one bitmap word.
+struct CarrierWordReturn {
+    /// Stable slot whose current incarnation owns the returned bits.
+    slot: Arc<BlockSlot>,
+    /// Incarnation that issued every carrier in `mask`.
+    incarnation: IncarnationIdentity,
+    /// Bitmap word containing every returned carrier.
+    word_index: usize,
+    /// Bits returned together when this group drops.
+    mask: u64,
+}
+
+impl Drop for CarrierWordReturn {
+    fn drop(&mut self) {
+        self.slot.release_won(
+            self.incarnation,
+            &[WonWord {
+                word_index: self.word_index,
+                mask: self.mask,
+            }],
+        );
+    }
+}
+
+/// Physical-first return accumulator for adjacent bitmap-word owners.
+pub(super) struct CarrierAllocationBatch {
+    /// Current homogeneous bitmap-word group.
+    current: Option<CarrierWordReturn>,
+}
+
+impl CarrierAllocationBatch {
+    /// Creates an empty physical return batch.
+    pub(super) fn new() -> Self {
+        Self { current: None }
+    }
+
+    /// Transfers one owner into its consecutive bitmap-word group.
+    pub(super) fn push(&mut self, allocation: &mut CarrierAllocation) {
+        let id = allocation.id();
+        let word_index = id.index as usize / u64::BITS as usize;
+        let mask = 1u64 << (id.index as usize % u64::BITS as usize);
+        let can_extend = self.current.as_ref().is_some_and(|word| {
+            Arc::ptr_eq(&word.slot, &allocation.slot)
+                && word.incarnation == id.incarnation
+                && word.word_index == word_index
+        });
+        if can_extend {
+            self.current
+                .as_mut()
+                .unwrap_or_else(|| invariant_violation("carrier return group disappeared"))
+                .mask |= mask;
+        } else {
+            drop(self.current.take());
+            self.current = Some(CarrierWordReturn {
+                slot: Arc::clone(&allocation.slot),
+                incarnation: id.incarnation,
+                word_index,
+                mask,
+            });
+        }
+        allocation.id = None;
     }
 }
 
@@ -1678,7 +1767,7 @@ mod tests {
         assert_eq!(
             preclaimed
                 .iter()
-                .map(|carrier| carrier.id.index)
+                .map(|carrier| carrier.id().index)
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
@@ -1691,7 +1780,7 @@ mod tests {
         assert_eq!(
             remaining
                 .iter()
-                .map(|carrier| carrier.id.index)
+                .map(|carrier| carrier.id().index)
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
@@ -1935,7 +2024,7 @@ mod tests {
         assert_eq!(
             carriers
                 .iter()
-                .map(|carrier| carrier.id.index)
+                .map(|carrier| carrier.id().index)
                 .collect::<Vec<_>>(),
             vec![64, 65]
         );
@@ -1952,7 +2041,7 @@ mod tests {
         assert_eq!(
             carriers
                 .iter()
-                .map(|carrier| carrier.id.index)
+                .map(|carrier| carrier.id().index)
                 .collect::<Vec<_>>(),
             vec![128, 129]
         );
@@ -1997,7 +2086,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(carriers.len(), 65);
-        assert_eq!(carriers.last().unwrap().id.index, 64);
+        assert_eq!(carriers.last().unwrap().id().index, 64);
         assert!(BlockSlot::try_claim(&slot, CarrierCount::new(1))
             .unwrap()
             .is_none());
@@ -2051,11 +2140,11 @@ mod tests {
             .into_carriers()
             .unwrap();
 
-        assert_eq!(first.last().unwrap().id.index, 62);
+        assert_eq!(first.last().unwrap().id().index, 62);
         assert_eq!(
             second
                 .iter()
-                .map(|carrier| carrier.id.index)
+                .map(|carrier| carrier.id().index)
                 .collect::<Vec<_>>(),
             vec![63, 64, 65]
         );
@@ -2087,7 +2176,7 @@ mod tests {
         assert_eq!(
             carriers
                 .iter()
-                .map(|carrier| carrier.id.index)
+                .map(|carrier| carrier.id().index)
                 .collect::<Vec<_>>(),
             vec![65, 67]
         );
@@ -2345,10 +2434,10 @@ mod tests {
         let carrier = carriers.pop().unwrap();
         let wrong = CarrierId {
             incarnation: IncarnationIdentity(
-                NonZeroUsize::new(carrier.id.incarnation.0.get().wrapping_add(1))
+                NonZeroUsize::new(carrier.id().incarnation.0.get().wrapping_add(1))
                     .unwrap_or(NonZeroUsize::MIN),
             ),
-            ..carrier.id
+            ..carrier.id()
         };
 
         let result = catch_unwind(AssertUnwindSafe(|| slot.release_one(wrong)));
@@ -2369,8 +2458,8 @@ mod tests {
             .unwrap();
         let carrier = carriers.pop().unwrap();
         let wrong = CarrierId {
-            slot: carrier.id.slot + 1,
-            ..carrier.id
+            slot: carrier.id().slot + 1,
+            ..carrier.id()
         };
 
         let result = catch_unwind(AssertUnwindSafe(|| slot.release_one(wrong)));
@@ -2711,10 +2800,10 @@ mod loom_tests {
 
             assert_eq!(prepared, CarrierCount::new(2));
             assert_eq!(preclaimed.len(), 1);
-            assert_eq!(preclaimed[0].id.index, 0);
+            assert_eq!(preclaimed[0].id().index, 0);
             if let Some(claimed) = &claimed {
                 assert_eq!(claimed.len(), 1);
-                assert_eq!(claimed[0].id.index, 1);
+                assert_eq!(claimed[0].id().index, 1);
             }
             let expected_live = 1 + claimed.as_ref().map_or(0, Vec::len);
             assert_eq!(slot.live_carriers(), expected_live);

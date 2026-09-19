@@ -4,21 +4,23 @@
  */
 
 use crate::io::stream::StreamContext;
-use crate::io::Buffer;
+use crate::io::PartBuffer;
 use crate::io::PartStream;
 use crate::io::SizeHint;
 
 use crate::io::PartData;
 
-use std::mem;
 use std::task::Poll;
 
-use bytes::Bytes;
 use pin_project_lite::pin_project;
 
 pin_project! {
     /// A wrapper that implements [`PartStream`] trait for an inner type
     /// that implements Tokio's IO traits.
+    ///
+    /// The adapter acquires one part-sized envelope from the transfer manager's
+    /// shared memory pool. Partial bytes and their reservation remain live
+    /// across `Poll::Pending`; a completed part is published without copying.
     ///
     /// # Examples
     ///
@@ -36,27 +38,8 @@ pin_project! {
         #[pin]
         inner: T,
         size_hint: SizeHint,
-        buf: BufState,
+        buffer: Option<PartBuffer>,
         next_part: u64,
-    }
-}
-
-#[derive(Debug)]
-enum BufState {
-    /// No buffer acquired
-    Unset,
-    /// Buffer acquired and possibly partially filled
-    Acquired(Buffer),
-}
-
-impl BufState {
-    /// Take the current buffer if already set or acquire a new one
-    fn take_or_acquire(&mut self, stream_cx: &StreamContext) -> Buffer {
-        let current = mem::replace(self, BufState::Unset);
-        match current {
-            BufState::Unset => stream_cx.new_buffer(stream_cx.part_size()),
-            BufState::Acquired(buffer) => buffer,
-        }
     }
 }
 
@@ -66,7 +49,7 @@ impl<T> TokioIo<T> {
         Self {
             inner,
             size_hint,
-            buf: BufState::Unset,
+            buffer: None,
             next_part: 1,
         }
     }
@@ -93,11 +76,23 @@ where
     ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
         use bytes::BufMut;
         let mut this = self.project();
-        let mut inner_buf = this.buf.take_or_acquire(stream_cx);
+        let part_buffer = this.buffer.get_or_insert_with(|| stream_cx.part_buffer());
+        match part_buffer.poll_acquire(cx, stream_cx.part_size()) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                *this.buffer = None;
+                return Poll::Ready(Some(Err(error)));
+            }
+        }
 
         loop {
+            let part_buffer = this
+                .buffer
+                .as_mut()
+                .expect("part buffer disappeared while reading");
             // SAFETY: `ReadBuf` and `poll_read` promise not to set any uninitialized bytes into `dst`.
-            let dst = unsafe { inner_buf.chunk_mut().as_uninit_slice_mut() };
+            let dst = unsafe { part_buffer.chunk_mut().as_uninit_slice_mut() };
             let mut buf = tokio::io::ReadBuf::uninit(dst);
 
             match this.inner.as_mut().poll_read(cx, &mut buf) {
@@ -107,33 +102,37 @@ where
                         if n > 0 {
                             // SAFETY: we just read that many bytes into the uninitialized part of the buffer
                             unsafe {
-                                inner_buf.advance_mut(n);
+                                part_buffer.advance_mut(n);
                             }
                         }
 
                         // full part available or EOF with partial data already buffered
-                        if inner_buf.len() == stream_cx.part_size()
-                            || (n == 0 && !inner_buf.is_empty())
+                        if part_buffer.len() == stream_cx.part_size()
+                            || (n == 0 && !part_buffer.is_empty())
                         {
-                            let data: Bytes = inner_buf.into();
+                            let data = this
+                                .buffer
+                                .take()
+                                .expect("completed part lost its buffer")
+                                .freeze();
                             let part_number = *this.next_part;
                             *this.next_part += 1;
                             // We don't know whether this is the last part data, since determining that
                             // would require an additional `poll_read`.
-                            let part = PartData::new(part_number, data);
+                            let part = PartData::from_segmented(part_number, data);
                             return Poll::Ready(Some(Ok(part)));
                         } else if n == 0 {
                             // EOF
+                            *this.buffer = None;
                             return Poll::Ready(None);
                         }
                     }
-                    Err(err) => return Poll::Ready(Some(Err(err))),
+                    Err(err) => {
+                        *this.buffer = None;
+                        return Poll::Ready(Some(Err(err)));
+                    }
                 },
-                Poll::Pending => {
-                    // store already acquired, possibly partially filled buffer for next poll
-                    *this.buf = BufState::Acquired(inner_buf);
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -150,11 +149,32 @@ mod tests {
     use crate::io::PartData;
     use crate::io::PartStream;
     use crate::io::SizeHint;
+    use crate::memory::BufferPool;
+    use crate::types::MemoryBudgetConfig;
     use futures_test::task::new_count_waker;
     use std::pin::pin;
     use std::task::Context;
     use tokio_test::io::Builder;
     use tokio_test::{assert_pending, assert_ready};
+
+    fn test_stream_cx(part_size: usize) -> (StreamContext, BufferPool) {
+        let buffer_pool = BufferPool::builder()
+            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .build()
+            .unwrap();
+        (
+            StreamContext::new(
+                part_size,
+                buffer_pool.clone(),
+                false,
+                std::sync::Arc::new(crate::transfer::MetricsState::new()),
+                std::sync::Arc::new(crate::telemetry::Telemetry::new(
+                    std::time::Duration::from_secs(1),
+                )),
+            ),
+            buffer_pool,
+        )
+    }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -165,16 +185,13 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(
-            part_size,
-            false,
-            std::sync::Arc::new(crate::transfer::MetricsState::new()),
-            std::sync::Arc::new(crate::telemetry::Telemetry::new(
-                std::time::Duration::from_secs(1),
-            )),
-        );
+        let (stream_cx, pool) = test_stream_cx(part_size);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            pool.carrier_size() as u64
+        );
         handle.read(b"hello");
         assert_eq!(awoken_cnt.get(), 1);
 
@@ -183,6 +200,12 @@ mod tests {
             .unwrap();
         let expected = PartData::new(1, "hello");
         assert_eq!(expected, result);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            pool.carrier_size() as u64
+        );
+        drop(result);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"world");
@@ -193,10 +216,12 @@ mod tests {
             .unwrap();
         let expected = PartData::new(2, "world");
         assert_eq!(expected, result);
+        drop(result);
 
         drop(handle);
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -208,18 +233,15 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(
-            part_size,
-            false,
-            std::sync::Arc::new(crate::transfer::MetricsState::new()),
-            std::sync::Arc::new(crate::telemetry::Telemetry::new(
-                std::time::Duration::from_secs(1),
-            )),
-        );
+        let (stream_cx, pool) = test_stream_cx(part_size);
 
         // partial read
         handle.read(b"hello");
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            pool.carrier_size() as u64
+        );
 
         handle.read(b"world"); // full part available
         handle.read(b"second"); // last part less than part size
@@ -232,6 +254,7 @@ mod tests {
             .unwrap();
         let expected = PartData::new(1, "helloworld");
         assert_eq!(expected, result);
+        drop(result);
 
         // should hit EOF and get the last part less than configured part size
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
@@ -239,9 +262,11 @@ mod tests {
             .unwrap();
         let expected = PartData::new(2, "second");
         assert_eq!(expected, result);
+        drop(result);
 
         // one final poll to actual get done signal
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 }

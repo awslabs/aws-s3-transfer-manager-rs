@@ -955,22 +955,34 @@ coverage for close to withdraw. If close linearizes first, close records uncover
 return to remove. Packing coverage and uncovered charges makes both orders produce the same final
 accounting state.
 
-Final `CarrierGuard` drop performs these operations in order:
+Final owner return performs these operations in order:
 
-1. Return the physical carrier to the arena.
-2. Decrement the originating reservation's outstanding direct-carrier count when direct provenance
-   exists.
-3. Remove one uncovered charge, or restore one unit of available coverage when no uncovered charge
-   remains.
+1. Return physical carrier ownership to the arena.
+2. Decrement originating reservations' outstanding direct-carrier counts.
+3. Remove uncovered charges, then restore any remaining units as available coverage.
 
 Physical return precedes accounting release. Reversing the order can admit a waiter that finds no
 reusable carrier and grows the arena while the responsible carrier is still unavailable.
 
-A return first applies one packed accounting transition. If it restores only available coverage,
-the return is complete without admission serialization. If it removes an uncovered charge, the
-return then enters admission serialization and drains the FIFO. A reservation request that acquired
-the mutex before the accounting transition is reconsidered by that drain; one that acquires it
-afterward observes the reduced `admission_used` during its own eligibility check.
+One owner may return independently, or several uniquely held owners with the same pool and direct
+reservation provenance may return as one batch. A batch groups physical bits by concrete slot
+incarnation and bitmap word before releasing aggregate owner counts. Shared owners and owners with
+different accounting provenance retain independent return authority and use the granular path.
+
+Reservation admission and uncovered repayment are ordered by a drain signal containing a queue bit
+and a repayment epoch. A reservation poll arms the signal while admission is held and before
+sampling coverage. Every uncovered repayment updates coverage and then unconditionally advances the
+epoch with acquire-release ordering.
+
+If repayment observes an armed signal, it enters admission serialization and drains every newly
+eligible FIFO head. If it observes an unarmed signal, a later poll's arm operation acquires the
+repayment epoch before that poll samples coverage. Each acquire-release repayment RMW acquires from
+the preceding RMW in the atomic's modification order, carrying earlier coverage updates through the
+chain. A poll therefore cannot enqueue from a coverage state older than any preceding repayment.
+The queue bit is cleared only while admission is held and the FIFO is empty.
+
+A return that restores only available coverage does not affect reservation eligibility and does not
+publish a repayment epoch.
 
 FIFO drain runs on the thread performing the final carrier return. It may wait for admission
 serialization, process multiple queue heads, prepare blocks for eligible grants, and invoke
@@ -978,9 +990,10 @@ registered wakers after releasing all pool locks. The path has no latency bound.
 that a return which must prepare additional storage is uncommon; it does not assume that returns
 removing uncovered charges are uncommon.
 
-An uncovered-charge return may wait behind a serialized acquisition performing a registry-wide
-fallback scan. Return latency in that regime can therefore depend on registry size; the
-pool-size-independent guarantee applies to coverage-restoring return.
+An uncovered-charge return that observes an armed signal may wait behind a serialized acquisition
+performing a registry-wide fallback scan. Return latency in that regime can therefore depend on
+registry size. Coverage-restoring returns and uncovered returns that observe an unarmed signal do
+not enter admission serialization.
 
 A direct return restores direct-acquisition authority while the reservation remains open. Return
 and growth rollback cannot reopen a closed reservation.
@@ -1002,10 +1015,12 @@ and delivery, `I` for integration, and `C` for configuration and operations.
   either authorizes the complete debit or rejects it.
 - **A5: Close reclassification.** Close removes the complete envelope without removing surviving
   owner charges. A later grant does not reclassify those charges.
-- **A6: Return ordering.** Physical return precedes charge release. A return or post-unlock
-  rollback that removes an uncovered charge reconsiders the FIFO.
-- **A7: FIFO transfer.** Fresh requests do not bypass waiters. Each waiter receives one terminal
-  result, made visible before its registered waker runs after admission unlock.
+- **A6: Return ordering.** Physical return precedes direct and aggregate charge release. Every
+  uncovered repayment publishes its epoch; repayment that observes an armed queue reconsiders the
+  FIFO.
+- **A7: FIFO transfer.** A reservation poll arms repayment ordering before sampling coverage.
+  Fresh requests do not bypass waiters. Each waiter receives one terminal result, made visible
+  before its registered waker runs after admission unlock.
 - **A8: Admission lifetime.** Dropping one pool handle does not invalidate reservations, waiters,
   carrier owners, or other handles.
 
@@ -2152,6 +2167,9 @@ impl Buf for SegmentedBytes {
 impl SegmentedBytes {
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
+    pub fn append(&mut self, other: SegmentedBytes);
+    pub fn into_segments(self) -> Vec<Bytes>;
+    pub fn try_into_contiguous(self) -> Result<Bytes, SegmentedBytes>;
     pub fn into_contiguous(self) -> Bytes;
 }
 
@@ -2174,6 +2192,17 @@ carrier guard; dropping one range returns the carrier only when no other range o
 Cloning `SegmentedBytes` clones its current cursor state and remaining holds. Each clone advances
 independently. Advancing one clone cannot release backing still reachable through another. `len`
 and `is_empty` report the state of that clone's cursor.
+
+`append` consumes another value's remaining ranges and preserves their owner boundaries. The join
+coalesces only when the same slot-identity and adjacency checks used during initial construction
+hold. `into_segments` consumes the cursor and returns one owner-backed `Bytes` for each remaining
+presentation segment without copying payload bytes. Each result retains every owner covering that
+segment, so owner release through an extracted segment occurs when that complete `Bytes` is
+released rather than at an interior owner boundary.
+
+`try_into_contiguous` distinguishes the zero-copy cases from a value that would require gathering.
+It returns an empty or one-segment `Bytes` in `Ok`; a multi-segment value is returned unchanged in
+`Err`.
 
 `into_contiguous` consumes the remaining data:
 
@@ -2207,9 +2236,10 @@ impl AsRef<[u8]> for ContiguousOwner {
 unsafe impl Send for ContiguousOwner {}
 ```
 
-The public contract does not expose segment iterators. Borrowed reads use `Buf`; callers that need
-one independently owned contiguous value use `into_contiguous`. `From<Bytes>` constructs a
-pool-independent one-segment value and retains the supplied `Bytes` as its owner.
+Borrowed reads use `Buf`. Callers that can transmit or store several immutable buffers use
+`into_segments`; callers that require one independently owned contiguous value use
+`try_into_contiguous` or `into_contiguous`. `From<Bytes>` constructs a pool-independent one-segment
+value and retains the supplied `Bytes` as its owner.
 
 **Obligations.**
 
@@ -2241,58 +2271,33 @@ pool-independent one-segment value and retains the supplied `Bytes` as its owner
 
 ## Integration
 
-Transfer-manager work that can present a `Reservation` uses reserved acquisition. Upload staging and
-the default download path both follow this rule. Hyper returns foreign `Bytes`; the transfer manager
-copies decoded payload into reserved pooled storage before retaining or delivering it. The copy
-transiently holds transport memory outside pool accounting but requires no transport modification.
+Transfer-manager work uses reserved acquisition whenever it can express the maximum writable
+envelope that may be live at once. Reserved acquisition is the normal path for managed staging.
 
 An integration boundary that cannot carry a reservation may use unreserved acquisition. It accounts
 writable storage before use and publishes through the same `Bytes` and `SegmentedBytes` ownership
-types. The baseline Hyper integration does not use this path.
+types.
 
-### Scheduler admission and dispatch
+### Reservation handoff
 
-Each work item reserves its memory envelope from `poll_work()` before becoming dispatchable. The
-transfer stores a `ReserveFuture` with the candidate work while admission is pending. A ready future
-moves the `Reservation` into the `IoRequest`; a pending future remains in transfer state and causes
-`PollWork::Pending`.
+Admission placement is an integration policy, not pool behavior. A caller may obtain a reservation
+before dispatch or while dispatched work is resolving its storage requirements. Both placements use
+the same memory contract:
 
-`PollWork` and `IoRequest` are transfer-manager scheduler types, not pool types. The memory contract
-requires only that the ready variant's `io` work data owns the granted `Reservation`.
+- the caller retains one `ReserveFuture` across `Poll::Pending` and supplies a wake path;
+- pooled acquisition begins only after that future yields a granted, prepared `Reservation`;
+- the reservation remains live while direct acquisition authority or unpublished mutable storage
+  depends on its envelope; and
+- dropping a pending future or an unused grant cancels that demand without publishing storage.
 
-`poll_work()` has no `Context` parameter. A crate-private scheduler adapter supplies one:
+The scheduler defines how blocked work releases and later reacquires execution capacity. The pool
+requires only that the admission future and resulting reservation remain owned across that handoff;
+see the [scheduler design](./scheduler.md#backpressure).
 
-```rust
-pub(crate) struct SchedulerWake {
-    scheduler: Scheduler,
-    transfer_id: TransferId,
-}
-
-impl Wake for SchedulerWake {
-    fn wake(self: Arc<Self>) {
-        self.scheduler.wake(self.transfer_id);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.scheduler.wake(self.transfer_id);
-    }
-}
-```
-
-The transfer polls its stored future with a `Waker` built from `SchedulerWake`. The scheduler
-records every wake request even while the transfer descriptor is claimed for `poll_work()`. If
-the future is granted after registering its waker but before `poll_work()` returns `Pending`, the
-scheduler observes that mark when it releases the claim and reinserts the transfer. No notification
-is lost in the poll-to-pending interval.
-
-Reservation or preparation failure produces no `IoRequest`. Cancellation removes queued admission
-by dropping the stored future, or consumes an already granted reservation before dispatch.
-Cancellation after dispatch stops producers, closes direct-acquisition authority, and drops
+Reservation or preparation failure grants no acquisition authority. Cancellation removes queued
+admission by dropping the stored future, or closes an already granted reservation before use.
+Cancellation after acquisition stops producers, closes direct-acquisition authority, and drops
 unpublished mutable buffers. Immutable bytes already published retain their carriers and charges.
-
-Execution code uses `pool.acquire(&reservation, min_bytes)`. The download collector uses the same
-reservation when copying foreign transport bytes into pooled staging. Scheduler admission remains
-independent of the transport's request and connection lifecycle.
 
 The reservation envelope includes the carrier-rounded shape of every independent buffer that can be
 live at once. `ReservationCapacityExceeded` while completing a part or range indicates an
@@ -2302,70 +2307,123 @@ complete.
 
 ### Upload staging and retry
 
-An upload that stages part data in the pool uses one `PooledBufMut` for each concurrently staged
-part. A known part length may be acquired in one request. An incremental source retains the same
-buffer and calls `reserve` before each fill, so the part's writable tail remains available across
-reads. A source read advances initialization only by its completed byte count; short completion,
-error, or cancellation leaves the remaining range uninitialized and unpublishable. The completed
-part freezes into `SegmentedBytes`:
+Each in-flight upload part has two memory lifetimes:
+
+1. mutable storage while the source produces bytes; and
+2. immutable storage retained until every network attempt using those bytes completes.
+
+`PartBuffer` joins those lifetimes without copying between them. Custom streams and adapters create
+one through `StreamContext::part_buffer`, retain it with their source state, and poll
+`PartBuffer::poll_acquire` before writing through `BufMut`. Creating the facade itself does not
+reserve or allocate payload memory.
+
+An acquisition request admits one logical envelope. The first envelope supplied while admission is
+pending remains fixed until the request completes. A producer normally requests the complete
+effective part size, but may use smaller envelopes when its source is incrementally available to
+limit the shared pool capacity held by one input stream while it waits for more data.
+`BufMut::remaining_mut` exposes only writable bytes covered by the active envelope;
+carrier-rounded padding is not part of the logical allowance.
 
 ```text
-Reservation
+source state
     |
     v
-pool.acquire(part capacity)
+PartBuffer::poll_acquire(envelope)
     |
-    v
-PooledBufMut
+    +-- Pending: retain PartBuffer and source progress
     |
-    +-- PooledBufMut::reserve(min_writable) --> source read --+
-    |                                                        |
-    +<-------------------------------------------------------+
-    |
-    `-- freeze --> SegmentedBytes
-                         |
-            +------------+------------+
-            |                         |
-       attempt 1 cursor           retry cursor
-            |                         |
-            +------ same holds -------+
+    `-- Ready: write initialized bytes through BufMut
+                   |
+                   +-- envelope has capacity: continue filling
+                   |
+                   +-- envelope full: publish prefix and acquire next envelope
+                   |
+                   `-- part complete: freeze into SegmentedBytes
 ```
 
-Parallel parts use separate buffers because their fill, retry, publication, and ownership lifetimes
-are independent. A final partial carrier belongs to that part and may remain retained by its final
-immutable segment.
+When an envelope becomes full, `PartBuffer` publishes its initialized prefix into a private
+`SegmentedBytes` accumulator and closes that envelope. Publication retains any writable tail in the
+current carrier. The next envelope consumes that tail before requesting another reservation, so
+carrier rounding does not strand usable capacity. Pool-aware classification may coalesce adjacent
+published views from the same concrete slot into one presentation segment; each view keeps its
+original immutable owner and accounting lifetime.
 
-Each SDK attempt receives a fresh body and cursor over the same immutable holds. The retained
-`SegmentedBytes` remains live through SDK retries and any transfer-manager retry checkpoint that can
-replay the part. `SdkBody::retryable` rebuilds a body for each clone attempt, and
-`SdkBody::try_clone` succeeds only when such a rebuild operation exists
-([`SdkBody` retry support][sdk-body-retry]).
+`PartBuffer::len` reports initialized bytes across published and mutable storage.
+`PartBuffer::remaining` reports bytes left before the part-size limit. A source advances
+initialization only for bytes it has actually written. Dropping the facade cancels queued admission
+and releases all transfer-manager-owned storage. Freezing closes active acquisition authority,
+returns wholly unused carriers, and transfers every initialized byte into `SegmentedBytes`.
 
-Retry requires either a source that can be read again or immutable bytes retained through the retry
-window. An addressable file or range source can rebuild an attempt by rereading its input. A
-forward-only source retains the staged `SegmentedBytes` or supplies another replay layer.
-Caller-owned `Bytes` and other already-resident upload memory remain outside pool accounting unless
-copied into pooled storage.
+The facade is `Send + Sync` because a `PartStream` can be retained in shared request state before
+polling obtains exclusive access. Mutable storage remains available only through `&mut PartBuffer`;
+shared access cannot expose or modify `PooledBufMut` ranges. Parallel parts use separate facades
+because their source progress, publication, retry, and release lifetimes are independent.
 
-The body reports its exact remaining length through `size_hint`; segmentation does not make the
-length unknown. The SDK body adapter forwards each `Bytes` frame and its size bounds without
-requiring one contiguous value ([`SdkBody` HTTP body adapter][sdk-body-http]).
+#### Multipart file staging
 
-Segmentation does not require a gather copy for checksum calculation, signing, or aws-chunked
-framing. The body adapters consume frames in order. A streaming checksum body updates the checksum
-per data frame and emits the value in trailers ([checksum body][sdk-checksum-body]). A segmented
-streaming `SdkBody` therefore selects a different wire shape from a single in-memory `Bytes` when
-SDK-owned checksum calculation is enabled: the checksum is carried in an aws-chunked trailer rather
-than an HTTP header ([S3 checksum selection][s3-checksum-selection],
-[aws-chunked selection][s3-chunked-selection]). The upload path may preserve header placement by
-calculating the checksum while filling and setting the header before transmit. Both paths retain a
-segmented body; neither requires a gather copy.
+A multipart file reader claims one disjoint file range, admits an envelope for that range's complete
+length, and reads directly into the `PartBuffer`'s contiguous writable runs. Each positioned read
+uses the claimed object offset plus the bytes already filled for that part. A run is marked
+initialized only after the operating-system read fills the complete range; a short read or error
+leaves it unpublished and releases the buffer when the operation is dropped.
 
-The upload calls `Reservation::close_acquisition` or drops the reservation after no staging buffer
-may require another carrier. Replaying an existing `SegmentedBytes` does not require open
-direct-acquisition authority. Closing does not release carriers retained by the retry body. A
-staging buffer that survives close may consume its existing writable tail but receives
-`ReservationClosed` if it attempts to grow.
+The source is opened before transmission and retained across attempts. Positional reads do not
+mutate a shared file cursor, so disjoint part ranges can execute concurrently without changing
+their offsets or source identity.
+
+After the final run is initialized, freezing publishes the part as `SegmentedBytes` without
+gathering. The immutable payload, rather than the file-read future or reservation, retains its
+carrier charges through network transmission and retries.
+
+#### File-backed PutObject
+
+A file-backed single-request upload remains a bounded streaming body. The transfer manager opens
+the file once before constructing the retryable SDK body. Every attempt starts a new positional
+cursor over the same open source, so replacing the path after transmission begins cannot redirect
+a retry to a different file. Mutation of that source during an upload remains part of the
+file-source integrity contract rather than a property provided by retry reconstruction.
+
+The body admits and reads bounded pooled chunks instead of staging the complete object. Exact
+positioned reads initialize each chunk before publication, and the resulting `SegmentedBytes`
+cursor emits owner-backed frames without gathering. Pool charges remain live while immutable
+chunks are waiting in the body, retained by downstream HTTP processing, or owned by an
+in-progress read. Cancellation prevents further staging and releases ownership as outstanding
+operations complete.
+
+#### Request bodies
+
+`PartData` owns the immutable payload for one part. Caller-owned `Bytes` remain outside pool
+accounting. Pooled and mixed payloads use `SegmentedBytes`, whose owners keep every carrier charged
+and mapped until the final body, retry cursor, and payload clone releases it.
+
+Empty and single-segment payloads use the SDK's contiguous `SdkBody::from(Bytes)` representation.
+Multi-segment payloads use an exact-length retryable body. Each attempt receives a fresh cursor over
+the same ordered immutable segments and emits one owner-backed `Bytes` frame per presentation
+segment. The body reports its exact remaining length through `size_hint`; segmentation does not
+make the content length unknown ([`SdkBody` HTTP body adapter][sdk-body-http]).
+
+`SdkBody::retryable` rebuilds the cursor for SDK retries, so `SdkBody::try_clone` succeeds without
+gathering the payload ([`SdkBody` retry support][sdk-body-retry]). An addressable source may instead
+rebuild an attempt by reading the same range again. A forward-only source must retain its immutable
+part data through the retry window.
+
+Direct-acquisition authority closes once no staging buffer can require another carrier. Closing a
+reservation does not release immutable carriers held by `PartData` or a request body. Replaying
+existing `SegmentedBytes` therefore requires no open reservation.
+
+#### Checksum framing
+
+With SDK-owned request checksums enabled, a contiguous in-memory body can be checksummed before
+signing and carry the checksum in a header. A segmented body is presented as a streaming body, so
+the SDK updates the checksum from its frames and emits the result in an aws-chunked trailer
+([checksum body][sdk-checksum-body], [S3 checksum selection][s3-checksum-selection],
+[aws-chunked selection][s3-chunked-selection]).
+
+The aws-chunked encoder allocates encoded chunks and copies payload bytes between framing data. An
+encoded chunk that spans several input frames may gather those frames before the encoding copy.
+This preserves replay and bounded ownership but is not a zero-copy transmission path. Eliminating
+that copy requires either a non-contiguous in-memory SDK body and checksum interface or checksum
+calculation before transmission with the result supplied as a header.
 
 ### Download receive and delivery
 
@@ -2465,8 +2523,9 @@ primitives without defining the transport API.
 
 **Obligations.**
 
-- **I1: Scheduler handoff.** `poll_work()` dispatches only a granted, prepared reservation. A
-  terminal future result is visible before wake, and a wake racing `Pending` schedules another poll.
+- **I1: Reservation handoff.** Pooled acquisition starts only under a granted, prepared
+  reservation. Pending admission retains the same future and a wake path until grant, cancellation,
+  or failure.
 - **I2: Cancellation ownership.** Cancellation closes direct-acquisition authority and releases
   transfer-manager-owned mutable buffers and clones unless their lifetime was transferred to active
   retry, delivery, I/O, or caller ownership. Published bytes remain valid.
@@ -3432,10 +3491,10 @@ section; one property may discharge several contracts.
 | A7         | Grant, cancellation, and poll produce one terminal waiter result                  | Loom over FIFO and wait slot                           | Release the slot during preparation and publish after `Taken`     |
 | A7         | Waker reentry observes the terminal result without lock nesting                   | Loom with waker reentry                                | Invoke the waker before publication or while admission is locked  |
 | A7         | Idle-only admission grants at most one request at a time                          | State-machine property test                            | Gate idle escape on configured headroom instead of planned demand |
-| A6         | Uncovered-charge return cannot strand an eligible waiter                          | Loom over packed return, enqueue, and FIFO drain       | Skip admission drain after repaying an uncovered charge           |
+| A6         | Uncovered-charge return cannot strand an eligible waiter                          | Loom over drain signal, packed return, enqueue, and FIFO | Skip an unarmed repayment epoch or weaken poll-arm ordering        |
 | A2         | Published shortfall preserves the floor during unlocked claim                     | Composed Loom over debit, trim, claim, and rollback    | Unlock before charge publication or floor preparation             |
 | A3, A6     | Post-unlock shortfall rollback cannot strand an eligible waiter                   | Loom over rollback, enqueue, and FIFO drain            | Skip admission drain after rollback repays an uncovered charge    |
-| A6         | Physical return precedes a newly eligible waiter's acquisition                    | Composed pool-level Loom model                         | Release accounting before clearing the physical bit               |
+| A6         | Granular and batched physical return precede a newly eligible waiter acquisition  | Real return paths in pool-level Loom models            | Release accounting before clearing the physical bit               |
 | A3         | Partial acquisition failure restores every debit and direct-acquisition authority | Failure injection after each claim and conversion      | Drop the debit before provisional and completed carriers          |
 | A4         | Close racing buffer growth has one complete outcome                               | Loom over authority, debit, rollback, and close        | Split `CLOSED` from the direct-authority debit                    |
 | A4         | Concurrent acquisitions consume direct-acquisition authority exactly once         | Loom over packed reservation owner state               | Load and store authority without compare-and-exchange             |
@@ -3488,8 +3547,8 @@ section; one property may discharge several contracts.
 
 | Obligation | Property                                                               | Evidence                                                                  | Negative control                                           |
 | ---------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| I1         | `poll_work()` dispatches only a granted, prepared reservation          | Scheduler integration test with parking and cancellation                  | Dispatch while the reservation future is pending           |
-| I1         | Wake racing `poll_work()` pending cannot strand a granted reservation  | Scheduler state-machine test across registration and claim release        | Ignore a wake recorded while the transfer is claimed       |
+| I1         | Pooled acquisition owns a granted, prepared reservation                | Integration tests with immediate, pending, and cancelled admission        | Acquire while the reservation future is pending             |
+| I1         | Pending admission retains one future and its wake path                 | Admission state-machine tests across registration and grant               | Drop and reconstruct the future after `Poll::Pending`       |
 | I2         | Cancellation releases manager holds without invalidating escaped bytes | Integration tests across queued, dispatched, and published states         | Release published bytes or retain unpublished buffers      |
 | I3         | Upload retry retains exact bytes through the final consuming attempt   | Retry tests with partial body polling and source failure                  | Release staged bytes before the last retry                 |
 | I3         | Upload parts reuse one mutable stream across source reads              | Multipart tests with carrier-misaligned read completions                  | Allocate one buffer for every source read                  |
